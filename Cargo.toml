@@ -1,0 +1,20 @@
+[package]
+name = "headjack"
+version = "0.1.0"
+edition = "2021"
+authors = ["Patrick Jackson <patrick@jackson.dev>"]
+readme = "README.md"
+license = "MIT"
+description = "Headjack - Jack some (AI) heads into Matrix."
+repository = "https://github.com/arcuru/headjack"
+homepage = "https://github.com/arcuru/headjack"
+
+[[bin]]
+name = "headjack"
+test = false
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "0.3.15"
+matrix-sdk = "0.7.1"

@@ -1,0 +1,59 @@
+# https://taskfile.dev
+
+version: "3"
+
+tasks:
+  default:
+    cmd: task --list
+    silent: true
+  ci:full:
+    desc: Run CI locally in containers
+    cmd: act
+  ci:local:
+    desc: Run CI locally
+    deps: [audit, fmt, test, nix:check, nix:build, clippy, pre-commit, build]
+  nix:check:
+    desc: Run Nix CI checks
+    sources:
+      - ./**/*
+    cmds:
+      - nix flake check
+  nix:build:
+    desc: Run Nix Build
+    cmds:
+      - nix build
+  clippy:
+    desc: Run clippy
+    sources:
+      - ./**/*.rs
+    cmd: cargo clippy
+  pre-commit:
+    desc: Run pre-commit
+    cmd: pre-commit run --all-files --show-diff-on-failure
+  fmt:
+    desc: Run all formatters
+    sources:
+      - ./**/*.rs
+      - ./**/*.nix
+    cmds:
+      - cargo fmt --all
+      - alejandra .
+  test:
+    desc: Run all tests
+    aliases: [t]
+    sources:
+      - ./**/*.rs
+    cmd: cargo nextest run
+  audit:
+    desc: Run cargo security audit
+    sources:
+      - Cargo.lock
+      - flake.lock
+    cmd: cargo audit
+  build:
+    desc: Build the project
+    aliases: [b]
+    sources:
+      - ./**/*.rs
+      - ./Cargo*
+    cmd: cargo build

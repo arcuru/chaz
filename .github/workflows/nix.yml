@@ -1,0 +1,26 @@
+name: Nix
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+      - name: Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Check
+        # Run 1 at a time and print all the log files
+        run: nix flake check --max-jobs 1 -L
+
+      - name: Build
+        run: nix build
