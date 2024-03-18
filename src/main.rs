@@ -20,6 +20,7 @@ use matrix_sdk::{
     },
     Client, Room, RoomState,
 };
+use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
 use tokio::time::{sleep, Duration};
 
 /// This is the starting point of the app. `main` is called by rust binaries to
@@ -162,16 +163,50 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
         return;
     };
 
-    // here comes the actual "logic": when the bot see's a `!party` in the message,
-    // it responds
-    if text_content.body.contains("!party") {
-        let content = RoomMessageEventContent::text_plain("🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+    // If we start with a single '!', interpret as a command
+    let text = text_content.body.trim_start();
+    if text.starts_with('!') && !text.starts_with("!!") {
+        // Interpret as a command
+        let command = text.split_whitespace().next();
+        if let Some(command) = command {
+            // Write a match statement to match the first word in the body
+            match &command[1..] {
+                "party" => {
+                    let content =
+                        RoomMessageEventContent::text_plain("🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+                    // send our message to the room we found the "!party" command in
+                    room.send(content).await.unwrap();
+                }
+                "ollama" => {
+                    // Remove the command from the text
+                    let input = text_content.body.trim_start_matches("!ollama").trim();
 
-        println!("sending");
+                    if let Ok(result) = send_to_ollama_server(input.to_string()).await {
+                        let content = RoomMessageEventContent::text_plain(result);
 
-        // send our message to the room we found the "!party" command in
-        room.send(content).await.unwrap();
-
-        println!("message sent");
+                        room.send(content).await.unwrap();
+                    }
+                }
+                _ => {
+                    println!("Unknown command");
+                }
+            }
+        }
     }
+}
+
+// Send the current conversation to the configured ollama server
+async fn send_to_ollama_server(input: String) -> Result<String, ()> {
+    let ollama = Ollama::default();
+
+    let model = "llama2:latest".to_string();
+    let prompt = input;
+
+    let res = ollama.generate(GenerationRequest::new(model, prompt)).await;
+
+    if let Ok(res) = res {
+        // Strip leading and trailing whitespace from res.response
+        return Ok(res.response.trim().to_string());
+    }
+    Err(())
 }
