@@ -2,6 +2,7 @@ use clap::Parser;
 use lazy_static::lazy_static;
 use matrix_sdk::{
     config::SyncSettings,
+    room::MessagesOptions,
     ruma::events::room::{
         member::StrippedRoomMemberEvent,
         message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
@@ -93,7 +94,7 @@ async fn login_and_sync(
     client
         .matrix_auth()
         .login_username(username, password)
-        .initial_device_display_name("getting started bot")
+        .initial_device_display_name("headjack-bot")
         .await?;
 
     // It worked!
@@ -194,34 +195,106 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
 
     // If we start with a single '!', interpret as a command
     let text = text_content.body.trim_start();
-    if text.starts_with('!') && !text.starts_with("!!") {
-        // Interpret as a command
+    if is_command(text) {
         let command = text.split_whitespace().next();
         if let Some(command) = command {
             // Write a match statement to match the first word in the body
             match &command[1..] {
                 "party" => {
                     let content =
-                        RoomMessageEventContent::text_plain("🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+                        RoomMessageEventContent::text_plain("!party\n🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
                     // send our message to the room we found the "!party" command in
                     room.send(content).await.unwrap();
                 }
                 "ollama" => {
-                    // Remove the command from the text
+                    // Send just this 1 message to the ollama server
                     let input = text_content.body.trim_start_matches("!ollama").trim();
 
                     if let Ok(result) = send_to_ollama_server(input.to_string()).await {
+                        // Add the prefix "!response:\n" to the result
+                        // That way we can identify our own responses and ignore them for context
+                        let result = format!("!response:\n{}", result);
                         let content = RoomMessageEventContent::text_plain(result);
 
                         room.send(content).await.unwrap();
                     }
+                }
+                "help" => {
+                    let content = RoomMessageEventContent::text_plain(
+                        "!help\n\nAvailable commands:\n- !party - Start a party!\n- !ollama <input> - Send <input> to the ollama server without context\n- !print - Print the full context of the conversation\n- !help - Print this message",
+                    );
+                    room.send(content).await.unwrap();
+                }
+                "print" => {
+                    // Prints the full context back to the room
+                    let mut context = get_context(&room).await.unwrap();
+                    context.insert_str(0, "!context\n");
+                    let content = RoomMessageEventContent::text_plain(context);
+                    room.send(content).await.unwrap();
                 }
                 _ => {
                     println!("Unknown command");
                 }
             }
         }
+    } else {
+        // If it's not a command, we should send the full context without commands to the ollama server
+        if let Ok(mut context) = get_context(&room).await {
+            let prefix = format!("Here is the full text of our ongoing conversation. Your name is {}, and your messages are prefixed by {}:. My name is {}, and my messages are prefixed by {}:. Send the next response in this conversation. Do not prefix your response with your name or any other text. Do not greet me again if you've already done so. Send only the text of your response.\n",
+                        room.client().user_id().unwrap(), room.client().user_id().unwrap(), event.sender, event.sender);
+            context.insert_str(0, &prefix);
+            if let Ok(result) = send_to_ollama_server(context).await {
+                let content = RoomMessageEventContent::text_plain(result);
+                room.send(content).await.unwrap();
+            }
+        }
     }
+}
+
+fn is_command(text: &str) -> bool {
+    text.starts_with('!') && !text.starts_with("!!")
+}
+
+/// Gets the context of the current conversation
+async fn get_context(room: &Room) -> Result<String, ()> {
+    // Read all the messages in the room, place them into a single string, and print them out
+    let mut messages = Vec::new();
+
+    let mut options = MessagesOptions::backward();
+
+    // FIXME: I think this doesn't work because we aren't saving the session
+    // It will only work for the messages in the current session
+
+    while let Ok(batch) = room.messages(options).await {
+        for message in batch.chunk {
+            if let Ok(content) = message
+                .event
+                .get_field::<RoomMessageEventContent>("content")
+            {
+                let Ok(sender) = message.event.get_field::<String>("sender") else {
+                    continue;
+                };
+                if let Some(content) = content {
+                    let MessageType::Text(text_content) = content.msgtype else {
+                        continue;
+                    };
+                    if is_command(&text_content.body) {
+                        continue;
+                    }
+                    // Push the sender and message to the front of the string
+
+                    messages.push(format!("{}: {}\n", sender.unwrap(), text_content.body));
+                }
+            }
+        }
+        if let Some(token) = batch.end {
+            options = MessagesOptions::backward().from(Some(token.as_str()));
+        } else {
+            break;
+        }
+    }
+    // Append the messages into a string with newlines in between, in reverse order
+    Ok(messages.into_iter().rev().collect::<String>())
 }
 
 // Send the current conversation to the configured ollama server
