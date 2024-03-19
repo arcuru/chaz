@@ -1,17 +1,4 @@
-///
-///  This is an example showcasing how to build a very simple bot using the
-/// matrix-sdk. To try it, you need a rust build setup, then you can run:
-/// `cargo run -p example-getting-started -- <homeserver_url> <user> <password>`
-///
-/// Use a second client to open a DM to your bot or invite them into some room.
-/// You should see it automatically join. Then post `!party` to see the client
-/// in action.
-///
-/// Below the code has a lot of inline documentation to help you understand the
-/// various parts and what they do
-// The imports we need
-use std::{env, process::exit};
-
+use clap::Parser;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::events::room::{
@@ -21,7 +8,26 @@ use matrix_sdk::{
     Client, Room, RoomState,
 };
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct HeadJackArgs {
+    /// path to config file
+    #[arg(short, long)]
+    config: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    homeserver_url: String,
+    username: String,
+    password: String,
+}
 
 /// This is the starting point of the app. `main` is called by rust binaries to
 /// run the program in this case, we use tokio (a reactor) to allow us to use
@@ -32,22 +38,16 @@ async fn main() -> anyhow::Result<()> {
     // var `RUST_LOG`
     tracing_subscriber::fmt::init();
 
-    // parse the command line for homeserver, username and password
-    let (homeserver_url, username, password) =
-        match (env::args().nth(1), env::args().nth(2), env::args().nth(3)) {
-            (Some(a), Some(b), Some(c)) => (a, b, c),
-            _ => {
-                eprintln!(
-                    "Usage: {} <homeserver_url> <username> <password>",
-                    env::args().next().unwrap()
-                );
-                // exit if missing
-                exit(1)
-            }
-        };
+    let args = HeadJackArgs::parse();
+
+    let mut file = File::open(args.config)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let config: Config = serde_yaml::from_str(&contents)?;
 
     // our actual runner
-    login_and_sync(homeserver_url, &username, &password).await?;
+    login_and_sync(config.homeserver_url, &config.username, &config.password).await?;
     Ok(())
 }
 
