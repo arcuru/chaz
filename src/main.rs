@@ -1,4 +1,5 @@
 use clap::Parser;
+use lazy_static::lazy_static;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::events::room::{
@@ -8,10 +9,12 @@ use matrix_sdk::{
     Client, Room, RoomState,
 };
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+use regex::Regex;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 #[derive(Parser)]
@@ -22,11 +25,17 @@ struct HeadJackArgs {
     config: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     homeserver_url: String,
     username: String,
     password: String,
+    /// Allow list of which accounts we will respond to
+    allow_list: Option<String>,
+}
+
+lazy_static! {
+    static ref GLOBAL_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 }
 
 /// This is the starting point of the app. `main` is called by rust binaries to
@@ -45,10 +54,22 @@ async fn main() -> anyhow::Result<()> {
     file.read_to_string(&mut contents)?;
 
     let config: Config = serde_yaml::from_str(&contents)?;
+    *GLOBAL_CONFIG.lock().unwrap() = Some(config.clone());
 
     // our actual runner
     login_and_sync(config.homeserver_url, &config.username, &config.password).await?;
     Ok(())
+}
+
+/// Verify if the sender is on the allow_list
+fn is_allowed(sender: &str) -> bool {
+    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+    // FIXME: Check to see if it's from ourselves, in which case we should do nothing
+    if let Some(allow_list) = config.allow_list {
+        let regex = Regex::new(&allow_list).expect("Invalid regular expression");
+        return regex.is_match(sender);
+    }
+    false
 }
 
 // The core sync loop we have running.
@@ -118,6 +139,10 @@ async fn on_stripped_state_member(
         // the invite we've seen isn't for us, but for someone else. ignore
         return;
     }
+    if !is_allowed(room_member.sender.as_str()) {
+        // Sender is not on the allowlist
+        return;
+    }
 
     // The event handlers are called before the next sync begins, but
     // methods that change the state of a room (joining, leaving a room)
@@ -162,6 +187,10 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
     let MessageType::Text(text_content) = event.content.msgtype else {
         return;
     };
+    if !is_allowed(event.sender.as_str()) {
+        // Sender is not on the allowlist
+        return;
+    }
 
     // If we start with a single '!', interpret as a command
     let text = text_content.body.trim_start();
