@@ -2,21 +2,63 @@ use clap::Parser;
 use lazy_static::lazy_static;
 use matrix_sdk::{
     config::SyncSettings,
+    matrix_auth::MatrixSession,
     room::MessagesOptions,
-    ruma::events::room::{
-        member::StrippedRoomMemberEvent,
-        message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+    ruma::{
+        api::client::filter::FilterDefinition,
+        events::room::{
+            member::StrippedRoomMemberEvent,
+            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+        },
     },
-    Client, Room, RoomState,
+    Client, Error, LoopCtrl, Room, RoomState,
 };
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use regex::Regex;
-use serde::Deserialize;
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::{collections::HashMap, fs::File};
-use tokio::time::{sleep, Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+use tokio::{
+    fs,
+    time::{sleep, Duration},
+};
+
+/// The data needed to re-build a client.
+#[derive(Debug, Serialize, Deserialize)]
+struct ClientSession {
+    /// The URL of the homeserver of the user.
+    homeserver: String,
+
+    /// The path of the database.
+    db_path: PathBuf,
+
+    /// The passphrase of the database.
+    passphrase: String,
+}
+
+/// The full session to persist.
+#[derive(Debug, Serialize, Deserialize)]
+struct FullSession {
+    /// The data to re-build the client.
+    client_session: ClientSession,
+
+    /// The Matrix user session.
+    user_session: MatrixSession,
+
+    /// The latest sync token.
+    ///
+    /// It is only needed to persist it when using `Client::sync_once()` and we
+    /// want to make our syncs faster by not receiving all the initial sync
+    /// again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_token: Option<String>,
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -30,7 +72,7 @@ struct HeadJackArgs {
 struct Config {
     homeserver_url: String,
     username: String,
-    password: String,
+    password: Option<String>,
     /// Allow list of which accounts we will respond to
     allow_list: Option<String>,
     ollama: Option<HashMap<String, OllamaConfig>>,
@@ -61,8 +103,8 @@ async fn main() -> anyhow::Result<()> {
     // var `RUST_LOG`
     tracing_subscriber::fmt::init();
 
+    // Read in the config file
     let args = HeadJackArgs::parse();
-
     let mut file = File::open(args.config)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
@@ -70,8 +112,32 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_str(&contents)?;
     *GLOBAL_CONFIG.lock().unwrap() = Some(config.clone());
 
-    // our actual runner
-    login_and_sync(config.homeserver_url, &config.username, &config.password).await?;
+    // The folder containing the persisted data.
+    let data_dir = dirs::data_dir()
+        .expect("no data_dir directory found")
+        .join("headjack");
+    // The file where the session is persisted.
+    let session_file = data_dir.join("session");
+
+    let (client, sync_token) = if session_file.exists() {
+        restore_session(&session_file).await?
+    } else {
+        (
+            login(
+                &data_dir,
+                &session_file,
+                config.homeserver_url,
+                &config.username,
+                &config.password,
+            )
+            .await?,
+            None,
+        )
+    };
+
+    sync(client, sync_token, &session_file)
+        .await
+        .expect("Error syncing with the server");
     Ok(())
 }
 
@@ -86,58 +152,213 @@ fn is_allowed(sender: &str) -> bool {
     false
 }
 
-// The core sync loop we have running.
-async fn login_and_sync(
+/// Login with a new device.
+async fn login(
+    data_dir: &Path,
+    session_file: &Path,
     homeserver_url: String,
     username: &str,
-    password: &str,
-) -> anyhow::Result<()> {
-    // First, we set up the client.
+    password: &Option<String>,
+) -> anyhow::Result<Client> {
+    eprintln!("No previous session found, logging in…");
 
-    // Note that when encryption is enabled, you should use a persistent store to be
-    // able to restore the session with a working encryption setup.
-    // See the `persist_session` example.
+    let (client, client_session) = build_client(data_dir, homeserver_url).await?;
+    let matrix_auth = client.matrix_auth();
+
+    // If there's no password, ask for it
+    let password = match password {
+        Some(password) => password.clone(),
+        None => {
+            print!("Password: ");
+            io::stdout().flush().expect("Unable to write to stdout");
+            let mut password = String::new();
+            io::stdin()
+                .read_line(&mut password)
+                .expect("Unable to read user input");
+            password.trim().to_owned()
+        }
+    };
+
+    match matrix_auth
+        .login_username(username, &password)
+        .initial_device_display_name("headjack client")
+        .await
+    {
+        Ok(_) => {
+            eprintln!("Logged in as {username}");
+        }
+        Err(error) => {
+            eprintln!("Error logging in: {error}");
+            return Err(error.into());
+        }
+    }
+
+    // Persist the session to reuse it later.
+    let user_session = matrix_auth
+        .session()
+        .expect("A logged-in client should have a session");
+    let serialized_session = serde_json::to_string(&FullSession {
+        client_session,
+        user_session,
+        sync_token: None,
+    })?;
+    fs::write(session_file, serialized_session).await?;
+
+    eprintln!("Session persisted in {}", session_file.to_string_lossy());
+
+    Ok(client)
+}
+
+/// Build a new client.
+async fn build_client(
+    data_dir: &Path,
+    homeserver: String,
+) -> anyhow::Result<(Client, ClientSession)> {
+    let mut rng = thread_rng();
+
+    // Place the db into a subfolder, just in case multiple clients are running
+    let db_subfolder: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .take(7)
+        .map(char::from)
+        .collect();
+    let db_path = data_dir.join(db_subfolder);
+
+    // Generate a random passphrase.
+    // It will be saved in the session file and used to encrypt the database.
+    let passphrase: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+
+    match Client::builder()
+        .homeserver_url(&homeserver)
+        // We use the SQLite store, which is enabled by default. This is the crucial part to
+        // persist the encryption setup.
+        // Note that other store backends are available and you can even implement your own.
+        .sqlite_store(&db_path, Some(&passphrase))
+        .build()
+        .await
+    {
+        Ok(client) => Ok((
+            client,
+            ClientSession {
+                homeserver,
+                db_path,
+                passphrase,
+            },
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Restore a previous session.
+async fn restore_session(session_file: &Path) -> anyhow::Result<(Client, Option<String>)> {
+    eprintln!(
+        "Previous session found in '{}'",
+        session_file.to_string_lossy()
+    );
+
+    // The session was serialized as JSON in a file.
+    let serialized_session = fs::read_to_string(session_file).await?;
+    let FullSession {
+        client_session,
+        user_session,
+        sync_token,
+    } = serde_json::from_str(&serialized_session)?;
+
+    // Build the client with the previous settings from the session.
     let client = Client::builder()
-        // We use the convenient client builder to set our custom homeserver URL on it.
-        .homeserver_url(homeserver_url)
+        .homeserver_url(client_session.homeserver)
+        .sqlite_store(client_session.db_path, Some(&client_session.passphrase))
         .build()
         .await?;
 
-    // Then let's log that client in
-    client
-        .matrix_auth()
-        .login_username(username, password)
-        .initial_device_display_name("headjack-bot")
-        .await?;
+    eprintln!("Restoring session for {}…", &user_session.meta.user_id);
 
-    // It worked!
-    println!("logged in as {username}");
+    // Restore the Matrix user session.
+    client.restore_session(user_session).await?;
 
-    // Now, we want our client to react to invites. Invites sent us stripped member
-    // state events so we want to react to them. We add the event handler before
-    // the sync, so this happens also for older messages. All rooms we've
-    // already entered won't have stripped states anymore and thus won't fire
+    eprintln!("Done!");
+
+    Ok((client, sync_token))
+}
+
+/// Setup the client to listen to new messages.
+async fn sync(
+    client: Client,
+    _initial_sync_token: Option<String>,
+    session_file: &Path,
+) -> anyhow::Result<()> {
+    // Enable room members lazy-loading, it will speed up the initial sync a lot
+    // with accounts in lots of rooms.
+    // See <https://spec.matrix.org/v1.6/client-server-api/#lazy-loading-room-members>.
+    let filter = FilterDefinition::with_lazy_loading();
+
+    let mut sync_settings = SyncSettings::default().filter(filter.into());
+
+    // This setting syncs it _to_ the provided token.
+    // We would use this to respond to events that happened while we were offline.
+    // if let Some(sync_token) = initial_sync_token {
+    //     sync_settings = sync_settings.token(sync_token);
+    // }
+
+    // React to invites.
+    // We set this up before the initial sync_once so that we join rooms
+    // even if they were invited before the bot was started.
     client.add_event_handler(on_stripped_state_member);
 
-    // An initial sync to set up state and so our bot doesn't respond to old
-    // messages. If the `StateStore` finds saved state in the location given the
-    // initial sync will be skipped in favor of loading state from the store
-    let sync_token = client
-        .sync_once(SyncSettings::default())
-        .await
-        .unwrap()
-        .next_batch;
+    loop {
+        match client.sync_once(sync_settings.clone()).await {
+            Ok(response) => {
+                // This is the last time we need to provide this token, the sync method after
+                // will handle it on its own.
+                sync_settings = sync_settings.token(response.next_batch.clone());
+                persist_sync_token(session_file, response.next_batch).await?;
+                break;
+            }
+            Err(error) => {
+                eprintln!("An error occurred during initial sync: {error}");
+                eprintln!("Trying again…");
+            }
+        }
+    }
 
-    // now that we've synced, let's attach a handler for incoming room messages, so
-    // we can react on it
+    eprintln!("The client is ready! Listening to new messages…");
+
+    // Now that we've synced, let's attach a handler for incoming room messages.
     client.add_event_handler(on_room_message);
 
-    // since we called `sync_once` before we entered our sync loop we must pass
-    // that sync token to `sync`
-    let settings = SyncSettings::default().token(sync_token);
-    // this keeps state from the server streaming in to the bot via the
-    // EventHandler trait
-    client.sync(settings).await?; // this essentially loops until we kill the bot
+    // This loops until we kill the program or an error happens.
+    client
+        .sync_with_result_callback(sync_settings, |sync_result| async move {
+            let response = sync_result?;
+
+            // We persist the token each time to be able to restore our session
+            persist_sync_token(session_file, response.next_batch)
+                .await
+                .map_err(|err| Error::UnknownError(err.into()))?;
+
+            Ok(LoopCtrl::Continue)
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Persist the sync token for a future session.
+/// Note that this is needed only when using `sync_once`. Other sync methods get
+/// the sync token from the store.
+/// Note that the sync token is currently never actually used. It allows you to sync
+/// to where we left off and respond to missed messages, but we don't want to do that yet.
+async fn persist_sync_token(session_file: &Path, sync_token: String) -> anyhow::Result<()> {
+    let serialized_session = fs::read_to_string(session_file).await?;
+    let mut full_session: FullSession = serde_json::from_str(&serialized_session)?;
+
+    full_session.sync_token = Some(sync_token);
+    let serialized_session = serde_json::to_string(&full_session)?;
+    fs::write(session_file, serialized_session).await?;
 
     Ok(())
 }
@@ -157,13 +378,14 @@ async fn on_stripped_state_member(
         // Sender is not on the allowlist
         return;
     }
+    eprintln!("Received stripped room member event: {:?}", room_member);
 
     // The event handlers are called before the next sync begins, but
     // methods that change the state of a room (joining, leaving a room)
     // wait for the sync to return the new room state so we need to spawn
     // a new task for them.
     tokio::spawn(async move {
-        println!("Autojoining room {}", room.room_id());
+        eprintln!("Autojoining room {}", room.room_id());
         let mut delay = 2;
 
         while let Err(err) = room.join().await {
@@ -183,7 +405,7 @@ async fn on_stripped_state_member(
                 break;
             }
         }
-        println!("Successfully joined room {}", room.room_id());
+        eprintln!("Successfully joined room {}", room.room_id());
     });
 }
 
@@ -246,11 +468,12 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     room.send(content).await.unwrap();
                 }
                 _ => {
-                    println!("Unknown command");
+                    eprintln!("Unknown command");
                 }
             }
         }
     } else {
+        eprintln!("Received message: {}", text_content.body);
         // If it's not a command, we should send the full context without commands to the ollama server
         if let Ok(mut context) = get_context(&room).await {
             let prefix = format!("Here is the full text of our ongoing conversation. Your name is {}, and your messages are prefixed by {}:. My name is {}, and my messages are prefixed by {}:. Send the next response in this conversation. Do not prefix your response with your name or any other text. Do not greet me again if you've already done so. Send only the text of your response.\n",
@@ -274,9 +497,6 @@ async fn get_context(room: &Room) -> Result<String, ()> {
     let mut messages = Vec::new();
 
     let mut options = MessagesOptions::backward();
-
-    // FIXME: I think this doesn't work because we aren't saving the session
-    // It will only work for the messages in the current session
 
     while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
