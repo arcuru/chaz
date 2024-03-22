@@ -1041,7 +1041,6 @@ dependencies = [
  "dirs",
  "lazy_static",
  "matrix-sdk",
- "ollama-rs",
  "rand",
  "regex",
  "serde",
@@ -1756,17 +1755,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6a622008b6e321afc04970976f62ee297fdbaa6f95318ca343e3eebb9648441"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "ollama-rs"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ee48e21359d1a897e180d612319de5e348a9247629aefc1f73147d78b4b859c"
-dependencies = [
- "reqwest",
- "serde",
- "serde_json",
 ]
 
 [[package]]
