@@ -26,6 +26,7 @@ homeserver_url: https://matrix.org
 username: "headjack"
 password: "" # Optional, if not given it will ask for it on first run
 allow_list: "" # Regex for allowed accounts.
+aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 ```
 
 ## Running

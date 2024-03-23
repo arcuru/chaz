@@ -2,25 +2,34 @@ use std::process::Command;
 
 pub struct AiChat {
     binary_location: String,
+    config_dir: Option<String>,
 }
 
 impl Default for AiChat {
     fn default() -> Self {
-        AiChat::new("aichat".to_string())
+        AiChat::new("aichat".to_string(), None)
     }
 }
 
 impl AiChat {
-    pub fn new(binary_location: String) -> Self {
-        AiChat { binary_location }
+    pub fn new(binary_location: String, config_dir: Option<String>) -> Self {
+        AiChat {
+            binary_location,
+            config_dir,
+        }
     }
 
+    /// List the models available to the aichat binary
     pub fn list_models(&self) -> Vec<String> {
-        // Run the binary with the `list` argument
-        let output = Command::new(&self.binary_location)
-            .arg("--list-models")
-            .output()
-            .expect("Failed to execute command");
+        let mut command = Command::new(self.binary_location.clone());
+        command.arg("--list-models");
+
+        // Add the config dir if it exists
+        if let Some(config_dir) = &self.config_dir {
+            command.env("AICHAT_CONFIG_DIR", config_dir);
+        }
+
+        let output = command.output().expect("Failed to execute command");
 
         // split each line of the output into it's own string and return
         output
@@ -35,6 +44,9 @@ impl AiChat {
         let mut command = Command::new(&self.binary_location);
         if let Some(model) = model {
             command.arg("--model").arg(model);
+        }
+        if let Some(config_dir) = &self.config_dir {
+            command.env("AICHAT_CONFIG_DIR", config_dir);
         }
         command.arg("--").arg(prompt);
         eprintln!("Running command: {:?}", command);
