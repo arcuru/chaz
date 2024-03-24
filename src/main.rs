@@ -517,16 +517,19 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 "rename" => {
                     if let Ok((context, _)) = get_context(&room).await {
                         let title_prompt= [
-                            "Summarize this conversation in less than 20 characters to use as the title of this conversation.",
-                            "Do not reference names of participants in the conversation.",
-                            "You are only allowed to include the summary text in your response.",
-                            &context
-                        ].join("\n");
+                            &context,
+                            "\nUSER: Summarize this conversation in less than 20 characters to use as the title of this conversation. ",
+                            "The output should be a single line of text describing the conversation. ",
+                            "Do not output anything except for the summary text. ",
+                            "Only the first 20 characters will be used. ",
+                            "\nASSISTANT: ",
+                        ].join("");
                         let model = get_chat_summary_model();
 
                         let response = get_backend().execute(&model, title_prompt);
                         if let Ok(result) = response {
-                            let result = result.chars().take(20).collect::<String>();
+                            eprintln!("Result: {}", result);
+                            let result = clean_summary_response(&result, 20);
                             if room.set_name(result).await.is_err() {
                                 room.send(RoomMessageEventContent::text_plain(
                                     ".error - I don't have permission to rename the room",
@@ -540,14 +543,18 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         }
 
                         let topic_prompt = [
-                            "Summarize this conversation in less than 50 characters to use as the descriptive topic of this conversation.",
-                            "Do not reference names of participants in the conversation.",
-                            "You are only allowed to include the summary text in your response.",
-                            &context
-                        ].join("\n");
+                            &context,
+                            "\nUSER: Summarize this conversation in less than 50 characters. ",
+                            "Do not output anything except for the summary text. ",
+                            "Only the first 50 characters will be used. ",
+                            "\nASSISTANT: ",
+                        ]
+                        .join("");
 
                         let response = get_backend().execute(&model, topic_prompt);
                         if let Ok(result) = response {
+                            eprintln!("Result: {}", result);
+                            let result = clean_summary_response(&result, 50);
                             if room.set_room_topic(&result).await.is_err() {
                                 room.send(RoomMessageEventContent::text_plain(
                                     ".error - I don't have permission to set the topic",
@@ -564,12 +571,11 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
             }
         }
     } else {
-        eprintln!("Received message: {}", text_content.body);
         // If it's not a command, we should send the full context without commands to the server
         if let Ok((mut context, model)) = get_context(&room).await {
-            let prefix = format!("Here is the full text of our ongoing conversation. Your name is {}, and your messages are prefixed by {}:. My name is {}, and my messages are prefixed by {}:. Send the next response in this conversation. Do not prefix your response with your name or any other text. Do not greet me again if you've already done so. Send only the text of your response.\n",
-                        room.client().user_id().unwrap(), room.client().user_id().unwrap(), event.sender, event.sender);
-            context.insert_str(0, &prefix);
+            // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
+            context.push_str("ASSISTANT: ");
+
             if let Ok(result) = get_backend().execute(&model, context) {
                 let content = RoomMessageEventContent::text_plain(result);
                 room.send(content).await.unwrap();
@@ -586,6 +592,24 @@ fn is_command(text: &str) -> bool {
 fn get_backend() -> AiChat {
     let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
     AiChat::new("aichat".to_string(), config.aichat_config_dir.clone())
+}
+
+/// Try to clean up the response from the model containing a summary
+/// Sometimes the models will return extra info, so we want to clean it if possible
+fn clean_summary_response(response: &str, max_length: usize) -> String {
+    let response = {
+        // Try to clean the response
+        // Should look for the first quoted string
+        let re = Regex::new(r#""([^"]*)""#).unwrap();
+        // If there are any matches, return the first one
+        if let Some(caps) = re.captures(response) {
+            caps.get(1).map_or("", |m| m.as_str())
+        } else {
+            response
+        }
+    };
+    let response = response.chars().take(max_length).collect::<String>();
+    response
 }
 
 /// Get the chat summary model from the global config
@@ -632,7 +656,14 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>), ()> {
                     }
                     // Push the sender and message to the front of the string
 
-                    messages.push(format!("{}: {}\n", sender.unwrap(), text_content.body));
+                    let sender = sender.unwrap_or("".to_string());
+                    if sender == room.client().user_id().unwrap().as_str() {
+                        // If the sender is the bot, prefix the message with "ASSISTANT: "
+                        messages.push(format!("ASSISTANT: {}\n", text_content.body));
+                    } else {
+                        // Otherwise, prefix the message with "USER: "
+                        messages.push(format!("USER: {}\n", text_content.body));
+                    }
                 }
             }
         }
