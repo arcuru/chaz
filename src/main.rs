@@ -80,6 +80,9 @@ struct Config {
     /// Set the config directory for aichat
     /// Allows for multiple instances setups of aichat
     aichat_config_dir: Option<String>,
+    /// Model to use for summarizing chats
+    /// Used for setting the room name/topic
+    chat_summary_model: Option<String>,
 }
 
 lazy_static! {
@@ -438,7 +441,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     // But we need to read the context to figure out the model to use
                     let (_, model) = get_context(&room).await.unwrap();
 
-                    if let Ok(result) = get_backend().execute(model, input.to_string()) {
+                    if let Ok(result) = get_backend().execute(&model, input.to_string()) {
                         // Add the prefix ".response:\n" to the result
                         // That way we can identify our own responses and ignore them for context
                         let result = format!(".response:\n{}", result);
@@ -459,6 +462,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                             "- .help - Print this message",
                             "- .list - List available models",
                             "- .model <model> - Select a model to use",
+                            "- .rename - Rename the room and set the topic based on the chat content",
                         ]
                         .join("\n"),
                     );
@@ -510,6 +514,50 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         .await
                         .unwrap();
                 }
+                "rename" => {
+                    if let Ok((context, _)) = get_context(&room).await {
+                        let title_prompt= [
+                            "Summarize this conversation in less than 20 characters to use as the title of this conversation.",
+                            "Do not reference names of participants in the conversation.",
+                            "You are only allowed to include the summary text in your response.",
+                            &context
+                        ].join("\n");
+                        let model = get_chat_summary_model();
+
+                        let response = get_backend().execute(&model, title_prompt);
+                        if let Ok(result) = response {
+                            let result = result.chars().take(20).collect::<String>();
+                            if room.set_name(result).await.is_err() {
+                                room.send(RoomMessageEventContent::text_plain(
+                                    ".error - I don't have permission to rename the room",
+                                ))
+                                .await
+                                .unwrap();
+
+                                // If we can't set the name, we can't set the topic either
+                                return;
+                            }
+                        }
+
+                        let topic_prompt = [
+                            "Summarize this conversation in less than 50 characters to use as the descriptive topic of this conversation.",
+                            "Do not reference names of participants in the conversation.",
+                            "You are only allowed to include the summary text in your response.",
+                            &context
+                        ].join("\n");
+
+                        let response = get_backend().execute(&model, topic_prompt);
+                        if let Ok(result) = response {
+                            if room.set_room_topic(&result).await.is_err() {
+                                room.send(RoomMessageEventContent::text_plain(
+                                    ".error - I don't have permission to set the topic",
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                        }
+                    }
+                }
                 _ => {
                     eprintln!(".error - Unknown command");
                 }
@@ -517,12 +565,12 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
         }
     } else {
         eprintln!("Received message: {}", text_content.body);
-        // If it's not a command, we should send the full context without commands to the ollama server
+        // If it's not a command, we should send the full context without commands to the server
         if let Ok((mut context, model)) = get_context(&room).await {
             let prefix = format!("Here is the full text of our ongoing conversation. Your name is {}, and your messages are prefixed by {}:. My name is {}, and my messages are prefixed by {}:. Send the next response in this conversation. Do not prefix your response with your name or any other text. Do not greet me again if you've already done so. Send only the text of your response.\n",
                         room.client().user_id().unwrap(), room.client().user_id().unwrap(), event.sender, event.sender);
             context.insert_str(0, &prefix);
-            if let Ok(result) = get_backend().execute(model, context) {
+            if let Ok(result) = get_backend().execute(&model, context) {
                 let content = RoomMessageEventContent::text_plain(result);
                 room.send(content).await.unwrap();
             }
@@ -538,6 +586,12 @@ fn is_command(text: &str) -> bool {
 fn get_backend() -> AiChat {
     let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
     AiChat::new("aichat".to_string(), config.aichat_config_dir.clone())
+}
+
+/// Get the chat summary model from the global config
+fn get_chat_summary_model() -> Option<String> {
+    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+    config.chat_summary_model
 }
 
 /// Gets the context of the current conversation

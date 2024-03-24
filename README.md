@@ -27,6 +27,7 @@ username: "headjack"
 password: "" # Optional, if not given it will ask for it on first run
 allow_list: "" # Regex for allowed accounts.
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
+chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
 ```
 
 ## Running

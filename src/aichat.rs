@@ -40,7 +40,7 @@ impl AiChat {
             .collect()
     }
 
-    pub fn execute(&self, model: Option<String>, prompt: String) -> Result<String, ()> {
+    pub fn execute(&self, model: &Option<String>, prompt: String) -> Result<String, ()> {
         let mut command = Command::new(&self.binary_location);
         if let Some(model) = model {
             command.arg("--model").arg(model);
