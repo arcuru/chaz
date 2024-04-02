@@ -484,13 +484,13 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         let models = get_backend().list_models();
                         if models.contains(&model.to_string()) {
                             // Set the model
-                            let response = format!(".model: set to {}", model);
+                            let response = format!(".model: Set to \"{}\"", model);
                             room.send(RoomMessageEventContent::text_plain(response))
                                 .await
                                 .unwrap();
                         } else {
                             let response = format!(
-                                ".error: {} not found.\n\nAvailable models:\n{}",
+                                ".error: Model \"{}\" not found.\n\nAvailable models:\n{}",
                                 model,
                                 models.join("\n")
                             );
@@ -502,8 +502,8 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         // No argument, so we'll print the model list
                         let (_, current_model) = get_context(&room).await.unwrap();
                         let response = format!(
-                            ".models:\n\ncurrent: {}\n\navailable:\n\n{}",
-                            current_model.unwrap_or("default".to_string()),
+                            ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
+                            current_model.unwrap_or(get_backend().default_model()),
                             get_backend().list_models().join("\n")
                         );
                         room.send(RoomMessageEventContent::text_plain(response))
@@ -514,8 +514,8 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 "list" => {
                     let (_, current_model) = get_context(&room).await.unwrap();
                     let response = format!(
-                        ".models:\n\ncurrent: {}\n\navailable:\n{}",
-                        current_model.unwrap_or("default".to_string()),
+                        ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
+                        current_model.unwrap_or(get_backend().default_model()),
                         get_backend().list_models().join("\n")
                     );
                     room.send(RoomMessageEventContent::text_plain(response))
