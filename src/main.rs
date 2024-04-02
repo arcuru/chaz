@@ -6,6 +6,7 @@ use lazy_static::lazy_static;
 use matrix_sdk::{
     config::SyncSettings,
     matrix_auth::MatrixSession,
+    media::{MediaFileHandle, MediaFormat, MediaRequest},
     room::MessagesOptions,
     ruma::{
         api::client::filter::FilterDefinition,
@@ -439,9 +440,10 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     let input = text_content.body.trim_start_matches(".send").trim();
 
                     // But we need to read the context to figure out the model to use
-                    let (_, model) = get_context(&room).await.unwrap();
+                    let (_, model, _) = get_context(&room).await.unwrap();
 
-                    if let Ok(result) = get_backend().execute(&model, input.to_string()) {
+                    if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new())
+                    {
                         // Add the prefix ".response:\n" to the result
                         // That way we can identify our own responses and ignore them for context
                         let result = format!(".response:\n{}", result);
@@ -471,7 +473,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 }
                 "print" => {
                     // Prints the full context back to the room
-                    let (mut context, _) = get_context(&room).await.unwrap();
+                    let (mut context, _, _) = get_context(&room).await.unwrap();
                     context.insert_str(0, ".context\n");
                     let content = RoomMessageEventContent::text_plain(context);
                     room.send(content).await.unwrap();
@@ -500,7 +502,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         }
                     } else {
                         // No argument, so we'll print the model list
-                        let (_, current_model) = get_context(&room).await.unwrap();
+                        let (_, current_model, _) = get_context(&room).await.unwrap();
                         let response = format!(
                             ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
                             current_model.unwrap_or(get_backend().default_model()),
@@ -512,7 +514,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     }
                 }
                 "list" => {
-                    let (_, current_model) = get_context(&room).await.unwrap();
+                    let (_, current_model, _) = get_context(&room).await.unwrap();
                     let response = format!(
                         ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
                         current_model.unwrap_or(get_backend().default_model()),
@@ -530,7 +532,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     .unwrap();
                 }
                 "rename" => {
-                    if let Ok((context, _)) = get_context(&room).await {
+                    if let Ok((context, _, _)) = get_context(&room).await {
                         let title_prompt= [
                             &context,
                             "\nUSER: Summarize this conversation in less than 20 characters to use as the title of this conversation. ",
@@ -541,7 +543,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         ].join("");
                         let model = get_chat_summary_model();
 
-                        let response = get_backend().execute(&model, title_prompt);
+                        let response = get_backend().execute(&model, title_prompt, Vec::new());
                         if let Ok(result) = response {
                             eprintln!("Result: {}", result);
                             let result = clean_summary_response(&result, None);
@@ -566,7 +568,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         ]
                         .join("");
 
-                        let response = get_backend().execute(&model, topic_prompt);
+                        let response = get_backend().execute(&model, topic_prompt, Vec::new());
                         if let Ok(result) = response {
                             eprintln!("Result: {}", result);
                             let result = clean_summary_response(&result, None);
@@ -587,12 +589,16 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
         }
     } else {
         // If it's not a command, we should send the full context without commands to the server
-        if let Ok((mut context, model)) = get_context(&room).await {
+        if let Ok((mut context, model, media)) = get_context(&room).await {
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
             context.push_str("ASSISTANT: ");
 
-            if let Ok(result) = get_backend().execute(&model, context) {
-                let content = RoomMessageEventContent::text_plain(result);
+            if let Ok(result) = get_backend().execute(&model, context, media) {
+                let content = if result.is_empty() {
+                    RoomMessageEventContent::text_plain(".error: No response")
+                } else {
+                    RoomMessageEventContent::text_plain(result)
+                };
                 room.send(content).await.unwrap();
             }
         }
@@ -637,12 +643,13 @@ fn get_chat_summary_model() -> Option<String> {
 
 /// Gets the context of the current conversation
 /// Returns a model if it was ever entered
-async fn get_context(room: &Room) -> Result<(String, Option<String>), ()> {
+async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFileHandle>), ()> {
     // Read all the messages in the room, place them into a single string, and print them out
     let mut messages = Vec::new();
 
     let mut options = MessagesOptions::backward();
     let mut model_response = None;
+    let mut media = Vec::new();
 
     'outer: while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
@@ -654,6 +661,29 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>), ()> {
                     continue;
                 };
                 if let Some(content) = content {
+                    if let MessageType::Image(image_content) = &content.msgtype {
+                        let request = MediaRequest {
+                            source: image_content.source.clone(),
+                            format: MediaFormat::File,
+                        };
+                        let mime = image_content
+                            .info
+                            .as_ref()
+                            .unwrap()
+                            .mimetype
+                            .clone()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        let x = room
+                            .client()
+                            .media()
+                            .get_media_file(&request, None, &mime, true, None)
+                            .await
+                            .unwrap();
+                        media.insert(0, x);
+                        continue;
+                    }
                     let MessageType::Text(text_content) = content.msgtype else {
                         continue;
                     };
@@ -698,5 +728,6 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>), ()> {
     Ok((
         messages.into_iter().rev().collect::<String>(),
         model_response,
+        media,
     ))
 }

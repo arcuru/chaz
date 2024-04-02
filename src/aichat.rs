@@ -64,7 +64,12 @@ impl AiChat {
             .unwrap_or("default".to_string())
     }
 
-    pub fn execute(&self, model: &Option<String>, prompt: String) -> Result<String, ()> {
+    pub fn execute(
+        &self,
+        model: &Option<String>,
+        prompt: String,
+        media: Vec<matrix_sdk::media::MediaFileHandle>,
+    ) -> Result<String, ()> {
         let mut command = Command::new(&self.binary_location);
         if let Some(model) = model {
             command.arg("--model").arg(model);
@@ -72,10 +77,20 @@ impl AiChat {
         if let Some(config_dir) = &self.config_dir {
             command.env("AICHAT_CONFIG_DIR", config_dir);
         }
+        // For each media file, add the media flag and the path to the file
+        // Note that we must not consume the media files, the handles need to persist until the command is finished
+        if !media.is_empty() {
+            command.arg("--file");
+            for media_file in &media {
+                command.arg(media_file.path());
+            }
+        }
         command.arg("--").arg(prompt);
         eprintln!("Running command: {:?}", command);
 
         let output = command.output().expect("Failed to execute command");
+
+        eprintln!("Output: {:?}", output);
 
         // return the output as a string
         String::from_utf8(output.stdout).map_err(|_| ())
