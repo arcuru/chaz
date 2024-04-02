@@ -56,7 +56,9 @@
       # place them here if they would otherwise show up in multiple places
       commonArgs = {
         inherit src cargoArtifacts;
-        nativeBuildInputs = with pkgs; [pkg-config];
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+        ];
         buildInputs = with pkgs; [
           openssl
           sqlite
@@ -67,18 +69,20 @@
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
       # Build the actual crate itself, reusing the cargoArtifacts
-      headjack = craneLib.buildPackage commonArgs;
+      headjack-unwrapped = craneLib.buildPackage commonArgs;
     in {
       checks =
         {
-          # Build the crate as part of `nix flake check` for convenience
-          inherit headjack;
+          # Build the final package as part of `nix flake check` for convenience
+          inherit (self.packages.${system}) headjack;
 
           # Run clippy (and deny all warnings) on the crate source
-          headjack-clippy = craneLib.cargoClippy (commonArgs
-            // {
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-            });
+          headjack-clippy =
+            craneLib.cargoClippy
+            (commonArgs
+              // {
+                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+              });
 
           # Check docs build successfully
           headjack-doc = craneLib.cargoDoc commonArgs;
@@ -114,9 +118,24 @@
           };
         };
 
-      packages = {
+      packages = rec {
+        inherit headjack-unwrapped;
+        # Wrap headjack to include the path to aichat
+        headjack =
+          pkgs.runCommand headjack-unwrapped.name {
+            inherit (headjack-unwrapped) pname version;
+            nativeBuildInputs = [
+              pkgs.makeWrapper
+            ];
+          } ''
+            mkdir -p $out/bin
+            cp ${headjack-unwrapped}/bin/headjack $out/bin
+            wrapProgram $out/bin/headjack \
+              --prefix PATH : ${lib.makeBinPath [
+              pkgs.aichat
+            ]}
+          '';
         default = headjack;
-        headjack = headjack;
       };
 
       apps = rec {
@@ -162,5 +181,6 @@
       overlays.default = final: prev: {
         headjack = self.packages.${final.system}.headjack;
       };
+      homeManagerModules.default = import ./nix/home-manager.nix;
     };
 }

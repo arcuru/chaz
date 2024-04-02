@@ -11,7 +11,9 @@ You will need your own API keys or your own local AI already configured.
 
 ## Install
 
-This is not packaged anywhere, so you'll have to clone and install it yourself.
+`headjack` is only packaged on crates.io, but it's recommended that you run from git HEAD for now.
+
+For [Nix](https://nixos.org/) users, this repo contains a Nix flake. See the [setup section](#nix) for details on configuring.
 
 ## Setup
 
@@ -28,6 +30,42 @@ password: "" # Optional, if not given it will ask for it on first run
 allow_list: "" # Regex for allowed accounts.
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
+```
+
+### Nix
+
+Development is being done using a [Nix flake](https://nixos.wiki/wiki/Flakes).
+The easiest way to install headjack is to use nix flakes.
+
+```bash
+❯ nix run github:arcuru/headjack
+```
+
+The flake contains an [overlay](https://nixos.wiki/wiki/Overlays) to make it easier to import into your own flake config.
+To use, add it to your inputs:
+
+```nix
+    inputs.headjack.url = "github:arcuru/headjack";
+```
+
+And then add the overlay `inputs.headjack.overlays.default` to your pkgs.
+
+The flake also contains a home-manager module for installing headjack as a service.
+Import the module into your home-manager config and you can configure `headjack` all from within nix:
+
+```nix
+{inputs, ... }: {
+  imports = [ inputs.headjack.homeManagerModules.default ];
+  services.headjack = {
+    enable = true;
+    settings = {
+        homeserver_url = "https://matrix.org";
+        username = "headjack";
+        password = "hunter2";
+        allow_list = "@me:matrix.org|@myfriend:matrix.org";
+    };
+  };
+}
 ```
 
 ## Running
