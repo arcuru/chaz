@@ -544,7 +544,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         let response = get_backend().execute(&model, title_prompt);
                         if let Ok(result) = response {
                             eprintln!("Result: {}", result);
-                            let result = clean_summary_response(&result, 20);
+                            let result = clean_summary_response(&result, None);
                             if room.set_name(result).await.is_err() {
                                 room.send(RoomMessageEventContent::text_plain(
                                     ".error - I don't have permission to rename the room",
@@ -561,7 +561,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                             &context,
                             "\nUSER: Summarize this conversation in less than 50 characters. ",
                             "Do not output anything except for the summary text. ",
-                            "Only the first 50 characters will be used. ",
+                            "Do not include any commentary or context, only the summary. ",
                             "\nASSISTANT: ",
                         ]
                         .join("");
@@ -569,7 +569,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         let response = get_backend().execute(&model, topic_prompt);
                         if let Ok(result) = response {
                             eprintln!("Result: {}", result);
-                            let result = clean_summary_response(&result, 50);
+                            let result = clean_summary_response(&result, None);
                             if room.set_room_topic(&result).await.is_err() {
                                 room.send(RoomMessageEventContent::text_plain(
                                     ".error: I don't have permission to set the topic",
@@ -611,7 +611,7 @@ fn get_backend() -> AiChat {
 
 /// Try to clean up the response from the model containing a summary
 /// Sometimes the models will return extra info, so we want to clean it if possible
-fn clean_summary_response(response: &str, max_length: usize) -> String {
+fn clean_summary_response(response: &str, max_length: Option<usize>) -> String {
     let response = {
         // Try to clean the response
         // Should look for the first quoted string
@@ -623,8 +623,10 @@ fn clean_summary_response(response: &str, max_length: usize) -> String {
             response
         }
     };
-    let response = response.chars().take(max_length).collect::<String>();
-    response
+    if let Some(max_length) = max_length {
+        return response.chars().take(max_length).collect::<String>();
+    }
+    response.to_string()
 }
 
 /// Get the chat summary model from the global config
