@@ -484,13 +484,13 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                         let models = get_backend().list_models();
                         if models.contains(&model.to_string()) {
                             // Set the model
-                            let response = format!(".model set to {}", model);
+                            let response = format!(".model: set to {}", model);
                             room.send(RoomMessageEventContent::text_plain(response))
                                 .await
                                 .unwrap();
                         } else {
                             let response = format!(
-                                ".model {} not found. Available models:\n\n{}",
+                                ".error: {} not found.\n\nAvailable models:\n{}",
                                 model,
                                 models.join("\n")
                             );
@@ -499,16 +499,23 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                                 .unwrap();
                         }
                     } else {
-                        room.send(RoomMessageEventContent::text_plain(
-                            ".error - must choose a model",
-                        ))
-                        .await
-                        .unwrap();
+                        // No argument, so we'll print the model list
+                        let (_, current_model) = get_context(&room).await.unwrap();
+                        let response = format!(
+                            ".models:\n\ncurrent: {}\n\navailable:\n\n{}",
+                            current_model.unwrap_or("default".to_string()),
+                            get_backend().list_models().join("\n")
+                        );
+                        room.send(RoomMessageEventContent::text_plain(response))
+                            .await
+                            .unwrap();
                     }
                 }
                 "list" => {
+                    let (_, current_model) = get_context(&room).await.unwrap();
                     let response = format!(
-                        ".models available:\n\n{}",
+                        ".models:\n\ncurrent: {}\n\navailable:\n{}",
+                        current_model.unwrap_or("default".to_string()),
                         get_backend().list_models().join("\n")
                     );
                     room.send(RoomMessageEventContent::text_plain(response))
@@ -517,7 +524,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 }
                 "clear" => {
                     room.send(RoomMessageEventContent::text_plain(
-                        ".clear - All messages before this will be ignored",
+                        ".clear: All messages before this will be ignored",
                     ))
                     .await
                     .unwrap();
@@ -565,7 +572,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                             let result = clean_summary_response(&result, 50);
                             if room.set_room_topic(&result).await.is_err() {
                                 room.send(RoomMessageEventContent::text_plain(
-                                    ".error - I don't have permission to set the topic",
+                                    ".error: I don't have permission to set the topic",
                                 ))
                                 .await
                                 .unwrap();
@@ -574,7 +581,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     }
                 }
                 _ => {
-                    eprintln!(".error - Unknown command");
+                    eprintln!(".error: Unknown command");
                 }
             }
         }
