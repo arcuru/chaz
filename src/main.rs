@@ -461,6 +461,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                             "- .print - Print the full context of the conversation",
                             "- .help - Print this message",
                             "- .list - List available models",
+                            "- .clear - Clear all messages before this point",
                             "- .model <model> - Select a model to use",
                             "- .rename - Rename the room and set the topic based on the chat content",
                         ]
@@ -513,6 +514,13 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     room.send(RoomMessageEventContent::text_plain(response))
                         .await
                         .unwrap();
+                }
+                "clear" => {
+                    room.send(RoomMessageEventContent::text_plain(
+                        ".clear - All messages before this will be ignored",
+                    ))
+                    .await
+                    .unwrap();
                 }
                 "rename" => {
                     if let Ok((context, _)) = get_context(&room).await {
@@ -627,7 +635,7 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>), ()> {
     let mut options = MessagesOptions::backward();
     let mut model_response = None;
 
-    while let Ok(batch) = room.messages(options).await {
+    'outer: while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
             if let Ok(content) = message
                 .event
@@ -651,6 +659,10 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>), ()> {
                                     model_response = Some(model.to_string());
                                 }
                             }
+                        }
+                        // if the message was a clear command, we are finished
+                        if text_content.body.starts_with(".clear") {
+                            break 'outer;
                         }
                         continue;
                     }
