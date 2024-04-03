@@ -142,6 +142,8 @@
               pkgs.aichat-git
             ]}
           '';
+        # Expose this for use by any downstream users
+        aichat-git = pkgs.aichat-git;
         default = headjack;
       };
 
