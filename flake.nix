@@ -36,6 +36,13 @@
     inputs.flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import inputs.nixpkgs {
         inherit system;
+        overlays = [
+          (_: prev: {
+            aichat-git = import ./nix/aichat-git.nix {
+              inherit (prev) lib stdenv darwin rustPlatform fetchFromGitHub pkg-config;
+            };
+          })
+        ];
       };
 
       inherit (pkgs) lib;
@@ -132,7 +139,7 @@
             cp ${headjack-unwrapped}/bin/headjack $out/bin
             wrapProgram $out/bin/headjack \
               --prefix PATH : ${lib.makeBinPath [
-              pkgs.aichat
+              pkgs.aichat-git
             ]}
           '';
         default = headjack;
