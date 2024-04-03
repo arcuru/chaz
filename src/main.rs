@@ -78,6 +78,9 @@ struct Config {
     password: Option<String>,
     /// Allow list of which accounts we will respond to
     allow_list: Option<String>,
+    /// Set the state directory for headjack
+    /// Defaults to $XDG_STATE_HOME/headjack
+    state_dir: Option<String>,
     /// Set the config directory for aichat
     /// Allows for multiple instances setups of aichat
     aichat_config_dir: Option<String>,
@@ -106,18 +109,23 @@ async fn main() -> anyhow::Result<()> {
     *GLOBAL_CONFIG.lock().unwrap() = Some(config.clone());
 
     // The folder containing the persisted data.
-    let data_dir = dirs::data_dir()
-        .expect("no data_dir directory found")
-        .join("headjack");
+    let state_dir = if let Some(state_dir) = &config.state_dir {
+        PathBuf::from(state_dir)
+    } else {
+        dirs::state_dir()
+            .expect("no state_dir directory found")
+            .join("headjack")
+    };
+
     // The file where the session is persisted.
-    let session_file = data_dir.join("session");
+    let session_file = state_dir.join("session");
 
     let (client, sync_token) = if session_file.exists() {
         restore_session(&session_file).await?
     } else {
         (
             login(
-                &data_dir,
+                &state_dir,
                 &session_file,
                 config.homeserver_url,
                 &config.username,
@@ -147,7 +155,7 @@ fn is_allowed(sender: &str) -> bool {
 
 /// Login with a new device.
 async fn login(
-    data_dir: &Path,
+    state_dir: &Path,
     session_file: &Path,
     homeserver_url: String,
     username: &str,
@@ -155,7 +163,7 @@ async fn login(
 ) -> anyhow::Result<Client> {
     eprintln!("No previous session found, logging in…");
 
-    let (client, client_session) = build_client(data_dir, homeserver_url).await?;
+    let (client, client_session) = build_client(state_dir, homeserver_url).await?;
     let matrix_auth = client.matrix_auth();
 
     // If there's no password, ask for it
@@ -204,7 +212,7 @@ async fn login(
 
 /// Build a new client.
 async fn build_client(
-    data_dir: &Path,
+    state_dir: &Path,
     homeserver: String,
 ) -> anyhow::Result<(Client, ClientSession)> {
     let mut rng = thread_rng();
@@ -215,7 +223,7 @@ async fn build_client(
         .take(7)
         .map(char::from)
         .collect();
-    let db_path = data_dir.join(db_subfolder);
+    let db_path = state_dir.join(db_subfolder);
 
     // Generate a random passphrase.
     // It will be saved in the session file and used to encrypt the database.

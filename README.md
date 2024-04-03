@@ -28,6 +28,7 @@ homeserver_url: https://matrix.org
 username: "headjack"
 password: "" # Optional, if not given it will ask for it on first run
 allow_list: "" # Regex for allowed accounts.
+state_dir: "$XDG_STATE_HOME/headjack" # Optional, for setting the headjack state directory
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
 ```
