@@ -652,6 +652,7 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
     let mut media = Vec::new();
 
     'outer: while let Ok(batch) = room.messages(options).await {
+        // This assumes that the messages are in reverse order
         for message in batch.chunk {
             if let Ok(content) = message
                 .event
@@ -689,7 +690,7 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                     };
                     if is_command(&text_content.body) {
                         // if the message is a valid model command, set the model
-                        if text_content.body.starts_with(".model") {
+                        if text_content.body.starts_with(".model") && model_response.is_none() {
                             let model = text_content.body.split_whitespace().nth(1);
                             if let Some(model) = model {
                                 // Add the config_dir from the global config
@@ -703,10 +704,10 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                         if text_content.body.starts_with(".clear") {
                             break 'outer;
                         }
+                        // Ignore other commands
                         continue;
                     }
                     // Push the sender and message to the front of the string
-
                     let sender = sender.unwrap_or("".to_string());
                     if sender == room.client().user_id().unwrap().as_str() {
                         // If the sender is the bot, prefix the message with "ASSISTANT: "
