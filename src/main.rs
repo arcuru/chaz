@@ -454,10 +454,9 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     room.send(content).await.unwrap();
                 }
                 "send" => {
-                    // Send just this message with no context
                     let input = text_content.body.trim_start_matches(".send").trim();
 
-                    // But we need to read the context to figure out the model to use
+                    // But we do need to read the context to figure out the model to use
                     let (_, model, _) = get_context(&room).await.unwrap();
 
                     if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new())
@@ -491,7 +490,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 "print" => {
                     // Prints the full context back to the room
                     let (mut context, _, _) = get_context(&room).await.unwrap();
-                    context.insert_str(0, ".context\n");
+                    context.insert_str(0, ".context:\n");
                     let content = RoomMessageEventContent::text_plain(context);
                     room.send(content).await.unwrap();
                 }
@@ -566,7 +565,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                             let result = clean_summary_response(&result, None);
                             if room.set_name(result).await.is_err() {
                                 room.send(RoomMessageEventContent::text_plain(
-                                    ".error - I don't have permission to rename the room",
+                                    ".error: I don't have permission to rename the room",
                                 ))
                                 .await
                                 .unwrap();
@@ -617,11 +616,16 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     RoomMessageEventContent::text_plain(result)
                 };
                 room.send(content).await.unwrap();
+            } else {
+                room.send(RoomMessageEventContent::text_plain(".error: Failed to generate response"))
+                    .await
+                    .unwrap();
             }
         }
     }
 }
 
+/// Check if the message is a command
 fn is_command(text: &str) -> bool {
     text.starts_with('.') && !text.starts_with("..")
 }
