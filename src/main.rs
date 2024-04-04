@@ -1,66 +1,18 @@
 mod aichat;
 use aichat::AiChat;
+use headjack::*;
 
 use clap::Parser;
 use lazy_static::lazy_static;
 use matrix_sdk::{
-    config::SyncSettings,
-    matrix_auth::MatrixSession,
     media::{MediaFileHandle, MediaFormat, MediaRequest},
     room::MessagesOptions,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::room::{
-            member::StrippedRoomMemberEvent,
-            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
-        },
-    },
-    Client, Error, LoopCtrl, Room, RoomState,
+    ruma::events::room::message::{MessageType, RoomMessageEventContent},
+    Room,
 };
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
-use tokio::{
-    fs,
-    time::{sleep, Duration},
-};
-
-/// The data needed to re-build a client.
-#[derive(Debug, Serialize, Deserialize)]
-struct ClientSession {
-    /// The URL of the homeserver of the user.
-    homeserver: String,
-
-    /// The path of the database.
-    db_path: PathBuf,
-
-    /// The passphrase of the database.
-    passphrase: String,
-}
-
-/// The full session to persist.
-#[derive(Debug, Serialize, Deserialize)]
-struct FullSession {
-    /// The data to re-build the client.
-    client_session: ClientSession,
-
-    /// The Matrix user session.
-    user_session: MatrixSession,
-
-    /// The latest sync token.
-    ///
-    /// It is only needed to persist it when using `Client::sync_once()` and we
-    /// want to make our syncs faster by not receiving all the initial sync
-    /// again.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sync_token: Option<String>,
-}
+use serde::Deserialize;
+use std::{fs::File, io::Read, path::PathBuf, sync::Mutex};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -95,8 +47,6 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // set up some simple stderr logging. You can configure it by changing the env
-    // var `RUST_LOG`
     tracing_subscriber::fmt::init();
 
     // Read in the config file
@@ -108,502 +58,126 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_str(&contents)?;
     *GLOBAL_CONFIG.lock().unwrap() = Some(config.clone());
 
-    // The folder containing the persisted data.
-    let state_dir = if let Some(state_dir) = &config.state_dir {
-        PathBuf::from(expand_tilde(state_dir))
-    } else {
-        dirs::state_dir()
-            .expect("no state_dir directory found")
-            .join("headjack")
-    };
+    // The config file is read, now we can start the bot
+    let mut bot = Bot::new(BotConfig {
+        login: Login {
+            homeserver_url: config.homeserver_url,
+            username: config.username.clone(),
+            password: config.password,
+        },
+        name: Some(config.username.clone()),
+        allow_list: config.allow_list,
+        state_dir: config.state_dir,
+    })
+    .await;
 
-    // The file where the session is persisted.
-    let session_file = state_dir.join("session");
-
-    let (client, sync_token) = if session_file.exists() {
-        restore_session(&session_file).await?
-    } else {
-        (
-            login(
-                &state_dir,
-                &session_file,
-                config.homeserver_url,
-                &config.username,
-                &config.password,
-            )
-            .await?,
-            None,
-        )
-    };
-
-    sync(client, sync_token, &session_file)
-        .await
-        .expect("Error syncing with the server");
-    Ok(())
-}
-
-/// Fixup the path if they've provided a ~
-fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home_dir) = dirs::home_dir() {
-            let without_tilde = &path[1..]; // Remove the '~' and keep the rest of the path
-            return home_dir.display().to_string() + without_tilde;
-        }
+    if let Err(e) = bot.login().await {
+        eprintln!("Error logging in: {e}");
     }
-    path.to_string()
-}
-
-/// Verify if the sender is on the allow_list
-fn is_allowed(sender: &str) -> bool {
-    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-    // FIXME: Check to see if it's from ourselves, in which case we should do nothing
-    if let Some(allow_list) = config.allow_list {
-        let regex = Regex::new(&allow_list).expect("Invalid regular expression");
-        return regex.is_match(sender);
-    }
-    false
-}
-
-/// Login with a new device.
-async fn login(
-    state_dir: &Path,
-    session_file: &Path,
-    homeserver_url: String,
-    username: &str,
-    password: &Option<String>,
-) -> anyhow::Result<Client> {
-    eprintln!("No previous session found, logging in…");
-
-    let (client, client_session) = build_client(state_dir, homeserver_url).await?;
-    let matrix_auth = client.matrix_auth();
-
-    // If there's no password, ask for it
-    let password = match password {
-        Some(password) => password.clone(),
-        None => {
-            print!("Password: ");
-            io::stdout().flush().expect("Unable to write to stdout");
-            let mut password = String::new();
-            io::stdin()
-                .read_line(&mut password)
-                .expect("Unable to read user input");
-            password.trim().to_owned()
-        }
-    };
-
-    match matrix_auth
-        .login_username(username, &password)
-        .initial_device_display_name("headjack client")
-        .await
-    {
-        Ok(_) => {
-            eprintln!("Logged in as {username}");
-        }
-        Err(error) => {
-            eprintln!("Error logging in: {error}");
-            return Err(error.into());
-        }
-    }
-
-    // Persist the session to reuse it later.
-    let user_session = matrix_auth
-        .session()
-        .expect("A logged-in client should have a session");
-    let serialized_session = serde_json::to_string(&FullSession {
-        client_session,
-        user_session,
-        sync_token: None,
-    })?;
-    fs::write(session_file, serialized_session).await?;
-
-    eprintln!("Session persisted in {}", session_file.to_string_lossy());
-
-    Ok(client)
-}
-
-/// Build a new client.
-async fn build_client(
-    state_dir: &Path,
-    homeserver: String,
-) -> anyhow::Result<(Client, ClientSession)> {
-    let mut rng = thread_rng();
-
-    // Place the db into a subfolder, just in case multiple clients are running
-    let db_subfolder: String = (&mut rng)
-        .sample_iter(Alphanumeric)
-        .take(7)
-        .map(char::from)
-        .collect();
-    let db_path = state_dir.join(db_subfolder);
-
-    // Generate a random passphrase.
-    // It will be saved in the session file and used to encrypt the database.
-    let passphrase: String = (&mut rng)
-        .sample_iter(Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-
-    match Client::builder()
-        .homeserver_url(&homeserver)
-        // We use the SQLite store, which is enabled by default. This is the crucial part to
-        // persist the encryption setup.
-        // Note that other store backends are available and you can even implement your own.
-        .sqlite_store(&db_path, Some(&passphrase))
-        .build()
-        .await
-    {
-        Ok(client) => Ok((
-            client,
-            ClientSession {
-                homeserver,
-                db_path,
-                passphrase,
-            },
-        )),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Restore a previous session.
-async fn restore_session(session_file: &Path) -> anyhow::Result<(Client, Option<String>)> {
-    eprintln!(
-        "Previous session found in '{}'",
-        session_file.to_string_lossy()
-    );
-
-    // The session was serialized as JSON in a file.
-    let serialized_session = fs::read_to_string(session_file).await?;
-    let FullSession {
-        client_session,
-        user_session,
-        sync_token,
-    } = serde_json::from_str(&serialized_session)?;
-
-    // Build the client with the previous settings from the session.
-    let client = Client::builder()
-        .homeserver_url(client_session.homeserver)
-        .sqlite_store(client_session.db_path, Some(&client_session.passphrase))
-        .build()
-        .await?;
-
-    eprintln!("Restoring session for {}…", &user_session.meta.user_id);
-
-    // Restore the Matrix user session.
-    client.restore_session(user_session).await?;
-
-    eprintln!("Done!");
-
-    Ok((client, sync_token))
-}
-
-/// Setup the client to listen to new messages.
-async fn sync(
-    client: Client,
-    _initial_sync_token: Option<String>,
-    session_file: &Path,
-) -> anyhow::Result<()> {
-    // Enable room members lazy-loading, it will speed up the initial sync a lot
-    // with accounts in lots of rooms.
-    // See <https://spec.matrix.org/v1.6/client-server-api/#lazy-loading-room-members>.
-    let filter = FilterDefinition::with_lazy_loading();
-
-    let mut sync_settings = SyncSettings::default().filter(filter.into());
-
-    // This setting syncs it _to_ the provided token.
-    // We would use this to respond to events that happened while we were offline.
-    // if let Some(sync_token) = initial_sync_token {
-    //     sync_settings = sync_settings.token(sync_token);
-    // }
 
     // React to invites.
-    // We set this up before the initial sync_once so that we join rooms
+    // We set this up before the initial sync so that we join rooms
     // even if they were invited before the bot was started.
-    client.add_event_handler(on_stripped_state_member);
+    bot.join_rooms();
 
-    loop {
-        match client.sync_once(sync_settings.clone()).await {
-            Ok(response) => {
-                // This is the last time we need to provide this token, the sync method after
-                // will handle it on its own.
-                sync_settings = sync_settings.token(response.next_batch.clone());
-                persist_sync_token(session_file, response.next_batch).await?;
-                break;
-            }
-            Err(error) => {
-                eprintln!("An error occurred during initial sync: {error}");
-                eprintln!("Trying again…");
-            }
-        }
+    // Syncs to the current state
+    if let Err(e) = bot.sync().await {
+        eprintln!("Error syncing: {e}");
     }
 
     eprintln!("The client is ready! Listening to new messages…");
 
-    // Now that we've synced, let's attach a handler for incoming room messages.
-    client.add_event_handler(on_room_message);
+    // The party command is from the matrix-rust-sdk examples
+    // Keeping it as an easter egg
+    bot.register_text_command("party", None, |_, room| async move {
+        let content = RoomMessageEventContent::text_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+        room.send(content).await.unwrap();
+        Ok(())
+    })
+    .await;
 
-    // This loops until we kill the program or an error happens.
-    client
-        .sync_with_result_callback(sync_settings, |sync_result| async move {
-            let response = sync_result?;
+    bot.register_text_command(
+        "print",
+        "Print the conversation".to_string(),
+        |_, room| async move {
+            let (mut context, _, _) = get_context(&room).await.unwrap();
+            context.insert_str(0, ".context:\n");
+            let content = RoomMessageEventContent::text_plain(context);
+            room.send(content).await.unwrap();
+            Ok(())
+        },
+    )
+    .await;
 
-            // We persist the token each time to be able to restore our session
-            persist_sync_token(session_file, response.next_batch)
-                .await
-                .map_err(|err| Error::UnknownError(err.into()))?;
+    bot.register_text_command(
+        "send",
+        "<message> - Send this message without context".to_string(),
+        |text, room| async move {
+            let input = text.trim_start_matches(".send").trim();
 
-            Ok(LoopCtrl::Continue)
-        })
-        .await?;
+            // But we do need to read the context to figure out the model to use
+            let (_, model, _) = get_context(&room).await.unwrap();
 
-    Ok(())
-}
+            if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new()) {
+                // Add the prefix ".response:\n" to the result
+                // That way we can identify our own responses and ignore them for context
+                let result = format!(".response:\n{}", result);
+                let content = RoomMessageEventContent::text_plain(result);
 
-/// Persist the sync token for a future session.
-/// Note that this is needed only when using `sync_once`. Other sync methods get
-/// the sync token from the store.
-/// Note that the sync token is currently never actually used. It allows you to sync
-/// to where we left off and respond to missed messages, but we don't want to do that yet.
-async fn persist_sync_token(session_file: &Path, sync_token: String) -> anyhow::Result<()> {
-    let serialized_session = fs::read_to_string(session_file).await?;
-    let mut full_session: FullSession = serde_json::from_str(&serialized_session)?;
+                room.send(content).await.unwrap();
+            }
+            Ok(())
+        },
+    )
+    .await;
 
-    full_session.sync_token = Some(sync_token);
-    let serialized_session = serde_json::to_string(&full_session)?;
-    fs::write(session_file, serialized_session).await?;
+    bot.register_text_command(
+        "model",
+        "<model> - Select the model to use".to_string(),
+        model,
+    )
+    .await;
 
-    Ok(())
-}
-
-// Whenever we see a new stripped room member event, we've asked our client to
-// call this function. So what exactly are we doing then?
-async fn on_stripped_state_member(
-    room_member: StrippedRoomMemberEvent,
-    client: Client,
-    room: Room,
-) {
-    if room_member.state_key != client.user_id().unwrap() {
-        // the invite we've seen isn't for us, but for someone else. ignore
-        return;
-    }
-    if !is_allowed(room_member.sender.as_str()) {
-        // Sender is not on the allowlist
-        return;
-    }
-    eprintln!("Received stripped room member event: {:?}", room_member);
-
-    // The event handlers are called before the next sync begins, but
-    // methods that change the state of a room (joining, leaving a room)
-    // wait for the sync to return the new room state so we need to spawn
-    // a new task for them.
-    tokio::spawn(async move {
-        eprintln!("Autojoining room {}", room.room_id());
-        let mut delay = 2;
-
-        while let Err(err) = room.join().await {
-            // retry autojoin due to synapse sending invites, before the
-            // invited user can join for more information see
-            // https://github.com/matrix-org/synapse/issues/4345
-            eprintln!(
-                "Failed to join room {} ({err:?}), retrying in {delay}s",
-                room.room_id()
+    bot.register_text_command(
+        "list",
+        "List available models".to_string(),
+        |_, room| async move {
+            let (_, current_model, _) = get_context(&room).await.unwrap();
+            let response = format!(
+                ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
+                current_model.unwrap_or(get_backend().default_model()),
+                get_backend().list_models().join("\n")
             );
+            room.send(RoomMessageEventContent::text_plain(response))
+                .await
+                .unwrap();
+            Ok(())
+        },
+    )
+    .await;
 
-            sleep(Duration::from_secs(delay)).await;
-            delay *= 2;
+    bot.register_text_command(
+        "clear",
+        "Ignore all messages before this point".to_string(),
+        |_, room| async move {
+            room.send(RoomMessageEventContent::text_plain(
+                ".clear: All messages before this will be ignored",
+            ))
+            .await
+            .unwrap();
+            Ok(())
+        },
+    )
+    .await;
 
-            if delay > 3600 {
-                eprintln!("Can't join room {} ({err:?})", room.room_id());
-                break;
-            }
-        }
-        eprintln!("Successfully joined room {}", room.room_id());
-    });
-}
+    bot.register_text_command(
+        "rename",
+        "Rename the room and set the topic based on the chat content".to_string(),
+        rename,
+    )
+    .await;
 
-// This fn is called whenever we see a new room message event. You notice that
-// the difference between this and the other function that we've given to the
-// handler lies only in their input parameters. However, that is enough for the
-// rust-sdk to figure out which one to call and only do so, when the parameters
-// are available.
-async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
-    // First, we need to unpack the message: We only want messages from rooms we are
-    // still in and that are regular text messages - ignoring everything else.
-    if room.state() != RoomState::Joined {
-        return;
-    }
-    let MessageType::Text(text_content) = event.content.msgtype else {
-        return;
-    };
-    if !is_allowed(event.sender.as_str()) {
-        // Sender is not on the allowlist
-        return;
-    }
-
-    // If we start with a single '.', interpret as a command
-    let text = text_content.body.trim_start();
-    eprintln!("Received message: {}", text);
-    if is_command(text) {
-        let command = text.split_whitespace().next();
-        if let Some(command) = command {
-            // Write a match statement to match the first word in the body
-            match &command[1..] {
-                "party" => {
-                    let content =
-                        RoomMessageEventContent::text_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
-                    room.send(content).await.unwrap();
-                }
-                "send" => {
-                    let input = text_content.body.trim_start_matches(".send").trim();
-
-                    // But we do need to read the context to figure out the model to use
-                    let (_, model, _) = get_context(&room).await.unwrap();
-
-                    if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new())
-                    {
-                        // Add the prefix ".response:\n" to the result
-                        // That way we can identify our own responses and ignore them for context
-                        let result = format!(".response:\n{}", result);
-                        let content = RoomMessageEventContent::text_plain(result);
-
-                        room.send(content).await.unwrap();
-                    }
-                }
-                "help" => {
-                    let content = RoomMessageEventContent::text_plain(
-                        [
-                            ".help",
-                            "",
-                            "Available commands:",
-                            "- .send <message> - Send this message without context",
-                            "- .print - Print the full context of the conversation",
-                            "- .help - Print this message",
-                            "- .list - List available models",
-                            "- .clear - Clear all messages before this point",
-                            "- .model <model> - Select a model to use",
-                            "- .rename - Rename the room and set the topic based on the chat content",
-                        ]
-                        .join("\n"),
-                    );
-                    room.send(content).await.unwrap();
-                }
-                "print" => {
-                    // Prints the full context back to the room
-                    let (mut context, _, _) = get_context(&room).await.unwrap();
-                    context.insert_str(0, ".context:\n");
-                    let content = RoomMessageEventContent::text_plain(context);
-                    room.send(content).await.unwrap();
-                }
-                "model" => {
-                    // Verify the command is fine
-                    // Get the second word in the command
-                    let model = text.split_whitespace().nth(1);
-                    if let Some(model) = model {
-                        let models = get_backend().list_models();
-                        if models.contains(&model.to_string()) {
-                            // Set the model
-                            let response = format!(".model: Set to \"{}\"", model);
-                            room.send(RoomMessageEventContent::text_plain(response))
-                                .await
-                                .unwrap();
-                        } else {
-                            let response = format!(
-                                ".error: Model \"{}\" not found.\n\nAvailable models:\n{}",
-                                model,
-                                models.join("\n")
-                            );
-                            room.send(RoomMessageEventContent::text_plain(response))
-                                .await
-                                .unwrap();
-                        }
-                    } else {
-                        // No argument, so we'll print the model list
-                        let (_, current_model, _) = get_context(&room).await.unwrap();
-                        let response = format!(
-                            ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
-                            current_model.unwrap_or(get_backend().default_model()),
-                            get_backend().list_models().join("\n")
-                        );
-                        room.send(RoomMessageEventContent::text_plain(response))
-                            .await
-                            .unwrap();
-                    }
-                }
-                "list" => {
-                    let (_, current_model, _) = get_context(&room).await.unwrap();
-                    let response = format!(
-                        ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
-                        current_model.unwrap_or(get_backend().default_model()),
-                        get_backend().list_models().join("\n")
-                    );
-                    room.send(RoomMessageEventContent::text_plain(response))
-                        .await
-                        .unwrap();
-                }
-                "clear" => {
-                    room.send(RoomMessageEventContent::text_plain(
-                        ".clear: All messages before this will be ignored",
-                    ))
-                    .await
-                    .unwrap();
-                }
-                "rename" => {
-                    if let Ok((context, _, _)) = get_context(&room).await {
-                        let title_prompt= [
-                            &context,
-                            "\nUSER: Summarize this conversation in less than 20 characters to use as the title of this conversation. ",
-                            "The output should be a single line of text describing the conversation. ",
-                            "Do not output anything except for the summary text. ",
-                            "Only the first 20 characters will be used. ",
-                            "\nASSISTANT: ",
-                        ].join("");
-                        let model = get_chat_summary_model();
-
-                        let response = get_backend().execute(&model, title_prompt, Vec::new());
-                        if let Ok(result) = response {
-                            eprintln!("Result: {}", result);
-                            let result = clean_summary_response(&result, None);
-                            if room.set_name(result).await.is_err() {
-                                room.send(RoomMessageEventContent::text_plain(
-                                    ".error: I don't have permission to rename the room",
-                                ))
-                                .await
-                                .unwrap();
-
-                                // If we can't set the name, we can't set the topic either
-                                return;
-                            }
-                        }
-
-                        let topic_prompt = [
-                            &context,
-                            "\nUSER: Summarize this conversation in less than 50 characters. ",
-                            "Do not output anything except for the summary text. ",
-                            "Do not include any commentary or context, only the summary. ",
-                            "\nASSISTANT: ",
-                        ]
-                        .join("");
-
-                        let response = get_backend().execute(&model, topic_prompt, Vec::new());
-                        if let Ok(result) = response {
-                            eprintln!("Result: {}", result);
-                            let result = clean_summary_response(&result, None);
-                            if room.set_room_topic(&result).await.is_err() {
-                                room.send(RoomMessageEventContent::text_plain(
-                                    ".error: I don't have permission to set the topic",
-                                ))
-                                .await
-                                .unwrap();
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!(".error: Unknown command");
-                }
-            }
-        }
-    } else {
+    bot.register_text_handler(|_, room| async move {
         // If it's not a command, we should send the full context without commands to the server
         if let Ok((mut context, model, media)) = get_context(&room).await {
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
@@ -624,12 +198,105 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 .unwrap();
             }
         }
+        Ok(())
+    });
+
+    // Run the bot, this should never return except on error
+    if let Err(e) = bot.run().await {
+        eprintln!("Error running bot: {e}");
     }
+
+    Ok(())
 }
 
-/// Check if the message is a command
-fn is_command(text: &str) -> bool {
-    text.starts_with('.') && !text.starts_with("..")
+async fn model(text: String, room: Room) -> Result<(), ()> {
+    // Verify the command is fine
+    // Get the second word in the command
+    let model = text.split_whitespace().nth(1);
+    if let Some(model) = model {
+        let models = get_backend().list_models();
+        if models.contains(&model.to_string()) {
+            // Set the model
+            let response = format!(".model: Set to \"{}\"", model);
+            room.send(RoomMessageEventContent::text_plain(response))
+                .await
+                .unwrap();
+        } else {
+            let response = format!(
+                ".error: Model \"{}\" not found.\n\nAvailable models:\n{}",
+                model,
+                models.join("\n")
+            );
+            room.send(RoomMessageEventContent::text_plain(response))
+                .await
+                .unwrap();
+        }
+    } else {
+        // No argument, so we'll print the model list
+        let (_, current_model, _) = get_context(&room).await.unwrap();
+        let response = format!(
+            ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
+            current_model.unwrap_or(get_backend().default_model()),
+            get_backend().list_models().join("\n")
+        );
+        room.send(RoomMessageEventContent::text_plain(response))
+            .await
+            .unwrap();
+    }
+    Ok(())
+}
+
+async fn rename(_: String, room: Room) -> Result<(), ()> {
+    if let Ok((context, _, _)) = get_context(&room).await {
+        let title_prompt= [
+                            &context,
+                            "\nUSER: Summarize this conversation in less than 20 characters to use as the title of this conversation. ",
+                            "The output should be a single line of text describing the conversation. ",
+                            "Do not output anything except for the summary text. ",
+                            "Only the first 20 characters will be used. ",
+                            "\nASSISTANT: ",
+                        ].join("");
+        let model = get_chat_summary_model();
+
+        let response = get_backend().execute(&model, title_prompt, Vec::new());
+        if let Ok(result) = response {
+            eprintln!("Result: {}", result);
+            let result = clean_summary_response(&result, None);
+            if room.set_name(result).await.is_err() {
+                room.send(RoomMessageEventContent::text_plain(
+                    ".error: I don't have permission to rename the room",
+                ))
+                .await
+                .unwrap();
+
+                // If we can't set the name, we can't set the topic either
+                return Ok(());
+            }
+        }
+
+        let topic_prompt = [
+            &context,
+            "\nUSER: Summarize this conversation in less than 50 characters. ",
+            "Do not output anything except for the summary text. ",
+            "Do not include any commentary or context, only the summary. ",
+            "\nASSISTANT: ",
+        ]
+        .join("");
+
+        let response = get_backend().execute(&model, topic_prompt, Vec::new());
+        if let Ok(result) = response {
+            eprintln!("Result: {}", result);
+            let result = clean_summary_response(&result, None);
+            if room.set_room_topic(&result).await.is_err() {
+                room.send(RoomMessageEventContent::text_plain(
+                    ".error: I don't have permission to set the topic",
+                ))
+                .await
+                .unwrap();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the backend based on the global config
