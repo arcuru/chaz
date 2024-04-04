@@ -617,9 +617,11 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                 };
                 room.send(content).await.unwrap();
             } else {
-                room.send(RoomMessageEventContent::text_plain(".error: Failed to generate response"))
-                    .await
-                    .unwrap();
+                room.send(RoomMessageEventContent::text_plain(
+                    ".error: Failed to generate response",
+                ))
+                .await
+                .unwrap();
             }
         }
     }
