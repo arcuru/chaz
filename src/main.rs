@@ -439,8 +439,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
             match &command[1..] {
                 "party" => {
                     let content =
-                        RoomMessageEventContent::text_plain("🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
-                    // send our message to the room we found the "!party" command in
+                        RoomMessageEventContent::text_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
                     room.send(content).await.unwrap();
                 }
                 "send" => {
@@ -466,7 +465,6 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                             ".help",
                             "",
                             "Available commands:",
-                            "- .party - Start a party!",
                             "- .send <message> - Send this message without context",
                             "- .print - Print the full context of the conversation",
                             "- .help - Print this message",
