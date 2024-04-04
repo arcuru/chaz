@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The folder containing the persisted data.
     let state_dir = if let Some(state_dir) = &config.state_dir {
-        PathBuf::from(state_dir)
+        PathBuf::from(expand_tilde(state_dir))
     } else {
         dirs::state_dir()
             .expect("no state_dir directory found")
@@ -140,6 +140,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Error syncing with the server");
     Ok(())
+}
+
+/// Fixup the path if they've provided a ~
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home_dir) = dirs::home_dir() {
+            let without_tilde = &path[1..]; // Remove the '~' and keep the rest of the path
+            return home_dir.display().to_string() + without_tilde;
+        }
+    }
+    path.to_string()
 }
 
 /// Verify if the sender is on the allow_list
