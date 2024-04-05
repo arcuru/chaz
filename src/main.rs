@@ -138,23 +138,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    bot.register_text_command(
-        "list",
-        "List available models".to_string(),
-        |_, room| async move {
-            let (_, current_model, _) = get_context(&room).await.unwrap();
-            let response = format!(
-                ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
-                current_model.unwrap_or(get_backend().default_model()),
-                get_backend().list_models().join("\n")
-            );
-            room.send(RoomMessageEventContent::text_plain(response))
-                .await
-                .unwrap();
-            Ok(())
-        },
-    )
-    .await;
+    bot.register_text_command("list", "List available models".to_string(), list_models)
+        .await;
 
     bot.register_text_command(
         "clear",
@@ -209,6 +194,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn list_models(_: String, room: Room) -> Result<(), ()> {
+    let (_, current_model, _) = get_context(&room).await.unwrap();
+    let response = format!(
+        ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
+        current_model.unwrap_or(get_backend().default_model()),
+        get_backend().list_models().join("\n")
+    );
+    room.send(RoomMessageEventContent::text_plain(response))
+        .await
+        .unwrap();
+    Ok(())
+}
+
 async fn model(text: String, room: Room) -> Result<(), ()> {
     // Verify the command is fine
     // Get the second word in the command
@@ -232,16 +230,7 @@ async fn model(text: String, room: Room) -> Result<(), ()> {
                 .unwrap();
         }
     } else {
-        // No argument, so we'll print the model list
-        let (_, current_model, _) = get_context(&room).await.unwrap();
-        let response = format!(
-            ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
-            current_model.unwrap_or(get_backend().default_model()),
-            get_backend().list_models().join("\n")
-        );
-        room.send(RoomMessageEventContent::text_plain(response))
-            .await
-            .unwrap();
+        list_models(text, room).await?;
     }
     Ok(())
 }
