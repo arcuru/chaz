@@ -7,7 +7,10 @@ use lazy_static::lazy_static;
 use matrix_sdk::{
     media::{MediaFileHandle, MediaFormat, MediaRequest},
     room::MessagesOptions,
-    ruma::events::room::message::{MessageType, RoomMessageEventContent},
+    ruma::{
+        events::room::message::{MessageType, RoomMessageEventContent},
+        OwnedUserId,
+    },
     Room,
 };
 use regex::Regex;
@@ -89,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The party command is from the matrix-rust-sdk examples
     // Keeping it as an easter egg
-    bot.register_text_command("party", None, |_, room| async move {
+    bot.register_text_command("party", None, |_, _, room| async move {
         let content = RoomMessageEventContent::text_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
         room.send(content).await.unwrap();
         Ok(())
@@ -99,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     bot.register_text_command(
         "print",
         "Print the conversation".to_string(),
-        |_, room| async move {
+        |_, _, room| async move {
             let (mut context, _, _) = get_context(&room).await.unwrap();
             context.insert_str(0, ".context:\n");
             let content = RoomMessageEventContent::text_plain(context);
@@ -112,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
     bot.register_text_command(
         "send",
         "<message> - Send this message without context".to_string(),
-        |text, room| async move {
+        |_, text, room| async move {
             let input = text.trim_start_matches(".send").trim();
 
             // But we do need to read the context to figure out the model to use
@@ -144,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     bot.register_text_command(
         "clear",
         "Ignore all messages before this point".to_string(),
-        |_, room| async move {
+        |_, _, room| async move {
             room.send(RoomMessageEventContent::text_plain(
                 ".clear: All messages before this will be ignored",
             ))
@@ -162,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    bot.register_text_handler(|_, room| async move {
+    bot.register_text_handler(|_, _, room| async move {
         // If it's not a command, we should send the full context without commands to the server
         if let Ok((mut context, model, media)) = get_context(&room).await {
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
@@ -194,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_models(_: String, room: Room) -> Result<(), ()> {
+async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     let (_, current_model, _) = get_context(&room).await.unwrap();
     let response = format!(
         ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
@@ -207,7 +210,7 @@ async fn list_models(_: String, room: Room) -> Result<(), ()> {
     Ok(())
 }
 
-async fn model(text: String, room: Room) -> Result<(), ()> {
+async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
     // Verify the command is fine
     // Get the second word in the command
     let model = text.split_whitespace().nth(1);
@@ -230,12 +233,12 @@ async fn model(text: String, room: Room) -> Result<(), ()> {
                 .unwrap();
         }
     } else {
-        list_models(text, room).await?;
+        list_models(sender, text, room).await?;
     }
     Ok(())
 }
 
-async fn rename(_: String, room: Room) -> Result<(), ()> {
+async fn rename(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     if let Ok((context, _, _)) = get_context(&room).await {
         let title_prompt= [
                             &context,

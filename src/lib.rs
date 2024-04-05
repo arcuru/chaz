@@ -3,6 +3,8 @@ use matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::events::AnySyncMessageLikeEvent;
+use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::RoomState;
 use matrix_sdk::{
     config::SyncSettings, matrix_auth::MatrixSession, ruma::api::client::filter::FilterDefinition,
@@ -192,7 +194,7 @@ impl Bot {
         self.register_text_command(
             "help",
             "Show this message".to_string(),
-            |_, room| async move {
+            |_, _, room| async move {
                 let global_state = GLOBAL_STATE.lock().await;
                 let state = global_state.get(&name).unwrap();
                 let state = state.lock().await;
@@ -265,7 +267,7 @@ impl Bot {
     /// Useful for bots that want to act more like chatbots, having some response to every message
     pub fn register_text_handler<F, Fut>(&self, callback: F)
     where
-        F: FnOnce(String, Room) -> Fut + Send + 'static + Clone + Sync,
+        F: FnOnce(OwnedUserId, String, Room) -> Fut + Send + 'static + Clone + Sync,
         Fut: std::future::Future<Output = Result<(), ()>> + Send + 'static,
     {
         let client = self.client.as_ref().expect("client not initialized");
@@ -287,7 +289,7 @@ impl Bot {
                 if is_command(body) {
                     return;
                 }
-                if let Err(e) = callback(body.to_string(), room).await {
+                if let Err(e) = callback(event.sender.clone(), body.to_string(), room).await {
                     eprintln!("Error responding to: {}\nError: {:?}", body, e);
                 }
             },
@@ -297,14 +299,15 @@ impl Bot {
     /// Register a text command
     /// This will call the callback when the command is received
     /// Sending no help text will make the command not show up in the help
-    /// TODO: This adds a separate handler for every command, this can be made more efficient
+    /// FIXME: This adds a separate handler for every command, this can be made more efficient
+    /// by storing the commands in the State struct
     pub async fn register_text_command<F, Fut, OptString>(
         &self,
         command: &str,
         short_help: OptString,
         callback: F,
     ) where
-        F: FnOnce(String, Room) -> Fut + Send + 'static + Clone + Sync,
+        F: FnOnce(OwnedUserId, String, Room) -> Fut + Send + 'static + Clone + Sync,
         Fut: std::future::Future<Output = Result<(), ()>> + Send + 'static,
         OptString: Into<Option<String>>,
     {
@@ -322,20 +325,31 @@ impl Bot {
         let allow_list = self.config.allow_list.clone();
         let command = command.to_owned();
         client.add_event_handler(
-            move |event: OriginalSyncRoomMessageEvent, room: Room| async move {
+            // This handler matches pretty much every sync event, we'll use that and then filter ourselves
+            move |event: AnySyncMessageLikeEvent, room: Room| async move {
                 // Ignore messages from rooms we're not in
                 if room.state() != RoomState::Joined {
                     return;
                 }
-                let MessageType::Text(text_content) = &event.content.msgtype else {
+                // Ignore non-message events
+                let AnySyncMessageLikeEvent::RoomMessage(event) = event else {
                     return;
                 };
+                // Must be unredacted
+                let Some(event) = event.as_original() else {
+                    return;
+                };
+                // Only look at text messages
+                let MessageType::Text(_) = event.content.msgtype else {
+                    return;
+                };
+                let text_content = event.content.body();
                 if !is_allowed(allow_list, event.sender.as_str()) {
                     // Sender is not on the allowlist
                     return;
                 }
 
-                let body = text_content.body.trim_start();
+                let body = text_content.trim_start();
                 if !is_command(body) {
                     return;
                 }
@@ -343,7 +357,8 @@ impl Bot {
                 if let Some(input_command) = input_command {
                     if input_command[1..] == command {
                         // Call the callback
-                        if let Err(e) = callback(body.to_string(), room).await {
+                        if let Err(e) = callback(event.sender.clone(), body.to_string(), room).await
+                        {
                             eprintln!("Error running command: {} - {:?}", command, e);
                         }
                     }
