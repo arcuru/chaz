@@ -1,8 +1,8 @@
 mod aichat;
 use aichat::AiChat;
-use headjack::*;
 
 use clap::Parser;
+use headjack::*;
 use lazy_static::lazy_static;
 use matrix_sdk::{
     media::{MediaFileHandle, MediaFormat, MediaRequest},
@@ -19,7 +19,7 @@ use std::{fs::File, io::Read, path::PathBuf, sync::Mutex};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-struct HeadJackArgs {
+struct ChazArgs {
     /// path to config file
     #[arg(short, long)]
     config: PathBuf,
@@ -33,8 +33,8 @@ struct Config {
     password: Option<String>,
     /// Allow list of which accounts we will respond to
     allow_list: Option<String>,
-    /// Set the state directory for headjack
-    /// Defaults to $XDG_STATE_HOME/headjack
+    /// Set the state directory for chaz
+    /// Defaults to $XDG_STATE_HOME/chaz
     state_dir: Option<String>,
     /// Set the config directory for aichat
     /// Allows for multiple instances setups of aichat
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Read in the config file
-    let args = HeadJackArgs::parse();
+    let args = ChazArgs::parse();
     let mut file = File::open(args.config)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;

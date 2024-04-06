@@ -11,7 +11,8 @@ tasks:
     cmd: act
   ci:local:
     desc: Run CI locally
-    deps: [audit, fmt, test, nix:check, nix:build, clippy, pre-commit, build]
+    deps:
+      [audit, doc, fmt, test, nix:check, nix:build, clippy, pre-commit, build]
   nix:check:
     desc: Run Nix CI checks
     sources:
@@ -44,6 +45,9 @@ tasks:
     sources:
       - ./**/*.rs
     cmd: cargo nextest run
+  doc:
+    desc: Build the documentation
+    cmd: cargo doc
   audit:
     desc: Run cargo security audit
     sources:

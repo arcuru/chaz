@@ -1,5 +1,5 @@
 {
-  description = "Headjack - Jack some (AI) heads into Matrix.";
+  description = "chaz - Jack some (AI) heads into Matrix.";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -76,15 +76,15 @@
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
       # Build the actual crate itself, reusing the cargoArtifacts
-      headjack-unwrapped = craneLib.buildPackage commonArgs;
+      chaz-unwrapped = craneLib.buildPackage commonArgs;
     in {
       checks =
         {
           # Build the final package as part of `nix flake check` for convenience
-          inherit (self.packages.${system}) headjack;
+          inherit (self.packages.${system}) chaz;
 
           # Run clippy (and deny all warnings) on the crate source
-          headjack-clippy =
+          chaz-clippy =
             craneLib.cargoClippy
             (commonArgs
               // {
@@ -92,14 +92,14 @@
               });
 
           # Check docs build successfully
-          headjack-doc = craneLib.cargoDoc commonArgs;
+          chaz-doc = craneLib.cargoDoc commonArgs;
 
           # Check formatting
-          headjack-fmt = craneLib.cargoFmt commonArgs;
+          chaz-fmt = craneLib.cargoFmt commonArgs;
 
           # Run tests with cargo-nextest
           # Note: This provides limited value, as tests are already run in the build
-          headjack-nextest = craneLib.cargoNextest commonArgs;
+          chaz-nextest = craneLib.cargoNextest commonArgs;
 
           # Audit dependencies
           crate-audit = craneLib.cargoAudit (commonArgs
@@ -109,7 +109,7 @@
         }
         // lib.optionalAttrs (system == "x86_64-linux") {
           # Check code coverage with tarpaulin runs
-          headjack-tarpaulin = craneLib.cargoTarpaulin commonArgs;
+          chaz-tarpaulin = craneLib.cargoTarpaulin commonArgs;
         }
         // {
           # Run formatting checks before commit
@@ -126,36 +126,36 @@
         };
 
       packages = rec {
-        inherit headjack-unwrapped;
-        # Wrap headjack to include the path to aichat
-        headjack =
-          pkgs.runCommand headjack-unwrapped.name {
-            inherit (headjack-unwrapped) pname version;
+        inherit chaz-unwrapped;
+        # Wrap chaz to include the path to aichat
+        chaz =
+          pkgs.runCommand chaz-unwrapped.name {
+            inherit (chaz-unwrapped) pname version;
             nativeBuildInputs = [
               pkgs.makeWrapper
             ];
           } ''
             mkdir -p $out/bin
-            cp ${headjack-unwrapped}/bin/headjack $out/bin
-            wrapProgram $out/bin/headjack \
+            cp ${chaz-unwrapped}/bin/chaz $out/bin
+            wrapProgram $out/bin/chaz \
               --prefix PATH : ${lib.makeBinPath [
               pkgs.aichat-git
             ]}
           '';
         # Expose this for use by any downstream users
         aichat-git = pkgs.aichat-git;
-        default = headjack;
+        default = chaz;
       };
 
       apps = rec {
-        default = headjack;
-        headjack = inputs.flake-utils.lib.mkApp {
-          drv = self.packages.${system}.headjack;
+        default = chaz;
+        chaz = inputs.flake-utils.lib.mkApp {
+          drv = self.packages.${system}.chaz;
         };
       };
 
       devShells.default = pkgs.mkShell {
-        name = "headjack";
+        name = "chaz";
         shellHook = ''
           ${self.checks.${system}.pre-commit-check.shellHook}
           echo ---------------------
@@ -188,7 +188,7 @@
     })
     // {
       overlays.default = final: prev: {
-        headjack = self.packages.${final.system}.headjack;
+        chaz = self.packages.${final.system}.chaz;
       };
       homeManagerModules.default = import ./nix/home-manager.nix;
     };

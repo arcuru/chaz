@@ -1,31 +1,27 @@
 [package]
-name = "headjack"
+name = "chaz"
 version = "0.2.0"
 edition = "2021"
 authors = ["Patrick Jackson <patrick@jackson.dev>"]
 readme = "README.md"
 license = "MIT"
-description = "Headjack - Jack some (AI) heads into Matrix."
-repository = "https://github.com/arcuru/headjack"
-homepage = "https://github.com/arcuru/headjack"
+description = "chaz"
+repository = "https://github.com/arcuru/chaz"
+homepage = "https://github.com/arcuru/chaz"
 
 [[bin]]
-name = "headjack"
+name = "chaz"
 test = false
 
-[lib]
-name = "headjack"
-
 [dependencies]
+headjack = "0.2.0"
 anyhow = "1"
 tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "0.3.15"
 matrix-sdk = "0.7.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
-serde_json = "1.0"
 clap = { version = "4.2.1", features = ["derive"] }
 lazy_static = "1.4.0"
 regex = "1.10.3"
 dirs = "5.0.1"
-rand = "0.8.5"

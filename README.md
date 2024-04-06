@@ -1,6 +1,6 @@
-# headjack
+# chaz
 
-Jack some (AI) heads into Matrix.
+Chaz is chaz.
 
 This is a [Matrix](https://github.com/sigoden/aichat) bot that connects to [AIChat](https://github.com/sigoden/aichat) to provide access to "10+ AI platforms, including OpenAI, Gemini, Claude, Mistral, LocalAI, Ollama, VertexAI, Ernie, Qianwen..." all from within Matrix.
 
@@ -11,7 +11,7 @@ You will need your own API keys or your own local AI already configured.
 
 ## Install
 
-`headjack` is only packaged on crates.io, but it's recommended that you run from git HEAD for now.
+`chaz` is only packaged on crates.io, but it's recommended that you run from git HEAD for now.
 
 For [Nix](https://nixos.org/) users, this repo contains a Nix flake. See the [setup section](#nix) for details on configuring.
 
@@ -25,10 +25,10 @@ Create a config file for the bot with its login info.
 
 ```yaml
 homeserver_url: https://matrix.org
-username: "headjack"
+username: "chaz"
 password: "" # Optional, if not given it will ask for it on first run
 allow_list: "" # Regex for allowed accounts.
-state_dir: "$XDG_STATE_HOME/headjack" # Optional, for setting the headjack state directory
+state_dir: "$XDG_STATE_HOME/chaz" # Optional, for setting the chaz state directory
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
 ```
@@ -36,32 +36,32 @@ chat_summary_model: "" # Optional, set a different model than the default to use
 ### Nix
 
 Development is being done using a [Nix flake](https://nixos.wiki/wiki/Flakes).
-The easiest way to install headjack is to use nix flakes.
+The easiest way to install chaz is to use nix flakes.
 
 ```bash
-❯ nix run github:arcuru/headjack
+❯ nix run github:arcuru/chaz
 ```
 
 The flake contains an [overlay](https://nixos.wiki/wiki/Overlays) to make it easier to import into your own flake config.
 To use, add it to your inputs:
 
 ```nix
-    inputs.headjack.url = "github:arcuru/headjack";
+    inputs.chaz.url = "github:arcuru/chaz";
 ```
 
-And then add the overlay `inputs.headjack.overlays.default` to your pkgs.
+And then add the overlay `inputs.chaz.overlays.default` to your pkgs.
 
-The flake also contains a home-manager module for installing headjack as a service.
-Import the module into your home-manager config and you can configure `headjack` all from within nix:
+The flake also contains a home-manager module for installing chaz as a service.
+Import the module into your home-manager config and you can configure `chaz` all from within nix:
 
 ```nix
 {inputs, ... }: {
-  imports = [ inputs.headjack.homeManagerModules.default ];
-  services.headjack = {
+  imports = [ inputs.chaz.homeManagerModules.default ];
+  services.chaz = {
     enable = true;
     settings = {
-        homeserver_url = "https://matrix.org";
-        username = "headjack";
+        homeserver_url = "https://matrix.jackson.dev";
+        username = "chaz";
         password = "hunter2";
         allow_list = "@me:matrix.org|@myfriend:matrix.org";
     };
@@ -73,10 +73,10 @@ Import the module into your home-manager config and you can configure `headjack`
 
 To run it, simply:
 
-1. Install _headjack_ and setup its config.
+1. Install _chaz_ and setup its config.
 2. Install [AIChat](https://github.com/sigoden/aichat).
 3. Configure [AIChat](https://github.com/sigoden/aichat) with the models and defaults that you want.
-4. Create a config file for _headjack_ with login details.
-5. Run the bot and specify it's config file location `headjack --config config.yaml`.
+4. Create a config file for _chaz_ with login details.
+5. Run the bot and specify it's config file location `chaz --config config.yaml`.
 
 The bot will not respond to older messages sent while it wasn't running to prevent overwhelming the backend.

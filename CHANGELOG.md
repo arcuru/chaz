@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2024-04-07
+
+### Bug Fixes
+
+- Update the prompts
+- Improve the summarizations
+- Only use the most recent model command
+- Expose the aichat-git package for any consumers
+- Hide the party command as an easter egg
+- Handle tilde safely
+
+### Features
+
+- Support a separate aichat config directory
+- Add room renaming
+- Add a clear command to reset the session
+- Parse the default model from aichat --info
+- Allow passing files to the models
+- Adding a systemd service config for home-manager
+- Checking in aichat-git for the nix build
+- Make the state directory configurable
+- Send the userid to the callbacks
+
+### Miscellaneous Tasks
+
+- Bump the version to v0.2.0
+- Split out headjack
+
+### Styling
+
+- Adjust some of the responses in listing/setting models
+- Cleanup some comments/error messages
+- Formatting
+- Major refactor into a matrix bot framework
+- Refactoring out the list command for reuse
+
 ## [0.1.0] - 2024-03-23
 
 ### Bug Fixes
@@ -20,6 +56,10 @@ All notable changes to this project will be documented in this file.
 - Add context to the ollama requests
 - Add model configuration to config file
 - Use aichat as the chat backend
+
+### Miscellaneous Tasks
+
+- Release v0.1.0
 
 ### Eat
 
