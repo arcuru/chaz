@@ -1,6 +1,9 @@
 mod aichat;
 use aichat::AiChat;
 
+mod role;
+use role::RoleDetails;
+
 use clap::Parser;
 use headjack::*;
 use lazy_static::lazy_static;
@@ -42,6 +45,10 @@ struct Config {
     /// Model to use for summarizing chats
     /// Used for setting the room name/topic
     chat_summary_model: Option<String>,
+    /// Default role
+    role: Option<String>,
+    /// Definitions of roles
+    roles: Option<Vec<RoleDetails>>,
 }
 
 lazy_static! {
@@ -103,7 +110,8 @@ async fn main() -> anyhow::Result<()> {
         "print",
         "Print the conversation".to_string(),
         |_, _, room| async move {
-            let (mut context, _, _) = get_context(&room).await.unwrap();
+            let (context, _, _) = get_context(&room).await.unwrap();
+            let mut context = add_role(&context);
             context.insert_str(0, ".context:\n");
             let content = RoomMessageEventContent::text_plain(context);
             room.send(content).await.unwrap();
@@ -167,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
 
     bot.register_text_handler(|_, _, room| async move {
         // If it's not a command, we should send the full context without commands to the server
-        if let Ok((mut context, model, media)) = get_context(&room).await {
+        if let Ok((context, model, media)) = get_context(&room).await {
+            let mut context = add_role(&context);
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
             context.push_str("ASSISTANT: ");
 
@@ -197,6 +206,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prepend the role defined in the global config
+fn add_role(context: &str) -> String {
+    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+    role::prepend_role(
+        context.to_string(),
+        config.role.clone(),
+        config.roles.clone(),
+    )
+}
+
+/// List the available models
 async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     let (_, current_model, _) = get_context(&room).await.unwrap();
     let response = format!(

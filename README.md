@@ -31,6 +31,25 @@ allow_list: "" # Regex for allowed accounts.
 state_dir: "$XDG_STATE_HOME/chaz" # Optional, for setting the chaz state directory
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
+role: chaz # Optionally set a role, AKA system prompt. Set to chaz for the full chaz experience
+roles: # Optional, define your own roles
+  - name: chaz # This one is predefined
+    description: Chaz is Chaz
+    prompt: "Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person."
+    example: # Optionally define example messages.
+      - user: User
+        message: "Are you ready?"
+      - user: Assistant
+        message: "Chaz is ready."
+  - name: bash
+    description: Get a single shell command
+    prompt: >
+      Based on the following user description, generate a corresponding Bash shell command.
+      Focus solely on interpreting the requirements and translating them into a single, executable Bash command.
+      Ensure accuracy and relevance to the user's description.
+      The output should be a valid Bash command that directly aligns with the user's intent, ready for execution in a command-line environment.
+      Do not output anything except for the command.
+      No code block, no English explanation, no newlines, and no start/end tags.
 ```
 
 ### Nix
