@@ -1,11 +1,11 @@
 [package]
 name = "chaz"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Patrick Jackson <patrick@jackson.dev>"]
 readme = "README.md"
 license = "MIT"
-description = "chaz"
+description = "Chaz is an AI chatbot for Matrix."
 repository = "https://github.com/arcuru/chaz"
 homepage = "https://github.com/arcuru/chaz"
 
