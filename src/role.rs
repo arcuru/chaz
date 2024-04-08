@@ -3,7 +3,6 @@
 // Some models, especially the chat models, take a specific system prompt, and others you can just inject it as the first message.
 // Prompting the models with an example message can also be useful.
 
-use lazy_static::lazy_static;
 use serde::de::{self, Deserializer, Unexpected, Visitor};
 use serde::Deserialize;
 use std::fmt;
@@ -74,23 +73,14 @@ impl<'de> Deserialize<'de> for MessageRole {
     }
 }
 
-lazy_static! {
-    /// Default roles built in
-    static ref INBUILT_ROLES: Vec<RoleDetails> = vec![RoleDetails {
-        name: "chaz".to_string(),
-        description: Some("Chaz is Chaz".to_string()),
-        prompt: Some("Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person.".to_string()),
-        example: Some(vec![
-            Message { user: MessageRole::User, message: "Are you ready?".to_string() },
-            Message { user: MessageRole::Assistant, message: "Chaz is ready".to_string() },
-        ]),
-    }];
-}
-
 /// Print details of a given role
 #[allow(dead_code)]
-pub fn print_role(role: Option<String>, role_list: Option<Vec<RoleDetails>>) {
-    if let Some(role) = get_role(role, role_list) {
+pub fn print_role(
+    role: Option<String>,
+    role_list: Option<Vec<RoleDetails>>,
+    default_roles: Option<Vec<RoleDetails>>,
+) {
+    if let Some(role) = get_role(role, role_list, default_roles) {
         println!("Role: {}", role.name);
         if let Some(description) = role.description {
             println!("Description: {}", description);
@@ -108,7 +98,11 @@ pub fn print_role(role: Option<String>, role_list: Option<Vec<RoleDetails>>) {
 }
 
 /// Get the role details from the role name
-fn get_role(role: Option<String>, role_list: Option<Vec<RoleDetails>>) -> Option<RoleDetails> {
+fn get_role(
+    role: Option<String>,
+    role_list: Option<Vec<RoleDetails>>,
+    default_roles: Option<Vec<RoleDetails>>,
+) -> Option<RoleDetails> {
     let role = role.as_ref()?;
     // Search for the role in the role details
     if let Some(role_details) = role_list {
@@ -119,9 +113,11 @@ fn get_role(role: Option<String>, role_list: Option<Vec<RoleDetails>>) -> Option
         }
     }
     // Search in the inbuilt roles
-    for details in INBUILT_ROLES.iter() {
-        if details.name == *role {
-            return Some(details.clone());
+    if let Some(role_details) = default_roles {
+        for details in role_details {
+            if details.name == *role {
+                return Some(details.clone());
+            }
         }
     }
     None
@@ -131,9 +127,10 @@ fn get_role(role: Option<String>, role_list: Option<Vec<RoleDetails>>) -> Option
 pub fn prepend_role(
     message: String,
     role: Option<String>,
-    role_details: Option<Vec<RoleDetails>>,
+    role_list: Option<Vec<RoleDetails>>,
+    default_roles: Option<Vec<RoleDetails>>,
 ) -> String {
-    if let Some(role_details) = get_role(role, role_details) {
+    if let Some(role_details) = get_role(role, role_list, default_roles) {
         return prepend_role_internal(message, &role_details);
     }
     // Nothing found, so just return

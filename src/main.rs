@@ -4,6 +4,9 @@ use aichat::AiChat;
 mod role;
 use role::RoleDetails;
 
+mod defaults;
+use defaults::DEFAULT_CONFIG;
+
 use clap::Parser;
 use headjack::*;
 use lazy_static::lazy_static;
@@ -29,7 +32,7 @@ struct ChazArgs {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct Config {
+pub struct Config {
     homeserver_url: String,
     username: String,
     /// Optionally specify the password, if not set it will be asked for on cmd line
@@ -213,6 +216,7 @@ fn add_role(context: &str) -> String {
         context.to_string(),
         config.role.clone(),
         config.roles.clone(),
+        DEFAULT_CONFIG.roles.clone(),
     )
 }
 

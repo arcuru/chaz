@@ -56,7 +56,17 @@
       craneLib = inputs.crane.lib.${system}.overrideToolchain toolChain;
 
       # Clean the src to only have the Rust-relevant files
-      src = craneLib.cleanCargoSource (craneLib.path ./.);
+      # src = let
+      #   # We need to keep the yaml files because they are used for the build defaults
+      #   yamlFilter = path: _type: builtins.match ".*defaults.yaml$" path != null;
+      #   yamlOrCargo = path: type:
+      #     (yamlFilter path type) || (craneLib.filterCargoSources path type);
+      # in
+      #   lib.cleanSourceWith {
+      #     src = craneLib.path ./.;
+      #     filter = yamlOrCargo;
+      #   };
+      src = ./.;
 
       # Common arguments for mkCargoDerivation, a helper for the crane functions
       # Arguments can be included here even if they aren't used, but we only

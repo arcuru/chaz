@@ -23,6 +23,8 @@ Create a config file for the bot with its login info.
 
 **IMPORTANT**: Make sure that you setup your allow_list or the bot will not respond
 
+The defaults are configured in [src/defaults.rs](src/defaults.rs)
+
 ```yaml
 homeserver_url: https://matrix.org
 username: "chaz"
