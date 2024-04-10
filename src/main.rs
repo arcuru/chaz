@@ -15,13 +15,14 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::{
         events::room::message::{MessageType, RoomMessageEventContent},
-        OwnedUserId,
+        OwnedUserId, UserId,
     },
     Room,
 };
 use regex::Regex;
 use serde::Deserialize;
-use std::{fs::File, io::Read, path::PathBuf, sync::Mutex};
+use std::format;
+use std::{collections::HashMap, fs::File, io::Read, path::PathBuf, sync::Mutex};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -39,6 +40,8 @@ pub struct Config {
     password: Option<String>,
     /// Allow list of which accounts we will respond to
     allow_list: Option<String>,
+    /// Per-account message limit while the bot is running
+    message_limit: Option<u64>,
     /// Set the state directory for chaz
     /// Defaults to $XDG_STATE_HOME/chaz
     state_dir: Option<String>,
@@ -55,7 +58,11 @@ pub struct Config {
 }
 
 lazy_static! {
+    /// Holds the config for the bot
     static ref GLOBAL_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+
+    /// Count of the global messages per user
+    static ref GLOBAL_MESSAGES: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
 }
 
 #[tokio::main]
@@ -127,6 +134,22 @@ async fn main() -> anyhow::Result<()> {
         "send",
         "<message> - Send this message without context".to_string(),
         |_, text, room| async move {
+            if rate_limit(room.client().user_id().unwrap()) {
+                let message_limit = GLOBAL_CONFIG
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap()
+                    .message_limit
+                    .unwrap_or(0);
+                room.send(RoomMessageEventContent::text_plain(format!(
+                    ".error: you have used  up your message limit of {} messages.",
+                    message_limit
+                )))
+                .await
+                .unwrap();
+                return Ok(());
+            }
             let input = text.trim_start_matches(".send").trim();
 
             // But we do need to read the context to figure out the model to use
@@ -177,6 +200,22 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     bot.register_text_handler(|_, _, room| async move {
+        if rate_limit(room.client().user_id().unwrap()) {
+            let message_limit = GLOBAL_CONFIG
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap()
+                .message_limit
+                .unwrap_or(0);
+            room.send(RoomMessageEventContent::text_plain(format!(
+                ".error: you have used  up your message limit of {} messages.",
+                message_limit
+            )))
+            .await
+            .unwrap();
+            return Ok(());
+        }
         // If it's not a command, we should send the full context without commands to the server
         if let Ok((context, model, media)) = get_context(&room).await {
             let mut context = add_role(&context);
@@ -218,6 +257,33 @@ fn add_role(context: &str) -> String {
         config.roles.clone(),
         DEFAULT_CONFIG.roles.clone(),
     )
+}
+
+/// Rate limit the user to a set number of messages
+/// Returns true if the user is being rate limited
+fn rate_limit(user_id: &UserId) -> bool {
+    // Check if there's a limit
+    let message_limit = GLOBAL_CONFIG
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .message_limit
+        .unwrap_or(0);
+    if message_limit == 0 {
+        return false;
+    }
+    let mut messages = GLOBAL_MESSAGES.lock().unwrap();
+    if let Some(count) = messages.get_mut(user_id.as_str()) {
+        if *count < message_limit {
+            *count += 1;
+            return false;
+        }
+        return true;
+    }
+    // Increment count and store that in messages
+    messages.insert(user_id.as_str().to_string(), 1);
+    false
 }
 
 /// List the available models
