@@ -33,7 +33,7 @@ allow_list: "" # Regex for allowed accounts.
 state_dir: "$XDG_STATE_HOME/chaz" # Optional, for setting the chaz state directory
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
-role: chaz # Optionally set a role, AKA system prompt. Set to chaz for the full chaz experience
+role: chaz # Optionally set a role, AKA system prompt. Set to `chaz` for the full chaz experience, or `cave-chaz` for even more chaz
 roles: # Optional, define your own roles
   - name: chaz # This one is predefined
     description: Chaz is Chaz
