@@ -30,6 +30,12 @@ username: ""
 # Optional. Set a role, A.K.A. system prompt, to use by default
 #role: ""
 
+# Optional. Set a per-account message limit. 0 = Unlimited.
+#message_limit: 0
+
+# Optional. Set a room size limit to respond in. 0 = Unlimited
+#room_size_limit: 0
+
 # Predefined roles here to use above
 # These roles are builtin and can be set by any user
 roles:
