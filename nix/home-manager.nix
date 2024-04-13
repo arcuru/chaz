@@ -40,6 +40,7 @@ in {
       };
 
       Service = {
+        Environment = "RUST_LOG=error";
         ExecStart = "${cfg.package}/bin/chaz --config ${yamlFormat.generate "config.yml" (cfg.settings)}";
         Restart = "always";
       };
