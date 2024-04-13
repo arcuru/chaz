@@ -1,4 +1,5 @@
 use std::process::Command;
+use tracing::info;
 
 pub struct AiChat {
     binary_location: String,
@@ -86,11 +87,11 @@ impl AiChat {
             }
         }
         command.arg("--").arg(prompt);
-        eprintln!("Running command: {:?}", command);
+        info!("Running command: {:?}", command);
 
         let output = command.output().expect("Failed to execute command");
 
-        eprintln!("Output: {:?}", output);
+        info!("Output: {:?}", output);
 
         // return the output as a string
         String::from_utf8(output.stdout).map_err(|_| ())

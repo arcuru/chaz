@@ -23,6 +23,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::format;
 use std::{collections::HashMap, fs::File, io::Read, path::PathBuf, sync::Mutex};
+use tracing::error;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -94,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     if let Err(e) = bot.login().await {
-        eprintln!("Error logging in: {e}");
+        error!("Error logging in: {e}");
     }
 
     // React to invites.
@@ -104,10 +105,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Syncs to the current state
     if let Err(e) = bot.sync().await {
-        eprintln!("Error syncing: {e}");
+        error!("Error syncing: {e}");
     }
 
-    eprintln!("The client is ready! Listening to new messages…");
+    error!("The client is ready! Listening to new messages…");
 
     // The party command is from the matrix-rust-sdk examples
     // Keeping it as an easter egg
@@ -136,8 +137,7 @@ async fn main() -> anyhow::Result<()> {
         "send",
         "<message> - Send this message without context".to_string(),
         |sender, text, room| async move {
-            if rate_limit(&room, sender).await {
-                room.send(RoomMessageEventContent::text_plain(".error: blocked"));
+            if rate_limit(&room, &sender).await {
                 return Ok(());
             }
             let input = text.trim_start_matches(".send").trim();
@@ -145,9 +145,19 @@ async fn main() -> anyhow::Result<()> {
             // But we do need to read the context to figure out the model to use
             let (_, model, _) = get_context(&room).await.unwrap();
 
+            error!(
+                "Request: {} - {}",
+                sender.as_str(),
+                input.replace('\n', " ")
+            );
             if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new()) {
                 // Add the prefix ".response:\n" to the result
                 // That way we can identify our own responses and ignore them for context
+                error!(
+                    "Response: {} - {}",
+                    sender.as_str(),
+                    result.replace('\n', " ")
+                );
                 let result = format!(".response:\n{}", result);
                 let content = RoomMessageEventContent::text_plain(result);
 
@@ -190,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     bot.register_text_handler(|sender, _, room| async move {
-        if rate_limit(&room, sender).await {
+        if rate_limit(&room, &sender).await {
             return Ok(());
         }
         // If it's not a command, we should send the full context without commands to the server
@@ -199,7 +209,17 @@ async fn main() -> anyhow::Result<()> {
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
             context.push_str("ASSISTANT: ");
 
+            error!(
+                "Request: {} - {}",
+                sender.as_str(),
+                context.replace('\n', " ")
+            );
             if let Ok(result) = get_backend().execute(&model, context, media) {
+                error!(
+                    "Response: {} - {}",
+                    sender.as_str(),
+                    result.replace('\n', " ")
+                );
                 let content = if result.is_empty() {
                     RoomMessageEventContent::text_plain(".error: No response")
                 } else {
@@ -219,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Run the bot, this should never return except on error
     if let Err(e) = bot.run().await {
-        eprintln!("Error running bot: {e}");
+        error!("Error running bot: {e}");
     }
 
     Ok(())
@@ -238,7 +258,7 @@ fn add_role(context: &str) -> String {
 
 /// Rate limit the user to a set number of messages
 /// Returns true if the user is being rate limited
-async fn rate_limit(room: &Room, sender: OwnedUserId) -> bool {
+async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
     let room_size = room
         .members(RoomMemberships::ACTIVE)
         .await
@@ -279,7 +299,7 @@ async fn rate_limit(room: &Room, sender: OwnedUserId) -> bool {
         }
         *count
     };
-    eprintln!("User {} has sent {} messages", sender, count);
+    error!("User {} has sent {} messages", sender, count);
     room.send(RoomMessageEventContent::text_plain(format!(
         ".error: you have used up your message limit of {} messages.",
         message_limit
@@ -331,7 +351,10 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
     Ok(())
 }
 
-async fn rename(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
+async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
+    if rate_limit(&room, &sender).await {
+        return Ok(());
+    }
     if let Ok((context, _, _)) = get_context(&room).await {
         let title_prompt= [
                             &context,
@@ -343,9 +366,18 @@ async fn rename(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
                         ].join("");
         let model = get_chat_summary_model();
 
+        error!(
+            "Request: {} - {}",
+            sender.as_str(),
+            title_prompt.replace('\n', " ")
+        );
         let response = get_backend().execute(&model, title_prompt, Vec::new());
         if let Ok(result) = response {
-            eprintln!("Result: {}", result);
+            error!(
+                "Response: {} - {}",
+                sender.as_str(),
+                result.replace('\n', " ")
+            );
             let result = clean_summary_response(&result, None);
             if room.set_name(result).await.is_err() {
                 room.send(RoomMessageEventContent::text_plain(
@@ -368,9 +400,18 @@ async fn rename(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         ]
         .join("");
 
+        error!(
+            "Request: {} - {}",
+            sender.as_str(),
+            topic_prompt.replace('\n', " ")
+        );
         let response = get_backend().execute(&model, topic_prompt, Vec::new());
         if let Ok(result) = response {
-            eprintln!("Result: {}", result);
+            error!(
+                "Response: {} - {}",
+                sender.as_str(),
+                result.replace('\n', " ")
+            );
             let result = clean_summary_response(&result, None);
             if room.set_room_topic(&result).await.is_err() {
                 room.send(RoomMessageEventContent::text_plain(
