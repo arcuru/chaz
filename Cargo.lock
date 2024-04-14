@@ -1053,8 +1053,7 @@ dependencies = [
 [[package]]
 name = "headjack"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12f2f17d1d1cf8831b3f33f7c3e64f6ea903cb046edc287be4a22ed03f013dc"
+source = "git+https://github.com/arcuru/headjack.git?rev=91856c08e49ebe3b6e68726321500beacd20ca42#91856c08e49ebe3b6e68726321500beacd20ca42"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1065,6 +1064,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
