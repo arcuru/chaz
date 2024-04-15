@@ -9,6 +9,25 @@ It is a bot that should be usable with any homeserver, you'll just need to creat
 
 You will need your own API keys or your own local AI already configured.
 
+## Usage
+
+Chaz will automatically accept Room invites for any user in the `allow_list`.
+
+When it's in a room, it will watch for commands that are prefixed by `.`, and any other messages will be sent to the configured backend.
+
+The commands that it recognizes are:
+
+``` markdown
+Available commands:
+- .print - Print the conversation
+- .send - <message> - Send this message without context
+- .model - <model> - Select the model to use
+- .list - List available models
+- .clear - Ignore all messages before this point
+- .rename - Rename the room and set the topic based on the chat content
+- .help - Show this message
+```
+
 ## Install
 
 `chaz` is only packaged on crates.io, but it's recommended that you run from git HEAD for now.
