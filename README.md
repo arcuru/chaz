@@ -11,6 +11,8 @@ You will need your own API keys or your own local AI already configured.
 
 This is built using [headjack](https://github.com/arcuru/headjack), a Matrix bot framework developed alongside it.
 
+Announcement Blog Post: [Chaz: An LLM <-> Matrix Chatbot ](https://jackson.dev/post/chaz/)
+
 ## Usage
 
 Chaz will automatically accept Room invites for any user in the `allow_list`.
