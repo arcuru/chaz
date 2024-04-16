@@ -19,8 +19,9 @@ When it's in a room, it will watch for commands that are prefixed by `.`, and an
 
 The commands that it recognizes are:
 
-``` markdown
+```markdown
 Available commands:
+
 - .print - Print the conversation
 - .send - <message> - Send this message without context
 - .model - <model> - Select the model to use
