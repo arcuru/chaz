@@ -13,6 +13,10 @@ This is built using [headjack](https://github.com/arcuru/headjack), a Matrix bot
 
 Announcement Blog Post: [Chaz: An LLM <-> Matrix Chatbot ](https://jackson.dev/post/chaz/)
 
+## Getting Help
+
+There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to/#/#chaz:jackson.dev)
+
 ## Usage
 
 Chaz will automatically accept Room invites for any user in the `allow_list`.
