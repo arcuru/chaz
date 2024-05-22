@@ -470,15 +470,19 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
     'outer: while let Ok(batch) = room.messages(options).await {
         // This assumes that the messages are in reverse order
         for message in batch.chunk {
-            if let Ok(content) = message
+            if let Some((sender, content)) = message
                 .event
-                .get_field::<RoomMessageEventContent>("content")
+                .get_field::<String>("sender")
+                .unwrap_or(None)
+                .zip(
+                    message
+                        .event
+                        .get_field::<RoomMessageEventContent>("content")
+                        .unwrap_or(None),
+                )
             {
-                let Ok(sender) = message.event.get_field::<String>("sender") else {
-                    continue;
-                };
-                if let Some(content) = content {
-                    if let MessageType::Image(image_content) = &content.msgtype {
+                match &content.msgtype {
+                    MessageType::Image(image_content) => {
                         let request = MediaRequest {
                             source: image_content.source.clone(),
                             format: MediaFormat::File,
@@ -499,40 +503,41 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                             .await
                             .unwrap();
                         media.insert(0, x);
-                        continue;
                     }
-                    let MessageType::Text(text_content) = content.msgtype else {
-                        continue;
-                    };
-                    if is_command(&text_content.body) {
-                        // if the message is a valid model command, set the model
-                        if text_content.body.starts_with(".model") && model_response.is_none() {
-                            let model = text_content.body.split_whitespace().nth(1);
-                            if let Some(model) = model {
-                                // Add the config_dir from the global config
-                                let models = get_backend().list_models();
-                                if models.contains(&model.to_string()) {
-                                    model_response = Some(model.to_string());
+                    MessageType::Text(text_content) => {
+                        if is_command(&text_content.body) {
+                            // if the message is a valid model command, set the model
+                            if text_content.body.starts_with(".model") && model_response.is_none() {
+                                let model = text_content.body.split_whitespace().nth(1);
+                                if let Some(model) = model {
+                                    // Add the config_dir from the global config
+                                    let models = get_backend().list_models();
+                                    if models.contains(&model.to_string()) {
+                                        model_response = Some(model.to_string());
+                                    }
                                 }
                             }
+                            // if the message was a clear command, we are finished
+                            if text_content.body.starts_with(".clear") {
+                                break 'outer;
+                            }
+                        } else {
+                            // Push the sender and message to the front of the string
+                            if room
+                                .client()
+                                .user_id()
+                                .is_some_and(|uid| sender == uid.as_str())
+                            {
+                                // If the sender is the bot, prefix the message with "ASSISTANT: "
+                                messages.push(format!("ASSISTANT: {}\n", text_content.body));
+                            } else {
+                                // Otherwise, prefix the message with "USER: "
+                                messages.push(format!("USER: {}\n", text_content.body));
+                            }
                         }
-                        // if the message was a clear command, we are finished
-                        if text_content.body.starts_with(".clear") {
-                            break 'outer;
-                        }
-                        // Ignore other commands
-                        continue;
                     }
-                    // Push the sender and message to the front of the string
-                    let sender = sender.unwrap_or("".to_string());
-                    if sender == room.client().user_id().unwrap().as_str() {
-                        // If the sender is the bot, prefix the message with "ASSISTANT: "
-                        messages.push(format!("ASSISTANT: {}\n", text_content.body));
-                    } else {
-                        // Otherwise, prefix the message with "USER: "
-                        messages.push(format!("USER: {}\n", text_content.body));
-                    }
-                }
+                    _ => {}
+                };
             }
         }
         if let Some(token) = batch.end {
