@@ -214,24 +214,22 @@ async fn main() -> anyhow::Result<()> {
                 sender.as_str(),
                 context.replace('\n', " ")
             );
-            if let Ok(result) = get_backend().execute(&model, context, media) {
-                info!(
-                    "Response: {} - {}",
-                    sender.as_str(),
-                    result.replace('\n', " ")
-                );
-                let content = if result.is_empty() {
-                    RoomMessageEventContent::text_plain(".error: No response")
-                } else {
-                    RoomMessageEventContent::text_plain(result)
-                };
-                room.send(content).await.unwrap();
-            } else {
-                room.send(RoomMessageEventContent::text_plain(
-                    ".error: Failed to generate response",
-                ))
-                .await
-                .unwrap();
+            match get_backend().execute(&model, context, media) {
+                Ok(stdout) => {
+                    info!("Response: {}", stdout.replace('\n', " "));
+                    room.send(RoomMessageEventContent::text_plain(stdout))
+                        .await
+                        .unwrap();
+                }
+                Err(stderr) => {
+                    error!("Error: {}", stderr.replace('\n', " "));
+                    room.send(RoomMessageEventContent::text_plain(format!(
+                        ".error: {}",
+                        stderr.replace('\n', " ")
+                    )))
+                    .await
+                    .unwrap();
+                }
             }
         }
         Ok(())
