@@ -23,7 +23,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::format;
 use std::{collections::HashMap, fs::File, io::Read, path::PathBuf, sync::Mutex};
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -105,10 +105,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Syncs to the current state
     if let Err(e) = bot.sync().await {
-        error!("Error syncing: {e}");
+        info!("Error syncing: {e}");
     }
 
-    error!("The client is ready! Listening to new messages…");
+    info!("The client is ready! Listening to new messages…");
 
     // The party command is from the matrix-rust-sdk examples
     // Keeping it as an easter egg
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
             // But we do need to read the context to figure out the model to use
             let (_, model, _) = get_context(&room).await.unwrap();
 
-            error!(
+            info!(
                 "Request: {} - {}",
                 sender.as_str(),
                 input.replace('\n', " ")
@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
             if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new()) {
                 // Add the prefix ".response:\n" to the result
                 // That way we can identify our own responses and ignore them for context
-                error!(
+                info!(
                     "Response: {} - {}",
                     sender.as_str(),
                     result.replace('\n', " ")
@@ -209,13 +209,13 @@ async fn main() -> anyhow::Result<()> {
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
             context.push_str("ASSISTANT: ");
 
-            error!(
+            info!(
                 "Request: {} - {}",
                 sender.as_str(),
                 context.replace('\n', " ")
             );
             if let Ok(result) = get_backend().execute(&model, context, media) {
-                error!(
+                info!(
                     "Response: {} - {}",
                     sender.as_str(),
                     result.replace('\n', " ")
@@ -366,14 +366,14 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
                         ].join("");
         let model = get_chat_summary_model();
 
-        error!(
+        info!(
             "Request: {} - {}",
             sender.as_str(),
             title_prompt.replace('\n', " ")
         );
         let response = get_backend().execute(&model, title_prompt, Vec::new());
         if let Ok(result) = response {
-            error!(
+            info!(
                 "Response: {} - {}",
                 sender.as_str(),
                 result.replace('\n', " ")
@@ -400,14 +400,14 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         ]
         .join("");
 
-        error!(
+        info!(
             "Request: {} - {}",
             sender.as_str(),
             topic_prompt.replace('\n', " ")
         );
         let response = get_backend().execute(&model, topic_prompt, Vec::new());
         if let Ok(result) = response {
-            error!(
+            info!(
                 "Response: {} - {}",
                 sender.as_str(),
                 result.replace('\n', " ")
