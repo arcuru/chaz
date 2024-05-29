@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     // The party command is from the matrix-rust-sdk examples
     // Keeping it as an easter egg
     bot.register_text_command("party", None, |_, _, room| async move {
-        let content = RoomMessageEventContent::text_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+        let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
         room.send(content).await.unwrap();
         Ok(())
     })
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
             let (context, _, _) = get_context(&room).await.unwrap();
             let mut context = add_role(&context);
             context.insert_str(0, ".context:\n");
-            let content = RoomMessageEventContent::text_plain(context);
+            let content = RoomMessageEventContent::notice_plain(context);
             room.send(content).await.unwrap();
             Ok(())
         },
@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     result.replace('\n', " ")
                 );
                 let result = format!(".response:\n{}", result);
-                let content = RoomMessageEventContent::text_plain(result);
+                let content = RoomMessageEventContent::notice_plain(result);
 
                 room.send(content).await.unwrap();
             }
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
         "clear",
         "Ignore all messages before this point".to_string(),
         |_, _, room| async move {
-            room.send(RoomMessageEventContent::text_plain(
+            room.send(RoomMessageEventContent::notice_plain(
                 ".clear: All messages before this will be ignored",
             ))
             .await
@@ -223,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(stderr) => {
                     error!("Error: {}", stderr.replace('\n', " "));
-                    room.send(RoomMessageEventContent::text_plain(format!(
+                    room.send(RoomMessageEventContent::notice_plain(format!(
                         ".error: {}",
                         stderr.replace('\n', " ")
                     )))
@@ -298,7 +298,7 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
         *count
     };
     error!("User {} has sent {} messages", sender, count);
-    room.send(RoomMessageEventContent::text_plain(format!(
+    room.send(RoomMessageEventContent::notice_plain(format!(
         ".error: you have used up your message limit of {} messages.",
         message_limit
     )))
@@ -315,7 +315,7 @@ async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         current_model.unwrap_or(get_backend().default_model()),
         get_backend().list_models().join("\n")
     );
-    room.send(RoomMessageEventContent::text_plain(response))
+    room.send(RoomMessageEventContent::notice_plain(response))
         .await
         .unwrap();
     Ok(())
@@ -330,7 +330,7 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
         if models.contains(&model.to_string()) {
             // Set the model
             let response = format!(".model: Set to \"{}\"", model);
-            room.send(RoomMessageEventContent::text_plain(response))
+            room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
         } else {
@@ -339,7 +339,7 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
                 model,
                 models.join("\n")
             );
-            room.send(RoomMessageEventContent::text_plain(response))
+            room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
         }
@@ -378,7 +378,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             );
             let result = clean_summary_response(&result, None);
             if room.set_name(result).await.is_err() {
-                room.send(RoomMessageEventContent::text_plain(
+                room.send(RoomMessageEventContent::notice_plain(
                     ".error: I don't have permission to rename the room",
                 ))
                 .await
@@ -412,7 +412,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             );
             let result = clean_summary_response(&result, None);
             if room.set_room_topic(&result).await.is_err() {
-                room.send(RoomMessageEventContent::text_plain(
+                room.send(RoomMessageEventContent::notice_plain(
                     ".error: I don't have permission to set the topic",
                 ))
                 .await
