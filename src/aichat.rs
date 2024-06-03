@@ -70,7 +70,7 @@ impl AiChat {
         model: &Option<String>,
         prompt: String,
         media: Vec<matrix_sdk::media::MediaFileHandle>,
-    ) -> Result<String, ()> {
+    ) -> Result<String, String> {
         let mut command = Command::new(&self.binary_location);
         if let Some(model) = model {
             command.arg("--model").arg(model);
@@ -94,6 +94,17 @@ impl AiChat {
         info!("Output: {:?}", output);
 
         // return the output as a string
-        String::from_utf8(output.stdout).map_err(|_| ())
+        if output.stdout.is_empty() {
+            // if stdout is empty, something is clearly wrong and we actually have an error
+            let stderr =
+                String::from_utf8(output.stderr).map_err(|_| "Error decoding stderr".to_string());
+            if let Ok(err) = stderr {
+                Result::Err(err)
+            } else {
+                stderr
+            }
+        } else {
+            String::from_utf8(output.stdout).map_err(|_| "Error decoding stdout".to_string())
+        }
     }
 }

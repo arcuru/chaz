@@ -23,7 +23,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::format;
 use std::{collections::HashMap, fs::File, io::Read, path::PathBuf, sync::Mutex};
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -105,15 +105,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Syncs to the current state
     if let Err(e) = bot.sync().await {
-        error!("Error syncing: {e}");
+        info!("Error syncing: {e}");
     }
 
-    error!("The client is ready! Listening to new messages…");
+    info!("The client is ready! Listening to new messages…");
 
     // The party command is from the matrix-rust-sdk examples
     // Keeping it as an easter egg
     bot.register_text_command("party", None, |_, _, room| async move {
-        let content = RoomMessageEventContent::text_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+        let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
         room.send(content).await.unwrap();
         Ok(())
     })
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
             let (context, _, _) = get_context(&room).await.unwrap();
             let mut context = add_role(&context);
             context.insert_str(0, ".context:\n");
-            let content = RoomMessageEventContent::text_plain(context);
+            let content = RoomMessageEventContent::notice_plain(context);
             room.send(content).await.unwrap();
             Ok(())
         },
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
             // But we do need to read the context to figure out the model to use
             let (_, model, _) = get_context(&room).await.unwrap();
 
-            error!(
+            info!(
                 "Request: {} - {}",
                 sender.as_str(),
                 input.replace('\n', " ")
@@ -153,13 +153,13 @@ async fn main() -> anyhow::Result<()> {
             if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new()) {
                 // Add the prefix ".response:\n" to the result
                 // That way we can identify our own responses and ignore them for context
-                error!(
+                info!(
                     "Response: {} - {}",
                     sender.as_str(),
                     result.replace('\n', " ")
                 );
                 let result = format!(".response:\n{}", result);
-                let content = RoomMessageEventContent::text_plain(result);
+                let content = RoomMessageEventContent::notice_plain(result);
 
                 room.send(content).await.unwrap();
             }
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
         "clear",
         "Ignore all messages before this point".to_string(),
         |_, _, room| async move {
-            room.send(RoomMessageEventContent::text_plain(
+            room.send(RoomMessageEventContent::notice_plain(
                 ".clear: All messages before this will be ignored",
             ))
             .await
@@ -209,29 +209,27 @@ async fn main() -> anyhow::Result<()> {
             // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
             context.push_str("ASSISTANT: ");
 
-            error!(
+            info!(
                 "Request: {} - {}",
                 sender.as_str(),
                 context.replace('\n', " ")
             );
-            if let Ok(result) = get_backend().execute(&model, context, media) {
-                error!(
-                    "Response: {} - {}",
-                    sender.as_str(),
-                    result.replace('\n', " ")
-                );
-                let content = if result.is_empty() {
-                    RoomMessageEventContent::text_plain(".error: No response")
-                } else {
-                    RoomMessageEventContent::text_plain(result)
-                };
-                room.send(content).await.unwrap();
-            } else {
-                room.send(RoomMessageEventContent::text_plain(
-                    ".error: Failed to generate response",
-                ))
-                .await
-                .unwrap();
+            match get_backend().execute(&model, context, media) {
+                Ok(stdout) => {
+                    info!("Response: {}", stdout.replace('\n', " "));
+                    room.send(RoomMessageEventContent::text_plain(stdout))
+                        .await
+                        .unwrap();
+                }
+                Err(stderr) => {
+                    error!("Error: {}", stderr.replace('\n', " "));
+                    room.send(RoomMessageEventContent::notice_plain(format!(
+                        ".error: {}",
+                        stderr.replace('\n', " ")
+                    )))
+                    .await
+                    .unwrap();
+                }
             }
         }
         Ok(())
@@ -300,7 +298,7 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
         *count
     };
     error!("User {} has sent {} messages", sender, count);
-    room.send(RoomMessageEventContent::text_plain(format!(
+    room.send(RoomMessageEventContent::notice_plain(format!(
         ".error: you have used up your message limit of {} messages.",
         message_limit
     )))
@@ -317,7 +315,7 @@ async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         current_model.unwrap_or(get_backend().default_model()),
         get_backend().list_models().join("\n")
     );
-    room.send(RoomMessageEventContent::text_plain(response))
+    room.send(RoomMessageEventContent::notice_plain(response))
         .await
         .unwrap();
     Ok(())
@@ -332,7 +330,7 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
         if models.contains(&model.to_string()) {
             // Set the model
             let response = format!(".model: Set to \"{}\"", model);
-            room.send(RoomMessageEventContent::text_plain(response))
+            room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
         } else {
@@ -341,7 +339,7 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
                 model,
                 models.join("\n")
             );
-            room.send(RoomMessageEventContent::text_plain(response))
+            room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
         }
@@ -366,21 +364,21 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
                         ].join("");
         let model = get_chat_summary_model();
 
-        error!(
+        info!(
             "Request: {} - {}",
             sender.as_str(),
             title_prompt.replace('\n', " ")
         );
         let response = get_backend().execute(&model, title_prompt, Vec::new());
         if let Ok(result) = response {
-            error!(
+            info!(
                 "Response: {} - {}",
                 sender.as_str(),
                 result.replace('\n', " ")
             );
             let result = clean_summary_response(&result, None);
             if room.set_name(result).await.is_err() {
-                room.send(RoomMessageEventContent::text_plain(
+                room.send(RoomMessageEventContent::notice_plain(
                     ".error: I don't have permission to rename the room",
                 ))
                 .await
@@ -400,21 +398,21 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         ]
         .join("");
 
-        error!(
+        info!(
             "Request: {} - {}",
             sender.as_str(),
             topic_prompt.replace('\n', " ")
         );
         let response = get_backend().execute(&model, topic_prompt, Vec::new());
         if let Ok(result) = response {
-            error!(
+            info!(
                 "Response: {} - {}",
                 sender.as_str(),
                 result.replace('\n', " ")
             );
             let result = clean_summary_response(&result, None);
             if room.set_room_topic(&result).await.is_err() {
-                room.send(RoomMessageEventContent::text_plain(
+                room.send(RoomMessageEventContent::notice_plain(
                     ".error: I don't have permission to set the topic",
                 ))
                 .await
@@ -470,15 +468,19 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
     'outer: while let Ok(batch) = room.messages(options).await {
         // This assumes that the messages are in reverse order
         for message in batch.chunk {
-            if let Ok(content) = message
+            if let Some((sender, content)) = message
                 .event
-                .get_field::<RoomMessageEventContent>("content")
+                .get_field::<String>("sender")
+                .unwrap_or(None)
+                .zip(
+                    message
+                        .event
+                        .get_field::<RoomMessageEventContent>("content")
+                        .unwrap_or(None),
+                )
             {
-                let Ok(sender) = message.event.get_field::<String>("sender") else {
-                    continue;
-                };
-                if let Some(content) = content {
-                    if let MessageType::Image(image_content) = &content.msgtype {
+                match &content.msgtype {
+                    MessageType::Image(image_content) => {
                         let request = MediaRequest {
                             source: image_content.source.clone(),
                             format: MediaFormat::File,
@@ -499,40 +501,41 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                             .await
                             .unwrap();
                         media.insert(0, x);
-                        continue;
                     }
-                    let MessageType::Text(text_content) = content.msgtype else {
-                        continue;
-                    };
-                    if is_command(&text_content.body) {
-                        // if the message is a valid model command, set the model
-                        if text_content.body.starts_with(".model") && model_response.is_none() {
-                            let model = text_content.body.split_whitespace().nth(1);
-                            if let Some(model) = model {
-                                // Add the config_dir from the global config
-                                let models = get_backend().list_models();
-                                if models.contains(&model.to_string()) {
-                                    model_response = Some(model.to_string());
+                    MessageType::Text(text_content) => {
+                        if is_command(&text_content.body) {
+                            // if the message is a valid model command, set the model
+                            if text_content.body.starts_with(".model") && model_response.is_none() {
+                                let model = text_content.body.split_whitespace().nth(1);
+                                if let Some(model) = model {
+                                    // Add the config_dir from the global config
+                                    let models = get_backend().list_models();
+                                    if models.contains(&model.to_string()) {
+                                        model_response = Some(model.to_string());
+                                    }
                                 }
                             }
+                            // if the message was a clear command, we are finished
+                            if text_content.body.starts_with(".clear") {
+                                break 'outer;
+                            }
+                        } else {
+                            // Push the sender and message to the front of the string
+                            if room
+                                .client()
+                                .user_id()
+                                .is_some_and(|uid| sender == uid.as_str())
+                            {
+                                // If the sender is the bot, prefix the message with "ASSISTANT: "
+                                messages.push(format!("ASSISTANT: {}\n", text_content.body));
+                            } else {
+                                // Otherwise, prefix the message with "USER: "
+                                messages.push(format!("USER: {}\n", text_content.body));
+                            }
                         }
-                        // if the message was a clear command, we are finished
-                        if text_content.body.starts_with(".clear") {
-                            break 'outer;
-                        }
-                        // Ignore other commands
-                        continue;
                     }
-                    // Push the sender and message to the front of the string
-                    let sender = sender.unwrap_or("".to_string());
-                    if sender == room.client().user_id().unwrap().as_str() {
-                        // If the sender is the bot, prefix the message with "ASSISTANT: "
-                        messages.push(format!("ASSISTANT: {}\n", text_content.body));
-                    } else {
-                        // Otherwise, prefix the message with "USER: "
-                        messages.push(format!("USER: {}\n", text_content.body));
-                    }
-                }
+                    _ => {}
+                };
             }
         }
         if let Some(token) = batch.end {
