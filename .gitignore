@@ -16,3 +16,5 @@
 
 # Local cache files for testing
 /.cache
+config.yml
+.pre-commit-config.yaml
