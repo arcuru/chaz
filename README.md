@@ -11,7 +11,7 @@ You will need your own API keys or your own local AI already configured.
 
 This is built using [headjack](https://github.com/arcuru/headjack), a Matrix bot framework developed alongside it.
 
-Announcement Blog Post: [Chaz: An LLM <-> Matrix Chatbot ](https://jackson.dev/post/chaz/)
+Announcement Blog Post: [Chaz: An LLM <-> Matrix Chatbot](https://jackson.dev/post/chaz/)
 
 ## Getting Help
 
@@ -21,20 +21,21 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 
 Chaz will automatically accept Room invites for any user in the `allow_list`.
 
-When it's in a room, it will watch for commands that are prefixed by `.`, and any other messages will be sent to the configured backend.
+When it's in a room, it will watch for commands that are prefixed by `!chaz`, and any other messages will be sent to the configured backend.
 
 The commands that it recognizes are:
 
 ```markdown
-Available commands:
+!chaz help
 
-- .print - Print the conversation
-- .send - <message> - Send this message without context
-- .model - <model> - Select the model to use
-- .list - List available models
-- .clear - Ignore all messages before this point
-- .rename - Rename the room and set the topic based on the chat content
-- .help - Show this message
+Available commands:
+!chaz print - Print the conversation
+!chaz send <message> - Send a message without context
+!chaz model <model> - Select the model to use
+!chaz list - List available models
+!chaz clear - Ignore all messages before this point
+!chaz rename - Rename the room and set the topic based on the chat content
+!chaz help - Show this message
 ```
 
 ## Install
