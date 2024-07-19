@@ -21,7 +21,12 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 
 Chaz will automatically accept Room invites for any user in the `allow_list`.
 
-When it's in a room, it will watch for commands that are prefixed by `!chaz`, and any other messages will be sent to the configured backend.
+When it's in a room, it will watch for commands that are prefixed by `!chaz`.
+If it's a DM, it will respond to every message that it doesn't recognize as a command.
+If it's in a larger room, it will only respond to messages that are sent to it using `!chaz`.
+
+So in a larger room, send just `!chaz` and it will be sent all the recent messages in the room and asked for a response.
+You can also send a request along with that, e.g. `!chaz explain that to me`, and it will receive your message and the context of the room and respond.
 
 The commands that it recognizes are:
 
