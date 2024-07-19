@@ -222,7 +222,14 @@ async fn main() -> anyhow::Result<()> {
 
     // The text handler is called for every non-command message
     // It is also called if _only_ `!chaz` is sent. That sounds like a feature to me.
-    bot.register_text_handler(|sender, _, room| async move {
+    bot.register_text_handler(|sender, body: String, room| async move {
+        // If this room is not marked as a direct message, ignore messages
+        // Direct message detection/conversion may be buggy? Recognize a direct message by either the room setting _or_ number of members
+        let is_direct = room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
+        if !is_direct && !body.as_str().starts_with("!chaz") {
+            return Ok(());
+        }
+
         if rate_limit(&room, &sender).await {
             return Ok(());
         }
@@ -543,6 +550,33 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                             // if the message was a clear command, we are finished
                             if text_content.body.starts_with("!chaz clear") {
                                 break 'outer;
+                            }
+                            // if it's not a recognized command, remove the "!chaz" and add that to messages
+                            if text_content.body.starts_with("!chaz") {
+                                let command = text_content.body.trim_start_matches("!chaz").trim();
+                                if command.is_empty() {
+                                    continue;
+                                }
+                                if let Some(command) = command.split_whitespace().next() {
+                                    // Recognized command, so skip adding it
+                                    if [
+                                        "help", "party", "send", "list", "rename", "print",
+                                        "model", "clear",
+                                    ]
+                                    .contains(&command.to_lowercase().as_str())
+                                    {
+                                        continue;
+                                    }
+                                }
+                                if room
+                                    .client()
+                                    .user_id()
+                                    .is_some_and(|uid| sender == uid.as_str())
+                                {
+                                    messages.push(format!("ASSISTANT: {}\n", command));
+                                } else {
+                                    messages.push(format!("USER: {}\n", command));
+                                }
                             }
                         } else {
                             // Push the sender and message to the front of the string
