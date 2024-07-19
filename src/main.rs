@@ -44,7 +44,7 @@ pub struct Config {
     /// Per-account message limit while the bot is running
     message_limit: Option<u64>,
     /// Room size limit to respond to
-    room_size_limit: Option<u64>,
+    room_size_limit: Option<usize>,
     /// Set the state directory for chaz
     /// Defaults to $XDG_STATE_HOME/chaz
     state_dir: Option<String>,
@@ -83,12 +83,14 @@ async fn main() -> anyhow::Result<()> {
 
     // The config file is read, now we can start the bot
     let mut bot = Bot::new(BotConfig {
+        command_prefix: None,
+        room_size_limit: config.room_size_limit,
         login: Login {
             homeserver_url: config.homeserver_url,
             username: config.username.clone(),
             password: config.password,
         },
-        name: Some(config.username.clone()),
+        name: Some("chaz".to_string()),
         allow_list: config.allow_list,
         state_dir: config.state_dir,
     })
@@ -112,20 +114,26 @@ async fn main() -> anyhow::Result<()> {
 
     // The party command is from the matrix-rust-sdk examples
     // Keeping it as an easter egg
-    bot.register_text_command("party", None, |_, _, room| async move {
-        let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
-        room.send(content).await.unwrap();
-        Ok(())
-    })
+    // TODO: Remove `party` from the help text
+    bot.register_text_command(
+        "party",
+        "".to_string(),
+        "Party!".to_string(),
+        |_, _, room| async move {
+            let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+            room.send(content).await.unwrap();
+            Ok(())
+        },
+    )
     .await;
 
     bot.register_text_command(
         "print",
-        "Print the conversation".to_string(),
+        None,
+        Some("Print the conversation".to_string()),
         |_, _, room| async move {
             let (context, _, _) = get_context(&room).await.unwrap();
-            let mut context = add_role(&context);
-            context.insert_str(0, ".context:\n");
+            let context = add_role(&context);
             let content = RoomMessageEventContent::notice_plain(context);
             room.send(content).await.unwrap();
             Ok(())
@@ -135,12 +143,18 @@ async fn main() -> anyhow::Result<()> {
 
     bot.register_text_command(
         "send",
-        "<message> - Send this message without context".to_string(),
+        "<message>".to_string(),
+        "Send a message without context".to_string(),
         |sender, text, room| async move {
             if rate_limit(&room, &sender).await {
                 return Ok(());
             }
-            let input = text.trim_start_matches(".send").trim();
+            // Skip over the command, which is "!chaz send"
+            let input = text
+                .split_whitespace()
+                .skip(2)
+                .collect::<Vec<&str>>()
+                .join(" ");
 
             // But we do need to read the context to figure out the model to use
             let (_, model, _) = get_context(&room).await.unwrap();
@@ -158,7 +172,6 @@ async fn main() -> anyhow::Result<()> {
                     sender.as_str(),
                     result.replace('\n', " ")
                 );
-                let result = format!(".response:\n{}", result);
                 let content = RoomMessageEventContent::notice_plain(result);
 
                 room.send(content).await.unwrap();
@@ -170,20 +183,27 @@ async fn main() -> anyhow::Result<()> {
 
     bot.register_text_command(
         "model",
-        "<model> - Select the model to use".to_string(),
+        "<model>".to_string(),
+        "Select the model to use".to_string(),
         model,
     )
     .await;
 
-    bot.register_text_command("list", "List available models".to_string(), list_models)
-        .await;
+    bot.register_text_command(
+        "list",
+        "".to_string(),
+        "List available models".to_string(),
+        list_models,
+    )
+    .await;
 
     bot.register_text_command(
         "clear",
+        "".to_string(),
         "Ignore all messages before this point".to_string(),
         |_, _, room| async move {
             room.send(RoomMessageEventContent::notice_plain(
-                ".clear: All messages before this will be ignored",
+                "!chaz clear: All messages before this will be ignored",
             ))
             .await
             .unwrap();
@@ -194,11 +214,14 @@ async fn main() -> anyhow::Result<()> {
 
     bot.register_text_command(
         "rename",
+        "".to_string(),
         "Rename the room and set the topic based on the chat content".to_string(),
         rename,
     )
     .await;
 
+    // The text handler is called for every non-command message
+    // It is also called if _only_ `!chaz` is sent. That sounds like a feature to me.
     bot.register_text_handler(|sender, _, room| async move {
         if rate_limit(&room, &sender).await {
             return Ok(());
@@ -222,13 +245,11 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap();
                 }
                 Err(stderr) => {
-                    error!("Error: {}", stderr.replace('\n', " "));
-                    room.send(RoomMessageEventContent::notice_plain(format!(
-                        ".error: {}",
-                        stderr.replace('\n', " ")
-                    )))
-                    .await
-                    .unwrap();
+                    let err = format!("!chaz Error: {}", stderr.replace('\n', " "));
+                    error!(err);
+                    room.send(RoomMessageEventContent::notice_plain(err))
+                        .await
+                        .unwrap();
                 }
             }
         }
@@ -275,7 +296,7 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
         .clone()
         .unwrap()
         .room_size_limit
-        .unwrap_or(u64::max_value());
+        .unwrap_or(usize::max_value());
     let count = {
         let mut messages = GLOBAL_MESSAGES.lock().unwrap();
         let count = match messages.get_mut(sender.as_str()) {
@@ -288,7 +309,7 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
         };
         // If the room is too big we will silently ignore the message
         // This is to prevent the bot from spamming large rooms
-        if room_size as u64 > room_size_limit {
+        if room_size > room_size_limit {
             return true;
         }
         if *count < message_limit {
@@ -299,7 +320,7 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
     };
     error!("User {} has sent {} messages", sender, count);
     room.send(RoomMessageEventContent::notice_plain(format!(
-        ".error: you have used up your message limit of {} messages.",
+        "!chaz Error: you have used up your message limit of {} messages.",
         message_limit
     )))
     .await
@@ -311,7 +332,7 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
 async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     let (_, current_model, _) = get_context(&room).await.unwrap();
     let response = format!(
-        ".models:\n\ncurrent: {}\n\nAvailable Models:\n{}",
+        "!chaz Current Model: {}\n\nAvailable Models:\n{}",
         current_model.unwrap_or(get_backend().default_model()),
         get_backend().list_models().join("\n")
     );
@@ -323,19 +344,19 @@ async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
 
 async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
     // Verify the command is fine
-    // Get the second word in the command
-    let model = text.split_whitespace().nth(1);
+    // Get the third word in the command, `!chaz model <model>`
+    let model = text.split_whitespace().nth(2);
     if let Some(model) = model {
         let models = get_backend().list_models();
         if models.contains(&model.to_string()) {
             // Set the model
-            let response = format!(".model: Set to \"{}\"", model);
+            let response = format!("!chaz Model set to \"{}\"", model);
             room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
         } else {
             let response = format!(
-                ".error: Model \"{}\" not found.\n\nAvailable models:\n{}",
+                "!chaz Error: Model \"{}\" not found.\n\nAvailable models:\n{}",
                 model,
                 models.join("\n")
             );
@@ -379,7 +400,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             let result = clean_summary_response(&result, None);
             if room.set_name(result).await.is_err() {
                 room.send(RoomMessageEventContent::notice_plain(
-                    ".error: I don't have permission to rename the room",
+                    "!chaz Error: I don't have permission to rename the room",
                 ))
                 .await
                 .unwrap();
@@ -413,7 +434,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             let result = clean_summary_response(&result, None);
             if room.set_room_topic(&result).await.is_err() {
                 room.send(RoomMessageEventContent::notice_plain(
-                    ".error: I don't have permission to set the topic",
+                    "!chaz Error: I don't have permission to set the topic",
                 ))
                 .await
                 .unwrap();
@@ -503,10 +524,14 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                         media.insert(0, x);
                     }
                     MessageType::Text(text_content) => {
-                        if is_command(&text_content.body) {
+                        // Commands are always prefixed with a !, regardless of the name
+                        if is_command("!", &text_content.body) {
                             // if the message is a valid model command, set the model
-                            if text_content.body.starts_with(".model") && model_response.is_none() {
-                                let model = text_content.body.split_whitespace().nth(1);
+                            // FIXME: hardcoded name
+                            if text_content.body.starts_with("!chaz model")
+                                && model_response.is_none()
+                            {
+                                let model = text_content.body.split_whitespace().nth(2);
                                 if let Some(model) = model {
                                     // Add the config_dir from the global config
                                     let models = get_backend().list_models();
@@ -516,7 +541,7 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                                 }
                             }
                             // if the message was a clear command, we are finished
-                            if text_content.body.starts_with(".clear") {
+                            if text_content.body.starts_with("!chaz clear") {
                                 break 'outer;
                             }
                         } else {
