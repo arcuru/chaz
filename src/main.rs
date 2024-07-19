@@ -296,14 +296,14 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
         .clone()
         .unwrap()
         .message_limit
-        .unwrap_or(u64::max_value());
+        .unwrap_or(u64::MAX);
     let room_size_limit = GLOBAL_CONFIG
         .lock()
         .unwrap()
         .clone()
         .unwrap()
         .room_size_limit
-        .unwrap_or(usize::max_value());
+        .unwrap_or(usize::MAX);
     let count = {
         let mut messages = GLOBAL_MESSAGES.lock().unwrap();
         let count = match messages.get_mut(sender.as_str()) {
