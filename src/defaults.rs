@@ -36,6 +36,9 @@ username: ""
 # Optional. Set a room size limit to respond in. 0 = Unlimited
 #room_size_limit: 0
 
+# Optional. Set to false to disable sending media context to aichat
+#disable_media_context: false
+
 # Predefined roles here to use above
 # These roles are builtin and can be set by any user
 roles:
