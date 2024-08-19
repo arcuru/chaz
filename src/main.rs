@@ -244,12 +244,16 @@ async fn main() -> anyhow::Result<()> {
                 sender.as_str(),
                 context.replace('\n', " ")
             );
+
+            room.typing_notice(true).await.unwrap();
+
             match get_backend().execute(&model, context, media) {
                 Ok(stdout) => {
                     info!("Response: {}", stdout.replace('\n', " "));
                     room.send(RoomMessageEventContent::text_plain(stdout))
                         .await
                         .unwrap();
+                    room.typing_notice(false).await.unwrap();
                 }
                 Err(stderr) => {
                     let err = format!("!chaz Error: {}", stderr.replace('\n', " "));
@@ -257,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                     room.send(RoomMessageEventContent::notice_plain(err))
                         .await
                         .unwrap();
+                    room.typing_notice(false).await.unwrap();
                 }
             }
         }
