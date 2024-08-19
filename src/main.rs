@@ -222,11 +222,17 @@ async fn main() -> anyhow::Result<()> {
 
     // The text handler is called for every non-command message
     // It is also called if _only_ `!chaz` is sent. That sounds like a feature to me.
-    bot.register_text_handler(|sender, body: String, room| async move {
+    bot.register_text_handler(|sender, body: String, room, event| async move {
         // If this room is not marked as a direct message, ignore messages
         // Direct message detection/conversion may be buggy? Recognize a direct message by either the room setting _or_ number of members
         let is_direct = room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
-        if !is_direct && !body.as_str().starts_with("!chaz") {
+
+        // If the message is not a command, check if it mentions the bot
+        let mentions_bot = event.content.mentions.as_ref()
+            .map(|mentions| mentions.user_ids.iter().any(|mention| mention == room.client().user_id().unwrap()))
+            .unwrap_or(false);
+
+        if !(is_direct || body.starts_with("!chaz") || mentions_bot) {
             return Ok(());
         }
 
