@@ -247,7 +247,8 @@ async fn main() -> anyhow::Result<()> {
             match get_backend().execute(&model, context, media) {
                 Ok(stdout) => {
                     info!("Response: {}", stdout.replace('\n', " "));
-                    room.send(RoomMessageEventContent::text_plain(stdout))
+                    // Most LLMs like responding with Markdown
+                    room.send(RoomMessageEventContent::text_markdown(stdout))
                         .await
                         .unwrap();
                 }
