@@ -58,6 +58,8 @@ pub struct Config {
     role: Option<String>,
     /// Definitions of roles
     roles: Option<Vec<RoleDetails>>,
+    /// Disable sending media context to aichat
+    disable_media_context: Option<bool>,
 }
 
 lazy_static! {
@@ -494,6 +496,9 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
     let mut model_response = None;
     let mut media = Vec::new();
 
+    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+    let enable_media_context = !config.disable_media_context.unwrap_or(false);
+
     'outer: while let Ok(batch) = room.messages(options).await {
         // This assumes that the messages are in reverse order
         for message in batch.chunk {
@@ -510,26 +515,28 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
             {
                 match &content.msgtype {
                     MessageType::Image(image_content) => {
-                        let request = MediaRequest {
-                            source: image_content.source.clone(),
-                            format: MediaFormat::File,
-                        };
-                        let mime = image_content
-                            .info
-                            .as_ref()
-                            .unwrap()
-                            .mimetype
-                            .clone()
-                            .unwrap()
-                            .parse()
-                            .unwrap();
-                        let x = room
-                            .client()
-                            .media()
-                            .get_media_file(&request, None, &mime, true, None)
-                            .await
-                            .unwrap();
-                        media.insert(0, x);
+                        if enable_media_context {
+                            let request = MediaRequest {
+                                source: image_content.source.clone(),
+                                format: MediaFormat::File,
+                            };
+                            let mime = image_content
+                                .info
+                                .as_ref()
+                                .unwrap()
+                                .mimetype
+                                .clone()
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            let x = room
+                                .client()
+                                .media()
+                                .get_media_file(&request, None, &mime, true, None)
+                                .await
+                                .unwrap();
+                            media.insert(0, x);
+                        }
                     }
                     MessageType::Text(text_content) => {
                         // Commands are always prefixed with a !, regardless of the name

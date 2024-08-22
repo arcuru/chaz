@@ -69,6 +69,7 @@ room_size_limit: 0 # Set a room size limit to respond in. 0 = Unlimited
 state_dir: "$XDG_STATE_HOME/chaz" # Optional, for setting the chaz state directory
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
+disable_media_context: false # Optional, set to true to disable sending media context to aichat
 role: chaz # Optionally set a role, AKA system prompt. Set to `chaz` for the full chaz experience, or `cave-chaz` for even more chaz
 roles: # Optional, define your own roles
   - name: chaz # This one is predefined
