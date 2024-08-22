@@ -7,9 +7,11 @@ on:
       - "main"
     tags:
       - "v*"
-  pull_request:
-    branches:
-      - "main"
+  # This is how to build on every PR
+  # The workflow is written so that it can test to see if PRs successfully build.
+  # pull_request:
+  #   branches:
+  #     - "main"
 
 jobs:
   docker:
