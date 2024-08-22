@@ -14,7 +14,7 @@ name = "chaz"
 test = false
 
 [dependencies]
-headjack = "0.4"
+headjack = { git = "https://github.com/arcuru/headjack", rev = "6db2a2e059e6bbc2f47eea3ac58be650bd484bf0" }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "0.3"
