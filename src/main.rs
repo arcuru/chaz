@@ -230,8 +230,16 @@ async fn main() -> anyhow::Result<()> {
         let is_direct = room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
 
         // If the message is not a command, check if it mentions the bot
-        let mentions_bot = event.content.mentions.as_ref()
-            .map(|mentions| mentions.user_ids.iter().any(|mention| mention == room.client().user_id().unwrap()))
+        let mentions_bot = event
+            .content
+            .mentions
+            .as_ref()
+            .map(|mentions| {
+                mentions
+                    .user_ids
+                    .iter()
+                    .any(|mention| mention == room.client().user_id().unwrap())
+            })
             .unwrap_or(false);
 
         if !(is_direct || body.starts_with("!chaz") || mentions_bot) {
