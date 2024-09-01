@@ -64,8 +64,8 @@ homeserver_url: https://matrix.org
 username: "chaz"
 password: "" # Optional, if not given it will ask for it on first run
 allow_list: "" # Regex for allowed accounts.
-message_limit: 0 # Set a per-account message limit. 0 = Unlimited.
-room_size_limit: 0 # Set a room size limit to respond in. 0 = Unlimited
+#message_limit: 0 # Set a per-account message limit, it will not allow more than this many messages per account.
+#room_size_limit: 0 # Set a room size limit. It will refuse join if the room is too large.
 state_dir: "$XDG_STATE_HOME/chaz" # Optional, for setting the chaz state directory
 aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat config
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
