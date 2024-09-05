@@ -11,10 +11,7 @@
       };
     };
 
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
 
     flake-utils.url = "github:numtide/flake-utils";
 
@@ -36,13 +33,6 @@
     inputs.flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import inputs.nixpkgs {
         inherit system;
-        overlays = [
-          (_: prev: {
-            aichat-git = import ./nix/aichat-git.nix {
-              inherit (prev) lib stdenv darwin rustPlatform fetchFromGitHub pkg-config;
-            };
-          })
-        ];
       };
 
       inherit (pkgs) lib;
@@ -53,7 +43,7 @@
       toolChain = fenixStable.completeToolchain;
 
       # Use the toolchain with the crane helper functions
-      craneLib = inputs.crane.lib.${system}.overrideToolchain toolChain;
+      craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
 
       # Clean the src to only have the Rust-relevant files
       # src = let
@@ -149,11 +139,9 @@
             cp ${chaz-unwrapped}/bin/chaz $out/bin
             wrapProgram $out/bin/chaz \
               --prefix PATH : ${lib.makeBinPath [
-              pkgs.aichat-git
+              pkgs.aichat
             ]}
           '';
-        # Expose this for use by any downstream users
-        aichat-git = pkgs.aichat-git;
         default = chaz;
       };
 
