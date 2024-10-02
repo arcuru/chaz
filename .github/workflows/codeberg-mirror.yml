@@ -1,0 +1,18 @@
+name: Codeberg Sync
+on:
+  push:
+    branches:
+    - '**'
+
+jobs:
+  codeberg:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - uses: yesolutions/mirror-action@master
+      with:
+        REMOTE: git@codeberg.org:arcuru/chaz.git
+        GIT_SSH_PRIVATE_KEY: ${{ secrets.GIT_SSH_PRIVATE_KEY }}
+        GIT_SSH_NO_VERIFY_HOST: "true"
