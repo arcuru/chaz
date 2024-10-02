@@ -13,6 +13,10 @@ This is built using [headjack](https://github.com/arcuru/headjack), a Matrix bot
 
 Announcement Blog Post: [Chaz: An LLM <-> Matrix Chatbot](https://jackson.dev/post/chaz/)
 
+## Repository
+
+**Mirrored on [GitHub](https://github.com/arcuru/chaz) and [Codeberg](https://codeberg.org/arcuru/chaz). GitHub is the official repo, but use either repo to contribute. Issues can't be synced so there may be some duplicates.**
+
 ## Getting Help
 
 There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to/#/#chaz:jackson.dev)
