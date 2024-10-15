@@ -19,6 +19,15 @@ pub struct RoleDetails {
     example: Option<Vec<Message>>,
 }
 
+impl RoleDetails {
+    pub fn get_prompt(&self) -> String {
+        if let Some(prompt) = &self.prompt {
+            return prompt.clone();
+        }
+        "".to_string()
+    }
+}
+
 /// A single message in a conversation
 #[derive(Debug, Deserialize, Clone)]
 struct Message {
@@ -127,6 +136,7 @@ pub fn get_role(
 pub fn prepend_role(message: String, role_details: &RoleDetails) -> String {
     let mut role_prompt = role_details.prompt.clone().unwrap_or("".to_string());
     if !role_prompt.is_empty() {
+        role_prompt = format!("SYSTEM: {}", role_prompt);
         role_prompt.push('\n');
     }
     // Add the conversation example if it exists

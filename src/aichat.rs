@@ -1,29 +1,32 @@
+/// AIChat Backend
+///
+/// Implements an interface to AIChat to use it as a general backend for LLMs.
 use std::process::Command;
 use tracing::info;
 
-use crate::ChatContext;
+use crate::{backends::LLMBackend, Backend, ChatContext};
 
 pub struct AiChat {
     binary_location: String,
     config_dir: Option<String>,
-}
-
-impl Default for AiChat {
-    fn default() -> Self {
-        AiChat::new("aichat".to_string(), None)
-    }
+    backend: Backend,
 }
 
 impl AiChat {
-    pub fn new(binary_location: String, config_dir: Option<String>) -> Self {
+    pub fn new(backend: &Backend) -> Self {
         AiChat {
-            binary_location,
-            config_dir,
+            binary_location: "aichat".to_string(),
+            config_dir: backend.config_dir.clone(),
+            backend: backend.clone(),
         }
     }
+}
 
-    /// List the models available to the aichat binary
-    pub fn list_models(&self) -> Vec<String> {
+impl LLMBackend for AiChat {
+    /// List the models known to the aichat binary
+    ///
+    /// This may not be a comprehensive list of available models.
+    fn list_models(&self) -> Vec<String> {
         let mut command = Command::new(self.binary_location.clone());
         command.arg("--list-models");
 
@@ -44,7 +47,9 @@ impl AiChat {
     }
 
     /// Get the default model for the current aichat config
-    pub fn default_model(&self) -> String {
+    ///
+    /// Query the aichat binary for the known models.
+    fn default_model(&self) -> Option<String> {
         let mut command = Command::new(self.binary_location.clone());
         command.arg("--info");
 
@@ -64,12 +69,14 @@ impl AiChat {
             .map(|s| String::from_utf8(s.to_vec()).unwrap())
             .find(|s| s.starts_with("model"))
             .map(|s| s.split_whitespace().nth(1).unwrap().to_string())
-            .unwrap_or("default".to_string())
     }
 
-    pub fn execute(&self, context: &ChatContext) -> Result<String, String> {
+    async fn execute(&self, context: &ChatContext) -> Result<String, String> {
         let mut command = Command::new(&self.binary_location);
         if let Some(model) = &context.model {
+            let model_prefix = self.backend.name.clone().unwrap_or("aichat".to_string());
+
+            let model = model.trim_start_matches(&format!("{}:", model_prefix));
             command.arg("--model").arg(model);
         }
         if let Some(config_dir) = &self.config_dir {
