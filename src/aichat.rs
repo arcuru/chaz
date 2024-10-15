@@ -1,6 +1,8 @@
 use std::process::Command;
 use tracing::info;
 
+use crate::ChatContext;
+
 pub struct AiChat {
     binary_location: String,
     config_dir: Option<String>,
@@ -65,14 +67,9 @@ impl AiChat {
             .unwrap_or("default".to_string())
     }
 
-    pub fn execute(
-        &self,
-        model: &Option<String>,
-        prompt: String,
-        media: Vec<matrix_sdk::media::MediaFileHandle>,
-    ) -> Result<String, String> {
+    pub fn execute(&self, context: &ChatContext) -> Result<String, String> {
         let mut command = Command::new(&self.binary_location);
-        if let Some(model) = model {
+        if let Some(model) = &context.model {
             command.arg("--model").arg(model);
         }
         if let Some(config_dir) = &self.config_dir {
@@ -80,13 +77,14 @@ impl AiChat {
         }
         // For each media file, add the media flag and the path to the file
         // Note that we must not consume the media files, the handles need to persist until the command is finished
-        if !media.is_empty() {
+        if !context.media.is_empty() {
             command.arg("--file");
-            for media_file in &media {
+            for media_file in &context.media {
                 command.arg(media_file.path());
             }
         }
-        command.arg("--").arg(prompt);
+        // Adds the full prompt as just a string
+        command.arg("--").arg(context.string_prompt_with_role());
         info!("Running command: {:?}", command);
 
         let output = command.output().expect("Failed to execute command");

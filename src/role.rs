@@ -98,7 +98,7 @@ pub fn print_role(
 }
 
 /// Get the role details from the role name
-fn get_role(
+pub fn get_role(
     role: Option<String>,
     role_list: Option<Vec<RoleDetails>>,
     default_roles: Option<Vec<RoleDetails>>,
@@ -124,22 +124,7 @@ fn get_role(
 }
 
 /// Prepends the role prompt to the message
-pub fn prepend_role(
-    message: String,
-    role: Option<String>,
-    role_list: Option<Vec<RoleDetails>>,
-    default_roles: Option<Vec<RoleDetails>>,
-) -> String {
-    if let Some(role_details) = get_role(role, role_list, default_roles) {
-        return prepend_role_internal(message, &role_details);
-    }
-    // Nothing found, so just return
-    // TODO: Provide an error message that it wasn't found
-    message
-}
-
-/// Prepends the role prompt to the message
-fn prepend_role_internal(message: String, role_details: &RoleDetails) -> String {
+pub fn prepend_role(message: String, role_details: &RoleDetails) -> String {
     let mut role_prompt = role_details.prompt.clone().unwrap_or("".to_string());
     if !role_prompt.is_empty() {
         role_prompt.push('\n');
