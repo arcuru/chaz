@@ -2,7 +2,7 @@ mod aichat;
 use aichat::AiChat;
 
 mod role;
-use role::RoleDetails;
+use role::{get_role, prepend_role, RoleDetails};
 
 mod defaults;
 use defaults::DEFAULT_CONFIG;
@@ -134,9 +134,8 @@ async fn main() -> anyhow::Result<()> {
         None,
         Some("Print the conversation".to_string()),
         |_, _, room| async move {
-            let (context, _, _) = get_context(&room).await.unwrap();
-            let context = add_role(&context);
-            let content = RoomMessageEventContent::notice_plain(context);
+            let context = get_context(&room).await.unwrap();
+            let content = RoomMessageEventContent::notice_plain(context.string_prompt());
             room.send(content).await.unwrap();
             Ok(())
         },
@@ -159,14 +158,23 @@ async fn main() -> anyhow::Result<()> {
                 .join(" ");
 
             // But we do need to read the context to figure out the model to use
-            let (_, model, _) = get_context(&room).await.unwrap();
+            let context = get_context(&room).await.unwrap();
+            let no_context = ChatContext {
+                messages: vec![Message {
+                    sender: "USER".to_string(),
+                    content: input.to_string(),
+                }],
+                model: context.model,
+                role: context.role,
+                media: Vec::new(),
+            };
 
             info!(
                 "Request: {} - {}",
                 sender.as_str(),
                 input.replace('\n', " ")
             );
-            if let Ok(result) = get_backend().execute(&model, input.to_string(), Vec::new()) {
+            if let Ok(result) = get_backend().execute(&no_context) {
                 // Add the prefix ".response:\n" to the result
                 // That way we can identify our own responses and ignore them for context
                 info!(
@@ -250,17 +258,8 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         // If it's not a command, we should send the full context without commands to the server
-        if let Ok((context, model, media)) = get_context(&room).await {
-            let mut context = add_role(&context);
-            // Append "ASSISTANT: " to the context string to indicate the assistant is speaking
-            context.push_str("ASSISTANT: ");
-
-            info!(
-                "Request: {} - {}",
-                sender.as_str(),
-                context.replace('\n', " ")
-            );
-            match get_backend().execute(&model, context, media) {
+        if let Ok(context) = get_context(&room).await {
+            match get_backend().execute(&context) {
                 Ok(stdout) => {
                     info!("Response: {}", stdout.replace('\n', " "));
                     // Most LLMs like responding with Markdown
@@ -286,17 +285,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Prepend the role defined in the global config
-fn add_role(context: &str) -> String {
-    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-    role::prepend_role(
-        context.to_string(),
-        config.role.clone(),
-        config.roles.clone(),
-        DEFAULT_CONFIG.roles.clone(),
-    )
 }
 
 /// Rate limit the user to a set number of messages
@@ -354,10 +342,10 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
 
 /// List the available models
 async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
-    let (_, current_model, _) = get_context(&room).await.unwrap();
+    let context = get_context(&room).await.unwrap();
     let response = format!(
         "!chaz Current Model: {}\n\nAvailable Models:\n{}",
-        current_model.unwrap_or(get_backend().default_model()),
+        context.model.unwrap_or(get_backend().default_model()),
         get_backend().list_models().join("\n")
     );
     room.send(RoomMessageEventContent::notice_plain(response))
@@ -398,23 +386,20 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     if rate_limit(&room, &sender).await {
         return Ok(());
     }
-    if let Ok((context, _, _)) = get_context(&room).await {
-        let title_prompt= [
-                            &context,
-                            "\nUSER: Summarize this conversation in less than 20 characters to use as the title of this conversation. ",
-                            "The output should be a single line of text describing the conversation. ",
-                            "Do not output anything except for the summary text. ",
-                            "Only the first 20 characters will be used. ",
-                            "\nASSISTANT: ",
-                        ].join("");
-        let model = get_chat_summary_model();
+    if let Ok(context) = get_context(&room).await {
+        let mut context = context;
+        context.model = get_chat_summary_model();
+        context.messages.push(Message {
+            sender: "USER".to_string(),
+            content: [
+                "Summarize this conversation in less than 20 characters to use as the title of this conversation.",
+                "The output should be a single line of text describing the conversation.",
+                "Do not output anything except for the summary text.",
+                "Only the first 20 characters will be used.",
+                ].join(" "),
+        });
 
-        info!(
-            "Request: {} - {}",
-            sender.as_str(),
-            title_prompt.replace('\n', " ")
-        );
-        let response = get_backend().execute(&model, title_prompt, Vec::new());
+        let response = get_backend().execute(&context);
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -433,22 +418,21 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
                 return Ok(());
             }
         }
+        // Remove the title summary request
+        context.messages.pop();
 
-        let topic_prompt = [
-            &context,
-            "\nUSER: Summarize this conversation in less than 50 characters. ",
-            "Do not output anything except for the summary text. ",
-            "Do not include any commentary or context, only the summary. ",
-            "\nASSISTANT: ",
-        ]
-        .join("");
+        context.model = get_chat_summary_model();
+        context.messages.push(Message {
+            sender: "USER".to_string(),
+            content: [
+                "Summarize this conversation in less than 50 characters.",
+                "Do not output anything except for the summary text.",
+                "Do not include any commentary or context, only the summary.",
+            ]
+            .join(" "),
+        });
 
-        info!(
-            "Request: {} - {}",
-            sender.as_str(),
-            topic_prompt.replace('\n', " ")
-        );
-        let response = get_backend().execute(&model, topic_prompt, Vec::new());
+        let response = get_backend().execute(&context);
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -500,21 +484,78 @@ fn get_chat_summary_model() -> Option<String> {
     config.chat_summary_model
 }
 
+struct Message {
+    sender: String,
+    content: String,
+}
+
+impl Message {
+    fn new<S: Into<String>>(sender: S, content: S) -> Message {
+        Message {
+            sender: sender.into(),
+            content: content.into(),
+        }
+    }
+}
+
+struct ChatContext {
+    messages: Vec<Message>,
+    model: Option<String>,
+    media: Vec<MediaFileHandle>,
+    role: Option<RoleDetails>,
+}
+
+impl ChatContext {
+    /// Convert messages into a single string.
+    fn string_prompt(&self) -> String {
+        // TODO: consider making this markdown
+        let mut prompt = String::new();
+        for message in self.messages.iter() {
+            prompt.push_str(&format!("{}: {}\n", message.sender, message.content));
+        }
+        // Indicate that the assistant needs to speak next
+        prompt.push_str("ASSISTANT: ");
+        prompt
+    }
+
+    /// Convert messages into a single string with the role prepended
+    fn string_prompt_with_role(&self) -> String {
+        let prompt = self.string_prompt();
+        if let Some(role) = &self.role {
+            prepend_role(prompt, role)
+        } else {
+            prompt
+        }
+    }
+}
+
 /// Gets the context of the current conversation
-/// Returns a model if it was ever entered
-async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFileHandle>), ()> {
-    // Read all the messages in the room, place them into a single string, and print them out
-    let mut messages = Vec::new();
+///
+/// The token_limit is the maximum number of tokens to add into the context.
+/// If no token_limit is given, the context will include the full room
+async fn get_context(room: &Room) -> Result<ChatContext, ()> {
+    let mut context = ChatContext {
+        messages: Vec::new(),
+        model: None,
+        media: Vec::new(),
+        role: None,
+    };
+    {
+        let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+        context.role = get_role(
+            config.role.clone(),
+            config.roles.clone(),
+            DEFAULT_CONFIG.roles.clone(),
+        );
+    }
 
     let mut options = MessagesOptions::backward();
-    let mut model_response = None;
-    let mut media = Vec::new();
 
     let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
     let enable_media_context = !config.disable_media_context.unwrap_or(false);
 
     'outer: while let Ok(batch) = room.messages(options).await {
-        // This assumes that the messages are in reverse order
+        // This assumes that the messages are in reverse order, which they should be
         for message in batch.chunk {
             if let Some((sender, content)) = message
                 .event
@@ -549,7 +590,7 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                                 .get_media_file(&request, None, &mime, true, None)
                                 .await
                                 .unwrap();
-                            media.insert(0, x);
+                            context.media.push(x);
                         }
                     }
                     MessageType::Text(text_content) => {
@@ -558,14 +599,14 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                             // if the message is a valid model command, set the model
                             // FIXME: hardcoded name
                             if text_content.body.starts_with("!chaz model")
-                                && model_response.is_none()
+                                && context.model.is_none()
                             {
                                 let model = text_content.body.split_whitespace().nth(2);
                                 if let Some(model) = model {
                                     // Add the config_dir from the global config
                                     let models = get_backend().list_models();
                                     if models.contains(&model.to_string()) {
-                                        model_response = Some(model.to_string());
+                                        context.model = Some(model.to_string());
                                     }
                                 }
                             }
@@ -595,9 +636,15 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                                     .user_id()
                                     .is_some_and(|uid| sender == uid.as_str())
                                 {
-                                    messages.push(format!("ASSISTANT: {}\n", command));
+                                    context.messages.push(Message::new(
+                                        "ASSISTANT".to_string(),
+                                        command.to_string(),
+                                    ));
                                 } else {
-                                    messages.push(format!("USER: {}\n", command));
+                                    context.messages.push(Message::new(
+                                        "USER".to_string(),
+                                        command.to_string(),
+                                    ));
                                 }
                             }
                         } else {
@@ -607,11 +654,16 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
                                 .user_id()
                                 .is_some_and(|uid| sender == uid.as_str())
                             {
-                                // If the sender is the bot, prefix the message with "ASSISTANT: "
-                                messages.push(format!("ASSISTANT: {}\n", text_content.body));
+                                // Sender is the bot
+                                context.messages.push(Message::new(
+                                    "ASSISTANT".to_string(),
+                                    text_content.body.clone(),
+                                ));
                             } else {
-                                // Otherwise, prefix the message with "USER: "
-                                messages.push(format!("USER: {}\n", text_content.body));
+                                context.messages.push(Message::new(
+                                    "USER".to_string(),
+                                    text_content.body.clone(),
+                                ));
                             }
                         }
                     }
@@ -625,10 +677,8 @@ async fn get_context(room: &Room) -> Result<(String, Option<String>, Vec<MediaFi
             break;
         }
     }
-    // Append the messages into a string with newlines in between, in reverse order
-    Ok((
-        messages.into_iter().rev().collect::<String>(),
-        model_response,
-        media,
-    ))
+    // Reverse context so that it's in the correct order
+    context.messages.reverse();
+    context.media.reverse();
+    Ok(context)
 }
