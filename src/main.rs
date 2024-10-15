@@ -1,8 +1,11 @@
 mod aichat;
-use aichat::AiChat;
+mod backends;
+mod openai;
+use backends::{BackendManager, ChatContext, Message};
 
 mod role;
-use role::{get_role, prepend_role, RoleDetails};
+use openai_api_rs::v1::chat_completion::MessageRole;
+use role::{get_role, RoleDetails};
 
 mod defaults;
 use defaults::DEFAULT_CONFIG;
@@ -11,7 +14,7 @@ use clap::Parser;
 use headjack::*;
 use lazy_static::lazy_static;
 use matrix_sdk::{
-    media::{MediaFileHandle, MediaFormat, MediaRequest},
+    media::{MediaFormat, MediaRequest},
     room::MessagesOptions,
     ruma::{
         events::room::message::{MessageType, RoomMessageEventContent},
@@ -33,6 +36,62 @@ struct ChazArgs {
     config: PathBuf,
 }
 
+/// Configuration info for a backend
+///
+/// Holds the config info for an OpenAPI compatible backend
+#[derive(Debug, Deserialize, Clone)]
+struct Backend {
+    /// The type of backend
+    ///
+    /// Currently only supports AIChat or OpenAICompatible
+    #[serde(rename = "type")]
+    backend_type: BackendType,
+    /// The base URL for the API
+    api_base: Option<String>,
+    /// The API key to use for the API
+    api_key: Option<String>,
+    /// Available models for this backend
+    models: Option<Vec<Model>>,
+    /// Name of this backend
+    ///
+    /// Will be used by Chaz to name the model as "name:model_name"
+    /// Will default to the backend_type, "aichat" or "openai"
+    name: Option<String>,
+    /// Set the config directory
+    /// Used by the aichat backend
+    #[allow(dead_code)]
+    config_dir: Option<String>,
+}
+
+impl Backend {
+    pub fn new(backend_type: BackendType) -> Self {
+        Backend {
+            backend_type,
+            api_base: None,
+            api_key: None,
+            models: None,
+            name: None,
+            config_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Model {
+    /// The name of the model
+    ///
+    /// This is passed to the backend to select the model, e.g. "gpt-3.5-turbo"
+    name: String,
+    // TODO: add other params, e.g. https://github.com/sigoden/aichat/blob/main/models.yaml
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+enum BackendType {
+    AIChat,
+    OpenAICompatible,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     homeserver_url: String,
@@ -48,9 +107,6 @@ pub struct Config {
     /// Set the state directory for chaz
     /// Defaults to $XDG_STATE_HOME/chaz
     state_dir: Option<String>,
-    /// Set the config directory for aichat
-    /// Allows for multiple instances setups of aichat
-    aichat_config_dir: Option<String>,
     /// Model to use for summarizing chats
     /// Used for setting the room name/topic
     chat_summary_model: Option<String>,
@@ -60,6 +116,10 @@ pub struct Config {
     roles: Option<Vec<RoleDetails>>,
     /// Disable sending media context to aichat
     disable_media_context: Option<bool>,
+    /// Backend configuration
+    ///
+    /// If set, this will be used instead of AiChat
+    backends: Option<Vec<Backend>>,
 }
 
 lazy_static! {
@@ -160,10 +220,7 @@ async fn main() -> anyhow::Result<()> {
             // But we do need to read the context to figure out the model to use
             let context = get_context(&room).await.unwrap();
             let no_context = ChatContext {
-                messages: vec![Message {
-                    sender: "USER".to_string(),
-                    content: input.to_string(),
-                }],
+                messages: vec![Message::new(MessageRole::user, input.to_string())],
                 model: context.model,
                 role: context.role,
                 media: Vec::new(),
@@ -174,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
                 sender.as_str(),
                 input.replace('\n', " ")
             );
-            if let Ok(result) = get_backend().execute(&no_context) {
+            if let Ok(result) = get_backend().execute(&no_context).await {
                 // Add the prefix ".response:\n" to the result
                 // That way we can identify our own responses and ignore them for context
                 info!(
@@ -182,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
                     sender.as_str(),
                     result.replace('\n', " ")
                 );
-                let content = RoomMessageEventContent::notice_plain(result);
+                let content = RoomMessageEventContent::notice_plain(result.clone());
 
                 room.send(content).await.unwrap();
             }
@@ -259,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
         }
         // If it's not a command, we should send the full context without commands to the server
         if let Ok(context) = get_context(&room).await {
-            match get_backend().execute(&context) {
+            match get_backend().execute(&context).await {
                 Ok(stdout) => {
                     info!("Response: {}", stdout.replace('\n', " "));
                     // Most LLMs like responding with Markdown
@@ -344,9 +401,13 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
 async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     let context = get_context(&room).await.unwrap();
     let response = format!(
-        "!chaz Current Model: {}\n\nAvailable Models:\n{}",
-        context.model.unwrap_or(get_backend().default_model()),
-        get_backend().list_models().join("\n")
+        "!chaz Current Model: {}\n\nKnown Models:\n{}",
+        context.model.unwrap_or(
+            get_backend()
+                .default_model()
+                .unwrap_or("unknown".to_string())
+        ),
+        get_backend().list_known_models().join("\n")
     );
     room.send(RoomMessageEventContent::notice_plain(response))
         .await
@@ -354,24 +415,24 @@ async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     Ok(())
 }
 
+/// Set the model to use for this chat
 async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
-    // Verify the command is fine
     // Get the third word in the command, `!chaz model <model>`
     let model = text.split_whitespace().nth(2);
     if let Some(model) = model {
-        let models = get_backend().list_models();
-        if models.contains(&model.to_string()) {
-            // Set the model
+        let backend = get_backend();
+        if backend.is_known_model(model) {
             let response = format!("!chaz Model set to \"{}\"", model);
             room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
+        } else if let Err(e) = backend.validate_model(model) {
+            let response = format!("!chaz Error: {}", e);
+            room.send(RoomMessageEventContent::notice_plain(response))
+                .await
+                .unwrap();
         } else {
-            let response = format!(
-                "!chaz Error: Model \"{}\" not found.\n\nAvailable models:\n{}",
-                model,
-                models.join("\n")
-            );
+            let response = format!("!chaz Model {} is unknown, but may be valid. Please manually verify that it is supported by your desired backend.", model);
             room.send(RoomMessageEventContent::notice_plain(response))
                 .await
                 .unwrap();
@@ -389,17 +450,16 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     if let Ok(context) = get_context(&room).await {
         let mut context = context;
         context.model = get_chat_summary_model();
-        context.messages.push(Message {
-            sender: "USER".to_string(),
-            content: [
+        context.messages.push(Message::new(
+            MessageRole::user,
+            [
                 "Summarize this conversation in less than 20 characters to use as the title of this conversation.",
                 "The output should be a single line of text describing the conversation.",
                 "Do not output anything except for the summary text.",
                 "Only the first 20 characters will be used.",
-                ].join(" "),
-        });
+                ].join(" ")));
 
-        let response = get_backend().execute(&context);
+        let response = get_backend().execute(&context).await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -422,17 +482,17 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         context.messages.pop();
 
         context.model = get_chat_summary_model();
-        context.messages.push(Message {
-            sender: "USER".to_string(),
-            content: [
+        context.messages.push(Message::new(
+            MessageRole::user,
+            [
                 "Summarize this conversation in less than 50 characters.",
                 "Do not output anything except for the summary text.",
                 "Do not include any commentary or context, only the summary.",
             ]
             .join(" "),
-        });
+        ));
 
-        let response = get_backend().execute(&context);
+        let response = get_backend().execute(&context).await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -453,9 +513,9 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
 }
 
 /// Returns the backend based on the global config
-fn get_backend() -> AiChat {
+fn get_backend() -> BackendManager {
     let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-    AiChat::new("aichat".to_string(), config.aichat_config_dir.clone())
+    BackendManager::new(&config.backends)
 }
 
 /// Try to clean up the response from the model containing a summary
@@ -482,51 +542,6 @@ fn clean_summary_response(response: &str, max_length: Option<usize>) -> String {
 fn get_chat_summary_model() -> Option<String> {
     let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
     config.chat_summary_model
-}
-
-struct Message {
-    sender: String,
-    content: String,
-}
-
-impl Message {
-    fn new<S: Into<String>>(sender: S, content: S) -> Message {
-        Message {
-            sender: sender.into(),
-            content: content.into(),
-        }
-    }
-}
-
-struct ChatContext {
-    messages: Vec<Message>,
-    model: Option<String>,
-    media: Vec<MediaFileHandle>,
-    role: Option<RoleDetails>,
-}
-
-impl ChatContext {
-    /// Convert messages into a single string.
-    fn string_prompt(&self) -> String {
-        // TODO: consider making this markdown
-        let mut prompt = String::new();
-        for message in self.messages.iter() {
-            prompt.push_str(&format!("{}: {}\n", message.sender, message.content));
-        }
-        // Indicate that the assistant needs to speak next
-        prompt.push_str("ASSISTANT: ");
-        prompt
-    }
-
-    /// Convert messages into a single string with the role prepended
-    fn string_prompt_with_role(&self) -> String {
-        let prompt = self.string_prompt();
-        if let Some(role) = &self.role {
-            prepend_role(prompt, role)
-        } else {
-            prompt
-        }
-    }
 }
 
 /// Gets the context of the current conversation
@@ -603,9 +618,7 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
                             {
                                 let model = text_content.body.split_whitespace().nth(2);
                                 if let Some(model) = model {
-                                    // Add the config_dir from the global config
-                                    let models = get_backend().list_models();
-                                    if models.contains(&model.to_string()) {
+                                    if get_backend().validate_model(model).is_ok() {
                                         context.model = Some(model.to_string());
                                     }
                                 }
@@ -637,14 +650,13 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
                                     .is_some_and(|uid| sender == uid.as_str())
                                 {
                                     context.messages.push(Message::new(
-                                        "ASSISTANT".to_string(),
+                                        MessageRole::assistant,
                                         command.to_string(),
                                     ));
                                 } else {
-                                    context.messages.push(Message::new(
-                                        "USER".to_string(),
-                                        command.to_string(),
-                                    ));
+                                    context
+                                        .messages
+                                        .push(Message::new(MessageRole::user, command.to_string()));
                                 }
                             }
                         } else {
@@ -656,12 +668,12 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
                             {
                                 // Sender is the bot
                                 context.messages.push(Message::new(
-                                    "ASSISTANT".to_string(),
+                                    MessageRole::assistant,
                                     text_content.body.clone(),
                                 ));
                             } else {
                                 context.messages.push(Message::new(
-                                    "USER".to_string(),
+                                    MessageRole::user,
                                     text_content.body.clone(),
                                 ));
                             }
