@@ -2,7 +2,9 @@
 
 Chaz is chaz.
 
-This is a [Matrix](https://github.com/sigoden/aichat) bot that connects to [AIChat](https://github.com/sigoden/aichat) to provide access to "10+ AI platforms, including OpenAI, Gemini, Claude, Mistral, LocalAI, Ollama, VertexAI, Ernie, Qianwen..." all from within Matrix.
+This is a [Matrix](https://matrix.org) bot that connects to multiple LLM providers to allow for chatting with any of the LLM models. It is compatible with any model using the OpenAI API.
+
+In addition, it is also possible to use [AIChat](https://github.com/sigoden/aichat) as a provider, so any models available through AIChat can be accessed as well.
 
 You do _NOT_ need to be running your own Matrix homeserver to use this.
 It is a bot that should be usable with any homeserver, you'll just need to create an account for it.
@@ -75,6 +77,22 @@ aichat_config_dir: "$AICHAT_CONFIG_DIR" # Optional, for using a separate aichat 
 chat_summary_model: "" # Optional, set a different model than the default to use for summarizing the chat
 disable_media_context: false # Optional, set to true to disable sending media context to aichat
 role: chaz # Optionally set a role, AKA system prompt. Set to `chaz` for the full chaz experience, or `cave-chaz` for even more chaz
+# Define backends. If more than 1 is defined, model names will be prefixed by the backends name.
+# If none are defined, Chaz will look for Aichat
+backends:
+  - name: openai # Name of the backend, models will be shown with this as a prefix, e.g. openai:gpt-4
+    type: openaicompatible
+    api_key:
+    api_base: https://api.openai.com/v1
+    models: # Listing models here is not necessary, but does make Chaz aware of them. You can still switch to a model not listed here through '!chaz model ....'
+      - name: gpt-4o
+      - name: gpt-4o-mini
+  - name: tog # Name can be anything. Model names will be "tog:<model>"
+    type: openaicompatible
+    api_key:
+    api_base: https://api.together.xyz/v1
+  - name: aic
+    type: aichat
 roles: # Optional, define your own roles
   - name: chaz # This one is predefined
     description: Chaz is Chaz
