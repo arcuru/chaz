@@ -97,6 +97,11 @@ impl BackendManager {
         }
     }
 
+    /// Lists all known backends
+    pub fn list_known_backends(&self) -> Vec<String> {
+        self.backends.iter().map(|b| b.get_name().clone()).collect()
+    }
+
     /// Lists all known models
     ///
     /// Models may be valid even if they aren't listed

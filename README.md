@@ -9,6 +9,9 @@ In addition, it is also possible to use [AIChat](https://github.com/sigoden/aich
 You do _NOT_ need to be running your own Matrix homeserver to use this.
 It is a bot that should be usable with any homeserver, you'll just need to create an account for it.
 
+If you can find a kind person running the Chaz bot that you trust, you can bring your own API keys and use _their_ bot as a proxy.
+See the `!chaz backend` command for more information.
+
 You will need your own API keys or your own local AI already configured.
 
 This is built using [headjack](https://github.com/arcuru/headjack), a Matrix bot framework developed alongside it.
@@ -43,6 +46,7 @@ Available commands:
 !chaz print - Print the conversation
 !chaz send <message> - Send a message without context
 !chaz model <model> - Select the model to use
+!chaz backend <name> <api_base> <api_key> - Manually enter an OpenAI Compatible Backend
 !chaz list - List available models
 !chaz clear - Ignore all messages before this point
 !chaz rename - Rename the room and set the topic based on the chat content
