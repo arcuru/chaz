@@ -11,12 +11,11 @@ tasks:
     cmd: act
   ci:local:
     desc: Run CI locally
+    aliases: [ci]
     deps:
       [audit, doc, fmt, test, nix:check, nix:build, clippy, pre-commit, build]
   nix:check:
     desc: Run Nix CI checks
-    sources:
-      - ./**/*
     cmds:
       - nix flake check
   nix:build:
@@ -25,8 +24,6 @@ tasks:
       - nix build
   clippy:
     desc: Run clippy
-    sources:
-      - ./**/*.rs
     cmd: cargo clippy
   pre-commit:
     desc: Run pre-commit
@@ -42,8 +39,6 @@ tasks:
   test:
     desc: Run all tests
     aliases: [t]
-    sources:
-      - ./**/*.rs
     cmd: cargo nextest run
   doc:
     desc: Build the documentation
