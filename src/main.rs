@@ -11,6 +11,7 @@ mod defaults;
 use defaults::DEFAULT_CONFIG;
 
 use clap::Parser;
+use headjack::Tags;
 use headjack::*;
 use lazy_static::lazy_static;
 use matrix_sdk::{
@@ -72,6 +73,18 @@ impl Backend {
             models: None,
             name: None,
             config_dir: None,
+        }
+    }
+
+    /// Get the name for this bacckend
+    pub fn get_name(&self) -> String {
+        if let Some(name) = &self.name {
+            name.clone()
+        } else {
+            match self.backend_type {
+                BackendType::AIChat => "aichat".to_string(),
+                BackendType::OpenAICompatible => "openai".to_string(),
+            }
         }
     }
 }
@@ -231,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 sender.as_str(),
                 input.replace('\n', " ")
             );
-            if let Ok(result) = get_backend().execute(&no_context).await {
+            if let Ok(result) = get_backend(&room).await.execute(&no_context).await {
                 // Add the prefix ".response:\n" to the result
                 // That way we can identify our own responses and ignore them for context
                 info!(
@@ -253,6 +266,14 @@ async fn main() -> anyhow::Result<()> {
         "<model>".to_string(),
         "Select the model to use".to_string(),
         model,
+    )
+    .await;
+
+    bot.register_text_command(
+        "backend",
+        "<name> <api_base> <api_key>".to_string(),
+        "Manually enter an OpenAI Compatible Backend".to_string(),
+        set_backend,
     )
     .await;
 
@@ -316,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
         }
         // If it's not a command, we should send the full context without commands to the server
         if let Ok(context) = get_context(&room).await {
-            match get_backend().execute(&context).await {
+            match get_backend(&room).await.execute(&context).await {
                 Ok(stdout) => {
                     info!("Response: {}", stdout.replace('\n', " "));
                     // Most LLMs like responding with Markdown
@@ -400,18 +421,56 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
 /// List the available models
 async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     let context = get_context(&room).await.unwrap();
+    let backends = get_backend(&room).await;
     let response = format!(
-        "!chaz Current Model: {}\n\nKnown Models:\n{}",
-        context.model.unwrap_or(
-            get_backend()
-                .default_model()
-                .unwrap_or("unknown".to_string())
-        ),
-        get_backend().list_known_models().join("\n")
+        "!chaz Current Model: {}\n\nKnown Backends:\n{}\n\nKnown Models:\n{}",
+        context
+            .model
+            .unwrap_or(backends.default_model().unwrap_or("unknown".to_string())),
+        backends.list_known_backends().join("\n"),
+        backends.list_known_models().join("\n")
     );
     room.send(RoomMessageEventContent::notice_plain(response))
         .await
         .unwrap();
+    Ok(())
+}
+
+/// Add a backend provider into the room tags
+async fn set_backend(_: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
+    // Skip to the 3rd word in the command, we know the first two are "!chaz backend"
+    let mut split = text.split_whitespace();
+    split.next();
+    split.next();
+    if let (Some(name), Some(url), Some(token)) = (split.next(), split.next(), split.next()) {
+        let mut tags = Tags::new(&room, "is.chaz.backend").await;
+        // The Scheme is like so:
+        // chazdefault=<name>
+        // <name>.url=<url>
+        // <name>.token=<token>
+        // <other name>.url=<url>
+        // <other name>.token=<token>
+        //
+        // TODO: Support "is.chaz.backend.<name>.model.<known models>"
+        // That will make it so that Chaz can validate and list those models
+        tags.replace_kv("chazdefault", name);
+        tags.replace_kv(&format!("{}.url", name), url);
+        tags.replace_kv(&format!("{}.token", name), token);
+        tags.sync().await;
+        room.send(RoomMessageEventContent::notice_plain(format!(
+            "!chaz Successfully added backend {}",
+            name
+        )))
+        .await
+        .unwrap();
+    } else {
+        room.send(RoomMessageEventContent::notice_plain(
+            "!chaz Error: invalid arguments. Usage: !chaz backend <name> <api_base> <api_key>",
+        ))
+        .await
+        .unwrap();
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -420,7 +479,7 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
     // Get the third word in the command, `!chaz model <model>`
     let model = text.split_whitespace().nth(2);
     if let Some(model) = model {
-        let backend = get_backend();
+        let backend = get_backend(&room).await;
         if backend.is_known_model(model) {
             let response = format!("!chaz Model set to \"{}\"", model);
             room.send(RoomMessageEventContent::notice_plain(response))
@@ -437,6 +496,9 @@ async fn model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> 
                 .await
                 .unwrap();
         }
+        let mut tags = Tags::new(&room, "is.chaz.model").await;
+        tags.replace_kv("default", model);
+        tags.sync().await;
     } else {
         list_models(sender, text, room).await?;
     }
@@ -459,7 +521,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
                 "Only the first 20 characters will be used.",
                 ].join(" ")));
 
-        let response = get_backend().execute(&context).await;
+        let response = get_backend(&room).await.execute(&context).await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -492,7 +554,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             .join(" "),
         ));
 
-        let response = get_backend().execute(&context).await;
+        let response = get_backend(&room).await.execute(&context).await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -512,10 +574,51 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     Ok(())
 }
 
+/// Get the backend defined in the room tags.
+async fn get_tag_backend(room: &Room) -> Option<Vec<Backend>> {
+    let mut backends = Vec::new();
+    let tags = Tags::new(room, "is.chaz.backend").await;
+    let default_backend = tags.get_value("chazdefault");
+    for tag in tags.tags() {
+        if tag.split('.').nth(1).is_some_and(|x| x.starts_with("url")) {
+            let name = tag.split('.').next().unwrap_or_default();
+            let mut backend = Backend::new(BackendType::OpenAICompatible);
+            backend.name = Some(name.to_string());
+            backend.api_base = tags.get_value(&format!("{}.url", name));
+            backend.api_key = tags.get_value(&format!("{}.token", name));
+            if backend.api_base.is_some() && backend.api_key.is_some() {
+                backends.push(backend);
+            }
+        }
+    }
+    if let Some(default_backend) = default_backend {
+        // Reorder so that the default backend is first
+        if let Some(index) = backends
+            .iter()
+            .position(|x| x.name == Some(default_backend.to_string()))
+        {
+            backends.swap(0, index);
+        }
+    }
+    Some(backends)
+}
+
 /// Returns the backend based on the global config
-fn get_backend() -> BackendManager {
+async fn get_backend(room: &Room) -> BackendManager {
+    let mut backends = Vec::new();
+    if let Some(tag_backends) = get_tag_backend(room).await {
+        backends = tag_backends;
+    }
+    // Pull the tags in the current room, and add that backend
     let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-    BackendManager::new(&config.backends)
+    if let Some(config_backends) = config.backends {
+        backends.extend(config_backends);
+    }
+    if backends.is_empty() {
+        BackendManager::new(&None)
+    } else {
+        BackendManager::new(&Some(backends))
+    }
 }
 
 /// Try to clean up the response from the model containing a summary
@@ -613,12 +716,13 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
                         if is_command("!", &text_content.body) {
                             // if the message is a valid model command, set the model
                             // FIXME: hardcoded name
+                            // This is being deprecated in favor of storing the models in the tags
                             if text_content.body.starts_with("!chaz model")
                                 && context.model.is_none()
                             {
                                 let model = text_content.body.split_whitespace().nth(2);
                                 if let Some(model) = model {
-                                    if get_backend().validate_model(model).is_ok() {
+                                    if get_backend(room).await.validate_model(model).is_ok() {
                                         context.model = Some(model.to_string());
                                     }
                                 }
@@ -688,6 +792,12 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
         } else {
             break;
         }
+    }
+    // Get the model name from the tags if it exists
+    // This is the new preferred method, so it just overwrites whatever we found above
+    let tags = Tags::new(room, "is.chaz.model").await;
+    if let Some(model) = tags.get_value("default") {
+        context.model = Some(model);
     }
     // Reverse context so that it's in the correct order
     context.messages.reverse();
