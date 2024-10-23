@@ -73,6 +73,7 @@ impl LLMBackend for AiChat {
 
     async fn execute(&self, context: &ChatContext) -> Result<String, String> {
         let mut command = Command::new(&self.binary_location);
+        command.arg("--no-stream");
         if let Some(model) = &context.model {
             let model_prefix = self.backend.name.clone().unwrap_or("aichat".to_string());
 
