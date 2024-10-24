@@ -10,7 +10,7 @@ use std::fmt;
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoleDetails {
     /// Name of the role, used to reference it
-    name: String,
+    pub name: String,
     /// Description of the role
     description: Option<String>,
     /// The system prompt for the model
@@ -20,6 +20,20 @@ pub struct RoleDetails {
 }
 
 impl RoleDetails {
+    pub fn new(
+        name: &str,
+        description: Option<String>,
+        prompt: Option<String>,
+        example: Option<Vec<Message>>,
+    ) -> Self {
+        RoleDetails {
+            name: name.to_owned(),
+            description,
+            prompt,
+            example,
+        }
+    }
+
     pub fn get_prompt(&self) -> String {
         if let Some(prompt) = &self.prompt {
             return prompt.clone();
@@ -30,7 +44,7 @@ impl RoleDetails {
 
 /// A single message in a conversation
 #[derive(Debug, Deserialize, Clone)]
-struct Message {
+pub struct Message {
     user: MessageRole,
     message: String,
 }
@@ -103,6 +117,14 @@ pub fn print_role(
                 println!("  {}: {}", message.user, message.message);
             }
         }
+    }
+}
+
+/// Return all the role names defines in the input.
+pub fn get_role_names(roles: Option<Vec<RoleDetails>>) -> Vec<String> {
+    match roles {
+        Some(role_details) => role_details.into_iter().map(|role| role.name).collect(),
+        None => Vec::new(),
     }
 }
 
