@@ -47,11 +47,20 @@ Available commands:
 !chaz send <message> - Send a message without context
 !chaz model <model> - Select the model to use
 !chaz backend <name> <api_base> <api_key> - Manually enter an OpenAI Compatible Backend
+!chaz role [<role>] [<prompt>] - Get the role info, set the role, or define a new role
 !chaz list - List available models
 !chaz clear - Ignore all messages before this point
 !chaz rename - Rename the room and set the topic based on the chat content
 !chaz help - Show this message
 ```
+
+### Setting Roles
+
+The `!chaz role` command takes 0, 1, or many arguments.
+
+- Use `!chaz role` to show the current role and list all available roles.
+- Use `!chaz role <name>` to set an existing role as the default.
+- Use `!chaz role <name> <prompt>` to create a new role with the given prompt.
 
 ## Install
 

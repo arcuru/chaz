@@ -62,6 +62,7 @@ impl LLMBackend for OpenAI {
         let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
         let request =
             convert_to_chatcompletionrequest(context, &model_prefix, &self.default_model());
+        eprintln!("ASDF: {:?}", request);
 
         let response = client.chat_completion(request).await;
 

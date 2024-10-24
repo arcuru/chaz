@@ -5,7 +5,7 @@ use backends::{BackendManager, ChatContext, Message};
 
 mod role;
 use openai_api_rs::v1::chat_completion::MessageRole;
-use role::{get_role, RoleDetails};
+use role::{get_role, get_role_names, RoleDetails};
 
 mod defaults;
 use defaults::DEFAULT_CONFIG;
@@ -278,6 +278,14 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     bot.register_text_command(
+        "role",
+        "[<role>] [<prompt>]".to_string(),
+        "Get the role info, set the role, or define a new role".to_string(),
+        set_role,
+    )
+    .await;
+
+    bot.register_text_command(
         "list",
         "".to_string(),
         "List available models".to_string(),
@@ -433,6 +441,82 @@ async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
     room.send(RoomMessageEventContent::notice_plain(response))
         .await
         .unwrap();
+    Ok(())
+}
+
+/// Control the roles
+///
+/// With no args, we print the info.
+/// With one arg, we print that and set it as the default role
+/// With more than 1, the first is the name of the role, and the rest is the prompt
+async fn set_role(_: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
+    // Skip over the command "!chaz role"
+    let mut words = text.split_whitespace().skip(2);
+    let mut tags = Tags::new(&room, "is.chaz.role").await;
+    if let Some(name) = words.next() {
+        // This name is now the default role
+        tags.replace_kv("chazdefault", name);
+        // If more arguments exist, that's the prompt
+        if let Some(prompt) = words.next() {
+            let prompt = words.fold(prompt.to_string(), |acc, x| format!("{} {}", acc, x));
+            // Set the role
+            tags.replace_kv(name, &prompt);
+        }
+        tags.sync().await;
+        room.send(RoomMessageEventContent::notice_plain(format!(
+            "!chaz Role set to \"{}\"",
+            name
+        )))
+        .await
+        .unwrap();
+    } else {
+        let context = get_context(&room);
+        // 0 args, print the info
+        let mut room_roles = Vec::new();
+        for tag in tags.tags() {
+            let role = tag.split('=').next().unwrap();
+            if role != "chazdefault" {
+                room_roles.push(role);
+            }
+        }
+        // Now add the roles from the config
+        let config_roles = {
+            let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+            get_role_names(config.roles)
+        };
+        let default_roles = get_role_names(DEFAULT_CONFIG.roles.clone());
+        let context = context.await?;
+        let current_role = {
+            if let Some(role) = context.role {
+                role.name
+            } else {
+                "unknown".to_string()
+            }
+        };
+        let mut response_parts = vec![format!("!chaz Current Role: {}", current_role)];
+
+        if !room_roles.is_empty() {
+            response_parts.push(format!(
+                "\n\nRoom Defined Roles:\n{}",
+                room_roles.join("\n")
+            ));
+        }
+
+        if !config_roles.is_empty() {
+            response_parts.push(format!(
+                "\n\nConfigured Roles:\n{}",
+                config_roles.join("\n")
+            ));
+        }
+
+        if !default_roles.is_empty() {
+            response_parts.push(format!("\n\nBuiltin Roles:\n{}", default_roles.join("\n")));
+        }
+        let response = response_parts.join("");
+        room.send(RoomMessageEventContent::notice_plain(response))
+            .await
+            .unwrap();
+    }
     Ok(())
 }
 
@@ -658,14 +742,14 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
         media: Vec::new(),
         role: None,
     };
-    {
+    context.role = {
         let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-        context.role = get_role(
+        get_role(
             config.role.clone(),
             config.roles.clone(),
             DEFAULT_CONFIG.roles.clone(),
-        );
-    }
+        )
+    };
 
     let mut options = MessagesOptions::backward();
 
@@ -799,6 +883,23 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
     if let Some(model) = tags.get_value("default") {
         context.model = Some(model);
     }
+    // Get the role from the tags if it exists
+    let tags = Tags::new(room, "is.chaz.role").await;
+    if let Some(role) = tags.get_value("chazdefault") {
+        if let Some(prompt) = tags.get_value(&role) {
+            context.role = Some(RoleDetails::new(&role, None, Some(prompt), None));
+        } else {
+            context.role = {
+                let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
+                get_role(
+                    Some(role),
+                    config.roles.clone(),
+                    DEFAULT_CONFIG.roles.clone(),
+                )
+            };
+        }
+    }
+
     // Reverse context so that it's in the correct order
     context.messages.reverse();
     context.media.reverse();
