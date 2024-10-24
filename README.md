@@ -59,6 +59,46 @@ Available commands:
 
 For [Nix](https://nixos.org/) users, this repo contains a Nix flake. See the [setup section](#nix) for details on configuring.
 
+### Docker
+
+There is a docker image available on [Docker Hub](https://hub.docker.com/r/arcuru/chaz).
+Here's a Docker Compose example:
+
+```yaml
+services:
+  chaz:
+    image: arcuru/chaz:main # Set to your desired version
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # Mount your config file to /config.yaml
+      - ./config.yaml:/config.yaml
+      # Mount your aichat config to /aichat, AND SET THAT LOCATION IN CHAZ'S CONFIG.YAML
+      - aichat-state:/aichat
+      - ./aichat.yaml:/aichat/config.yaml
+      # Mount the volume into the same location specified in config.yaml
+      - chaz-state:/state
+
+volumes:
+  # Persists the logged in session
+  chaz-state:
+  aichat-state:
+```
+
+Note that this requires 2 config files to be mounted into the container, one for chaz and one for aichat.
+You'll also need to set the state/cache directories in your chaz config file.
+
+The chaz config file should look something like this:
+
+```yaml
+homeserver_url: https://matrix.jackson.dev
+username: "chaz"
+password: ""
+state_dir: "/state"
+aichat_config_dir: "/aichat"
+allow_list: "@.*:jackson.dev|@arcuru:matrix.org"
+```
+
 ## Setup
 
 First, setup an account on any Matrix server for the bot to use.
@@ -117,47 +157,19 @@ roles: # Optional, define your own roles
       No code block, no English explanation, no newlines, and no start/end tags.
 ```
 
-## Docker
+## Running
 
-There is a docker image available on [Docker Hub](https://hub.docker.com/r/arcuru/chaz).
-Here's a Docker Compose example:
+To run it, simply:
 
-```yaml
-services:
-  chaz:
-    image: arcuru/chaz:main # Set to your desired version
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      # Mount your config file to /config.yaml
-      - ./config.yaml:/config.yaml
-      # Mount your aichat config to /aichat, AND SET THAT LOCATION IN CHAZ'S CONFIG.YAML
-      - aichat-state:/aichat
-      - ./aichat.yaml:/aichat/config.yaml
-      # Mount the volume into the same location specified in config.yaml
-      - chaz-state:/state
+1. Install _chaz_ and setup its config.
+2. Install [AIChat](https://github.com/sigoden/aichat).
+3. Configure [AIChat](https://github.com/sigoden/aichat) with the models and defaults that you want.
+4. Create a config file for _chaz_ with login details.
+5. Run the bot and specify it's config file location `chaz --config config.yaml`.
 
-volumes:
-  # Persists the logged in session
-  chaz-state:
-  aichat-state:
-```
+The bot will not respond to older messages sent while it wasn't running to prevent overwhelming the backend.
 
-Note that this requires 2 config files to be mounted into the container, one for chaz and one for aichat.
-You'll also need to set the state/cache directories in your chaz config file.
-
-The chaz config file should look something like this:
-
-```yaml
-homeserver_url: https://matrix.jackson.dev
-username: "chaz"
-password: ""
-state_dir: "/state"
-aichat_config_dir: "/aichat"
-allow_list: "@.*:jackson.dev|@arcuru:matrix.org"
-```
-
-### Nix
+## Nix
 
 Development is being done using a [Nix flake](https://nixos.wiki/wiki/Flakes).
 The easiest way to install chaz is to use nix flakes.
@@ -192,15 +204,3 @@ Import the module into your home-manager config and you can configure `chaz` all
   };
 }
 ```
-
-## Running
-
-To run it, simply:
-
-1. Install _chaz_ and setup its config.
-2. Install [AIChat](https://github.com/sigoden/aichat).
-3. Configure [AIChat](https://github.com/sigoden/aichat) with the models and defaults that you want.
-4. Create a config file for _chaz_ with login details.
-5. Run the bot and specify it's config file location `chaz --config config.yaml`.
-
-The bot will not respond to older messages sent while it wasn't running to prevent overwhelming the backend.
