@@ -6,25 +6,18 @@ This is a [Matrix](https://matrix.org) bot that connects to multiple LLM provide
 
 In addition, it is also possible to use [AIChat](https://github.com/sigoden/aichat) as a provider, so any models available through AIChat can be accessed as well.
 
-You do _NOT_ need to be running your own Matrix homeserver to use this.
-It is a bot that should be usable with any homeserver, you'll just need to create an account for it.
-
-If you can find a kind person running the Chaz bot that you trust, you can bring your own API keys and use _their_ bot as a proxy.
-See the `!chaz backend` command for more information.
-
 You will need your own API keys or your own local AI already configured.
 
-This is built using [headjack](https://github.com/arcuru/headjack), a Matrix bot framework developed alongside it.
-
 Announcement Blog Post: [Chaz: An LLM <-> Matrix Chatbot](https://jackson.dev/post/chaz/)
-
-## Repository
-
-**Mirrored on [GitHub](https://github.com/arcuru/chaz) and [Codeberg](https://codeberg.org/arcuru/chaz). GitHub is the official repo, but use either repo to contribute. Issues can't be synced so there may be some duplicates.**
 
 ## Getting Help
 
 There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to/#/#chaz:jackson.dev)
+
+## Getting Started
+
+If you have your own API keys, and you trust me not to abuse them, you can get started quickly with [@chaz:jackson.dev](https://matrix.to/#/@chaz:jackson.dev).
+Simply add that Matrix user to your room, configure it with your own API keys to an OpenAI API compatible backend, and you're good to go.
 
 ## Usage
 
@@ -213,3 +206,7 @@ Import the module into your home-manager config and you can configure `chaz` all
   };
 }
 ```
+
+## Repository
+
+**Mirrored on [GitHub](https://github.com/arcuru/chaz) and [Codeberg](https://codeberg.org/arcuru/chaz). GitHub is the official repo, but use either repo to contribute. Issues can't be synced so there may be some duplicates.**
