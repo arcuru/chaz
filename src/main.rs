@@ -76,7 +76,7 @@ impl Backend {
         }
     }
 
-    /// Get the name for this bacckend
+    /// Get the name for this backend
     pub fn get_name(&self) -> String {
         if let Some(name) = &self.name {
             name.clone()
@@ -245,8 +245,6 @@ async fn main() -> anyhow::Result<()> {
                 input.replace('\n', " ")
             );
             if let Ok(result) = get_backend(&room).await.execute(&no_context).await {
-                // Add the prefix ".response:\n" to the result
-                // That way we can identify our own responses and ignore them for context
                 info!(
                     "Response: {} - {}",
                     sender.as_str(),
