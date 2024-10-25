@@ -35,13 +35,16 @@ impl LLMBackend for AiChat {
             command.env("AICHAT_CONFIG_DIR", config_dir);
         }
 
-        let output = command.output().expect("Failed to execute command");
-
+        // Return empty vec if command fails instead of panicking
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(_) => return Vec::new(),
+        };
         // split each line of the output into it's own string and return
         output
             .stdout
             .split(|c| *c == b'\n')
-            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .map(|s| String::from_utf8(s.to_vec()).unwrap_or_default())
             .filter(|s| !s.is_empty())
             .collect()
     }
@@ -58,17 +61,20 @@ impl LLMBackend for AiChat {
             command.env("AICHAT_CONFIG_DIR", config_dir);
         }
 
-        let output = command.output().expect("Failed to execute command");
-
+        // Return None if command fails instead of panicking
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(_) => return None,
+        };
         // The model is returned on it's own line beginning with "model"
         // so we can split the output by newlines and find the line that starts with "model"
         // Then we can split that line by whitespace and take the second element
         output
             .stdout
             .split(|c| *c == b'\n')
-            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .map(|s| String::from_utf8(s.to_vec()).unwrap_or_default())
             .find(|s| s.starts_with("model"))
-            .map(|s| s.split_whitespace().nth(1).unwrap().to_string())
+            .and_then(|s| s.split_whitespace().nth(1).map(String::from))
     }
 
     async fn execute(&self, context: &ChatContext) -> Result<String, String> {
