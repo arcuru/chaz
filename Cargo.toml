@@ -26,4 +26,4 @@ clap = { version = "4", features = ["derive"] }
 lazy_static = "1"
 regex = "1"
 dirs = "5"
-openai-api-rs = "5.0.12"
+openai-api-rs = "5"
