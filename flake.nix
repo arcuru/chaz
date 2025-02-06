@@ -7,7 +7,6 @@
       url = "github:cachix/pre-commit-hooks.nix";
       inputs = {
         nixpkgs.follows = "nixpkgs";
-        nixpkgs-stable.follows = "nixpkgs";
       };
     };
 
@@ -99,7 +98,7 @@
 
           # Run tests with cargo-nextest
           # Note: This provides limited value, as tests are already run in the build
-          chaz-nextest = craneLib.cargoNextest commonArgs;
+          # chaz-nextest = craneLib.cargoNextest commonArgs;
 
           # Audit dependencies
           crate-audit = craneLib.cargoAudit (commonArgs
@@ -107,10 +106,11 @@
               inherit (inputs) advisory-db;
             });
         }
-        // lib.optionalAttrs (system == "x86_64-linux") {
-          # Check code coverage with tarpaulin runs
-          chaz-tarpaulin = craneLib.cargoTarpaulin commonArgs;
-        }
+        # No tests exist yet, so we don't need to run coverage
+        # // lib.optionalAttrs (system == "x86_64-linux") {
+        #   # Check code coverage with tarpaulin runs
+        #   chaz-tarpaulin = craneLib.cargoTarpaulin commonArgs;
+        # }
         // {
           # Run formatting checks before commit
           # Can be run manually with `pre-commit run -a`
@@ -178,6 +178,7 @@
 
           # Code coverage
           cargo-tarpaulin
+          cargo-nextest
         ];
 
         # Many tools read this to find the sources for rust stdlib
