@@ -1,3 +1,6 @@
+/// Manage all the backends for chaz.
+///
+/// This module is responsible for handling dispatch, validation, and general management for all the different backends
 use matrix_sdk::media::MediaFileHandle;
 use openai_api_rs::v1::chat_completion::MessageRole;
 
@@ -7,10 +10,6 @@ use crate::{
     role::{prepend_role, RoleDetails},
     Backend, BackendType,
 };
-
-/// Manage all the backends for chaz.
-///
-/// This module is responsible for handling dispatch, validation, and general management for all the different backends
 
 pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;

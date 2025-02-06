@@ -1,11 +1,11 @@
+/// OpenAI Compatible Backend
+///
+/// Communicates over the OpenAI API as a backend for chaz.
 use openai_api_rs::v1::{
     api::OpenAIClient,
     chat_completion::{self, ChatCompletionMessage, ChatCompletionRequest, MessageRole},
 };
 
-/// OpenAI Compatible Backend
-///
-/// Communicates over the OpenAI API as a backend for chaz.
 use crate::{backends::LLMBackend, Backend, ChatContext};
 
 /// Handle connections to an OpenAI compatible backend
@@ -58,7 +58,11 @@ impl LLMBackend for OpenAI {
             None => return Err("API base doesn't exist".to_string()),
         };
 
-        let client = OpenAIClient::new_with_endpoint(api_base, api_key);
+        let client = OpenAIClient::builder()
+            .with_endpoint(api_base)
+            .with_api_key(api_key)
+            .build()
+            .map_err(|e| e.to_string())?;
         let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
         let request =
             convert_to_chatcompletionrequest(context, &model_prefix, &self.default_model());
