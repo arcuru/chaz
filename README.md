@@ -1,5 +1,7 @@
 # chaz
 
+**IMPORTANT NOTICE** - This project is not very active. You should prefer to use https://github.com/etkecc/baibot, which is actively developed, with more features, and is supported by a company that runs Matrix servers.
+
 Chaz is chaz.
 
 This is a [Matrix](https://matrix.org) bot that connects to multiple LLM providers to allow for chatting with any of the LLM models. It is compatible with any model using the OpenAI API.
