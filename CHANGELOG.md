@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1](https://github.com/arcuru/chaz/compare/v0.3.0...v0.3.1) - 2025-07-17
+
+### Other
+
+- add baibot link
+- adding an equivalent justfile
+- bump all the deps
+- run cargo update
+- don't pin openapi-api-rs version
+
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 
 ### Other
