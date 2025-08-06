@@ -82,6 +82,11 @@ services:
       - ./aichat.yaml:/aichat/config.yaml
       # Mount the volume into the same location specified in config.yaml
       - chaz-state:/state
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
 
 volumes:
   # Persists the logged in session
