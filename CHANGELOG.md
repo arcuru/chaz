@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.3.1](https://github.com/arcuru/chaz/compare/v0.3.0...v0.3.1) - 2025-08-06
+
+### Other
+
+- add Docker logging config to prevent huge log files
+- add baibot link
+- adding an equivalent justfile
+- bump all the deps
+- run cargo update
+- don't pin openapi-api-rs version
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 
 ### Other
