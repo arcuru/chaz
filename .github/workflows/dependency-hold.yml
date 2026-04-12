@@ -1,0 +1,38 @@
+name: "Deps: Hold Gate"
+
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: deps-hold-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-hold:
+    name: Dependency Hold
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check hold status
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$HEAD_REF" =~ ^deps/ ]]; then
+            echo "Not a dependency branch, skipping hold check."
+            exit 0
+          fi
+
+          echo "Dependency branch detected: $HEAD_REF"
+
+          PR_LABELS=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '[.labels[].name]')
+          echo "Current labels: $PR_LABELS"
+
+          if echo "$PR_LABELS" | jq -e 'index("on-hold")' > /dev/null 2>&1; then
+            echo "::error::This dependency update is on hold. The on-hold label will be automatically removed after the hold period expires."
+            exit 1
+          fi
+
+          echo "No hold in effect, dependency update may proceed."

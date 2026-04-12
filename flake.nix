@@ -1,194 +1,225 @@
 {
-  description = "chaz - Jack some (AI) heads into Matrix.";
+  description = "chaz - AI agent orchestrator for Matrix.";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    pre-commit-hooks = {
-      url = "github:cachix/pre-commit-hooks.nix";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-      };
-    };
 
     crane.url = "github:ipetkov/crane";
 
-    flake-utils.url = "github:numtide/flake-utils";
-
     fenix = {
-      # Needed because rust-overlay, normally used by crane, doesn't have llvm-tools for coverage
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-analyzer-src.follows = "";
     };
 
-    advisory-db = {
-      # Rust dependency security advisories
-      url = "github:rustsec/advisory-db";
-      flake = false;
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
+
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = {self, ...} @ inputs:
-    inputs.flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = import inputs.nixpkgs {
-        inherit system;
+  outputs = inputs @ {flake-parts, ...}:
+    flake-parts.lib.mkFlake {inherit inputs;} {
+      imports = [
+        inputs.flake-parts.flakeModules.easyOverlay
+        inputs.treefmt-nix.flakeModule
+      ];
+
+      flake = {
+        homeManagerModules.default = import ./nix/home-manager.nix;
       };
 
-      inherit (pkgs) lib;
+      systems = [
+        "aarch64-linux"
+        "x86_64-linux"
+        "aarch64-darwin"
+        "x86_64-darwin"
+      ];
 
-      # Use the stable rust tools from fenix
-      fenixStable = inputs.fenix.packages.${system}.stable;
-      rustSrc = fenixStable.rust-src;
-      toolChain = fenixStable.completeToolchain;
+      perSystem = {
+        config,
+        system,
+        pkgs,
+        lib,
+        ...
+      }: let
+        # Use the stable rust tools from fenix
+        fenixStable = inputs.fenix.packages.${system}.stable;
+        rustSrc = fenixStable.rust-src;
+        toolChain = fenixStable.completeToolchain;
 
-      # Use the toolchain with the crane helper functions
-      craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
+        # Use the toolchain with the crane helper functions
+        craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
 
-      # Clean the src to only have the Rust-relevant files
-      # src = let
-      #   # We need to keep the yaml files because they are used for the build defaults
-      #   yamlFilter = path: _type: builtins.match ".*defaults.yaml$" path != null;
-      #   yamlOrCargo = path: type:
-      #     (yamlFilter path type) || (craneLib.filterCargoSources path type);
-      # in
-      #   lib.cleanSourceWith {
-      #     src = craneLib.path ./.;
-      #     filter = yamlOrCargo;
-      #   };
-      src = ./.;
+        # Source filtering — only Rust-relevant files
+        src = craneLib.cleanCargoSource (craneLib.path ./.);
 
-      # Common arguments for mkCargoDerivation, a helper for the crane functions
-      # Arguments can be included here even if they aren't used, but we only
-      # place them here if they would otherwise show up in multiple places
-      commonArgs = {
-        inherit src cargoArtifacts;
-        nativeBuildInputs = with pkgs; [
-          pkg-config
-        ];
-        buildInputs = with pkgs; [
-          openssl
-          sqlite
-        ];
-      };
-
-      # Build only the cargo dependencies so we can cache them all when running in CI
-      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-      # Build the actual crate itself, reusing the cargoArtifacts
-      chaz-unwrapped = craneLib.buildPackage commonArgs;
-    in {
-      checks =
-        {
-          # Build the final package as part of `nix flake check` for convenience
-          inherit (self.packages.${system}) chaz;
-
-          # Run clippy (and deny all warnings) on the crate source
-          chaz-clippy =
-            craneLib.cargoClippy
-            (commonArgs
-              // {
-                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-              });
-
-          # Check docs build successfully
-          chaz-doc = craneLib.cargoDoc commonArgs;
-
-          # Check formatting
-          chaz-fmt = craneLib.cargoFmt commonArgs;
-
-          # Run tests with cargo-nextest
-          # Note: This provides limited value, as tests are already run in the build
-          # chaz-nextest = craneLib.cargoNextest commonArgs;
-
-          # Audit dependencies
-          crate-audit = craneLib.cargoAudit (commonArgs
-            // {
-              inherit (inputs) advisory-db;
-            });
-        }
-        # No tests exist yet, so we don't need to run coverage
-        # // lib.optionalAttrs (system == "x86_64-linux") {
-        #   # Check code coverage with tarpaulin runs
-        #   chaz-tarpaulin = craneLib.cargoTarpaulin commonArgs;
-        # }
-        // {
-          # Run formatting checks before commit
-          # Can be run manually with `pre-commit run -a`
-          pre-commit-check = inputs.pre-commit-hooks.lib.${system}.run {
-            src = ./.;
-            tools.rustfmt = toolChain;
-            hooks = {
-              alejandra.enable = true; # Nix formatting
-              prettier.enable = true; # Markdown formatting
-              rustfmt.enable = true; # Rust formatting
-            };
-          };
+        # Common arguments
+        commonArgs = {
+          inherit src;
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+          ];
+          buildInputs = with pkgs; [
+            openssl
+            sqlite
+          ];
         };
 
-      packages = rec {
-        inherit chaz-unwrapped;
-        # Wrap chaz to include the path to aichat
+        # Build only cargo dependencies for caching
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        # Args with cached artifacts
+        buildArgs = commonArgs // {inherit cargoArtifacts;};
+
+        # Build the binary
+        chaz-unwrapped = craneLib.buildPackage buildArgs;
+
+        # Wrap chaz to include aichat in PATH
         chaz =
           pkgs.runCommand chaz-unwrapped.name {
             inherit (chaz-unwrapped) pname version;
-            nativeBuildInputs = [
-              pkgs.makeWrapper
-            ];
+            nativeBuildInputs = [pkgs.makeWrapper];
           } ''
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz $out/bin
             wrapProgram $out/bin/chaz \
-              --prefix PATH : ${lib.makeBinPath [
-              pkgs.aichat
-            ]}
+              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]}
           '';
-        default = chaz;
-      };
 
-      apps = rec {
-        default = chaz;
-        chaz = inputs.flake-utils.lib.mkApp {
-          drv = self.packages.${system}.chaz;
+        # Lint packages
+        chaz-clippy = craneLib.cargoClippy (buildArgs
+          // {
+            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+          });
+
+        chaz-doc = craneLib.cargoDoc buildArgs;
+
+        chaz-fmt = craneLib.cargoFmt buildArgs;
+
+        chaz-deny = craneLib.mkCargoDerivation (buildArgs
+          // {
+            pnameSuffix = "-deny";
+            buildPhaseCargoCommand = "cargo deny check --config .config/deny.toml";
+            nativeBuildInputs = (buildArgs.nativeBuildInputs or []) ++ [pkgs.cargo-deny];
+            # cargo-deny needs the full source for config
+            src = ./.;
+          });
+
+        # Helper to create aggregate packages
+        mkAggregate = name: packages:
+          pkgs.symlinkJoin {
+            inherit name;
+            paths = builtins.attrValues packages;
+          };
+
+        lintDefaults = {
+          inherit chaz-clippy chaz-fmt;
+        };
+
+        lintAll =
+          lintDefaults
+          // {
+            inherit chaz-deny;
+          };
+      in {
+        # Hierarchical package structure via legacyPackages
+        legacyPackages = {
+          # Lint group
+          lint =
+            lintAll
+            // {
+              default = mkAggregate "lint" lintDefaults;
+              all = mkAggregate "lint-all" lintAll;
+            };
+
+          # Test group
+          test = {
+            default = craneLib.cargoTest buildArgs;
+          };
+
+          # Doc group
+          doc = {
+            default = chaz-doc;
+          };
+
+          # Main package
+          chaz = {
+            bin = chaz;
+            unwrapped = chaz-unwrapped;
+          };
+
+          default = chaz;
+        };
+
+        packages = {
+          inherit chaz chaz-unwrapped;
+          default = chaz;
+        };
+
+        # CI checks — run during `nix flake check`
+        checks = {
+          build = chaz-unwrapped;
+          test = craneLib.cargoTest buildArgs;
+          lint = mkAggregate "lint" lintDefaults;
+          doc = chaz-doc;
+        };
+
+        # Formatting via treefmt
+        treefmt = {
+          projectRootFile = "flake.nix";
+          programs = {
+            alejandra.enable = true;
+            prettier.enable = true;
+            rustfmt.enable = true;
+          };
+        };
+
+        apps = {
+          default = {
+            type = "app";
+            program = "${chaz}/bin/chaz";
+          };
+        };
+
+        # Overlay for downstream consumers
+        overlayAttrs = {
+          chaz = config.packages.chaz;
+        };
+
+        devShells.default = pkgs.mkShell {
+          name = "chaz";
+          shellHook = ''
+            echo ---------------------
+            just --list
+            echo ---------------------
+          '';
+
+          inputsFrom = [
+            chaz-unwrapped
+            chaz-clippy
+          ];
+
+          nativeBuildInputs = with pkgs; [
+            alejandra
+            cargo-deny
+            cargo-nextest
+            deadnix
+            git-cliff
+            just
+            nodePackages.prettier
+            nix-fast-build
+            statix
+            config.treefmt.build.wrapper
+          ];
+
+          RUST_SRC_PATH = "${rustSrc}/lib/rustlib/src/rust/library";
         };
       };
-
-      devShells.default = pkgs.mkShell {
-        name = "chaz";
-        shellHook = ''
-          ${self.checks.${system}.pre-commit-check.shellHook}
-          echo ---------------------
-          task --list
-          echo ---------------------
-        '';
-
-        # Include the packages from the defined checks and packages
-        inputsFrom =
-          (builtins.attrValues self.checks.${system})
-          ++ (builtins.attrValues self.packages.${system});
-
-        nativeBuildInputs = with pkgs; [
-          act # For running Github Actions locally
-          alejandra
-          deadnix
-          git-cliff
-          go-task
-          gum # Pretty printing in scripts
-          nodePackages.prettier
-          statix
-
-          # Code coverage
-          cargo-tarpaulin
-          cargo-nextest
-        ];
-
-        # Many tools read this to find the sources for rust stdlib
-        RUST_SRC_PATH = "${rustSrc}/lib/rustlib/src/rust/library";
-      };
-    })
-    // {
-      overlays.default = final: prev: {
-        chaz = self.packages.${final.system}.chaz;
-      };
-      homeManagerModules.default = import ./nix/home-manager.nix;
     };
 }

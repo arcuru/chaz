@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+
+      - name: Lint
+        run: |
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.lint'
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.treefmt'
+
+      - name: Test
+        run: |
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.test'
+
+      - name: Doc
+        run: |
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.doc'
+
+      - name: Build
+        run: |
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.build'

@@ -1,0 +1,66 @@
+name: "Deps: Hold Expiry"
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: deps-hold-expiry
+  cancel-in-progress: true
+
+jobs:
+  release-holds:
+    name: Release Expired Holds
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'arcuru'
+    permissions:
+      pull-requests: write
+      checks: write
+    steps:
+      - name: Check and release expired holds
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          echo "Today: $TODAY"
+
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --label on-hold --state open --json number,body --jq '.[]')
+
+          if [ -z "$PRS" ]; then
+            echo "No PRs with on-hold label found."
+            exit 0
+          fi
+
+          echo "$PRS" | jq -c '.' | while read -r PR; do
+            NUMBER=$(echo "$PR" | jq -r '.number')
+            BODY=$(echo "$PR" | jq -r '.body')
+
+            HOLD_DATE=$(echo "$BODY" | sed -n 's/.*<!-- hold-until: \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*/\1/p' | head -n1)
+
+            if [ -z "$HOLD_DATE" ]; then
+              echo "PR #$NUMBER: No hold-until date found, skipping."
+              continue
+            fi
+
+            echo "PR #$NUMBER: Hold until $HOLD_DATE"
+
+            if [[ ! "$TODAY" < "$HOLD_DATE" ]]; then
+              echo "PR #$NUMBER: Hold expired, removing label."
+              gh pr edit "$NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label on-hold
+
+              HEAD_SHA=$(gh pr view "$NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
+              gh api "repos/$GITHUB_REPOSITORY/check-runs" --method POST \
+                -f name="Dependency Hold" \
+                -f head_sha="$HEAD_SHA" \
+                -f status="completed" \
+                -f conclusion="success" \
+                -f "output[title]=Hold expired" \
+                -f "output[summary]=Hold period expired (was until $HOLD_DATE). Dependency update may proceed."
+
+              COMMENT="Hold period expired (was until $HOLD_DATE). Removing \`on-hold\` label — this PR is now eligible for merge."
+              gh pr comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body "$COMMENT"
+            else
+              echo "PR #$NUMBER: Still on hold until $HOLD_DATE."
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

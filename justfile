@@ -1,50 +1,151 @@
-# default recipe to display help information
+# Chaz Development Commands
+# Run `just` to see available recipes
+
+alias b := build
+alias t := test
+
+[private]
 default:
     @just --list
 
-# Run CI locally in containers
-ci-full:
-    act
+# =============================================================================
+# Development Workflows
+# =============================================================================
 
-# Run CI locally
-ci: audit fmt test nix-check nix-build clippy pre-commit build
-    @echo "Running CI checks"
+# Quick development feedback (build + test + lint)
+dev:
+    just build
+    just test
+    just lint clippy
 
-# Run Nix CI checks 
-nix-check:
-    nix flake check
+# Run automatic fixes (clippy fix + nix fixes + format)
+fix:
+    cargo clippy --fix --allow-dirty --all-targets --allow-no-vcs -- -D warnings
+    statix fix .
+    deadnix --edit .
+    just fmt
 
-# Run Nix Build
-nix-build:
-    nix build
+# =============================================================================
+# Building
+# =============================================================================
 
-# Run clippy
-clippy:
-    cargo clippy
+# Build the project (debug or release)
+build mode='debug':
+    cargo build --all-targets {{ if mode == "release" { "--release" } else { "" } }} --quiet
 
-# Run clippy fixes
-clippy-fix:
-    cargo clippy --fix --allow-dirty
+# =============================================================================
+# Testing
+# =============================================================================
 
-# Run pre-commit
-pre-commit:
-    pre-commit run --all-files --show-diff-on-failure
+# Run tests: [filter] or bare
+test *args='':
+    cargo test {{ args }}
 
-# Run all formatters
-fmt:
-    cargo fmt --all
-    alejandra .
+# =============================================================================
+# Linting (Static Analysis)
+# =============================================================================
 
-# Run all tests
-alias t := test
-test:
-    cargo test
+# Run linter(s): clippy, audit, statix, deadnix, all
+lint +tools='clippy audit statix deadnix':
+    #!/usr/bin/env bash
+    set -e
+    for tool in {{ tools }}; do
+        case "$tool" in
+            clippy)
+                echo "=== Running clippy ==="
+                cargo clippy --all-targets -- -D warnings
+                ;;
+            audit)
+                echo "=== Running audit (cargo-deny) ==="
+                cargo deny check --config .config/deny.toml
+                ;;
+            statix)
+                echo "=== Running statix ==="
+                statix check .
+                ;;
+            deadnix)
+                echo "=== Running deadnix ==="
+                deadnix --fail .
+                ;;
+            all)
+                just lint clippy audit statix deadnix
+                ;;
+            *)
+                echo "Unknown linter: $tool"
+                echo "Options: clippy, audit, statix, deadnix, all"
+                exit 1
+                ;;
+        esac
+    done
 
-# Run cargo security audit
-audit:
-    cargo audit
+# =============================================================================
+# Formatting
+# =============================================================================
 
-# Build the project
-alias b := build
-build:
-    cargo build
+# Run formatters: (default), check
+fmt mode='':
+    #!/usr/bin/env bash
+    set -e
+    case "{{ mode }}" in
+        check)
+            cargo fmt --all -- --check
+            alejandra . --check --quiet
+            prettier --check . --log-level warn
+            ;;
+        *)
+            cargo fmt --all
+            alejandra . --quiet
+            prettier --write . --log-level warn
+            ;;
+    esac
+
+# =============================================================================
+# CI
+# =============================================================================
+
+# Run CI locally: local (default), nix
+ci mode='local':
+    #!/usr/bin/env bash
+    set -e
+    case "{{ mode }}" in
+        local)
+            just fix
+            just lint
+            just build
+            just test
+            ;;
+        nix)
+            just nix full
+            ;;
+        *)
+            echo "Unknown mode: {{ mode }}"
+            echo "Options: local, nix"
+            exit 1
+            ;;
+    esac
+
+# =============================================================================
+# Nix
+# =============================================================================
+
+# Nix commands: build, check, full
+nix action='check':
+    #!/usr/bin/env bash
+    set -e
+    case "{{ action }}" in
+        build)
+            nix build
+            ;;
+        check)
+            nix-fast-build --no-link --skip-cached ${CI:+--no-nom}
+            ;;
+        full)
+            just nix check
+            nix build --no-link
+            ;;
+        *)
+            echo "Unknown action: {{ action }}"
+            echo "Options: build, check, full"
+            exit 1
+            ;;
+    esac

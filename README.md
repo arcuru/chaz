@@ -1,10 +1,8 @@
 # chaz
 
-**IMPORTANT NOTICE** - This project is not very active. You should prefer to use https://github.com/etkecc/baibot, which is actively developed, with more features, and is supported by a company that runs Matrix servers.
+Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects to LLM providers via OpenAI-compatible APIs to enable chatting with any model, and is being expanded into a full agent framework with tool use, memory, and autonomous capabilities.
 
-Chaz is chaz.
-
-This is a [Matrix](https://matrix.org) bot that connects to multiple LLM providers to allow for chatting with any of the LLM models. It is compatible with any model using the OpenAI API.
+For a more mature Matrix chatbot focused on day-to-day use, see [baibot](https://github.com/etkecc/baibot).
 
 In addition, it is also possible to use [AIChat](https://github.com/sigoden/aichat) as a provider, so any models available through AIChat can be accessed as well.
 
