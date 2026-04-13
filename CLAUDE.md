@@ -34,6 +34,7 @@ config.rs            Config, Backend types, GLOBAL_CONFIG/GLOBAL_MESSAGES
 types.rs             ConversationId
 agent.rs             Agent config (role, model defaults)
 session.rs           SessionManager + Session (eidetica-backed message history)
+persistence.rs       SharedBackend(Arc<InMemory>) wrapper + SaveHandle for disk persistence
 tool.rs              Tool trait, ToolDefinition, ToolRegistry
 tools/
   mod.rs             Re-exports all tools
@@ -42,6 +43,7 @@ tools/
   shell.rs           shell — execute commands (FIXME: unsandboxed)
   file.rs            read_file, write_file — filesystem access
   web.rs             web_fetch — HTTP GET/POST
+  memory.rs          remember, recall — persistent key-value memory (eidetica-backed)
 runtime.rs           ReAct loop: context → LLM → parse tool calls → execute → loop
 router.rs            Dispatches ChatRequests, manages sessions, calls runtime
 gateway/
@@ -66,7 +68,8 @@ defaults.rs          Built-in default config and roles
 
 - **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
 - **Sequential router**: One request at a time to prevent session state races
-- **Session history**: eidetica InMemory backend (SQLite blocked by libsqlite3-sys version conflict)
+- **Session history**: eidetica InMemory backend with disk persistence (state saved to `eidetica.json` on shutdown via SharedBackend/SaveHandle pattern)
+- **Memory**: eidetica Table store for key-value facts, shared database with sessions
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
 - **Global state**: `lazy_static` for GLOBAL_CONFIG and GLOBAL_MESSAGES (rate limiting)
