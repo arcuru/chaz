@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms and responds using LLM backends (OpenAI-compatible APIs and AIChat subprocess). Single binary, no database — per-room config is stored in Matrix room state events (tags).
+Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development. Being expanded from a chatbot into a full agent orchestrator with tool use, memory, and autonomous capabilities.
+**Status**: Active development — Phase 1 (architecture + ReAct loop) and Phase 2 (tools) complete. Working on memory, persistence, and extensibility.
 
 ## Build & Development Commands
 
-Development environment uses Nix flakes with treefmt (enter via `direnv allow` or `nix develop`). The `justfile` is the primary task runner:
+Development environment uses Nix flakes with treefmt (enter via `direnv allow` or `nix develop .#`). The `justfile` is the primary task runner:
 
 ```bash
 just build          # cargo build
@@ -22,35 +22,79 @@ just nix build      # nix build
 just nix check      # nix flake check
 ```
 
-There are no unit tests yet — `cargo test` will pass but has no meaningful test coverage. Build dependencies require `pkg-config`, `openssl`, and `sqlite`.
+Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
+
+No unit tests yet — `cargo test` passes with no meaningful coverage. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 
-Single Rust binary with six source modules:
+```
+main.rs              CLI args, config, eidetica init, tool registry, gateway selection
+config.rs            Config, Backend types, GLOBAL_CONFIG/GLOBAL_MESSAGES
+types.rs             ConversationId
+agent.rs             Agent config (role, model defaults)
+session.rs           SessionManager + Session (eidetica-backed message history)
+tool.rs              Tool trait, ToolDefinition, ToolRegistry
+tools/
+  mod.rs             Re-exports all tools
+  time.rs            get_time — current UTC time
+  calculate.rs       calculate — math expressions (meval)
+  shell.rs           shell — execute commands (FIXME: unsandboxed)
+  file.rs            read_file, write_file — filesystem access
+  web.rs             web_fetch — HTTP GET/POST
+runtime.rs           ReAct loop: context → LLM → parse tool calls → execute → loop
+router.rs            Dispatches ChatRequests, manages sessions, calls runtime
+gateway/
+  mod.rs             ChatRequest, ChatResponse types
+  matrix.rs          MatrixGateway — headjack integration, commands, text handler
+  tui.rs             TuiGateway — stdin/stdout for testing (--tui flag)
+backends.rs          BackendManager, LLMBackend trait, ChatContext, Message
+openai.rs            OpenAI-compatible backend + chat_with_tools for ReAct loop
+role.rs              Role/system prompt management
+defaults.rs          Built-in default config and roles
+```
 
-- **`main.rs`** — Bot entry point, Matrix event handlers, all `!chaz` command implementations, context/history gathering, rate limiting
-- **`backends.rs`** — `BackendManager` dispatcher and `LLMBackend` trait definition. `ChatContext` struct represents a generic chat request
-- **`openai.rs`** — `LLMBackend` impl for OpenAI-compatible APIs via `openai-api-rs`
-- **`aichat.rs`** — `LLMBackend` impl that spawns `aichat` as a subprocess
-- **`role.rs`** — System prompt/role management. Roles define name, description, prompt, and example messages. Hierarchy: room-defined → config → built-in
-- **`defaults.rs`** — Built-in default config and pre-defined roles (chaz, chazmina, cave-chaz, bash, fish, zsh, nu, etc.)
+### Key flows
 
-Key design patterns:
+**Message flow (Matrix):** Matrix sync → text handler → read room tags for model/role → send ChatRequest via channel → router adds to session → runtime runs ReAct loop → response sent back via oneshot → gateway sends to room.
 
-- Global state via `lazy_static` (`GLOBAL_CONFIG`, `GLOBAL_MESSAGES` for rate limiting)
-- Matrix room tags for per-room model/role/backend persistence (namespace `is.chaz.*`)
-- Bot framework: `headjack` crate wraps `matrix-sdk`
-- Config: YAML (`config.yaml`) parsed with `serde_yaml`
+**Message flow (TUI):** stdin → ChatRequest → router → runtime → stdout.
+
+**ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: execute tools, feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
+
+### Key patterns
+
+- **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
+- **Sequential router**: One request at a time to prevent session state races
+- **Session history**: eidetica InMemory backend (SQLite blocked by libsqlite3-sys version conflict)
+- **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
+- **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
+- **Global state**: `lazy_static` for GLOBAL_CONFIG and GLOBAL_MESSAGES (rate limiting)
+- **Room tags**: `is.chaz.*` namespace for per-room model/role/backend persistence
+
+## Adding a New Tool
+
+1. Create `src/tools/my_tool.rs` implementing the `Tool` trait
+2. Add `mod my_tool;` and `pub use` to `src/tools/mod.rs`
+3. Register in `main.rs`: `tools.register(tools::MyTool);`
+
+The `Tool` trait requires: `name()`, `description()`, `parameters()` (JSON Schema), and `execute()` (returns boxed future for async support).
 
 ## CI
 
-GitHub Actions runs on push to main and PRs:
-
-- `ci.yml`: nix-fast-build based — lint, test, build
-- `security-audit.yml`: daily cargo-deny, auto-creates GitHub issues
-- `release-plz.yml`: automated versioning and crates.io publishing
-- Dependency update workflows: cargo-update, flake-update, actions-update (monthly with hold gates)
+GitHub Actions on push to main and PRs:
+- `ci.yml`: nix-fast-build — lint, test, build, doc
+- `security-audit.yml`: daily cargo-deny
+- Dependency update workflows: cargo-update, flake-update, actions-update (monthly)
 
 ## Formatting & Linting
 
 treefmt enforces: `rustfmt` (Rust), `alejandra` (Nix), `prettier` (Markdown/YAML). Clippy denies all warnings in CI.
+
+## Test Instance
+
+- Bot: `@chaz-dev:jackson.dev`
+- Config: `~/chaz-test/config.yaml`
+- Logs: `~/chaz-test/chaz.log`
+- Start: `~/chaz-test/run.sh`
+- Backend: OpenRouter (`minimax/minimax-m2.7` default)
