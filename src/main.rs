@@ -9,6 +9,7 @@ mod router;
 mod runtime;
 mod session;
 mod tool;
+mod tools;
 mod types;
 
 use config::*;
@@ -54,8 +55,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Register built-in tools
     let mut tools = tool::ToolRegistry::new();
-    tools.register(tool::GetTime);
-    tools.register(tool::Calculate);
+    tools.register(tools::GetTime);
+    tools.register(tools::Calculate);
+    tools.register(tools::ShellExec);
+    tools.register(tools::ReadFile);
+    tools.register(tools::WriteFile);
+    tools.register(tools::WebFetch);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
 
