@@ -5,13 +5,11 @@ use crate::role::RoleDetails;
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::crdt::Doc;
 use eidetica::store::Table;
 use eidetica::{Database, Instance};
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use tracing::{error, info};
 
 /// Maximum messages to include in context sent to the LLM.
@@ -32,56 +30,21 @@ pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
     messages: Vec<SessionMessage>,
-    /// Path to the JSONL file for this session (None = no file persistence)
-    file_path: Option<PathBuf>,
 }
 
 impl Session {
-    async fn new(
-        conversation_id: ConversationId,
-        database: Database,
-        sessions_dir: Option<&PathBuf>,
-    ) -> Self {
-        let file_path = sessions_dir.map(|dir| {
-            // Use a filesystem-safe hash of the conversation ID
-            let hash = Self::hash_id(&conversation_id);
-            dir.join(format!("{hash}.jsonl"))
-        });
-
+    async fn new(conversation_id: ConversationId, database: Database) -> Self {
         let mut session = Session {
             conversation_id,
             database,
             messages: Vec::new(),
-            file_path,
         };
 
-        // Load from file first (persistent across restarts)
-        session.load_from_file();
-
-        // Also try eidetica (may have messages from this run not yet on disk — shouldn't happen, but defensive)
-        if session.messages.is_empty() {
-            session.load_from_db().await;
-        }
-
+        session.load_from_db().await;
         session
     }
 
-    /// Load messages from JSONL file
-    fn load_from_file(&mut self) {
-        let Some(path) = &self.file_path else {
-            return;
-        };
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
-        };
-        for line in content.lines() {
-            if let Ok(msg) = serde_json::from_str::<SessionMessage>(line) {
-                self.messages.push(msg);
-            }
-        }
-    }
-
-    /// Load messages from eidetica (fallback)
+    /// Load messages from eidetica
     async fn load_from_db(&mut self) {
         let store_name = self.store_name();
         let Ok(txn) = self.database.new_transaction().await else {
@@ -100,32 +63,9 @@ impl Session {
         }
     }
 
-    /// Append a message to the JSONL file
-    fn persist_to_file(&self, msg: &SessionMessage) {
-        let Some(path) = &self.file_path else {
-            return;
-        };
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(mut file) => {
-                if let Ok(json) = serde_json::to_string(msg) {
-                    let _ = writeln!(file, "{json}");
-                }
-            }
-            Err(e) => error!("Failed to persist message to file: {e}"),
-        }
-    }
-
     /// Add a message to the session with persistence
     pub async fn add_message(&mut self, msg: SessionMessage) {
-        // Persist to file (survives restarts)
-        self.persist_to_file(&msg);
-
-        // Persist to eidetica (in-memory, for CRDT operations)
+        // Persist to eidetica (SQLite-backed)
         let store_name = self.store_name();
         match self.database.new_transaction().await {
             Ok(txn) => match txn.get_store::<Table<SessionMessage>>(&store_name).await {
@@ -171,15 +111,6 @@ impl Session {
     fn store_name(&self) -> String {
         format!("messages:{}", self.conversation_id.0)
     }
-
-    /// Produce a filesystem-safe hash of the conversation ID
-    fn hash_id(id: &ConversationId) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        id.0.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    }
 }
 
 /// Manages sessions across conversations
@@ -187,7 +118,6 @@ pub struct SessionManager {
     _instance: Instance,
     database: Database,
     sessions: HashMap<ConversationId, Session>,
-    sessions_dir: Option<PathBuf>,
     pub agent: Agent,
 }
 
@@ -196,22 +126,12 @@ impl SessionManager {
         instance: Instance,
         mut user: eidetica::user::User,
         config: &Config,
-        state_dir: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
-        // Set up file persistence directory
-        let sessions_dir = state_dir.map(|dir| {
-            let sessions = dir.join("sessions");
-            if let Err(e) = std::fs::create_dir_all(&sessions) {
-                error!("Failed to create sessions directory: {e}");
-            }
-            sessions
-        });
-
         // Find or create the eidetica sessions database
         let database = match user.find_database("chaz-sessions").await {
             Ok(existing) if !existing.is_empty() => existing.into_iter().next().unwrap(),
             _ => {
-                let mut settings = Doc::new();
+                let mut settings = eidetica::crdt::Doc::new();
                 settings.set("name", "chaz-sessions");
                 let key_id = user.get_default_key()?;
                 user.create_database(settings, &key_id).await?
@@ -224,20 +144,19 @@ impl SessionManager {
             _instance: instance,
             database,
             sessions: HashMap::new(),
-            sessions_dir,
             agent,
         })
+    }
+
+    /// Get the eidetica database (for sharing with tools)
+    pub fn database(&self) -> &Database {
+        &self.database
     }
 
     /// Get or create a session for a conversation
     pub async fn get_or_create(&mut self, id: &ConversationId) -> &mut Session {
         if !self.sessions.contains_key(id) {
-            let session = Session::new(
-                id.clone(),
-                self.database.clone(),
-                self.sessions_dir.as_ref(),
-            )
-            .await;
+            let session = Session::new(id.clone(), self.database.clone()).await;
             info!(
                 "Session for {}: {} messages loaded",
                 id,

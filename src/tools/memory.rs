@@ -1,28 +1,27 @@
 use crate::tool::Tool;
 use chrono::Utc;
+use eidetica::store::Table;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryEntry {
-    key: String,
-    value: String,
-    timestamp: String,
+pub struct MemoryEntry {
+    pub key: String,
+    pub value: String,
+    pub timestamp: String,
 }
 
-/// Store a fact in persistent memory
+/// Store a fact in persistent memory (eidetica-backed)
 pub struct Remember {
-    memory_file: PathBuf,
+    database: Database,
 }
 
 impl Remember {
-    pub fn new(state_dir: &std::path::Path) -> Self {
-        Self {
-            memory_file: state_dir.join("memory.jsonl"),
-        }
+    pub fn new(database: Database) -> Self {
+        Self { database }
     }
 }
 
@@ -72,32 +71,36 @@ impl Tool for Remember {
                 timestamp: Utc::now().to_rfc3339(),
             };
 
-            let json =
-                serde_json::to_string(&entry).map_err(|e| format!("Serialization error: {e}"))?;
-
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.memory_file)
-                .map_err(|e| format!("Failed to open memory file: {e}"))?;
-            writeln!(file, "{json}").map_err(|e| format!("Failed to write memory: {e}"))?;
+            let txn = self
+                .database
+                .new_transaction()
+                .await
+                .map_err(|e| format!("Failed to create transaction: {e}"))?;
+            let store = txn
+                .get_store::<Table<MemoryEntry>>("memory")
+                .await
+                .map_err(|e| format!("Failed to open memory store: {e}"))?;
+            store
+                .insert(entry)
+                .await
+                .map_err(|e| format!("Failed to store memory: {e}"))?;
+            txn.commit()
+                .await
+                .map_err(|e| format!("Failed to commit memory: {e}"))?;
 
             Ok(format!("Remembered: {key} = {value}"))
         })
     }
 }
 
-/// Search persistent memory for facts
+/// Search persistent memory for facts (eidetica-backed)
 pub struct Recall {
-    memory_file: PathBuf,
+    database: Database,
 }
 
 impl Recall {
-    pub fn new(state_dir: &std::path::Path) -> Self {
-        Self {
-            memory_file: state_dir.join("memory.jsonl"),
-        }
+    pub fn new(database: Database) -> Self {
+        Self { database }
     }
 }
 
@@ -134,32 +137,44 @@ impl Tool for Recall {
                 .ok_or_else(|| "Missing 'query' argument".to_string())?
                 .to_lowercase();
 
-            let content = std::fs::read_to_string(&self.memory_file).unwrap_or_default();
-            if content.is_empty() {
-                return Ok("No memories stored yet.".to_string());
-            }
+            let txn = self
+                .database
+                .new_transaction()
+                .await
+                .map_err(|e| format!("Failed to create transaction: {e}"))?;
+            let store = txn
+                .get_store::<Table<MemoryEntry>>("memory")
+                .await
+                .map_err(|e| format!("Failed to open memory store: {e}"))?;
 
-            let mut matches = Vec::new();
-            // Walk backwards so most recent entries win for duplicate keys
-            for line in content.lines().rev() {
-                if let Ok(entry) = serde_json::from_str::<MemoryEntry>(line) {
-                    if entry.key.to_lowercase().contains(&query)
+            let records = store
+                .search(|entry: &MemoryEntry| {
+                    entry.key.to_lowercase().contains(&query)
                         || entry.value.to_lowercase().contains(&query)
-                    {
-                        // Deduplicate by key — keep only the most recent
-                        if !matches.iter().any(|m: &MemoryEntry| m.key == entry.key) {
-                            matches.push(entry);
-                        }
-                    }
-                }
-            }
+                })
+                .await
+                .map_err(|e| format!("Failed to search memory: {e}"))?;
 
-            if matches.is_empty() {
+            if records.is_empty() {
                 return Ok(format!("No memories found matching '{query}'."));
             }
 
-            let result = matches
-                .iter()
+            // Deduplicate by key — keep only the most recent
+            let mut by_key: std::collections::HashMap<String, MemoryEntry> =
+                std::collections::HashMap::new();
+            for (_, entry) in records {
+                by_key
+                    .entry(entry.key.clone())
+                    .and_modify(|existing| {
+                        if entry.timestamp > existing.timestamp {
+                            *existing = entry.clone();
+                        }
+                    })
+                    .or_insert(entry);
+            }
+
+            let result = by_key
+                .values()
                 .map(|m| format!("- **{}**: {} ({})", m.key, m.value, m.timestamp))
                 .collect::<Vec<_>>()
                 .join("\n");

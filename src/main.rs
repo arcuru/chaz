@@ -4,6 +4,7 @@ mod config;
 mod defaults;
 mod gateway;
 mod openai;
+mod persistence;
 mod role;
 mod router;
 mod runtime;
@@ -16,7 +17,7 @@ use config::*;
 
 use clap::Parser;
 use std::{fs::File, io::Read, path::PathBuf};
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -42,16 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_yaml::from_str(&contents)?;
     *GLOBAL_CONFIG.lock().unwrap() = Some(config.clone());
 
-    // Initialize eidetica for session management
-    // Using InMemory backend for now due to libsqlite3-sys version conflict
-    // between matrix-sdk (rusqlite) and eidetica (sqlx). SQLite persistence
-    // can be enabled once the deps align.
-    let backend = eidetica::backend::database::InMemory::new();
-    let instance = eidetica::Instance::open(Box::new(backend)).await?;
-    let _ = instance.create_user("chaz", None).await; // OK if already exists
-    let user = instance.login_user("chaz", None).await?;
-
-    // Resolve state directory for file persistence
+    // Resolve state directory for persistence
     let state_dir = config
         .state_dir
         .as_ref()
@@ -61,8 +53,16 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
 
-    let session_manager =
-        session::SessionManager::new(instance, user, &config, state_dir.clone()).await?;
+    // Initialize eidetica with InMemory backend, loading persisted state from disk
+    let eidetica_path = state_dir.as_ref().map(|d| d.join("eidetica.json"));
+    let (backend, save_handle) =
+        persistence::SharedBackend::load_or_create(eidetica_path.as_deref()).await;
+    let instance = eidetica::Instance::open(backend).await?;
+    let _ = instance.create_user("chaz", None).await; // OK if already exists
+    let user = instance.login_user("chaz", None).await?;
+
+    let session_manager = session::SessionManager::new(instance, user, &config).await?;
+    let memory_db = session_manager.database().clone();
 
     // Register built-in tools
     let mut tools = tool::ToolRegistry::new();
@@ -72,10 +72,8 @@ async fn main() -> anyhow::Result<()> {
     tools.register(tools::ReadFile);
     tools.register(tools::WriteFile);
     tools.register(tools::WebFetch);
-    if let Some(dir) = &state_dir {
-        tools.register(tools::Remember::new(dir));
-        tools.register(tools::Recall::new(dir));
-    }
+    tools.register(tools::Remember::new(memory_db.clone()));
+    tools.register(tools::Recall::new(memory_db));
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
 
@@ -96,5 +94,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     router_handle.abort();
+
+    // Save eidetica state to disk on shutdown
+    if let Some(handle) = &save_handle {
+        match handle.save().await {
+            Ok(()) => info!("Eidetica state saved to disk"),
+            Err(e) => error!("Failed to save eidetica state: {e}"),
+        }
+    }
+
     Ok(())
 }
