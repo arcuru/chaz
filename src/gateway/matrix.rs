@@ -299,17 +299,13 @@ impl MatrixGateway {
         });
 
         // Headjack's run() doesn't retry on transient sync errors (timeouts,
-        // network blips). Wrap in a retry loop so the bot stays alive.
+        // network blips, server errors). Wrap in a retry loop so the bot stays alive.
         loop {
             match bot.run().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    let err = e.to_string();
-                    if err.contains("timed out") || err.contains("connection") {
-                        error!("Matrix sync error (retrying): {err}");
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!("Bot error: {e}"));
+                    error!("Matrix sync error (retrying in 5s): {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         }
