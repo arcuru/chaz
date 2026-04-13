@@ -152,7 +152,23 @@ pub async fn execute(
         }
     }
 
-    Err("Agent reached maximum tool iterations without a final response".to_string())
+    // Hit the cap — make one final call without tools to force a text summary
+    info!("Max tool iterations reached, forcing final response");
+    messages.push(RuntimeMessage::User(
+        "Please summarize what you found so far and respond to the user.".to_string(),
+    ));
+    match openai.chat_with_tools(&messages, &[], &model).await {
+        Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),
+        _ => {
+            // Last resort: return the last tool result
+            for msg in messages.iter().rev() {
+                if let RuntimeMessage::ToolResult { content, .. } = msg {
+                    return Ok(content.clone());
+                }
+            }
+            Err("Agent reached maximum tool iterations without a final response".to_string())
+        }
+    }
 }
 
 /// Convert a ChatContext into RuntimeMessages for the ReAct loop
