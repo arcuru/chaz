@@ -1,7 +1,7 @@
 use crate::tool::Tool;
 use chrono::Utc;
-use eidetica::store::Table;
 use eidetica::Database;
+use eidetica::store::Table;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;

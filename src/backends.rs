@@ -1,7 +1,6 @@
 /// Manage all the backends for chaz.
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
-use matrix_sdk::media::MediaFileHandle;
 use openai_api_rs::v1::chat_completion::MessageRole;
 
 use crate::{config::Backend, openai::OpenAI, role::RoleDetails};
@@ -51,7 +50,6 @@ impl Message {
 pub struct ChatContext {
     pub messages: Vec<Message>,
     pub model: Option<String>,
-    pub media: Vec<MediaFileHandle>,
     pub role: Option<RoleDetails>,
 }
 

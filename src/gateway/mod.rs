@@ -5,7 +5,18 @@ use crate::backends::BackendManager;
 use crate::role::RoleDetails;
 use crate::session::SessionMessage;
 use crate::types::ConversationId;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+
+/// Trait for transport gateways (Matrix, TUI, etc.)
+///
+/// A gateway owns a transport connection and converts transport-specific
+/// events into `ChatRequest`s sent to the router via `event_tx`.
+pub trait Gateway {
+    fn run(
+        self,
+        event_tx: mpsc::Sender<ChatRequest>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+}
 
 /// A request to process a chat message through the agent runtime
 pub struct ChatRequest {

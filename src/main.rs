@@ -13,6 +13,7 @@ mod tools;
 mod types;
 
 use config::Config;
+use gateway::Gateway;
 
 use clap::Parser;
 use std::{fs::File, io::Read, path::PathBuf};
@@ -56,8 +57,7 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|d| d.join("eidetica.db"))
         .unwrap_or_else(|| PathBuf::from("eidetica.db"));
-    let backend =
-        eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
+    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
     let instance = eidetica::Instance::open(Box::new(backend)).await?;
     let _ = instance.create_user("chaz", None).await; // OK if already exists
     let user = instance.login_user("chaz", None).await?;

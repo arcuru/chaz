@@ -79,4 +79,3 @@ pub struct Model {
 pub enum BackendType {
     OpenAICompatible,
 }
-

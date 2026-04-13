@@ -1,7 +1,7 @@
 use crate::backends::BackendManager;
 use crate::config::Config;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::gateway::{ChatRequest, ChatResponse};
+use crate::gateway::{ChatRequest, ChatResponse, Gateway};
 use crate::role::get_role;
 use crate::types::ConversationId;
 
@@ -16,8 +16,10 @@ impl TuiGateway {
     pub fn new(config: Config) -> Self {
         Self { config }
     }
+}
 
-    pub async fn run(self, event_tx: mpsc::Sender<ChatRequest>) -> anyhow::Result<()> {
+impl Gateway for TuiGateway {
+    async fn run(self, event_tx: mpsc::Sender<ChatRequest>) -> anyhow::Result<()> {
         let conversation_id = ConversationId("tui".to_string());
 
         // Resolve role from config (no transport-specific overrides for TUI)

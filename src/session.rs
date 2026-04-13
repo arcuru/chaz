@@ -102,9 +102,7 @@ impl Session {
                 // Persist to eidetica
                 let store_name = self.store_name();
                 if let Ok(txn) = self.database.new_transaction().await {
-                    if let Ok(store) =
-                        txn.get_store::<Table<SessionMessage>>(&store_name).await
-                    {
+                    if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&store_name).await {
                         if store.insert(msg.clone()).await.is_ok() {
                             let _ = txn.commit().await;
                         }
@@ -145,7 +143,6 @@ impl Session {
             messages,
             model,
             role,
-            media: Vec::new(),
         }
     }
 
