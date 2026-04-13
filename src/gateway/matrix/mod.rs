@@ -314,6 +314,9 @@ impl Gateway for MatrixGateway {
                                     .await
                                     .unwrap();
                             }
+                            Ok(ChatResponse::Skipped) => {
+                                // Message was batched with a later message — no response needed
+                            }
                             Err(_) => error!("Router dropped response channel"),
                         }
                     }

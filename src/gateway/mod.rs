@@ -39,6 +39,13 @@ pub struct ChatRequest {
 
 /// Response from the agent runtime
 pub enum ChatResponse {
-    Message { body: String, is_markdown: bool },
-    Error { error: String },
+    Message {
+        body: String,
+        is_markdown: bool,
+    },
+    Error {
+        error: String,
+    },
+    /// Message was added to session but no LLM response generated (batched with later messages)
+    Skipped,
 }

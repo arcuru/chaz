@@ -72,6 +72,7 @@ impl Gateway for TuiGateway {
                 ChatResponse::Error { error } => {
                     eprintln!("\nError: {}\n", error);
                 }
+                ChatResponse::Skipped => {}
             }
         }
 
