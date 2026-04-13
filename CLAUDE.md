@@ -70,7 +70,7 @@ defaults.rs          Built-in default config and roles
 
 - **Gateway trait**: Both MatrixGateway and TuiGateway implement `Gateway` trait with `run()` method
 - **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
-- **Sequential router**: One request at a time to prevent session state races
+- **Batching router**: Drains buffered messages, groups by conversation, only LLM-responds to last message per batch (prevents duplicate responses on reconnect/burst)
 - **Transport ID binding**: Gateways send native transport IDs, SessionManager resolves to ConversationId
 - **Session history**: eidetica SQLite backend for persistent storage
 - **Memory**: eidetica Table store for key-value facts, shared database with sessions
