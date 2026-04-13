@@ -5,7 +5,7 @@ use backends::{BackendManager, ChatContext, Message};
 
 mod role;
 use openai_api_rs::v1::chat_completion::MessageRole;
-use role::{get_role, get_role_names, RoleDetails};
+use role::{RoleDetails, get_role, get_role_names};
 
 mod defaults;
 use defaults::DEFAULT_CONFIG;
@@ -15,13 +15,13 @@ use headjack::Tags;
 use headjack::*;
 use lazy_static::lazy_static;
 use matrix_sdk::{
+    Room, RoomMemberships,
     media::{MediaFormat, MediaRequest},
     room::MessagesOptions,
     ruma::{
-        events::room::message::{MessageType, RoomMessageEventContent},
         OwnedUserId,
+        events::room::message::{MessageType, RoomMessageEventContent},
     },
-    Room, RoomMemberships,
 };
 use regex::Regex;
 use serde::Deserialize;

@@ -1,5 +1,5 @@
 name: Setup Nix
-description: Install Nix with nix-fast-build
+description: Install Nix with nix-fast-build and caching
 
 runs:
   using: composite
@@ -9,6 +9,9 @@ runs:
       with:
         extra-conf: |
           accept-flake-config = true
+
+    - name: Enable Magic Nix Cache
+      uses: DeterminateSystems/magic-nix-cache-action@b46e247b898aa56e6d2d2e728dc6df6c84571b6f # v9
 
     - name: Install nix-fast-build
       shell: bash

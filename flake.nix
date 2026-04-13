@@ -119,7 +119,7 @@
           };
 
         lintDefaults = {
-          inherit chaz-clippy chaz-fmt;
+          inherit chaz-clippy;
         };
 
         lintAll =
@@ -176,10 +176,7 @@
           programs = {
             alejandra.enable = true;
             prettier.enable = true;
-            rustfmt = {
-              enable = true;
-              package = toolChain;
-            };
+            rustfmt.enable = true;
           };
         };
 

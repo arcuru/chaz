@@ -4,7 +4,7 @@
 use std::process::Command;
 use tracing::info;
 
-use crate::{backends::LLMBackend, Backend, ChatContext};
+use crate::{Backend, ChatContext, backends::LLMBackend};
 
 pub struct AiChat {
     binary_location: String,
