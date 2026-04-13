@@ -108,3 +108,30 @@ treefmt enforces: `rustfmt` (Rust), `alejandra` (Nix), `prettier` (Markdown/YAML
 - Logs: `~/chaz-test/chaz.log`
 - Start: `~/chaz-test/run.sh`
 - Backend: OpenRouter (`minimax/minimax-m2.7` default)
+
+### Running the bot
+
+The test instance runs from a release build in the workspace:
+
+```bash
+# Build
+nix develop .# -c cargo build --release
+
+# Start (foreground)
+~/chaz-test/run.sh
+
+# Start (background)
+nohup ~/chaz-test/run.sh > ~/chaz-test/chaz.log 2>&1 &
+
+# Check if running
+ps aux | grep "chaz.*config" | grep -v grep
+
+# Stop
+kill $(pgrep -f "chaz.*config.yaml")
+
+# Check logs
+tail -f ~/chaz-test/chaz.log
+grep -E "ERROR|Response:|Batching" ~/chaz-test/chaz.log
+```
+
+After code changes, rebuild and restart — the bot persists sessions in eidetica SQLite (`~/chaz-test/` state dir), so conversation history survives restarts. The sync token is persisted by headjack, so the bot resumes from where it left off (the router's message batching prevents duplicate responses from the catch-up sync).
