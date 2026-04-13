@@ -28,6 +28,21 @@ pub struct Config {
     pub roles: Option<Vec<RoleDetails>>,
     /// Backend configuration
     pub backends: Option<Vec<Backend>>,
+    /// Agent definitions
+    pub agents: Option<Vec<AgentConfig>>,
+}
+
+/// Configuration for an agent
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentConfig {
+    /// Name of the agent
+    pub name: String,
+    /// Default role (system prompt) for this agent
+    pub role: Option<String>,
+    /// Default model for this agent
+    pub model: Option<String>,
+    /// List of tool names this agent is allowed to use (None = all tools)
+    pub tools: Option<Vec<String>>,
 }
 
 /// Configuration info for a backend

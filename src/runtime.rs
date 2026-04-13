@@ -6,7 +6,7 @@
 //! back to a single-shot LLM call.
 
 use crate::backends::{BackendManager, ChatContext};
-use crate::tool::ToolRegistry;
+use crate::tool::FilteredTools;
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -56,7 +56,7 @@ pub enum LLMResponse {
 pub async fn execute(
     context: &ChatContext,
     backend: &BackendManager,
-    tools: &ToolRegistry,
+    tools: &FilteredTools<'_>,
 ) -> Result<String, String> {
     // Fast path: no tools or backend doesn't support them → single-shot
     if tools.is_empty() || !backend.supports_tools(context) {

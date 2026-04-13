@@ -8,17 +8,19 @@ use tracing::error;
 
 /// Run the router, processing chat requests sequentially with session management.
 ///
-/// Each request: resolve transport_id → conversation → add to session → build context
-/// → execute (with ReAct loop) → store response → reply.
+/// Each request: resolve transport_id → conversation → select agent → add to session
+/// → build context → execute (with filtered tools) → store response → reply.
 pub async fn run(
     mut event_rx: mpsc::Receiver<ChatRequest>,
     mut sessions: SessionManager,
     tools: ToolRegistry,
 ) {
     while let Some(request) = event_rx.recv().await {
-        // Extract agent defaults before borrowing sessions mutably
-        let default_role = sessions.agent.default_role.clone();
-        let default_model = sessions.agent.default_model.clone();
+        // Select agent (default for now; future: per-conversation agent selection)
+        let agent = sessions.agents.default_agent();
+        let default_role = agent.default_role.clone();
+        let default_model = agent.default_model.clone();
+        let allowed_tools = agent.allowed_tools.clone();
 
         // Resolve transport ID to a conversation
         let conversation_id = sessions.resolve_conversation(&request.transport_id);
@@ -44,8 +46,11 @@ pub async fn run(
         let model = request.model_override.or(default_model);
         let context = session.build_context(role, model);
 
+        // Filter tools based on agent's allowed list
+        let filtered = tools.filtered_view(allowed_tools.as_deref());
+
         // Execute via runtime (handles ReAct loop if tools available)
-        let result = runtime::execute(&context, &request.backend, &tools).await;
+        let result = runtime::execute(&context, &request.backend, &filtered).await;
 
         match result {
             Ok(body) => {

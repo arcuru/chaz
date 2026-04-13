@@ -1,4 +1,4 @@
-use crate::agent::Agent;
+use crate::agent::AgentRegistry;
 use crate::backends::{ChatContext, Message};
 use crate::config::Config;
 use crate::role::RoleDetails;
@@ -162,7 +162,7 @@ pub struct SessionManager {
     sessions: HashMap<ConversationId, Session>,
     /// Maps transport_id → ConversationId. Enables multiple gateways to share a conversation.
     bindings: HashMap<String, ConversationId>,
-    pub agent: Agent,
+    pub agents: AgentRegistry,
 }
 
 impl SessionManager {
@@ -182,14 +182,14 @@ impl SessionManager {
             }
         };
 
-        let agent = Agent::from_config(config);
+        let agents = AgentRegistry::from_config(config);
 
         Ok(Self {
             _instance: instance,
             database,
             sessions: HashMap::new(),
             bindings: HashMap::new(),
-            agent,
+            agents,
         })
     }
 
