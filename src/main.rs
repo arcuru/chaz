@@ -12,7 +12,7 @@ mod tool;
 mod tools;
 mod types;
 
-use config::*;
+use config::Config;
 
 use clap::Parser;
 use std::{fs::File, io::Read, path::PathBuf};
@@ -40,7 +40,6 @@ async fn main() -> anyhow::Result<()> {
     file.read_to_string(&mut contents)?;
 
     let config: Config = serde_yaml::from_str(&contents)?;
-    *GLOBAL_CONFIG.lock().unwrap() = Some(config.clone());
 
     // Resolve state directory for persistence
     let state_dir = config

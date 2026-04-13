@@ -1,8 +1,5 @@
 use crate::role::RoleDetails;
-use lazy_static::lazy_static;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Configuration for the chaz bot
 #[derive(Debug, Deserialize, Clone)]
@@ -83,10 +80,3 @@ pub enum BackendType {
     OpenAICompatible,
 }
 
-lazy_static! {
-    /// Holds the config for the bot
-    pub static ref GLOBAL_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
-
-    /// Count of the global messages per user
-    pub static ref GLOBAL_MESSAGES: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
-}

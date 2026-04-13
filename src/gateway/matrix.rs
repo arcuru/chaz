@@ -20,7 +20,7 @@ use matrix_sdk::{
 };
 use openai_api_rs::v1::chat_completion::MessageRole;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::format;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -42,7 +42,7 @@ impl MatrixGateway {
     }
 
     pub async fn run(self, event_tx: mpsc::Sender<ChatRequest>) -> anyhow::Result<()> {
-        let config = self.config;
+        let config = Arc::new(self.config);
 
         let mut bot = Bot::new(BotConfig {
             command_prefix: None,
@@ -86,59 +86,80 @@ impl MatrixGateway {
         )
         .await;
 
-        bot.register_text_command(
-            "print",
-            None,
-            Some("Print the conversation".to_string()),
-            |_, _, room| async move {
-                let context = get_context(&room).await.unwrap();
-                let content = RoomMessageEventContent::notice_plain(context.string_prompt());
-                room.send(content).await.unwrap();
-                Ok(())
-            },
-        )
-        .await;
+        {
+            let config = config.clone();
+            bot.register_text_command(
+                "print",
+                None,
+                Some("Print the conversation".to_string()),
+                move |_, _, room| {
+                    let config = config.clone();
+                    async move {
+                        let context = get_context(&room, &config).await.unwrap();
+                        let content =
+                            RoomMessageEventContent::notice_plain(context.string_prompt());
+                        room.send(content).await.unwrap();
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }
 
-        bot.register_text_command(
-            "send",
-            "<message>".to_string(),
-            "Send a message without context".to_string(),
-            |sender, text, room| async move {
-                if rate_limit(&room, &sender).await {
-                    return Ok(());
-                }
-                let input = text
-                    .split_whitespace()
-                    .skip(2)
-                    .collect::<Vec<&str>>()
-                    .join(" ");
+        // Shared rate limiting state across all handlers
+        let message_counts: Arc<Mutex<HashMap<String, u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
-                let context = get_context(&room).await.unwrap();
-                let no_context = ChatContext {
-                    messages: vec![Message::new(MessageRole::user, input.to_string())],
-                    model: context.model,
-                    role: context.role,
-                    media: Vec::new(),
-                };
+        {
+            let config = config.clone();
+            let counts = message_counts.clone();
+            bot.register_text_command(
+                "send",
+                "<message>".to_string(),
+                "Send a message without context".to_string(),
+                move |sender, text, room| {
+                    let config = config.clone();
+                    let counts = counts.clone();
+                    async move {
+                        if rate_limit(&room, &sender, &config, &counts).await {
+                            return Ok(());
+                        }
+                        let input = text
+                            .split_whitespace()
+                            .skip(2)
+                            .collect::<Vec<&str>>()
+                            .join(" ");
 
-                info!(
-                    "Request: {} - {}",
-                    sender.as_str(),
-                    input.replace('\n', " ")
-                );
-                if let Ok(result) = get_backend(&room).await.execute(&no_context).await {
-                    info!(
-                        "Response: {} - {}",
-                        sender.as_str(),
-                        result.replace('\n', " ")
-                    );
-                    let content = RoomMessageEventContent::notice_plain(result.clone());
-                    room.send(content).await.unwrap();
-                }
-                Ok(())
-            },
-        )
-        .await;
+                        let context = get_context(&room, &config).await.unwrap();
+                        let no_context = ChatContext {
+                            messages: vec![Message::new(MessageRole::user, input.to_string())],
+                            model: context.model,
+                            role: context.role,
+                            media: Vec::new(),
+                        };
+
+                        info!(
+                            "Request: {} - {}",
+                            sender.as_str(),
+                            input.replace('\n', " ")
+                        );
+                        if let Ok(result) =
+                            get_backend(&room, &config).await.execute(&no_context).await
+                        {
+                            info!(
+                                "Response: {} - {}",
+                                sender.as_str(),
+                                result.replace('\n', " ")
+                            );
+                            let content = RoomMessageEventContent::notice_plain(result.clone());
+                            room.send(content).await.unwrap();
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }
 
         bot.register_text_command(
             "model",
@@ -156,21 +177,33 @@ impl MatrixGateway {
         )
         .await;
 
-        bot.register_text_command(
-            "role",
-            "[<role>] [<prompt>]".to_string(),
-            "Get the role info, set the role, or define a new role".to_string(),
-            set_role,
-        )
-        .await;
+        {
+            let config = config.clone();
+            bot.register_text_command(
+                "role",
+                "[<role>] [<prompt>]".to_string(),
+                "Get the role info, set the role, or define a new role".to_string(),
+                move |sender, text, room| {
+                    let config = config.clone();
+                    async move { set_role(sender, text, room, &config).await }
+                },
+            )
+            .await;
+        }
 
-        bot.register_text_command(
-            "list",
-            "".to_string(),
-            "List available models".to_string(),
-            list_models,
-        )
-        .await;
+        {
+            let config = config.clone();
+            bot.register_text_command(
+                "list",
+                "".to_string(),
+                "List available models".to_string(),
+                move |sender, text, room| {
+                    let config = config.clone();
+                    async move { list_models(sender, text, room, &config).await }
+                },
+            )
+            .await;
+        }
 
         bot.register_text_command(
             "clear",
@@ -187,137 +220,150 @@ impl MatrixGateway {
         )
         .await;
 
-        bot.register_text_command(
-            "rename",
-            "".to_string(),
-            "Rename the room and set the topic based on the chat content".to_string(),
-            rename,
-        )
-        .await;
+        {
+            let config = config.clone();
+            let counts = message_counts.clone();
+            bot.register_text_command(
+                "rename",
+                "".to_string(),
+                "Rename the room and set the topic based on the chat content".to_string(),
+                move |sender, text, room| {
+                    let config = config.clone();
+                    let counts = counts.clone();
+                    async move { rename(sender, text, room, &config, &counts).await }
+                },
+            )
+            .await;
+        }
 
         // === Text handler — routes messages through the router ===
 
-        let tx = event_tx;
-        let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
-            Arc::new(Mutex::new(HashSet::new()));
-        bot.register_text_handler(move |sender, body: String, room, event| {
-            let tx = tx.clone();
-            let backfilled_rooms = backfilled_rooms.clone();
-            async move {
-                let is_direct =
-                    room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
+        {
+            let tx = event_tx;
+            let config = config.clone();
+            let counts = message_counts;
+            let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
+                Arc::new(Mutex::new(HashSet::new()));
+            bot.register_text_handler(move |sender, body: String, room, event| {
+                let tx = tx.clone();
+                let config = config.clone();
+                let backfilled_rooms = backfilled_rooms.clone();
+                let counts = counts.clone();
+                async move {
+                    let is_direct =
+                        room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
 
-                let mentions_bot = event
-                    .content
-                    .mentions
-                    .as_ref()
-                    .map(|mentions| {
-                        mentions
-                            .user_ids
-                            .iter()
-                            .any(|mention| mention == room.client().user_id().unwrap())
-                    })
-                    .unwrap_or(false);
-
-                if !(is_direct || body.starts_with("!chaz") || mentions_bot) {
-                    return Ok(());
-                }
-
-                if rate_limit(&room, &sender).await {
-                    return Ok(());
-                }
-
-                {
-                    // Read model/role overrides from room tags
-                    let model_override = {
-                        let tags = Tags::new(&room, "is.chaz.model").await;
-                        tags.get_value("default")
-                    };
-                    let role_override = {
-                        let tags = Tags::new(&room, "is.chaz.role").await;
-                        if let Some(role_name) = tags.get_value("chazdefault") {
-                            if let Some(prompt) = tags.get_value(&role_name) {
-                                Some(RoleDetails::new(&role_name, None, Some(prompt), None))
-                            } else {
-                                let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-                                get_role(
-                                    Some(role_name),
-                                    config.roles.clone(),
-                                    DEFAULT_CONFIG.roles.clone(),
-                                )
-                            }
-                        } else {
-                            None
-                        }
-                    };
-
-                    // Strip !chaz prefix if present (it's just a trigger, not part of the message)
-                    let body = if body.starts_with("!chaz") {
-                        body.trim_start_matches("!chaz").trim().to_string()
-                    } else {
-                        body
-                    };
-
-                    let backend = get_backend(&room).await;
-                    let (response_tx, response_rx) = oneshot::channel();
-
-                    // Backfill room history on first message per room
-                    let room_id = room.room_id().to_string();
-                    let backfill_history = {
-                        let mut rooms = backfilled_rooms.lock().await;
-                        if rooms.insert(room_id.clone()) {
-                            // First time seeing this room — read history
-                            info!("Backfilling history for room {}", room_id);
-                            Some(read_room_history(&room).await)
-                        } else {
-                            None
-                        }
-                    };
-
-                    if tx
-                        .send(ChatRequest {
-                            conversation_id: ConversationId(room_id),
-                            sender: sender.to_string(),
-                            body,
-                            model_override,
-                            role_override,
-                            backend,
-                            response_tx,
-                            backfill_history,
+                    let mentions_bot = event
+                        .content
+                        .mentions
+                        .as_ref()
+                        .map(|mentions| {
+                            mentions
+                                .user_ids
+                                .iter()
+                                .any(|mention| mention == room.client().user_id().unwrap())
                         })
-                        .await
-                        .is_err()
-                    {
-                        error!("Router channel closed");
+                        .unwrap_or(false);
+
+                    if !(is_direct || body.starts_with("!chaz") || mentions_bot) {
                         return Ok(());
                     }
 
-                    match response_rx.await {
-                        Ok(ChatResponse::Message { body, is_markdown }) => {
-                            info!("Response: {}", body.replace('\n', " "));
-                            if is_markdown {
-                                room.send(RoomMessageEventContent::text_markdown(body))
-                                    .await
-                                    .unwrap();
+                    if rate_limit(&room, &sender, &config, &counts).await {
+                        return Ok(());
+                    }
+
+                    {
+                        // Read model/role overrides from room tags
+                        let model_override = {
+                            let tags = Tags::new(&room, "is.chaz.model").await;
+                            tags.get_value("default")
+                        };
+                        let role_override = {
+                            let tags = Tags::new(&room, "is.chaz.role").await;
+                            if let Some(role_name) = tags.get_value("chazdefault") {
+                                if let Some(prompt) = tags.get_value(&role_name) {
+                                    Some(RoleDetails::new(&role_name, None, Some(prompt), None))
+                                } else {
+                                    get_role(
+                                        Some(role_name),
+                                        config.roles.clone(),
+                                        DEFAULT_CONFIG.roles.clone(),
+                                    )
+                                }
                             } else {
-                                room.send(RoomMessageEventContent::notice_plain(body))
+                                None
+                            }
+                        };
+
+                        // Strip !chaz prefix if present (it's just a trigger, not part of the message)
+                        let body = if body.starts_with("!chaz") {
+                            body.trim_start_matches("!chaz").trim().to_string()
+                        } else {
+                            body
+                        };
+
+                        let backend = get_backend(&room, &config).await;
+                        let (response_tx, response_rx) = oneshot::channel();
+
+                        // Backfill room history on first message per room
+                        let room_id = room.room_id().to_string();
+                        let backfill_history = {
+                            let mut rooms = backfilled_rooms.lock().await;
+                            if rooms.insert(room_id.clone()) {
+                                // First time seeing this room — read history
+                                info!("Backfilling history for room {}", room_id);
+                                Some(read_room_history(&room).await)
+                            } else {
+                                None
+                            }
+                        };
+
+                        if tx
+                            .send(ChatRequest {
+                                conversation_id: ConversationId(room_id),
+                                sender: sender.to_string(),
+                                body,
+                                model_override,
+                                role_override,
+                                backend,
+                                response_tx,
+                                backfill_history,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            error!("Router channel closed");
+                            return Ok(());
+                        }
+
+                        match response_rx.await {
+                            Ok(ChatResponse::Message { body, is_markdown }) => {
+                                info!("Response: {}", body.replace('\n', " "));
+                                if is_markdown {
+                                    room.send(RoomMessageEventContent::text_markdown(body))
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    room.send(RoomMessageEventContent::notice_plain(body))
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+                            Ok(ChatResponse::Error { error }) => {
+                                let err = format!("!chaz Error: {}", error.replace('\n', " "));
+                                tracing::error!("{}", err);
+                                room.send(RoomMessageEventContent::notice_plain(err))
                                     .await
                                     .unwrap();
                             }
+                            Err(_) => error!("Router dropped response channel"),
                         }
-                        Ok(ChatResponse::Error { error }) => {
-                            let err = format!("!chaz Error: {}", error.replace('\n', " "));
-                            tracing::error!("{}", err);
-                            room.send(RoomMessageEventContent::notice_plain(err))
-                                .await
-                                .unwrap();
-                        }
-                        Err(_) => error!("Router dropped response channel"),
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
-        });
+            });
+        }
 
         // Headjack's run() doesn't retry on transient sync errors (timeouts,
         // network blips, server errors). Wrap in a retry loop so the bot stays alive.
@@ -333,32 +379,25 @@ impl MatrixGateway {
     }
 }
 
-// === Helper functions (moved from main.rs) ===
+// === Helper functions ===
 
 /// Rate limit the user to a set number of messages
 /// Returns true if the user is being rate limited
-async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
+async fn rate_limit(
+    room: &Room,
+    sender: &OwnedUserId,
+    config: &Config,
+    message_counts: &Mutex<HashMap<String, u64>>,
+) -> bool {
     let room_size = room
         .members(RoomMemberships::ACTIVE)
         .await
         .unwrap_or(Vec::new())
         .len();
-    let message_limit = GLOBAL_CONFIG
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap()
-        .message_limit
-        .unwrap_or(u64::MAX);
-    let room_size_limit = GLOBAL_CONFIG
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap()
-        .room_size_limit
-        .unwrap_or(usize::MAX);
+    let message_limit = config.message_limit.unwrap_or(u64::MAX);
+    let room_size_limit = config.room_size_limit.unwrap_or(usize::MAX);
     let count = {
-        let mut messages = GLOBAL_MESSAGES.lock().unwrap();
+        let mut messages = message_counts.lock().await;
         let count = match messages.get_mut(sender.as_str()) {
             Some(count) => count,
             None => {
@@ -386,9 +425,14 @@ async fn rate_limit(room: &Room, sender: &OwnedUserId) -> bool {
 }
 
 /// List the available models
-async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
-    let context = get_context(&room).await.unwrap();
-    let backends = get_backend(&room).await;
+async fn list_models(
+    _: OwnedUserId,
+    _: String,
+    room: Room,
+    config: &Config,
+) -> Result<(), ()> {
+    let context = get_context(&room, config).await.unwrap();
+    let backends = get_backend(&room, config).await;
     let response = format!(
         "!chaz Current Model: {}\n\nKnown Backends:\n{}\n\nKnown Models:\n{}",
         context
@@ -404,7 +448,7 @@ async fn list_models(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
 }
 
 /// Control the roles
-async fn set_role(_: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
+async fn set_role(_: OwnedUserId, text: String, room: Room, config: &Config) -> Result<(), ()> {
     let mut words = text.split_whitespace().skip(2);
     let mut tags = Tags::new(&room, "is.chaz.role").await;
     if let Some(name) = words.next() {
@@ -421,7 +465,7 @@ async fn set_role(_: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
         .await
         .unwrap();
     } else {
-        let context = get_context(&room);
+        let context = get_context(&room, config);
         let mut room_roles = Vec::new();
         for tag in tags.tags() {
             let role = tag.split('=').next().unwrap();
@@ -429,10 +473,7 @@ async fn set_role(_: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
                 room_roles.push(role);
             }
         }
-        let config_roles = {
-            let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-            get_role_names(config.roles)
-        };
+        let config_roles = get_role_names(config.roles.clone());
         let default_roles = get_role_names(DEFAULT_CONFIG.roles.clone());
         let context = context.await?;
         let current_role = {
@@ -501,7 +542,7 @@ async fn set_backend(_: OwnedUserId, text: String, room: Room) -> Result<(), ()>
 async fn set_model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
     let model = text.split_whitespace().nth(2);
     if let Some(model) = model {
-        let backend = get_backend(&room).await;
+        let backend = get_backend_default(&room).await;
         if backend.is_known_model(model) {
             let response = format!("!chaz Model set to \"{}\"", model);
             room.send(RoomMessageEventContent::notice_plain(response))
@@ -525,18 +566,38 @@ async fn set_model(sender: OwnedUserId, text: String, room: Room) -> Result<(), 
         tags.replace_kv("default", model);
         tags.sync().await;
     } else {
-        list_models(sender, text, room).await?;
+        list_models_default(sender, text, room).await?;
     }
     Ok(())
 }
 
-async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
-    if rate_limit(&room, &sender).await {
+/// List models fallback for set_model (no config available in old-style command handler)
+async fn list_models_default(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
+    let backends = get_backend_default(&room).await;
+    let response = format!(
+        "!chaz Known Backends:\n{}\n\nKnown Models:\n{}",
+        backends.list_known_backends().join("\n"),
+        backends.list_known_models().join("\n")
+    );
+    room.send(RoomMessageEventContent::notice_plain(response))
+        .await
+        .unwrap();
+    Ok(())
+}
+
+async fn rename(
+    sender: OwnedUserId,
+    _: String,
+    room: Room,
+    config: &Config,
+    message_counts: &Mutex<HashMap<String, u64>>,
+) -> Result<(), ()> {
+    if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
     }
-    if let Ok(context) = get_context(&room).await {
+    if let Ok(context) = get_context(&room, config).await {
         let mut context = context;
-        context.model = get_chat_summary_model();
+        context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
             MessageRole::user,
             [
@@ -548,7 +609,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             .join(" "),
         ));
 
-        let response = get_backend(&room).await.execute(&context).await;
+        let response = get_backend(&room, config).await.execute(&context).await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -568,7 +629,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
         }
         context.messages.pop();
 
-        context.model = get_chat_summary_model();
+        context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
             MessageRole::user,
             [
@@ -579,7 +640,7 @@ async fn rename(sender: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
             .join(" "),
         ));
 
-        let response = get_backend(&room).await.execute(&context).await;
+        let response = get_backend(&room, config).await.execute(&context).await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -627,15 +688,27 @@ async fn get_tag_backend(room: &Room) -> Option<Vec<Backend>> {
     Some(backends)
 }
 
-/// Returns the backend based on the global config
-async fn get_backend(room: &Room) -> BackendManager {
+/// Returns the backend based on the config
+async fn get_backend(room: &Room, config: &Config) -> BackendManager {
     let mut backends = Vec::new();
     if let Some(tag_backends) = get_tag_backend(room).await {
         backends = tag_backends;
     }
-    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-    if let Some(config_backends) = config.backends {
-        backends.extend(config_backends);
+    if let Some(config_backends) = &config.backends {
+        backends.extend(config_backends.clone());
+    }
+    if backends.is_empty() {
+        BackendManager::new(&None)
+    } else {
+        BackendManager::new(&Some(backends))
+    }
+}
+
+/// Returns the backend from room tags only (for commands without config access)
+async fn get_backend_default(room: &Room) -> BackendManager {
+    let mut backends = Vec::new();
+    if let Some(tag_backends) = get_tag_backend(room).await {
+        backends = tag_backends;
     }
     if backends.is_empty() {
         BackendManager::new(&None)
@@ -660,13 +733,6 @@ fn clean_summary_response(response: &str, max_length: Option<usize>) -> String {
     response.to_string()
 }
 
-/// Get the chat summary model from the global config
-fn get_chat_summary_model() -> Option<String> {
-    let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-    config.chat_summary_model
-}
-
-/// Gets the context of the current conversation
 /// Read room message history as SessionMessages for backfilling.
 /// Reads backward from most recent, stops at `!chaz clear` or end of history.
 async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
@@ -699,8 +765,11 @@ async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
                             continue;
                         }
                         if let Some(cmd) = command.split_whitespace().next() {
-                            if ["help", "party", "send", "list", "rename", "print", "model", "clear", "backend", "role"]
-                                .contains(&cmd.to_lowercase().as_str())
+                            if [
+                                "help", "party", "send", "list", "rename", "print", "model",
+                                "clear", "backend", "role",
+                            ]
+                            .contains(&cmd.to_lowercase().as_str())
                             {
                                 continue;
                             }
@@ -708,15 +777,16 @@ async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
                     }
 
                     let body = if text_content.body.starts_with("!chaz") {
-                        text_content.body.trim_start_matches("!chaz").trim().to_string()
+                        text_content
+                            .body
+                            .trim_start_matches("!chaz")
+                            .trim()
+                            .to_string()
                     } else {
                         text_content.body.clone()
                     };
 
-                    let role = if bot_user_id
-                        .as_ref()
-                        .is_some_and(|uid| sender == *uid)
-                    {
+                    let role = if bot_user_id.as_ref().is_some_and(|uid| sender == *uid) {
                         "assistant"
                     } else {
                         "user"
@@ -727,9 +797,7 @@ async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
                         .event
                         .get_field::<u64>("origin_server_ts")
                         .unwrap_or(None)
-                        .and_then(|ts| {
-                            chrono::DateTime::from_timestamp_millis(ts as i64)
-                        })
+                        .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts as i64))
                         .unwrap_or_else(Utc::now);
 
                     messages.push(SessionMessage {
@@ -753,21 +821,19 @@ async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
     messages
 }
 
-async fn get_context(room: &Room) -> Result<ChatContext, ()> {
+/// Gets the context of the current conversation from Matrix room history
+async fn get_context(room: &Room, config: &Config) -> Result<ChatContext, ()> {
     let mut context = ChatContext {
         messages: Vec::new(),
         model: None,
         media: Vec::new(),
         role: None,
     };
-    context.role = {
-        let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-        get_role(
-            config.role.clone(),
-            config.roles.clone(),
-            DEFAULT_CONFIG.roles.clone(),
-        )
-    };
+    context.role = get_role(
+        config.role.clone(),
+        config.roles.clone(),
+        DEFAULT_CONFIG.roles.clone(),
+    );
 
     let mut options = MessagesOptions::backward();
 
@@ -818,7 +884,11 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
                             {
                                 let model = text_content.body.split_whitespace().nth(2);
                                 if let Some(model) = model {
-                                    if get_backend(room).await.validate_model(model).is_ok() {
+                                    if get_backend(room, config)
+                                        .await
+                                        .validate_model(model)
+                                        .is_ok()
+                                    {
                                         context.model = Some(model.to_string());
                                     }
                                 }
@@ -890,14 +960,11 @@ async fn get_context(room: &Room) -> Result<ChatContext, ()> {
         if let Some(prompt) = tags.get_value(&role) {
             context.role = Some(RoleDetails::new(&role, None, Some(prompt), None));
         } else {
-            context.role = {
-                let config = GLOBAL_CONFIG.lock().unwrap().clone().unwrap();
-                get_role(
-                    Some(role),
-                    config.roles.clone(),
-                    DEFAULT_CONFIG.roles.clone(),
-                )
-            };
+            context.role = get_role(
+                Some(role),
+                config.roles.clone(),
+                DEFAULT_CONFIG.roles.clone(),
+            );
         }
     }
 
