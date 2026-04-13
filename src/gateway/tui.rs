@@ -60,6 +60,7 @@ impl TuiGateway {
                     role_override: role_override.clone(),
                     backend,
                     response_tx,
+                    backfill_history: None,
                 })
                 .await?;
 

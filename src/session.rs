@@ -84,6 +84,47 @@ impl Session {
         self.messages.push(msg);
     }
 
+    /// Merge backfill history from a gateway (e.g., Matrix room history).
+    /// Only inserts messages that are older than our earliest message or fill gaps.
+    /// Deduplicates by timestamp+content.
+    pub async fn backfill(&mut self, history: Vec<SessionMessage>) {
+        if history.is_empty() {
+            return;
+        }
+
+        let mut new_count = 0;
+        for msg in history {
+            // Skip if we already have a message with the same timestamp and content
+            let already_exists = self.messages.iter().any(|existing| {
+                existing.timestamp == msg.timestamp && existing.content == msg.content
+            });
+            if !already_exists {
+                // Persist to eidetica
+                let store_name = self.store_name();
+                if let Ok(txn) = self.database.new_transaction().await {
+                    if let Ok(store) =
+                        txn.get_store::<Table<SessionMessage>>(&store_name).await
+                    {
+                        if store.insert(msg.clone()).await.is_ok() {
+                            let _ = txn.commit().await;
+                        }
+                    }
+                }
+                self.messages.push(msg);
+                new_count += 1;
+            }
+        }
+
+        if new_count > 0 {
+            // Re-sort by timestamp after merging
+            self.messages.sort_by_key(|m| m.timestamp);
+            info!(
+                "Backfilled {} messages for {}",
+                new_count, self.conversation_id
+            );
+        }
+    }
+
     /// Build a ChatContext from session history with truncation
     pub fn build_context(&self, role: Option<RoleDetails>, model: Option<String>) -> ChatContext {
         // Truncate: keep only the most recent messages

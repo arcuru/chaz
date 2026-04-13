@@ -21,6 +21,11 @@ pub async fn run(
 
         let session = sessions.get_or_create(&request.conversation_id).await;
 
+        // Backfill from gateway history if provided
+        if let Some(history) = request.backfill_history {
+            session.backfill(history).await;
+        }
+
         // Add user message to session
         session
             .add_message(SessionMessage {

@@ -3,6 +3,7 @@ pub mod tui;
 
 use crate::backends::BackendManager;
 use crate::role::RoleDetails;
+use crate::session::SessionMessage;
 use crate::types::ConversationId;
 use tokio::sync::oneshot;
 
@@ -18,6 +19,8 @@ pub struct ChatRequest {
     /// Backend to use (gateway resolves transport-specific backends)
     pub backend: BackendManager,
     pub response_tx: oneshot::Sender<ChatResponse>,
+    /// Room history for backfilling sessions (provided on first message per room)
+    pub backfill_history: Option<Vec<SessionMessage>>,
 }
 
 /// Response from the agent runtime

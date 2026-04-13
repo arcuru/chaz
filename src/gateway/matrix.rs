@@ -3,8 +3,10 @@ use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::gateway::{ChatRequest, ChatResponse};
 use crate::role::{RoleDetails, get_role, get_role_names};
+use crate::session::SessionMessage;
 use crate::types::ConversationId;
 
+use chrono::Utc;
 use headjack::Tags;
 use headjack::*;
 use matrix_sdk::{
@@ -18,8 +20,10 @@ use matrix_sdk::{
 };
 use openai_api_rs::v1::chat_completion::MessageRole;
 use regex::Regex;
+use std::collections::HashSet;
 use std::format;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{error, info};
 
 pub struct MatrixGateway {
@@ -194,8 +198,11 @@ impl MatrixGateway {
         // === Text handler — routes messages through the router ===
 
         let tx = event_tx;
+        let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
         bot.register_text_handler(move |sender, body: String, room, event| {
             let tx = tx.clone();
+            let backfilled_rooms = backfilled_rooms.clone();
             async move {
                 let is_direct =
                     room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
@@ -254,15 +261,29 @@ impl MatrixGateway {
                     let backend = get_backend(&room).await;
                     let (response_tx, response_rx) = oneshot::channel();
 
+                    // Backfill room history on first message per room
+                    let room_id = room.room_id().to_string();
+                    let backfill_history = {
+                        let mut rooms = backfilled_rooms.lock().await;
+                        if rooms.insert(room_id.clone()) {
+                            // First time seeing this room — read history
+                            info!("Backfilling history for room {}", room_id);
+                            Some(read_room_history(&room).await)
+                        } else {
+                            None
+                        }
+                    };
+
                     if tx
                         .send(ChatRequest {
-                            conversation_id: ConversationId(room.room_id().to_string()),
+                            conversation_id: ConversationId(room_id),
                             sender: sender.to_string(),
                             body,
                             model_override,
                             role_override,
                             backend,
                             response_tx,
+                            backfill_history,
                         })
                         .await
                         .is_err()
@@ -646,6 +667,92 @@ fn get_chat_summary_model() -> Option<String> {
 }
 
 /// Gets the context of the current conversation
+/// Read room message history as SessionMessages for backfilling.
+/// Reads backward from most recent, stops at `!chaz clear` or end of history.
+async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
+    let mut messages = Vec::new();
+    let bot_user_id = room.client().user_id().map(|uid| uid.to_string());
+    let mut options = MessagesOptions::backward();
+
+    'outer: while let Ok(batch) = room.messages(options).await {
+        for message in batch.chunk {
+            if let Some((sender, content)) = message
+                .event
+                .get_field::<String>("sender")
+                .unwrap_or(None)
+                .zip(
+                    message
+                        .event
+                        .get_field::<RoomMessageEventContent>("content")
+                        .unwrap_or(None),
+                )
+            {
+                if let MessageType::Text(text_content) = &content.msgtype {
+                    // Stop at !chaz clear
+                    if text_content.body.starts_with("!chaz clear") {
+                        break 'outer;
+                    }
+                    // Skip chaz commands that aren't meaningful conversation
+                    if text_content.body.starts_with("!chaz") {
+                        let command = text_content.body.trim_start_matches("!chaz").trim();
+                        if command.is_empty() {
+                            continue;
+                        }
+                        if let Some(cmd) = command.split_whitespace().next() {
+                            if ["help", "party", "send", "list", "rename", "print", "model", "clear", "backend", "role"]
+                                .contains(&cmd.to_lowercase().as_str())
+                            {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let body = if text_content.body.starts_with("!chaz") {
+                        text_content.body.trim_start_matches("!chaz").trim().to_string()
+                    } else {
+                        text_content.body.clone()
+                    };
+
+                    let role = if bot_user_id
+                        .as_ref()
+                        .is_some_and(|uid| sender == *uid)
+                    {
+                        "assistant"
+                    } else {
+                        "user"
+                    };
+
+                    // Use event origin_server_ts if available, otherwise now
+                    let timestamp = message
+                        .event
+                        .get_field::<u64>("origin_server_ts")
+                        .unwrap_or(None)
+                        .and_then(|ts| {
+                            chrono::DateTime::from_timestamp_millis(ts as i64)
+                        })
+                        .unwrap_or_else(Utc::now);
+
+                    messages.push(SessionMessage {
+                        role: role.to_string(),
+                        content: body,
+                        sender: sender.clone(),
+                        timestamp,
+                    });
+                }
+            }
+        }
+        if let Some(token) = batch.end {
+            options = MessagesOptions::backward().from(Some(token.as_str()));
+        } else {
+            break;
+        }
+    }
+
+    // Reverse to chronological order (we read backward)
+    messages.reverse();
+    messages
+}
+
 async fn get_context(room: &Room) -> Result<ChatContext, ()> {
     let mut context = ChatContext {
         messages: Vec::new(),
