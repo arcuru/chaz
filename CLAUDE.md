@@ -29,13 +29,12 @@ No unit tests yet — `cargo test` passes with no meaningful coverage. Build dep
 ## Architecture
 
 ```
-main.rs              CLI args, config, eidetica init, tool registry, gateway selection
-config.rs            Config, Backend types, GLOBAL_CONFIG/GLOBAL_MESSAGES
-types.rs             ConversationId
-agent.rs             Agent config (role, model defaults)
-session.rs           SessionManager + Session (eidetica-backed message history)
-persistence.rs       SharedBackend(Arc<InMemory>) wrapper + SaveHandle for disk persistence
-tool.rs              Tool trait, ToolDefinition, ToolRegistry
+main.rs              CLI args, config, eidetica init, tool registry, gateway dispatch
+config.rs            Config, Backend, AgentConfig types (immutable after load, no globals)
+types.rs             ConversationId (gateway-agnostic)
+agent.rs             Agent, AgentRegistry (YAML-configurable, per-agent tool visibility)
+session.rs           SessionManager + Session (eidetica SQLite, transport_id binding registry)
+tool.rs              Tool trait, ToolRegistry, FilteredTools (per-agent view)
 tools/
   mod.rs             Re-exports all tools
   time.rs            get_time — current UTC time
@@ -45,20 +44,23 @@ tools/
   web.rs             web_fetch — HTTP GET/POST
   memory.rs          remember, recall — persistent key-value memory (eidetica-backed)
 runtime.rs           ReAct loop: context → LLM → parse tool calls → execute → loop
-router.rs            Dispatches ChatRequests, manages sessions, calls runtime
+router.rs            Resolves transport_id → conversation, selects agent, dispatches to runtime
 gateway/
-  mod.rs             ChatRequest, ChatResponse types
-  matrix.rs          MatrixGateway — headjack integration, commands, text handler
+  mod.rs             Gateway trait, ChatRequest/ChatResponse types
+  matrix/
+    mod.rs           MatrixGateway — lifecycle, sync, retry, text handler
+    commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
+    history.rs       Room history reading for backfill
   tui.rs             TuiGateway — stdin/stdout for testing (--tui flag)
-backends.rs          BackendManager, LLMBackend trait, ChatContext, Message
-openai.rs            OpenAI-compatible backend + chat_with_tools for ReAct loop
+backends.rs          BackendManager, LLMBackend trait (with tool support), ChatContext, Message
+openai.rs            OpenAI-compatible backend implementing LLMBackend
 role.rs              Role/system prompt management
 defaults.rs          Built-in default config and roles
 ```
 
 ### Key flows
 
-**Message flow (Matrix):** Matrix sync → text handler → read room tags for model/role → send ChatRequest via channel → router adds to session → runtime runs ReAct loop → response sent back via oneshot → gateway sends to room.
+**Message flow (Matrix):** Matrix sync → text handler → read room tags for model/role → send ChatRequest (with transport_id) via channel → router resolves transport_id → ConversationId → selects agent → adds to session → runtime runs ReAct loop with filtered tools → response sent back via oneshot → gateway sends to room.
 
 **Message flow (TUI):** stdin → ChatRequest → router → runtime → stdout.
 
@@ -66,13 +68,17 @@ defaults.rs          Built-in default config and roles
 
 ### Key patterns
 
+- **Gateway trait**: Both MatrixGateway and TuiGateway implement `Gateway` trait with `run()` method
 - **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
 - **Sequential router**: One request at a time to prevent session state races
-- **Session history**: eidetica InMemory backend with disk persistence (state saved to `eidetica.json` on shutdown via SharedBackend/SaveHandle pattern)
+- **Transport ID binding**: Gateways send native transport IDs, SessionManager resolves to ConversationId
+- **Session history**: eidetica SQLite backend for persistent storage
 - **Memory**: eidetica Table store for key-value facts, shared database with sessions
+- **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
+- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
-- **Global state**: `lazy_static` for GLOBAL_CONFIG and GLOBAL_MESSAGES (rate limiting)
+- **Config**: Immutable after load, threaded via `Arc<Config>` in Matrix gateway
 - **Room tags**: `is.chaz.*` namespace for per-room model/role/backend persistence
 
 ## Adding a New Tool
