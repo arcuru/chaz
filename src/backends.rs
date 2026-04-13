@@ -5,10 +5,10 @@ use matrix_sdk::media::MediaFileHandle;
 use openai_api_rs::v1::chat_completion::MessageRole;
 
 use crate::{
+    Backend, BackendType,
     aichat::AiChat,
     openai::OpenAI,
-    role::{prepend_role, RoleDetails},
-    Backend, BackendType,
+    role::{RoleDetails, prepend_role},
 };
 
 pub trait LLMBackend {
