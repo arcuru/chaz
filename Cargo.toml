@@ -14,12 +14,12 @@ name = "chaz"
 test = false
 
 [dependencies]
-headjack = "0.5"
+headjack = { git = "https://github.com/arcuru/vibe-headjack" }
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing-subscriber = "0.3"
 tracing = "0.1"
-matrix-sdk = "0.7"
+matrix-sdk = { version = "0.7", default-features = false, features = ["native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
@@ -27,8 +27,7 @@ lazy_static = "1"
 regex = "1"
 dirs = "5"
 openai-api-rs = "5"
-eidetica = { git = "https://github.com/arcuru/eidetica", default-features = false }
-async-trait = "0.1"
+eidetica = { git = "https://github.com/arcuru/eidetica", features = ["sqlite"] }
 chrono = { version = "0.4", features = ["serde"] }
 meval = "0.2"
 reqwest = "0.12"

@@ -4,7 +4,6 @@ mod config;
 mod defaults;
 mod gateway;
 mod openai;
-mod persistence;
 mod role;
 mod router;
 mod runtime;
@@ -17,7 +16,7 @@ use config::*;
 
 use clap::Parser;
 use std::{fs::File, io::Read, path::PathBuf};
-use tracing::{error, info};
+use tracing::error;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -53,11 +52,14 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
 
-    // Initialize eidetica with InMemory backend, loading persisted state from disk
-    let eidetica_path = state_dir.as_ref().map(|d| d.join("eidetica.json"));
-    let (backend, save_handle) =
-        persistence::SharedBackend::load_or_create(eidetica_path.as_deref()).await;
-    let instance = eidetica::Instance::open(backend).await?;
+    // Initialize eidetica with SQLite backend for persistent storage
+    let eidetica_db_path = state_dir
+        .as_ref()
+        .map(|d| d.join("eidetica.db"))
+        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
+    let backend =
+        eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
+    let instance = eidetica::Instance::open(Box::new(backend)).await?;
     let _ = instance.create_user("chaz", None).await; // OK if already exists
     let user = instance.login_user("chaz", None).await?;
 
@@ -94,14 +96,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     router_handle.abort();
-
-    // Save eidetica state to disk on shutdown
-    if let Some(handle) = &save_handle {
-        match handle.save().await {
-            Ok(()) => info!("Eidetica state saved to disk"),
-            Err(e) => error!("Failed to save eidetica state: {e}"),
-        }
-    }
-
     Ok(())
 }
