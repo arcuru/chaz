@@ -6,7 +6,7 @@ use openai_api_rs::v1::{
     chat_completion::{self, ChatCompletionMessage, ChatCompletionRequest, MessageRole},
 };
 
-use crate::{Backend, ChatContext, backends::LLMBackend};
+use crate::{backends::LLMBackend, Backend, ChatContext};
 
 /// Handle connections to an OpenAI compatible backend
 pub struct OpenAI {
