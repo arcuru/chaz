@@ -4,7 +4,6 @@ pub mod tui;
 use crate::backends::BackendManager;
 use crate::role::RoleDetails;
 use crate::session::SessionMessage;
-use crate::types::ConversationId;
 use tokio::sync::{mpsc, oneshot};
 
 /// Trait for transport gateways (Matrix, TUI, etc.)
@@ -18,9 +17,13 @@ pub trait Gateway {
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 }
 
-/// A request to process a chat message through the agent runtime
+/// A request to process a chat message through the agent runtime.
+///
+/// Gateways send their native transport ID (e.g., Matrix room ID, "tui").
+/// The router resolves this to a `ConversationId` via SessionManager.
 pub struct ChatRequest {
-    pub conversation_id: ConversationId,
+    /// Transport-native identifier (e.g., Matrix room ID, "tui")
+    pub transport_id: String,
     pub sender: String,
     pub body: String,
     /// Optional model override from gateway (e.g., Matrix room tags)

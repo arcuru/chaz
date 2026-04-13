@@ -8,7 +8,8 @@ use tracing::error;
 
 /// Run the router, processing chat requests sequentially with session management.
 ///
-/// Each request: add to session → build context → execute (with ReAct loop) → store response → reply.
+/// Each request: resolve transport_id → conversation → add to session → build context
+/// → execute (with ReAct loop) → store response → reply.
 pub async fn run(
     mut event_rx: mpsc::Receiver<ChatRequest>,
     mut sessions: SessionManager,
@@ -19,7 +20,9 @@ pub async fn run(
         let default_role = sessions.agent.default_role.clone();
         let default_model = sessions.agent.default_model.clone();
 
-        let session = sessions.get_or_create(&request.conversation_id).await;
+        // Resolve transport ID to a conversation
+        let conversation_id = sessions.resolve_conversation(&request.transport_id);
+        let session = sessions.get_or_create(&conversation_id).await;
 
         // Backfill from gateway history if provided
         if let Some(history) = request.backfill_history {

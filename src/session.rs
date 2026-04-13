@@ -151,11 +151,17 @@ impl Session {
     }
 }
 
-/// Manages sessions across conversations
+/// Manages sessions across conversations.
+///
+/// Holds a binding registry that maps transport-native IDs (e.g., Matrix room IDs)
+/// to gateway-agnostic `ConversationId`s. Multiple transport IDs can map to the
+/// same conversation, enabling cross-gateway sessions.
 pub struct SessionManager {
     _instance: Instance,
     database: Database,
     sessions: HashMap<ConversationId, Session>,
+    /// Maps transport_id → ConversationId. Enables multiple gateways to share a conversation.
+    bindings: HashMap<String, ConversationId>,
     pub agent: Agent,
 }
 
@@ -182,6 +188,7 @@ impl SessionManager {
             _instance: instance,
             database,
             sessions: HashMap::new(),
+            bindings: HashMap::new(),
             agent,
         })
     }
@@ -189,6 +196,17 @@ impl SessionManager {
     /// Get the eidetica database (for sharing with tools)
     pub fn database(&self) -> &Database {
         &self.database
+    }
+
+    /// Resolve a transport ID to a ConversationId.
+    ///
+    /// Creates a new binding if none exists. Default: transport_id becomes the ConversationId.
+    /// Future: this can be overridden to map multiple transport IDs to the same conversation.
+    pub fn resolve_conversation(&mut self, transport_id: &str) -> ConversationId {
+        self.bindings
+            .entry(transport_id.to_string())
+            .or_insert_with(|| ConversationId(transport_id.to_string()))
+            .clone()
     }
 
     /// Get or create a session for a conversation

@@ -5,7 +5,6 @@ use crate::config::Config;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::gateway::{ChatRequest, ChatResponse, Gateway};
 use crate::role::{RoleDetails, get_role};
-use crate::types::ConversationId;
 
 use headjack::Tags;
 use headjack::*;
@@ -279,7 +278,7 @@ impl Gateway for MatrixGateway {
 
                         if tx
                             .send(ChatRequest {
-                                conversation_id: ConversationId(room_id),
+                                transport_id: room_id,
                                 sender: sender.to_string(),
                                 body,
                                 model_override,

@@ -3,7 +3,6 @@ use crate::config::Config;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::gateway::{ChatRequest, ChatResponse, Gateway};
 use crate::role::get_role;
-use crate::types::ConversationId;
 
 use std::io::{self, Write};
 use tokio::sync::{mpsc, oneshot};
@@ -20,7 +19,7 @@ impl TuiGateway {
 
 impl Gateway for TuiGateway {
     async fn run(self, event_tx: mpsc::Sender<ChatRequest>) -> anyhow::Result<()> {
-        let conversation_id = ConversationId("tui".to_string());
+        let transport_id = "tui".to_string();
 
         // Resolve role from config (no transport-specific overrides for TUI)
         let role_override = get_role(
@@ -55,7 +54,7 @@ impl Gateway for TuiGateway {
             let (response_tx, response_rx) = oneshot::channel();
             event_tx
                 .send(ChatRequest {
-                    conversation_id: conversation_id.clone(),
+                    transport_id: transport_id.clone(),
                     sender: "user".to_string(),
                     body: line,
                     model_override: None,
