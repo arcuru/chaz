@@ -83,6 +83,7 @@ The `Tool` trait requires: `name()`, `description()`, `parameters()` (JSON Schem
 ## CI
 
 GitHub Actions on push to main and PRs:
+
 - `ci.yml`: nix-fast-build — lint, test, build, doc
 - `security-audit.yml`: daily cargo-deny
 - Dependency update workflows: cargo-update, flake-update, actions-update (monthly)

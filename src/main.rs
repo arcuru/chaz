@@ -51,7 +51,18 @@ async fn main() -> anyhow::Result<()> {
     let _ = instance.create_user("chaz", None).await; // OK if already exists
     let user = instance.login_user("chaz", None).await?;
 
-    let session_manager = session::SessionManager::new(instance, user, &config).await?;
+    // Resolve state directory for file persistence
+    let state_dir = config
+        .state_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| dirs::state_dir().map(|d| d.join("chaz")));
+    if let Some(dir) = &state_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let session_manager =
+        session::SessionManager::new(instance, user, &config, state_dir.clone()).await?;
 
     // Register built-in tools
     let mut tools = tool::ToolRegistry::new();
@@ -61,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
     tools.register(tools::ReadFile);
     tools.register(tools::WriteFile);
     tools.register(tools::WebFetch);
+    if let Some(dir) = &state_dir {
+        tools.register(tools::Remember::new(dir));
+        tools.register(tools::Recall::new(dir));
+    }
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
 
