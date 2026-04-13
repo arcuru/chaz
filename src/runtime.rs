@@ -58,23 +58,20 @@ pub async fn execute(
     backend: &BackendManager,
     tools: &ToolRegistry,
 ) -> Result<String, String> {
-    // Fast path: no tools → single-shot
-    if tools.is_empty() {
+    // Fast path: no tools or backend doesn't support them → single-shot
+    if tools.is_empty() || !backend.supports_tools(context) {
         return backend.execute(context).await;
     }
 
-    // Check if the selected backend supports tools
-    let openai = match backend.get_openai_backend(context) {
-        Some(openai) => openai,
-        None => return backend.execute(context).await,
-    };
-
     let tool_defs = tools.definitions();
-    let model = openai.resolve_model(context);
+    let model = backend.resolve_model(context);
     let mut messages = context_to_messages(context);
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
-        let response = match openai.chat_with_tools(&messages, &tool_defs, &model).await {
+        let response = match backend
+            .chat_with_tools(context, &messages, &tool_defs, &model)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) if iteration == 0 => {
                 // First call failed with tools — retry without tools as fallback.
@@ -157,7 +154,10 @@ pub async fn execute(
     messages.push(RuntimeMessage::User(
         "Please summarize what you found so far and respond to the user.".to_string(),
     ));
-    match openai.chat_with_tools(&messages, &[], &model).await {
+    match backend
+        .chat_with_tools(context, &messages, &[], &model)
+        .await
+    {
         Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),
         _ => {
             // Last resort: return the last tool result

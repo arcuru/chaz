@@ -49,24 +49,11 @@ impl OpenAI {
             .map_err(|e| e.to_string())
     }
 
-    /// Resolve the model name for this backend, stripping the backend prefix
-    pub fn resolve_model(&self, context: &ChatContext) -> String {
-        let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
-        let mut model = context.model.clone().unwrap_or_default();
-        model = model
-            .trim_start_matches(&format!("{}:", model_prefix))
-            .to_string();
-        if model.is_empty() {
-            model = self.default_model().unwrap_or_default();
-        }
-        model
-    }
-
     /// Execute a single LLM call with tool definitions, returning a structured response.
     ///
     /// This is called by the runtime's ReAct loop. It converts RuntimeMessages
     /// to OpenAI format, includes tool definitions, and parses the response.
-    pub async fn chat_with_tools(
+    async fn chat_with_tools_impl(
         &self,
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
@@ -140,6 +127,31 @@ impl LLMBackend for OpenAI {
             }
         }
         None
+    }
+
+    fn resolve_model(&self, context: &ChatContext) -> String {
+        let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
+        let mut model = context.model.clone().unwrap_or_default();
+        model = model
+            .trim_start_matches(&format!("{}:", model_prefix))
+            .to_string();
+        if model.is_empty() {
+            model = self.default_model().unwrap_or_default();
+        }
+        model
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+    ) -> Result<LLMResponse, String> {
+        self.chat_with_tools_impl(messages, tools, model).await
     }
 
     /// Execute a simple chat request (no tools)

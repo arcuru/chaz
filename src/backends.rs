@@ -3,12 +3,35 @@
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
 use openai_api_rs::v1::chat_completion::MessageRole;
 
-use crate::{config::Backend, openai::OpenAI, role::RoleDetails};
+use crate::{
+    config::Backend,
+    openai::OpenAI,
+    role::RoleDetails,
+    runtime::{LLMResponse, RuntimeMessage},
+    tool::ToolDefinition,
+};
 
 pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;
     fn default_model(&self) -> Option<String>;
+    fn resolve_model(&self, context: &ChatContext) -> String;
     async fn execute(&self, context: &ChatContext) -> Result<String, String>;
+
+    /// Whether this backend supports tool/function calling
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    /// Execute a single LLM call with tool definitions (ReAct loop step).
+    /// Returns structured response with text or tool calls.
+    async fn chat_with_tools(
+        &self,
+        _messages: &[RuntimeMessage],
+        _tools: &[ToolDefinition],
+        _model: &str,
+    ) -> Result<LLMResponse, String> {
+        Err("Tool calling not supported by this backend".to_string())
+    }
 }
 
 pub struct BackendManager {
@@ -142,7 +165,7 @@ impl BackendManager {
         }
     }
 
-    /// Execute the ChatContext
+    /// Execute the ChatContext (simple, no tools)
     pub async fn execute(&self, context: &ChatContext) -> Result<String, String> {
         if self.backends.is_empty() {
             return Err("No backends configured".to_string());
@@ -151,11 +174,38 @@ impl BackendManager {
         OpenAI::new(backend).execute(context).await
     }
 
-    /// Get an OpenAI backend for the selected context (for tool-aware execution)
-    pub fn get_openai_backend(&self, context: &ChatContext) -> Option<OpenAI> {
+    /// Whether the selected backend supports tool/function calling
+    pub fn supports_tools(&self, context: &ChatContext) -> bool {
         if self.backends.is_empty() {
-            return None;
+            return false;
         }
-        Some(OpenAI::new(self.select_backend(context)))
+        let backend = self.select_backend(context);
+        OpenAI::new(backend).supports_tools()
+    }
+
+    /// Resolve the model name for the selected backend
+    pub fn resolve_model(&self, context: &ChatContext) -> String {
+        if self.backends.is_empty() {
+            return String::new();
+        }
+        let backend = self.select_backend(context);
+        OpenAI::new(backend).resolve_model(context)
+    }
+
+    /// Execute a single LLM call with tool definitions (for ReAct loop)
+    pub async fn chat_with_tools(
+        &self,
+        context: &ChatContext,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+    ) -> Result<LLMResponse, String> {
+        if self.backends.is_empty() {
+            return Err("No backends configured".to_string());
+        }
+        let backend = self.select_backend(context);
+        OpenAI::new(backend)
+            .chat_with_tools(messages, tools, model)
+            .await
     }
 }
