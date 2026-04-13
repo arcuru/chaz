@@ -1,4 +1,4 @@
-use crate::Config;
+use crate::config::Config;
 use lazy_static::lazy_static;
 
 // This is the default configuration for chaz
@@ -20,10 +20,6 @@ username: ""
 # Optional. Not setting it here because reading it from an XDG library is safer.
 #state_dir: "$XDG_STATE_HOME/username"
 
-# Optional, for setting a separate Aichat config directory
-# Aichat uses $AICHAT_CONFIG_DIR
-#aichat_config_dir: "$AICHAT_CONFIG_DIR"
-
 # Optional. This is a separate model to use for summarization
 #chat_summary_model: ""
 
@@ -35,9 +31,6 @@ username: ""
 
 # Optional. Set a room size limit to respond in.
 #room_size_limit: 0
-
-# Optional. Set to true to disable sending media context to aichat
-#disable_media_context: false
 
 # Predefined roles here to use above
 # These roles are builtin and can be set by any user

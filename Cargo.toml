@@ -16,7 +16,7 @@ test = false
 [dependencies]
 headjack = "0.5"
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing-subscriber = "0.3"
 tracing = "0.1"
 matrix-sdk = "0.7"
@@ -27,3 +27,7 @@ lazy_static = "1"
 regex = "1"
 dirs = "5"
 openai-api-rs = "5"
+eidetica = { git = "https://github.com/arcuru/eidetica", default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+meval = "0.2"
+serde_json = "1"

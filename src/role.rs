@@ -152,20 +152,3 @@ pub fn get_role(
     }
     None
 }
-
-/// Prepends the role prompt to the message
-pub fn prepend_role(message: String, role_details: &RoleDetails) -> String {
-    let mut role_prompt = role_details.prompt.clone().unwrap_or("".to_string());
-    if !role_prompt.is_empty() {
-        role_prompt = format!("SYSTEM: {}", role_prompt);
-        role_prompt.push('\n');
-    }
-    // Add the conversation example if it exists
-    if let Some(example) = role_details.example.clone() {
-        for message in example {
-            role_prompt.push_str(&format!("{}: {}\n", message.user, message.message));
-        }
-    }
-    role_prompt.push_str(&message);
-    role_prompt
-}

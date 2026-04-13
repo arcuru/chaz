@@ -4,12 +4,7 @@
 use matrix_sdk::media::MediaFileHandle;
 use openai_api_rs::v1::chat_completion::MessageRole;
 
-use crate::{
-    Backend, BackendType,
-    aichat::AiChat,
-    openai::OpenAI,
-    role::{RoleDetails, prepend_role},
-};
+use crate::{config::Backend, openai::OpenAI, role::RoleDetails};
 
 pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;
@@ -22,6 +17,7 @@ pub struct BackendManager {
 }
 
 /// A generic Message
+#[derive(Clone)]
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
@@ -53,7 +49,6 @@ impl Message {
 ///
 /// The frontend converts to this format, and the backend converts this to the backend-specific APIs.
 pub struct ChatContext {
-    // TODO: consider making this the OpenAI format for a ChatCompletion request.
     pub messages: Vec<Message>,
     pub model: Option<String>,
     pub media: Vec<MediaFileHandle>,
@@ -63,36 +58,20 @@ pub struct ChatContext {
 impl ChatContext {
     /// Convert messages into a single string.
     pub fn string_prompt(&self) -> String {
-        // TODO: consider making this markdown
         let mut prompt = String::new();
         for message in self.messages.iter() {
             prompt.push_str(&format!("{}\n", message))
         }
-        // Indicate that the assistant needs to speak next
         prompt.push_str("ASSISTANT: ");
         prompt
-    }
-
-    /// Convert messages into a single string with the role prepended
-    pub fn string_prompt_with_role(&self) -> String {
-        let prompt = self.string_prompt();
-        if let Some(role) = &self.role {
-            prepend_role(prompt, role)
-        } else {
-            prompt
-        }
     }
 }
 
 impl BackendManager {
     /// Create a new backend manager
-    ///
-    /// If no backends are provided, it will default to an AIChat backend for backwards compat.
     pub fn new(backends: &Option<Vec<Backend>>) -> Self {
         Self {
-            backends: backends
-                .as_ref()
-                .map_or_else(|| vec![Backend::new(BackendType::AIChat)], |v| v.clone()),
+            backends: backends.as_ref().cloned().unwrap_or_default(),
         }
     }
 
@@ -105,118 +84,55 @@ impl BackendManager {
     ///
     /// Models may be valid even if they aren't listed
     pub fn list_known_models(&self) -> Vec<String> {
-        // TODO: Cache/memoize this
         if self.backends.len() == 1 {
-            // Don't prepend the names if there is only 1 backend
-            let backend = &self.backends[0];
-            match backend.backend_type {
-                BackendType::AIChat => AiChat::new(backend).list_models(),
-                BackendType::OpenAICompatible => OpenAI::new(backend).list_models(),
-            }
+            OpenAI::new(&self.backends[0]).list_models()
         } else {
-            let mut models = Vec::new();
-            for backend in &self.backends {
-                match backend.backend_type {
-                    BackendType::AIChat => {
-                        let mut backend_models = AiChat::new(backend).list_models();
-                        backend_models = backend_models
-                            .into_iter()
-                            .map(|model| {
-                                format!("{}:{}", backend.name.as_deref().unwrap_or("aichat"), model)
-                            })
-                            .collect();
-                        models.append(&mut backend_models);
-                    }
-                    BackendType::OpenAICompatible => {
-                        let mut backend_models = OpenAI::new(backend).list_models();
-                        backend_models = backend_models
-                            .into_iter()
-                            .map(|model| {
-                                format!("{}:{}", backend.name.as_deref().unwrap_or("openai"), model)
-                            })
-                            .collect();
-                        models.append(&mut backend_models);
-                    }
-                }
-            }
-            models
+            self.backends
+                .iter()
+                .flat_map(|backend| {
+                    let prefix = backend.get_name();
+                    OpenAI::new(backend)
+                        .list_models()
+                        .into_iter()
+                        .map(move |model| format!("{}:{}", prefix, model))
+                })
+                .collect()
         }
     }
 
     /// Returns true if the model is known
-    ///
-    /// This doesn't mean the model is invalid, just that there is no information on the model locally.
     pub fn is_known_model(&self, model: &str) -> bool {
         self.list_known_models().contains(&model.to_string())
     }
 
     /// Validate that the model name is valid
-    ///
-    /// Models can have invalid names, they must be prefixed by the name of the backend if more than 1 backend exists.
     pub fn validate_model(&self, model: &str) -> Result<(), String> {
-        if self.is_known_model(model) {
-            Ok(())
-        } else {
-            // Might still be ok, let's validate the name
-            if self.backends.len() == 1 {
-                // No need to prepend the name / no real way to validate
-                Ok(())
-            } else {
-                // The name must be prefixed by the backend name
-                for backend in &self.backends {
-                    if model.starts_with(&format!("{}:", backend.name.as_deref().unwrap_or(""))) {
-                        return Ok(());
-                    }
-                }
-                Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openai:gpt-4o or aichat:ollama:llama3".to_string())
+        if self.is_known_model(model) || self.backends.len() <= 1 {
+            return Ok(());
+        }
+        // Multiple backends: name must be prefixed by backend name
+        for backend in &self.backends {
+            if model.starts_with(&format!("{}:", backend.name.as_deref().unwrap_or(""))) {
+                return Ok(());
             }
         }
+        Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name".to_string())
     }
 
     /// Get the default model
     pub fn default_model(&self) -> Option<String> {
-        if self.backends.is_empty() {
-            None
+        let backend = self.backends.first()?;
+        let model = OpenAI::new(backend).default_model()?;
+        if self.backends.len() == 1 {
+            Some(model)
         } else {
-            let backend = &self.backends[0];
-            if self.backends.len() == 1 {
-                match backend.backend_type {
-                    BackendType::AIChat => AiChat::new(backend).default_model(),
-                    BackendType::OpenAICompatible => OpenAI::new(backend).default_model(),
-                }
-            } else {
-                match backend.backend_type {
-                    BackendType::AIChat => AiChat::new(backend).default_model().map(|s| {
-                        format!(
-                            "{}:{}",
-                            backend.name.clone().unwrap_or("aichat".to_string()),
-                            s
-                        )
-                    }),
-                    BackendType::OpenAICompatible => {
-                        OpenAI::new(backend).default_model().map(|s| {
-                            format!(
-                                "{}:{}",
-                                backend.name.clone().unwrap_or("openai".to_string()),
-                                s
-                            )
-                        })
-                    }
-                }
-            }
+            Some(format!("{}:{}", backend.get_name(), model))
         }
     }
 
-    /// Execute the ChatContext
-    ///
-    /// If no model is provided in the ChatContext, it will hand it off to the default model.
-    pub async fn execute(&self, context: &ChatContext) -> Result<String, String> {
-        if self.backends.is_empty() {
-            return Err("No backends configured".to_string());
-        }
-
-        // Pick the backend to use based on the model name given in the ChatContext
-        let backend = if let Some(model) = &context.model {
+    /// Select the backend based on the model name in the context
+    fn select_backend(&self, context: &ChatContext) -> &Backend {
+        if let Some(model) = &context.model {
             self.backends
                 .iter()
                 .find(|backend| {
@@ -225,10 +141,23 @@ impl BackendManager {
                 .unwrap_or(&self.backends[0])
         } else {
             &self.backends[0]
-        };
-        match backend.backend_type {
-            BackendType::AIChat => AiChat::new(backend).execute(context).await,
-            BackendType::OpenAICompatible => OpenAI::new(backend).execute(context).await,
         }
+    }
+
+    /// Execute the ChatContext
+    pub async fn execute(&self, context: &ChatContext) -> Result<String, String> {
+        if self.backends.is_empty() {
+            return Err("No backends configured".to_string());
+        }
+        let backend = self.select_backend(context);
+        OpenAI::new(backend).execute(context).await
+    }
+
+    /// Get an OpenAI backend for the selected context (for tool-aware execution)
+    pub fn get_openai_backend(&self, context: &ChatContext) -> Option<OpenAI> {
+        if self.backends.is_empty() {
+            return None;
+        }
+        Some(OpenAI::new(self.select_backend(context)))
     }
 }
