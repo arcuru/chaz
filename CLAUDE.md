@@ -29,29 +29,34 @@ No unit tests yet — `cargo test` passes with no meaningful coverage. Build dep
 ## Architecture
 
 ```
-main.rs              CLI args, config, eidetica init, tool registry, gateway dispatch
-config.rs            Config, Backend, AgentConfig types (immutable after load, no globals)
+main.rs              CLI args, config, eidetica init, security context, tool registry, gateway dispatch
+config.rs            Config, Backend, AgentConfig, SecurityConfig types (immutable after load)
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent, AgentRegistry (YAML-configurable, per-agent tool visibility)
 session.rs           SessionManager + Session (eidetica SQLite, transport_id binding registry)
-tool.rs              Tool trait, ToolRegistry, FilteredTools (per-agent view)
+tool.rs              Tool trait (with security methods), ToolRegistry, FilteredTools, RiskLevel, ApprovalRequirement
 tools/
   mod.rs             Re-exports all tools
-  time.rs            get_time — current UTC time
-  calculate.rs       calculate — math expressions (meval)
-  shell.rs           shell — execute commands (FIXME: unsandboxed)
-  file.rs            read_file, write_file — filesystem access
-  web.rs             web_fetch — HTTP GET/POST
-  memory.rs          remember, recall — persistent key-value memory (eidetica-backed)
-runtime.rs           ReAct loop: context → LLM → parse tool calls → execute → loop
-router.rs            Resolves transport_id → conversation, selects agent, dispatches to runtime
+  time.rs            get_time — current UTC time (Low risk)
+  calculate.rs       calculate — math expressions (Low risk)
+  shell.rs           shell — execute commands (High risk, approval required, command allow/denylist)
+  file.rs            read_file (Low), write_file (Medium, approval unless auto-approved)
+  web.rs             web_fetch — HTTP GET/POST (Medium risk, network policy enforced, SSRF protection)
+  memory.rs          remember, recall — persistent key-value memory (Low risk)
+security/
+  mod.rs             SecurityContext (leak detector, auto-approved tools, approval channel)
+  leak_detector.rs   LeakDetector — 12 secret patterns, redact/block policy
+  network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
+  sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
+runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings
+router.rs            Resolves transport_id → conversation, threads security context to runtime
 gateway/
-  mod.rs             Gateway trait, ChatRequest/ChatResponse types
+  mod.rs             Gateway trait, ChatRequest/ChatResponse, ApprovalExchange/ApprovalDecision
   matrix/
     mod.rs           MatrixGateway — lifecycle, sync, retry, text handler
     commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
     history.rs       Room history reading for backfill
-  tui.rs             TuiGateway — stdin/stdout for testing (--tui flag)
+  tui.rs             TuiGateway — stdin/stdout, interactive tool approval (y/n/all)
 backends.rs          BackendManager, LLMBackend trait (with tool support), ChatContext, Message
 openai.rs            OpenAI-compatible backend implementing LLMBackend
 role.rs              Role/system prompt management
@@ -64,7 +69,7 @@ defaults.rs          Built-in default config and roles
 
 **Message flow (TUI):** stdin → ChatRequest → router → runtime → stdout.
 
-**ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: execute tools, feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
+**ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
 
 ### Key patterns
 
@@ -77,6 +82,10 @@ defaults.rs          Built-in default config and roles
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
+- **Security context**: Built from SecurityConfig, threaded through router to runtime per-request. Contains leak detector, auto-approved tool set, and approval channel from gateway.
+- **Tool approval flow**: Tools declare risk level and approval requirement. Runtime checks SecurityContext, sends ApprovalExchange to gateway via mpsc channel, gateway prompts user (TUI: stdin, Matrix: deferred). Approval decisions: Approve/Deny/ApproveAll.
+- **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
+- **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
 - **Config**: Immutable after load, threaded via `Arc<Config>` in Matrix gateway
 - **Room tags**: `is.chaz.*` namespace for per-room model/role/backend persistence
@@ -87,7 +96,7 @@ defaults.rs          Built-in default config and roles
 2. Add `mod my_tool;` and `pub use` to `src/tools/mod.rs`
 3. Register in `main.rs`: `tools.register(tools::MyTool);`
 
-The `Tool` trait requires: `name()`, `description()`, `parameters()` (JSON Schema), and `execute()` (returns boxed future for async support).
+The `Tool` trait requires: `name()`, `description()`, `parameters()` (JSON Schema), and `execute()` (returns boxed future for async support). Optional security methods with defaults: `risk_level()` (Low), `requires_approval()` (Never), `execution_timeout()` (60s), `sensitive_params()` (none). Override these for tools with side effects or security implications.
 
 ## CI
 
