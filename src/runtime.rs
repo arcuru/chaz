@@ -14,7 +14,7 @@
 use crate::backends::{BackendManager, ChatContext};
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
-use crate::tool::{FilteredTools, ToolApprovalInfo, ToolContext};
+use crate::tool::{ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -64,10 +64,12 @@ pub enum LLMResponse {
 pub async fn execute(
     context: &ChatContext,
     backend: &BackendManager,
-    tools: &FilteredTools<'_>,
     security: &SecurityContext,
     tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
 ) -> Result<String, String> {
+    let tools = &tool_ctx.tools;
+
     // Fast path: no tools or backend doesn't support them → single-shot
     if tools.is_empty() || !backend.supports_tools(context) {
         return backend.execute(context).await;
@@ -129,20 +131,23 @@ pub async fn execute(
                 for call in &tool_calls {
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
+                            let policy = policies.resolve(tool);
                             let args: serde_json::Value =
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
 
                             // --- Security: approval gate ---
-                            let approval_req = tool.requires_approval(&args);
-                            if !approve_all && security.needs_approval(&call.name, &approval_req) {
-                                let risk = tool.risk_level(&args);
+                            if !approve_all
+                                && security.needs_approval(&call.name, &policy.approval)
+                            {
+                                let sensitive_refs: Vec<&str> =
+                                    policy.sensitive_params.iter().map(|s| s.as_str()).collect();
                                 let info = ToolApprovalInfo {
                                     name: call.name.clone(),
                                     arguments_display: redact_sensitive_params(
                                         &call.arguments,
-                                        tool.sensitive_params(),
+                                        &sensitive_refs,
                                     ),
-                                    risk_level: risk,
+                                    risk_level: policy.risk.clone(),
                                 };
 
                                 let decision = security.request_approval(info).await;
@@ -152,7 +157,6 @@ pub async fn execute(
                                         approve_all = true; // skip approval for rest of turn
                                     }
                                     ApprovalDecision::Deny => {
-                                        "Tool execution denied by user".to_string();
                                         messages.push(RuntimeMessage::ToolResult {
                                             call_id: call.id.clone(),
                                             content: "Tool execution denied by user".to_string(),
@@ -163,7 +167,7 @@ pub async fn execute(
                             }
 
                             // --- Security: execute with timeout ---
-                            let timeout = tool.execution_timeout();
+                            let timeout = policy.timeout_duration();
                             let exec_result =
                                 tokio::time::timeout(timeout, tool.execute(args, tool_ctx)).await;
 

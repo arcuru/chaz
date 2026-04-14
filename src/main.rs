@@ -120,26 +120,44 @@ async fn main() -> anyhow::Result<()> {
         approval_callback: None, // set per-session by server
     };
 
+    // Build tool policy registry from config
+    let policy_overrides = sec.tool_policies.clone().unwrap_or_default();
+    let policies = std::sync::Arc::new(tool::ToolPolicyRegistry::new(policy_overrides));
+
+    let registry = std::sync::Arc::new(registry);
+
     // Register built-in tools
-    let mut tools = tool::ToolRegistry::new();
-    tools.register(tools::GetTime);
-    tools.register(tools::Calculate);
-    tools.register(tools::ShellExec::new(
+    let mut tool_registry = tool::ToolRegistry::new();
+    tool_registry.register(tools::GetTime);
+    tool_registry.register(tools::Calculate);
+    tool_registry.register(tools::ShellExec::new(
         sec.shell_allowlist.clone(),
         sec.shell_denylist.clone(),
     ));
-    tools.register(tools::ReadFile);
-    tools.register(tools::WriteFile);
-    tools.register(tools::WebFetch::new(network_policy));
-    tools.register(tools::Remember::new(central_db.clone()));
-    tools.register(tools::Recall::new(central_db));
-    tools.register(tools::SpawnAgent);
+    tool_registry.register(tools::ReadFile);
+    tool_registry.register(tools::WriteFile);
+    tool_registry.register(tools::WebFetch::new(network_policy));
+    tool_registry.register(tools::Remember::new(central_db.clone()));
+    tool_registry.register(tools::Recall::new(central_db));
+    // SpawnAgent is a privileged native-only tool — holds Arc refs for agent orchestration
+    tool_registry.register(tools::SpawnAgent {
+        agent_registry: agent_registry.clone(),
+        policies: policies.clone(),
+        backend: backends::BackendManager::new(&config.backends, secret_store.clone()),
+        security: security_ctx.clone(),
+        database: registry.central_db().clone(),
+    });
 
-    let tools = std::sync::Arc::new(tools);
-    let registry = std::sync::Arc::new(registry);
+    let tool_registry = std::sync::Arc::new(tool_registry);
 
     // Create the callback-driven server
-    let server = server::Server::new(registry, agent_registry, tools, security_ctx);
+    let server = server::Server::new(
+        registry,
+        agent_registry,
+        tool_registry,
+        policies,
+        security_ctx,
+    );
 
     // Run the selected gateway
     let result = if args.tui {

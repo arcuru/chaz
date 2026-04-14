@@ -1,8 +1,7 @@
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext};
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 /// Execute a shell command and return its output.
 ///
@@ -78,41 +77,35 @@ impl ShellExec {
 }
 
 impl Tool for ShellExec {
-    fn name(&self) -> &str {
-        "shell"
-    }
-
-    fn description(&self) -> &str {
-        "Execute a shell command and return its stdout, stderr, and exit code"
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "shell".to_string(),
+            description: "Execute a shell command and return its stdout, stderr, and exit code"
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Optional working directory for the command"
+                    }
                 },
-                "working_dir": {
-                    "type": "string",
-                    "description": "Optional working directory for the command"
-                }
-            },
-            "required": ["command"]
-        })
+                "required": ["command"]
+            }),
+        }
     }
 
-    fn risk_level(&self, _params: &Value) -> RiskLevel {
-        RiskLevel::High
-    }
-
-    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::Always
-    }
-
-    fn execution_timeout(&self) -> Duration {
-        Duration::from_secs(30)
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::High,
+            approval: ApprovalRequirement::Always,
+            timeout: 30,
+            ..ToolPolicy::default()
+        }
     }
 
     fn execute(

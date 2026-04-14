@@ -1,4 +1,4 @@
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext};
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,25 +7,21 @@ use std::pin::Pin;
 pub struct ReadFile;
 
 impl Tool for ReadFile {
-    fn name(&self) -> &str {
-        "read_file"
-    }
-
-    fn description(&self) -> &str {
-        "Read the contents of a file at the given path"
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to read"
-                }
-            },
-            "required": ["path"]
-        })
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "read_file".to_string(),
+            description: "Read the contents of a file at the given path".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to read"
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
     }
 
     fn execute(
@@ -59,37 +55,33 @@ impl Tool for ReadFile {
 pub struct WriteFile;
 
 impl Tool for WriteFile {
-    fn name(&self) -> &str {
-        "write_file"
-    }
-
-    fn description(&self) -> &str {
-        "Write content to a file at the given path. Creates the file if it doesn't exist, overwrites if it does."
-    }
-
-    fn risk_level(&self, _params: &Value) -> RiskLevel {
-        RiskLevel::Medium
-    }
-
-    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to write to"
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "write_file".to_string(),
+            description: "Write content to a file at the given path. Creates the file if it doesn't exist, overwrites if it does.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to write to"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write to the file"
+                    }
                 },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write to the file"
-                }
-            },
-            "required": ["path", "content"]
-        })
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::Medium,
+            approval: ApprovalRequirement::UnlessAutoApproved,
+            ..ToolPolicy::default()
+        }
     }
 
     fn execute(

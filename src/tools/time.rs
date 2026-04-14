@@ -1,4 +1,4 @@
-use crate::tool::{Tool, ToolContext};
+use crate::tool::{Tool, ToolContext, ToolDescriptor};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,20 +7,16 @@ use std::pin::Pin;
 pub struct GetTime;
 
 impl Tool for GetTime {
-    fn name(&self) -> &str {
-        "get_time"
-    }
-
-    fn description(&self) -> &str {
-        "Get the current date and time in UTC"
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        })
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "get_time".to_string(),
+            description: "Get the current date and time in UTC".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
     }
 
     fn execute(

@@ -209,6 +209,11 @@ impl Session {
         self.entries.last()
     }
 
+    /// Get all entries in the session
+    pub fn entries(&self) -> &[SessionEntry] {
+        &self.entries
+    }
+
     /// Get the underlying eidetica Database handle (for sharing with tools)
     pub fn database(&self) -> &Database {
         &self.database

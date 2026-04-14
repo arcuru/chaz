@@ -1,7 +1,7 @@
-use crate::tool::{Tool, ToolContext};
+use crate::tool::{Tool, ToolContext, ToolDescriptor};
 use chrono::Utc;
-use eidetica::Database;
 use eidetica::store::Table;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -26,29 +26,25 @@ impl Remember {
 }
 
 impl Tool for Remember {
-    fn name(&self) -> &str {
-        "remember"
-    }
-
-    fn description(&self) -> &str {
-        "Store a fact in persistent memory. Use this to save important information that should be recalled later across conversations."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "A short descriptive label for this fact (e.g. 'user_name', 'project_deadline')"
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "remember".to_string(),
+            description: "Store a fact in persistent memory. Use this to save important information that should be recalled later across conversations.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "A short descriptive label for this fact (e.g. 'user_name', 'project_deadline')"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The fact to remember"
+                    }
                 },
-                "value": {
-                    "type": "string",
-                    "description": "The fact to remember"
-                }
-            },
-            "required": ["key", "value"]
-        })
+                "required": ["key", "value"]
+            }),
+        }
     }
 
     fn execute(
@@ -106,25 +102,21 @@ impl Recall {
 }
 
 impl Tool for Recall {
-    fn name(&self) -> &str {
-        "recall"
-    }
-
-    fn description(&self) -> &str {
-        "Search persistent memory for previously stored facts. Returns all matching entries."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Keyword to search for in memory keys and values"
-                }
-            },
-            "required": ["query"]
-        })
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "recall".to_string(),
+            description: "Search persistent memory for previously stored facts. Returns all matching entries.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword to search for in memory keys and values"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
     }
 
     fn execute(

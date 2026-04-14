@@ -34,10 +34,10 @@ config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig,
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
 session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB)
-tool.rs              Tool trait (with ToolContext), ToolRegistry, FilteredTools, RiskLevel, ApprovalRequirement
+tool.rs              Tool trait (descriptor + execute + default_policy), ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools
 tools/
   mod.rs             Re-exports all tools
-  agent.rs           spawn_agent — delegate to another agent in a fresh session (Medium risk)
+  agent.rs           spawn_agent — delegate to another agent in a fresh session (holds Arc refs for orchestration)
   time.rs            get_time — current UTC time (Low risk)
   calculate.rs       calculate — math expressions (Low risk)
   shell.rs           shell — execute commands (High risk, approval required, command allow/denylist)
@@ -58,7 +58,7 @@ gateway/
     mod.rs           MatrixGateway — lifecycle, sync, retry, text handler
     commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
     history.rs       Room history reading for backfill
-  tui.rs             TuiGateway — stdin/stdout, interactive tool approval (y/n/all)
+  tui.rs             TuiGateway — ratatui async terminal app, Elm architecture (App/Action/ui)
 backends.rs          BackendManager, LLMBackend trait (with tool support), ChatContext, Message
 openai.rs            OpenAI-compatible backend implementing LLMBackend
 role.rs              Role/system prompt management
@@ -69,7 +69,7 @@ defaults.rs          Built-in default config and roles
 
 **Message flow (Matrix):** Matrix sync → text handler → writes SessionEntry to session DB → eidetica on_local_write callback fires → server processing loop detects user message → spawns agent task → agent runs full ReAct loop → writes response SessionEntry to session DB → callback fires → server detects agent response → delivers via ResponseDelivery channel → Matrix response task sends to room. Different rooms run in parallel.
 
-**Message flow (TUI):** stdin → writes SessionEntry to session DB → callback fires → server runs agent → writes response → delivers via channel → TUI prints.
+**Message flow (TUI):** Input box → writes SessionEntry to session DB → callback fires → server runs agent → writes response → on_local_write sends `()` notify → event loop re-reads session from eidetica → renders updated entries in ratatui terminal.
 
 **ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
 
@@ -79,12 +79,14 @@ defaults.rs          Built-in default config and roles
 - **Callback-driven server**: Server registers on_local_write callbacks on session DBs. Callback fires → notify channel → processing loop checks latest entry → if non-agent Message, spawns agent task. Agent writes response entry → gateway callback detects it → delivers to transport. No mpsc in the message flow. Global Semaphore(10) caps concurrent LLM calls.
 - **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
 - **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
-- **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
+- **Agent registry**: YAML-configurable agents with per-agent tool visibility (ScopedTools with transitive narrowing)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
-- **Tool approval flow**: Tools declare risk level and approval requirement. Runtime checks SecurityContext, sends ApprovalExchange to gateway via mpsc channel, gateway prompts user (TUI: stdin, Matrix: deferred). Approval decisions: Approve/Deny/ApproveAll.
+- **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Callback sends `()` on any session write; event loop re-reads full session from eidetica. No mpsc content bridging — session entries are the source of truth. Tool approval rendered inline, y/n/a keys in approval mode.
+- **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll.
+- **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools.
 - **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
 - **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
@@ -97,7 +99,7 @@ defaults.rs          Built-in default config and roles
 2. Add `mod my_tool;` and `pub use` to `src/tools/mod.rs`
 3. Register in `main.rs`: `tools.register(tools::MyTool);`
 
-The `Tool` trait requires: `name()`, `description()`, `parameters()` (JSON Schema), and `execute()` (returns boxed future for async support). Optional security methods with defaults: `risk_level()` (Low), `requires_approval()` (Never), `execution_timeout()` (60s), `sensitive_params()` (none). Override these for tools with side effects or security implications.
+The `Tool` trait requires: `descriptor()` (returns `ToolDescriptor` with name, description, parameters JSON Schema) and `execute()` (returns boxed future for async support). Optional `default_policy()` returns `ToolPolicy` (risk, approval, timeout, sensitive_params) — config overrides via `security.tool_policies` take precedence. `ToolPolicyRegistry` resolves effective policy per tool.
 
 ## CI
 

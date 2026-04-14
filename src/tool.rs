@@ -1,8 +1,6 @@
-use crate::agent::AgentRegistry;
-use crate::backends::BackendManager;
-use crate::security::SecurityContext;
-use eidetica::Database;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -10,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Risk level for a tool invocation. Influences logging and approval requirements.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     /// Safe, read-only, or trivial operations
     #[default]
@@ -32,7 +31,8 @@ impl fmt::Display for RiskLevel {
 }
 
 /// Whether a tool invocation requires explicit user approval before execution.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalRequirement {
     /// Tool never needs approval
     #[default]
@@ -43,10 +43,50 @@ pub enum ApprovalRequirement {
     Always,
 }
 
+/// What a tool declares about itself — portable, durable metadata.
+#[derive(Clone, Debug)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+/// Host policy for a tool — risk, approval, timeout, sensitive params.
+/// Configured by the admin, not declared by the tool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    #[serde(default)]
+    pub risk: RiskLevel,
+    #[serde(default)]
+    pub approval: ApprovalRequirement,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout: u64,
+    #[serde(default)]
+    pub sensitive_params: Vec<String>,
+}
+
+fn default_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            timeout: 60,
+            sensitive_params: Vec::new(),
+        }
+    }
+}
+
+impl ToolPolicy {
+    pub fn timeout_duration(&self) -> Duration {
+        Duration::from_secs(self.timeout)
+    }
+}
+
 /// Context provided by the runtime to tools during execution.
-///
-/// Most tools ignore this. `spawn_agent` depends on it to access the
-/// agent registry, backend, and tool registry for spawning child agents.
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
@@ -54,16 +94,8 @@ pub struct ToolContext {
     pub call_depth: usize,
     /// Maximum allowed spawn depth
     pub max_call_depth: usize,
-    /// Agent registry for looking up definitions
-    pub agent_registry: Arc<AgentRegistry>,
-    /// Tool registry for building child agent tool sets
-    pub tool_registry: Arc<ToolRegistry>,
-    /// Backend for LLM calls
-    pub backend: BackendManager,
-    /// Security context (leak detection, approval)
-    pub security: SecurityContext,
-    /// Eidetica database for creating child sessions
-    pub database: Database,
+    /// Scoped tool set for this agent — narrowed transitively down the spawn tree
+    pub tools: ScopedTools,
 }
 
 /// A tool that can be invoked by the LLM during a ReAct loop.
@@ -71,42 +103,21 @@ pub struct ToolContext {
 /// Tools are object-safe via boxed futures. Implement this trait to add
 /// new capabilities to the agent.
 pub trait Tool: Send + Sync {
-    /// Unique name used by the LLM to invoke this tool
-    fn name(&self) -> &str;
-
-    /// Human-readable description shown to the LLM
-    fn description(&self) -> &str;
-
-    /// JSON Schema for the tool's parameters
-    fn parameters(&self) -> Value;
+    /// Static metadata: name, description, JSON Schema parameters.
+    fn descriptor(&self) -> ToolDescriptor;
 
     /// Execute the tool with the given arguments and runtime context.
-    /// Most tools can ignore ctx — it's used by spawn_agent and similar
-    /// meta-tools that need access to the runtime machinery.
     fn execute<'a>(
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
-    /// Risk level for this invocation (may depend on arguments)
-    fn risk_level(&self, _params: &Value) -> RiskLevel {
-        RiskLevel::Low
-    }
-
-    /// Whether this invocation requires user approval
-    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::Never
-    }
-
-    /// Maximum execution time before the tool is killed
-    fn execution_timeout(&self) -> Duration {
-        Duration::from_secs(60)
-    }
-
-    /// Parameter names whose values should be redacted in logs and LLM context
-    fn sensitive_params(&self) -> &[&str] {
-        &[]
+    /// Default policy for this tool. Used when no config override exists.
+    /// Built-in tools override this with sensible defaults (e.g., shell → High/Always/30s).
+    /// Config-level policy always takes precedence.
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy::default()
     }
 }
 
@@ -125,6 +136,32 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+/// Resolves effective policy for tools: config overrides > tool defaults.
+pub struct ToolPolicyRegistry {
+    overrides: HashMap<String, ToolPolicy>,
+}
+
+impl ToolPolicyRegistry {
+    pub fn new(overrides: HashMap<String, ToolPolicy>) -> Self {
+        Self { overrides }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            overrides: HashMap::new(),
+        }
+    }
+
+    /// Get the effective policy for a tool: config override if present, else tool's default.
+    pub fn resolve(&self, tool: &dyn Tool) -> ToolPolicy {
+        let desc = tool.descriptor();
+        self.overrides
+            .get(&desc.name)
+            .cloned()
+            .unwrap_or_else(|| tool.default_policy())
+    }
 }
 
 /// Registry of available tools
@@ -150,10 +187,13 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .map(|t| ToolDefinition {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters(),
+            .map(|t| {
+                let desc = t.descriptor();
+                ToolDefinition {
+                    name: desc.name,
+                    description: desc.description,
+                    parameters: desc.parameters,
+                }
             })
             .collect()
     }
@@ -162,27 +202,50 @@ impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
-            .find(|t| t.name() == name)
+            .find(|t| t.descriptor().name == name)
             .map(|t| t.as_ref())
     }
 
-    /// Get a filtered view of tools for a specific allowed set.
-    /// If `allowed` is None, returns all tools (no filtering).
-    pub fn filtered_view(&self, allowed: Option<&[String]>) -> FilteredTools<'_> {
-        FilteredTools {
-            registry: self,
-            allowed: allowed.map(|a| a.to_vec()),
-        }
-    }
 }
 
-/// A filtered view of the tool registry, restricted to an agent's allowed tools.
-pub struct FilteredTools<'a> {
-    registry: &'a ToolRegistry,
+/// Owned, narrowable view of the tool registry.
+///
+/// Carries an Arc to the full registry plus an optional allowlist.
+/// Narrowing via `narrow()` produces a new ScopedTools with a tighter allowlist,
+/// enabling transitive tool restriction down the agent spawn tree.
+#[derive(Clone)]
+pub struct ScopedTools {
+    registry: Arc<ToolRegistry>,
     allowed: Option<Vec<String>>,
 }
 
-impl FilteredTools<'_> {
+impl ScopedTools {
+    pub fn new(registry: Arc<ToolRegistry>, allowed: Option<Vec<String>>) -> Self {
+        Self { registry, allowed }
+    }
+
+    /// Narrow this scope further for a child agent.
+    ///
+    /// Returns a new ScopedTools whose allowlist is the intersection of
+    /// this scope's allowlist and the child's allowed_tools.
+    pub fn narrow(&self, child_allowed: Option<&[String]>) -> Self {
+        let narrowed = match (&self.allowed, child_allowed) {
+            (None, None) => None,
+            (None, Some(c)) => Some(c.to_vec()),
+            (Some(p), None) => Some(p.clone()),
+            (Some(p), Some(c)) => Some(
+                c.iter()
+                    .filter(|t| p.contains(t))
+                    .cloned()
+                    .collect(),
+            ),
+        };
+        Self {
+            registry: self.registry.clone(),
+            allowed: narrowed,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         match &self.allowed {
             None => self.registry.is_empty(),
@@ -190,7 +253,7 @@ impl FilteredTools<'_> {
                 .registry
                 .tools
                 .iter()
-                .any(|t| allowed.contains(&t.name().to_string())),
+                .any(|t| allowed.contains(&t.descriptor().name)),
         }
     }
 
@@ -200,12 +263,15 @@ impl FilteredTools<'_> {
             .iter()
             .filter(|t| match &self.allowed {
                 None => true,
-                Some(allowed) => allowed.contains(&t.name().to_string()),
+                Some(allowed) => allowed.contains(&t.descriptor().name),
             })
-            .map(|t| ToolDefinition {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters(),
+            .map(|t| {
+                let desc = t.descriptor();
+                ToolDefinition {
+                    name: desc.name,
+                    description: desc.description,
+                    parameters: desc.parameters,
+                }
             })
             .collect()
     }

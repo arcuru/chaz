@@ -1,71 +1,79 @@
 use crate::role::RoleDetails;
 use crate::runtime;
 use crate::session::{EntryType, Session, SessionEntry};
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext};
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 use tracing::info;
+
+use crate::agent::AgentRegistry;
+use crate::backends::BackendManager;
+use crate::security::SecurityContext;
+use crate::tool::ToolPolicyRegistry;
+use eidetica::Database;
+use std::sync::Arc;
 
 /// Spawn a new agent to handle a task in a fresh session.
 ///
 /// Creates a new session (thread), runs the named agent's ReAct loop,
 /// and returns the result. The session persists in eidetica as a record.
-pub struct SpawnAgent;
+///
+/// This is a privileged native-only tool — it holds Arc refs to the
+/// registries and backend needed for agent orchestration.
+pub struct SpawnAgent {
+    pub agent_registry: Arc<AgentRegistry>,
+    pub policies: Arc<ToolPolicyRegistry>,
+    pub backend: BackendManager,
+    pub security: SecurityContext,
+    pub database: Database,
+}
 
 impl Tool for SpawnAgent {
-    fn name(&self) -> &str {
-        "spawn_agent"
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "spawn_agent".to_string(),
+            description: "Spawn a thread: creates a new session, runs the named agent with the given task, and returns the result. Use for delegating research, coding, or other focused work. Supports presets and per-field overrides.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Agent definition name (e.g. 'researcher', 'coder')"
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "What the agent should accomplish"
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional background info appended to the agent's system prompt"
+                    },
+                    "preset": {
+                        "type": "string",
+                        "description": "Named preset from the agent definition (e.g. 'deep', 'quick', 'max')"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Override the model"
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Override max ReAct iterations"
+                    }
+                },
+                "required": ["agent", "task"]
+            }),
+        }
     }
 
-    fn description(&self) -> &str {
-        "Spawn a thread: creates a new session, runs the named agent with the given task, and returns the result. Use for delegating research, coding, or other focused work. Supports presets and per-field overrides."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": "Agent definition name (e.g. 'researcher', 'coder')"
-                },
-                "task": {
-                    "type": "string",
-                    "description": "What the agent should accomplish"
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Optional background info appended to the agent's system prompt"
-                },
-                "preset": {
-                    "type": "string",
-                    "description": "Named preset from the agent definition (e.g. 'deep', 'quick', 'max')"
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Override the model"
-                },
-                "max_iterations": {
-                    "type": "integer",
-                    "description": "Override max ReAct iterations"
-                }
-            },
-            "required": ["agent", "task"]
-        })
-    }
-
-    fn risk_level(&self, _params: &Value) -> RiskLevel {
-        RiskLevel::Medium
-    }
-
-    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
-    }
-
-    fn execution_timeout(&self) -> Duration {
-        Duration::from_secs(300)
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::Medium,
+            approval: ApprovalRequirement::UnlessAutoApproved,
+            timeout: 300,
+            ..ToolPolicy::default()
+        }
     }
 
     fn execute<'a>(
@@ -97,14 +105,17 @@ impl Tool for SpawnAgent {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
 
-            if !ctx.agent_registry.can_spawn(&ctx.agent_name, agent_name) {
+            if !self
+                .agent_registry
+                .can_spawn(&ctx.agent_name, agent_name)
+            {
                 return Err(format!(
                     "Agent '{}' is not allowed to spawn '{}'",
                     ctx.agent_name, agent_name
                 ));
             }
 
-            let agent_def = ctx
+            let agent_def = self
                 .agent_registry
                 .get(agent_name)
                 .ok_or_else(|| format!("Unknown agent: '{agent_name}'"))?;
@@ -150,7 +161,7 @@ impl Tool for SpawnAgent {
 
             // Create a fresh session for this spawned agent
             let session_id = crate::types::ConversationId(uuid::Uuid::new_v4().to_string());
-            let mut session = Session::new_ephemeral(session_id, ctx.database.clone()).await;
+            let mut session = Session::new_ephemeral(session_id, self.database.clone()).await;
 
             // Add the task as the first entry (from the calling agent)
             session
@@ -165,33 +176,27 @@ impl Tool for SpawnAgent {
             // Build context from the session
             let chat_context = session.build_context(agent_name, role, resolved.model);
 
-            let filtered =
-                ctx.tool_registry
-                    .filtered_view(resolved.allowed_tools.as_deref());
+            let child_tools = ctx.tools.narrow(resolved.allowed_tools.as_deref());
 
-            let child_security = crate::security::SecurityContext {
-                leak_detector: ctx.security.leak_detector.clone(),
-                auto_approved_tools: ctx.security.auto_approved_tools.clone(),
-                approval_callback: ctx.security.approval_callback.clone(),
+            let child_security = SecurityContext {
+                leak_detector: self.security.leak_detector.clone(),
+                auto_approved_tools: self.security.auto_approved_tools.clone(),
+                approval_callback: self.security.approval_callback.clone(),
             };
 
             let child_ctx = ToolContext {
                 agent_name: agent_name.to_string(),
                 call_depth: ctx.call_depth + 1,
                 max_call_depth: ctx.max_call_depth,
-                agent_registry: ctx.agent_registry.clone(),
-                tool_registry: ctx.tool_registry.clone(),
-                backend: ctx.backend.clone(),
-                security: child_security.clone(),
-                database: ctx.database.clone(),
+                tools: child_tools,
             };
 
             let result = runtime::execute(
                 &chat_context,
-                &ctx.backend,
-                &filtered,
+                &self.backend,
                 &child_security,
                 &child_ctx,
+                &self.policies,
             )
             .await;
 

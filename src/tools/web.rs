@@ -1,5 +1,5 @@
 use crate::security::NetworkPolicy;
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext};
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -17,41 +17,39 @@ impl WebFetch {
 }
 
 impl Tool for WebFetch {
-    fn name(&self) -> &str {
-        "web_fetch"
-    }
-
-    fn description(&self) -> &str {
-        "Fetch a URL via HTTP and return the response body. Supports GET and POST methods."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The URL to fetch"
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "web_fetch".to_string(),
+            description:
+                "Fetch a URL via HTTP and return the response body. Supports GET and POST methods."
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch"
+                    },
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method: GET (default) or POST"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Request body (for POST requests)"
+                    }
                 },
-                "method": {
-                    "type": "string",
-                    "description": "HTTP method: GET (default) or POST"
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Request body (for POST requests)"
-                }
-            },
-            "required": ["url"]
-        })
+                "required": ["url"]
+            }),
+        }
     }
 
-    fn risk_level(&self, _params: &Value) -> RiskLevel {
-        RiskLevel::Medium
-    }
-
-    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::Medium,
+            approval: ApprovalRequirement::UnlessAutoApproved,
+            ..ToolPolicy::default()
+        }
     }
 
     fn execute(

@@ -1,4 +1,4 @@
-use crate::tool::{Tool, ToolContext};
+use crate::tool::{Tool, ToolContext, ToolDescriptor};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,25 +7,21 @@ use std::pin::Pin;
 pub struct Calculate;
 
 impl Tool for Calculate {
-    fn name(&self) -> &str {
-        "calculate"
-    }
-
-    fn description(&self) -> &str {
-        "Evaluate a mathematical expression. Supports +, -, *, /, parentheses, and common functions like sqrt, sin, cos, etc."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "The mathematical expression to evaluate, e.g. '2 + 3 * 4' or 'sqrt(16)'"
-                }
-            },
-            "required": ["expression"]
-        })
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "calculate".to_string(),
+            description: "Evaluate a mathematical expression. Supports +, -, *, /, parentheses, and common functions like sqrt, sin, cos, etc.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "The mathematical expression to evaluate, e.g. '2 + 3 * 4' or 'sqrt(16)'"
+                    }
+                },
+                "required": ["expression"]
+            }),
+        }
     }
 
     fn execute(

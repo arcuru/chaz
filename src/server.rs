@@ -19,7 +19,7 @@ use crate::gateway::ApprovalExchange;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
-use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolRegistry};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +45,7 @@ pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
     tools: Arc<ToolRegistry>,
+    policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
     semaphore: Arc<Semaphore>,
     /// Per-session metadata (backend, agent override, approval channel)
@@ -60,6 +61,7 @@ impl Server {
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
         tools: Arc<ToolRegistry>,
+        policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
@@ -68,6 +70,7 @@ impl Server {
             registry,
             agents,
             tools,
+            policies,
             security,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -213,7 +216,6 @@ impl Server {
         self.spawn_agent_task(
             transport_id.to_string(),
             session,
-            session_db,
             agent,
             meta.0,
             meta.2,
@@ -228,7 +230,6 @@ impl Server {
         &self,
         transport_id: String,
         mut session: Session,
-        session_db: eidetica::Database,
         agent: crate::agent::Agent,
         backend: BackendManager,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
@@ -240,7 +241,7 @@ impl Server {
         let max_call_depth = agent.max_iterations as usize;
 
         let tools = self.tools.clone();
-        let agents = self.agents.clone();
+        let policies = self.policies.clone();
         let security = self.security.clone();
         let semaphore = self.semaphore.clone();
 
@@ -248,8 +249,6 @@ impl Server {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
 
             let context = session.build_context(&agent_name, default_role, default_model);
-
-            let filtered = tools.filtered_view(allowed_tools.as_deref());
 
             let request_security = SecurityContext {
                 leak_detector: security.leak_detector.clone(),
@@ -261,16 +260,17 @@ impl Server {
                 agent_name: agent_name.clone(),
                 call_depth: 0,
                 max_call_depth,
-                agent_registry: agents,
-                tool_registry: tools.clone(),
-                backend: backend.clone(),
-                security: request_security.clone(),
-                database: session_db,
+                tools: ScopedTools::new(tools, allowed_tools),
             };
 
-            let result =
-                runtime::execute(&context, &backend, &filtered, &request_security, &tool_ctx)
-                    .await;
+            let result = runtime::execute(
+                &context,
+                &backend,
+                &request_security,
+                &tool_ctx,
+                &policies,
+            )
+            .await;
 
             drop(_permit);
 

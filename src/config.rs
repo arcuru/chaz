@@ -145,6 +145,8 @@ pub struct SecurityConfig {
     pub auto_approved_tools: Option<Vec<String>>,
     /// Leak detection policy: "redact" (default) or "block"
     pub leak_policy: Option<String>,
+    /// Per-tool policy overrides (risk, approval, timeout, sensitive_params)
+    pub tool_policies: Option<std::collections::HashMap<String, crate::tool::ToolPolicy>>,
 }
 
 /// An allowed endpoint for network policy
