@@ -9,6 +9,11 @@ use tracing::{error, info};
 /// Secrets are referenced by opaque IDs and only materialized at host
 /// boundaries (HTTP client creation). Never serialized into LLM context.
 ///
+/// **Not encrypted.** Secrets are stored in plaintext in the eidetica SQLite
+/// database. The security boundary here is keeping secrets out of the LLM
+/// data flow, not protecting them at rest. For encrypted storage, this could
+/// be upgraded to eidetica's `PasswordStore<DocStore>` in the future.
+///
 /// Architecture:
 /// - In-memory `HashMap` cache for fast sync reads (`get()`)
 /// - Persistent eidetica `DocStore` ("secrets" subtree) for durability
