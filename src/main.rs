@@ -66,9 +66,10 @@ async fn main() -> anyhow::Result<()> {
     let session_manager = session::SessionManager::new(instance, user, &config).await?;
     let memory_db = session_manager.database().clone();
 
-    // Build secret store: extract API keys from backend configs, resolve env vars,
-    // store in SecretStore, and replace raw keys with opaque references.
-    let secret_store = security::SecretStore::new();
+    // Build secret store backed by the same eidetica database.
+    // Loads existing secrets from the "secrets" DocStore, then reconciles
+    // with config — only writes if a value actually changed.
+    let secret_store = security::SecretStore::new(session_manager.database().clone()).await;
     if let Some(backends) = &mut config.backends {
         for backend in backends.iter_mut() {
             if let Some(raw_key) = backend.api_key.take() {
@@ -80,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
                     raw_key
                 });
                 let ref_id = backend.secret_key();
-                secret_store.insert(ref_id.clone(), resolved);
+                secret_store.insert(ref_id.clone(), resolved).await;
                 backend.api_key_ref = Some(ref_id);
             }
         }

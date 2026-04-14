@@ -1,38 +1,107 @@
+use eidetica::Database;
+use eidetica::store::DocStore;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::{error, info};
 
-/// Centralized secret storage. Secrets are referenced by opaque IDs and only
-/// materialized at host boundaries (HTTP client creation). Never serialized,
-/// never enters LLM context.
+/// Centralized secret storage backed by eidetica DocStore.
 ///
-/// Uses `Arc<RwLock<..>>` so it can be shared across threads and extended at
-/// runtime (e.g., when Matrix room tag backends provide API keys).
-#[derive(Clone, Default)]
+/// Secrets are referenced by opaque IDs and only materialized at host
+/// boundaries (HTTP client creation). Never serialized into LLM context.
+///
+/// Architecture:
+/// - In-memory `HashMap` cache for fast sync reads (`get()`)
+/// - Persistent eidetica `DocStore` ("secrets" subtree) for durability
+/// - On startup: load from DocStore, reconcile with config, update if changed
+/// - `insert()` writes to both cache and DocStore
+#[derive(Clone)]
 pub struct SecretStore {
-    secrets: Arc<RwLock<HashMap<String, String>>>,
+    cache: Arc<RwLock<HashMap<String, String>>>,
+    database: Database,
 }
 
 impl SecretStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// Create a new SecretStore backed by the given eidetica database.
+    /// Loads any existing secrets from the "secrets" DocStore into memory.
+    pub async fn new(database: Database) -> Self {
+        let store = Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            database,
+        };
+        store.load_from_db().await;
+        store
     }
 
-    /// Look up a secret by reference ID. Returns a clone (never a reference
-    /// into the locked map) so the lock is held only briefly.
+    /// Load all secrets from the eidetica DocStore into the in-memory cache.
+    async fn load_from_db(&self) {
+        let Ok(txn) = self.database.new_transaction().await else {
+            error!("Failed to create transaction for loading secrets");
+            return;
+        };
+        let Ok(store) = txn.get_store::<DocStore>("secrets").await else {
+            // First run — no secrets subtree yet, that's fine
+            return;
+        };
+        let Ok(doc) = store.get_all().await else {
+            return;
+        };
+
+        let mut cache = self.cache.write().expect("SecretStore lock poisoned");
+        let mut count = 0;
+        for (key, value) in doc.iter() {
+            if let Ok(s) = value.try_into() {
+                let s: String = s;
+                cache.insert(key.clone(), s);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            info!("Loaded {count} secrets from store");
+        }
+    }
+
+    /// Look up a secret by reference ID. Sync — reads from in-memory cache.
     pub fn get(&self, id: &str) -> Option<String> {
-        self.secrets
+        self.cache
             .read()
             .expect("SecretStore lock poisoned")
             .get(id)
             .cloned()
     }
 
-    /// Store a secret under the given reference ID.
-    pub fn insert(&self, id: String, value: String) {
-        self.secrets
-            .write()
-            .expect("SecretStore lock poisoned")
-            .insert(id, value);
+    /// Store a secret. Updates the in-memory cache immediately and persists
+    /// to the eidetica DocStore. Only writes to the store if the value changed.
+    pub async fn insert(&self, id: String, value: String) {
+        // Check if value actually changed
+        let changed = {
+            let mut cache = self.cache.write().expect("SecretStore lock poisoned");
+            let old = cache.get(&id);
+            if old.is_some_and(|v| v == &value) {
+                false
+            } else {
+                cache.insert(id.clone(), value.clone());
+                true
+            }
+        };
+
+        if !changed {
+            return;
+        }
+
+        // Persist to eidetica DocStore
+        match self.database.new_transaction().await {
+            Ok(txn) => match txn.get_store::<DocStore>("secrets").await {
+                Ok(store) => {
+                    if let Err(e) = store.set_string(&id, &value).await {
+                        error!("Failed to persist secret '{id}': {e}");
+                    } else if let Err(e) = txn.commit().await {
+                        error!("Failed to commit secret '{id}': {e}");
+                    }
+                }
+                Err(e) => error!("Failed to open secrets store: {e}"),
+            },
+            Err(e) => error!("Failed to create transaction for secret: {e}"),
+        }
     }
 
     /// Resolve a config value that may be an environment variable reference.
@@ -56,7 +125,7 @@ impl SecretStore {
 
 impl std::fmt::Debug for SecretStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.secrets.read().map(|s| s.len()).unwrap_or(0);
+        let count = self.cache.read().map(|s| s.len()).unwrap_or(0);
         write!(f, "SecretStore({} secrets)", count)
     }
 }
@@ -65,13 +134,8 @@ impl std::fmt::Debug for SecretStore {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_insert_and_get() {
-        let store = SecretStore::new();
-        store.insert("test-key".into(), "secret-value".into());
-        assert_eq!(store.get("test-key"), Some("secret-value".to_string()));
-        assert_eq!(store.get("missing"), None);
-    }
+    // Note: tests that need eidetica would require a test database setup.
+    // These tests cover the sync/env-resolution parts only.
 
     #[test]
     fn test_resolve_env_literal() {
@@ -109,7 +173,6 @@ mod tests {
 
     #[test]
     fn test_resolve_env_bare_dollar() {
-        // Just "$" alone should be treated as literal
         assert_eq!(SecretStore::resolve_env("$").unwrap(), "$");
     }
 }

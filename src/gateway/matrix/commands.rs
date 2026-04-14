@@ -385,7 +385,7 @@ async fn get_tag_backend(room: &Room, secrets: &SecretStore) -> Option<Vec<Backe
             // Extract API key into SecretStore instead of keeping on Backend struct
             if let Some(key) = tags.get_value(&format!("{}.token", name)) {
                 let ref_id = format!("room:{room_id}:{name}");
-                secrets.insert(ref_id.clone(), key);
+                secrets.insert(ref_id.clone(), key).await;
                 backend.api_key_ref = Some(ref_id);
             }
             if backend.api_base.is_some() && backend.api_key_ref.is_some() {
