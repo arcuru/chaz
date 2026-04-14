@@ -45,7 +45,7 @@ tools/
   memory.rs          remember, recall — persistent key-value memory (Low risk)
 security/
   mod.rs             SecurityContext (leak detector, auto-approved tools, approval channel)
-  secrets.rs         SecretStore — centralized secret storage, env var resolution, host-boundary injection
+  secrets.rs         SecretStore — eidetica DocStore-backed secret storage, HashMap cache, env var resolution
   leak_detector.rs   LeakDetector — 12 secret patterns, redact/block policy
   network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
   sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
@@ -82,7 +82,7 @@ defaults.rs          Built-in default config and roles
 - **Memory**: eidetica Table store for key-value facts, shared database with sessions
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
-- **Secret store**: API keys extracted from config at startup into SecretStore (Arc<RwLock<HashMap>>). Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (OpenAI::build_client). Supports env var references: `"${VAR_NAME}"` in config.
+- **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
 - **Security context**: Built from SecurityConfig, threaded through router to runtime per-request. Contains leak detector, auto-approved tool set, and approval channel from gateway.
 - **Tool approval flow**: Tools declare risk level and approval requirement. Runtime checks SecurityContext, sends ApprovalExchange to gateway via mpsc channel, gateway prompts user (TUI: stdin, Matrix: deferred). Approval decisions: Approve/Deny/ApproveAll.
