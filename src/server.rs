@@ -1,10 +1,13 @@
 //! Callback-driven agent server.
 //!
 //! The server watches session databases for new entries via eidetica's
-//! `on_local_write` callbacks. When a new user message is detected, it
-//! spawns an agent task that runs the ReAct loop and writes the response
-//! back to the session database. Responses are delivered to transports
-//! (Matrix rooms, TUI) through a response channel.
+//! `on_local_write` callbacks. When a new message from a non-agent sender
+//! is detected, it spawns an agent task that runs the ReAct loop and writes
+//! the response back to the session database.
+//!
+//! The server is transport-agnostic — it only cares about session DBs and
+//! agent execution. Gateways (Matrix, TUI) register their own callbacks on
+//! session DBs to detect agent responses and deliver them to their transports.
 //!
 //! **Known limitation**: concurrent writes to the same session may cause
 //! duplicate agent runs. Each callback independently checks the latest
@@ -26,13 +29,6 @@ use tracing::{error, info};
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
 
-/// A response to deliver to a transport (Matrix room, TUI, etc.)
-pub struct ResponseDelivery {
-    pub transport_id: String,
-    pub body: String,
-    pub is_markdown: bool,
-}
-
 /// Per-session metadata needed for agent processing.
 struct SessionMeta {
     backend: BackendManager,
@@ -42,36 +38,30 @@ struct SessionMeta {
 
 /// Callback-driven agent server.
 ///
-/// Watches session databases for new entries. When a user message appears,
-/// spawns an agent task. When an agent response appears, delivers it to the
-/// transport via the response channel.
+/// Watches session databases for new entries. When a non-agent message appears,
+/// spawns an agent task. Transport-agnostic — gateways handle their own response
+/// delivery by registering callbacks on session DBs.
 pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
     tools: Arc<ToolRegistry>,
     security: SecurityContext,
-    response_tx: mpsc::Sender<ResponseDelivery>,
-    /// Response receiver — gateways take this to deliver responses
-    response_rx: Mutex<Option<mpsc::Receiver<ResponseDelivery>>>,
     semaphore: Arc<Semaphore>,
     /// Per-session metadata (backend, agent override, approval channel)
     sessions: Arc<Mutex<HashMap<String, SessionMeta>>>,
-    /// Track which session DBs have callbacks registered
+    /// Track which session DBs have server callbacks registered
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Internal notification channel — callbacks send transport_id here
     notify_tx: mpsc::Sender<String>,
 }
 
 impl Server {
-    /// Create a new server. Returns the server and a response receiver
-    /// that transports should read from to deliver responses.
     pub fn new(
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
         tools: Arc<ToolRegistry>,
         security: SecurityContext,
     ) -> Arc<Self> {
-        let (response_tx, response_rx) = mpsc::channel(256);
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
         let server = Arc::new(Self {
@@ -79,8 +69,6 @@ impl Server {
             agents,
             tools,
             security,
-            response_tx,
-            response_rx: Mutex::new(Some(response_rx)),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -101,21 +89,19 @@ impl Server {
         &self.registry
     }
 
-    /// Take the response receiver. Gateways call this to get the channel
-    /// for delivering responses to transports. Can only be called once.
-    pub async fn take_response_rx(&self) -> mpsc::Receiver<ResponseDelivery> {
-        self.response_rx
-            .lock()
-            .await
-            .take()
-            .expect("response_rx already taken")
+    /// Get the agent registry
+    pub fn agents(&self) -> &AgentRegistry {
+        &self.agents
     }
 
-    /// Register a session for callback-driven processing.
+    /// Register a session for callback-driven agent processing.
     ///
     /// Call this when a gateway first encounters a transport (e.g., a Matrix room).
-    /// Registers an `on_local_write` callback on the session database and stores
-    /// the transport-specific metadata (backend, approval channel).
+    /// Registers an `on_local_write` callback on the session database that triggers
+    /// agent processing when new non-agent messages appear.
+    ///
+    /// Gateways should register their own callbacks on the session DB to handle
+    /// response delivery (e.g., sending agent messages to a Matrix room).
     ///
     /// Safe to call multiple times — updates metadata, skips duplicate callback registration.
     pub async fn register_session(
@@ -139,7 +125,7 @@ impl Server {
             );
         }
 
-        // Register callback if not already done for this session DB
+        // Register server callback if not already done for this session DB
         let db_id = session_db.root_id().to_string();
         let mut watched = self.watched.lock().await;
         if watched.contains(&db_id) {
@@ -154,13 +140,12 @@ impl Server {
             let tx = tx.clone();
             let tid = tid.clone();
             Box::pin(async move {
-                // Just notify — the processing loop does the heavy lifting
                 let _ = tx.send(tid).await;
                 Ok(())
             })
         })?;
 
-        info!("Watching session DB for {}", transport_id);
+        info!("Server watching session DB for {}", transport_id);
         Ok(())
     }
 
@@ -194,58 +179,46 @@ impl Server {
 
         let latest = match session.latest_entry() {
             Some(e) => e.clone(),
-            None => return Ok(()), // Empty session
+            None => return Ok(()),
+        };
+
+        // Only act on Messages from non-agent senders
+        if latest.entry_type != EntryType::Message {
+            return Ok(());
+        }
+
+        // Check if sender is a known agent — if so, ignore (it's a response, not a request)
+        if self.agents.get(&latest.sender).is_some() {
+            return Ok(());
+        }
+
+        // User message — spawn agent task
+        let meta = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(transport_id) {
+                Some(m) => (
+                    m.backend.clone(),
+                    m.agent_override.clone(),
+                    m.approval_tx.clone(),
+                ),
+                None => return Ok(()),
+            }
         };
 
         let agent = self
             .registry
-            .resolve_agent(transport_id, None)
+            .resolve_agent(transport_id, meta.1.as_deref())
             .await;
 
-        match latest.entry_type {
-            EntryType::Message if latest.sender != agent.name => {
-                // User message — spawn agent task
-                let meta = {
-                    let sessions = self.sessions.lock().await;
-                    match sessions.get(transport_id) {
-                        Some(m) => (
-                            m.backend.clone(),
-                            m.agent_override.clone(),
-                            m.approval_tx.clone(),
-                        ),
-                        None => return Ok(()), // Not registered
-                    }
-                };
-
-                // Re-resolve agent with override
-                let agent = self
-                    .registry
-                    .resolve_agent(transport_id, meta.1.as_deref())
-                    .await;
-
-                self.spawn_agent_task(
-                    transport_id.to_string(),
-                    session,
-                    session_db,
-                    agent,
-                    meta.0,
-                    meta.2,
-                )
-                .await;
-            }
-            EntryType::Message if latest.sender == agent.name => {
-                // Agent response — deliver to transport
-                let _ = self
-                    .response_tx
-                    .send(ResponseDelivery {
-                        transport_id: transport_id.to_string(),
-                        body: latest.content,
-                        is_markdown: true,
-                    })
-                    .await;
-            }
-            _ => {} // Ack, Error — no action needed
-        }
+        self.spawn_agent_task(
+            transport_id.to_string(),
+            session,
+            session_db,
+            agent,
+            meta.0,
+            meta.2,
+        )
+        .await;
 
         Ok(())
     }
@@ -303,8 +276,6 @@ impl Server {
 
             match result {
                 Ok(body) => {
-                    // Write response to session DB — this triggers the callback,
-                    // which will detect the agent message and deliver it to the transport.
                     session
                         .add_entry(SessionEntry {
                             sender: agent_name,

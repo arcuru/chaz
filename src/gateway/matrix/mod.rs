@@ -5,11 +5,10 @@ use crate::config::Config;
 use crate::gateway::Gateway;
 use crate::security::SecretStore;
 use crate::server::Server;
-use crate::session::{EntryType, SessionEntry};
+use crate::session::{EntryType, Session, SessionEntry};
 
 use headjack::Tags;
 use headjack::*;
-use matrix_sdk::Room as MatrixRoom;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -102,7 +101,6 @@ impl Gateway for MatrixGateway {
             .await;
         }
 
-        // Shared rate limiting state across all handlers
         let message_counts: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
         {
@@ -210,18 +208,17 @@ impl Gateway for MatrixGateway {
             .await;
         }
 
-        // === Text handler — writes entries to session DB, server processes via callbacks ===
+        // === Text handler — bridges Matrix events to session DB entries ===
 
-        // Room handle cache for response delivery
-        let rooms: Arc<Mutex<HashMap<String, MatrixRoom>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        // Track which session DBs have gateway response callbacks registered
+        let gateway_watched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         {
             let config = config.clone();
             let counts = message_counts;
             let secrets = self.secrets.clone();
             let server = server.clone();
-            let rooms = rooms.clone();
+            let gateway_watched = gateway_watched.clone();
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> =
@@ -233,7 +230,7 @@ impl Gateway for MatrixGateway {
                 let counts = counts.clone();
                 let secrets = secrets.clone();
                 let server = server.clone();
-                let rooms = rooms.clone();
+                let gateway_watched = gateway_watched.clone();
                 async move {
                     // Deduplicate events across sync restarts
                     {
@@ -265,13 +262,11 @@ impl Gateway for MatrixGateway {
                         return Ok(());
                     }
 
-                    // Read agent/model/role overrides from room tags
                     let agent_override = {
                         let tags = Tags::new(&room, "is.chaz.agent").await;
                         tags.get_value("default")
                     };
 
-                    // Strip !chaz prefix if present
                     let body = if body.starts_with("!chaz") {
                         body.trim_start_matches("!chaz").trim().to_string()
                     } else {
@@ -280,9 +275,6 @@ impl Gateway for MatrixGateway {
 
                     let backend = get_backend(&room, &config, &secrets).await;
                     let room_id = room.room_id().to_string();
-
-                    // Cache room handle for response delivery
-                    rooms.lock().await.insert(room_id.clone(), room.clone());
 
                     // Get or create session DB
                     let (_conv_id, session_db) = match server
@@ -297,7 +289,7 @@ impl Gateway for MatrixGateway {
                         }
                     };
 
-                    // Register with server (ensures callback is set up)
+                    // Register server callback (agent processing)
                     if let Err(e) = server
                         .register_session(
                             &room_id,
@@ -312,13 +304,68 @@ impl Gateway for MatrixGateway {
                         return Ok(());
                     }
 
+                    // Register gateway callback (response delivery to Matrix room)
+                    {
+                        let db_id = session_db.root_id().to_string();
+                        let mut watched = gateway_watched.lock().await;
+                        if !watched.contains(&db_id) {
+                            watched.insert(db_id);
+                            drop(watched);
+
+                            let matrix_room = room.clone();
+                            let agents = server.agents().clone();
+                            let rid = room_id.clone();
+                            if let Err(e) = session_db.on_local_write(
+                                move |_entry, db, _instance| {
+                                    let matrix_room = matrix_room.clone();
+                                    let agents = agents.clone();
+                                    let db = db.clone();
+                                    let rid = rid.clone();
+                                    Box::pin(async move {
+                                        // Read latest entry
+                                        let session = Session::new(
+                                            crate::types::ConversationId(rid),
+                                            db,
+                                        )
+                                        .await;
+                                        if let Some(latest) = session.latest_entry() {
+                                            // Send agent messages to Matrix
+                                            if latest.entry_type == EntryType::Message
+                                                && agents.get(&latest.sender).is_some()
+                                            {
+                                                info!(
+                                                    "→ Matrix: {}",
+                                                    latest.content.replace('\n', " ")
+                                                );
+                                                let content =
+                                                    RoomMessageEventContent::text_markdown(
+                                                        &latest.content,
+                                                    );
+                                                if let Err(e) = matrix_room.send(content).await {
+                                                    tracing::error!(
+                                                        "Failed to send to Matrix: {e}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    })
+                                },
+                            ) {
+                                error!("Failed to register gateway callback: {e}");
+                            } else {
+                                info!("Gateway watching session DB for {}", room_id);
+                            }
+                        }
+                    }
+
                     // Backfill room history on first message per room
                     {
                         let mut backfilled = backfilled_rooms.lock().await;
                         if backfilled.insert(room_id.clone()) {
                             info!("Backfilling history for room {}", room_id);
                             let history = read_room_history(&room).await;
-                            let mut session = crate::session::Session::new(
+                            let mut session = Session::new(
                                 crate::types::ConversationId(room_id.clone()),
                                 session_db.clone(),
                             )
@@ -327,10 +374,10 @@ impl Gateway for MatrixGateway {
                         }
                     }
 
-                    // Write user entry to session DB — this triggers the callback
-                    // which causes the server to run the agent
-                    let mut session = crate::session::Session::new(
-                        crate::types::ConversationId(room_id.clone()),
+                    // Write user entry to session DB — triggers server callback → agent runs
+                    // Agent response → triggers gateway callback → sends to Matrix room
+                    let mut session = Session::new(
+                        crate::types::ConversationId(room_id),
                         session_db,
                     )
                     .await;
@@ -343,38 +390,10 @@ impl Gateway for MatrixGateway {
                         })
                         .await;
 
-                    // Response delivery happens asynchronously via the response channel
                     Ok(())
                 }
             });
         }
-
-        // === Response delivery task — reads agent responses and sends to Matrix rooms ===
-
-        let response_rooms = rooms;
-        tokio::spawn(async move {
-            let mut response_rx = server.take_response_rx().await;
-            while let Some(delivery) = response_rx.recv().await {
-                let rooms = response_rooms.lock().await;
-                if let Some(room) = rooms.get(&delivery.transport_id) {
-                    info!("Response: {}", delivery.body.replace('\n', " "));
-                    if delivery.is_markdown {
-                        room.send(RoomMessageEventContent::text_markdown(&delivery.body))
-                            .await
-                            .unwrap();
-                    } else {
-                        room.send(RoomMessageEventContent::notice_plain(&delivery.body))
-                            .await
-                            .unwrap();
-                    }
-                } else {
-                    error!(
-                        "No room handle for transport_id {}",
-                        delivery.transport_id
-                    );
-                }
-            }
-        });
 
         // Retry loop for transient sync errors
         loop {

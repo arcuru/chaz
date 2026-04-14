@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use crate::security::SecretStore;
 use crate::server::Server;
-use crate::session::{EntryType, SessionEntry};
+use crate::session::{EntryType, Session, SessionEntry};
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -37,19 +37,40 @@ impl Gateway for TuiGateway {
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
-        // Register session with server
+        // Register server callback (agent processing)
         server
             .register_session(
                 &transport_id,
                 &session_db,
-                backend.clone(),
+                backend,
                 None,
                 Some(approval_tx.clone()),
             )
             .await?;
 
-        // Take the response receiver
-        let mut response_rx = server.take_response_rx().await;
+        // Register gateway callback (response display)
+        // Uses an mpsc channel to bridge from the async callback to the main TUI loop.
+        let (response_tx, mut response_rx) = mpsc::channel::<String>(16);
+        let agents = server.agents().clone();
+        let tui_db = session_db.clone();
+        let tui_tid = transport_id.clone();
+        tui_db.on_local_write(move |_entry, db, _instance| {
+            let agents = agents.clone();
+            let db = db.clone();
+            let tid = tui_tid.clone();
+            let tx = response_tx.clone();
+            Box::pin(async move {
+                let session = Session::new(crate::types::ConversationId(tid), db).await;
+                if let Some(latest) = session.latest_entry() {
+                    if latest.entry_type == EntryType::Message
+                        && agents.get(&latest.sender).is_some()
+                    {
+                        let _ = tx.send(latest.content.clone()).await;
+                    }
+                }
+                Ok(())
+            })
+        })?;
 
         loop {
             print!("> ");
@@ -71,7 +92,7 @@ impl Gateway for TuiGateway {
             }
 
             // Write user entry to session DB — triggers server callback
-            let mut session = crate::session::Session::new(
+            let mut session = Session::new(
                 crate::types::ConversationId(transport_id.clone()),
                 session_db.clone(),
             )
@@ -86,21 +107,18 @@ impl Gateway for TuiGateway {
                 .await;
 
             // Wait for response, handling approval requests concurrently
-            let response = loop {
+            loop {
                 tokio::select! {
                     Some(exchange) = approval_rx.recv() => {
                         let decision = prompt_approval(&exchange);
                         let _ = exchange.decision_tx.send(decision);
                     }
-                    Some(delivery) = response_rx.recv() => {
-                        if delivery.transport_id == transport_id {
-                            break delivery;
-                        }
+                    Some(body) = response_rx.recv() => {
+                        println!("\n{}\n", body);
+                        break;
                     }
                 }
-            };
-
-            println!("\n{}\n", response.body);
+            }
         }
 
         Ok(())
