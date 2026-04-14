@@ -11,7 +11,6 @@ homepage = "https://github.com/arcuru/chaz"
 
 [[bin]]
 name = "chaz"
-test = false
 
 [dependencies]
 headjack = { git = "https://github.com/arcuru/vibe-headjack" }
@@ -33,3 +32,4 @@ meval = "0.2"
 reqwest = "0.12"
 serde_json = "1"
 url = "2"
+uuid = { version = "1", features = ["v4"] }

@@ -135,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
     tools.register(tools::WebFetch::new(network_policy));
     tools.register(tools::Remember::new(memory_db.clone()));
     tools.register(tools::Recall::new(memory_db));
+    tools.register(tools::SpawnAgent);
 
     let tools = std::sync::Arc::new(tools);
 

@@ -45,6 +45,16 @@ impl Session {
         session
     }
 
+    /// Create a new session without loading existing messages.
+    /// Used by spawn_agent to create fresh sessions for spawned agents.
+    pub async fn new_ephemeral(conversation_id: ConversationId, database: Database) -> Self {
+        Session {
+            conversation_id,
+            database,
+            messages: Vec::new(),
+        }
+    }
+
     /// Load messages from eidetica
     async fn load_from_db(&mut self) {
         let store_name = self.store_name();

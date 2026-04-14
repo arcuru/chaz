@@ -83,11 +83,11 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with the given arguments and runtime context.
     /// Most tools can ignore ctx — it's used by spawn_agent and similar
     /// meta-tools that need access to the runtime machinery.
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
     /// Risk level for this invocation (may depend on arguments)
     fn risk_level(&self, _params: &Value) -> RiskLevel {
