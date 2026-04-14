@@ -63,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = instance.create_user("chaz", None).await; // OK if already exists
     let user = instance.login_user("chaz", None).await?;
 
-    let session_manager = session::SessionManager::new(instance, user, &config).await?;
+    let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
+    let session_manager =
+        session::SessionManager::new(instance, user, agent_registry.clone()).await?;
     let memory_db = session_manager.database().clone();
 
     // Build secret store backed by the same eidetica database.
@@ -134,10 +136,18 @@ async fn main() -> anyhow::Result<()> {
     tools.register(tools::Remember::new(memory_db.clone()));
     tools.register(tools::Recall::new(memory_db));
 
+    let tools = std::sync::Arc::new(tools);
+
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
 
     // Spawn the router with session management and tools
-    let router_handle = tokio::spawn(router::run(event_rx, session_manager, tools, security_ctx));
+    let router_handle = tokio::spawn(router::run(
+        event_rx,
+        session_manager,
+        tools,
+        agent_registry,
+        security_ctx,
+    ));
 
     // Run the selected gateway
     let result = if args.tui {

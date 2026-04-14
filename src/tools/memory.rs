@@ -1,4 +1,4 @@
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolContext};
 use chrono::Utc;
 use eidetica::Database;
 use eidetica::store::Table;
@@ -54,6 +54,7 @@ impl Tool for Remember {
     fn execute(
         &self,
         arguments: Value,
+        _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let key = arguments
@@ -129,6 +130,7 @@ impl Tool for Recall {
     fn execute(
         &self,
         arguments: Value,
+        _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let query = arguments

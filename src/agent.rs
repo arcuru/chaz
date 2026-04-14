@@ -120,6 +120,7 @@ fn intersect_tools(base: &Option<Vec<String>>, override_tools: &[String]) -> Vec
 }
 
 /// Registry of named agents. Always has a default agent.
+#[derive(Clone)]
 pub struct AgentRegistry {
     agents: Vec<Agent>,
 }

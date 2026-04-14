@@ -1,4 +1,4 @@
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolContext};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -26,6 +26,7 @@ impl Tool for GetTime {
     fn execute(
         &self,
         _arguments: Value,
+        _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async { Ok(chrono::Utc::now().to_rfc3339()) })
     }

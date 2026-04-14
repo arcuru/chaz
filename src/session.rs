@@ -1,4 +1,5 @@
 use crate::agent::{Agent, AgentRegistry};
+use std::sync::Arc;
 use crate::backends::{ChatContext, Message};
 use crate::config::Config;
 use crate::role::RoleDetails;
@@ -164,14 +165,14 @@ pub struct SessionManager {
     bindings: HashMap<String, ConversationId>,
     /// Maps ConversationId → agent definition name for per-conversation agent selection.
     agent_bindings: HashMap<ConversationId, String>,
-    pub agents: AgentRegistry,
+    pub agents: Arc<AgentRegistry>,
 }
 
 impl SessionManager {
     pub async fn new(
         instance: Instance,
         mut user: eidetica::user::User,
-        config: &Config,
+        agents: Arc<AgentRegistry>,
     ) -> anyhow::Result<Self> {
         // Find or create the eidetica sessions database
         let database = match user.find_database("chaz-sessions").await {
@@ -183,8 +184,6 @@ impl SessionManager {
                 user.create_database(settings, &key_id).await?
             }
         };
-
-        let agents = AgentRegistry::from_config(config);
 
         Ok(Self {
             _instance: instance,

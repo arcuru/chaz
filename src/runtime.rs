@@ -14,7 +14,7 @@
 use crate::backends::{BackendManager, ChatContext};
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
-use crate::tool::{FilteredTools, ToolApprovalInfo};
+use crate::tool::{FilteredTools, ToolApprovalInfo, ToolContext};
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -66,6 +66,7 @@ pub async fn execute(
     backend: &BackendManager,
     tools: &FilteredTools<'_>,
     security: &SecurityContext,
+    tool_ctx: &ToolContext,
 ) -> Result<String, String> {
     // Fast path: no tools or backend doesn't support them → single-shot
     if tools.is_empty() || !backend.supports_tools(context) {
@@ -164,7 +165,7 @@ pub async fn execute(
                             // --- Security: execute with timeout ---
                             let timeout = tool.execution_timeout();
                             let exec_result =
-                                tokio::time::timeout(timeout, tool.execute(args)).await;
+                                tokio::time::timeout(timeout, tool.execute(args, tool_ctx)).await;
 
                             match exec_result {
                                 Ok(Ok(output)) => {

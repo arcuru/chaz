@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use tokio::sync::{mpsc, oneshot};
 
 /// Security context threaded through the runtime.
+#[derive(Clone)]
 pub struct SecurityContext {
     pub leak_detector: LeakDetector,
     pub auto_approved_tools: HashSet<String>,

@@ -1,7 +1,12 @@
+use crate::agent::AgentRegistry;
+use crate::backends::BackendManager;
+use crate::security::SecurityContext;
+use eidetica::Database;
 use serde_json::Value;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Risk level for a tool invocation. Influences logging and approval requirements.
@@ -38,6 +43,29 @@ pub enum ApprovalRequirement {
     Always,
 }
 
+/// Context provided by the runtime to tools during execution.
+///
+/// Most tools ignore this. `spawn_agent` depends on it to access the
+/// agent registry, backend, and tool registry for spawning child agents.
+pub struct ToolContext {
+    /// Name of the agent currently executing
+    pub agent_name: String,
+    /// Current spawn depth (0 = root agent from gateway)
+    pub call_depth: usize,
+    /// Maximum allowed spawn depth
+    pub max_call_depth: usize,
+    /// Agent registry for looking up definitions
+    pub agent_registry: Arc<AgentRegistry>,
+    /// Tool registry for building child agent tool sets
+    pub tool_registry: Arc<ToolRegistry>,
+    /// Backend for LLM calls
+    pub backend: BackendManager,
+    /// Security context (leak detection, approval)
+    pub security: SecurityContext,
+    /// Eidetica database for creating child sessions
+    pub database: Database,
+}
+
 /// A tool that can be invoked by the LLM during a ReAct loop.
 ///
 /// Tools are object-safe via boxed futures. Implement this trait to add
@@ -52,10 +80,13 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the tool's parameters
     fn parameters(&self) -> Value;
 
-    /// Execute the tool with the given arguments, returning a text result
+    /// Execute the tool with the given arguments and runtime context.
+    /// Most tools can ignore ctx — it's used by spawn_agent and similar
+    /// meta-tools that need access to the runtime machinery.
     fn execute(
         &self,
         arguments: Value,
+        ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 
     /// Risk level for this invocation (may depend on arguments)

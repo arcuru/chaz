@@ -35,6 +35,7 @@ pub trait LLMBackend {
     }
 }
 
+#[derive(Clone)]
 pub struct BackendManager {
     backends: Vec<Backend>,
     secrets: SecretStore,

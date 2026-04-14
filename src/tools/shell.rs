@@ -1,4 +1,4 @@
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool};
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -118,6 +118,7 @@ impl Tool for ShellExec {
     fn execute(
         &self,
         arguments: Value,
+        _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let command = arguments

@@ -1,10 +1,12 @@
+use crate::agent::AgentRegistry;
 use crate::gateway::{ChatRequest, ChatResponse};
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{SessionManager, SessionMessage};
-use crate::tool::ToolRegistry;
+use crate::tool::{ToolContext, ToolRegistry};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -18,7 +20,8 @@ use tracing::{error, info};
 pub async fn run(
     mut event_rx: mpsc::Receiver<ChatRequest>,
     mut sessions: SessionManager,
-    tools: ToolRegistry,
+    tools: Arc<ToolRegistry>,
+    agent_registry: Arc<AgentRegistry>,
     security: SecurityContext,
 ) {
     while let Some(first) = event_rx.recv().await {
@@ -60,6 +63,8 @@ pub async fn run(
                 let default_model = agent.default_model.clone();
                 let allowed_tools = agent.allowed_tools.clone();
                 let agent_name = agent.name.clone();
+                let max_call_depth = agent.max_iterations as usize; // use max_iterations as depth limit for now
+                let database = sessions.database().clone();
                 let session = sessions.get_or_create(&conversation_id).await;
 
                 // Backfill from gateway history if provided
@@ -101,8 +106,20 @@ pub async fn run(
                     approval_callback: request.approval_tx,
                 };
 
+                // Build tool context for this request
+                let tool_ctx = ToolContext {
+                    agent_name: agent_name.clone(),
+                    call_depth: 0,
+                    max_call_depth,
+                    agent_registry: agent_registry.clone(),
+                    tool_registry: tools.clone(),
+                    backend: request.backend.clone(),
+                    security: request_security.clone(),
+                    database: database.clone(),
+                };
+
                 let result =
-                    runtime::execute(&context, &request.backend, &filtered, &request_security)
+                    runtime::execute(&context, &request.backend, &filtered, &request_security, &tool_ctx)
                         .await;
 
                 match result {

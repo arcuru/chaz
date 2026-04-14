@@ -1,4 +1,4 @@
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolContext};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -31,6 +31,7 @@ impl Tool for Calculate {
     fn execute(
         &self,
         arguments: Value,
+        _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             let expr = arguments
