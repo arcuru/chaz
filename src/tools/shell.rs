@@ -1,15 +1,81 @@
-// FIXME: Shell execution is completely unsandboxed. Commands run with the
-// bot's full user permissions. This MUST be sandboxed before any untrusted
-// users can interact with the bot. Options: seccomp, bubblewrap, WASM,
-// container isolation, or an explicit allowlist of commands.
-
-use crate::tool::Tool;
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
-/// Execute a shell command and return its output
-pub struct ShellExec;
+/// Execute a shell command and return its output.
+///
+/// Security: High risk, always requires approval. Supports command
+/// allowlist/denylist filtering via SecurityConfig.
+pub struct ShellExec {
+    /// If set, only commands starting with these prefixes are allowed
+    allowlist: Option<Vec<String>>,
+    /// Commands starting with these prefixes are always denied
+    denylist: Vec<String>,
+}
+
+impl ShellExec {
+    pub fn new(allowlist: Option<Vec<String>>, denylist: Option<Vec<String>>) -> Self {
+        Self {
+            allowlist,
+            denylist: denylist.unwrap_or_default(),
+        }
+    }
+
+    /// Check if a command is allowed by the allowlist/denylist.
+    fn check_command(&self, command: &str) -> Result<(), String> {
+        // Extract all command tokens (handles pipes, &&, ||, ;, $())
+        let commands = Self::extract_commands(command);
+
+        for cmd in &commands {
+            let binary = cmd.trim();
+            if binary.is_empty() {
+                continue;
+            }
+
+            // Check denylist first
+            for denied in &self.denylist {
+                if binary.starts_with(denied) {
+                    return Err(format!("Command '{binary}' is denied by security policy"));
+                }
+            }
+
+            // Check allowlist if configured
+            if let Some(allowlist) = &self.allowlist {
+                if !allowlist.iter().any(|allowed| binary.starts_with(allowed)) {
+                    return Err(format!(
+                        "Command '{binary}' is not in the allowed commands list"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract individual command binaries from a shell command string.
+    /// Handles pipes, &&, ||, ;, and $() subshells.
+    fn extract_commands(command: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        // Split on shell operators
+        for segment in command.split(['|', '&', ';']) {
+            let trimmed = segment.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Take just the first word (the binary name)
+            if let Some(first_word) = trimmed.split_whitespace().next() {
+                // Strip leading $( or ( for subshells
+                let clean = first_word.trim_start_matches("$(").trim_start_matches('(');
+                if !clean.is_empty() {
+                    commands.push(clean.to_string());
+                }
+            }
+        }
+        commands
+    }
+}
 
 impl Tool for ShellExec {
     fn name(&self) -> &str {
@@ -37,6 +103,18 @@ impl Tool for ShellExec {
         })
     }
 
+    fn risk_level(&self, _params: &Value) -> RiskLevel {
+        RiskLevel::High
+    }
+
+    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    fn execution_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     fn execute(
         &self,
         arguments: Value,
@@ -46,6 +124,9 @@ impl Tool for ShellExec {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing 'command' argument".to_string())?;
+
+            // Check against allowlist/denylist
+            self.check_command(command)?;
 
             let working_dir = arguments
                 .get("working_dir")

@@ -1,4 +1,4 @@
-use crate::tool::Tool;
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -64,6 +64,14 @@ impl Tool for WriteFile {
 
     fn description(&self) -> &str {
         "Write content to a file at the given path. Creates the file if it doesn't exist, overwrites if it does."
+    }
+
+    fn risk_level(&self, _params: &Value) -> RiskLevel {
+        RiskLevel::Medium
+    }
+
+    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn parameters(&self) -> Value {

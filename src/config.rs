@@ -30,6 +30,8 @@ pub struct Config {
     pub backends: Option<Vec<Backend>>,
     /// Agent definitions
     pub agents: Option<Vec<AgentConfig>>,
+    /// Security settings
+    pub security: Option<SecurityConfig>,
 }
 
 /// Configuration for an agent
@@ -93,4 +95,30 @@ pub struct Model {
 #[serde(rename_all = "lowercase")]
 pub enum BackendType {
     OpenAICompatible,
+}
+
+/// Security configuration
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SecurityConfig {
+    /// Allowed endpoints for web_fetch (empty = allow all, non-empty = deny-all default)
+    pub allowed_endpoints: Option<Vec<EndpointConfig>>,
+    /// Shell commands allowed (if set, only these command prefixes are permitted)
+    pub shell_allowlist: Option<Vec<String>>,
+    /// Shell commands denied (blocked even without an allowlist)
+    pub shell_denylist: Option<Vec<String>>,
+    /// Tools that are auto-approved (skip approval for UnlessAutoApproved tools)
+    pub auto_approved_tools: Option<Vec<String>>,
+    /// Leak detection policy: "redact" (default) or "block"
+    pub leak_policy: Option<String>,
+}
+
+/// An allowed endpoint for network policy
+#[derive(Debug, Deserialize, Clone)]
+pub struct EndpointConfig {
+    /// Host to match (exact or wildcard like "*.example.com")
+    pub host: String,
+    /// Optional path prefix restriction
+    pub path_prefix: Option<String>,
+    /// Allowed HTTP methods (None = all)
+    pub methods: Option<Vec<String>>,
 }

@@ -1,5 +1,6 @@
 use crate::gateway::{ChatRequest, ChatResponse};
 use crate::runtime;
+use crate::security::SecurityContext;
 use crate::session::{SessionManager, SessionMessage};
 use crate::tool::ToolRegistry;
 use chrono::Utc;
@@ -18,6 +19,7 @@ pub async fn run(
     mut event_rx: mpsc::Receiver<ChatRequest>,
     mut sessions: SessionManager,
     tools: ToolRegistry,
+    security: SecurityContext,
 ) {
     while let Some(first) = event_rx.recv().await {
         // Drain any immediately-available requests to batch them
@@ -87,7 +89,17 @@ pub async fn run(
                 let context = session.build_context(role, model);
 
                 let filtered = tools.filtered_view(allowed_tools.as_deref());
-                let result = runtime::execute(&context, &request.backend, &filtered).await;
+
+                // Build per-request security context with the gateway's approval channel
+                let request_security = SecurityContext {
+                    leak_detector: security.leak_detector.clone(),
+                    auto_approved_tools: security.auto_approved_tools.clone(),
+                    approval_callback: request.approval_tx,
+                };
+
+                let result =
+                    runtime::execute(&context, &request.backend, &filtered, &request_security)
+                        .await;
 
                 match result {
                     Ok(body) => {

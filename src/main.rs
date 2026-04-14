@@ -7,6 +7,7 @@ mod openai;
 mod role;
 mod router;
 mod runtime;
+mod security;
 mod session;
 mod tool;
 mod tools;
@@ -65,21 +66,57 @@ async fn main() -> anyhow::Result<()> {
     let session_manager = session::SessionManager::new(instance, user, &config).await?;
     let memory_db = session_manager.database().clone();
 
+    // Build security context from config
+    let sec = config.security.clone().unwrap_or_default();
+    let leak_policy = match sec.leak_policy.as_deref() {
+        Some("block") => security::LeakPolicy::Block,
+        _ => security::LeakPolicy::Redact,
+    };
+    let leak_detector = security::LeakDetector::new(leak_policy);
+    let network_policy = std::sync::Arc::new(security::NetworkPolicy::new(
+        sec.allowed_endpoints
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| security::network::EndpointPattern {
+                host: e.host,
+                path_prefix: e.path_prefix,
+                methods: e.methods,
+            })
+            .collect(),
+        true, // always deny private IPs
+    ));
+    let auto_approved: std::collections::HashSet<String> = sec
+        .auto_approved_tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let security_ctx = security::SecurityContext {
+        leak_detector,
+        auto_approved_tools: auto_approved,
+        approval_callback: None, // will be set per-request in router
+    };
+
     // Register built-in tools
     let mut tools = tool::ToolRegistry::new();
     tools.register(tools::GetTime);
     tools.register(tools::Calculate);
-    tools.register(tools::ShellExec);
+    tools.register(tools::ShellExec::new(
+        sec.shell_allowlist.clone(),
+        sec.shell_denylist.clone(),
+    ));
     tools.register(tools::ReadFile);
     tools.register(tools::WriteFile);
-    tools.register(tools::WebFetch);
+    tools.register(tools::WebFetch::new(network_policy));
     tools.register(tools::Remember::new(memory_db.clone()));
     tools.register(tools::Recall::new(memory_db));
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
 
     // Spawn the router with session management and tools
-    let router_handle = tokio::spawn(router::run(event_rx, session_manager, tools));
+    let router_handle = tokio::spawn(router::run(event_rx, session_manager, tools, security_ctx));
 
     // Run the selected gateway
     let result = if args.tui {

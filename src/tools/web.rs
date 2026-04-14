@@ -1,10 +1,20 @@
-use crate::tool::Tool;
+use crate::security::NetworkPolicy;
+use crate::tool::{ApprovalRequirement, RiskLevel, Tool};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-/// Fetch a URL and return the response body
-pub struct WebFetch;
+/// Fetch a URL via HTTP. Network policy enforced before requests.
+pub struct WebFetch {
+    network_policy: Arc<NetworkPolicy>,
+}
+
+impl WebFetch {
+    pub fn new(network_policy: Arc<NetworkPolicy>) -> Self {
+        Self { network_policy }
+    }
+}
 
 impl Tool for WebFetch {
     fn name(&self) -> &str {
@@ -36,6 +46,14 @@ impl Tool for WebFetch {
         })
     }
 
+    fn risk_level(&self, _params: &Value) -> RiskLevel {
+        RiskLevel::Medium
+    }
+
+    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
+
     fn execute(
         &self,
         arguments: Value,
@@ -51,6 +69,9 @@ impl Tool for WebFetch {
                 .and_then(|v| v.as_str())
                 .unwrap_or("GET")
                 .to_uppercase();
+
+            // Enforce network policy
+            self.network_policy.check(url, &method)?;
 
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))

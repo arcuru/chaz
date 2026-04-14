@@ -1,6 +1,42 @@
 use serde_json::Value;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
+
+/// Risk level for a tool invocation. Influences logging and approval requirements.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum RiskLevel {
+    /// Safe, read-only, or trivial operations
+    #[default]
+    Low,
+    /// Side effects but generally reversible (file writes, HTTP requests)
+    Medium,
+    /// Potentially dangerous or irreversible (shell execution, system changes)
+    High,
+}
+
+impl fmt::Display for RiskLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RiskLevel::Low => write!(f, "low"),
+            RiskLevel::Medium => write!(f, "medium"),
+            RiskLevel::High => write!(f, "HIGH"),
+        }
+    }
+}
+
+/// Whether a tool invocation requires explicit user approval before execution.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ApprovalRequirement {
+    /// Tool never needs approval
+    #[default]
+    Never,
+    /// Needs approval unless listed in auto_approved_tools config
+    UnlessAutoApproved,
+    /// Always requires explicit user approval
+    Always,
+}
 
 /// A tool that can be invoked by the LLM during a ReAct loop.
 ///
@@ -21,6 +57,35 @@ pub trait Tool: Send + Sync {
         &self,
         arguments: Value,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+
+    /// Risk level for this invocation (may depend on arguments)
+    fn risk_level(&self, _params: &Value) -> RiskLevel {
+        RiskLevel::Low
+    }
+
+    /// Whether this invocation requires user approval
+    fn requires_approval(&self, _params: &Value) -> ApprovalRequirement {
+        ApprovalRequirement::Never
+    }
+
+    /// Maximum execution time before the tool is killed
+    fn execution_timeout(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+
+    /// Parameter names whose values should be redacted in logs and LLM context
+    fn sensitive_params(&self) -> &[&str] {
+        &[]
+    }
+}
+
+/// Information about a tool call presented to the user for approval.
+#[derive(Clone, Debug)]
+pub struct ToolApprovalInfo {
+    pub name: String,
+    /// Redacted display version of the arguments
+    pub arguments_display: String,
+    pub risk_level: RiskLevel,
 }
 
 /// Serializable tool definition for sending to the LLM

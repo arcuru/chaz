@@ -286,6 +286,7 @@ impl Gateway for MatrixGateway {
                                 backend,
                                 response_tx,
                                 backfill_history,
+                                approval_tx: None, // Matrix approval UX deferred
                             })
                             .await
                             .is_err()

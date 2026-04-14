@@ -4,6 +4,7 @@ pub mod tui;
 use crate::backends::BackendManager;
 use crate::role::RoleDetails;
 use crate::session::SessionMessage;
+use crate::tool::ToolApprovalInfo;
 use tokio::sync::{mpsc, oneshot};
 
 /// Trait for transport gateways (Matrix, TUI, etc.)
@@ -35,6 +36,9 @@ pub struct ChatRequest {
     pub response_tx: oneshot::Sender<ChatResponse>,
     /// Room history for backfilling sessions (provided on first message per room)
     pub backfill_history: Option<Vec<SessionMessage>>,
+    /// Channel for the runtime to request tool approval from the gateway.
+    /// The gateway reads approval requests and sends back decisions.
+    pub approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
 }
 
 /// Response from the agent runtime
@@ -48,4 +52,19 @@ pub enum ChatResponse {
     },
     /// Message was added to session but no LLM response generated (batched with later messages)
     Skipped,
+}
+
+/// An approval exchange: the runtime sends tool info and a channel to receive the decision.
+pub struct ApprovalExchange {
+    pub info: ToolApprovalInfo,
+    pub decision_tx: oneshot::Sender<ApprovalDecision>,
+}
+
+/// User's decision on a tool approval request
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+    /// Approve this and all remaining tool calls this turn
+    ApproveAll,
 }

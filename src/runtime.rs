@@ -4,12 +4,20 @@
 //! If tools are available and the backend supports them, it runs a
 //! ReAct loop (Reason → Act → Observe → repeat). Otherwise it falls
 //! back to a single-shot LLM call.
+//!
+//! Security controls (Phase 3.8):
+//! - Tool calls are checked against approval requirements before execution
+//! - Tool outputs are scanned for secret leaks before entering the conversation
+//! - Tool execution is wrapped in a timeout
+//! - Content from tool outputs is scanned for injection patterns (warning-only)
 
 use crate::backends::{BackendManager, ChatContext};
-use crate::tool::FilteredTools;
+use crate::gateway::ApprovalDecision;
+use crate::security::{Sanitizer, SecurityContext};
+use crate::tool::{FilteredTools, ToolApprovalInfo};
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 const MAX_TOOL_ITERATIONS: usize = 10;
 
@@ -57,6 +65,7 @@ pub async fn execute(
     context: &ChatContext,
     backend: &BackendManager,
     tools: &FilteredTools<'_>,
+    security: &SecurityContext,
 ) -> Result<String, String> {
     // Fast path: no tools or backend doesn't support them → single-shot
     if tools.is_empty() || !backend.supports_tools(context) {
@@ -66,6 +75,7 @@ pub async fn execute(
     let tool_defs = tools.definitions();
     let model = backend.resolve_model(context);
     let mut messages = context_to_messages(context);
+    let mut approve_all = false; // tracks if user chose "approve all" this turn
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let response = match backend
@@ -114,22 +124,84 @@ pub async fn execute(
                     tool_calls: tool_calls.clone(),
                 });
 
-                // Execute each tool and record results
+                // Execute each tool with security checks
                 for call in &tool_calls {
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
                             let args: serde_json::Value =
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
-                            match tool.execute(args).await {
-                                Ok(output) => {
+
+                            // --- Security: approval gate ---
+                            let approval_req = tool.requires_approval(&args);
+                            if !approve_all && security.needs_approval(&call.name, &approval_req) {
+                                let risk = tool.risk_level(&args);
+                                let info = ToolApprovalInfo {
+                                    name: call.name.clone(),
+                                    arguments_display: redact_sensitive_params(
+                                        &call.arguments,
+                                        tool.sensitive_params(),
+                                    ),
+                                    risk_level: risk,
+                                };
+
+                                let decision = security.request_approval(info).await;
+                                match decision {
+                                    ApprovalDecision::Approve => {} // proceed
+                                    ApprovalDecision::ApproveAll => {
+                                        approve_all = true; // skip approval for rest of turn
+                                    }
+                                    ApprovalDecision::Deny => {
+                                        "Tool execution denied by user".to_string();
+                                        messages.push(RuntimeMessage::ToolResult {
+                                            call_id: call.id.clone(),
+                                            content: "Tool execution denied by user".to_string(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // --- Security: execute with timeout ---
+                            let timeout = tool.execution_timeout();
+                            let exec_result =
+                                tokio::time::timeout(timeout, tool.execute(args)).await;
+
+                            match exec_result {
+                                Ok(Ok(output)) => {
                                     info!(
                                         "Tool {} returned: {}",
                                         call.name,
                                         &output[..output.len().min(100)]
                                     );
-                                    output
+
+                                    // --- Security: scan for injection patterns (warning-only) ---
+                                    let warnings = Sanitizer::scan(&output);
+                                    if !warnings.is_empty() {
+                                        warn!(
+                                            tool = %call.name,
+                                            count = warnings.len(),
+                                            "Prompt injection patterns detected in tool output"
+                                        );
+                                    }
+
+                                    // --- Security: leak detection ---
+                                    match security.leak_detector.scan(&output) {
+                                        Ok(scanned) => scanned,
+                                        Err(e) => {
+                                            warn!(tool = %call.name, "Tool output blocked by leak detector");
+                                            format!("Tool output blocked: {e}")
+                                        }
+                                    }
                                 }
-                                Err(e) => format!("Tool error: {e}"),
+                                Ok(Err(e)) => format!("Tool error: {e}"),
+                                Err(_) => {
+                                    warn!(
+                                        tool = %call.name,
+                                        timeout_secs = timeout.as_secs(),
+                                        "Tool execution timed out"
+                                    );
+                                    format!("Tool timed out after {} seconds", timeout.as_secs())
+                                }
                             }
                         }
                         None => format!("Unknown tool: {}", call.name),
@@ -168,6 +240,29 @@ pub async fn execute(
             }
             Err("Agent reached maximum tool iterations without a final response".to_string())
         }
+    }
+}
+
+/// Redact sensitive parameter values from a JSON arguments string for display.
+fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
+    if sensitive.is_empty() {
+        return arguments_json.to_string();
+    }
+
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(arguments_json) {
+        if let Some(obj) = value.as_object_mut() {
+            for key in sensitive {
+                if obj.contains_key(*key) {
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String("[REDACTED]".to_string()),
+                    );
+                }
+            }
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| arguments_json.to_string())
+    } else {
+        arguments_json.to_string()
     }
 }
 
