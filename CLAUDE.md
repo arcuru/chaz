@@ -75,16 +75,15 @@ defaults.rs          Built-in default config and roles
 
 ### Key patterns
 
-- **Gateway trait**: Both MatrixGateway and TuiGateway implement `Gateway` trait with `run()` method
-- **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
-- **Callback-driven server**: Gateways write SessionEntries to session DBs. Eidetica on_local_write callbacks fire, notifying the server processing loop. Server checks latest entry — if user message, spawns agent task; if agent response, delivers to transport. Global Semaphore(10) caps concurrent LLM calls.
+- **Gateway = bridge**: Gateways translate platform events ↔ session DB entries. Each registers its own on_local_write callback to detect agent responses and deliver to its transport. Server is transport-agnostic.
+- **Callback-driven server**: Server registers on_local_write callbacks on session DBs. Callback fires → notify channel → processing loop checks latest entry → if non-agent Message, spawns agent task. Agent writes response entry → gateway callback detects it → delivers to transport. No mpsc in the message flow. Global Semaphore(10) caps concurrent LLM calls.
 - **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
 - **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
-- **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
-- **Security context**: Built from SecurityConfig, threaded through router to runtime per-request. Contains leak detector, auto-approved tool set, and approval channel from gateway.
+- **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
+- **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
 - **Tool approval flow**: Tools declare risk level and approval requirement. Runtime checks SecurityContext, sends ApprovalExchange to gateway via mpsc channel, gateway prompts user (TUI: stdin, Matrix: deferred). Approval decisions: Approve/Deny/ApproveAll.
 - **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
 - **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
