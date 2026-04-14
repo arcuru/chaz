@@ -162,6 +162,8 @@ pub struct SessionManager {
     sessions: HashMap<ConversationId, Session>,
     /// Maps transport_id → ConversationId. Enables multiple gateways to share a conversation.
     bindings: HashMap<String, ConversationId>,
+    /// Maps ConversationId → agent definition name for per-conversation agent selection.
+    agent_bindings: HashMap<ConversationId, String>,
     pub agents: AgentRegistry,
 }
 
@@ -189,6 +191,7 @@ impl SessionManager {
             database,
             sessions: HashMap::new(),
             bindings: HashMap::new(),
+            agent_bindings: HashMap::new(),
             agents,
         })
     }

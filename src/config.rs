@@ -1,5 +1,6 @@
 use crate::role::RoleDetails;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Configuration for the chaz bot
 #[derive(Debug, Deserialize, Clone)]
@@ -45,6 +46,30 @@ pub struct AgentConfig {
     pub model: Option<String>,
     /// List of tool names this agent is allowed to use (None = all tools)
     pub tools: Option<Vec<String>>,
+    /// Which agent definitions this agent can spawn
+    pub can_spawn: Option<Vec<String>>,
+    /// Which agents are allowed to spawn this one (None/empty = any with can_spawn permission)
+    pub allowed_callers: Option<Vec<String>>,
+    /// Maximum ReAct loop iterations (default: 10)
+    pub max_iterations: Option<u32>,
+    /// Whether this agent can run without user input (scheduled/heartbeat)
+    #[serde(default)]
+    pub autonomous: bool,
+    /// Named override bundles for spawn-time configuration
+    pub presets: Option<HashMap<String, AgentPreset>>,
+}
+
+/// A named bundle of overrides that can be selected at spawn time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AgentPreset {
+    /// Override the model
+    pub model: Option<String>,
+    /// Override max iterations
+    pub max_iterations: Option<u32>,
+    /// Restrict tools (must be subset of agent definition's tools)
+    pub tools: Option<Vec<String>>,
+    /// Appended to the base system prompt
+    pub role_suffix: Option<String>,
 }
 
 /// Configuration info for a backend
