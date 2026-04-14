@@ -27,6 +27,8 @@ pub struct ChatRequest {
     pub transport_id: String,
     pub sender: String,
     pub body: String,
+    /// Optional agent override from gateway (e.g., Matrix room tags `is.chaz.agent`)
+    pub agent_override: Option<String>,
     /// Optional model override from gateway (e.g., Matrix room tags)
     pub model_override: Option<String>,
     /// Optional role override from gateway (e.g., Matrix room tags)

@@ -48,14 +48,18 @@ pub async fn run(
             for (i, request) in requests.into_iter().enumerate() {
                 let is_last = i == last_idx;
 
-                // Select agent
-                let agent = sessions.agents.default_agent();
+                // Resolve transport ID to a conversation
+                let conversation_id = sessions.resolve_conversation(&request.transport_id);
+
+                // Select agent: explicit override > conversation binding > default
+                let agent = sessions.resolve_agent(
+                    &conversation_id,
+                    request.agent_override.as_deref(),
+                );
                 let default_role = agent.default_role.clone();
                 let default_model = agent.default_model.clone();
                 let allowed_tools = agent.allowed_tools.clone();
-
-                // Resolve transport ID to a conversation
-                let conversation_id = sessions.resolve_conversation(&request.transport_id);
+                let agent_name = agent.name.clone();
                 let session = sessions.get_or_create(&conversation_id).await;
 
                 // Backfill from gateway history if provided
@@ -107,7 +111,7 @@ pub async fn run(
                             .add_message(SessionMessage {
                                 role: "assistant".into(),
                                 content: body.clone(),
-                                sender: "chaz".into(),
+                                sender: agent_name.clone(),
                                 timestamp: Utc::now(),
                             })
                             .await;

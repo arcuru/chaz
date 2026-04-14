@@ -1,4 +1,4 @@
-use crate::agent::AgentRegistry;
+use crate::agent::{Agent, AgentRegistry};
 use crate::backends::{ChatContext, Message};
 use crate::config::Config;
 use crate::role::RoleDetails;
@@ -224,5 +224,29 @@ impl SessionManager {
             self.sessions.insert(id.clone(), session);
         }
         self.sessions.get_mut(id).unwrap()
+    }
+
+    /// Bind a conversation to a specific agent definition.
+    pub fn set_agent_binding(&mut self, id: &ConversationId, agent_name: String) {
+        self.agent_bindings.insert(id.clone(), agent_name);
+    }
+
+    /// Get the agent name bound to a conversation, if any.
+    pub fn get_agent_binding(&self, id: &ConversationId) -> Option<&str> {
+        self.agent_bindings.get(id).map(|s| s.as_str())
+    }
+
+    /// Resolve which agent should handle a conversation.
+    /// Priority: explicit override > conversation binding > default agent.
+    pub fn resolve_agent(&self, conversation_id: &ConversationId, override_name: Option<&str>) -> &Agent {
+        let name = override_name
+            .or_else(|| self.get_agent_binding(conversation_id));
+
+        if let Some(name) = name {
+            if let Some(agent) = self.agents.get(name) {
+                return agent;
+            }
+        }
+        self.agents.default_agent()
     }
 }

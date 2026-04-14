@@ -251,7 +251,11 @@ impl Gateway for MatrixGateway {
                     }
 
                     {
-                        // Read model/role overrides from room tags
+                        // Read agent/model/role overrides from room tags
+                        let agent_override = {
+                            let tags = Tags::new(&room, "is.chaz.agent").await;
+                            tags.get_value("default")
+                        };
                         let model_override = {
                             let tags = Tags::new(&room, "is.chaz.model").await;
                             tags.get_value("default")
@@ -301,6 +305,7 @@ impl Gateway for MatrixGateway {
                                 transport_id: room_id,
                                 sender: sender.to_string(),
                                 body,
+                                agent_override,
                                 model_override,
                                 role_override,
                                 backend,

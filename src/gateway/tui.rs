@@ -62,6 +62,7 @@ impl Gateway for TuiGateway {
                     transport_id: transport_id.clone(),
                     sender: "user".to_string(),
                     body: line,
+                    agent_override: None,
                     model_override: None,
                     role_override: role_override.clone(),
                     backend,
