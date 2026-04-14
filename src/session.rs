@@ -204,6 +204,11 @@ impl Session {
         self.entries.len()
     }
 
+    /// Get the most recent entry, if any
+    pub fn latest_entry(&self) -> Option<&SessionEntry> {
+        self.entries.last()
+    }
+
     /// Get the underlying eidetica Database handle (for sharing with tools)
     pub fn database(&self) -> &Database {
         &self.database

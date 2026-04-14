@@ -1,12 +1,13 @@
 use crate::backends::BackendManager;
 use crate::config::Config;
-use crate::defaults::DEFAULT_CONFIG;
-use crate::gateway::{ApprovalDecision, ApprovalExchange, ChatRequest, ChatResponse, Gateway};
-use crate::role::get_role;
+use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use crate::security::SecretStore;
+use crate::server::Server;
+use crate::session::{EntryType, SessionEntry};
 
 use std::io::{self, Write};
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub struct TuiGateway {
     config: Config,
@@ -20,17 +21,35 @@ impl TuiGateway {
 }
 
 impl Gateway for TuiGateway {
-    async fn run(self, event_tx: mpsc::Sender<ChatRequest>) -> anyhow::Result<()> {
+    async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let transport_id = "tui".to_string();
 
-        // Resolve role from config (no transport-specific overrides for TUI)
-        let role_override = get_role(
-            self.config.role.clone(),
-            self.config.roles.clone(),
-            DEFAULT_CONFIG.roles.clone(),
-        );
-
         println!("Chaz TUI \u{2014} type /quit to exit\n");
+
+        // Create approval channel
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalExchange>(8);
+
+        // Get or create session DB
+        let (_conv_id, session_db) = server
+            .registry()
+            .get_or_create_session_db(&transport_id)
+            .await?;
+
+        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+
+        // Register session with server
+        server
+            .register_session(
+                &transport_id,
+                &session_db,
+                backend.clone(),
+                None,
+                Some(approval_tx.clone()),
+            )
+            .await?;
+
+        // Take the response receiver
+        let mut response_rx = server.take_response_rx().await;
 
         loop {
             print!("> ");
@@ -51,56 +70,37 @@ impl Gateway for TuiGateway {
                 break;
             }
 
-            let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
-
-            // Create approval channel for this request
-            let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalExchange>(8);
-
-            let (response_tx, response_rx) = oneshot::channel();
-            event_tx
-                .send(ChatRequest {
-                    transport_id: transport_id.clone(),
+            // Write user entry to session DB — triggers server callback
+            let mut session = crate::session::Session::new(
+                crate::types::ConversationId(transport_id.clone()),
+                session_db.clone(),
+            )
+            .await;
+            session
+                .add_entry(SessionEntry {
                     sender: "user".to_string(),
-                    body: line,
-                    agent_override: None,
-                    model_override: None,
-                    role_override: role_override.clone(),
-                    backend,
-                    response_tx,
-                    backfill_history: None,
-                    approval_tx: Some(approval_tx),
+                    content: line,
+                    timestamp: chrono::Utc::now(),
+                    entry_type: EntryType::Message,
                 })
-                .await?;
+                .await;
 
-            // Handle both approval requests and final response concurrently.
-            // Pin the response future so we can poll it across select iterations.
-            let mut response_fut = Box::pin(response_rx);
+            // Wait for response, handling approval requests concurrently
             let response = loop {
                 tokio::select! {
-                    // Handle approval requests from the runtime
                     Some(exchange) = approval_rx.recv() => {
                         let decision = prompt_approval(&exchange);
                         let _ = exchange.decision_tx.send(decision);
                     }
-                    // Wait for the final response
-                    result = &mut response_fut => {
-                        break result;
+                    Some(delivery) = response_rx.recv() => {
+                        if delivery.transport_id == transport_id {
+                            break delivery;
+                        }
                     }
                 }
             };
 
-            match response {
-                Ok(ChatResponse::Message { body, .. }) => {
-                    println!("\n{}\n", body);
-                }
-                Ok(ChatResponse::Error { error }) => {
-                    eprintln!("\nError: {}\n", error);
-                }
-                Ok(ChatResponse::Skipped) => {}
-                Err(e) => {
-                    eprintln!("\nChannel error: {}\n", e);
-                }
-            }
+            println!("\n{}\n", response.body);
         }
 
         Ok(())

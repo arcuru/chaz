@@ -2,17 +2,18 @@ mod commands;
 mod history;
 
 use crate::config::Config;
-use crate::defaults::DEFAULT_CONFIG;
-use crate::gateway::{ChatRequest, ChatResponse, Gateway};
-use crate::role::{RoleDetails, get_role};
+use crate::gateway::Gateway;
 use crate::security::SecretStore;
+use crate::server::Server;
+use crate::session::{EntryType, SessionEntry};
 
 use headjack::Tags;
 use headjack::*;
+use matrix_sdk::Room as MatrixRoom;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use commands::{get_backend, get_context, rate_limit};
@@ -36,7 +37,7 @@ impl MatrixGateway {
 }
 
 impl Gateway for MatrixGateway {
-    async fn run(self, event_tx: mpsc::Sender<ChatRequest>) -> anyhow::Result<()> {
+    async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let config = Arc::new(self.config);
 
         let mut bot = Bot::new(BotConfig {
@@ -57,8 +58,6 @@ impl Gateway for MatrixGateway {
             error!("Error logging in: {e}");
         }
 
-        // React to invites before initial sync so we join rooms
-        // even if they were invited before the bot was started.
         bot.join_rooms();
 
         if let Err(e) = bot.sync().await {
@@ -67,7 +66,7 @@ impl Gateway for MatrixGateway {
 
         info!("The client is ready! Listening to new messages…");
 
-        // === Register commands (handled directly, not routed through router) ===
+        // === Register commands (handled directly, not routed through server) ===
 
         bot.register_text_command(
             "party",
@@ -211,27 +210,32 @@ impl Gateway for MatrixGateway {
             .await;
         }
 
-        // === Text handler — routes messages through the router ===
+        // === Text handler — writes entries to session DB, server processes via callbacks ===
+
+        // Room handle cache for response delivery
+        let rooms: Arc<Mutex<HashMap<String, MatrixRoom>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         {
-            let tx = event_tx;
             let config = config.clone();
             let counts = message_counts;
             let secrets = self.secrets.clone();
+            let server = server.clone();
+            let rooms = rooms.clone();
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             bot.register_text_handler(move |sender, body: String, room, event| {
-                let tx = tx.clone();
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
                 let seen_events = seen_events.clone();
                 let counts = counts.clone();
                 let secrets = secrets.clone();
+                let server = server.clone();
+                let rooms = rooms.clone();
                 async move {
-                    // Deduplicate events across sync restarts — after a timeout+retry,
-                    // the server may re-deliver recent timeline events.
+                    // Deduplicate events across sync restarts
                     {
                         let mut seen = seen_events.lock().await;
                         if !seen.insert(event.event_id.to_string()) {
@@ -261,109 +265,118 @@ impl Gateway for MatrixGateway {
                         return Ok(());
                     }
 
+                    // Read agent/model/role overrides from room tags
+                    let agent_override = {
+                        let tags = Tags::new(&room, "is.chaz.agent").await;
+                        tags.get_value("default")
+                    };
+
+                    // Strip !chaz prefix if present
+                    let body = if body.starts_with("!chaz") {
+                        body.trim_start_matches("!chaz").trim().to_string()
+                    } else {
+                        body
+                    };
+
+                    let backend = get_backend(&room, &config, &secrets).await;
+                    let room_id = room.room_id().to_string();
+
+                    // Cache room handle for response delivery
+                    rooms.lock().await.insert(room_id.clone(), room.clone());
+
+                    // Get or create session DB
+                    let (_conv_id, session_db) = match server
+                        .registry()
+                        .get_or_create_session_db(&room_id)
+                        .await
                     {
-                        // Read agent/model/role overrides from room tags
-                        let agent_override = {
-                            let tags = Tags::new(&room, "is.chaz.agent").await;
-                            tags.get_value("default")
-                        };
-                        let model_override = {
-                            let tags = Tags::new(&room, "is.chaz.model").await;
-                            tags.get_value("default")
-                        };
-                        let role_override = {
-                            let tags = Tags::new(&room, "is.chaz.role").await;
-                            if let Some(role_name) = tags.get_value("chazdefault") {
-                                if let Some(prompt) = tags.get_value(&role_name) {
-                                    Some(RoleDetails::new(&role_name, None, Some(prompt), None))
-                                } else {
-                                    get_role(
-                                        Some(role_name),
-                                        config.roles.clone(),
-                                        DEFAULT_CONFIG.roles.clone(),
-                                    )
-                                }
-                            } else {
-                                None
-                            }
-                        };
-
-                        // Strip !chaz prefix if present (it's just a trigger, not part of the message)
-                        let body = if body.starts_with("!chaz") {
-                            body.trim_start_matches("!chaz").trim().to_string()
-                        } else {
-                            body
-                        };
-
-                        let backend = get_backend(&room, &config, &secrets).await;
-                        let (response_tx, response_rx) = oneshot::channel();
-
-                        // Backfill room history on first message per room
-                        let room_id = room.room_id().to_string();
-                        let backfill_history = {
-                            let mut rooms = backfilled_rooms.lock().await;
-                            if rooms.insert(room_id.clone()) {
-                                // First time seeing this room — read history
-                                info!("Backfilling history for room {}", room_id);
-                                Some(read_room_history(&room).await)
-                            } else {
-                                None
-                            }
-                        };
-
-                        if tx
-                            .send(ChatRequest {
-                                transport_id: room_id,
-                                sender: sender.to_string(),
-                                body,
-                                agent_override,
-                                model_override,
-                                role_override,
-                                backend,
-                                response_tx,
-                                backfill_history,
-                                approval_tx: None, // Matrix approval UX deferred
-                            })
-                            .await
-                            .is_err()
-                        {
-                            error!("Router channel closed");
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Failed to get session DB: {e}");
                             return Ok(());
                         }
+                    };
 
-                        match response_rx.await {
-                            Ok(ChatResponse::Message { body, is_markdown }) => {
-                                info!("Response: {}", body.replace('\n', " "));
-                                if is_markdown {
-                                    room.send(RoomMessageEventContent::text_markdown(body))
-                                        .await
-                                        .unwrap();
-                                } else {
-                                    room.send(RoomMessageEventContent::notice_plain(body))
-                                        .await
-                                        .unwrap();
-                                }
-                            }
-                            Ok(ChatResponse::Error { error }) => {
-                                let err = format!("!chaz Error: {}", error.replace('\n', " "));
-                                tracing::error!("{}", err);
-                                room.send(RoomMessageEventContent::notice_plain(err))
-                                    .await
-                                    .unwrap();
-                            }
-                            Ok(ChatResponse::Skipped) => {
-                                // Message was batched with a later message — no response needed
-                            }
-                            Err(_) => error!("Router dropped response channel"),
+                    // Register with server (ensures callback is set up)
+                    if let Err(e) = server
+                        .register_session(
+                            &room_id,
+                            &session_db,
+                            backend,
+                            agent_override,
+                            None, // Matrix approval UX deferred
+                        )
+                        .await
+                    {
+                        error!("Failed to register session: {e}");
+                        return Ok(());
+                    }
+
+                    // Backfill room history on first message per room
+                    {
+                        let mut backfilled = backfilled_rooms.lock().await;
+                        if backfilled.insert(room_id.clone()) {
+                            info!("Backfilling history for room {}", room_id);
+                            let history = read_room_history(&room).await;
+                            let mut session = crate::session::Session::new(
+                                crate::types::ConversationId(room_id.clone()),
+                                session_db.clone(),
+                            )
+                            .await;
+                            session.backfill(history).await;
                         }
                     }
+
+                    // Write user entry to session DB — this triggers the callback
+                    // which causes the server to run the agent
+                    let mut session = crate::session::Session::new(
+                        crate::types::ConversationId(room_id.clone()),
+                        session_db,
+                    )
+                    .await;
+                    session
+                        .add_entry(SessionEntry {
+                            sender: sender.to_string(),
+                            content: body,
+                            timestamp: chrono::Utc::now(),
+                            entry_type: EntryType::Message,
+                        })
+                        .await;
+
+                    // Response delivery happens asynchronously via the response channel
                     Ok(())
                 }
             });
         }
 
-        // Headjack's run() doesn't retry on transient sync errors (timeouts,
-        // network blips, server errors). Wrap in a retry loop so the bot stays alive.
+        // === Response delivery task — reads agent responses and sends to Matrix rooms ===
+
+        let response_rooms = rooms;
+        tokio::spawn(async move {
+            let mut response_rx = server.take_response_rx().await;
+            while let Some(delivery) = response_rx.recv().await {
+                let rooms = response_rooms.lock().await;
+                if let Some(room) = rooms.get(&delivery.transport_id) {
+                    info!("Response: {}", delivery.body.replace('\n', " "));
+                    if delivery.is_markdown {
+                        room.send(RoomMessageEventContent::text_markdown(&delivery.body))
+                            .await
+                            .unwrap();
+                    } else {
+                        room.send(RoomMessageEventContent::notice_plain(&delivery.body))
+                            .await
+                            .unwrap();
+                    }
+                } else {
+                    error!(
+                        "No room handle for transport_id {}",
+                        delivery.transport_id
+                    );
+                }
+            }
+        });
+
+        // Retry loop for transient sync errors
         loop {
             match bot.run().await {
                 Ok(()) => return Ok(()),

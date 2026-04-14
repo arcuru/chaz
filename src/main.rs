@@ -5,9 +5,9 @@ mod defaults;
 mod gateway;
 mod openai;
 mod role;
-mod router;
 mod runtime;
 mod security;
+pub mod server;
 mod session;
 mod tool;
 mod tools;
@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let security_ctx = security::SecurityContext {
         leak_detector,
         auto_approved_tools: auto_approved,
-        approval_callback: None, // will be set per-request in router
+        approval_callback: None, // set per-session by server
     };
 
     // Register built-in tools
@@ -138,30 +138,21 @@ async fn main() -> anyhow::Result<()> {
     let tools = std::sync::Arc::new(tools);
     let registry = std::sync::Arc::new(registry);
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
-
-    // Spawn the router
-    let router_handle = tokio::spawn(router::run(
-        event_rx,
-        registry,
-        tools,
-        agent_registry,
-        security_ctx,
-    ));
+    // Create the callback-driven server
+    let server = server::Server::new(registry, agent_registry, tools, security_ctx);
 
     // Run the selected gateway
     let result = if args.tui {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store);
-        gateway.run(event_tx).await
+        gateway.run(server).await
     } else {
         let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
-        gateway.run(event_tx).await
+        gateway.run(server).await
     };
 
     if let Err(e) = result {
         error!("Gateway error: {e}");
     }
 
-    router_handle.abort();
     Ok(())
 }
