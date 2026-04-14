@@ -75,6 +75,14 @@ impl Tool for SpawnAgent {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
+            // Depth limiting
+            if ctx.call_depth >= ctx.max_call_depth {
+                return Err(format!(
+                    "Maximum spawn depth ({}) reached. Cannot spawn further agents.",
+                    ctx.max_call_depth
+                ));
+            }
+
             let agent_name = arguments
                 .get("agent")
                 .and_then(|v| v.as_str())

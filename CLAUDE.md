@@ -32,11 +32,12 @@ No unit tests yet — `cargo test` passes with no meaningful coverage. Build dep
 main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
 config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
-agent.rs             Agent, AgentRegistry (YAML-configurable, per-agent tool visibility)
-session.rs           SessionManager + Session (eidetica SQLite, transport_id binding registry)
-tool.rs              Tool trait (with security methods), ToolRegistry, FilteredTools, RiskLevel, ApprovalRequirement
+agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
+session.rs           SessionManager + Session (eidetica SQLite, transport_id + agent binding registries)
+tool.rs              Tool trait (with ToolContext), ToolRegistry, FilteredTools, RiskLevel, ApprovalRequirement
 tools/
   mod.rs             Re-exports all tools
+  agent.rs           spawn_agent — delegate to another agent in a fresh session (Medium risk)
   time.rs            get_time — current UTC time (Low risk)
   calculate.rs       calculate — math expressions (Low risk)
   shell.rs           shell — execute commands (High risk, approval required, command allow/denylist)
@@ -49,8 +50,8 @@ security/
   leak_detector.rs   LeakDetector — 12 secret patterns, redact/block policy
   network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
   sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
-runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings
-router.rs            Resolves transport_id → conversation, threads security context to runtime
+runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings; receives ToolContext
+router.rs            Resolves transport_id → conversation, selects agent per-conversation, builds ToolContext
 gateway/
   mod.rs             Gateway trait, ChatRequest/ChatResponse, ApprovalExchange/ApprovalDecision
   matrix/
