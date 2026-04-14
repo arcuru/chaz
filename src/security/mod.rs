@@ -1,10 +1,12 @@
 pub mod leak_detector;
 pub mod network;
 pub mod sanitizer;
+pub mod secrets;
 
 pub use leak_detector::{LeakDetector, LeakPolicy};
 pub use network::NetworkPolicy;
 pub use sanitizer::Sanitizer;
+pub use secrets::SecretStore;
 
 use crate::gateway::{ApprovalDecision, ApprovalExchange};
 use crate::tool::{ApprovalRequirement, ToolApprovalInfo};

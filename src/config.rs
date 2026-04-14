@@ -56,8 +56,12 @@ pub struct Backend {
     pub backend_type: BackendType,
     /// The base URL for the API
     pub api_base: Option<String>,
-    /// The API key to use for the API
+    /// The API key from config (extracted into SecretStore at startup, then cleared).
+    /// Supports env var references: `"${VAR_NAME}"` or `"$VAR_NAME"`.
     pub api_key: Option<String>,
+    /// Opaque reference ID into SecretStore (set after api_key is extracted)
+    #[serde(skip)]
+    pub api_key_ref: Option<String>,
     /// Available models for this backend
     pub models: Option<Vec<Model>>,
     /// Name of this backend
@@ -73,10 +77,16 @@ impl Backend {
             backend_type,
             api_base: None,
             api_key: None,
+            api_key_ref: None,
             models: None,
             name: None,
             config_dir: None,
         }
+    }
+
+    /// Generate a SecretStore reference key for this backend's API key.
+    pub fn secret_key(&self) -> String {
+        format!("backend:{}", self.get_name())
     }
 
     /// Get the name for this backend

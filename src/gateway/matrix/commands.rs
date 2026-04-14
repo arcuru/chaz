@@ -2,6 +2,7 @@ use crate::backends::{BackendManager, ChatContext, Message};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::role::{RoleDetails, get_role, get_role_names};
+use crate::security::SecretStore;
 
 use headjack::Tags;
 use headjack::*;
@@ -63,9 +64,15 @@ pub async fn rate_limit(
 }
 
 /// List the available models
-pub async fn list_models(_: OwnedUserId, _: String, room: Room, config: &Config) -> Result<(), ()> {
-    let context = get_context(&room, config).await.unwrap();
-    let backends = get_backend(&room, config).await;
+pub async fn list_models(
+    _: OwnedUserId,
+    _: String,
+    room: Room,
+    config: &Config,
+    secrets: &SecretStore,
+) -> Result<(), ()> {
+    let context = get_context(&room, config, secrets).await.unwrap();
+    let backends = get_backend(&room, config, secrets).await;
     let response = format!(
         "!chaz Current Model: {}\n\nKnown Backends:\n{}\n\nKnown Models:\n{}",
         context
@@ -81,7 +88,13 @@ pub async fn list_models(_: OwnedUserId, _: String, room: Room, config: &Config)
 }
 
 /// Control the roles
-pub async fn set_role(_: OwnedUserId, text: String, room: Room, config: &Config) -> Result<(), ()> {
+pub async fn set_role(
+    _: OwnedUserId,
+    text: String,
+    room: Room,
+    config: &Config,
+    secrets: &SecretStore,
+) -> Result<(), ()> {
     let mut words = text.split_whitespace().skip(2);
     let mut tags = Tags::new(&room, "is.chaz.role").await;
     if let Some(name) = words.next() {
@@ -98,7 +111,7 @@ pub async fn set_role(_: OwnedUserId, text: String, room: Room, config: &Config)
         .await
         .unwrap();
     } else {
-        let context = get_context(&room, config);
+        let context = get_context(&room, config, secrets);
         let mut room_roles = Vec::new();
         for tag in tags.tags() {
             let role = tag.split('=').next().unwrap();
@@ -150,6 +163,7 @@ pub async fn send(
     room: matrix_sdk::Room,
     config: &Config,
     message_counts: &Mutex<HashMap<String, u64>>,
+    secrets: &SecretStore,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
@@ -160,7 +174,7 @@ pub async fn send(
         .collect::<Vec<&str>>()
         .join(" ");
 
-    let context = get_context(&room, config).await.unwrap();
+    let context = get_context(&room, config, secrets).await.unwrap();
     let no_context = ChatContext {
         messages: vec![Message::new(MessageRole::user, input.to_string())],
         model: context.model,
@@ -172,7 +186,11 @@ pub async fn send(
         sender.as_str(),
         input.replace('\n', " ")
     );
-    if let Ok(result) = get_backend(&room, config).await.execute(&no_context).await {
+    if let Ok(result) = get_backend(&room, config, secrets)
+        .await
+        .execute(&no_context)
+        .await
+    {
         info!(
             "Response: {} - {}",
             sender.as_str(),
@@ -213,10 +231,15 @@ pub async fn set_backend(_: OwnedUserId, text: String, room: Room) -> Result<(),
 }
 
 /// Set the model to use for this chat
-pub async fn set_model(sender: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
+pub async fn set_model(
+    sender: OwnedUserId,
+    text: String,
+    room: Room,
+    secrets: &SecretStore,
+) -> Result<(), ()> {
     let model = text.split_whitespace().nth(2);
     if let Some(model) = model {
-        let backend = get_backend_default(&room).await;
+        let backend = get_backend_default(&room, secrets).await;
         if backend.is_known_model(model) {
             let response = format!("!chaz Model set to \"{}\"", model);
             room.send(RoomMessageEventContent::notice_plain(response))
@@ -240,14 +263,19 @@ pub async fn set_model(sender: OwnedUserId, text: String, room: Room) -> Result<
         tags.replace_kv("default", model);
         tags.sync().await;
     } else {
-        list_models_default(sender, text, room).await?;
+        list_models_default(sender, text, room, secrets).await?;
     }
     Ok(())
 }
 
 /// List models fallback for set_model (no config available in old-style command handler)
-async fn list_models_default(_: OwnedUserId, _: String, room: Room) -> Result<(), ()> {
-    let backends = get_backend_default(&room).await;
+async fn list_models_default(
+    _: OwnedUserId,
+    _: String,
+    room: Room,
+    secrets: &SecretStore,
+) -> Result<(), ()> {
+    let backends = get_backend_default(&room, secrets).await;
     let response = format!(
         "!chaz Known Backends:\n{}\n\nKnown Models:\n{}",
         backends.list_known_backends().join("\n"),
@@ -265,11 +293,12 @@ pub async fn rename(
     room: Room,
     config: &Config,
     message_counts: &Mutex<HashMap<String, u64>>,
+    secrets: &SecretStore,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
     }
-    if let Ok(context) = get_context(&room, config).await {
+    if let Ok(context) = get_context(&room, config, secrets).await {
         let mut context = context;
         context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
@@ -283,7 +312,10 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config).await.execute(&context).await;
+        let response = get_backend(&room, config, secrets)
+            .await
+            .execute(&context)
+            .await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -314,7 +346,10 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config).await.execute(&context).await;
+        let response = get_backend(&room, config, secrets)
+            .await
+            .execute(&context)
+            .await;
         if let Ok(result) = response {
             info!(
                 "Response: {} - {}",
@@ -335,18 +370,25 @@ pub async fn rename(
 }
 
 /// Get the backend defined in the room tags.
-async fn get_tag_backend(room: &Room) -> Option<Vec<Backend>> {
+/// Extracts API keys from tags into the SecretStore, keeping them out of Backend structs.
+async fn get_tag_backend(room: &Room, secrets: &SecretStore) -> Option<Vec<Backend>> {
     let mut backends = Vec::new();
     let tags = Tags::new(room, "is.chaz.backend").await;
     let default_backend = tags.get_value("chazdefault");
+    let room_id = room.room_id().as_str();
     for tag in tags.tags() {
         if tag.split('.').nth(1).is_some_and(|x| x.starts_with("url")) {
             let name = tag.split('.').next().unwrap_or_default();
             let mut backend = Backend::new(BackendType::OpenAICompatible);
             backend.name = Some(name.to_string());
             backend.api_base = tags.get_value(&format!("{}.url", name));
-            backend.api_key = tags.get_value(&format!("{}.token", name));
-            if backend.api_base.is_some() && backend.api_key.is_some() {
+            // Extract API key into SecretStore instead of keeping on Backend struct
+            if let Some(key) = tags.get_value(&format!("{}.token", name)) {
+                let ref_id = format!("room:{room_id}:{name}");
+                secrets.insert(ref_id.clone(), key);
+                backend.api_key_ref = Some(ref_id);
+            }
+            if backend.api_base.is_some() && backend.api_key_ref.is_some() {
                 backends.push(backend);
             }
         }
@@ -363,31 +405,31 @@ async fn get_tag_backend(room: &Room) -> Option<Vec<Backend>> {
 }
 
 /// Returns the backend based on the config
-pub async fn get_backend(room: &Room, config: &Config) -> BackendManager {
+pub async fn get_backend(room: &Room, config: &Config, secrets: &SecretStore) -> BackendManager {
     let mut backends = Vec::new();
-    if let Some(tag_backends) = get_tag_backend(room).await {
+    if let Some(tag_backends) = get_tag_backend(room, secrets).await {
         backends = tag_backends;
     }
     if let Some(config_backends) = &config.backends {
         backends.extend(config_backends.clone());
     }
     if backends.is_empty() {
-        BackendManager::new(&None)
+        BackendManager::new(&None, secrets.clone())
     } else {
-        BackendManager::new(&Some(backends))
+        BackendManager::new(&Some(backends), secrets.clone())
     }
 }
 
 /// Returns the backend from room tags only (for commands without config access)
-async fn get_backend_default(room: &Room) -> BackendManager {
+async fn get_backend_default(room: &Room, secrets: &SecretStore) -> BackendManager {
     let mut backends = Vec::new();
-    if let Some(tag_backends) = get_tag_backend(room).await {
+    if let Some(tag_backends) = get_tag_backend(room, secrets).await {
         backends = tag_backends;
     }
     if backends.is_empty() {
-        BackendManager::new(&None)
+        BackendManager::new(&None, secrets.clone())
     } else {
-        BackendManager::new(&Some(backends))
+        BackendManager::new(&Some(backends), secrets.clone())
     }
 }
 
@@ -409,7 +451,11 @@ fn clean_summary_response(response: &str, max_length: Option<usize>) -> String {
 
 /// Gets the context of the current conversation from Matrix room history.
 /// Used by legacy commands (print, send, rename, role, list) that bypass the router.
-pub async fn get_context(room: &Room, config: &Config) -> Result<ChatContext, ()> {
+pub async fn get_context(
+    room: &Room,
+    config: &Config,
+    secrets: &SecretStore,
+) -> Result<ChatContext, ()> {
     let mut context = ChatContext {
         messages: Vec::new(),
         model: None,
@@ -441,7 +487,7 @@ pub async fn get_context(room: &Room, config: &Config) -> Result<ChatContext, ()
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {
                             let model = text_content.body.split_whitespace().nth(2);
                             if let Some(model) = model {
-                                if get_backend(room, config)
+                                if get_backend(room, config, secrets)
                                     .await
                                     .validate_model(model)
                                     .is_ok()

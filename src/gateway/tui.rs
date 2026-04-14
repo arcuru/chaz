@@ -3,17 +3,19 @@ use crate::config::Config;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, ChatRequest, ChatResponse, Gateway};
 use crate::role::get_role;
+use crate::security::SecretStore;
 
 use std::io::{self, Write};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct TuiGateway {
     config: Config,
+    secrets: SecretStore,
 }
 
 impl TuiGateway {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config, secrets: SecretStore) -> Self {
+        Self { config, secrets }
     }
 }
 
@@ -49,7 +51,7 @@ impl Gateway for TuiGateway {
                 break;
             }
 
-            let backend = BackendManager::new(&self.config.backends);
+            let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
             // Create approval channel for this request
             let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalExchange>(8);

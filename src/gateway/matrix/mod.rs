@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::gateway::{ChatRequest, ChatResponse, Gateway};
 use crate::role::{RoleDetails, get_role};
+use crate::security::SecretStore;
 
 use headjack::Tags;
 use headjack::*;
@@ -19,17 +20,18 @@ use history::read_room_history;
 
 pub struct MatrixGateway {
     config: Config,
+    secrets: SecretStore,
 }
 
 impl MatrixGateway {
-    pub fn new(config: Config) -> anyhow::Result<Self> {
+    pub fn new(config: Config, secrets: SecretStore) -> anyhow::Result<Self> {
         if config.homeserver_url.is_empty() {
             anyhow::bail!("homeserver_url is required for Matrix gateway");
         }
         if config.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
-        Ok(Self { config })
+        Ok(Self { config, secrets })
     }
 }
 
@@ -81,14 +83,16 @@ impl Gateway for MatrixGateway {
 
         {
             let config = config.clone();
+            let secrets = self.secrets.clone();
             bot.register_text_command(
                 "print",
                 None,
                 Some("Print the conversation".to_string()),
                 move |_, _, room| {
                     let config = config.clone();
+                    let secrets = secrets.clone();
                     async move {
-                        let context = get_context(&room, &config).await.unwrap();
+                        let context = get_context(&room, &config, &secrets).await.unwrap();
                         let content =
                             RoomMessageEventContent::notice_plain(context.string_prompt());
                         room.send(content).await.unwrap();
@@ -105,6 +109,7 @@ impl Gateway for MatrixGateway {
         {
             let config = config.clone();
             let counts = message_counts.clone();
+            let secrets = self.secrets.clone();
             bot.register_text_command(
                 "send",
                 "<message>".to_string(),
@@ -112,19 +117,26 @@ impl Gateway for MatrixGateway {
                 move |sender, text, room| {
                     let config = config.clone();
                     let counts = counts.clone();
-                    async move { commands::send(sender, text, room, &config, &counts).await }
+                    let secrets = secrets.clone();
+                    async move { commands::send(sender, text, room, &config, &counts, &secrets).await }
                 },
             )
             .await;
         }
 
-        bot.register_text_command(
-            "model",
-            "<model>".to_string(),
-            "Select the model to use".to_string(),
-            commands::set_model,
-        )
-        .await;
+        {
+            let secrets = self.secrets.clone();
+            bot.register_text_command(
+                "model",
+                "<model>".to_string(),
+                "Select the model to use".to_string(),
+                move |sender, text, room| {
+                    let secrets = secrets.clone();
+                    async move { commands::set_model(sender, text, room, &secrets).await }
+                },
+            )
+            .await;
+        }
 
         bot.register_text_command(
             "backend",
@@ -136,13 +148,15 @@ impl Gateway for MatrixGateway {
 
         {
             let config = config.clone();
+            let secrets = self.secrets.clone();
             bot.register_text_command(
                 "role",
                 "[<role>] [<prompt>]".to_string(),
                 "Get the role info, set the role, or define a new role".to_string(),
                 move |sender, text, room| {
                     let config = config.clone();
-                    async move { commands::set_role(sender, text, room, &config).await }
+                    let secrets = secrets.clone();
+                    async move { commands::set_role(sender, text, room, &config, &secrets).await }
                 },
             )
             .await;
@@ -150,13 +164,15 @@ impl Gateway for MatrixGateway {
 
         {
             let config = config.clone();
+            let secrets = self.secrets.clone();
             bot.register_text_command(
                 "list",
                 "".to_string(),
                 "List available models".to_string(),
                 move |sender, text, room| {
                     let config = config.clone();
-                    async move { commands::list_models(sender, text, room, &config).await }
+                    let secrets = secrets.clone();
+                    async move { commands::list_models(sender, text, room, &config, &secrets).await }
                 },
             )
             .await;
@@ -180,6 +196,7 @@ impl Gateway for MatrixGateway {
         {
             let config = config.clone();
             let counts = message_counts.clone();
+            let secrets = self.secrets.clone();
             bot.register_text_command(
                 "rename",
                 "".to_string(),
@@ -187,7 +204,8 @@ impl Gateway for MatrixGateway {
                 move |sender, text, room| {
                     let config = config.clone();
                     let counts = counts.clone();
-                    async move { commands::rename(sender, text, room, &config, &counts).await }
+                    let secrets = secrets.clone();
+                    async move { commands::rename(sender, text, room, &config, &counts, &secrets).await }
                 },
             )
             .await;
@@ -199,6 +217,7 @@ impl Gateway for MatrixGateway {
             let tx = event_tx;
             let config = config.clone();
             let counts = message_counts;
+            let secrets = self.secrets.clone();
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             bot.register_text_handler(move |sender, body: String, room, event| {
@@ -206,6 +225,7 @@ impl Gateway for MatrixGateway {
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
                 let counts = counts.clone();
+                let secrets = secrets.clone();
                 async move {
                     let is_direct =
                         room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
@@ -260,7 +280,7 @@ impl Gateway for MatrixGateway {
                             body
                         };
 
-                        let backend = get_backend(&room, &config).await;
+                        let backend = get_backend(&room, &config, &secrets).await;
                         let (response_tx, response_rx) = oneshot::channel();
 
                         // Backfill room history on first message per room

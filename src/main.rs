@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
-    let config: Config = serde_yaml::from_str(&contents)?;
+    let mut config: Config = serde_yaml::from_str(&contents)?;
 
     // Resolve state directory for persistence
     let state_dir = config
@@ -65,6 +65,26 @@ async fn main() -> anyhow::Result<()> {
 
     let session_manager = session::SessionManager::new(instance, user, &config).await?;
     let memory_db = session_manager.database().clone();
+
+    // Build secret store: extract API keys from backend configs, resolve env vars,
+    // store in SecretStore, and replace raw keys with opaque references.
+    let secret_store = security::SecretStore::new();
+    if let Some(backends) = &mut config.backends {
+        for backend in backends.iter_mut() {
+            if let Some(raw_key) = backend.api_key.take() {
+                let resolved = security::SecretStore::resolve_env(&raw_key).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Failed to resolve API key for backend '{}': {e}",
+                        backend.get_name()
+                    );
+                    raw_key
+                });
+                let ref_id = backend.secret_key();
+                secret_store.insert(ref_id.clone(), resolved);
+                backend.api_key_ref = Some(ref_id);
+            }
+        }
+    }
 
     // Build security context from config
     let sec = config.security.clone().unwrap_or_default();
@@ -120,10 +140,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Run the selected gateway
     let result = if args.tui {
-        let gateway = gateway::tui::TuiGateway::new(config);
+        let gateway = gateway::tui::TuiGateway::new(config, secret_store);
         gateway.run(event_tx).await
     } else {
-        let gateway = gateway::matrix::MatrixGateway::new(config)?;
+        let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
         gateway.run(event_tx).await
     };
 

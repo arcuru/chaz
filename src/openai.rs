@@ -14,28 +14,36 @@ use crate::{
     backends::{ChatContext, LLMBackend},
     config::Backend,
     runtime::{LLMResponse, RuntimeMessage, ToolCallRequest},
+    security::SecretStore,
     tool::ToolDefinition,
 };
 use std::collections::HashMap;
 
 /// Handle connections to an OpenAI compatible backend
 pub struct OpenAI {
-    /// Stores the full info given in the config file
+    /// Stores the backend config (api_key cleared — use secret store)
     backend: Backend,
+    /// Secret store for host-boundary key injection
+    secrets: SecretStore,
 }
 
 impl OpenAI {
-    pub fn new(backend: &Backend) -> Self {
+    pub fn new(backend: &Backend, secrets: &SecretStore) -> Self {
         OpenAI {
             backend: backend.clone(),
+            secrets: secrets.clone(),
         }
     }
 
     fn build_client(&self) -> Result<OpenAIClient, String> {
+        // Host-boundary injection: resolve API key from SecretStore by reference,
+        // falling back to the raw api_key field for backward compatibility.
         let api_key = self
             .backend
-            .api_key
-            .clone()
+            .api_key_ref
+            .as_ref()
+            .and_then(|r| self.secrets.get(r))
+            .or_else(|| self.backend.api_key.clone())
             .ok_or("API key doesn't exist")?;
         let api_base = self
             .backend

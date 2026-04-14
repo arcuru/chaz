@@ -29,8 +29,8 @@ No unit tests yet — `cargo test` passes with no meaningful coverage. Build dep
 ## Architecture
 
 ```
-main.rs              CLI args, config, eidetica init, security context, tool registry, gateway dispatch
-config.rs            Config, Backend, AgentConfig, SecurityConfig types (immutable after load)
+main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
+config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent, AgentRegistry (YAML-configurable, per-agent tool visibility)
 session.rs           SessionManager + Session (eidetica SQLite, transport_id binding registry)
@@ -45,6 +45,7 @@ tools/
   memory.rs          remember, recall — persistent key-value memory (Low risk)
 security/
   mod.rs             SecurityContext (leak detector, auto-approved tools, approval channel)
+  secrets.rs         SecretStore — centralized secret storage, env var resolution, host-boundary injection
   leak_detector.rs   LeakDetector — 12 secret patterns, redact/block policy
   network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
   sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
@@ -80,7 +81,8 @@ defaults.rs          Built-in default config and roles
 - **Session history**: eidetica SQLite backend for persistent storage
 - **Memory**: eidetica Table store for key-value facts, shared database with sessions
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
-- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager
+- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
+- **Secret store**: API keys extracted from config at startup into SecretStore (Arc<RwLock<HashMap>>). Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (OpenAI::build_client). Supports env var references: `"${VAR_NAME}"` in config.
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the router
 - **Security context**: Built from SecurityConfig, threaded through router to runtime per-request. Contains leak detector, auto-approved tool set, and approval channel from gateway.
 - **Tool approval flow**: Tools declare risk level and approval requirement. Runtime checks SecurityContext, sends ApprovalExchange to gateway via mpsc channel, gateway prompts user (TUI: stdin, Matrix: deferred). Approval decisions: Approve/Deny/ApproveAll.

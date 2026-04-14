@@ -8,6 +8,7 @@ use crate::{
     openai::OpenAI,
     role::RoleDetails,
     runtime::{LLMResponse, RuntimeMessage},
+    security::SecretStore,
     tool::ToolDefinition,
 };
 
@@ -36,6 +37,7 @@ pub trait LLMBackend {
 
 pub struct BackendManager {
     backends: Vec<Backend>,
+    secrets: SecretStore,
 }
 
 /// A generic Message
@@ -90,9 +92,10 @@ impl ChatContext {
 
 impl BackendManager {
     /// Create a new backend manager
-    pub fn new(backends: &Option<Vec<Backend>>) -> Self {
+    pub fn new(backends: &Option<Vec<Backend>>, secrets: SecretStore) -> Self {
         Self {
             backends: backends.as_ref().cloned().unwrap_or_default(),
+            secrets,
         }
     }
 
@@ -106,13 +109,13 @@ impl BackendManager {
     /// Models may be valid even if they aren't listed
     pub fn list_known_models(&self) -> Vec<String> {
         if self.backends.len() == 1 {
-            OpenAI::new(&self.backends[0]).list_models()
+            OpenAI::new(&self.backends[0], &self.secrets).list_models()
         } else {
             self.backends
                 .iter()
                 .flat_map(|backend| {
                     let prefix = backend.get_name();
-                    OpenAI::new(backend)
+                    OpenAI::new(backend, &self.secrets)
                         .list_models()
                         .into_iter()
                         .map(move |model| format!("{}:{}", prefix, model))
@@ -143,7 +146,7 @@ impl BackendManager {
     /// Get the default model
     pub fn default_model(&self) -> Option<String> {
         let backend = self.backends.first()?;
-        let model = OpenAI::new(backend).default_model()?;
+        let model = OpenAI::new(backend, &self.secrets).default_model()?;
         if self.backends.len() == 1 {
             Some(model)
         } else {
@@ -171,7 +174,7 @@ impl BackendManager {
             return Err("No backends configured".to_string());
         }
         let backend = self.select_backend(context);
-        OpenAI::new(backend).execute(context).await
+        OpenAI::new(backend, &self.secrets).execute(context).await
     }
 
     /// Whether the selected backend supports tool/function calling
@@ -180,7 +183,7 @@ impl BackendManager {
             return false;
         }
         let backend = self.select_backend(context);
-        OpenAI::new(backend).supports_tools()
+        OpenAI::new(backend, &self.secrets).supports_tools()
     }
 
     /// Resolve the model name for the selected backend
@@ -189,7 +192,7 @@ impl BackendManager {
             return String::new();
         }
         let backend = self.select_backend(context);
-        OpenAI::new(backend).resolve_model(context)
+        OpenAI::new(backend, &self.secrets).resolve_model(context)
     }
 
     /// Execute a single LLM call with tool definitions (for ReAct loop)
@@ -204,7 +207,7 @@ impl BackendManager {
             return Err("No backends configured".to_string());
         }
         let backend = self.select_backend(context);
-        OpenAI::new(backend)
+        OpenAI::new(backend, &self.secrets)
             .chat_with_tools(messages, tools, model)
             .await
     }
