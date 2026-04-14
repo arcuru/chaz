@@ -33,7 +33,7 @@ main.rs              CLI args, config, eidetica init, secret store, security con
 config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
-session.rs           SessionManager + Session (eidetica SQLite, transport_id + agent binding registries)
+session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB)
 tool.rs              Tool trait (with ToolContext), ToolRegistry, FilteredTools, RiskLevel, ApprovalRequirement
 tools/
   mod.rs             Re-exports all tools
@@ -67,9 +67,9 @@ defaults.rs          Built-in default config and roles
 
 ### Key flows
 
-**Message flow (Matrix):** Matrix sync → text handler → read room tags for model/role → send ChatRequest (with transport_id) via channel → router resolves transport_id → ConversationId → selects agent → adds to session → runtime runs ReAct loop with filtered tools → response sent back via oneshot → gateway sends to room.
+**Message flow (Matrix):** Matrix sync → text handler → read room tags for model/role → send ChatRequest (with transport_id) via channel → router spawns tokio task → task opens/creates session DB from registry → loads session → resolves agent → acquires semaphore → runtime runs full ReAct loop with filtered tools → writes response to session → response sent back via oneshot → gateway sends to room. Different rooms run in parallel.
 
-**Message flow (TUI):** stdin → ChatRequest → router → runtime → stdout.
+**Message flow (TUI):** stdin → ChatRequest → router → spawned task → runtime → stdout.
 
 **ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
 
@@ -77,10 +77,9 @@ defaults.rs          Built-in default config and roles
 
 - **Gateway trait**: Both MatrixGateway and TuiGateway implement `Gateway` trait with `run()` method
 - **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
-- **Batching router**: Drains buffered messages, groups by conversation, only LLM-responds to last message per batch (prevents duplicate responses on reconnect/burst)
-- **Transport ID binding**: Gateways send native transport IDs, SessionManager resolves to ConversationId
-- **Session history**: eidetica SQLite backend for persistent storage
-- **Memory**: eidetica Table store for key-value facts, shared database with sessions
+- **Task-per-message router**: Each incoming message spawns a tokio task. Task opens session DB from registry, loads messages, runs full ReAct loop, writes back. Global Semaphore(10) caps concurrent LLM calls. No persistent workers.
+- **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
+- **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.

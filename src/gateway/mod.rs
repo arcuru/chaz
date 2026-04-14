@@ -21,7 +21,7 @@ pub trait Gateway {
 /// A request to process a chat message through the agent runtime.
 ///
 /// Gateways send their native transport ID (e.g., Matrix room ID, "tui").
-/// The router resolves this to a `ConversationId` via SessionManager.
+/// The router resolves this to a session DB via SessionRegistry.
 pub struct ChatRequest {
     /// Transport-native identifier (e.g., Matrix room ID, "tui")
     pub transport_id: String,
