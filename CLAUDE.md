@@ -51,9 +51,9 @@ security/
   network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
   sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
 runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings; receives ToolContext
-router.rs            Resolves transport_id → conversation, selects agent per-conversation, builds ToolContext
+server.rs            Callback-driven Server: registers on_local_write on session DBs, processing loop, agent task spawning, response delivery
 gateway/
-  mod.rs             Gateway trait, ChatRequest/ChatResponse, ApprovalExchange/ApprovalDecision
+  mod.rs             Gateway trait, ApprovalExchange/ApprovalDecision
   matrix/
     mod.rs           MatrixGateway — lifecycle, sync, retry, text handler
     commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
@@ -67,9 +67,9 @@ defaults.rs          Built-in default config and roles
 
 ### Key flows
 
-**Message flow (Matrix):** Matrix sync → text handler → read room tags for model/role → send ChatRequest (with transport_id) via channel → router spawns tokio task → task opens/creates session DB from registry → loads session → resolves agent → acquires semaphore → runtime runs full ReAct loop with filtered tools → writes response to session → response sent back via oneshot → gateway sends to room. Different rooms run in parallel.
+**Message flow (Matrix):** Matrix sync → text handler → writes SessionEntry to session DB → eidetica on_local_write callback fires → server processing loop detects user message → spawns agent task → agent runs full ReAct loop → writes response SessionEntry to session DB → callback fires → server detects agent response → delivers via ResponseDelivery channel → Matrix response task sends to room. Different rooms run in parallel.
 
-**Message flow (TUI):** stdin → ChatRequest → router → spawned task → runtime → stdout.
+**Message flow (TUI):** stdin → writes SessionEntry to session DB → callback fires → server runs agent → writes response → delivers via channel → TUI prints.
 
 **ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
 
@@ -77,7 +77,7 @@ defaults.rs          Built-in default config and roles
 
 - **Gateway trait**: Both MatrixGateway and TuiGateway implement `Gateway` trait with `run()` method
 - **Channel-based dispatch**: Gateway → Router via mpsc, responses via oneshot per request
-- **Task-per-message router**: Each incoming message spawns a tokio task. Task opens session DB from registry, loads messages, runs full ReAct loop, writes back. Global Semaphore(10) caps concurrent LLM calls. No persistent workers.
+- **Callback-driven server**: Gateways write SessionEntries to session DBs. Eidetica on_local_write callbacks fire, notifying the server processing loop. Server checks latest entry — if user message, spawns agent task; if agent response, delivers to transport. Global Semaphore(10) caps concurrent LLM calls.
 - **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
 - **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (FilteredTools)
