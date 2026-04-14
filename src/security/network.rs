@@ -98,8 +98,10 @@ impl NetworkPolicy {
             None => return Err("URL has no host".to_string()),
         };
 
-        // Check if host is a raw IP address
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        // Check if host is a raw IP address.
+        // url::Url returns IPv6 hosts with brackets (e.g., "[::1]"), strip them.
+        let bare_host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+        if let Ok(ip) = bare_host.parse::<IpAddr>() {
             if is_private_ip(&ip) {
                 return Err(format!("SSRF protection: private IP {ip} not allowed"));
             }

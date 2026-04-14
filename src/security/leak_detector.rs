@@ -59,12 +59,12 @@ static PATTERNS: LazyLock<Vec<LeakPattern>> = LazyLock::new(|| {
             regex: Regex::new(r"xox[bpoas]-[a-zA-Z0-9\-]{10,}").unwrap(),
         },
         LeakPattern {
-            name: "PEM private key",
-            regex: Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").unwrap(),
-        },
-        LeakPattern {
             name: "SSH private key",
             regex: Regex::new(r"-----BEGIN OPENSSH PRIVATE KEY-----").unwrap(),
+        },
+        LeakPattern {
+            name: "PEM private key",
+            regex: Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").unwrap(),
         },
         LeakPattern {
             name: "Bearer token",
