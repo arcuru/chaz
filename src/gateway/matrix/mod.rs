@@ -220,13 +220,24 @@ impl Gateway for MatrixGateway {
             let secrets = self.secrets.clone();
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
+            let seen_events: Arc<Mutex<HashSet<String>>> =
+                Arc::new(Mutex::new(HashSet::new()));
             bot.register_text_handler(move |sender, body: String, room, event| {
                 let tx = tx.clone();
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
+                let seen_events = seen_events.clone();
                 let counts = counts.clone();
                 let secrets = secrets.clone();
                 async move {
+                    // Deduplicate events across sync restarts — after a timeout+retry,
+                    // the server may re-deliver recent timeline events.
+                    {
+                        let mut seen = seen_events.lock().await;
+                        if !seen.insert(event.event_id.to_string()) {
+                            return Ok(());
+                        }
+                    }
                     let is_direct =
                         room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
 

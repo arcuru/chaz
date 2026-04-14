@@ -1,4 +1,3 @@
-use crate::backends::ChatContext;
 use crate::role::RoleDetails;
 use crate::runtime;
 use crate::session::Session;

@@ -64,14 +64,12 @@ async fn main() -> anyhow::Result<()> {
     let user = instance.login_user("chaz", None).await?;
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
-    let session_manager =
-        session::SessionManager::new(instance, user, agent_registry.clone()).await?;
-    let memory_db = session_manager.database().clone();
+    let registry =
+        session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
+    let central_db = registry.central_db().clone();
 
-    // Build secret store backed by the same eidetica database.
-    // Loads existing secrets from the "secrets" DocStore, then reconciles
-    // with config — only writes if a value actually changed.
-    let secret_store = security::SecretStore::new(session_manager.database().clone()).await;
+    // Build secret store backed by the central eidetica database.
+    let secret_store = security::SecretStore::new(central_db.clone()).await;
     if let Some(backends) = &mut config.backends {
         for backend in backends.iter_mut() {
             if let Some(raw_key) = backend.api_key.take() {
@@ -133,18 +131,19 @@ async fn main() -> anyhow::Result<()> {
     tools.register(tools::ReadFile);
     tools.register(tools::WriteFile);
     tools.register(tools::WebFetch::new(network_policy));
-    tools.register(tools::Remember::new(memory_db.clone()));
-    tools.register(tools::Recall::new(memory_db));
+    tools.register(tools::Remember::new(central_db.clone()));
+    tools.register(tools::Recall::new(central_db));
     tools.register(tools::SpawnAgent);
 
     let tools = std::sync::Arc::new(tools);
+    let registry = std::sync::Arc::new(registry);
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
 
-    // Spawn the router with session management and tools
+    // Spawn the router
     let router_handle = tokio::spawn(router::run(
         event_rx,
-        session_manager,
+        registry,
         tools,
         agent_registry,
         security_ctx,

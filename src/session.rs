@@ -1,16 +1,15 @@
 use crate::agent::{Agent, AgentRegistry};
-use std::sync::Arc;
 use crate::backends::{ChatContext, Message};
-use crate::config::Config;
 use crate::role::RoleDetails;
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
 use eidetica::store::Table;
-use eidetica::{Database, Instance};
+use eidetica::Database;
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 /// Maximum messages to include in context sent to the LLM.
@@ -26,19 +25,43 @@ pub struct SessionMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Per-conversation state with persistent message history
+/// A binding record stored in the central registry database.
+/// Maps a transport ID (e.g., Matrix room ID) to a session database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBinding {
+    pub transport_id: String,
+    pub conversation_id: String,
+    /// Eidetica database root ID for this session's DB
+    pub session_db_id: String,
+    /// Agent name bound to this conversation, if any
+    pub agent_name: Option<String>,
+}
+
+/// Per-conversation state backed by its own eidetica Database.
+///
+/// Each session owns a dedicated eidetica Database containing a single
+/// `Table<SessionMessage>` store. Messages are loaded from the DB on
+/// creation and kept in memory for context building.
+///
+/// Regular sessions use store name "messages". Ephemeral sessions (spawned
+/// agents) use "messages:{conversation_id}" to avoid collisions when sharing
+/// a parent's database.
 pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
     messages: Vec<SessionMessage>,
+    /// Store name for messages — "messages" for regular, "messages:{id}" for ephemeral
+    store_name: String,
 }
 
 impl Session {
-    async fn new(conversation_id: ConversationId, database: Database) -> Self {
+    /// Open a session, loading existing messages from its database.
+    pub async fn new(conversation_id: ConversationId, database: Database) -> Self {
         let mut session = Session {
             conversation_id,
             database,
             messages: Vec::new(),
+            store_name: "messages".to_string(),
         };
 
         session.load_from_db().await;
@@ -46,9 +69,11 @@ impl Session {
     }
 
     /// Create a new session without loading existing messages.
-    /// Used by spawn_agent to create fresh sessions for spawned agents.
+    /// Used by spawn_agent to create fresh sessions in a parent's database.
+    /// Uses a unique store name to avoid collisions with the parent's messages.
     pub async fn new_ephemeral(conversation_id: ConversationId, database: Database) -> Self {
         Session {
+            store_name: format!("messages:{}", conversation_id.0),
             conversation_id,
             database,
             messages: Vec::new(),
@@ -57,11 +82,10 @@ impl Session {
 
     /// Load messages from eidetica
     async fn load_from_db(&mut self) {
-        let store_name = self.store_name();
         let Ok(txn) = self.database.new_transaction().await else {
             return;
         };
-        if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&store_name).await {
+        if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&self.store_name).await {
             match store.search(|_| true).await {
                 Ok(records) => {
                     let mut msgs: Vec<SessionMessage> =
@@ -76,10 +100,8 @@ impl Session {
 
     /// Add a message to the session with persistence
     pub async fn add_message(&mut self, msg: SessionMessage) {
-        // Persist to eidetica (SQLite-backed)
-        let store_name = self.store_name();
         match self.database.new_transaction().await {
-            Ok(txn) => match txn.get_store::<Table<SessionMessage>>(&store_name).await {
+            Ok(txn) => match txn.get_store::<Table<SessionMessage>>(&self.store_name).await {
                 Ok(store) => {
                     if let Err(e) = store.insert(msg.clone()).await {
                         error!("Failed to persist message to eidetica: {e}");
@@ -105,15 +127,12 @@ impl Session {
 
         let mut new_count = 0;
         for msg in history {
-            // Skip if we already have a message with the same timestamp and content
             let already_exists = self.messages.iter().any(|existing| {
                 existing.timestamp == msg.timestamp && existing.content == msg.content
             });
             if !already_exists {
-                // Persist to eidetica
-                let store_name = self.store_name();
                 if let Ok(txn) = self.database.new_transaction().await {
-                    if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&store_name).await {
+                    if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&self.store_name).await {
                         if store.insert(msg.clone()).await.is_ok() {
                             let _ = txn.commit().await;
                         }
@@ -125,7 +144,6 @@ impl Session {
         }
 
         if new_count > 0 {
-            // Re-sort by timestamp after merging
             self.messages.sort_by_key(|m| m.timestamp);
             info!(
                 "Backfilled {} messages for {}",
@@ -136,7 +154,6 @@ impl Session {
 
     /// Build a ChatContext from session history with truncation
     pub fn build_context(&self, role: Option<RoleDetails>, model: Option<String>) -> ChatContext {
-        // Truncate: keep only the most recent messages
         let start = self.messages.len().saturating_sub(MAX_CONTEXT_MESSAGES);
         let messages = self.messages[start..]
             .iter()
@@ -157,105 +174,195 @@ impl Session {
         }
     }
 
-    fn store_name(&self) -> String {
-        format!("messages:{}", self.conversation_id.0)
+    /// Number of messages currently in the session
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Get the underlying eidetica Database handle (for sharing with tools)
+    pub fn database(&self) -> &Database {
+        &self.database
     }
 }
 
-/// Manages sessions across conversations.
+/// Central registry mapping transport IDs to per-session eidetica Databases.
 ///
-/// Holds a binding registry that maps transport-native IDs (e.g., Matrix room IDs)
-/// to gateway-agnostic `ConversationId`s. Multiple transport IDs can map to the
-/// same conversation, enabling cross-gateway sessions.
-pub struct SessionManager {
-    _instance: Instance,
-    database: Database,
-    sessions: HashMap<ConversationId, Session>,
-    /// Maps transport_id → ConversationId. Enables multiple gateways to share a conversation.
-    bindings: HashMap<String, ConversationId>,
-    /// Maps ConversationId → agent definition name for per-conversation agent selection.
-    agent_bindings: HashMap<ConversationId, String>,
+/// The registry itself is backed by an eidetica Database ("chaz-registry") containing
+/// a `Table<SessionBinding>` that persists transport_id → session DB mappings across
+/// restarts. Each session gets its own eidetica Database for message storage.
+///
+/// The registry also holds a separate "chaz-central" Database for shared data
+/// (memory store, secrets) that isn't per-conversation.
+pub struct SessionRegistry {
+    /// Eidetica instance (Clone = cheap Arc handle)
+    instance: eidetica::Instance,
+    /// User for creating new session databases (behind Mutex since create_database needs &mut)
+    user: Arc<Mutex<eidetica::user::User>>,
+    /// Central registry database — holds SessionBinding table
+    registry_db: Database,
+    /// Central shared database — for memory tools, secrets, etc.
+    central_db: Database,
+    /// Agent registry
     pub agents: Arc<AgentRegistry>,
 }
 
-impl SessionManager {
+impl SessionRegistry {
+    /// Create or open the session registry.
+    ///
+    /// Finds or creates two databases:
+    /// - "chaz-registry" — bindings table mapping transport IDs to session DBs
+    /// - "chaz-central" — shared data (memory, secrets)
     pub async fn new(
-        instance: Instance,
+        instance: eidetica::Instance,
         mut user: eidetica::user::User,
         agents: Arc<AgentRegistry>,
     ) -> anyhow::Result<Self> {
-        // Find or create the eidetica sessions database
-        let database = match user.find_database("chaz-sessions").await {
-            Ok(existing) if !existing.is_empty() => existing.into_iter().next().unwrap(),
-            _ => {
-                let mut settings = eidetica::crdt::Doc::new();
-                settings.set("name", "chaz-sessions");
-                let key_id = user.get_default_key()?;
-                user.create_database(settings, &key_id).await?
-            }
-        };
+        let registry_db = find_or_create_db(&mut user, "chaz-registry").await?;
+        let central_db = find_or_create_db(&mut user, "chaz-central").await?;
 
         Ok(Self {
-            _instance: instance,
-            database,
-            sessions: HashMap::new(),
-            bindings: HashMap::new(),
-            agent_bindings: HashMap::new(),
+            instance,
+            user: Arc::new(Mutex::new(user)),
+            registry_db,
+            central_db,
             agents,
         })
     }
 
-    /// Get the eidetica database (for sharing with tools)
-    pub fn database(&self) -> &Database {
-        &self.database
+    /// Get the central shared database (for memory tools, secrets, etc.)
+    pub fn central_db(&self) -> &Database {
+        &self.central_db
     }
 
-    /// Resolve a transport ID to a ConversationId.
+    /// Get the eidetica Instance handle
+    pub fn instance(&self) -> &eidetica::Instance {
+        &self.instance
+    }
+
+    /// Look up a transport ID and return the session Database, creating one if needed.
     ///
-    /// Creates a new binding if none exists. Default: transport_id becomes the ConversationId.
-    /// Future: this can be overridden to map multiple transport IDs to the same conversation.
-    pub fn resolve_conversation(&mut self, transport_id: &str) -> ConversationId {
-        self.bindings
-            .entry(transport_id.to_string())
-            .or_insert_with(|| ConversationId(transport_id.to_string()))
-            .clone()
-    }
+    /// On first call for a transport_id, creates a new eidetica Database and persists
+    /// the binding. On subsequent calls (including after restart), opens the existing DB.
+    pub async fn get_or_create_session_db(
+        &self,
+        transport_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        // Check registry for existing binding
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
 
-    /// Get or create a session for a conversation
-    pub async fn get_or_create(&mut self, id: &ConversationId) -> &mut Session {
-        if !self.sessions.contains_key(id) {
-            let session = Session::new(id.clone(), self.database.clone()).await;
-            info!(
-                "Session for {}: {} messages loaded",
-                id,
-                session.messages.len()
-            );
-            self.sessions.insert(id.clone(), session);
+        let existing = bindings
+            .search(|b| b.transport_id == transport_id)
+            .await?;
+
+        if let Some((_, binding)) = existing.into_iter().next() {
+            // Found existing binding — open the session DB
+            let conversation_id = ConversationId(binding.conversation_id);
+            let db = {
+                let user = self.user.lock().await;
+                let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse session DB ID '{}': {e}", binding.session_db_id)
+                })?;
+                user.open_database(&root_id).await?
+            };
+            return Ok((conversation_id, db));
         }
-        self.sessions.get_mut(id).unwrap()
-    }
+        drop(txn); // release before creating DB
 
-    /// Bind a conversation to a specific agent definition.
-    pub fn set_agent_binding(&mut self, id: &ConversationId, agent_name: String) {
-        self.agent_bindings.insert(id.clone(), agent_name);
-    }
+        // No binding — create a new session DB
+        let conversation_id = ConversationId(transport_id.to_string());
+        let db_name = format!("session:{}", transport_id);
+        let db = {
+            let mut user = self.user.lock().await;
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", db_name.as_str());
+            let key_id = user.get_default_key()?;
+            user.create_database(settings, &key_id).await?
+        };
 
-    /// Get the agent name bound to a conversation, if any.
-    pub fn get_agent_binding(&self, id: &ConversationId) -> Option<&str> {
-        self.agent_bindings.get(id).map(|s| s.as_str())
+        // Persist the binding
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+        bindings
+            .insert(SessionBinding {
+                transport_id: transport_id.to_string(),
+                conversation_id: conversation_id.0.clone(),
+                session_db_id: db.root_id().to_string(),
+                agent_name: None,
+            })
+            .await?;
+        txn.commit().await?;
+
+        info!("Created new session DB for {}", transport_id);
+        Ok((conversation_id, db))
     }
 
     /// Resolve which agent should handle a conversation.
-    /// Priority: explicit override > conversation binding > default agent.
-    pub fn resolve_agent(&self, conversation_id: &ConversationId, override_name: Option<&str>) -> &Agent {
-        let name = override_name
-            .or_else(|| self.get_agent_binding(conversation_id));
-
-        if let Some(name) = name {
+    /// Priority: explicit override > persisted binding > default agent.
+    pub async fn resolve_agent(
+        &self,
+        transport_id: &str,
+        override_name: Option<&str>,
+    ) -> Agent {
+        // Check explicit override first
+        if let Some(name) = override_name {
             if let Some(agent) = self.agents.get(name) {
-                return agent;
+                return agent.clone();
             }
         }
-        self.agents.default_agent()
+
+        // Check persisted binding
+        if let Ok(txn) = self.registry_db.new_transaction().await {
+            if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
+                if let Ok(results) = bindings
+                    .search(|b| b.transport_id == transport_id)
+                    .await
+                {
+                    if let Some((_, binding)) = results.into_iter().next() {
+                        if let Some(agent_name) = &binding.agent_name {
+                            if let Some(agent) = self.agents.get(agent_name) {
+                                return agent.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.agents.default_agent().clone()
+    }
+
+    /// Bind a conversation to a specific agent (persisted).
+    pub async fn set_agent_binding(&self, transport_id: &str, agent_name: String) {
+        if let Ok(txn) = self.registry_db.new_transaction().await {
+            if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
+                if let Ok(results) = bindings
+                    .search(|b| b.transport_id == transport_id)
+                    .await
+                {
+                    if let Some((key, mut binding)) = results.into_iter().next() {
+                        binding.agent_name = Some(agent_name);
+                        let _ = bindings.set(&key, binding).await;
+                        let _ = txn.commit().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Find or create a named eidetica database for a user.
+async fn find_or_create_db(
+    user: &mut eidetica::user::User,
+    name: &str,
+) -> anyhow::Result<Database> {
+    match user.find_database(name).await {
+        Ok(existing) if !existing.is_empty() => Ok(existing.into_iter().next().unwrap()),
+        _ => {
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", name);
+            let key_id = user.get_default_key()?;
+            Ok(user.create_database(settings, &key_id).await?)
+        }
     }
 }
