@@ -1,6 +1,6 @@
 use crate::role::RoleDetails;
 use crate::runtime;
-use crate::session::Session;
+use crate::session::{EntryType, Session, SessionEntry};
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext};
 use serde_json::Value;
 use std::future::Future;
@@ -74,7 +74,6 @@ impl Tool for SpawnAgent {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
-            // Depth limiting
             if ctx.call_depth >= ctx.max_call_depth {
                 return Err(format!(
                     "Maximum spawn depth ({}) reached. Cannot spawn further agents.",
@@ -98,7 +97,6 @@ impl Tool for SpawnAgent {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
 
-            // Validate spawn permissions (two-sided)
             if !ctx.agent_registry.can_spawn(&ctx.agent_name, agent_name) {
                 return Err(format!(
                     "Agent '{}' is not allowed to spawn '{}'",
@@ -106,18 +104,16 @@ impl Tool for SpawnAgent {
                 ));
             }
 
-            // Look up agent definition
             let agent_def = ctx
                 .agent_registry
                 .get(agent_name)
                 .ok_or_else(|| format!("Unknown agent: '{agent_name}'"))?;
 
-            // Resolve overrides: definition defaults → preset → inline overrides
             let resolved = agent_def.resolve_overrides(
                 preset,
                 model_override,
                 max_iterations_override,
-                None, // tool restriction via arguments not implemented yet
+                None,
             );
 
             info!(
@@ -156,29 +152,26 @@ impl Tool for SpawnAgent {
             let session_id = crate::types::ConversationId(uuid::Uuid::new_v4().to_string());
             let mut session = Session::new_ephemeral(session_id, ctx.database.clone()).await;
 
-            // Add the task as the first user message
+            // Add the task as the first entry (from the calling agent)
             session
-                .add_message(crate::session::SessionMessage {
-                    role: "user".into(),
-                    content: task.to_string(),
+                .add_entry(SessionEntry {
                     sender: ctx.agent_name.clone(),
+                    content: task.to_string(),
                     timestamp: chrono::Utc::now(),
+                    entry_type: EntryType::Message,
                 })
                 .await;
 
             // Build context from the session
-            let chat_context = session.build_context(role, resolved.model);
+            let chat_context = session.build_context(agent_name, role, resolved.model);
 
-            // Build filtered tools for the spawned agent
             let filtered =
                 ctx.tool_registry
                     .filtered_view(resolved.allowed_tools.as_deref());
 
-            // Build child ToolContext with incremented depth
             let child_security = crate::security::SecurityContext {
                 leak_detector: ctx.security.leak_detector.clone(),
                 auto_approved_tools: ctx.security.auto_approved_tools.clone(),
-                // Spawned agents inherit the approval channel — user sees all consequential actions
                 approval_callback: ctx.security.approval_callback.clone(),
             };
 
@@ -193,7 +186,6 @@ impl Tool for SpawnAgent {
                 database: ctx.database.clone(),
             };
 
-            // Run the agent's ReAct loop
             let result = runtime::execute(
                 &chat_context,
                 &ctx.backend,
@@ -203,25 +195,25 @@ impl Tool for SpawnAgent {
             )
             .await;
 
-            // Store the agent's response in the session for audit trail
+            // Store the response/error in the session for audit trail
             match &result {
                 Ok(response) => {
                     session
-                        .add_message(crate::session::SessionMessage {
-                            role: "assistant".into(),
-                            content: response.clone(),
+                        .add_entry(SessionEntry {
                             sender: agent_name.to_string(),
+                            content: response.clone(),
                             timestamp: chrono::Utc::now(),
+                            entry_type: EntryType::Message,
                         })
                         .await;
                 }
                 Err(error) => {
                     session
-                        .add_message(crate::session::SessionMessage {
-                            role: "system".into(),
+                        .add_entry(SessionEntry {
+                            sender: agent_name.to_string(),
                             content: format!("Agent error: {error}"),
-                            sender: "system".to_string(),
                             timestamp: chrono::Utc::now(),
+                            entry_type: EntryType::Error,
                         })
                         .await;
                 }

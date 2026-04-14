@@ -2,7 +2,7 @@ use crate::agent::AgentRegistry;
 use crate::gateway::{ChatRequest, ChatResponse};
 use crate::runtime;
 use crate::security::SecurityContext;
-use crate::session::{Session, SessionMessage, SessionRegistry};
+use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
 use crate::tool::{ToolContext, ToolRegistry};
 use chrono::Utc;
 use std::sync::Arc;
@@ -33,7 +33,6 @@ pub async fn run(
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
 
     while let Some(request) = event_rx.recv().await {
-        // Spawn a task per incoming message
         let registry = registry.clone();
         let tools = tools.clone();
         let agent_registry = agent_registry.clone();
@@ -63,15 +62,12 @@ async fn handle_message(
     security: &SecurityContext,
     semaphore: &Semaphore,
 ) -> anyhow::Result<()> {
-    // Resolve transport_id to a session DB (creates on first use)
     let (conversation_id, session_db) = registry
         .get_or_create_session_db(&request.transport_id)
         .await?;
 
-    // Load session from DB
     let mut session = Session::new(conversation_id, session_db.clone()).await;
 
-    // Resolve agent
     let agent = registry
         .resolve_agent(&request.transport_id, request.agent_override.as_deref())
         .await;
@@ -81,28 +77,25 @@ async fn handle_message(
     let allowed_tools = agent.allowed_tools.clone();
     let max_call_depth = agent.max_iterations as usize;
 
-    // Backfill from gateway history if provided
     if let Some(history) = request.backfill_history {
         session.backfill(history).await;
     }
 
-    // Add user message to session
+    // Add user entry to session
     session
-        .add_message(SessionMessage {
-            role: "user".into(),
-            content: request.body.clone(),
+        .add_entry(SessionEntry {
             sender: request.sender.clone(),
+            content: request.body.clone(),
             timestamp: Utc::now(),
+            entry_type: EntryType::Message,
         })
         .await;
 
-    // Acquire semaphore before LLM call
     let _permit = semaphore.acquire().await.expect("semaphore closed");
 
-    // Build context and run LLM
     let role = request.role_override.or(default_role);
     let model = request.model_override.or(default_model);
-    let context = session.build_context(role, model);
+    let context = session.build_context(&agent_name, role, model);
 
     let filtered = tools.filtered_view(allowed_tools.as_deref());
 
@@ -127,17 +120,16 @@ async fn handle_message(
         runtime::execute(&context, &request.backend, &filtered, &request_security, &tool_ctx)
             .await;
 
-    // Release permit before session write + response send
     drop(_permit);
 
     match result {
         Ok(body) => {
             session
-                .add_message(SessionMessage {
-                    role: "assistant".into(),
-                    content: body.clone(),
+                .add_entry(SessionEntry {
                     sender: agent_name,
+                    content: body.clone(),
                     timestamp: Utc::now(),
+                    entry_type: EntryType::Message,
                 })
                 .await;
             let _ = request.response_tx.send(ChatResponse::Message {

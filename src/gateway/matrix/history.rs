@@ -1,4 +1,4 @@
-use crate::session::SessionMessage;
+use crate::session::{EntryType, SessionEntry};
 
 use chrono::Utc;
 use matrix_sdk::{
@@ -7,14 +7,10 @@ use matrix_sdk::{
     ruma::events::room::message::{MessageType, RoomMessageEventContent},
 };
 
-/// Read room message history as SessionMessages for backfilling.
+/// Read room message history as SessionEntries for backfilling.
 /// Reads backward from most recent, stops at `!chaz clear` or end of history.
-pub async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
-    let mut messages = Vec::new();
-    let bot_user_id = room
-        .client()
-        .user_id()
-        .map(|uid: &matrix_sdk::ruma::UserId| uid.to_string());
+pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
+    let mut entries = Vec::new();
     let mut options = MessagesOptions::backward();
 
     'outer: while let Ok(batch) = room.messages(options).await {
@@ -63,12 +59,6 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
                         text_content.body.clone()
                     };
 
-                    let role = if bot_user_id.as_ref().is_some_and(|uid| sender == *uid) {
-                        "assistant"
-                    } else {
-                        "user"
-                    };
-
                     // Use event origin_server_ts if available, otherwise now
                     let timestamp = message
                         .event
@@ -77,11 +67,11 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
                         .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts as i64))
                         .unwrap_or_else(Utc::now);
 
-                    messages.push(SessionMessage {
-                        role: role.to_string(),
-                        content: body,
+                    entries.push(SessionEntry {
                         sender: sender.clone(),
+                        content: body,
                         timestamp,
+                        entry_type: EntryType::Message,
                     });
                 }
             }
@@ -94,6 +84,6 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionMessage> {
     }
 
     // Reverse to chronological order (we read backward)
-    messages.reverse();
-    messages
+    entries.reverse();
+    entries
 }

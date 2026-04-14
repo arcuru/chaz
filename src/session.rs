@@ -16,13 +16,28 @@ use tracing::{error, info};
 /// Older messages are dropped to stay within token limits.
 const MAX_CONTEXT_MESSAGES: usize = 50;
 
-/// A message stored in a session
+/// Type of session entry. Participants (users and agents alike) write entries
+/// to a session. There is no user/agent distinction at the protocol level.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum EntryType {
+    /// A chat message (from any participant)
+    Message,
+    /// Acknowledgement that work is in progress
+    Ack,
+    /// An error that occurred during processing
+    Error,
+}
+
+/// An entry in a session. Participants (human users and AI agents) are
+/// treated identically — both write SessionEntries with their name as sender.
+/// The agent determines assistant vs user roles at context-building time by
+/// comparing the sender to its own name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMessage {
-    pub role: String,
-    pub content: String,
+pub struct SessionEntry {
     pub sender: String,
+    pub content: String,
     pub timestamp: DateTime<Utc>,
+    pub entry_type: EntryType,
 }
 
 /// A binding record stored in the central registry database.
@@ -40,71 +55,71 @@ pub struct SessionBinding {
 /// Per-conversation state backed by its own eidetica Database.
 ///
 /// Each session owns a dedicated eidetica Database containing a single
-/// `Table<SessionMessage>` store. Messages are loaded from the DB on
+/// `Table<SessionEntry>` store. Entries are loaded from the DB on
 /// creation and kept in memory for context building.
 ///
-/// Regular sessions use store name "messages". Ephemeral sessions (spawned
-/// agents) use "messages:{conversation_id}" to avoid collisions when sharing
+/// Regular sessions use store name "entries". Ephemeral sessions (spawned
+/// agents) use "entries:{conversation_id}" to avoid collisions when sharing
 /// a parent's database.
 pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
-    messages: Vec<SessionMessage>,
-    /// Store name for messages — "messages" for regular, "messages:{id}" for ephemeral
+    entries: Vec<SessionEntry>,
+    /// Store name — "entries" for regular, "entries:{id}" for ephemeral
     store_name: String,
 }
 
 impl Session {
-    /// Open a session, loading existing messages from its database.
+    /// Open a session, loading existing entries from its database.
     pub async fn new(conversation_id: ConversationId, database: Database) -> Self {
         let mut session = Session {
             conversation_id,
             database,
-            messages: Vec::new(),
-            store_name: "messages".to_string(),
+            entries: Vec::new(),
+            store_name: "entries".to_string(),
         };
 
         session.load_from_db().await;
         session
     }
 
-    /// Create a new session without loading existing messages.
+    /// Create a new session without loading existing entries.
     /// Used by spawn_agent to create fresh sessions in a parent's database.
-    /// Uses a unique store name to avoid collisions with the parent's messages.
+    /// Uses a unique store name to avoid collisions with the parent's entries.
     pub async fn new_ephemeral(conversation_id: ConversationId, database: Database) -> Self {
         Session {
-            store_name: format!("messages:{}", conversation_id.0),
+            store_name: format!("entries:{}", conversation_id.0),
             conversation_id,
             database,
-            messages: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
-    /// Load messages from eidetica
+    /// Load entries from eidetica
     async fn load_from_db(&mut self) {
         let Ok(txn) = self.database.new_transaction().await else {
             return;
         };
-        if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&self.store_name).await {
+        if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
             match store.search(|_| true).await {
                 Ok(records) => {
-                    let mut msgs: Vec<SessionMessage> =
-                        records.into_iter().map(|(_, msg)| msg).collect();
-                    msgs.sort_by_key(|m| m.timestamp);
-                    self.messages = msgs;
+                    let mut entries: Vec<SessionEntry> =
+                        records.into_iter().map(|(_, entry)| entry).collect();
+                    entries.sort_by_key(|e| e.timestamp);
+                    self.entries = entries;
                 }
-                Err(e) => error!("Failed to load session messages from eidetica: {e}"),
+                Err(e) => error!("Failed to load session entries from eidetica: {e}"),
             }
         }
     }
 
-    /// Add a message to the session with persistence
-    pub async fn add_message(&mut self, msg: SessionMessage) {
+    /// Add an entry to the session with persistence
+    pub async fn add_entry(&mut self, entry: SessionEntry) {
         match self.database.new_transaction().await {
-            Ok(txn) => match txn.get_store::<Table<SessionMessage>>(&self.store_name).await {
+            Ok(txn) => match txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
                 Ok(store) => {
-                    if let Err(e) = store.insert(msg.clone()).await {
-                        error!("Failed to persist message to eidetica: {e}");
+                    if let Err(e) = store.insert(entry.clone()).await {
+                        error!("Failed to persist entry to eidetica: {e}");
                     } else if let Err(e) = txn.commit().await {
                         error!("Failed to commit to eidetica: {e}");
                     }
@@ -114,56 +129,66 @@ impl Session {
             Err(e) => error!("Failed to create eidetica transaction: {e}"),
         }
 
-        self.messages.push(msg);
+        self.entries.push(entry);
     }
 
     /// Merge backfill history from a gateway (e.g., Matrix room history).
-    /// Only inserts messages that are older than our earliest message or fill gaps.
+    /// Only inserts entries that are older than our earliest entry or fill gaps.
     /// Deduplicates by timestamp+content.
-    pub async fn backfill(&mut self, history: Vec<SessionMessage>) {
+    pub async fn backfill(&mut self, history: Vec<SessionEntry>) {
         if history.is_empty() {
             return;
         }
 
         let mut new_count = 0;
-        for msg in history {
-            let already_exists = self.messages.iter().any(|existing| {
-                existing.timestamp == msg.timestamp && existing.content == msg.content
+        for entry in history {
+            let already_exists = self.entries.iter().any(|existing| {
+                existing.timestamp == entry.timestamp && existing.content == entry.content
             });
             if !already_exists {
                 if let Ok(txn) = self.database.new_transaction().await {
-                    if let Ok(store) = txn.get_store::<Table<SessionMessage>>(&self.store_name).await {
-                        if store.insert(msg.clone()).await.is_ok() {
+                    if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
+                        if store.insert(entry.clone()).await.is_ok() {
                             let _ = txn.commit().await;
                         }
                     }
                 }
-                self.messages.push(msg);
+                self.entries.push(entry);
                 new_count += 1;
             }
         }
 
         if new_count > 0 {
-            self.messages.sort_by_key(|m| m.timestamp);
+            self.entries.sort_by_key(|e| e.timestamp);
             info!(
-                "Backfilled {} messages for {}",
+                "Backfilled {} entries for {}",
                 new_count, self.conversation_id
             );
         }
     }
 
-    /// Build a ChatContext from session history with truncation
-    pub fn build_context(&self, role: Option<RoleDetails>, model: Option<String>) -> ChatContext {
-        let start = self.messages.len().saturating_sub(MAX_CONTEXT_MESSAGES);
-        let messages = self.messages[start..]
+    /// Build a ChatContext from session history with truncation.
+    ///
+    /// The `agent_name` parameter determines perspective: entries from this sender
+    /// become assistant messages, all others become user messages. Only `Message`
+    /// entries are included (Ack, Error are excluded from LLM context).
+    pub fn build_context(
+        &self,
+        agent_name: &str,
+        role: Option<RoleDetails>,
+        model: Option<String>,
+    ) -> ChatContext {
+        let start = self.entries.len().saturating_sub(MAX_CONTEXT_MESSAGES);
+        let messages = self.entries[start..]
             .iter()
-            .map(|m| {
-                let msg_role = match m.role.as_str() {
-                    "assistant" => MessageRole::assistant,
-                    "system" => MessageRole::system,
-                    _ => MessageRole::user,
+            .filter(|e| e.entry_type == EntryType::Message)
+            .map(|e| {
+                let msg_role = if e.sender == agent_name {
+                    MessageRole::assistant
+                } else {
+                    MessageRole::user
                 };
-                Message::new(msg_role, m.content.clone())
+                Message::new(msg_role, e.content.clone())
             })
             .collect();
 
@@ -174,9 +199,9 @@ impl Session {
         }
     }
 
-    /// Number of messages currently in the session
-    pub fn message_count(&self) -> usize {
-        self.messages.len()
+    /// Number of entries currently in the session
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Get the underlying eidetica Database handle (for sharing with tools)

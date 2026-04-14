@@ -3,7 +3,7 @@ pub mod tui;
 
 use crate::backends::BackendManager;
 use crate::role::RoleDetails;
-use crate::session::SessionMessage;
+use crate::session::SessionEntry;
 use crate::tool::ToolApprovalInfo;
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,7 +37,7 @@ pub struct ChatRequest {
     pub backend: BackendManager,
     pub response_tx: oneshot::Sender<ChatResponse>,
     /// Room history for backfilling sessions (provided on first message per room)
-    pub backfill_history: Option<Vec<SessionMessage>>,
+    pub backfill_history: Option<Vec<SessionEntry>>,
     /// Channel for the runtime to request tool approval from the gateway.
     /// The gateway reads approval requests and sends back decisions.
     pub approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
