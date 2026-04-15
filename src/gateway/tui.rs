@@ -116,13 +116,7 @@ async fn setup_session(
     notify_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
     server
-        .register_session(
-            transport_id,
-            session_db,
-            backend,
-            None,
-            Some(approval_tx),
-        )
+        .register_session(transport_id, session_db, backend, None, Some(approval_tx))
         .await?;
 
     // Register TUI notification callback — fires on any session write
@@ -221,7 +215,10 @@ impl Gateway for TuiGateway {
         // Initialize app state
         let mut app = App::new(agent_names, default_transport.clone());
         {
-            let agent = server.registry().resolve_agent(&default_transport, None).await;
+            let agent = server
+                .registry()
+                .resolve_agent(&default_transport, None)
+                .await;
             app.current_agent = agent.name.clone();
             let session = Session::new(
                 crate::types::ConversationId(default_transport.clone()),
@@ -270,18 +267,12 @@ impl Gateway for TuiGateway {
                     } else {
                         match app.mode {
                             TuiMode::Chat => {
-                                let switch = handle_chat_key(
-                                    &mut app,
-                                    key,
-                                    &session_db,
-                                )
-                                .await;
+                                let switch = handle_chat_key(&mut app, key, &session_db).await;
 
                                 if let Some(cmd) = switch {
                                     match cmd {
                                         ChatCommand::OpenPicker => {
-                                            app.session_list =
-                                                load_session_list(&server).await;
+                                            app.session_list = load_session_list(&server).await;
                                             // Pre-select current session
                                             app.picker_index = app
                                                 .session_list
@@ -309,19 +300,26 @@ impl Gateway for TuiGateway {
                                                     app.waiting = false;
                                                 }
                                                 Err(e) => {
-                                                    show_error(&mut app, format!("Failed to switch session: {e}"));
+                                                    show_error(
+                                                        &mut app,
+                                                        format!("Failed to switch session: {e}"),
+                                                    );
                                                 }
                                             }
                                         }
                                         ChatCommand::ShareSession => {
-                                            match generate_share_ticket(&server, &session_db).await {
+                                            match generate_share_ticket(&server, &session_db).await
+                                            {
                                                 Ok(ticket) => {
                                                     show_system_msg(&mut app, format!(
                                                         "Share this ticket to sync the current session:\n\n{ticket}"
                                                     ));
                                                 }
                                                 Err(e) => {
-                                                    show_error(&mut app, format!("Failed to generate ticket: {e}"));
+                                                    show_error(
+                                                        &mut app,
+                                                        format!("Failed to generate ticket: {e}"),
+                                                    );
                                                 }
                                             }
                                         }
@@ -331,7 +329,10 @@ impl Gateway for TuiGateway {
                                                     show_system_msg(&mut app, msg);
                                                 }
                                                 Err(e) => {
-                                                    show_error(&mut app, format!("Sync failed: {e}"));
+                                                    show_error(
+                                                        &mut app,
+                                                        format!("Sync failed: {e}"),
+                                                    );
                                                 }
                                             }
                                         }
@@ -339,9 +340,7 @@ impl Gateway for TuiGateway {
                                 }
                             }
                             TuiMode::SessionPicker => {
-                                if let Some(selected) =
-                                    handle_picker_key(&mut app, key)
-                                {
+                                if let Some(selected) = handle_picker_key(&mut app, key) {
                                     match switch_session(
                                         &server,
                                         &selected,
@@ -360,9 +359,10 @@ impl Gateway for TuiGateway {
                                             app.waiting = false;
                                         }
                                         Err(e) => {
-                                            show_error(&mut app, format!(
-                                                "Failed to switch session: {e}"
-                                            ));
+                                            show_error(
+                                                &mut app,
+                                                format!("Failed to switch session: {e}"),
+                                            );
                                         }
                                     }
                                     app.mode = TuiMode::Chat;
@@ -451,8 +451,7 @@ async fn generate_share_ticket(
         .sync()
         .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
 
-    let mut ticket =
-        eidetica::sync::DatabaseTicket::new(session_db.root_id().clone());
+    let mut ticket = eidetica::sync::DatabaseTicket::new(session_db.root_id().clone());
 
     // Add all known server addresses as hints
     if let Ok(addresses) = sync.get_all_server_addresses().await {
@@ -756,13 +755,10 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
             }
             None
         }
-        KeyCode::Enter => {
-            if let Some(info) = app.session_list.get(app.picker_index) {
-                Some(info.transport_id.clone())
-            } else {
-                None
-            }
-        }
+        KeyCode::Enter => app
+            .session_list
+            .get(app.picker_index)
+            .map(|info| info.transport_id.clone()),
         KeyCode::Char('n') => {
             // Create new session with a UUID transport ID
             let tid = format!("tui:{}", uuid::Uuid::new_v4());
@@ -931,11 +927,8 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         " {} | agent: {} | messages: {}{} | /help",
         app.transport_id, app.current_agent, msg_count, debug_indicator
     );
-    let status = Paragraph::new(status_text).style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White),
-    );
+    let status =
+        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(status, chunks[1]);
 
     // === Input area ===
@@ -971,10 +964,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
             let marker = if is_selected { "> " } else { "  " };
             let current_marker = if is_current { " *" } else { "" };
 
-            let agent_str = info
-                .agent_name
-                .as_deref()
-                .unwrap_or("default");
+            let agent_str = info.agent_name.as_deref().unwrap_or("default");
 
             let header = format!(
                 "{}{}{} ({}, {} entries)",
@@ -995,14 +985,9 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
 
             // Show last message preview
             if let Some(ref preview) = info.last_message {
-                let preview_style = if is_selected {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
                 lines.push(Line::from(vec![Span::styled(
                     format!("    {preview}"),
-                    preview_style,
+                    Style::default().fg(Color::DarkGray),
                 )]));
             }
 
@@ -1015,9 +1000,8 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
         .block(Block::bordered().title(" Sessions "));
     f.render_widget(list, chunks[0]);
 
-    let help = Paragraph::new(
-        " [Up/Down] navigate | [Enter] select | [n] new session | [Esc] cancel",
-    )
-    .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let help =
+        Paragraph::new(" [Up/Down] navigate | [Enter] select | [n] new session | [Esc] cancel")
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(help, chunks[1]);
 }

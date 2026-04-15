@@ -138,7 +138,8 @@ impl Session {
             });
             if !already_exists {
                 if let Ok(txn) = self.database.new_transaction().await {
-                    if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
+                    if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await
+                    {
                         if store.insert(entry.clone()).await.is_ok() {
                             let _ = txn.commit().await;
                         }
@@ -188,11 +189,6 @@ impl Session {
             model,
             role,
         }
-    }
-
-    /// Number of entries currently in the session
-    pub fn entry_count(&self) -> usize {
-        self.entries.len()
     }
 
     /// Get the most recent entry, if any
@@ -285,9 +281,7 @@ impl SessionRegistry {
         let txn = self.registry_db.new_transaction().await?;
         let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
 
-        let existing = bindings
-            .search(|b| b.transport_id == transport_id)
-            .await?;
+        let existing = bindings.search(|b| b.transport_id == transport_id).await?;
 
         if let Some((_, binding)) = existing.into_iter().next() {
             // Found existing binding — open the session DB
@@ -295,7 +289,10 @@ impl SessionRegistry {
             let db = {
                 let user = self.user.lock().await;
                 let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
-                    anyhow::anyhow!("Failed to parse session DB ID '{}': {e}", binding.session_db_id)
+                    anyhow::anyhow!(
+                        "Failed to parse session DB ID '{}': {e}",
+                        binding.session_db_id
+                    )
                 })?;
                 user.open_database(&root_id).await?
             };
@@ -333,11 +330,7 @@ impl SessionRegistry {
 
     /// Resolve which agent should handle a conversation.
     /// Priority: explicit override > persisted binding > default agent.
-    pub async fn resolve_agent(
-        &self,
-        transport_id: &str,
-        override_name: Option<&str>,
-    ) -> Agent {
+    pub async fn resolve_agent(&self, transport_id: &str, override_name: Option<&str>) -> Agent {
         // Check explicit override first
         if let Some(name) = override_name {
             if let Some(agent) = self.agents.get(name) {
@@ -348,10 +341,7 @@ impl SessionRegistry {
         // Check persisted binding
         if let Ok(txn) = self.registry_db.new_transaction().await {
             if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
-                if let Ok(results) = bindings
-                    .search(|b| b.transport_id == transport_id)
-                    .await
-                {
+                if let Ok(results) = bindings.search(|b| b.transport_id == transport_id).await {
                     if let Some((_, binding)) = results.into_iter().next() {
                         if let Some(agent_name) = &binding.agent_name {
                             if let Some(agent) = self.agents.get(agent_name) {
@@ -370,10 +360,7 @@ impl SessionRegistry {
     pub async fn set_agent_binding(&self, transport_id: &str, agent_name: String) {
         if let Ok(txn) = self.registry_db.new_transaction().await {
             if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
-                if let Ok(results) = bindings
-                    .search(|b| b.transport_id == transport_id)
-                    .await
-                {
+                if let Ok(results) = bindings.search(|b| b.transport_id == transport_id).await {
                     if let Some((key, mut binding)) = results.into_iter().next() {
                         binding.agent_name = Some(agent_name);
                         let _ = bindings.set(&key, binding).await;

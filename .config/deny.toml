@@ -1,4 +1,19 @@
 [advisories]
+# Upstream transitive dependency issues (via eidetica → iroh)
+ignore = [
+    # Transitive via eidetica → iroh
+    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained
+    "RUSTSEC-2025-0012", # rustls vulnerability
+    "RUSTSEC-2026-0098", # rustls-webpki URI name constraints
+    "RUSTSEC-2026-0099", # rustls-webpki wildcard name constraints
+    # Transitive via headjack → matrix-sdk 0.7
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
+    "RUSTSEC-2024-0384", # instant unmaintained
+    "RUSTSEC-2024-0436", # paste-impl unmaintained
+    "RUSTSEC-2025-0065", # matrix-sdk-base power level panic
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+    "RUSTSEC-2025-0135", # matrix-sdk-base join_rules DoS
+]
 
 [bans]
 multiple-versions = "allow"
@@ -9,6 +24,7 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",
