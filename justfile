@@ -100,6 +100,31 @@ fmt mode='':
     esac
 
 # =============================================================================
+# Documentation
+# =============================================================================
+
+# Documentation commands: build, serve, test
+doc action='build':
+    #!/usr/bin/env bash
+    set -e
+    case "{{ action }}" in
+        build)
+            mdbook build docs
+            ;;
+        serve)
+            mdbook serve docs --open
+            ;;
+        test)
+            mdbook test docs
+            ;;
+        *)
+            echo "Unknown action: {{ action }}"
+            echo "Options: build, serve, test"
+            exit 1
+            ;;
+    esac
+
+# =============================================================================
 # CI
 # =============================================================================
 

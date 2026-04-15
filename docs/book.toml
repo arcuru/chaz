@@ -1,0 +1,13 @@
+[book]
+authors = ["Patrick Jackson"]
+title = "Chaz Documentation"
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+additional-js = ["mermaid-init.js"]
+git-repository-url = "https://github.com/arcuru/chaz"
+
+[rust]
+edition = "2024"
