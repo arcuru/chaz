@@ -309,15 +309,29 @@ impl Gateway for TuiGateway {
                                                     app.waiting = false;
                                                 }
                                                 Err(e) => {
-                                                    // Show error inline
-                                                    app.entries.push(SessionEntry {
-                                                        sender: "system".to_string(),
-                                                        content: format!(
-                                                            "Failed to switch session: {e}"
-                                                        ),
-                                                        timestamp: chrono::Utc::now(),
-                                                        entry_type: EntryType::Error,
-                                                    });
+                                                    show_error(&mut app, format!("Failed to switch session: {e}"));
+                                                }
+                                            }
+                                        }
+                                        ChatCommand::ShareSession => {
+                                            match generate_share_ticket(&server, &session_db).await {
+                                                Ok(ticket) => {
+                                                    show_system_msg(&mut app, format!(
+                                                        "Share this ticket to sync the current session:\n\n{ticket}"
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    show_error(&mut app, format!("Failed to generate ticket: {e}"));
+                                                }
+                                            }
+                                        }
+                                        ChatCommand::SyncTicket(ticket_str) => {
+                                            match sync_from_ticket(&server, &ticket_str).await {
+                                                Ok(msg) => {
+                                                    show_system_msg(&mut app, msg);
+                                                }
+                                                Err(e) => {
+                                                    show_error(&mut app, format!("Sync failed: {e}"));
                                                 }
                                             }
                                         }
@@ -346,14 +360,9 @@ impl Gateway for TuiGateway {
                                             app.waiting = false;
                                         }
                                         Err(e) => {
-                                            app.entries.push(SessionEntry {
-                                                sender: "system".to_string(),
-                                                content: format!(
-                                                    "Failed to switch session: {e}"
-                                                ),
-                                                timestamp: chrono::Utc::now(),
-                                                entry_type: EntryType::Error,
-                                            });
+                                            show_error(&mut app, format!(
+                                                "Failed to switch session: {e}"
+                                            ));
                                         }
                                     }
                                     app.mode = TuiMode::Chat;
@@ -399,6 +408,8 @@ impl Gateway for TuiGateway {
 enum ChatCommand {
     OpenPicker,
     SwitchSession(String),
+    ShareSession,
+    SyncTicket(String),
 }
 
 /// Switch to a different session. Registers with server and returns the new DB, entries, and agent name.
@@ -428,6 +439,69 @@ async fn switch_session(
     let session = Session::new(conv_id, session_db.clone()).await;
     let entries = session.entries().to_vec();
     Ok((session_db, entries, agent.name))
+}
+
+/// Generate a shareable DatabaseTicket for the current session.
+async fn generate_share_ticket(
+    server: &Server,
+    session_db: &eidetica::Database,
+) -> anyhow::Result<String> {
+    let instance = server.registry().instance();
+    let sync = instance
+        .sync()
+        .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+
+    let mut ticket =
+        eidetica::sync::DatabaseTicket::new(session_db.root_id().clone());
+
+    // Add all known server addresses as hints
+    if let Ok(addresses) = sync.get_all_server_addresses().await {
+        for (transport_type, address) in addresses {
+            ticket.add_address(eidetica::sync::Address::new(transport_type, address));
+        }
+    }
+
+    Ok(ticket.to_string())
+}
+
+/// Sync a remote session via a DatabaseTicket URL.
+async fn sync_from_ticket(server: &Server, ticket_str: &str) -> anyhow::Result<String> {
+    let instance = server.registry().instance();
+    let sync = instance
+        .sync()
+        .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+
+    let ticket: eidetica::sync::DatabaseTicket = ticket_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid ticket: {e}"))?;
+
+    let db_id = ticket.database_id().clone();
+    sync.sync_with_ticket(&ticket).await?;
+
+    Ok(format!(
+        "Synced database {}. Use /sessions to find and open it.",
+        db_id
+    ))
+}
+
+/// Show a system message in the TUI.
+fn show_system_msg(app: &mut App, content: String) {
+    app.entries.push(SessionEntry {
+        sender: "system".to_string(),
+        content,
+        timestamp: chrono::Utc::now(),
+        entry_type: EntryType::Message,
+    });
+}
+
+/// Show an error in the TUI.
+fn show_error(app: &mut App, content: String) {
+    app.entries.push(SessionEntry {
+        sender: "system".to_string(),
+        content,
+        timestamp: chrono::Utc::now(),
+        entry_type: EntryType::Error,
+    });
 }
 
 /// Handle a key event in chat mode. Returns a ChatCommand if the event loop
@@ -485,6 +559,16 @@ async fn handle_chat_key(
                         let tid = format!("tui:{}", uuid::Uuid::new_v4());
                         return Some(ChatCommand::SwitchSession(tid));
                     }
+                    "/share" => {
+                        return Some(ChatCommand::ShareSession);
+                    }
+                    _ if text.starts_with("/sync ") => {
+                        let ticket = text.strip_prefix("/sync ").unwrap().trim().to_string();
+                        if !ticket.is_empty() {
+                            return Some(ChatCommand::SyncTicket(ticket));
+                        }
+                        return None;
+                    }
                     "/help" | "/?" => {
                         app.entries.push(SessionEntry {
                             sender: "system".to_string(),
@@ -494,6 +578,8 @@ async fn handle_chat_key(
                                 "  /new           — create a new session",
                                 "  /join <id>     — switch to session by transport ID",
                                 "  /info          — show current session info",
+                                "  /share         — generate shareable ticket for current session",
+                                "  /sync <ticket> — sync a remote session via ticket",
                                 "  /clear         — clear display (entries still in DB)",
                                 "  /raw           — dump raw entry data for debugging",
                                 "  /debug         — toggle debug mode (Ctrl+D)",

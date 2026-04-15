@@ -18,7 +18,7 @@ use gateway::Gateway;
 
 use clap::Parser;
 use std::{fs::File, io::Read, path::PathBuf};
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -62,6 +62,19 @@ async fn main() -> anyhow::Result<()> {
     let instance = eidetica::Instance::open(Box::new(backend)).await?;
     let _ = instance.create_user("chaz", None).await; // OK if already exists
     let user = instance.login_user("chaz", None).await?;
+
+    // Enable eidetica sync with HTTP transport for session sharing
+    instance.enable_sync().await?;
+    if let Some(sync) = instance.sync() {
+        use eidetica::sync::transports::http::HttpTransport;
+        sync.register_transport("http", HttpTransport::builder())
+            .await?;
+        sync.accept_connections().await?;
+        match sync.get_server_address().await {
+            Ok(addr) => info!("Eidetica sync listening on {addr}"),
+            Err(e) => tracing::warn!("Could not get sync server address: {e}"),
+        }
+    }
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
     let registry =
