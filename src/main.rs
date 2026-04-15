@@ -6,6 +6,7 @@ mod gateway;
 mod openai;
 mod role;
 mod runtime;
+mod scheduler;
 mod security;
 pub mod server;
 mod session;
@@ -174,9 +175,27 @@ async fn main() -> anyhow::Result<()> {
         "SpawnAgent server cell already set"
     );
 
+    // Start the scheduler if any schedules are configured
+    let scheduler = if let Some(schedules) = config.schedules.clone() {
+        if !schedules.is_empty() {
+            let sched = std::sync::Arc::new(scheduler::Scheduler::new(
+                schedules,
+                server.clone(),
+                backends::BackendManager::new(&config.backends, secret_store.clone()),
+            ));
+            sched.start();
+            Some(sched)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Run the selected gateway
     let result = if args.tui {
-        let gateway = gateway::tui::TuiGateway::new(config, secret_store);
+        let gateway =
+            gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
         gateway.run(server).await
     } else {
         let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;

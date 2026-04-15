@@ -1,6 +1,7 @@
 use crate::backends::BackendManager;
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
+use crate::scheduler::Scheduler;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
@@ -21,11 +22,21 @@ use tokio_stream::StreamExt;
 pub struct TuiGateway {
     config: Config,
     secrets: SecretStore,
+    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl TuiGateway {
     pub fn new(config: Config, secrets: SecretStore) -> Self {
-        Self { config, secrets }
+        Self {
+            config,
+            secrets,
+            scheduler: None,
+        }
+    }
+
+    pub fn with_scheduler(mut self, scheduler: Option<Arc<Scheduler>>) -> Self {
+        self.scheduler = scheduler;
+        self
     }
 }
 
@@ -336,6 +347,46 @@ impl Gateway for TuiGateway {
                                                 }
                                             }
                                         }
+                                        ChatCommand::ListSchedules => {
+                                            if let Some(ref sched) = self.scheduler {
+                                                let schedules = sched.list().await;
+                                                if schedules.is_empty() {
+                                                    show_system_msg(&mut app, "No schedules configured.".to_string());
+                                                } else {
+                                                    let mut msg = String::from("Schedules:\n");
+                                                    for s in &schedules {
+                                                        let status = if s.enabled { "enabled" } else { "disabled" };
+                                                        let last = s.last_run
+                                                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                                                            .unwrap_or_else(|| "never".to_string());
+                                                        let next = s.next_run
+                                                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                                                            .unwrap_or_else(|| "n/a".to_string());
+                                                        msg.push_str(&format!(
+                                                            "\n  {} [{}]\n    session: {}\n    task: {}\n    last: {} | next: {}\n",
+                                                            s.name, status, s.session, s.task, last, next
+                                                        ));
+                                                    }
+                                                    show_system_msg(&mut app, msg);
+                                                }
+                                            } else {
+                                                show_system_msg(&mut app, "No scheduler configured.".to_string());
+                                            }
+                                        }
+                                        ChatCommand::TriggerSchedule(name) => {
+                                            if let Some(ref sched) = self.scheduler {
+                                                match sched.trigger(&name).await {
+                                                    Ok(()) => {
+                                                        show_system_msg(&mut app, format!("Triggered schedule '{name}'."));
+                                                    }
+                                                    Err(e) => {
+                                                        show_error(&mut app, format!("Failed to trigger '{name}': {e}"));
+                                                    }
+                                                }
+                                            } else {
+                                                show_error(&mut app, "No scheduler configured.".to_string());
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -410,6 +461,8 @@ enum ChatCommand {
     SwitchSession(String),
     ShareSession,
     SyncTicket(String),
+    ListSchedules,
+    TriggerSchedule(String),
 }
 
 /// Switch to a different session. Registers with server and returns the new DB, entries, and agent name.
@@ -568,6 +621,16 @@ async fn handle_chat_key(
                         }
                         return None;
                     }
+                    "/schedules" => {
+                        return Some(ChatCommand::ListSchedules);
+                    }
+                    _ if text.starts_with("/run ") => {
+                        let name = text.strip_prefix("/run ").unwrap().trim().to_string();
+                        if !name.is_empty() {
+                            return Some(ChatCommand::TriggerSchedule(name));
+                        }
+                        return None;
+                    }
                     "/help" | "/?" => {
                         app.entries.push(SessionEntry {
                             sender: "system".to_string(),
@@ -579,6 +642,8 @@ async fn handle_chat_key(
                                 "  /info          — show current session info",
                                 "  /share         — generate shareable ticket for current session",
                                 "  /sync <ticket> — sync a remote session via ticket",
+                                "  /schedules     — list configured schedules",
+                                "  /run <name>    — trigger a schedule immediately",
                                 "  /clear         — clear display (entries still in DB)",
                                 "  /raw           — dump raw entry data for debugging",
                                 "  /debug         — toggle debug mode (Ctrl+D)",
@@ -616,11 +681,13 @@ async fn handle_chat_key(
                             .iter()
                             .filter(|e| e.entry_type == EntryType::Error)
                             .count();
+                        let db_id = session_db.root_id().to_string();
                         app.entries.push(SessionEntry {
                             sender: "system".to_string(),
                             content: format!(
-                                "Session: {}\nTotal entries: {}\nMessages: {} | Directives: {} | Tool calls: {} | Errors: {}\nDebug mode: {}",
+                                "Session: {}\nDatabase ID: {}\nTotal entries: {}\nMessages: {} | Directives: {} | Tool calls: {} | Errors: {}\nDebug mode: {}",
                                 app.transport_id,
+                                db_id,
                                 app.entries.len(),
                                 msg_count,
                                 directive_count,

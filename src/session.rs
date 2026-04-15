@@ -269,6 +269,37 @@ impl SessionRegistry {
         Ok(results.into_iter().map(|(_, b)| b).collect())
     }
 
+    /// Open a session database by its eidetica root ID.
+    ///
+    /// Returns the transport_id (from the registry binding) and the database handle.
+    /// Fails if no binding exists for this root ID.
+    pub async fn open_session_by_db_id(
+        &self,
+        db_id: &str,
+    ) -> anyhow::Result<(String, ConversationId, Database)> {
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+        let results = bindings
+            .search(|b| b.session_db_id == db_id)
+            .await?;
+
+        let (_, binding) = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No session found for DB ID '{db_id}'"))?;
+
+        let conversation_id = ConversationId(binding.conversation_id);
+        let db = {
+            let user = self.user.lock().await;
+            let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
+                anyhow::anyhow!("Failed to parse session DB ID '{}': {e}", binding.session_db_id)
+            })?;
+            user.open_database(&root_id).await?
+        };
+
+        Ok((binding.transport_id, conversation_id, db))
+    }
+
     /// Look up a transport ID and return the session Database, creating one if needed.
     ///
     /// On first call for a transport_id, creates a new eidetica Database and persists

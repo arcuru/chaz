@@ -33,6 +33,8 @@ pub struct Config {
     pub agents: Option<Vec<AgentConfig>>,
     /// Security settings
     pub security: Option<SecurityConfig>,
+    /// Scheduled tasks
+    pub schedules: Option<Vec<ScheduleConfig>>,
 }
 
 /// Configuration for an agent
@@ -130,6 +132,26 @@ pub struct Model {
 #[serde(rename_all = "lowercase")]
 pub enum BackendType {
     OpenAICompatible,
+}
+
+/// Configuration for a scheduled task
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScheduleConfig {
+    /// Unique name for this schedule
+    pub name: String,
+    /// Eidetica database root ID of the target session
+    pub session: String,
+    /// Task instructions sent as the directive content
+    pub task: String,
+    /// Cron expression (e.g., "0 9 * * *")
+    pub cron: String,
+    /// Whether this schedule is active (default: true)
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// Security configuration

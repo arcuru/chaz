@@ -28,6 +28,7 @@ dirs = "5"
 openai-api-rs = "5"
 eidetica = { git = "https://github.com/arcuru/eidetica", features = ["sqlite"] }
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
 meval = "0.2"
 reqwest = "0.12"
 serde_json = "1"
