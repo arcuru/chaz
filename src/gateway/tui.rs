@@ -62,6 +62,7 @@ struct App {
     waiting: bool,
     agent_names: HashSet<String>,
     should_quit: bool,
+    debug_mode: bool,
     // Current session
     transport_id: String,
     // Session picker state
@@ -81,6 +82,7 @@ impl App {
             waiting: false,
             agent_names,
             should_quit: false,
+            debug_mode: false,
             transport_id,
             session_list: Vec::new(),
             picker_index: 0,
@@ -252,11 +254,15 @@ impl Gateway for TuiGateway {
 
             match action {
                 Action::Key(key) => {
-                    // Ctrl+C always quits
+                    // Global key bindings
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         app.should_quit = true;
+                    } else if key.code == KeyCode::Char('d')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        app.debug_mode = !app.debug_mode;
                     } else {
                         match app.mode {
                             TuiMode::Chat => {
@@ -476,7 +482,14 @@ async fn handle_chat_key(
                                 "  /new           — create a new session",
                                 "  /join <id>     — switch to session by transport ID",
                                 "  /info          — show current session info",
+                                "  /raw           — dump raw entry data for debugging",
+                                "  /debug         — toggle debug mode (Ctrl+D)",
                                 "  /quit, /q      — exit",
+                                "",
+                                "Keys:",
+                                "  Ctrl+D         — toggle debug mode (shows timestamps, types)",
+                                "  Ctrl+C         — quit",
+                                "  Up/Down        — scroll messages",
                             ]
                             .join("\n"),
                             timestamp: chrono::Utc::now(),
@@ -495,18 +508,58 @@ async fn handle_chat_key(
                             .iter()
                             .filter(|e| e.entry_type == EntryType::ToolCall)
                             .count();
+                        let directive_count = app
+                            .entries
+                            .iter()
+                            .filter(|e| e.entry_type == EntryType::Directive)
+                            .count();
+                        let error_count = app
+                            .entries
+                            .iter()
+                            .filter(|e| e.entry_type == EntryType::Error)
+                            .count();
                         app.entries.push(SessionEntry {
                             sender: "system".to_string(),
                             content: format!(
-                                "Session: {}\nTotal entries: {}\nMessages: {}\nTool calls: {}",
+                                "Session: {}\nTotal entries: {}\nMessages: {} | Directives: {} | Tool calls: {} | Errors: {}\nDebug mode: {}",
                                 app.transport_id,
                                 app.entries.len(),
                                 msg_count,
+                                directive_count,
                                 tool_count,
+                                error_count,
+                                if app.debug_mode { "on" } else { "off" },
                             ),
                             timestamp: chrono::Utc::now(),
                             entry_type: EntryType::Message,
                         });
+                        return None;
+                    }
+                    "/raw" => {
+                        let mut raw = String::new();
+                        for (i, entry) in app.entries.iter().enumerate() {
+                            let ts = entry.timestamp.format("%H:%M:%S%.3f");
+                            let typ = format!("{:?}", entry.entry_type);
+                            let content_preview = if entry.content.len() > 80 {
+                                format!("{}...", &entry.content[..80])
+                            } else {
+                                entry.content.replace('\n', "\\n")
+                            };
+                            raw.push_str(&format!(
+                                "#{i:3} [{ts}] {typ:<12} {:<15} {content_preview}\n",
+                                entry.sender
+                            ));
+                        }
+                        app.entries.push(SessionEntry {
+                            sender: "system".to_string(),
+                            content: raw,
+                            timestamp: chrono::Utc::now(),
+                            entry_type: EntryType::Message,
+                        });
+                        return None;
+                    }
+                    "/debug" => {
+                        app.debug_mode = !app.debug_mode;
                         return None;
                     }
                     _ => {}
@@ -638,6 +691,16 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in &app.entries {
+        // Debug prefix: timestamp + entry type
+        let debug_prefix = if app.debug_mode {
+            let ts = entry.timestamp.format("%H:%M:%S");
+            let typ = format!("{:?}", entry.entry_type);
+            format!("[{ts} {typ:<10}] ")
+        } else {
+            String::new()
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+
         match entry.entry_type {
             EntryType::Message | EntryType::Directive => {
                 let is_agent = app.agent_names.contains(&entry.sender);
@@ -656,11 +719,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
                         .add_modifier(Modifier::BOLD)
                 };
 
-                let label = if entry.entry_type == EntryType::Directive {
-                    format!("{} (directive):", entry.sender)
+                let type_label = if entry.entry_type == EntryType::Directive {
+                    " (directive)"
                 } else {
-                    format!("{}:", entry.sender)
+                    ""
                 };
+                let label = format!("{}{}{}:", debug_prefix, entry.sender, type_label);
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
@@ -671,30 +735,31 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
             }
             EntryType::Ack => {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  {} thinking...", entry.sender),
-                    Style::default().fg(Color::DarkGray),
+                    format!("{debug_prefix}{} thinking...", entry.sender),
+                    dim,
                 )]));
             }
             EntryType::ToolCall => {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  > {}", entry.content),
-                    Style::default().fg(Color::DarkGray),
+                    format!("{debug_prefix}  > {}", entry.content),
+                    dim,
                 )]));
             }
             EntryType::ToolResult => {
-                let display = if entry.content.len() > 120 {
-                    format!("{}...", &entry.content[..120])
+                let max_len = if app.debug_mode { 500 } else { 120 };
+                let display = if entry.content.len() > max_len {
+                    format!("{}...", &entry.content[..max_len])
                 } else {
                     entry.content.clone()
                 };
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  < {display}"),
-                    Style::default().fg(Color::DarkGray),
+                    format!("{debug_prefix}  < {display}"),
+                    dim,
                 )]));
             }
             EntryType::Error => {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  ERROR {}: {}", entry.sender, entry.content),
+                    format!("{debug_prefix}  ERROR {}: {}", entry.sender, entry.content),
                     Style::default().fg(Color::Red),
                 )]));
                 lines.push(Line::from(""));
@@ -756,9 +821,10 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         .iter()
         .filter(|e| e.entry_type == EntryType::Message)
         .count();
+    let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let status_text = format!(
-        " session: {} | entries: {} | /sessions to switch | /help for commands",
-        app.transport_id, msg_count
+        " session: {} | messages: {}{} | /sessions to switch | /help for commands",
+        app.transport_id, msg_count, debug_indicator
     );
     let status = Paragraph::new(status_text).style(
         Style::default()
