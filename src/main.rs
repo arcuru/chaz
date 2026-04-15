@@ -77,8 +77,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
-    let registry =
-        session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
+    let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
     let central_db = registry.central_db().clone();
 
     // Build secret store backed by the central eidetica database.

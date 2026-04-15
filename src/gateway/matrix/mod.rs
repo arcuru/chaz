@@ -221,8 +221,7 @@ impl Gateway for MatrixGateway {
             let gateway_watched = gateway_watched.clone();
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
-            let seen_events: Arc<Mutex<HashSet<String>>> =
-                Arc::new(Mutex::new(HashSet::new()));
+            let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             bot.register_text_handler(move |sender, body: String, room, event| {
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
@@ -277,17 +276,14 @@ impl Gateway for MatrixGateway {
                     let room_id = room.room_id().to_string();
 
                     // Get or create session DB
-                    let (_conv_id, session_db) = match server
-                        .registry()
-                        .get_or_create_session_db(&room_id)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("Failed to get session DB: {e}");
-                            return Ok(());
-                        }
-                    };
+                    let (_conv_id, session_db) =
+                        match server.registry().get_or_create_session_db(&room_id).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("Failed to get session DB: {e}");
+                                return Ok(());
+                            }
+                        };
 
                     // Register server callback (agent processing)
                     if let Err(e) = server
@@ -315,19 +311,17 @@ impl Gateway for MatrixGateway {
                             let matrix_room = room.clone();
                             let agents = server.agents().clone();
                             let rid = room_id.clone();
-                            if let Err(e) = session_db.on_local_write(
-                                move |_entry, db, _instance| {
+                            if let Err(e) =
+                                session_db.on_local_write(move |_entry, db, _instance| {
                                     let matrix_room = matrix_room.clone();
                                     let agents = agents.clone();
                                     let db = db.clone();
                                     let rid = rid.clone();
                                     Box::pin(async move {
                                         // Read latest entry
-                                        let session = Session::new(
-                                            crate::types::ConversationId(rid),
-                                            db,
-                                        )
-                                        .await;
+                                        let session =
+                                            Session::new(crate::types::ConversationId(rid), db)
+                                                .await;
                                         if let Some(latest) = session.latest_entry() {
                                             // Send agent messages to Matrix
                                             if latest.entry_type == EntryType::Message
@@ -350,8 +344,8 @@ impl Gateway for MatrixGateway {
                                         }
                                         Ok(())
                                     })
-                                },
-                            ) {
+                                })
+                            {
                                 error!("Failed to register gateway callback: {e}");
                             } else {
                                 info!("Gateway watching session DB for {}", room_id);
@@ -376,11 +370,8 @@ impl Gateway for MatrixGateway {
 
                     // Write user entry to session DB — triggers server callback → agent runs
                     // Agent response → triggers gateway callback → sends to Matrix room
-                    let mut session = Session::new(
-                        crate::types::ConversationId(room_id),
-                        session_db,
-                    )
-                    .await;
+                    let mut session =
+                        Session::new(crate::types::ConversationId(room_id), session_db).await;
                     session
                         .add_entry(SessionEntry {
                             sender: sender.to_string(),

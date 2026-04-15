@@ -100,8 +100,6 @@
 
         chaz-doc = craneLib.cargoDoc buildArgs;
 
-        chaz-fmt = craneLib.cargoFmt buildArgs;
-
         chaz-deny = craneLib.mkCargoDerivation (buildArgs
           // {
             pnameSuffix = "-deny";
@@ -189,7 +187,7 @@
 
         # Overlay for downstream consumers
         overlayAttrs = {
-          chaz = config.packages.chaz;
+          inherit (config.packages) chaz;
         };
 
         devShells.default = pkgs.mkShell {

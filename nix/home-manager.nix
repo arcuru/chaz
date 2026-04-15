@@ -17,7 +17,7 @@ in {
       description = "Package for the chaz service.";
     };
     settings = mkOption {
-      type = yamlFormat.type;
+      inherit (yamlFormat) type;
       default = {};
       example = literalExpression ''
         {
@@ -41,7 +41,7 @@ in {
 
       Service = {
         Environment = "RUST_LOG=error";
-        ExecStart = "${cfg.package}/bin/chaz --config ${yamlFormat.generate "config.yml" (cfg.settings)}";
+        ExecStart = "${cfg.package}/bin/chaz --config ${yamlFormat.generate "config.yml" cfg.settings}";
         Restart = "always";
       };
 

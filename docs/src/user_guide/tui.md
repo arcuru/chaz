@@ -35,31 +35,31 @@ The TUI has three sections:
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/help`, `/?` | Show all commands and key bindings |
-| `/sessions`, `/s` | Open session picker |
-| `/new` | Create a new session |
-| `/join <id>` | Switch to a session by transport ID |
-| `/info` | Show current session details (entry counts, debug state) |
-| `/share` | Generate a shareable ticket URL for the current session |
-| `/sync <ticket>` | Sync a remote session via a ticket URL |
-| `/clear` | Clear the display (entries remain in the database) |
-| `/raw` | Dump all raw entry data (index, timestamp, type, sender, content) |
-| `/debug` | Toggle debug mode |
-| `/quit`, `/q` | Exit |
+| Command           | Description                                                       |
+| ----------------- | ----------------------------------------------------------------- |
+| `/help`, `/?`     | Show all commands and key bindings                                |
+| `/sessions`, `/s` | Open session picker                                               |
+| `/new`            | Create a new session                                              |
+| `/join <id>`      | Switch to a session by transport ID                               |
+| `/info`           | Show current session details (entry counts, debug state)          |
+| `/share`          | Generate a shareable ticket URL for the current session           |
+| `/sync <ticket>`  | Sync a remote session via a ticket URL                            |
+| `/clear`          | Clear the display (entries remain in the database)                |
+| `/raw`            | Dump all raw entry data (index, timestamp, type, sender, content) |
+| `/debug`          | Toggle debug mode                                                 |
+| `/quit`, `/q`     | Exit                                                              |
 
 ## Key Bindings
 
-| Key | Action |
-|-----|--------|
-| `Enter` | Send message or execute command |
-| `Ctrl+D` | Toggle debug mode |
-| `Ctrl+C` | Quit |
-| `Up/Down` | Scroll messages (3 lines) |
-| `PageUp/PageDown` | Fast scroll (20 lines) |
-| `Home/End` | Move cursor to start/end of input |
-| `Esc` | Quit |
+| Key               | Action                            |
+| ----------------- | --------------------------------- |
+| `Enter`           | Send message or execute command   |
+| `Ctrl+D`          | Toggle debug mode                 |
+| `Ctrl+C`          | Quit                              |
+| `Up/Down`         | Scroll messages (3 lines)         |
+| `PageUp/PageDown` | Fast scroll (20 lines)            |
+| `Home/End`        | Move cursor to start/end of input |
+| `Esc`             | Quit                              |
 
 ## Debug Mode
 
@@ -107,14 +107,14 @@ The current session is marked with `*`. Press `Enter` to switch, `n` to create a
 
 The TUI renders different entry types with distinct styles:
 
-| Type | Appearance | Description |
-|------|------------|-------------|
-| Message | **Bold colored sender** + content | Chat messages from users and agents |
-| Directive | **Bold sender (directive):** + content | Task instructions (from spawn_agent, scheduler) |
-| Ack | Dimmed "*agent* thinking..." | Agent is processing |
-| ToolCall | Dimmed `> tool_name(args)` | Agent invoked a tool |
-| ToolResult | Dimmed `< tool_name: output` | Tool returned a result |
-| Error | Red `ERROR sender: message` | An error occurred |
+| Type       | Appearance                             | Description                                     |
+| ---------- | -------------------------------------- | ----------------------------------------------- |
+| Message    | **Bold colored sender** + content      | Chat messages from users and agents             |
+| Directive  | **Bold sender (directive):** + content | Task instructions (from spawn_agent, scheduler) |
+| Ack        | Dimmed "_agent_ thinking..."           | Agent is processing                             |
+| ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                            |
+| ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                          |
+| Error      | Red `ERROR sender: message`            | An error occurred                               |
 
 Senders are color-coded: agents in green, users in cyan, system in yellow.
 

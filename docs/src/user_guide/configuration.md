@@ -9,16 +9,16 @@ Chaz is configured via a YAML file passed with `--config`.
 homeserver_url: https://matrix.org
 username: "chaz"
 password: "hunter2"
-allow_list: "@user:matrix.org|@other:matrix.org"  # Regex
+allow_list: "@user:matrix.org|@other:matrix.org" # Regex
 
 # Persistence
-state_dir: "/path/to/state"  # Default: $XDG_STATE_HOME/chaz
+state_dir: "/path/to/state" # Default: $XDG_STATE_HOME/chaz
 
 # LLM backends (OpenAI-compatible)
 backends:
   - name: openrouter
     type: openaicompatible
-    api_key: "${OPENROUTER_API_KEY}"  # Env var reference
+    api_key: "${OPENROUTER_API_KEY}" # Env var reference
     api_base: https://openrouter.ai/api/v1
     models:
       - name: anthropic/claude-sonnet-4
@@ -35,7 +35,7 @@ agents:
   - name: default
     role: chaz
     max_iterations: 10
-    allowed_tools: null  # null = all tools
+    allowed_tools: null # null = all tools
     can_spawn: ["researcher", "coder"]
   - name: researcher
     role: researcher
@@ -72,7 +72,7 @@ security:
     - host: "api.example.com"
       path_prefix: "/v1"
       methods: ["GET"]
-  leak_policy: "redact"  # "redact" (default) or "block"
+  leak_policy: "redact" # "redact" (default) or "block"
   tool_policies:
     shell:
       approval: Always

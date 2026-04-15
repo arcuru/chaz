@@ -165,8 +165,7 @@ pub async fn execute(
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
 
                             // --- Security: approval gate ---
-                            if !approve_all
-                                && security.needs_approval(&call.name, &policy.approval)
+                            if !approve_all && security.needs_approval(&call.name, &policy.approval)
                             {
                                 let sensitive_refs: Vec<&str> =
                                     policy.sensitive_params.iter().map(|s| s.as_str()).collect();
@@ -243,8 +242,8 @@ pub async fn execute(
 
                     // Emit tool result event
                     if let Some(ref sink) = event_sink {
-                        let is_error =
-                            result.starts_with("Tool error:") || result.starts_with("Tool timed out");
+                        let is_error = result.starts_with("Tool error:")
+                            || result.starts_with("Tool timed out");
                         let _ = sink
                             .send(RuntimeEvent::ToolResult {
                                 id: call.id.clone(),

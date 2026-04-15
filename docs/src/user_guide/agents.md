@@ -9,10 +9,10 @@ Agents are defined in the `agents` section of the config:
 ```yaml
 agents:
   - name: default
-    role: chaz            # System prompt (from roles section)
-    max_iterations: 10    # Max ReAct loop iterations before forced summary
-    allowed_tools: null   # null = all tools, or list specific tools
-    can_spawn:            # Which agents this one can delegate to
+    role: chaz # System prompt (from roles section)
+    max_iterations: 10 # Max ReAct loop iterations before forced summary
+    allowed_tools: null # null = all tools, or list specific tools
+    can_spawn: # Which agents this one can delegate to
       - researcher
       - coder
 
@@ -52,7 +52,7 @@ agents:
 Tool access is controlled at two levels:
 
 1. **Agent definition**: `allowed_tools` restricts which tools an agent can see
-2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the *intersection* of A's tools and B's `allowed_tools`
+2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `allowed_tools`
 
 This means a child agent can never have more tools than its parent, even if its definition allows them.
 
@@ -88,7 +88,7 @@ presets:
 The calling agent can request a preset via the `spawn_agent` tool:
 
 ```json
-{"agent": "researcher", "task": "...", "preset": "deep"}
+{ "agent": "researcher", "task": "...", "preset": "deep" }
 ```
 
 ## Synchronous vs Asynchronous Spawn
@@ -96,7 +96,7 @@ The calling agent can request a preset via the `spawn_agent` tool:
 By default, `spawn_agent` waits for the child agent to complete and returns the result. With `"async": true`, it returns immediately and the child runs in the background:
 
 ```json
-{"agent": "researcher", "task": "...", "async": true}
+{ "agent": "researcher", "task": "...", "async": true }
 ```
 
 Async spawns return the child session ID, which can be found via `/sessions` in the TUI.

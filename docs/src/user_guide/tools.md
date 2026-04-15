@@ -4,17 +4,17 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 
 ## Built-in Tools
 
-| Tool | Risk | Approval | Description |
-|------|------|----------|-------------|
-| `get_time` | Low | Never | Returns the current UTC time |
-| `calculate` | Low | Never | Evaluates math expressions (via meval) |
-| `read_file` | Low | Never | Reads file contents from disk |
-| `remember` | Low | Never | Stores a key-value fact in persistent memory |
-| `recall` | Low | Never | Searches stored facts by keyword |
-| `write_file` | Medium | UnlessAutoApproved | Writes content to a file |
-| `web_fetch` | Medium | UnlessAutoApproved | HTTP GET or POST requests |
-| `spawn_agent` | Medium | UnlessAutoApproved | Delegates a task to a sub-agent |
-| `shell` | High | Always | Executes a shell command |
+| Tool          | Risk   | Approval           | Description                                  |
+| ------------- | ------ | ------------------ | -------------------------------------------- |
+| `get_time`    | Low    | Never              | Returns the current UTC time                 |
+| `calculate`   | Low    | Never              | Evaluates math expressions (via meval)       |
+| `read_file`   | Low    | Never              | Reads file contents from disk                |
+| `remember`    | Low    | Never              | Stores a key-value fact in persistent memory |
+| `recall`      | Low    | Never              | Searches stored facts by keyword             |
+| `write_file`  | Medium | UnlessAutoApproved | Writes content to a file                     |
+| `web_fetch`   | Medium | UnlessAutoApproved | HTTP GET or POST requests                    |
+| `spawn_agent` | Medium | UnlessAutoApproved | Delegates a task to a sub-agent              |
+| `shell`       | High   | Always             | Executes a shell command                     |
 
 ## Risk Levels
 
@@ -41,7 +41,7 @@ Returns the current UTC timestamp. No arguments.
 Evaluates a mathematical expression string. Uses the `meval` crate.
 
 ```json
-{"expression": "2 * pi * 6371"}
+{ "expression": "2 * pi * 6371" }
 ```
 
 ### read_file / write_file
@@ -67,7 +67,7 @@ Performs HTTP requests. Subject to network policy (endpoint allowlisting, SSRF p
 Executes a shell command. Subject to command allowlist/denylist filtering.
 
 ```json
-{"command": "ls -la /tmp"}
+{ "command": "ls -la /tmp" }
 ```
 
 ### remember / recall

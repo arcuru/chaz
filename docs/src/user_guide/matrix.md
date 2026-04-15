@@ -27,19 +27,19 @@ To send without the `!chaz` prefix in a DM, just type normally.
 
 Commands are sent as Matrix messages:
 
-| Command | Description |
-|---------|-------------|
-| `!chaz help` | Show available commands |
-| `!chaz print` | Print the current conversation context |
-| `!chaz send <msg>` | Send a message without conversation context |
-| `!chaz model <model>` | Set the model for this room |
-| `!chaz backend <name> <api_base> <api_key>` | Add a custom backend |
-| `!chaz role` | Show current role and available roles |
-| `!chaz role <name>` | Set role for this room |
-| `!chaz role <name> <prompt>` | Define a new role |
-| `!chaz list` | List available models |
-| `!chaz clear` | Ignore all messages before this point |
-| `!chaz rename` | Rename the room based on conversation content |
+| Command                                     | Description                                   |
+| ------------------------------------------- | --------------------------------------------- |
+| `!chaz help`                                | Show available commands                       |
+| `!chaz print`                               | Print the current conversation context        |
+| `!chaz send <msg>`                          | Send a message without conversation context   |
+| `!chaz model <model>`                       | Set the model for this room                   |
+| `!chaz backend <name> <api_base> <api_key>` | Add a custom backend                          |
+| `!chaz role`                                | Show current role and available roles         |
+| `!chaz role <name>`                         | Set role for this room                        |
+| `!chaz role <name> <prompt>`                | Define a new role                             |
+| `!chaz list`                                | List available models                         |
+| `!chaz clear`                               | Ignore all messages before this point         |
+| `!chaz rename`                              | Rename the room based on conversation content |
 
 ## Per-Room Settings
 

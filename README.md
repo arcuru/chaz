@@ -21,17 +21,17 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 
 ### Built-in Tools
 
-| Tool | Description |
-|------|-------------|
-| `get_time` | Current UTC time |
-| `calculate` | Math expressions |
-| `read_file` | Read file contents |
-| `write_file` | Write to files |
-| `web_fetch` | HTTP GET/POST |
-| `shell` | Execute commands (approval required) |
-| `remember` | Store key-value facts |
-| `recall` | Search stored facts |
-| `spawn_agent` | Delegate to sub-agents |
+| Tool          | Description                          |
+| ------------- | ------------------------------------ |
+| `get_time`    | Current UTC time                     |
+| `calculate`   | Math expressions                     |
+| `read_file`   | Read file contents                   |
+| `write_file`  | Write to files                       |
+| `web_fetch`   | HTTP GET/POST                        |
+| `shell`       | Execute commands (approval required) |
+| `remember`    | Store key-value facts                |
+| `recall`      | Search stored facts                  |
+| `spawn_agent` | Delegate to sub-agents               |
 
 ## Running
 
@@ -53,29 +53,29 @@ chaz --config config.yaml --tui
 
 #### TUI Commands
 
-| Command | Description |
-|---------|-------------|
-| `/help` | Show all commands and key bindings |
-| `/sessions`, `/s` | Open session picker |
-| `/new` | Create a new session |
-| `/join <id>` | Switch to session by transport ID |
-| `/info` | Show current session details |
-| `/share` | Generate shareable ticket for current session |
-| `/sync <ticket>` | Sync a remote session via ticket |
-| `/clear` | Clear display (entries remain in DB) |
-| `/raw` | Dump raw entry data for debugging |
-| `/debug` | Toggle debug mode (also Ctrl+D) |
-| `/quit`, `/q` | Exit |
+| Command           | Description                                   |
+| ----------------- | --------------------------------------------- |
+| `/help`           | Show all commands and key bindings            |
+| `/sessions`, `/s` | Open session picker                           |
+| `/new`            | Create a new session                          |
+| `/join <id>`      | Switch to session by transport ID             |
+| `/info`           | Show current session details                  |
+| `/share`          | Generate shareable ticket for current session |
+| `/sync <ticket>`  | Sync a remote session via ticket              |
+| `/clear`          | Clear display (entries remain in DB)          |
+| `/raw`            | Dump raw entry data for debugging             |
+| `/debug`          | Toggle debug mode (also Ctrl+D)               |
+| `/quit`, `/q`     | Exit                                          |
 
 #### TUI Key Bindings
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+D` | Toggle debug mode (shows timestamps, entry types) |
-| `Ctrl+C` | Quit |
-| `Up/Down` | Scroll messages |
-| `PageUp/PageDown` | Fast scroll (20 lines) |
-| `Home/End` | Move cursor in input |
+| Key               | Action                                            |
+| ----------------- | ------------------------------------------------- |
+| `Ctrl+D`          | Toggle debug mode (shows timestamps, entry types) |
+| `Ctrl+C`          | Quit                                              |
+| `Up/Down`         | Scroll messages                                   |
+| `PageUp/PageDown` | Fast scroll (20 lines)                            |
+| `Home/End`        | Move cursor in input                              |
 
 ## Session Sharing
 
@@ -143,14 +143,14 @@ Create a YAML config file:
 homeserver_url: https://matrix.org
 username: "chaz"
 password: ""
-allow_list: "@user:matrix.org"  # Regex for allowed accounts
-state_dir: "/path/to/state"     # Persistence directory
+allow_list: "@user:matrix.org" # Regex for allowed accounts
+state_dir: "/path/to/state" # Persistence directory
 
 # LLM backends (OpenAI-compatible)
 backends:
   - name: openrouter
     type: openaicompatible
-    api_key: "${OPENROUTER_API_KEY}"  # Supports env var references
+    api_key: "${OPENROUTER_API_KEY}" # Supports env var references
     api_base: https://openrouter.ai/api/v1
     models:
       - name: anthropic/claude-sonnet-4
@@ -159,7 +159,7 @@ backends:
 agents:
   - name: default
     role: chaz
-    allowed_tools: null  # null = all tools
+    allowed_tools: null # null = all tools
     can_spawn: ["researcher"]
   - name: researcher
     role: researcher
@@ -168,7 +168,8 @@ agents:
 
 # Security settings
 security:
-  auto_approved_tools: ["get_time", "calculate", "read_file", "remember", "recall"]
+  auto_approved_tools:
+    ["get_time", "calculate", "read_file", "remember", "recall"]
   shell_allowlist: ["ls", "cat", "grep", "find"]
   shell_denylist: ["rm", "sudo"]
   allowed_endpoints:

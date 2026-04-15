@@ -7,6 +7,7 @@ The tool system manages tool registration, policy enforcement, and per-agent too
 Every tool implements the `Tool` trait:
 
 <!-- Code block ignored: trait definition for illustration -->
+
 ```rust,ignore
 trait Tool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
@@ -23,6 +24,7 @@ trait Tool: Send + Sync {
 Each tool has a policy controlling its risk level, approval requirements, and execution timeout:
 
 <!-- Code block ignored: struct definition for illustration -->
+
 ```rust,ignore
 struct ToolPolicy {
     risk: RiskLevel,              // Low, Medium, High
@@ -48,6 +50,7 @@ graph TD
 When agent A spawns agent B, B's tools are computed as the intersection of A's current scope and B's `allowed_tools`. This is transitive -- tools can only decrease down the spawn tree.
 
 <!-- Code block ignored: struct definition for illustration -->
+
 ```rust,ignore
 struct ScopedTools {
     registry: Arc<ToolRegistry>,
@@ -66,6 +69,7 @@ impl ScopedTools {
 The `ToolContext` is passed to every tool execution:
 
 <!-- Code block ignored: struct definition for illustration -->
+
 ```rust,ignore
 struct ToolContext {
     agent_name: String,       // current agent

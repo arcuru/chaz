@@ -187,7 +187,12 @@ impl Server {
         call_depth: usize,
         max_call_depth: usize,
         parent_tools: ScopedTools,
-    ) -> anyhow::Result<(String, ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
+    ) -> anyhow::Result<(
+        String,
+        ConversationId,
+        eidetica::Database,
+        mpsc::Receiver<()>,
+    )> {
         let transport_id = format!("spawn:{}", uuid::Uuid::new_v4());
 
         let (conversation_id, session_db) = self
@@ -264,10 +269,8 @@ impl Server {
 
     /// Check a session for new entries and act on them.
     async fn process_session(&self, transport_id: &str) -> anyhow::Result<()> {
-        let (conversation_id, session_db) = self
-            .registry
-            .get_or_create_session_db(transport_id)
-            .await?;
+        let (conversation_id, session_db) =
+            self.registry.get_or_create_session_db(transport_id).await?;
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
@@ -410,7 +413,10 @@ impl Server {
                             .await;
                         }
                         runtime::RuntimeEvent::ToolResult {
-                            name, output, is_error, ..
+                            name,
+                            output,
+                            is_error,
+                            ..
                         } => {
                             let content = if is_error {
                                 format!("{name}: ERROR: {output}")

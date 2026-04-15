@@ -205,7 +205,6 @@ impl ToolRegistry {
             .find(|t| t.descriptor().name == name)
             .map(|t| t.as_ref())
     }
-
 }
 
 /// Owned, narrowable view of the tool registry.
@@ -233,12 +232,7 @@ impl ScopedTools {
             (None, None) => None,
             (None, Some(c)) => Some(c.to_vec()),
             (Some(p), None) => Some(p.clone()),
-            (Some(p), Some(c)) => Some(
-                c.iter()
-                    .filter(|t| p.contains(t))
-                    .cloned()
-                    .collect(),
-            ),
+            (Some(p), Some(c)) => Some(c.iter().filter(|t| p.contains(t)).cloned().collect()),
         };
         Self {
             registry: self.registry.clone(),

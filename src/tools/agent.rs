@@ -126,12 +126,8 @@ impl Tool for SpawnAgent {
                 .get(agent_name)
                 .ok_or_else(|| format!("Unknown agent: '{agent_name}'"))?;
 
-            let resolved = agent_def.resolve_overrides(
-                preset,
-                model_override,
-                max_iterations_override,
-                None,
-            );
+            let resolved =
+                agent_def.resolve_overrides(preset, model_override, max_iterations_override, None);
 
             info!(
                 caller = %ctx.agent_name,

@@ -19,14 +19,15 @@ security:
   # Per-tool policy overrides
   tool_policies:
     shell:
-      approval: Always     # Always ask, even if auto-approved
-      timeout: 60          # Seconds before execution times out
+      approval: Always # Always ask, even if auto-approved
+      timeout: 60 # Seconds before execution times out
     web_fetch:
       approval: UnlessAutoApproved
       timeout: 30
 ```
 
 Approval levels:
+
 - **Never** -- runs without asking
 - **UnlessAutoApproved** -- runs if in `auto_approved_tools`, asks otherwise
 - **Always** -- always asks the user
@@ -87,7 +88,7 @@ When a secret is detected:
 
 ```yaml
 security:
-  leak_policy: "redact"  # or "block"
+  leak_policy: "redact" # or "block"
 ```
 
 ## Prompt Injection Detection
