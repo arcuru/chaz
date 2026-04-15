@@ -1,32 +1,28 @@
-use crate::role::RoleDetails;
-use crate::runtime;
+use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use tracing::info;
 
-use crate::agent::AgentRegistry;
 use crate::backends::BackendManager;
 use crate::security::SecurityContext;
-use crate::tool::ToolPolicyRegistry;
-use eidetica::Database;
-use std::sync::Arc;
 
-/// Spawn a new agent to handle a task in a fresh session.
+/// Spawn a new agent to handle a task in a child session.
 ///
-/// Creates a new session (thread), runs the named agent's ReAct loop,
-/// and returns the result. The session persists in eidetica as a record.
+/// Creates a new session via the server, writes a Directive entry,
+/// and waits for the server's callback-driven processing to run the
+/// agent and write the response. The response is then returned to the
+/// calling agent.
 ///
-/// This is a privileged native-only tool — it holds Arc refs to the
-/// registries and backend needed for agent orchestration.
+/// This routes through the same server processing loop as gateway messages,
+/// unifying all agent invocation paths.
 pub struct SpawnAgent {
-    pub agent_registry: Arc<AgentRegistry>,
-    pub policies: Arc<ToolPolicyRegistry>,
+    pub server: Arc<OnceLock<Arc<Server>>>,
     pub backend: BackendManager,
     pub security: SecurityContext,
-    pub database: Database,
 }
 
 impl Tool for SpawnAgent {
@@ -60,6 +56,10 @@ impl Tool for SpawnAgent {
                     "max_iterations": {
                         "type": "integer",
                         "description": "Override max ReAct iterations"
+                    },
+                    "async": {
+                        "type": "boolean",
+                        "description": "If true, spawn the agent and return immediately without waiting for the result. The agent runs in the background."
                     }
                 },
                 "required": ["agent", "task"]
@@ -82,6 +82,11 @@ impl Tool for SpawnAgent {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
+            let server = self
+                .server
+                .get()
+                .ok_or_else(|| "SpawnAgent: server not initialized".to_string())?;
+
             if ctx.call_depth >= ctx.max_call_depth {
                 return Err(format!(
                     "Maximum spawn depth ({}) reached. Cannot spawn further agents.",
@@ -104,19 +109,20 @@ impl Tool for SpawnAgent {
                 .get("max_iterations")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
+            let is_async = arguments
+                .get("async")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            if !self
-                .agent_registry
-                .can_spawn(&ctx.agent_name, agent_name)
-            {
+            if !server.agents().can_spawn(&ctx.agent_name, agent_name) {
                 return Err(format!(
                     "Agent '{}' is not allowed to spawn '{}'",
                     ctx.agent_name, agent_name
                 ));
             }
 
-            let agent_def = self
-                .agent_registry
+            let agent_def = server
+                .agents()
                 .get(agent_name)
                 .ok_or_else(|| format!("Unknown agent: '{agent_name}'"))?;
 
@@ -131,100 +137,62 @@ impl Tool for SpawnAgent {
                 caller = %ctx.agent_name,
                 target = %agent_name,
                 depth = ctx.call_depth,
-                "Spawning agent"
+                "Spawning agent via server"
             );
 
-            // Build system prompt: agent's role + optional context suffix
-            let mut role = agent_def.default_role.clone();
-            if let Some(suffix) = &resolved.role_suffix {
-                if let Some(ref mut r) = role {
-                    let existing = r.get_prompt();
-                    *r = RoleDetails::new(
-                        &agent_def.name,
-                        None,
-                        Some(format!("{existing}\n\n{suffix}")),
-                        None,
-                    );
-                }
-            }
+            let child_max_depth = resolved.max_iterations as usize;
+
+            // Register a child session with the server
+            let (_transport_id, conversation_id, session_db, mut completion_rx) = server
+                .register_child_session(
+                    agent_name,
+                    self.backend.clone(),
+                    self.security.approval_callback.clone(),
+                    ctx.call_depth + 1,
+                    child_max_depth,
+                    ctx.tools.clone(),
+                )
+                .await
+                .map_err(|e| format!("Failed to create child session: {e}"))?;
+
+            // Build the directive content: task + optional context
+            let mut directive = task.to_string();
             if let Some(ctx_str) = context_str {
-                if let Some(ref mut r) = role {
-                    let existing = r.get_prompt();
-                    *r = RoleDetails::new(
-                        &agent_def.name,
-                        None,
-                        Some(format!("{existing}\n\nContext: {ctx_str}")),
-                        None,
-                    );
-                }
+                directive = format!("{directive}\n\nContext: {ctx_str}");
             }
 
-            // Create a fresh session for this spawned agent
-            let session_id = crate::types::ConversationId(uuid::Uuid::new_v4().to_string());
-            let mut session = Session::new_ephemeral(session_id, self.database.clone()).await;
-
-            // Add the task as the first entry (from the calling agent)
+            // Write the directive entry to trigger agent execution
+            let mut session = Session::new(conversation_id.clone(), session_db).await;
             session
                 .add_entry(SessionEntry {
                     sender: ctx.agent_name.clone(),
-                    content: task.to_string(),
+                    content: directive,
                     timestamp: chrono::Utc::now(),
-                    entry_type: EntryType::Message,
+                    entry_type: EntryType::Directive,
                 })
                 .await;
 
-            // Build context from the session
-            let chat_context = session.build_context(agent_name, role, resolved.model);
-
-            let child_tools = ctx.tools.narrow(resolved.allowed_tools.as_deref());
-
-            let child_security = SecurityContext {
-                leak_detector: self.security.leak_detector.clone(),
-                auto_approved_tools: self.security.auto_approved_tools.clone(),
-                approval_callback: self.security.approval_callback.clone(),
-            };
-
-            let child_ctx = ToolContext {
-                agent_name: agent_name.to_string(),
-                call_depth: ctx.call_depth + 1,
-                max_call_depth: ctx.max_call_depth,
-                tools: child_tools,
-            };
-
-            let result = runtime::execute(
-                &chat_context,
-                &self.backend,
-                &child_security,
-                &child_ctx,
-                &self.policies,
-            )
-            .await;
-
-            // Store the response/error in the session for audit trail
-            match &result {
-                Ok(response) => {
-                    session
-                        .add_entry(SessionEntry {
-                            sender: agent_name.to_string(),
-                            content: response.clone(),
-                            timestamp: chrono::Utc::now(),
-                            entry_type: EntryType::Message,
-                        })
-                        .await;
-                }
-                Err(error) => {
-                    session
-                        .add_entry(SessionEntry {
-                            sender: agent_name.to_string(),
-                            content: format!("Agent error: {error}"),
-                            timestamp: chrono::Utc::now(),
-                            entry_type: EntryType::Error,
-                        })
-                        .await;
-                }
+            if is_async {
+                // Fire-and-forget: return immediately, agent runs in background
+                return Ok(format!(
+                    "Agent '{agent_name}' spawned asynchronously in session {}",
+                    conversation_id.0
+                ));
             }
 
-            result
+            // Synchronous: wait for the server to process and the agent to complete
+            completion_rx
+                .recv()
+                .await
+                .ok_or_else(|| "Child agent task dropped without completing".to_string())?;
+
+            // Re-read the session to get the response
+            let session = Session::new(conversation_id, session.database().clone()).await;
+            match session.latest_entry() {
+                Some(e) if e.entry_type == EntryType::Message => Ok(e.content.clone()),
+                Some(e) if e.entry_type == EntryType::Error => Err(e.content.clone()),
+                _ => Err("No response from child agent".to_string()),
+            }
         })
     }
 }

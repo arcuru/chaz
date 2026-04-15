@@ -17,7 +17,24 @@ use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+/// Events emitted during the ReAct loop for audit trail / observability.
+#[allow(dead_code)]
+pub enum RuntimeEvent {
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+}
 
 const MAX_TOOL_ITERATIONS: usize = 10;
 
@@ -67,6 +84,7 @@ pub async fn execute(
     security: &SecurityContext,
     tool_ctx: &ToolContext,
     policies: &ToolPolicyRegistry,
+    event_sink: Option<mpsc::Sender<RuntimeEvent>>,
 ) -> Result<String, String> {
     let tools = &tool_ctx.tools;
 
@@ -129,6 +147,17 @@ pub async fn execute(
 
                 // Execute each tool with security checks
                 for call in &tool_calls {
+                    // Emit tool call event
+                    if let Some(ref sink) = event_sink {
+                        let _ = sink
+                            .send(RuntimeEvent::ToolCall {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            })
+                            .await;
+                    }
+
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
                             let policy = policies.resolve(tool);
@@ -211,6 +240,20 @@ pub async fn execute(
                         }
                         None => format!("Unknown tool: {}", call.name),
                     };
+
+                    // Emit tool result event
+                    if let Some(ref sink) = event_sink {
+                        let is_error =
+                            result.starts_with("Tool error:") || result.starts_with("Tool timed out");
+                        let _ = sink
+                            .send(RuntimeEvent::ToolResult {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                output: result.clone(),
+                                is_error,
+                            })
+                            .await;
+                    }
 
                     info!(
                         "Tool result for {}: {}",

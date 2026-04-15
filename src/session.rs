@@ -22,6 +22,13 @@ const MAX_CONTEXT_MESSAGES: usize = 50;
 pub enum EntryType {
     /// A chat message (from any participant)
     Message,
+    /// A task/instruction from a non-user source (spawn_agent, scheduler, system).
+    /// Included in LLM context as a user message.
+    Directive,
+    /// Record of a tool invocation (audit trail). Excluded from LLM context.
+    ToolCall,
+    /// Record of a tool result (audit trail). Excluded from LLM context.
+    ToolResult,
     /// Acknowledgement that work is in progress
     Ack,
     /// An error that occurred during processing
@@ -57,10 +64,6 @@ pub struct SessionBinding {
 /// Each session owns a dedicated eidetica Database containing a single
 /// `Table<SessionEntry>` store. Entries are loaded from the DB on
 /// creation and kept in memory for context building.
-///
-/// Regular sessions use store name "entries". Ephemeral sessions (spawned
-/// agents) use "entries:{conversation_id}" to avoid collisions when sharing
-/// a parent's database.
 pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
@@ -81,18 +84,6 @@ impl Session {
 
         session.load_from_db().await;
         session
-    }
-
-    /// Create a new session without loading existing entries.
-    /// Used by spawn_agent to create fresh sessions in a parent's database.
-    /// Uses a unique store name to avoid collisions with the parent's entries.
-    pub async fn new_ephemeral(conversation_id: ConversationId, database: Database) -> Self {
-        Session {
-            store_name: format!("entries:{}", conversation_id.0),
-            conversation_id,
-            database,
-            entries: Vec::new(),
-        }
     }
 
     /// Load entries from eidetica
@@ -181,7 +172,7 @@ impl Session {
         let start = self.entries.len().saturating_sub(MAX_CONTEXT_MESSAGES);
         let messages = self.entries[start..]
             .iter()
-            .filter(|e| e.entry_type == EntryType::Message)
+            .filter(|e| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
             .map(|e| {
                 let msg_role = if e.sender == agent_name {
                     MessageRole::assistant
@@ -272,6 +263,14 @@ impl SessionRegistry {
     /// Get the eidetica Instance handle
     pub fn instance(&self) -> &eidetica::Instance {
         &self.instance
+    }
+
+    /// List all known session bindings.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBinding>> {
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+        let results = bindings.search(|_| true).await?;
+        Ok(results.into_iter().map(|(_, b)| b).collect())
     }
 
     /// Look up a transport ID and return the session Database, creating one if needed.

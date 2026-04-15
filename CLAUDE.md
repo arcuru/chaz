@@ -33,11 +33,11 @@ main.rs              CLI args, config, eidetica init, secret store, security con
 config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
-session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB)
+session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error)
 tool.rs              Tool trait (descriptor + execute + default_policy), ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools
 tools/
   mod.rs             Re-exports all tools
-  agent.rs           spawn_agent — delegate to another agent in a fresh session (holds Arc refs for orchestration)
+  agent.rs           spawn_agent — delegate to another agent via server's session messaging (sync/async modes)
   time.rs            get_time — current UTC time (Low risk)
   calculate.rs       calculate — math expressions (Low risk)
   shell.rs           shell — execute commands (High risk, approval required, command allow/denylist)
@@ -50,8 +50,8 @@ security/
   leak_detector.rs   LeakDetector — 12 secret patterns, redact/block policy
   network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
   sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
-runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings; receives ToolContext
-server.rs            Callback-driven Server: registers on_local_write on session DBs, processing loop, agent task spawning, response delivery
+runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings; RuntimeEventSink for audit trail
+server.rs            Callback-driven Server: registers on_local_write on session DBs, processing loop, agent task spawning, response delivery, child session management
 gateway/
   mod.rs             Gateway trait, ApprovalExchange/ApprovalDecision
   matrix/
@@ -71,7 +71,9 @@ defaults.rs          Built-in default config and roles
 
 **Message flow (TUI):** Input box → writes SessionEntry to session DB → callback fires → server runs agent → writes response → on_local_write sends `()` notify → event loop re-reads session from eidetica → renders updated entries in ratatui terminal.
 
-**ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached.
+**ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → emit RuntimeEvent → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached. Runtime emits ToolCall/ToolResult events via optional RuntimeEventSink; server writes these to the session DB as audit trail entries.
+
+**spawn_agent:** Writes a Directive entry to a child session → server's on_local_write callback fires → process_session detects Directive → spawns agent task → agent runs ReAct loop → writes response → completion channel signals caller. Supports sync (default) and async (`"async": true`) modes.
 
 ### Key patterns
 

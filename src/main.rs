@@ -139,13 +139,12 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::WebFetch::new(network_policy));
     tool_registry.register(tools::Remember::new(central_db.clone()));
     tool_registry.register(tools::Recall::new(central_db));
-    // SpawnAgent is a privileged native-only tool — holds Arc refs for agent orchestration
+    // SpawnAgent routes through the server — OnceLock is set after Server::new
+    let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
     tool_registry.register(tools::SpawnAgent {
-        agent_registry: agent_registry.clone(),
-        policies: policies.clone(),
+        server: spawn_server_cell.clone(),
         backend: backends::BackendManager::new(&config.backends, secret_store.clone()),
         security: security_ctx.clone(),
-        database: registry.central_db().clone(),
     });
 
     let tool_registry = std::sync::Arc::new(tool_registry);
@@ -157,6 +156,10 @@ async fn main() -> anyhow::Result<()> {
         tool_registry,
         policies,
         security_ctx,
+    );
+    assert!(
+        spawn_server_cell.set(server.clone()).is_ok(),
+        "SpawnAgent server cell already set"
     );
 
     // Run the selected gateway

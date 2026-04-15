@@ -305,34 +305,62 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in &app.entries {
-        if entry.entry_type != EntryType::Message {
-            continue;
+        match entry.entry_type {
+            EntryType::Message | EntryType::Directive => {
+                let is_agent = app.agent_names.contains(&entry.sender);
+                let sender_style = if is_agent {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                };
+
+                let label = if entry.entry_type == EntryType::Directive {
+                    format!("{} (directive):", entry.sender)
+                } else {
+                    format!("{}:", entry.sender)
+                };
+
+                lines.push(Line::from(vec![Span::styled(label, sender_style)]));
+
+                for content_line in entry.content.lines() {
+                    lines.push(Line::from(format!("  {content_line}")));
+                }
+                lines.push(Line::from(""));
+            }
+            EntryType::Ack => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {} thinking...", entry.sender),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+            EntryType::ToolCall => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  ⚙ {}", entry.content),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+            EntryType::ToolResult => {
+                let display = if entry.content.len() > 120 {
+                    format!("{}…", &entry.content[..120])
+                } else {
+                    entry.content.clone()
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  → {display}"),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+            EntryType::Error => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  ✗ {}: {}", entry.sender, entry.content),
+                    Style::default().fg(Color::Red),
+                )]));
+            }
         }
-
-        let is_agent = app.agent_names.contains(&entry.sender);
-        let sender_style = if is_agent {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        };
-
-        // Sender line
-        lines.push(Line::from(vec![Span::styled(
-            format!("{}:", entry.sender),
-            sender_style,
-        )]));
-
-        // Content lines
-        for content_line in entry.content.lines() {
-            lines.push(Line::from(format!("  {content_line}")));
-        }
-
-        // Blank separator
-        lines.push(Line::from(""));
     }
 
     // Tool approval prompt
