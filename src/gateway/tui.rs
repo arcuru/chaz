@@ -65,6 +65,7 @@ struct App {
     debug_mode: bool,
     // Current session
     transport_id: String,
+    current_agent: String,
     // Session picker state
     session_list: Vec<SessionInfo>,
     picker_index: usize,
@@ -84,6 +85,7 @@ impl App {
             should_quit: false,
             debug_mode: false,
             transport_id,
+            current_agent: String::new(),
             session_list: Vec::new(),
             picker_index: 0,
         }
@@ -219,6 +221,8 @@ impl Gateway for TuiGateway {
         // Initialize app state
         let mut app = App::new(agent_names, default_transport.clone());
         {
+            let agent = server.registry().resolve_agent(&default_transport, None).await;
+            app.current_agent = agent.name.clone();
             let session = Session::new(
                 crate::types::ConversationId(default_transport.clone()),
                 session_db.clone(),
@@ -296,10 +300,11 @@ impl Gateway for TuiGateway {
                                             )
                                             .await
                                             {
-                                                Ok((db, entries)) => {
+                                                Ok((db, entries, agent_name)) => {
                                                     session_db = db;
                                                     app.transport_id = tid;
                                                     app.entries = entries;
+                                                    app.current_agent = agent_name;
                                                     app.scroll_offset = 0;
                                                     app.waiting = false;
                                                 }
@@ -332,10 +337,11 @@ impl Gateway for TuiGateway {
                                     )
                                     .await
                                     {
-                                        Ok((db, entries)) => {
+                                        Ok((db, entries, agent_name)) => {
                                             session_db = db;
                                             app.transport_id = selected;
                                             app.entries = entries;
+                                            app.current_agent = agent_name;
                                             app.scroll_offset = 0;
                                             app.waiting = false;
                                         }
@@ -395,14 +401,14 @@ enum ChatCommand {
     SwitchSession(String),
 }
 
-/// Switch to a different session. Registers with server and returns the new DB + entries.
+/// Switch to a different session. Registers with server and returns the new DB, entries, and agent name.
 async fn switch_session(
     server: &Server,
     transport_id: &str,
     backend: &BackendManager,
     approval_tx: &mpsc::Sender<ApprovalExchange>,
     notify_tx: &mpsc::Sender<()>,
-) -> anyhow::Result<(eidetica::Database, Vec<SessionEntry>)> {
+) -> anyhow::Result<(eidetica::Database, Vec<SessionEntry>, String)> {
     let (conv_id, session_db) = server
         .registry()
         .get_or_create_session_db(transport_id)
@@ -418,9 +424,10 @@ async fn switch_session(
     )
     .await?;
 
+    let agent = server.registry().resolve_agent(transport_id, None).await;
     let session = Session::new(conv_id, session_db.clone()).await;
     let entries = session.entries().to_vec();
-    Ok((session_db, entries))
+    Ok((session_db, entries, agent.name))
 }
 
 /// Handle a key event in chat mode. Returns a ChatCommand if the event loop
@@ -462,6 +469,11 @@ async fn handle_chat_key(
                     "/sessions" | "/s" => {
                         return Some(ChatCommand::OpenPicker);
                     }
+                    "/clear" => {
+                        app.entries.clear();
+                        app.scroll_offset = 0;
+                        return None;
+                    }
                     _ if text.starts_with("/join ") => {
                         let tid = text.strip_prefix("/join ").unwrap().trim().to_string();
                         if !tid.is_empty() {
@@ -482,6 +494,7 @@ async fn handle_chat_key(
                                 "  /new           — create a new session",
                                 "  /join <id>     — switch to session by transport ID",
                                 "  /info          — show current session info",
+                                "  /clear         — clear display (entries still in DB)",
                                 "  /raw           — dump raw entry data for debugging",
                                 "  /debug         — toggle debug mode (Ctrl+D)",
                                 "  /quit, /q      — exit",
@@ -626,6 +639,12 @@ async fn handle_chat_key(
         }
         KeyCode::Down => {
             app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        KeyCode::PageUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(20);
+        }
+        KeyCode::PageDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(20);
         }
         KeyCode::Esc => {
             app.should_quit = true;
@@ -823,8 +842,8 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         .count();
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let status_text = format!(
-        " session: {} | messages: {}{} | /sessions to switch | /help for commands",
-        app.transport_id, msg_count, debug_indicator
+        " {} | agent: {} | messages: {}{} | /help",
+        app.transport_id, app.current_agent, msg_count, debug_indicator
     );
     let status = Paragraph::new(status_text).style(
         Style::default()
