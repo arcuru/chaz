@@ -78,7 +78,10 @@ defaults.rs          Built-in default config and roles
 ### Key patterns
 
 - **Gateway = bridge**: Gateways translate platform events ↔ session DB entries. Each registers its own on_local_write callback to detect agent responses and deliver to its transport. Server is transport-agnostic.
-- **Callback-driven server**: Server registers on_local_write callbacks on session DBs. Callback fires → notify channel → processing loop checks latest entry → if non-agent Message, spawns agent task. Agent writes response entry → gateway callback detects it → delivers to transport. No mpsc in the message flow. Global Semaphore(10) caps concurrent LLM calls.
+- **Callback-driven server**: Server registers on_local_write callbacks on session DBs. Callback fires → notify channel → processing loop checks latest entry → if non-agent Message or Directive, spawns agent task. Agent writes Ack → runs ReAct loop (emitting ToolCall/ToolResult events to session) → writes response. Global Semaphore(10) caps concurrent LLM calls.
+- **Session messaging primitive**: All agent invocation goes through session entries. spawn_agent writes a Directive entry to a child session and awaits completion via the server's callback path (register_child_session + mpsc completion channel). Supports sync and async modes.
+- **Entry types**: Message (chat), Directive (instructions to agent — included in LLM context), ToolCall/ToolResult (audit trail — excluded from LLM context), Ack (thinking indicator), Error. Only Message and Directive enter the LLM context window.
+- **Eidetica sync**: HTTP transport enabled at startup. `/share` generates DatabaseTicket URLs, `/sync <ticket>` syncs remote sessions. Writes propagate bidirectionally via on_local_write callbacks.
 - **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
 - **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (ScopedTools with transitive narrowing)
@@ -86,7 +89,7 @@ defaults.rs          Built-in default config and roles
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
-- **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Callback sends `()` on any session write; event loop re-reads full session from eidetica. No mpsc content bridging — session entries are the source of truth. Tool approval rendered inline, y/n/a keys in approval mode.
+- **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Supports session picker, debug mode (Ctrl+D), session sharing (/share, /sync), and slash commands (/sessions, /new, /join, /info, /raw, /clear). Renders all entry types with distinct styles. Tool approval inline with y/n/a keys.
 - **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll.
 - **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools.
 - **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
@@ -149,3 +152,31 @@ grep -E "ERROR|Response:|Batching" ~/chaz-test/chaz.log
 ```
 
 After code changes, rebuild and restart — the bot persists sessions in eidetica SQLite (`~/chaz-test/` state dir), so conversation history survives restarts. The sync token is persisted by headjack, so the bot resumes from where it left off (the router's message batching prevents duplicate responses from the catch-up sync).
+
+### TUI mode
+
+```bash
+# Run TUI against the same state dir as the Matrix bot
+nix develop .# -c cargo run -- --config ~/chaz-test/config.yaml --tui
+
+# Or against a separate state dir for isolated testing
+nix develop .# -c cargo run -- --config ~/chaz-test/config-tui.yaml --tui
+```
+
+TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/debug` (toggle timestamps/types), `/raw` (dump entries).
+
+### Session sharing between instances
+
+Eidetica sync is enabled automatically with an HTTP transport. The server address is logged at startup.
+
+```bash
+# On instance A (e.g., the Matrix bot), get a session ticket:
+# In TUI: /share
+# Output: eidetica:?db=sha256:abc...&pr=http:127.0.0.1:12345
+
+# On instance B (e.g., a local TUI), sync the session:
+# In TUI: /sync eidetica:?db=sha256:abc...&pr=http:192.168.1.10:12345
+# Then: /sessions to find and open it
+```
+
+Both instances must be network-reachable. Writes propagate bidirectionally via eidetica's on_local_write callbacks.
