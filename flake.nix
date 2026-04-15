@@ -212,6 +212,7 @@
             deadnix
             git-cliff
             just
+            mdbook
             prettier
             nix-fast-build
             statix

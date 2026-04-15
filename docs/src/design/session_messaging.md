@@ -50,7 +50,7 @@ graph LR
 
 The server's `process_session` decides whether to act on an entry:
 
-```
+```text
 match latest.entry_type {
     Message  if sender is NOT a known agent  => spawn agent task
     Directive                                 => spawn agent task
@@ -106,7 +106,7 @@ Spawn-specific metadata is bundled in `SpawnContext`:
 
 The runtime accepts an optional `mpsc::Sender<RuntimeEvent>`:
 
-```
+```text
 enum RuntimeEvent {
     ToolCall { id, name, arguments }
     ToolResult { id, name, output, is_error }

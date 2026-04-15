@@ -17,7 +17,7 @@ The bot will log in, accept invites from allowed users, and start responding.
 
 To send a message with room context:
 
-```
+```text
 !chaz summarize the discussion so far
 ```
 

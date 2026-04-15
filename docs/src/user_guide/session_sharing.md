@@ -6,7 +6,7 @@ Chaz instances can share sessions over the network using [eidetica's sync protoc
 
 Each chaz instance starts an HTTP sync server automatically at startup. The server address is logged:
 
-```
+```text
 INFO Eidetica sync listening on 127.0.0.1:12345
 ```
 
@@ -25,13 +25,13 @@ Once synced, writes from either side propagate automatically via eidetica's `on_
 
 On the instance that has the session you want to share, use the TUI command:
 
-```
+```text
 /share
 ```
 
 This generates a ticket URL:
 
-```
+```text
 eidetica:?db=sha256:a1b2c3...&pr=http:192.168.1.10:12345
 ```
 
@@ -44,7 +44,7 @@ The URL contains:
 
 On another chaz instance, paste the ticket:
 
-```
+```text
 /sync eidetica:?db=sha256:a1b2c3...&pr=http:192.168.1.10:12345
 ```
 
@@ -67,7 +67,7 @@ After syncing completes, the session appears in the session list. Use `/sessions
 
 3. On the server (via a second TUI or programmatically), get the session ticket:
 
-   ```
+   ```text
    /join !roomid:matrix.org
    /share
    # Output: eidetica:?db=sha256:abc...&pr=http:myserver.com:12345
@@ -75,7 +75,7 @@ After syncing completes, the session appears in the session list. Use `/sessions
 
 4. On the local TUI, sync and open:
 
-   ```
+   ```text
    /sync eidetica:?db=sha256:abc...&pr=http:myserver.com:12345
    /sessions
    ```
@@ -93,13 +93,13 @@ After syncing completes, the session appears in the session list. Use `/sessions
 
 Tickets use a magnet-style URI format:
 
-```
+```text
 eidetica:?db=<database_id>&pr=<transport>:<address>
 ```
 
 Multiple peer addresses can be included:
 
-```
+```text
 eidetica:?db=sha256:abc...&pr=http:192.168.1.10:8080&pr=http:10.0.0.1:8080
 ```
 

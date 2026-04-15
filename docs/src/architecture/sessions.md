@@ -4,7 +4,7 @@ Sessions are the core data model in chaz. Every conversation -- whether from a M
 
 ## Entry Types
 
-```rust
+```rust,ignore
 enum EntryType {
     Message,    // Chat message (from any participant)
     Directive,  // Task instruction (from spawn_agent, scheduler, system)

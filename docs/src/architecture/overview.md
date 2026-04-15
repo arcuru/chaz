@@ -97,7 +97,7 @@ See [Tool System](tools.md) for details.
 
 ## Source Layout
 
-```
+```text
 src/
   main.rs          CLI, config, eidetica init, tool registration, gateway dispatch
   config.rs        Config types (backends, agents, security)

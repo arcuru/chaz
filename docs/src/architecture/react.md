@@ -55,7 +55,7 @@ The server consumes these events and writes `ToolCall` and `ToolResult` entries 
 
 The runtime converts `ChatContext` into `RuntimeMessage` vectors for the LLM:
 
-```
+```text
 RuntimeMessage::System(role prompt)
 RuntimeMessage::User(message 1)
 RuntimeMessage::Assistant(message 2)

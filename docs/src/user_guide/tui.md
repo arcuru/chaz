@@ -8,7 +8,7 @@ chaz --config config.yaml --tui
 
 ## Interface Layout
 
-```
+```text
 +--[ Chaz ]------------------------------------------+
 | user:                                               |
 |   What's the current time?                          |
@@ -77,7 +77,7 @@ The `/raw` command provides an even more detailed dump: every entry's index, tim
 
 Open with `/sessions` or `/s`:
 
-```
+```text
 +--[ Sessions ]---------------------------------------+
 |                                                     |
 | > tui * (default, 15 entries)                       |
@@ -122,7 +122,7 @@ Senders are color-coded: agents in green, users in cyan, system in yellow.
 
 When an agent calls a tool that requires approval, the TUI shows an inline prompt:
 
-```
+```text
 --- Tool Approval Required ---
   Tool: shell
   Risk: High
