@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::WriteFile);
     tool_registry.register(tools::WebFetch::new(network_policy));
     tool_registry.register(tools::Remember::new(central_db.clone()));
-    tool_registry.register(tools::Recall::new(central_db));
+    tool_registry.register(tools::Recall::new(central_db.clone()));
     // SpawnAgent routes through the server — OnceLock is set after Server::new
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
     tool_registry.register(tools::SpawnAgent {
@@ -178,11 +178,15 @@ async fn main() -> anyhow::Result<()> {
     // Start the scheduler if any schedules are configured
     let scheduler = if let Some(schedules) = config.schedules.clone() {
         if !schedules.is_empty() {
-            let sched = std::sync::Arc::new(scheduler::Scheduler::new(
-                schedules,
-                server.clone(),
-                backends::BackendManager::new(&config.backends, secret_store.clone()),
-            ));
+            let sched = std::sync::Arc::new(
+                scheduler::Scheduler::new(
+                    schedules,
+                    server.clone(),
+                    backends::BackendManager::new(&config.backends, secret_store.clone()),
+                    central_db,
+                )
+                .await,
+            );
             sched.start();
             Some(sched)
         } else {

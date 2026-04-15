@@ -3,17 +3,30 @@
 //! The scheduler is a background task that writes Directive entries to sessions
 //! on a cron schedule. The existing server callback machinery handles agent
 //! execution — the scheduler just provides the trigger.
+//!
+//! Schedule state (last_run) is persisted in the central eidetica database
+//! so that restarts don't cause duplicate or missed runs.
 
 use crate::backends::BackendManager;
 use crate::config::ScheduleConfig;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cron::Schedule;
+use eidetica::store::Table;
+use eidetica::Database;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Persisted schedule state in eidetica central DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduleState {
+    name: String,
+    last_run: String, // ISO 8601
+}
 
 /// A parsed schedule ready for execution.
 struct ScheduleRecord {
@@ -22,7 +35,7 @@ struct ScheduleRecord {
     task: String,
     cron: Schedule,
     enabled: bool,
-    last_run: Option<chrono::DateTime<Utc>>,
+    last_run: Option<DateTime<Utc>>,
 }
 
 /// Cron-driven scheduler that writes Directive entries to sessions.
@@ -30,19 +43,25 @@ pub struct Scheduler {
     records: Arc<Mutex<Vec<ScheduleRecord>>>,
     server: Arc<Server>,
     backend: BackendManager,
+    central_db: Database,
 }
 
 impl Scheduler {
     /// Create a new scheduler from config.
     ///
-    /// Parses cron expressions and validates schedule configs. Invalid schedules
-    /// are logged and skipped.
-    pub fn new(
+    /// Parses cron expressions, validates configs, and loads persisted last_run
+    /// times from the central eidetica database. Invalid schedules are logged
+    /// and skipped.
+    pub async fn new(
         configs: Vec<ScheduleConfig>,
         server: Arc<Server>,
         backend: BackendManager,
+        central_db: Database,
     ) -> Self {
         let mut records = Vec::new();
+
+        // Load persisted state
+        let persisted = load_schedule_states(&central_db).await;
 
         for cfg in configs {
             if !cfg.enabled {
@@ -52,10 +71,17 @@ impl Scheduler {
 
             match Schedule::from_str(&cfg.cron) {
                 Ok(cron) => {
+                    let last_run = persisted
+                        .iter()
+                        .find(|s| s.name == cfg.name)
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s.last_run).ok())
+                        .map(|dt| dt.with_timezone(&Utc));
+
                     info!(
                         schedule = %cfg.name,
                         session = %cfg.session,
                         cron = %cfg.cron,
+                        last_run = ?last_run,
                         "Schedule registered"
                     );
                     records.push(ScheduleRecord {
@@ -64,7 +90,7 @@ impl Scheduler {
                         task: cfg.task,
                         cron,
                         enabled: true,
-                        last_run: None,
+                        last_run,
                     });
                 }
                 Err(e) => {
@@ -81,6 +107,7 @@ impl Scheduler {
             records: Arc::new(Mutex::new(records)),
             server,
             backend,
+            central_db,
         }
     }
 
@@ -98,7 +125,7 @@ impl Scheduler {
         records
             .iter()
             .map(|r| {
-                let next_run = r.cron.upcoming(Utc).next();
+                let next_run = next_run_after(&r.cron, r.last_run);
                 ScheduleInfo {
                     name: r.name.clone(),
                     session: r.session_db_id.clone(),
@@ -123,12 +150,7 @@ impl Scheduler {
         };
 
         self.fire_schedule(name, &task.0, &task.1).await?;
-
-        // Update last_run
-        let mut records = self.records.lock().await;
-        if let Some(record) = records.iter_mut().find(|r| r.name == name) {
-            record.last_run = Some(Utc::now());
-        }
+        self.record_last_run(name).await;
 
         Ok(())
     }
@@ -160,7 +182,7 @@ impl Scheduler {
         records
             .iter()
             .filter(|r| r.enabled)
-            .filter_map(|r| r.cron.upcoming(Utc).next())
+            .filter_map(|r| next_run_after(&r.cron, r.last_run))
             .min()
             .map(|next| {
                 let delta = next - now;
@@ -178,21 +200,12 @@ impl Scheduler {
                 .iter()
                 .filter(|r| r.enabled)
                 .filter(|r| {
-                    // Check if the next scheduled time is now or in the past
-                    // (i.e., we woke up at or after the scheduled time)
-                    r.cron
-                        .upcoming(Utc)
-                        .next()
-                        .map(|next| next <= now + chrono::Duration::seconds(2))
+                    // A schedule is due if its next run time (after last_run) is at or before now
+                    next_run_after(&r.cron, r.last_run)
+                        .map(|next| next <= now)
                         .unwrap_or(false)
                 })
-                .map(|r| {
-                    (
-                        r.name.clone(),
-                        r.session_db_id.clone(),
-                        r.task.clone(),
-                    )
-                })
+                .map(|r| (r.name.clone(), r.session_db_id.clone(), r.task.clone()))
                 .collect()
         };
 
@@ -200,12 +213,25 @@ impl Scheduler {
             if let Err(e) = self.fire_schedule(&name, &session, &task).await {
                 error!(schedule = %name, "Failed to fire schedule: {e}");
             }
+            self.record_last_run(&name).await;
+        }
+    }
 
-            // Update last_run
+    /// Update last_run in memory and persist to eidetica.
+    async fn record_last_run(&self, name: &str) {
+        let now = Utc::now();
+
+        // Update in-memory
+        {
             let mut records = self.records.lock().await;
             if let Some(record) = records.iter_mut().find(|r| r.name == name) {
-                record.last_run = Some(Utc::now());
+                record.last_run = Some(now);
             }
+        }
+
+        // Persist to eidetica
+        if let Err(e) = save_schedule_state(&self.central_db, name, now).await {
+            warn!(schedule = %name, "Failed to persist last_run: {e}");
         }
     }
 
@@ -258,12 +284,61 @@ impl Scheduler {
     }
 }
 
+/// Compute the next run time for a cron schedule after the given last_run.
+/// If last_run is None, returns the next upcoming time from now.
+fn next_run_after(cron: &Schedule, last_run: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match last_run {
+        Some(lr) => cron.after(&lr).next(),
+        None => cron.upcoming(Utc).next(),
+    }
+}
+
+/// Load all persisted schedule states from the central DB.
+async fn load_schedule_states(db: &Database) -> Vec<ScheduleState> {
+    let Ok(txn) = db.new_transaction().await else {
+        return Vec::new();
+    };
+    let Ok(store) = txn.get_store::<Table<ScheduleState>>("schedules").await else {
+        return Vec::new();
+    };
+    match store.search(|_| true).await {
+        Ok(results) => results.into_iter().map(|(_, s)| s).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persist a schedule's last_run to the central DB.
+async fn save_schedule_state(
+    db: &Database,
+    name: &str,
+    last_run: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<Table<ScheduleState>>("schedules").await?;
+
+    // Update existing or insert new
+    let existing = store.search(|s| s.name == name).await?;
+    let state = ScheduleState {
+        name: name.to_string(),
+        last_run: last_run.to_rfc3339(),
+    };
+
+    if let Some((key, _)) = existing.into_iter().next() {
+        store.set(&key, state).await?;
+    } else {
+        store.insert(state).await?;
+    }
+
+    txn.commit().await?;
+    Ok(())
+}
+
 /// Public schedule status info for TUI display.
 pub struct ScheduleInfo {
     pub name: String,
     pub session: String,
     pub task: String,
     pub enabled: bool,
-    pub last_run: Option<chrono::DateTime<Utc>>,
-    pub next_run: Option<chrono::DateTime<Utc>>,
+    pub last_run: Option<DateTime<Utc>>,
+    pub next_run: Option<DateTime<Utc>>,
 }
