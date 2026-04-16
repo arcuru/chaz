@@ -109,6 +109,10 @@ pub struct Backend {
     /// Set the config directory
     #[allow(dead_code)]
     pub config_dir: Option<String>,
+    /// Timeout for LLM requests in seconds (default: 120)
+    pub request_timeout: Option<u64>,
+    /// Maximum retry attempts for transient LLM errors (default: 3)
+    pub max_retries: Option<u32>,
 }
 
 impl Backend {
@@ -121,7 +125,19 @@ impl Backend {
             models: None,
             name: None,
             config_dir: None,
+            request_timeout: None,
+            max_retries: None,
         }
+    }
+
+    /// LLM request timeout as Duration (default: 120s).
+    pub fn request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.request_timeout.unwrap_or(120))
+    }
+
+    /// Maximum retry attempts for transient errors (default: 3).
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries.unwrap_or(3)
     }
 
     /// Generate a SecretStore reference key for this backend's API key.

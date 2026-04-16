@@ -12,10 +12,12 @@
 //! - Content from tool outputs is scanned for injection patterns (warning-only)
 
 use crate::backends::BackendManager;
+use crate::error::LlmError;
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -73,6 +75,65 @@ pub enum LLMResponse {
     },
 }
 
+/// Base delay for exponential backoff (1 second).
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum backoff delay cap (30 seconds).
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Compute the backoff delay for a retry attempt.
+///
+/// Uses exponential backoff (base * 2^attempt), capped at `RETRY_MAX_DELAY`.
+/// If the error provides a `retry_after` hint (e.g., from a 429 response),
+/// that value is used as the minimum delay.
+fn backoff_delay(attempt: u32, error: &LlmError) -> Duration {
+    let exponential = RETRY_BASE_DELAY.saturating_mul(1 << attempt.min(5));
+    let capped = exponential.min(RETRY_MAX_DELAY);
+    // Honor Retry-After hint from rate limit responses
+    match error.retry_after() {
+        Some(retry_after) => capped.max(retry_after),
+        None => capped,
+    }
+}
+
+/// Execute an LLM call with retry for transient errors.
+///
+/// Retries up to `max_retries` times with exponential backoff for errors
+/// classified as retryable (429, 5xx, timeouts, network errors).
+/// Non-retryable errors (auth, bad request, config) fail immediately.
+async fn llm_call_with_retry(
+    backend: &BackendManager,
+    model: Option<&str>,
+    messages: &[RuntimeMessage],
+    tools: &[crate::tool::ToolDefinition],
+    resolved_model: &str,
+    max_retries: u32,
+) -> Result<LLMResponse, LlmError> {
+    let mut last_error = None;
+    for attempt in 0..=max_retries {
+        match backend
+            .chat_with_tools_for_model(model, messages, tools, resolved_model)
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(e) if e.is_retryable() && attempt < max_retries => {
+                let delay = backoff_delay(attempt, &e);
+                warn!(
+                    error = %e,
+                    attempt = attempt + 1,
+                    max_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    "Transient LLM error, retrying after backoff"
+                );
+                tokio::time::sleep(delay).await;
+                last_error = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_error.unwrap())
+}
+
 /// Run the agent runtime for a single turn.
 ///
 /// If tools are registered and the backend supports tool calling,
@@ -91,12 +152,19 @@ pub async fn execute(
 ) -> Result<String, String> {
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
+    let max_retries = backend.max_retries_for_model(model);
 
-    // Fast path: no tools or backend doesn't support them → single-shot
+    // Fast path: no tools or backend doesn't support them → single-shot (with retry)
     if tools.is_empty() || !backend.supports_tools_for_model(model) {
-        return match backend
-            .chat_with_tools_for_model(model, &initial_messages, &[], &resolved_model)
-            .await
+        return match llm_call_with_retry(
+            backend,
+            model,
+            &initial_messages,
+            &[],
+            &resolved_model,
+            max_retries,
+        )
+        .await
         {
             Ok(LLMResponse::Text(text)) => Ok(text),
             Ok(LLMResponse::ToolCalls { .. }) => {
@@ -112,45 +180,47 @@ pub async fn execute(
     let mut rate_limiter = RateLimiter::new();
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
-        let response = match backend
-            .chat_with_tools_for_model(model, &messages, &tool_defs, &resolved_model)
-            .await
+        let response = match llm_call_with_retry(
+            backend,
+            model,
+            &messages,
+            &tool_defs,
+            &resolved_model,
+            max_retries,
+        )
+        .await
         {
             Ok(resp) => resp,
             Err(ref e) if e.is_retryable() && iteration == 0 => {
-                // Transient error on first call with tools — retry without tools
+                // All retries exhausted on first call with tools — try without tools
                 // in case this model/provider doesn't support function calling.
                 info!(
                     error = %e,
-                    retryable = e.is_retryable(),
-                    "Tool-aware call failed, falling back to no-tools execution"
+                    "Tool-aware call failed after retries, falling back to no-tools execution"
                 );
-                return match backend
-                    .chat_with_tools_for_model(model, &messages, &[], &resolved_model)
-                    .await
+                return match llm_call_with_retry(
+                    backend,
+                    model,
+                    &messages,
+                    &[],
+                    &resolved_model,
+                    max_retries,
+                )
+                .await
                 {
                     Ok(LLMResponse::Text(text)) => Ok(text),
                     Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
                     Err(e) => Err(e.to_string()),
                 };
             }
-            Err(e) if e.is_retryable() => {
-                // Transient error mid-loop — log and propagate (retry layer will wrap this later)
-                warn!(
-                    error = %e,
-                    status = ?e.status(),
-                    iteration,
-                    "Transient LLM error during ReAct loop"
-                );
-                return Err(e.to_string());
-            }
             Err(e) => {
-                // Non-retryable error — stop immediately
+                // All retries exhausted or non-retryable — stop
                 warn!(
                     error = %e,
                     status = ?e.status(),
-                    retryable = false,
-                    "LLM error during ReAct loop"
+                    retryable = e.is_retryable(),
+                    iteration,
+                    "LLM error during ReAct loop (retries exhausted)"
                 );
                 return Err(e.to_string());
             }
@@ -338,9 +408,7 @@ pub async fn execute(
     messages.push(RuntimeMessage::User(
         "Please summarize what you found so far and respond to the user.".to_string(),
     ));
-    match backend
-        .chat_with_tools_for_model(model, &messages, &[], &resolved_model)
-        .await
+    match llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries).await
     {
         Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),
         Ok(_) | Err(_) => {
@@ -392,6 +460,53 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::LlmError;
+
+    #[test]
+    fn test_backoff_delay_exponential() {
+        let err = LlmError::ServerError {
+            status: 502,
+            message: "Bad Gateway".into(),
+        };
+        // attempt 0: 1s, attempt 1: 2s, attempt 2: 4s, attempt 3: 8s
+        assert_eq!(backoff_delay(0, &err), Duration::from_secs(1));
+        assert_eq!(backoff_delay(1, &err), Duration::from_secs(2));
+        assert_eq!(backoff_delay(2, &err), Duration::from_secs(4));
+        assert_eq!(backoff_delay(3, &err), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn test_backoff_delay_capped() {
+        let err = LlmError::Timeout;
+        // attempt 5: 32s, but capped at 30s
+        assert_eq!(backoff_delay(5, &err), RETRY_MAX_DELAY);
+        assert_eq!(backoff_delay(10, &err), RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn test_backoff_delay_respects_retry_after() {
+        let err = LlmError::RateLimited {
+            retry_after_duration: Some(Duration::from_secs(10)),
+            message: "slow down".into(),
+        };
+        // attempt 0: max(1s, 10s) = 10s
+        assert_eq!(backoff_delay(0, &err), Duration::from_secs(10));
+        // attempt 1: max(2s, 10s) = 10s
+        assert_eq!(backoff_delay(1, &err), Duration::from_secs(10));
+        // attempt 4: max(16s, 10s) = 16s
+        assert_eq!(backoff_delay(4, &err), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn test_backoff_delay_no_retry_after() {
+        let err = LlmError::RateLimited {
+            retry_after_duration: None,
+            message: "slow down".into(),
+        };
+        // Falls back to exponential only
+        assert_eq!(backoff_delay(0, &err), Duration::from_secs(1));
+        assert_eq!(backoff_delay(2, &err), Duration::from_secs(4));
+    }
 
     #[test]
     fn test_wrap_tool_output_basic() {

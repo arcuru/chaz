@@ -84,9 +84,13 @@ impl OpenAI {
             request.tools = Some(openai_tools);
         }
 
-        let response = client
-            .chat_completion(request)
+        let timeout = self.backend.request_timeout();
+        let response = tokio::time::timeout(timeout, client.chat_completion(request))
             .await
+            .map_err(|_| {
+                tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
+                LlmError::Timeout
+            })?
             .map_err(LlmError::from_api_error)?;
 
         let choice = response
@@ -179,9 +183,13 @@ impl LLMBackend for OpenAI {
             "LLM request"
         );
 
-        let response = client
-            .chat_completion(request)
+        let timeout = self.backend.request_timeout();
+        let response = tokio::time::timeout(timeout, client.chat_completion(request))
             .await
+            .map_err(|_| {
+                tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
+                LlmError::Timeout
+            })?
             .map_err(LlmError::from_api_error)?;
 
         Ok(response.choices[0]

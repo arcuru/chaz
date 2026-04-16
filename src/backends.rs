@@ -226,6 +226,14 @@ impl BackendManager {
         resolved
     }
 
+    /// Maximum retry attempts for transient errors on the backend for the given model.
+    pub fn max_retries_for_model(&self, model: Option<&str>) -> u32 {
+        if self.backends.is_empty() {
+            return 3;
+        }
+        self.select_backend_for_model(model).max_retries()
+    }
+
     /// Execute a single LLM call with tool definitions (for ReAct loop).
     pub async fn chat_with_tools_for_model(
         &self,

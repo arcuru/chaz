@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phases 0–9 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles). Recent: room tag migration to registry DB, Matrix approval UX (reactions + commands), new-session auto-detection callbacks, named sessions, MCP auto-restart, tiktoken tokenization, glob tool allowlists, per-session serialization, XML injection defense, per-agent memory isolation, tool rate limiting.
+**Status**: Active development — Phases 0–11 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience). Recent: LLM request timeout, retry with exponential backoff, room tag migration to registry DB, Matrix approval UX (reactions + commands), named sessions, MCP auto-restart, tiktoken tokenization, glob tool allowlists, per-session serialization, XML injection defense, per-agent memory isolation, tool rate limiting.
 
 ## Build & Development Commands
 
@@ -24,7 +24,7 @@ just nix check      # nix flake check
 
 Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
 
-60 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), and secret resolution. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
+72 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), and secret resolution. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 
@@ -54,7 +54,7 @@ security/
   leak_detector.rs   LeakDetector — 12 secret patterns, redact/block policy
   network.rs         NetworkPolicy — endpoint allowlisting, SSRF protection
   sanitizer.rs       Sanitizer — prompt injection detection (warning-only)
-runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings; RuntimeEventSink for audit trail
+runtime.rs           ReAct loop with security: approval gate, timeouts, leak scanning, injection warnings; RuntimeEventSink for audit trail; retry with exponential backoff for transient LLM errors
 server.rs            Callback-driven Server: registers on_local_write on session DBs, processing loop, agent task spawning, response delivery, child session management
 gateway/
   mod.rs             Gateway trait, ApprovalExchange/ApprovalDecision
@@ -76,7 +76,7 @@ defaults.rs          Built-in default config and roles
 
 **Message flow (TUI):** Input box → writes SessionEntry to session DB → callback fires → server runs agent → writes response → on_local_write sends `()` notify → event loop re-reads session from eidetica → renders updated entries in ratatui terminal.
 
-**ReAct loop:** ContextBuilder assembles token-budgeted RuntimeMessages from session entries (respecting Summary boundaries) → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → emit RuntimeEvent → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to no-tools execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached. Runtime emits ToolCall/ToolResult events via optional RuntimeEventSink; server writes these to the session DB as audit trail entries.
+**ReAct loop:** ContextBuilder assembles token-budgeted RuntimeMessages from session entries (respecting Summary boundaries) → call LLM with tool definitions (with retry on transient errors) → if tool_calls: check approval requirement → if approved: execute with timeout → emit RuntimeEvent → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to no-tools execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached. LLM calls retry transient errors (429, 5xx, timeout, network) with exponential backoff (1s–30s, honors Retry-After headers). All LLM HTTP requests wrapped in configurable timeout (default 120s). Runtime emits ToolCall/ToolResult events via optional RuntimeEventSink; server writes these to the session DB as audit trail entries.
 
 **spawn_agent:** Writes a Directive entry to a child session → server's on_local_write callback fires → process_session detects Directive → spawns agent task → agent runs ReAct loop → writes response → completion channel signals caller. Supports sync (default) and async (`"async": true`) modes.
 
@@ -92,7 +92,7 @@ defaults.rs          Built-in default config and roles
 - **Named sessions**: Sessions can be given human-friendly names via `/name <alias>`. Names are unique, persisted, and usable wherever a session identifier is accepted (`/join`, schedule configs). `SessionRegistry::resolve_session()` tries name → DB ID → transport ID.
 - **Memory**: eidetica Table store for key-value facts, namespaced per agent (`memory:{agent_name}`) in central "chaz-central" DB. Each agent has isolated memory.
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (ScopedTools with transitive narrowing)
-- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection. Backend methods return `Result<_, LlmError>` with structured error classification (retryable/permanent/auth/config). Runtime converts to `String` at the server boundary.
+- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection. Backend methods return `Result<_, LlmError>` with structured error classification (retryable/permanent/auth/config). Runtime converts to `String` at the server boundary. All LLM HTTP calls wrapped in `tokio::time::timeout` (configurable per backend, default 120s). Transient errors (429, 5xx, timeout, network) retried with exponential backoff (1s–30s, honors `Retry-After`, configurable `max_retries` default 3).
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
