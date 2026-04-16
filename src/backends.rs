@@ -234,6 +234,18 @@ impl BackendManager {
         self.select_backend_for_model(model).max_retries()
     }
 
+    /// Fallback model names for the backend serving the given model.
+    /// Returns an empty slice if no fallbacks are configured.
+    pub fn fallback_models_for_model(&self, model: Option<&str>) -> Vec<String> {
+        if self.backends.is_empty() {
+            return Vec::new();
+        }
+        self.select_backend_for_model(model)
+            .fallback_models
+            .clone()
+            .unwrap_or_default()
+    }
+
     /// Execute a single LLM call with tool definitions (for ReAct loop).
     pub async fn chat_with_tools_for_model(
         &self,
@@ -251,5 +263,46 @@ impl BackendManager {
         OpenAI::new(backend, &self.secrets)
             .chat_with_tools(messages, tools, resolved_model)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{Backend, BackendType};
+
+    #[test]
+    fn test_fallback_models_default_none() {
+        let b = Backend::new(BackendType::OpenAICompatible);
+        assert!(b.fallback_models.is_none());
+    }
+
+    #[test]
+    fn test_fallback_models_deserialization() {
+        let yaml = r#"
+type: openaicompatible
+api_base: "https://example.com"
+models:
+  - name: primary-model
+fallback_models:
+  - "fallback-a"
+  - "fallback-b"
+"#;
+        let backend: Backend = serde_yaml::from_str(yaml).unwrap();
+        let fallbacks = backend.fallback_models.unwrap();
+        assert_eq!(fallbacks.len(), 2);
+        assert_eq!(fallbacks[0], "fallback-a");
+        assert_eq!(fallbacks[1], "fallback-b");
+    }
+
+    #[test]
+    fn test_fallback_models_absent_in_config() {
+        let yaml = r#"
+type: openaicompatible
+api_base: "https://example.com"
+models:
+  - name: primary-model
+"#;
+        let backend: Backend = serde_yaml::from_str(yaml).unwrap();
+        assert!(backend.fallback_models.is_none());
     }
 }

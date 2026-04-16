@@ -113,6 +113,9 @@ pub struct Backend {
     pub request_timeout: Option<u64>,
     /// Maximum retry attempts for transient LLM errors (default: 3)
     pub max_retries: Option<u32>,
+    /// Fallback model names to try when the primary model fails after all retries.
+    /// Models are tried in order. Each fallback gets the same retry budget as the primary.
+    pub fallback_models: Option<Vec<String>>,
 }
 
 impl Backend {
@@ -127,6 +130,7 @@ impl Backend {
             config_dir: None,
             request_timeout: None,
             max_retries: None,
+            fallback_models: None,
         }
     }
 
