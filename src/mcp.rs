@@ -5,7 +5,7 @@ use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescrip
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -18,7 +18,15 @@ const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 /// MCP protocol version we advertise.
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
+/// Maximum restart attempts before giving up.
+const MAX_RESTART_ATTEMPTS: u8 = 5;
+
+/// Base backoff delay in milliseconds (doubles each attempt: 1s, 2s, 4s, 8s, 16s).
+const BASE_BACKOFF_MS: u64 = 1000;
+
 /// Manages a single MCP subprocess server and its JSON-RPC transport.
+///
+/// Supports automatic restart with exponential backoff when the subprocess crashes.
 pub struct McpServer {
     name: String,
     stdin: Mutex<ChildStdin>,
@@ -27,14 +35,36 @@ pub struct McpServer {
     default_policy: Option<ToolPolicy>,
     /// Kept alive so the child process isn't killed on drop of Child fields.
     _child: Mutex<Child>,
+    /// Config for restarting the server.
+    config: McpServerConfig,
+    /// Consecutive restart attempts (reset to 0 on successful request).
+    restart_attempts: AtomicU8,
 }
 
 impl McpServer {
     /// Spawn the MCP server subprocess and perform the initialize handshake.
     pub async fn start(config: &McpServerConfig) -> Result<Self, String> {
+        let (child, stdin, stdout) = Self::spawn_process(config)?;
+
+        let server = Self {
+            name: config.name.clone(),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            next_id: AtomicU64::new(1),
+            default_policy: config.default_policy.clone(),
+            _child: Mutex::new(child),
+            config: config.clone(),
+            restart_attempts: AtomicU8::new(0),
+        };
+
+        server.initialize().await?;
+        Ok(server)
+    }
+
+    /// Spawn the subprocess, returning the child and its stdio handles.
+    fn spawn_process(config: &McpServerConfig) -> Result<(Child, ChildStdin, ChildStdout), String> {
         let mut cmd = tokio::process::Command::new(&config.command);
         if let Some(args) = &config.args {
-            // Resolve ${VAR} references in arguments
             let resolved: Vec<String> = args
                 .iter()
                 .map(|a| SecretStore::resolve_env(a).unwrap_or_else(|_| a.clone()))
@@ -64,17 +94,41 @@ impl McpServer {
             .take()
             .ok_or_else(|| format!("No stdout for MCP server '{}'", config.name))?;
 
-        let server = Self {
-            name: config.name.clone(),
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
-            next_id: AtomicU64::new(1),
-            default_policy: config.default_policy.clone(),
-            _child: Mutex::new(child),
-        };
+        Ok((child, stdin, stdout))
+    }
 
-        server.initialize().await?;
-        Ok(server)
+    /// Attempt to restart the subprocess with exponential backoff.
+    ///
+    /// Returns Ok if restart succeeded, Err if max attempts exhausted.
+    async fn restart(&self) -> Result<(), String> {
+        let attempt = self.restart_attempts.fetch_add(1, Ordering::Relaxed);
+        if attempt >= MAX_RESTART_ATTEMPTS {
+            return Err(format!(
+                "MCP server '{}' exceeded max restart attempts ({MAX_RESTART_ATTEMPTS})",
+                self.name
+            ));
+        }
+
+        let backoff_ms = BASE_BACKOFF_MS * (1u64 << attempt.min(5));
+        warn!(
+            "MCP server '{}' restarting (attempt {}/{MAX_RESTART_ATTEMPTS}, backoff {backoff_ms}ms)",
+            self.name,
+            attempt + 1
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+
+        let (child, stdin, stdout) = Self::spawn_process(&self.config)?;
+
+        // Replace the process handles
+        *self._child.lock().await = child;
+        *self.stdin.lock().await = stdin;
+        *self.stdout.lock().await = BufReader::new(stdout);
+
+        // Re-initialize
+        self.initialize().await?;
+
+        info!("MCP server '{}' restarted successfully", self.name);
+        Ok(())
     }
 
     /// Perform the MCP initialize handshake.
@@ -146,17 +200,25 @@ impl McpServer {
         Ok(tools)
     }
 
-    /// Call a tool on the MCP server.
+    /// Call a tool on the MCP server, with auto-restart on process death.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, String> {
-        let result = self
-            .send_request(
-                "tools/call",
-                json!({
-                    "name": name,
-                    "arguments": arguments
-                }),
-            )
-            .await?;
+        let params = json!({
+            "name": name,
+            "arguments": arguments
+        });
+
+        let result = match self.send_request("tools/call", params.clone()).await {
+            Ok(r) => r,
+            Err(e) if self.is_process_dead_error(&e) => {
+                // Process died — attempt restart and retry
+                self.restart().await?;
+                self.send_request("tools/call", params).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Reset restart counter on success
+        self.restart_attempts.store(0, Ordering::Relaxed);
 
         // Check if the result indicates an error
         if result.get("isError").and_then(|e| e.as_bool()) == Some(true) {
@@ -179,6 +241,14 @@ impl McpServer {
         } else {
             Ok(text)
         }
+    }
+
+    /// Check if an error indicates the subprocess has died.
+    fn is_process_dead_error(&self, error: &str) -> bool {
+        error.contains("closed stdout")
+            || error.contains("write error")
+            || error.contains("read error")
+            || error.contains("Broken pipe")
     }
 
     /// Send a JSON-RPC request and wait for the matching response.
