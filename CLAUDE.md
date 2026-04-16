@@ -63,6 +63,7 @@ gateway/
     commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
     history.rs       Room history reading for backfill
   tui.rs             TuiGateway — ratatui async terminal app, Elm architecture (App/Action/ui)
+error.rs             Structured error types: top-level Error enum, LlmError (retryable/permanent classification, thiserror)
 backends.rs          BackendManager (model-based routing), LLMBackend trait, ChatContext (legacy: Matrix commands, /compact), Message
 openai.rs            OpenAI-compatible backend implementing LLMBackend
 role.rs              Role/system prompt management
@@ -91,7 +92,7 @@ defaults.rs          Built-in default config and roles
 - **Named sessions**: Sessions can be given human-friendly names via `/name <alias>`. Names are unique, persisted, and usable wherever a session identifier is accepted (`/join`, schedule configs). `SessionRegistry::resolve_session()` tries name → DB ID → transport ID.
 - **Memory**: eidetica Table store for key-value facts, namespaced per agent (`memory:{agent_name}`) in central "chaz-central" DB. Each agent has isolated memory.
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (ScopedTools with transitive narrowing)
-- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
+- **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection. Backend methods return `Result<_, LlmError>` with structured error classification (retryable/permanent/auth/config). Runtime converts to `String` at the server boundary.
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
@@ -131,12 +132,12 @@ RUST_LOG=error chaz --config config.yaml --tui
 
 ### Log levels by category
 
-| Level | What |
-|-------|------|
-| **error** | Login/session DB failures, gateway crashes, agent execution errors |
-| **warn** | Secret leak detection (redact/block), SSRF blocks, network policy denials, shell command denials, approval channel failures, tool execution errors/timeouts, unknown tools, injection patterns detected |
-| **info** | Startup sequence (config load, agent/tool registry init, gateway mode), session creation, shell command execution, file writes, web fetches, approval decisions, ReAct loop lifecycle, eidetica sync, MCP server lifecycle |
-| **debug** | LLM request/response details, individual tool results, model resolution, file reads, memory store/recall, HTTP response status/size, shell exit codes, MCP JSON-RPC traffic |
+| Level     | What                                                                                                                                                                                                                       |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **error** | Login/session DB failures, gateway crashes, agent execution errors                                                                                                                                                         |
+| **warn**  | Secret leak detection (redact/block), SSRF blocks, network policy denials, shell command denials, approval channel failures, tool execution errors/timeouts, unknown tools, injection patterns detected                    |
+| **info**  | Startup sequence (config load, agent/tool registry init, gateway mode), session creation, shell command execution, file writes, web fetches, approval decisions, ReAct loop lifecycle, eidetica sync, MCP server lifecycle |
+| **debug** | LLM request/response details, individual tool results, model resolution, file reads, memory store/recall, HTTP response status/size, shell exit codes, MCP JSON-RPC traffic                                                |
 
 ### Adding logging to new code
 
