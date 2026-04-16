@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phases 0–9 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles). Recent: named sessions, MCP auto-restart, tiktoken tokenization, glob tool allowlists, per-session serialization, XML injection defense, per-agent memory isolation, tool rate limiting.
+**Status**: Active development — Phases 0–9 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles). Recent: room tag migration to registry DB, Matrix approval UX (reactions + commands), new-session auto-detection callbacks, named sessions, MCP auto-restart, tiktoken tokenization, glob tool allowlists, per-session serialization, XML injection defense, per-agent memory isolation, tool rate limiting.
 
 ## Build & Development Commands
 
@@ -33,7 +33,7 @@ main.rs              CLI args, config, eidetica init, secret store, security con
 config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
-session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error, Summary)
+session.rs           SessionRegistry (central DB with bindings + new-session events) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error, Summary) + SessionBinding (transport→DB mapping + per-session config: model, role, backend)
 context.rs           ContextBuilder — token-budgeted context assembly from session entries, with Summary boundary support
 tool.rs              Tool trait, ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools, ToolProfile, PresentationMode
 mcp.rs               MCP subprocess server management: McpServer (JSON-RPC over stdin/stdout), McpTool (Tool wrapper), startup orchestration
@@ -96,7 +96,7 @@ defaults.rs          Built-in default config and roles
 - **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
 - **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Supports session picker, debug mode (Ctrl+D), session sharing (/share, /sync), and slash commands (/sessions, /new, /join, /info, /raw, /clear). Renders all entry types with distinct styles. Tool approval inline with y/n/a keys.
-- **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll.
+- **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll. Matrix surfaces approval requests as room messages with reaction support (✅❌⏭) and text commands (!chaz approve/deny).
 - **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM.
 - **Tool profiles**: Named configurations (in `tool_profiles:` config) controlling tool definition presentation. PresentationMode: Full (default), Brief (first sentence, no param descriptions), Summary (name only), Hidden. Supports glob prefix matching (`"filesystem.*": summary`). Configured per agent (`tool_profile:`), per preset, or per session. Applied at `ScopedTools::definitions()` call.
 - **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout). Config: `mcp_servers:` with name, command, args, env, default_policy. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details. Auto-restart with exponential backoff (1s–16s, max 5 attempts) on subprocess crash.
@@ -108,7 +108,8 @@ defaults.rs          Built-in default config and roles
 - **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
 - **Config**: Immutable after load, threaded via `Arc<Config>` in Matrix gateway
-- **Room tags**: `is.chaz.*` namespace for per-room model/role/backend persistence
+- **Session config**: Per-session model, role, and backend overrides stored in SessionBinding (registry DB). Replaces headjack Tags — config is transport-independent and syncs with eidetica.
+- **New-session detection**: SessionRegistry emits `NewSessionEvent` on session creation (local and sync'd). Server logs new sessions; consumers can subscribe via `subscribe_new_sessions()`.
 
 ## Adding a New Tool
 
