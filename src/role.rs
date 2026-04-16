@@ -10,11 +10,13 @@ use std::fmt;
 pub struct RoleDetails {
     /// Name of the role, used to reference it
     pub name: String,
-    /// Description of the role
+    /// Description of the role (deserialized from config, reserved for future use)
+    #[allow(dead_code)]
     description: Option<String>,
     /// The system prompt for the model
     prompt: Option<String>,
-    /// Example Conversations
+    /// Example Conversations (deserialized from config, reserved for future use)
+    #[allow(dead_code)]
     example: Option<Vec<Message>>,
 }
 
@@ -52,8 +54,9 @@ impl RoleDetails {
     }
 }
 
-/// A single message in a conversation
+/// A single message in a conversation (deserialized from config, fields used by serde)
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct Message {
     user: MessageRole,
     message: String,
@@ -103,30 +106,6 @@ impl<'de> Deserialize<'de> for MessageRole {
         D: Deserializer<'de>,
     {
         deserializer.deserialize_str(RoleVisitor)
-    }
-}
-
-/// Print details of a given role
-#[allow(dead_code)]
-pub fn print_role(
-    role: Option<String>,
-    role_list: Option<Vec<RoleDetails>>,
-    default_roles: Option<Vec<RoleDetails>>,
-) {
-    if let Some(role) = get_role(role, role_list, default_roles) {
-        println!("Role: {}", role.name);
-        if let Some(description) = role.description {
-            println!("Description: {}", description);
-        }
-        if let Some(prompt) = role.prompt {
-            println!("Prompt: {}", prompt);
-        }
-        if let Some(example) = role.example {
-            println!("Example Messages:");
-            for message in example {
-                println!("  {}: {}", message.user, message.message);
-            }
-        }
     }
 }
 
