@@ -63,6 +63,9 @@ pub struct ToolPolicy {
     pub timeout: u64,
     #[serde(default)]
     pub sensitive_params: Vec<String>,
+    /// Maximum calls per minute (None = unlimited)
+    #[serde(default)]
+    pub rate_limit: Option<u32>,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -76,6 +79,7 @@ impl Default for ToolPolicy {
             approval: ApprovalRequirement::Never,
             timeout: 60,
             sensitive_params: Vec::new(),
+            rate_limit: None,
         }
     }
 }
@@ -83,6 +87,45 @@ impl Default for ToolPolicy {
 impl ToolPolicy {
     pub fn timeout_duration(&self) -> Duration {
         Duration::from_secs(self.timeout)
+    }
+}
+
+/// Tracks per-tool call timestamps for rate limiting within a single agent turn.
+pub struct RateLimiter {
+    /// Tool name → list of call timestamps (within the sliding window)
+    calls: HashMap<String, Vec<std::time::Instant>>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            calls: HashMap::new(),
+        }
+    }
+
+    /// Check if a tool call is allowed under its rate limit.
+    /// Returns Ok(()) if allowed, Err(message) if rate limited.
+    pub fn check(&mut self, tool_name: &str, limit: u32) -> Result<(), String> {
+        let now = std::time::Instant::now();
+        let window = Duration::from_secs(60);
+
+        let timestamps = self.calls.entry(tool_name.to_string()).or_default();
+
+        // Prune expired entries
+        timestamps.retain(|t| now.duration_since(*t) < window);
+
+        if timestamps.len() >= limit as usize {
+            let oldest = timestamps.first().unwrap();
+            let retry_after = window.saturating_sub(now.duration_since(*oldest));
+            return Err(format!(
+                "Rate limited: {} exceeded {limit} calls/minute. Retry in {}s.",
+                tool_name,
+                retry_after.as_secs()
+            ));
+        }
+
+        timestamps.push(now);
+        Ok(())
     }
 }
 
@@ -566,5 +609,24 @@ mod tests {
         assert!(is_allowed_by(&allowed, "filesystem.write"));
         assert!(!is_allowed_by(&allowed, "web_fetch"));
         assert!(!is_allowed_by(&allowed, "filesystemx"));
+    }
+
+    #[test]
+    fn test_rate_limiter_allows_within_limit() {
+        let mut rl = RateLimiter::new();
+        assert!(rl.check("shell", 3).is_ok());
+        assert!(rl.check("shell", 3).is_ok());
+        assert!(rl.check("shell", 3).is_ok());
+        // 4th call exceeds limit of 3
+        assert!(rl.check("shell", 3).is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_independent_tools() {
+        let mut rl = RateLimiter::new();
+        assert!(rl.check("shell", 1).is_ok());
+        assert!(rl.check("shell", 1).is_err());
+        // Different tool has its own counter
+        assert!(rl.check("web_fetch", 1).is_ok());
     }
 }

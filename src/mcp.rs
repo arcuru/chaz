@@ -412,6 +412,7 @@ impl Tool for McpTool {
             approval: ApprovalRequirement::UnlessAutoApproved,
             timeout: 60,
             sensitive_params: Vec::new(),
+            rate_limit: None,
         })
     }
 }

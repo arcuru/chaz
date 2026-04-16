@@ -14,7 +14,7 @@
 use crate::backends::BackendManager;
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
-use crate::tool::{ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
+use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -109,6 +109,7 @@ pub async fn execute(
     let tool_defs = tools.definitions(&tool_ctx.profile);
     let mut messages = initial_messages;
     let mut approve_all = false; // tracks if user chose "approve all" this turn
+    let mut rate_limiter = RateLimiter::new();
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let response = match backend
@@ -182,6 +183,18 @@ pub async fn execute(
                             let policy = policies.resolve(tool);
                             let args: serde_json::Value =
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
+
+                            // --- Security: rate limit check ---
+                            if let Some(limit) = policy.rate_limit {
+                                if let Err(msg) = rate_limiter.check(&call.name, limit) {
+                                    warn!(tool = %call.name, "Rate limited");
+                                    messages.push(RuntimeMessage::ToolResult {
+                                        call_id: call.id.clone(),
+                                        content: wrap_tool_output(&call.name, &msg),
+                                    });
+                                    continue;
+                                }
+                            }
 
                             // --- Security: approval gate ---
                             if !approve_all && security.needs_approval(&call.name, &policy.approval)
