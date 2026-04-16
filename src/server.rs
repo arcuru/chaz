@@ -15,11 +15,13 @@
 
 use crate::agent::AgentRegistry;
 use crate::backends::BackendManager;
+use crate::config::ContextConfig;
+use crate::context::ContextBuilder;
 use crate::gateway::ApprovalExchange;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
-use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolRegistry};
+use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolProfile, ToolRegistry};
 use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -65,6 +67,10 @@ pub struct Server {
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
     semaphore: Arc<Semaphore>,
+    /// Named tool profiles from config
+    tool_profiles: HashMap<String, ToolProfile>,
+    /// Context window management config
+    context_config: ContextConfig,
     /// Per-session metadata (backend, agent override, approval channel)
     sessions: Arc<Mutex<HashMap<String, SessionMeta>>>,
     /// Track which session DBs have server callbacks registered
@@ -80,6 +86,8 @@ impl Server {
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
+        tool_profiles: HashMap<String, ToolProfile>,
+        context_config: ContextConfig,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
@@ -90,6 +98,8 @@ impl Server {
             policies,
             security,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS)),
+            tool_profiles,
+            context_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             notify_tx,
@@ -347,10 +357,20 @@ impl Server {
             agent.max_iterations as usize
         };
 
+        // Resolve tool profile: agent default (preset resolution happens at spawn_agent level)
+        let profile = agent
+            .tool_profile
+            .as_ref()
+            .and_then(|name| self.tool_profiles.get(name))
+            .cloned()
+            .unwrap_or_default();
+
         let tools = self.tools.clone();
         let policies = self.policies.clone();
         let security = self.security.clone();
         let semaphore = self.semaphore.clone();
+        let context_config = self.context_config.clone();
+        let max_context_tokens = agent.max_context_tokens;
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
@@ -367,11 +387,6 @@ impl Server {
                 })
                 .await;
             }
-
-            let context = {
-                let s = session.lock().await;
-                s.build_context(&agent_name, default_role, default_model)
-            };
 
             let request_security = SecurityContext {
                 leak_detector: security.leak_detector.clone(),
@@ -391,7 +406,27 @@ impl Server {
                 call_depth: spawn.call_depth,
                 max_call_depth,
                 tools: scoped_tools,
+                profile,
+                session: session.clone(),
             };
+
+            // Build context using ContextBuilder (token-budgeted)
+            let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+            let assembled = {
+                let s = session.lock().await;
+                ContextBuilder::new(s.entries(), &agent_name, &context_config)
+                    .with_role(default_role.as_ref())
+                    .with_tools(&tool_defs)
+                    .with_max_tokens_override(max_context_tokens)
+                    .build()
+            };
+
+            if assembled.truncated {
+                info!(
+                    "Context truncated for {}: {} entries, ~{} tokens",
+                    agent_name, assembled.entries_included, assembled.estimated_tokens
+                );
+            }
 
             // Set up event sink for ToolCall/ToolResult audit trail
             let (event_tx, mut event_rx) = mpsc::channel::<runtime::RuntimeEvent>(64);
@@ -441,7 +476,8 @@ impl Server {
             });
 
             let result = runtime::execute(
-                &context,
+                default_model.as_deref(),
+                assembled.messages,
                 &backend,
                 &request_security,
                 &tool_ctx,

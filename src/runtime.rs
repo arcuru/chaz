@@ -1,9 +1,9 @@
 //! Agent runtime — executes the ReAct loop.
 //!
-//! The runtime takes a ChatContext, a backend, and a set of tools.
-//! If tools are available and the backend supports them, it runs a
-//! ReAct loop (Reason → Act → Observe → repeat). Otherwise it falls
-//! back to a single-shot LLM call.
+//! The runtime takes pre-built RuntimeMessages, a model name, a backend,
+//! and a set of tools. If tools are available and the backend supports
+//! them, it runs a ReAct loop (Reason → Act → Observe → repeat).
+//! Otherwise it falls back to a single-shot LLM call.
 //!
 //! Security controls (Phase 3.8):
 //! - Tool calls are checked against approval requirements before execution
@@ -11,7 +11,7 @@
 //! - Tool execution is wrapped in a timeout
 //! - Content from tool outputs is scanned for injection patterns (warning-only)
 
-use crate::backends::{BackendManager, ChatContext};
+use crate::backends::BackendManager;
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
@@ -39,8 +39,8 @@ const MAX_TOOL_ITERATIONS: usize = 10;
 
 // === Message types for the ReAct loop ===
 
-/// A message in the runtime conversation, richer than ChatContext::Message
-/// to support tool call/result exchanges.
+/// A message in the runtime conversation. Richer than simple text messages
+/// to support tool call/result exchanges in the ReAct loop.
 #[derive(Clone, Debug)]
 pub enum RuntimeMessage {
     System(String),
@@ -78,11 +78,10 @@ pub enum LLMResponse {
 /// If tools are registered and the backend supports tool calling,
 /// runs a ReAct loop. Otherwise falls back to a single-shot execute.
 ///
-/// Accepts pre-built `RuntimeMessage`s from the `ContextBuilder`.
-/// The `context` is still needed for backend selection (model routing)
-/// and the simple-execution fallback path.
+/// Accepts pre-built `RuntimeMessage`s from the `ContextBuilder` and
+/// an optional model name for backend routing.
 pub async fn execute(
-    context: &ChatContext,
+    model: Option<&str>,
     initial_messages: Vec<RuntimeMessage>,
     backend: &BackendManager,
     security: &SecurityContext,
@@ -91,13 +90,12 @@ pub async fn execute(
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
 ) -> Result<String, String> {
     let tools = &tool_ctx.tools;
-    let model = backend.resolve_model(context);
+    let resolved_model = backend.resolve_model_name(model);
 
     // Fast path: no tools or backend doesn't support them → single-shot
-    // Use chat_with_tools with empty tools — it sends RuntimeMessages directly.
-    if tools.is_empty() || !backend.supports_tools(context) {
+    if tools.is_empty() || !backend.supports_tools_for_model(model) {
         return match backend
-            .chat_with_tools(context, &initial_messages, &[], &model)
+            .chat_with_tools_for_model(model, &initial_messages, &[], &resolved_model)
             .await
         {
             Ok(LLMResponse::Text(text)) => Ok(text),
@@ -114,15 +112,22 @@ pub async fn execute(
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let response = match backend
-            .chat_with_tools(context, &messages, &tool_defs, &model)
+            .chat_with_tools_for_model(model, &messages, &tool_defs, &resolved_model)
             .await
         {
             Ok(resp) => resp,
             Err(e) if iteration == 0 => {
                 // First call failed with tools — retry without tools as fallback.
                 // Some models/providers don't support function calling.
-                info!("Tool-aware call failed ({e}), falling back to simple execution");
-                return backend.execute(context).await;
+                info!("Tool-aware call failed ({e}), falling back to no-tools execution");
+                return match backend
+                    .chat_with_tools_for_model(model, &messages, &[], &resolved_model)
+                    .await
+                {
+                    Ok(LLMResponse::Text(text)) => Ok(text),
+                    Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
+                    Err(e) => Err(e),
+                };
             }
             Err(e) => return Err(e),
         };
@@ -288,7 +293,7 @@ pub async fn execute(
         "Please summarize what you found so far and respond to the user.".to_string(),
     ));
     match backend
-        .chat_with_tools(context, &messages, &[], &model)
+        .chat_with_tools_for_model(model, &messages, &[], &resolved_model)
         .await
     {
         Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),

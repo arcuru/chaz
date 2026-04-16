@@ -137,18 +137,6 @@ impl LLMBackend for OpenAI {
         None
     }
 
-    fn resolve_model(&self, context: &ChatContext) -> String {
-        let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
-        let mut model = context.model.clone().unwrap_or_default();
-        model = model
-            .trim_start_matches(&format!("{}:", model_prefix))
-            .to_string();
-        if model.is_empty() {
-            model = self.default_model().unwrap_or_default();
-        }
-        model
-    }
-
     fn supports_tools(&self) -> bool {
         true
     }

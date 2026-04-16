@@ -15,7 +15,7 @@ use crate::{
 pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;
     fn default_model(&self) -> Option<String>;
-    fn resolve_model(&self, context: &ChatContext) -> String;
+    /// Execute a simple chat request (no tools). Used by /compact and Matrix commands.
     async fn execute(&self, context: &ChatContext) -> Result<String, String>;
 
     /// Whether this backend supports tool/function calling
@@ -155,9 +155,10 @@ impl BackendManager {
         }
     }
 
-    /// Select the backend based on the model name in the context
-    fn select_backend(&self, context: &ChatContext) -> &Backend {
-        if let Some(model) = &context.model {
+    /// Select the backend based on a model name.
+    /// Multi-backend setups use "backend_name:model" prefixed names.
+    fn select_backend_for_model(&self, model: Option<&str>) -> &Backend {
+        if let Some(model) = model {
             self.backends
                 .iter()
                 .find(|backend| {
@@ -169,7 +170,14 @@ impl BackendManager {
         }
     }
 
-    /// Execute the ChatContext (simple, no tools)
+    /// Select the backend based on the model name in a ChatContext.
+    /// Used by legacy code paths (Matrix commands, /compact).
+    fn select_backend(&self, context: &ChatContext) -> &Backend {
+        self.select_backend_for_model(context.model.as_deref())
+    }
+
+    /// Execute a ChatContext (simple, no tools).
+    /// Used by Matrix commands and /compact — not by the runtime.
     pub async fn execute(&self, context: &ChatContext) -> Result<String, String> {
         if self.backends.is_empty() {
             return Err("No backends configured".to_string());
@@ -178,38 +186,48 @@ impl BackendManager {
         OpenAI::new(backend, &self.secrets).execute(context).await
     }
 
-    /// Whether the selected backend supports tool/function calling
-    pub fn supports_tools(&self, context: &ChatContext) -> bool {
+    /// Whether the backend for the given model supports tool/function calling.
+    pub fn supports_tools_for_model(&self, model: Option<&str>) -> bool {
         if self.backends.is_empty() {
             return false;
         }
-        let backend = self.select_backend(context);
+        let backend = self.select_backend_for_model(model);
         OpenAI::new(backend, &self.secrets).supports_tools()
     }
 
-    /// Resolve the model name for the selected backend
-    pub fn resolve_model(&self, context: &ChatContext) -> String {
+    /// Resolve a model name: strip backend prefix, fall back to default.
+    pub fn resolve_model_name(&self, model: Option<&str>) -> String {
         if self.backends.is_empty() {
             return String::new();
         }
-        let backend = self.select_backend(context);
-        OpenAI::new(backend, &self.secrets).resolve_model(context)
+        let backend = self.select_backend_for_model(model);
+        let model_prefix = backend.name.clone().unwrap_or_else(|| "openai".to_string());
+        let mut resolved = model.unwrap_or("").to_string();
+        resolved = resolved
+            .trim_start_matches(&format!("{model_prefix}:"))
+            .to_string();
+        if resolved.is_empty() {
+            resolved = OpenAI::new(backend, &self.secrets)
+                .default_model()
+                .unwrap_or_default();
+        }
+        resolved
     }
 
-    /// Execute a single LLM call with tool definitions (for ReAct loop)
-    pub async fn chat_with_tools(
+    /// Execute a single LLM call with tool definitions (for ReAct loop).
+    pub async fn chat_with_tools_for_model(
         &self,
-        context: &ChatContext,
+        model: Option<&str>,
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
-        model: &str,
+        resolved_model: &str,
     ) -> Result<LLMResponse, String> {
         if self.backends.is_empty() {
             return Err("No backends configured".to_string());
         }
-        let backend = self.select_backend(context);
+        let backend = self.select_backend_for_model(model);
         OpenAI::new(backend, &self.secrets)
-            .chat_with_tools(messages, tools, model)
+            .chat_with_tools(messages, tools, resolved_model)
             .await
     }
 }
