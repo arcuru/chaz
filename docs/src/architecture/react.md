@@ -53,7 +53,7 @@ The server consumes these events and writes `ToolCall` and `ToolResult` entries 
 
 ## Context Assembly
 
-The runtime converts `ChatContext` into `RuntimeMessage` vectors for the LLM:
+The `ContextBuilder` assembles session entries into `RuntimeMessage` vectors within a token budget. The runtime receives these pre-built messages:
 
 ```text
 RuntimeMessage::System(role prompt)

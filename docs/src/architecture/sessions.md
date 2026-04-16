@@ -65,12 +65,19 @@ graph LR
 
 ## Context Building
 
-`Session::build_context` converts session entries into a `ChatContext` for the LLM:
+`ContextBuilder` (in `context.rs`) assembles the LLM context within a token budget:
 
-1. Filter for `Message` and `Directive` entries only
-2. Truncate to the last 50 entries (MAX_CONTEXT_MESSAGES)
-3. Map senders to roles: current agent name = `assistant`, everything else = `user`
-4. Attach the agent's system prompt (role)
+1. Account for system prompt and tool definition tokens first
+2. Find the most recent `Summary` entry (context boundary — older entries excluded)
+3. Filter for `Message`, `Directive`, and `Summary` entries
+4. Fill from newest messages backward until the token budget is exhausted
+5. Map senders to roles: current agent name = `assistant`, everything else = `user`
+
+Token estimation uses a `chars.div_ceil(4)` heuristic. The budget is `max_context_tokens - reserved_output_tokens`, configurable globally and per-agent.
+
+### Compaction
+
+The `compact` tool and `/compact` TUI command write a `Summary` entry to the session. The `ContextBuilder` treats the most recent `Summary` as the conversation start boundary, effectively replacing older messages with the summary.
 
 ## Eidetica Sync
 

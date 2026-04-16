@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phase 1 (architecture + ReAct loop) and Phase 2 (tools) complete. Working on memory, persistence, and extensibility.
+**Status**: Active development — Phases 0–9 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles). Working on context budgeting and further extensibility.
 
 ## Build & Development Commands
 
@@ -24,7 +24,7 @@ just nix check      # nix flake check
 
 Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
 
-No unit tests yet — `cargo test` passes with no meaningful coverage. Build deps: `pkg-config`, `openssl`, `sqlite`.
+41 unit tests covering security (leak detection, SSRF, sanitizer), agent spawn permissions, tool profiles, and secret resolution. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 
@@ -33,11 +33,15 @@ main.rs              CLI args, config, eidetica init, secret store, security con
 config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
-session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error)
-tool.rs              Tool trait (descriptor + execute + default_policy), ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools
+session.rs           SessionRegistry (central DB with bindings) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error, Summary)
+context.rs           ContextBuilder — token-budgeted context assembly from session entries, with Summary boundary support
+tool.rs              Tool trait, ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools, ToolProfile, PresentationMode
+mcp.rs               MCP subprocess server management: McpServer (JSON-RPC over stdin/stdout), McpTool (Tool wrapper), startup orchestration
 tools/
   mod.rs             Re-exports all tools
   agent.rs           spawn_agent — delegate to another agent via server's session messaging (sync/async modes)
+  compact.rs         compact — write a Summary entry to compact conversation history (Low risk)
+  describe.rs        describe_tool — returns full tool description/schema for on-demand discovery (Low risk)
   time.rs            get_time — current UTC time (Low risk)
   calculate.rs       calculate — math expressions (Low risk)
   shell.rs           shell — execute commands (High risk, approval required, command allow/denylist)
@@ -59,7 +63,7 @@ gateway/
     commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
     history.rs       Room history reading for backfill
   tui.rs             TuiGateway — ratatui async terminal app, Elm architecture (App/Action/ui)
-backends.rs          BackendManager, LLMBackend trait (with tool support), ChatContext, Message
+backends.rs          BackendManager (model-based routing), LLMBackend trait, ChatContext (legacy: Matrix commands, /compact), Message
 openai.rs            OpenAI-compatible backend implementing LLMBackend
 role.rs              Role/system prompt management
 defaults.rs          Built-in default config and roles
@@ -71,7 +75,7 @@ defaults.rs          Built-in default config and roles
 
 **Message flow (TUI):** Input box → writes SessionEntry to session DB → callback fires → server runs agent → writes response → on_local_write sends `()` notify → event loop re-reads session from eidetica → renders updated entries in ratatui terminal.
 
-**ReAct loop:** Build context from session → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → emit RuntimeEvent → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to simple execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached. Runtime emits ToolCall/ToolResult events via optional RuntimeEventSink; server writes these to the session DB as audit trail entries.
+**ReAct loop:** ContextBuilder assembles token-budgeted RuntimeMessages from session entries (respecting Summary boundaries) → call LLM with tool definitions → if tool_calls: check approval requirement → if approved: execute with timeout → emit RuntimeEvent → scan output for leaks → scan for injection (warn) → feed results back, loop → if text: return final response. Falls back to no-tools execution if backend doesn't support tools. Forces a summary if iteration cap (10) is reached. Runtime emits ToolCall/ToolResult events via optional RuntimeEventSink; server writes these to the session DB as audit trail entries.
 
 **spawn_agent:** Writes a Directive entry to a child session → server's on_local_write callback fires → process_session detects Directive → spawns agent task → agent runs ReAct loop → writes response → completion channel signals caller. Supports sync (default) and async (`"async": true`) modes.
 
@@ -80,7 +84,8 @@ defaults.rs          Built-in default config and roles
 - **Gateway = bridge**: Gateways translate platform events ↔ session DB entries. Each registers its own on_local_write callback to detect agent responses and deliver to its transport. Server is transport-agnostic.
 - **Callback-driven server**: Server registers on_local_write callbacks on session DBs. Callback fires → notify channel → processing loop checks latest entry → if non-agent Message or Directive, spawns agent task. Agent writes Ack → runs ReAct loop (emitting ToolCall/ToolResult events to session) → writes response. Global Semaphore(10) caps concurrent LLM calls.
 - **Session messaging primitive**: All agent invocation goes through session entries. spawn_agent writes a Directive entry to a child session and awaits completion via the server's callback path (register_child_session + mpsc completion channel). Supports sync and async modes.
-- **Entry types**: Message (chat), Directive (instructions to agent — included in LLM context), ToolCall/ToolResult (audit trail — excluded from LLM context), Ack (thinking indicator), Error. Only Message and Directive enter the LLM context window.
+- **Entry types**: Message (chat), Directive (instructions to agent — included in LLM context), Summary (compacted context boundary), ToolCall/ToolResult (audit trail — excluded from LLM context), Ack (thinking indicator), Error. Only Message, Directive, and Summary enter the LLM context window.
+- **Context budgeting**: `ContextBuilder` assembles `RuntimeMessage`s within a token budget (`max_context_tokens - reserved_output_tokens`). Accounts for system prompt and tool definition overhead first, then fills messages from newest backward. The most recent `Summary` entry acts as a start boundary — older entries are excluded. Configurable globally and per-agent. The `compact` tool and `/compact` TUI command write Summary entries to trigger compaction.
 - **Eidetica sync**: HTTP transport enabled at startup. `/share` generates DatabaseTicket URLs, `/sync <ticket>` syncs remote sessions. Writes propagate bidirectionally via on_local_write callbacks.
 - **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
 - **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
@@ -91,7 +96,9 @@ defaults.rs          Built-in default config and roles
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
 - **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Supports session picker, debug mode (Ctrl+D), session sharing (/share, /sync), and slash commands (/sessions, /new, /join, /info, /raw, /clear). Renders all entry types with distinct styles. Tool approval inline with y/n/a keys.
 - **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll.
-- **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools.
+- **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM.
+- **Tool profiles**: Named configurations (in `tool_profiles:` config) controlling tool definition presentation. PresentationMode: Full (default), Brief (first sentence, no param descriptions), Summary (name only), Hidden. Supports glob prefix matching (`"filesystem.*": summary`). Configured per agent (`tool_profile:`), per preset, or per session. Applied at `ScopedTools::definitions()` call.
+- **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout). Config: `mcp_servers:` with name, command, args, env, default_policy. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details.
 - **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
 - **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
@@ -100,11 +107,32 @@ defaults.rs          Built-in default config and roles
 
 ## Adding a New Tool
 
+### Built-in (Rust)
+
 1. Create `src/tools/my_tool.rs` implementing the `Tool` trait
 2. Add `mod my_tool;` and `pub use` to `src/tools/mod.rs`
 3. Register in `main.rs`: `tools.register(tools::MyTool);`
 
 The `Tool` trait requires: `descriptor()` (returns `ToolDescriptor` with name, description, parameters JSON Schema) and `execute()` (returns boxed future for async support). Optional `default_policy()` returns `ToolPolicy` (risk, approval, timeout, sensitive_params) — config overrides via `security.tool_policies` take precedence. `ToolPolicyRegistry` resolves effective policy per tool.
+
+### External (MCP)
+
+Add to config — no code changes needed:
+
+```yaml
+mcp_servers:
+  - name: filesystem
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+    env:
+      SOME_VAR: "value"
+    default_policy:
+      risk: medium
+      approval: unless_auto_approved
+      timeout: 30
+```
+
+Tools are discovered via MCP `tools/list` at startup and registered as `server_name.tool_name` (e.g., `filesystem.read_file`). Policy overrides work the same as built-in tools via `security.tool_policies`. Use `tool_profiles` to control context usage when many MCP tools are present.
 
 ## CI
 
@@ -163,7 +191,7 @@ nix develop .# -c cargo run -- --config ~/chaz-test/config.yaml --tui
 nix develop .# -c cargo run -- --config ~/chaz-test/config-tui.yaml --tui
 ```
 
-TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/debug` (toggle timestamps/types), `/raw` (dump entries).
+TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/compact` (summarize and compact context), `/debug` (toggle timestamps/types), `/raw` (dump entries).
 
 ### Session sharing between instances
 
