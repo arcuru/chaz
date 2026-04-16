@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phases 0–9 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles). Working on context budgeting and further extensibility.
+**Status**: Active development — Phases 0–9 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles). Recent: named sessions, MCP auto-restart, tiktoken tokenization, glob tool allowlists, per-session serialization, XML injection defense, per-agent memory isolation, tool rate limiting.
 
 ## Build & Development Commands
 
@@ -24,7 +24,7 @@ just nix check      # nix flake check
 
 Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
 
-41 unit tests covering security (leak detection, SSRF, sanitizer), agent spawn permissions, tool profiles, and secret resolution. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
+60 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), and secret resolution. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 
@@ -85,10 +85,11 @@ defaults.rs          Built-in default config and roles
 - **Callback-driven server**: Server registers on_local_write callbacks on session DBs. Callback fires → notify channel → processing loop checks latest entry → if non-agent Message or Directive, spawns agent task. Agent writes Ack → runs ReAct loop (emitting ToolCall/ToolResult events to session) → writes response. Global Semaphore(10) caps concurrent LLM calls.
 - **Session messaging primitive**: All agent invocation goes through session entries. spawn_agent writes a Directive entry to a child session and awaits completion via the server's callback path (register_child_session + mpsc completion channel). Supports sync and async modes.
 - **Entry types**: Message (chat), Directive (instructions to agent — included in LLM context), Summary (compacted context boundary), ToolCall/ToolResult (audit trail — excluded from LLM context), Ack (thinking indicator), Error. Only Message, Directive, and Summary enter the LLM context window.
-- **Context budgeting**: `ContextBuilder` assembles `RuntimeMessage`s within a token budget (`max_context_tokens - reserved_output_tokens`). Accounts for system prompt and tool definition overhead first, then fills messages from newest backward. The most recent `Summary` entry acts as a start boundary — older entries are excluded. Configurable globally and per-agent. The `compact` tool and `/compact` TUI command write Summary entries to trigger compaction.
+- **Context budgeting**: `ContextBuilder` assembles `RuntimeMessage`s within a token budget (`max_context_tokens - reserved_output_tokens`). Uses tiktoken (cl100k_base) for accurate token counting. Accounts for system prompt and tool definition overhead first, then fills messages from newest backward. The most recent `Summary` entry acts as a start boundary — older entries are excluded. Configurable globally and per-agent. The `compact` tool and `/compact` TUI command write Summary entries to trigger compaction.
 - **Eidetica sync**: HTTP transport enabled at startup. `/share` generates DatabaseTicket URLs, `/sync <ticket>` syncs remote sessions. Writes propagate bidirectionally via on_local_write callbacks.
 - **Per-session eidetica DBs**: Each conversation gets its own eidetica Database. SessionRegistry (central "chaz-registry" DB) persists transport_id → session DB root ID bindings across restarts.
-- **Memory**: eidetica Table store for key-value facts in central "chaz-central" DB (shared, not per-session)
+- **Named sessions**: Sessions can be given human-friendly names via `/name <alias>`. Names are unique, persisted, and usable wherever a session identifier is accepted (`/join`, schedule configs). `SessionRegistry::resolve_session()` tries name → DB ID → transport ID.
+- **Memory**: eidetica Table store for key-value facts, namespaced per agent (`memory:{agent_name}`) in central "chaz-central" DB. Each agent has isolated memory.
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (ScopedTools with transitive narrowing)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection.
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
@@ -98,7 +99,11 @@ defaults.rs          Built-in default config and roles
 - **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll.
 - **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM.
 - **Tool profiles**: Named configurations (in `tool_profiles:` config) controlling tool definition presentation. PresentationMode: Full (default), Brief (first sentence, no param descriptions), Summary (name only), Hidden. Supports glob prefix matching (`"filesystem.*": summary`). Configured per agent (`tool_profile:`), per preset, or per session. Applied at `ScopedTools::definitions()` call.
-- **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout). Config: `mcp_servers:` with name, command, args, env, default_policy. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details.
+- **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout). Config: `mcp_servers:` with name, command, args, env, default_policy. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details. Auto-restart with exponential backoff (1s–16s, max 5 attempts) on subprocess crash.
+- **Tool allowlist globs**: Agent tool allowlists support `"namespace.*"` glob patterns (e.g., `"filesystem.*"` matches all tools from that MCP server). Works in ScopedTools filtering, access checks, and transitive narrowing.
+- **Per-session serialization**: Server tracks which sessions have active agent tasks. Concurrent writes to the same session are skipped while an agent is running, preventing duplicate responses.
+- **XML tool output wrapping**: Tool results fed back to the LLM are wrapped in `<tool_output tool="name">` delimiters with angle-bracket escaping, preventing injection attacks through tool output.
+- **Tool rate limiting**: Per-tool `rate_limit` (calls/minute) in policy config. Sliding-window RateLimiter enforced in the ReAct loop before tool execution.
 - **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
 - **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
@@ -191,7 +196,7 @@ nix develop .# -c cargo run -- --config ~/chaz-test/config.yaml --tui
 nix develop .# -c cargo run -- --config ~/chaz-test/config-tui.yaml --tui
 ```
 
-TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/compact` (summarize and compact context), `/debug` (toggle timestamps/types), `/raw` (dump entries).
+TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/name <alias>` (name session), `/join <name|id>` (switch), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/compact` (summarize and compact context), `/debug` (toggle timestamps/types), `/raw` (dump entries).
 
 ### Session sharing between instances
 
