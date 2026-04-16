@@ -7,6 +7,13 @@ use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Derive the eidetica store name for an agent's memory.
+///
+/// Each agent gets its own isolated memory namespace in the central DB.
+fn memory_store_name(agent_name: &str) -> String {
+    format!("memory:{agent_name}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub key: String,
@@ -47,11 +54,11 @@ impl Tool for Remember {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let key = arguments
                 .get("key")
@@ -68,13 +75,14 @@ impl Tool for Remember {
                 timestamp: Utc::now().to_rfc3339(),
             };
 
+            let store_name = memory_store_name(&ctx.agent_name);
             let txn = self
                 .database
                 .new_transaction()
                 .await
                 .map_err(|e| format!("Failed to create transaction: {e}"))?;
             let store = txn
-                .get_store::<Table<MemoryEntry>>("memory")
+                .get_store::<Table<MemoryEntry>>(&store_name)
                 .await
                 .map_err(|e| format!("Failed to open memory store: {e}"))?;
             store
@@ -119,11 +127,11 @@ impl Tool for Recall {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let query = arguments
                 .get("query")
@@ -131,13 +139,14 @@ impl Tool for Recall {
                 .ok_or_else(|| "Missing 'query' argument".to_string())?
                 .to_lowercase();
 
+            let store_name = memory_store_name(&ctx.agent_name);
             let txn = self
                 .database
                 .new_transaction()
                 .await
                 .map_err(|e| format!("Failed to create transaction: {e}"))?;
             let store = txn
-                .get_store::<Table<MemoryEntry>>("memory")
+                .get_store::<Table<MemoryEntry>>(&store_name)
                 .await
                 .map_err(|e| format!("Failed to open memory store: {e}"))?;
 
