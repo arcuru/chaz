@@ -93,6 +93,16 @@ The bot will log in to Matrix, accept room invites from allowed users, and respo
 
 See [Matrix Bot](matrix.md) for details.
 
+## Troubleshooting
+
+If something isn't working, increase log verbosity:
+
+```bash
+RUST_LOG=debug chaz --config config.yaml --tui 2> chaz.log
+```
+
+See [Logging](logging.md) for details on log levels and filtering.
+
 ## Next Steps
 
 - [Configuration](configuration.md) for full config reference
@@ -100,3 +110,4 @@ See [Matrix Bot](matrix.md) for details.
 - [Tools](tools.md) for the built-in tool set
 - [Agents](agents.md) for multi-agent orchestration
 - [Session Sharing](session_sharing.md) for syncing sessions between instances
+- [Logging](logging.md) for observability and debugging

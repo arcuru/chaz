@@ -13,6 +13,7 @@
 - [MCP External Tools](user_guide/mcp.md)
 - [Agents](user_guide/agents.md)
 - [Security](user_guide/security.md)
+- [Logging](user_guide/logging.md)
 
 # Architecture
 

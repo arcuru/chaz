@@ -111,6 +111,41 @@ defaults.rs          Built-in default config and roles
 - **Session config**: Per-session model, role, and backend overrides stored in SessionBinding (registry DB). Replaces headjack Tags — config is transport-independent and syncs with eidetica.
 - **New-session detection**: SessionRegistry emits `NewSessionEvent` on session creation (local and sync'd). Server logs new sessions; consumers can subscribe via `subscribe_new_sessions()`.
 
+## Logging
+
+All logging uses the `tracing` crate (`tracing-subscriber` with default fmt subscriber). Control output via `RUST_LOG`:
+
+```bash
+# Default (info+)
+chaz --config config.yaml --tui
+
+# Debug — includes tool results, LLM requests, model resolution
+RUST_LOG=debug chaz --config config.yaml --tui
+
+# Module-specific
+RUST_LOG=chaz::runtime=debug,chaz::security=debug chaz --config config.yaml --tui
+
+# Quiet — errors only
+RUST_LOG=error chaz --config config.yaml --tui
+```
+
+### Log levels by category
+
+| Level | What |
+|-------|------|
+| **error** | Login/session DB failures, gateway crashes, agent execution errors |
+| **warn** | Secret leak detection (redact/block), SSRF blocks, network policy denials, shell command denials, approval channel failures, tool execution errors/timeouts, unknown tools, injection patterns detected |
+| **info** | Startup sequence (config load, agent/tool registry init, gateway mode), session creation, shell command execution, file writes, web fetches, approval decisions, ReAct loop lifecycle, eidetica sync, MCP server lifecycle |
+| **debug** | LLM request/response details, individual tool results, model resolution, file reads, memory store/recall, HTTP response status/size, shell exit codes, MCP JSON-RPC traffic |
+
+### Adding logging to new code
+
+- Import the levels you need: `use tracing::{debug, info, warn, error};`
+- Use structured fields: `info!(tool = %name, bytes = len, "File written")`
+- Security operations should always log at warn+ when denying/blocking
+- Tool execution: info for start, debug for result, warn for errors
+- LLM traffic: debug (it's verbose)
+
 ## Adding a New Tool
 
 ### Built-in (Rust)
