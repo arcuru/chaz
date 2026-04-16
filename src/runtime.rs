@@ -17,6 +17,8 @@ use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -38,6 +40,49 @@ pub enum RuntimeEvent {
 }
 
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Number of times a tool call fingerprint can repeat before loop detection triggers.
+const LOOP_DETECTION_THRESHOLD: u32 = 3;
+
+/// Detects repetitive tool call patterns that indicate the agent is stuck in a loop.
+///
+/// Fingerprints each set of tool calls per iteration (sorted hash of name + arguments).
+/// When the same fingerprint appears `LOOP_DETECTION_THRESHOLD` times, the loop is
+/// considered stuck and should be broken.
+struct LoopDetector {
+    /// Maps iteration fingerprints to their occurrence count.
+    fingerprints: HashMap<u64, u32>,
+}
+
+impl LoopDetector {
+    fn new() -> Self {
+        Self {
+            fingerprints: HashMap::new(),
+        }
+    }
+
+    /// Record a set of tool calls for one iteration and check for loops.
+    /// Returns `true` if a loop is detected.
+    fn record_and_check(&mut self, tool_calls: &[ToolCallRequest]) -> bool {
+        let fingerprint = Self::fingerprint(tool_calls);
+        let count = self.fingerprints.entry(fingerprint).or_insert(0);
+        *count += 1;
+        *count >= LOOP_DETECTION_THRESHOLD
+    }
+
+    /// Compute a fingerprint for a set of tool calls.
+    /// Sorts by name to be order-independent within a single iteration.
+    fn fingerprint(tool_calls: &[ToolCallRequest]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        let mut pairs: Vec<(&str, &str)> = tool_calls
+            .iter()
+            .map(|tc| (tc.name.as_str(), tc.arguments.as_str()))
+            .collect();
+        pairs.sort();
+        pairs.hash(&mut hasher);
+        hasher.finish()
+    }
+}
 
 // === Message types for the ReAct loop ===
 
@@ -237,6 +282,7 @@ pub async fn execute(
     let mut messages = initial_messages;
     let mut approve_all = false; // tracks if user chose "approve all" this turn
     let mut rate_limiter = RateLimiter::new();
+    let mut loop_detector = LoopDetector::new();
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let response = match llm_call_with_retry(
@@ -312,6 +358,20 @@ pub async fn execute(
                     "Tool calls requested: {:?}",
                     tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>()
                 );
+
+                // --- Loop detection: check if the agent is repeating the same calls ---
+                if loop_detector.record_and_check(&tool_calls) {
+                    warn!(
+                        iteration,
+                        threshold = LOOP_DETECTION_THRESHOLD,
+                        tools = ?tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>(),
+                        "Loop detected: agent is repeating the same tool calls"
+                    );
+                    messages.push(RuntimeMessage::User(
+                        "You are stuck in a loop — you have made the same tool calls multiple times with the same arguments. Stop using tools and provide your best response based on the information you already have.".to_string(),
+                    ));
+                    break;
+                }
 
                 // Record the assistant's tool call request
                 messages.push(RuntimeMessage::AssistantToolCalls {
@@ -464,11 +524,15 @@ pub async fn execute(
         }
     }
 
-    // Hit the cap — make one final call without tools to force a text summary
-    info!("Max tool iterations reached, forcing final response");
-    messages.push(RuntimeMessage::User(
-        "Please summarize what you found so far and respond to the user.".to_string(),
-    ));
+    // Hit the cap or loop detected — make one final call without tools to force a text summary
+    info!("Forcing final response (max iterations or loop detected)");
+    // Only add summary prompt if the last message isn't already a loop-break prompt
+    if !matches!(messages.last(), Some(RuntimeMessage::User(msg)) if msg.contains("stuck in a loop"))
+    {
+        messages.push(RuntimeMessage::User(
+            "Please summarize what you found so far and respond to the user.".to_string(),
+        ));
+    }
     match llm_call_with_retry(
         backend,
         model,
@@ -605,5 +669,67 @@ mod tests {
         // The closing tag should be escaped, preventing breakout
         assert!(!result.contains("</tool_output>\n<system>"));
         assert!(result.contains("&lt;/tool_output&gt;"));
+    }
+
+    fn make_tool_call(name: &str, args: &str) -> ToolCallRequest {
+        ToolCallRequest {
+            id: "call_1".to_string(),
+            name: name.to_string(),
+            arguments: args.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_loop_detector_no_loop() {
+        let mut detector = LoopDetector::new();
+        // Different tool calls each time — no loop
+        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls"}"#)]));
+        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"pwd"}"#)]));
+        assert!(!detector.record_and_check(&[make_tool_call("read_file", r#"{"path":"a.txt"}"#)]));
+    }
+
+    #[test]
+    fn test_loop_detector_triggers_on_repetition() {
+        let mut detector = LoopDetector::new();
+        let calls = vec![make_tool_call("shell", r#"{"cmd":"ls"}"#)];
+        assert!(!detector.record_and_check(&calls)); // 1st
+        assert!(!detector.record_and_check(&calls)); // 2nd
+        assert!(detector.record_and_check(&calls)); // 3rd — loop detected
+    }
+
+    #[test]
+    fn test_loop_detector_order_independent() {
+        let mut detector = LoopDetector::new();
+        let calls_a = vec![
+            make_tool_call("shell", r#"{"cmd":"ls"}"#),
+            make_tool_call("read_file", r#"{"path":"a.txt"}"#),
+        ];
+        let calls_b = vec![
+            make_tool_call("read_file", r#"{"path":"a.txt"}"#),
+            make_tool_call("shell", r#"{"cmd":"ls"}"#),
+        ];
+        assert!(!detector.record_and_check(&calls_a));
+        assert!(!detector.record_and_check(&calls_b)); // same tools, different order
+        assert!(detector.record_and_check(&calls_a)); // 3rd — loop detected
+    }
+
+    #[test]
+    fn test_loop_detector_different_args_no_loop() {
+        let mut detector = LoopDetector::new();
+        // Same tool, different arguments each time — not a loop
+        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -l"}"#)]));
+        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -a"}"#)]));
+        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -la"}"#)]));
+    }
+
+    #[test]
+    fn test_loop_detector_fingerprint_deterministic() {
+        let calls = vec![
+            make_tool_call("a", "1"),
+            make_tool_call("b", "2"),
+        ];
+        let fp1 = LoopDetector::fingerprint(&calls);
+        let fp2 = LoopDetector::fingerprint(&calls);
+        assert_eq!(fp1, fp2);
     }
 }
