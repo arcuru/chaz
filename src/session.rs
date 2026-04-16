@@ -53,6 +53,9 @@ pub struct SessionBinding {
     pub session_db_id: String,
     /// Agent name bound to this conversation, if any
     pub agent_name: Option<String>,
+    /// Human-friendly alias for this session (e.g., "daily-standup")
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Per-conversation state backed by its own eidetica Database.
@@ -316,6 +319,7 @@ impl SessionRegistry {
                 conversation_id: conversation_id.0.clone(),
                 session_db_id: db.root_id().to_string(),
                 agent_name: None,
+                name: None,
             })
             .await?;
         txn.commit().await?;
@@ -350,6 +354,101 @@ impl SessionRegistry {
         }
 
         self.agents.default_agent().clone()
+    }
+
+    /// Look up a session by its human-friendly name.
+    ///
+    /// Returns the transport_id, ConversationId, and Database handle.
+    /// Fails if no session has this name.
+    pub async fn open_session_by_name(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<(String, ConversationId, Database)> {
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+        let results = bindings.search(|b| b.name.as_deref() == Some(name)).await?;
+
+        let (_, binding) = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No session named '{name}'"))?;
+
+        let conversation_id = ConversationId(binding.conversation_id);
+        let db = {
+            let user = self.user.lock().await;
+            let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse session DB ID '{}': {e}",
+                    binding.session_db_id
+                )
+            })?;
+            user.open_database(&root_id).await?
+        };
+
+        Ok((binding.transport_id, conversation_id, db))
+    }
+
+    /// Set a human-friendly name for a session (persisted).
+    ///
+    /// Returns an error if the name is already taken by another session.
+    pub async fn set_session_name(&self, transport_id: &str, name: String) -> anyhow::Result<()> {
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+
+        // Check for name collision
+        let existing = bindings
+            .search(|b| b.name.as_deref() == Some(&name) && b.transport_id != transport_id)
+            .await?;
+        if !existing.is_empty() {
+            anyhow::bail!("Name '{name}' is already used by another session");
+        }
+
+        // Update the binding
+        let results = bindings.search(|b| b.transport_id == transport_id).await?;
+        if let Some((key, mut binding)) = results.into_iter().next() {
+            binding.name = Some(name);
+            bindings.set(&key, binding).await?;
+            txn.commit().await?;
+        } else {
+            anyhow::bail!("No session found for transport ID '{transport_id}'");
+        }
+
+        Ok(())
+    }
+
+    /// Clear the name from a session (persisted).
+    pub async fn clear_session_name(&self, transport_id: &str) -> anyhow::Result<()> {
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+        let results = bindings.search(|b| b.transport_id == transport_id).await?;
+        if let Some((key, mut binding)) = results.into_iter().next() {
+            binding.name = None;
+            bindings.set(&key, binding).await?;
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a session identifier that could be a name, DB ID, or transport ID.
+    ///
+    /// Tries in order: name → DB ID → transport ID (creates if needed).
+    pub async fn resolve_session(
+        &self,
+        identifier: &str,
+    ) -> anyhow::Result<(String, ConversationId, Database)> {
+        // Try name first
+        if let Ok(result) = self.open_session_by_name(identifier).await {
+            return Ok(result);
+        }
+
+        // Try DB ID
+        if let Ok(result) = self.open_session_by_db_id(identifier).await {
+            return Ok(result);
+        }
+
+        // Fall back to transport ID (creates if needed)
+        let (conv_id, db) = self.get_or_create_session_db(identifier).await?;
+        Ok((identifier.to_string(), conv_id, db))
     }
 
     /// Bind a conversation to a specific agent (persisted).

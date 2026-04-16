@@ -31,7 +31,8 @@ struct ScheduleState {
 /// A parsed schedule ready for execution.
 struct ScheduleRecord {
     name: String,
-    session_db_id: String,
+    /// Session identifier — can be a name, DB ID, or transport ID (resolved at fire time)
+    session_id: String,
     task: String,
     cron: Schedule,
     enabled: bool,
@@ -86,7 +87,7 @@ impl Scheduler {
                     );
                     records.push(ScheduleRecord {
                         name: cfg.name,
-                        session_db_id: cfg.session,
+                        session_id: cfg.session,
                         task: cfg.task,
                         cron,
                         enabled: true,
@@ -128,7 +129,7 @@ impl Scheduler {
                 let next_run = next_run_after(&r.cron, r.last_run);
                 ScheduleInfo {
                     name: r.name.clone(),
-                    session: r.session_db_id.clone(),
+                    session: r.session_id.clone(),
                     task: r.task.clone(),
                     enabled: r.enabled,
                     last_run: r.last_run,
@@ -146,7 +147,7 @@ impl Scheduler {
                 .iter()
                 .find(|r| r.name == name)
                 .ok_or_else(|| anyhow::anyhow!("Unknown schedule: '{name}'"))?;
-            (record.session_db_id.clone(), record.task.clone())
+            (record.session_id.clone(), record.task.clone())
         };
 
         self.fire_schedule(name, &task.0, &task.1).await?;
@@ -205,7 +206,7 @@ impl Scheduler {
                         .map(|next| next <= now)
                         .unwrap_or(false)
                 })
-                .map(|r| (r.name.clone(), r.session_db_id.clone(), r.task.clone()))
+                .map(|r| (r.name.clone(), r.session_id.clone(), r.task.clone()))
                 .collect()
         };
 
@@ -236,20 +237,12 @@ impl Scheduler {
     }
 
     /// Fire a single schedule: write a Directive to the target session.
-    async fn fire_schedule(
-        &self,
-        name: &str,
-        session_db_id: &str,
-        task: &str,
-    ) -> anyhow::Result<()> {
-        info!(schedule = %name, db_id = %session_db_id, "Firing scheduled task");
+    async fn fire_schedule(&self, name: &str, session_id: &str, task: &str) -> anyhow::Result<()> {
+        info!(schedule = %name, session = %session_id, "Firing scheduled task");
 
-        // Open the session by its eidetica DB root ID
-        let (transport_id, conversation_id, session_db) = self
-            .server
-            .registry()
-            .open_session_by_db_id(session_db_id)
-            .await?;
+        // Resolve the session identifier (name, DB ID, or transport ID)
+        let (transport_id, conversation_id, session_db) =
+            self.server.registry().resolve_session(session_id).await?;
 
         // Ensure the server is watching this session
         self.server

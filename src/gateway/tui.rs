@@ -57,6 +57,7 @@ enum TuiMode {
 struct SessionInfo {
     transport_id: String,
     agent_name: Option<String>,
+    name: Option<String>,
     entry_count: usize,
     last_message: Option<String>,
 }
@@ -77,6 +78,7 @@ struct App {
     // Current session
     transport_id: String,
     current_agent: String,
+    session_name: Option<String>,
     // Session picker state
     session_list: Vec<SessionInfo>,
     picker_index: usize,
@@ -97,6 +99,7 @@ impl App {
             debug_mode: false,
             transport_id,
             current_agent: String::new(),
+            session_name: None,
             session_list: Vec::new(),
             picker_index: 0,
         }
@@ -181,6 +184,7 @@ async fn load_session_list(server: &Server) -> Vec<SessionInfo> {
         sessions.push(SessionInfo {
             transport_id: binding.transport_id,
             agent_name: binding.agent_name,
+            name: binding.name,
             entry_count,
             last_message,
         });
@@ -292,21 +296,22 @@ impl Gateway for TuiGateway {
                                                 .unwrap_or(0);
                                             app.mode = TuiMode::SessionPicker;
                                         }
-                                        ChatCommand::SwitchSession(tid) => {
+                                        ChatCommand::SwitchSession(id) => {
                                             match switch_session(
                                                 &server,
-                                                &tid,
+                                                &id,
                                                 &backend,
                                                 &approval_tx,
                                                 &notify_tx,
                                             )
                                             .await
                                             {
-                                                Ok((db, entries, agent_name)) => {
-                                                    session_db = db;
-                                                    app.transport_id = tid;
-                                                    app.entries = entries;
-                                                    app.current_agent = agent_name;
+                                                Ok(result) => {
+                                                    session_db = result.db;
+                                                    app.transport_id = result.transport_id;
+                                                    app.entries = result.entries;
+                                                    app.current_agent = result.agent_name;
+                                                    app.session_name = result.session_name;
                                                     app.scroll_offset = 0;
                                                     app.waiting = false;
                                                 }
@@ -455,6 +460,50 @@ impl Gateway for TuiGateway {
                                                 }
                                             }
                                         }
+                                        ChatCommand::NameSession(name) => {
+                                            match server
+                                                .registry()
+                                                .set_session_name(&app.transport_id, name.clone())
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    app.session_name = Some(name.clone());
+                                                    show_system_msg(
+                                                        &mut app,
+                                                        format!(
+                                                            "Session named '{name}'. Use /join {name} to switch here."
+                                                        ),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    show_error(
+                                                        &mut app,
+                                                        format!("Failed to name session: {e}"),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ChatCommand::ClearSessionName => {
+                                            match server
+                                                .registry()
+                                                .clear_session_name(&app.transport_id)
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    app.session_name = None;
+                                                    show_system_msg(
+                                                        &mut app,
+                                                        "Session name cleared.".to_string(),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    show_error(
+                                                        &mut app,
+                                                        format!("Failed to clear name: {e}"),
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -469,11 +518,12 @@ impl Gateway for TuiGateway {
                                     )
                                     .await
                                     {
-                                        Ok((db, entries, agent_name)) => {
-                                            session_db = db;
-                                            app.transport_id = selected;
-                                            app.entries = entries;
-                                            app.current_agent = agent_name;
+                                        Ok(result) => {
+                                            session_db = result.db;
+                                            app.transport_id = result.transport_id;
+                                            app.entries = result.entries;
+                                            app.current_agent = result.agent_name;
+                                            app.session_name = result.session_name;
                                             app.scroll_offset = 0;
                                             app.waiting = false;
                                         }
@@ -532,24 +582,33 @@ enum ChatCommand {
     ListSchedules,
     TriggerSchedule(String),
     CompactSession,
+    NameSession(String),
+    ClearSessionName,
 }
 
-/// Switch to a different session. Registers with server and returns the new DB, entries, and agent name.
+/// Result of switching to a session.
+struct SwitchResult {
+    db: eidetica::Database,
+    entries: Vec<SessionEntry>,
+    agent_name: String,
+    transport_id: String,
+    session_name: Option<String>,
+}
+
+/// Switch to a different session. Resolves the identifier as a name, DB ID, or transport ID.
+/// Registers with server and returns session state.
 async fn switch_session(
     server: &Server,
-    transport_id: &str,
+    identifier: &str,
     backend: &BackendManager,
     approval_tx: &mpsc::Sender<ApprovalExchange>,
     notify_tx: &mpsc::Sender<()>,
-) -> anyhow::Result<(eidetica::Database, Vec<SessionEntry>, String)> {
-    let (conv_id, session_db) = server
-        .registry()
-        .get_or_create_session_db(transport_id)
-        .await?;
+) -> anyhow::Result<SwitchResult> {
+    let (transport_id, conv_id, session_db) = server.registry().resolve_session(identifier).await?;
 
     setup_session(
         server,
-        transport_id,
+        &transport_id,
         &session_db,
         backend.clone(),
         approval_tx.clone(),
@@ -557,10 +616,29 @@ async fn switch_session(
     )
     .await?;
 
-    let agent = server.registry().resolve_agent(transport_id, None).await;
+    // Look up the session name from the binding
+    let session_name = server
+        .registry()
+        .list_sessions()
+        .await
+        .ok()
+        .and_then(|bindings| {
+            bindings
+                .into_iter()
+                .find(|b| b.transport_id == transport_id)
+                .and_then(|b| b.name)
+        });
+
+    let agent = server.registry().resolve_agent(&transport_id, None).await;
     let session = Session::new(conv_id, session_db.clone()).await;
     let entries = session.entries().to_vec();
-    Ok((session_db, entries, agent.name))
+    Ok(SwitchResult {
+        db: session_db,
+        entries,
+        agent_name: agent.name,
+        transport_id,
+        session_name,
+    })
 }
 
 /// Generate a shareable DatabaseTicket for the current session.
@@ -752,11 +830,21 @@ async fn handle_chat_key(
                         return None;
                     }
                     _ if text.starts_with("/join ") => {
-                        let tid = text.strip_prefix("/join ").unwrap().trim().to_string();
-                        if !tid.is_empty() {
-                            return Some(ChatCommand::SwitchSession(tid));
+                        let identifier = text.strip_prefix("/join ").unwrap().trim().to_string();
+                        if !identifier.is_empty() {
+                            return Some(ChatCommand::SwitchSession(identifier));
                         }
                         return None;
+                    }
+                    _ if text.starts_with("/name ") => {
+                        let name = text.strip_prefix("/name ").unwrap().trim().to_string();
+                        if !name.is_empty() {
+                            return Some(ChatCommand::NameSession(name));
+                        }
+                        return None;
+                    }
+                    "/name" => {
+                        return Some(ChatCommand::ClearSessionName);
                     }
                     "/new" => {
                         let tid = format!("tui:{}", uuid::Uuid::new_v4());
@@ -792,7 +880,9 @@ async fn handle_chat_key(
                                 "Commands:",
                                 "  /sessions, /s  — open session picker",
                                 "  /new           — create a new session",
-                                "  /join <id>     — switch to session by transport ID",
+                                "  /join <id>     — switch to session by name, DB ID, or transport ID",
+                                "  /name <alias>  — set a human-friendly name for this session",
+                                "  /name          — clear the session name",
                                 "  /info          — show current session info",
                                 "  /share         — generate shareable ticket for current session",
                                 "  /sync <ticket> — sync a remote session via ticket",
@@ -837,10 +927,14 @@ async fn handle_chat_key(
                             .filter(|e| e.entry_type == EntryType::Error)
                             .count();
                         let db_id = session_db.root_id().to_string();
+                        let name_line = match &app.session_name {
+                            Some(name) => format!("\nName: {name}"),
+                            None => String::new(),
+                        };
                         app.entries.push(SessionEntry {
                             sender: "system".to_string(),
                             content: format!(
-                                "Session: {}\nDatabase ID: {}\nTotal entries: {}\nMessages: {} | Directives: {} | Tool calls: {} | Errors: {}\nDebug mode: {}",
+                                "Session: {}{name_line}\nDatabase ID: {}\nTotal entries: {}\nMessages: {} | Directives: {} | Tool calls: {} | Errors: {}\nDebug mode: {}",
                                 app.transport_id,
                                 db_id,
                                 app.entries.len(),
@@ -1161,9 +1255,13 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         .filter(|e| e.entry_type == EntryType::Message)
         .count();
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
+    let session_label = match &app.session_name {
+        Some(name) => format!("{} ({})", name, app.transport_id),
+        None => app.transport_id.clone(),
+    };
     let status_text = format!(
         " {} | agent: {} | messages: {}{} | /help",
-        app.transport_id, app.current_agent, msg_count, debug_indicator
+        session_label, app.current_agent, msg_count, debug_indicator
     );
     let status =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
@@ -1203,10 +1301,15 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
             let current_marker = if is_current { " *" } else { "" };
 
             let agent_str = info.agent_name.as_deref().unwrap_or("default");
+            let name_str = info
+                .name
+                .as_ref()
+                .map(|n| format!(" \"{n}\""))
+                .unwrap_or_default();
 
             let header = format!(
-                "{}{}{} ({}, {} entries)",
-                marker, info.transport_id, current_marker, agent_str, info.entry_count
+                "{}{}{}{} ({}, {} entries)",
+                marker, info.transport_id, name_str, current_marker, agent_str, info.entry_count
             );
 
             let style = if is_selected {

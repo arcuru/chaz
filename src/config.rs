@@ -152,7 +152,7 @@ pub enum BackendType {
 pub struct ScheduleConfig {
     /// Unique name for this schedule
     pub name: String,
-    /// Eidetica database root ID of the target session
+    /// Target session identifier — can be a session name, eidetica DB root ID, or transport ID
     pub session: String,
     /// Task instructions sent as the directive content
     pub task: String,

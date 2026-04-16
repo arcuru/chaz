@@ -20,3 +20,4 @@ config.yml
 
 # Claude Code
 /.claude
+target-test/
