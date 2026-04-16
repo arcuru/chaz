@@ -89,6 +89,7 @@ RUST_LOG=chaz::security=info,chaz::runtime=warn chaz --config config.yaml --tui 
 ```
 
 Key events to monitor:
+
 - `Secret detected in output` — a tool returned content matching a secret pattern
 - `Network request blocked` — SSRF or endpoint policy denial
 - `Shell command denied` — command not in allowlist or on denylist

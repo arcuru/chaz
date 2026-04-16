@@ -34,7 +34,7 @@ agents:
       - read_file
       - write_file
       - calculate
-      - "filesystem.*"  # Glob: all tools from "filesystem" MCP server
+      - "filesystem.*" # Glob: all tools from "filesystem" MCP server
     presets:
       quick:
         max_iterations: 5

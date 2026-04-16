@@ -571,7 +571,12 @@ pub async fn get_context(
         }
         if let Some(role_name) = &binding.role_name {
             if let Some(prompt) = &binding.role_prompt {
-                context.role = Some(RoleDetails::new(role_name, None, Some(prompt.clone()), None));
+                context.role = Some(RoleDetails::new(
+                    role_name,
+                    None,
+                    Some(prompt.clone()),
+                    None,
+                ));
             } else {
                 context.role = get_role(
                     Some(role_name.clone()),

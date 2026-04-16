@@ -27,13 +27,13 @@ mcp_servers:
 
 ### Fields
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Namespace prefix for tools (e.g., `filesystem` → `filesystem.read_file`) |
-| `command` | Yes | Command to spawn the MCP server |
-| `args` | No | Arguments for the command |
-| `env` | No | Environment variables (supports `${VAR}` references) |
-| `default_policy` | No | Default policy for all tools from this server |
+| Field            | Required | Description                                                              |
+| ---------------- | -------- | ------------------------------------------------------------------------ |
+| `name`           | Yes      | Namespace prefix for tools (e.g., `filesystem` → `filesystem.read_file`) |
+| `command`        | Yes      | Command to spawn the MCP server                                          |
+| `args`           | No       | Arguments for the command                                                |
+| `env`            | No       | Environment variables (supports `${VAR}` references)                     |
+| `default_policy` | No       | Default policy for all tools from this server                            |
 
 ## Tool Discovery and Namespacing
 
@@ -113,7 +113,7 @@ agents:
       - shell
       - read_file
       - write_file
-      - "filesystem.*"  # All filesystem MCP tools
+      - "filesystem.*" # All filesystem MCP tools
 ```
 
 See [Agents](agents.md) for details on tool narrowing.

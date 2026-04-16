@@ -116,7 +116,7 @@ Per-tool call frequency can be limited via the `rate_limit` field in tool polici
 security:
   tool_policies:
     shell:
-      rate_limit: 5  # max 5 calls per minute
+      rate_limit: 5 # max 5 calls per minute
     web_fetch:
       rate_limit: 20
 ```

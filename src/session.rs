@@ -397,12 +397,10 @@ impl SessionRegistry {
         info!("Created new session DB for {}", transport_id);
 
         // Notify listeners about the new session
-        let _ = self
-            .new_session_tx
-            .try_send(NewSessionEvent {
-                transport_id: transport_id.to_string(),
-                session_db_id: db.root_id().to_string(),
-            });
+        let _ = self.new_session_tx.try_send(NewSessionEvent {
+            transport_id: transport_id.to_string(),
+            session_db_id: db.root_id().to_string(),
+        });
 
         Ok((conversation_id, db))
     }

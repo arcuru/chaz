@@ -97,8 +97,7 @@ impl Gateway for MatrixGateway {
 
         // === Approval infrastructure ===
         let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
-        let (approval_relay_tx, mut approval_relay_rx) =
-            mpsc::channel::<RoomApprovalRequest>(64);
+        let (approval_relay_tx, mut approval_relay_rx) = mpsc::channel::<RoomApprovalRequest>(64);
 
         // Spawn relay task: receives approval requests, sends notices to rooms,
         // stores pending decisions for reaction/command handling
@@ -107,11 +106,10 @@ impl Gateway for MatrixGateway {
             let client = bot.client().clone();
             tokio::spawn(async move {
                 while let Some(req) = approval_relay_rx.recv().await {
-                    let room_id_parsed =
-                        match matrix_sdk::ruma::RoomId::parse(&req.room_id) {
-                            Ok(id) => id,
-                            Err(_) => continue,
-                        };
+                    let room_id_parsed = match matrix_sdk::ruma::RoomId::parse(&req.room_id) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
                     let Some(room) = client.get_room(&room_id_parsed) else {
                         continue;
                     };
@@ -266,8 +264,9 @@ impl Gateway for MatrixGateway {
                     let secrets = secrets.clone();
                     let registry = registry.clone();
                     async move {
-                        let context =
-                            get_context(&room, &config, &secrets, &registry).await.unwrap();
+                        let context = get_context(&room, &config, &secrets, &registry)
+                            .await
+                            .unwrap();
                         let content =
                             RoomMessageEventContent::notice_plain(context.string_prompt());
                         room.send(content).await.unwrap();
@@ -488,8 +487,7 @@ impl Gateway for MatrixGateway {
                         body
                     };
 
-                    let backend =
-                        get_backend(&room, &config, &secrets, server.registry()).await;
+                    let backend = get_backend(&room, &config, &secrets, server.registry()).await;
 
                     // Get or create session DB
                     let (_conv_id, session_db) =
@@ -502,10 +500,8 @@ impl Gateway for MatrixGateway {
                         };
 
                     // Create per-room approval channel that feeds the shared relay
-                    let approval_tx = make_room_approval_tx(
-                        room_id.clone(),
-                        approval_relay_tx.clone(),
-                    );
+                    let approval_tx =
+                        make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
 
                     // Register server callback (agent processing)
                     if let Err(e) = server

@@ -167,7 +167,11 @@ impl Tool for ShellExec {
             if result.is_empty() {
                 result.push_str("[no output]");
             }
-            debug!(exit_code, output_len = result.len(), "Shell command completed");
+            debug!(
+                exit_code,
+                output_len = result.len(),
+                "Shell command completed"
+            );
 
             // Truncate very long output
             if result.len() > 10000 {

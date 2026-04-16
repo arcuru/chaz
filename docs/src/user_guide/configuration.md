@@ -76,7 +76,7 @@ security:
   tool_policies:
     shell:
       approval: Always
-      rate_limit: 5  # max 5 calls per minute
+      rate_limit: 5 # max 5 calls per minute
     web_fetch:
       approval: UnlessAutoApproved
       timeout: 30
@@ -94,7 +94,7 @@ mcp_servers:
 # Scheduled tasks
 schedules:
   - name: daily-check
-    session: daily-standup  # Session name, DB ID, or transport ID
+    session: daily-standup # Session name, DB ID, or transport ID
     task: "Run the daily status check"
     cron: "0 9 * * *"
     enabled: true
