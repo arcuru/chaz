@@ -124,6 +124,11 @@ impl Server {
         &self.registry
     }
 
+    /// Get a shared Arc handle to the session registry
+    pub fn registry_arc(&self) -> Arc<SessionRegistry> {
+        self.registry.clone()
+    }
+
     /// Get the agent registry
     pub fn agents(&self) -> &AgentRegistry {
         &self.agents

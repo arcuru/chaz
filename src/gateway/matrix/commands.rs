@@ -3,8 +3,8 @@ use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
 use crate::role::{get_role, get_role_names, RoleDetails};
 use crate::security::SecretStore;
+use crate::session::SessionRegistry;
 
-use headjack::Tags;
 use headjack::*;
 use matrix_sdk::{
     room::MessagesOptions,
@@ -70,9 +70,10 @@ pub async fn list_models(
     room: Room,
     config: &Config,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<(), ()> {
-    let context = get_context(&room, config, secrets).await.unwrap();
-    let backends = get_backend(&room, config, secrets).await;
+    let context = get_context(&room, config, secrets, registry).await.unwrap();
+    let backends = get_backend(&room, config, secrets, registry).await;
     let response = format!(
         "!chaz Current Model: {}\n\nKnown Backends:\n{}\n\nKnown Models:\n{}",
         context
@@ -94,16 +95,25 @@ pub async fn set_role(
     room: Room,
     config: &Config,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<(), ()> {
+    let room_id = room.room_id().to_string();
     let mut words = text.split_whitespace().skip(2);
-    let mut tags = Tags::new(&room, "is.chaz.role").await;
     if let Some(name) = words.next() {
-        tags.replace_kv("chazdefault", name);
-        if let Some(prompt) = words.next() {
-            let prompt = words.fold(prompt.to_string(), |acc, x| format!("{} {}", acc, x));
-            tags.replace_kv(name, &prompt);
+        let custom_prompt = words
+            .next()
+            .map(|prompt| words.fold(prompt.to_string(), |acc, x| format!("{} {}", acc, x)));
+        if let Err(e) = registry
+            .update_binding(&room_id, |b| {
+                b.role_name = Some(name.to_string());
+                if let Some(ref prompt) = custom_prompt {
+                    b.role_prompt = Some(prompt.clone());
+                }
+            })
+            .await
+        {
+            error!("Failed to set role: {e}");
         }
-        tags.sync().await;
         room.send(RoomMessageEventContent::notice_plain(format!(
             "!chaz Role set to \"{}\"",
             name
@@ -111,17 +121,9 @@ pub async fn set_role(
         .await
         .unwrap();
     } else {
-        let context = get_context(&room, config, secrets);
-        let mut room_roles = Vec::new();
-        for tag in tags.tags() {
-            let role = tag.split('=').next().unwrap();
-            if role != "chazdefault" {
-                room_roles.push(role);
-            }
-        }
+        let context = get_context(&room, config, secrets, registry).await?;
         let config_roles = get_role_names(config.roles.clone());
         let default_roles = get_role_names(DEFAULT_CONFIG.roles.clone());
-        let context = context.await?;
         let current_role = {
             if let Some(role) = context.role {
                 role.name
@@ -130,13 +132,6 @@ pub async fn set_role(
             }
         };
         let mut response_parts = vec![format!("!chaz Current Role: {}", current_role)];
-
-        if !room_roles.is_empty() {
-            response_parts.push(format!(
-                "\n\nRoom Defined Roles:\n{}",
-                room_roles.join("\n")
-            ));
-        }
 
         if !config_roles.is_empty() {
             response_parts.push(format!(
@@ -164,6 +159,7 @@ pub async fn send(
     config: &Config,
     message_counts: &Mutex<HashMap<String, u64>>,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
@@ -174,7 +170,7 @@ pub async fn send(
         .collect::<Vec<&str>>()
         .join(" ");
 
-    let context = get_context(&room, config, secrets).await.unwrap();
+    let context = get_context(&room, config, secrets, registry).await.unwrap();
     let no_context = ChatContext {
         messages: vec![Message::new(MessageRole::user, input.to_string())],
         model: context.model,
@@ -186,7 +182,7 @@ pub async fn send(
         sender.as_str(),
         input.replace('\n', " ")
     );
-    if let Ok(result) = get_backend(&room, config, secrets)
+    if let Ok(result) = get_backend(&room, config, secrets, registry)
         .await
         .execute(&no_context)
         .await
@@ -202,17 +198,31 @@ pub async fn send(
     Ok(())
 }
 
-/// Add a backend provider into the room tags
-pub async fn set_backend(_: OwnedUserId, text: String, room: Room) -> Result<(), ()> {
+/// Add a backend provider for this session
+pub async fn set_backend(
+    _: OwnedUserId,
+    text: String,
+    room: Room,
+    secrets: &SecretStore,
+    registry: &SessionRegistry,
+) -> Result<(), ()> {
+    let room_id = room.room_id().to_string();
     let mut split = text.split_whitespace();
     split.next();
     split.next();
     if let (Some(name), Some(url), Some(token)) = (split.next(), split.next(), split.next()) {
-        let mut tags = Tags::new(&room, "is.chaz.backend").await;
-        tags.replace_kv("chazdefault", name);
-        tags.replace_kv(&format!("{}.url", name), url);
-        tags.replace_kv(&format!("{}.token", name), token);
-        tags.sync().await;
+        let ref_id = format!("session:{room_id}:{name}");
+        secrets.insert(ref_id.clone(), token.to_string()).await;
+        if let Err(e) = registry
+            .update_binding(&room_id, |b| {
+                b.backend_name = Some(name.to_string());
+                b.backend_url = Some(url.to_string());
+                b.backend_key_ref = Some(ref_id.clone());
+            })
+            .await
+        {
+            error!("Failed to set backend: {e}");
+        }
         room.send(RoomMessageEventContent::notice_plain(format!(
             "!chaz Successfully added backend {}",
             name
@@ -225,7 +235,6 @@ pub async fn set_backend(_: OwnedUserId, text: String, room: Room) -> Result<(),
         ))
         .await
         .unwrap();
-        return Ok(());
     }
     Ok(())
 }
@@ -236,10 +245,12 @@ pub async fn set_model(
     text: String,
     room: Room,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<(), ()> {
+    let room_id = room.room_id().to_string();
     let model = text.split_whitespace().nth(2);
     if let Some(model) = model {
-        let backend = get_backend_default(&room, secrets).await;
+        let backend = get_backend_from_binding(&room, secrets, registry).await;
         if backend.is_known_model(model) {
             let response = format!("!chaz Model set to \"{}\"", model);
             room.send(RoomMessageEventContent::notice_plain(response))
@@ -259,11 +270,16 @@ pub async fn set_model(
                 .await
                 .unwrap();
         }
-        let mut tags = Tags::new(&room, "is.chaz.model").await;
-        tags.replace_kv("default", model);
-        tags.sync().await;
+        if let Err(e) = registry
+            .update_binding(&room_id, |b| {
+                b.model = Some(model.to_string());
+            })
+            .await
+        {
+            error!("Failed to set model: {e}");
+        }
     } else {
-        list_models_default(sender, text, room, secrets).await?;
+        list_models_default(sender, text, room, secrets, registry).await?;
     }
     Ok(())
 }
@@ -274,8 +290,9 @@ async fn list_models_default(
     _: String,
     room: Room,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<(), ()> {
-    let backends = get_backend_default(&room, secrets).await;
+    let backends = get_backend_from_binding(&room, secrets, registry).await;
     let response = format!(
         "!chaz Known Backends:\n{}\n\nKnown Models:\n{}",
         backends.list_known_backends().join("\n"),
@@ -294,11 +311,12 @@ pub async fn rename(
     config: &Config,
     message_counts: &Mutex<HashMap<String, u64>>,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
     }
-    if let Ok(context) = get_context(&room, config, secrets).await {
+    if let Ok(context) = get_context(&room, config, secrets, registry).await {
         let mut context = context;
         context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
@@ -312,7 +330,7 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config, secrets)
+        let response = get_backend(&room, config, secrets, registry)
             .await
             .execute(&context)
             .await;
@@ -346,7 +364,7 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config, secrets)
+        let response = get_backend(&room, config, secrets, registry)
             .await
             .execute(&context)
             .await;
@@ -369,46 +387,31 @@ pub async fn rename(
     Ok(())
 }
 
-/// Get the backend defined in the room tags.
-/// Extracts API keys from tags into the SecretStore, keeping them out of Backend structs.
-async fn get_tag_backend(room: &Room, secrets: &SecretStore) -> Option<Vec<Backend>> {
-    let mut backends = Vec::new();
-    let tags = Tags::new(room, "is.chaz.backend").await;
-    let default_backend = tags.get_value("chazdefault");
-    let room_id = room.room_id().as_str();
-    for tag in tags.tags() {
-        if tag.split('.').nth(1).is_some_and(|x| x.starts_with("url")) {
-            let name = tag.split('.').next().unwrap_or_default();
-            let mut backend = Backend::new(BackendType::OpenAICompatible);
-            backend.name = Some(name.to_string());
-            backend.api_base = tags.get_value(&format!("{}.url", name));
-            // Extract API key into SecretStore instead of keeping on Backend struct
-            if let Some(key) = tags.get_value(&format!("{}.token", name)) {
-                let ref_id = format!("room:{room_id}:{name}");
-                secrets.insert(ref_id.clone(), key).await;
-                backend.api_key_ref = Some(ref_id);
-            }
-            if backend.api_base.is_some() && backend.api_key_ref.is_some() {
-                backends.push(backend);
-            }
-        }
-    }
-    if let Some(default_backend) = default_backend {
-        if let Some(index) = backends
-            .iter()
-            .position(|x| x.name == Some(default_backend.to_string()))
-        {
-            backends.swap(0, index);
-        }
-    }
-    Some(backends)
+/// Get the backend defined in the session binding.
+fn get_binding_backend(binding: &crate::session::SessionBinding) -> Option<Backend> {
+    let name = binding.backend_name.as_ref()?;
+    let url = binding.backend_url.as_ref()?;
+    let key_ref = binding.backend_key_ref.as_ref()?;
+    let mut backend = Backend::new(BackendType::OpenAICompatible);
+    backend.name = Some(name.clone());
+    backend.api_base = Some(url.clone());
+    backend.api_key_ref = Some(key_ref.clone());
+    Some(backend)
 }
 
-/// Returns the backend based on the config
-pub async fn get_backend(room: &Room, config: &Config, secrets: &SecretStore) -> BackendManager {
+/// Returns the backend based on the config and session binding
+pub async fn get_backend(
+    room: &Room,
+    config: &Config,
+    secrets: &SecretStore,
+    registry: &SessionRegistry,
+) -> BackendManager {
+    let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
-    if let Some(tag_backends) = get_tag_backend(room, secrets).await {
-        backends = tag_backends;
+    if let Some(binding) = registry.get_binding(&room_id).await {
+        if let Some(backend) = get_binding_backend(&binding) {
+            backends.push(backend);
+        }
     }
     if let Some(config_backends) = &config.backends {
         backends.extend(config_backends.clone());
@@ -420,11 +423,18 @@ pub async fn get_backend(room: &Room, config: &Config, secrets: &SecretStore) ->
     }
 }
 
-/// Returns the backend from room tags only (for commands without config access)
-async fn get_backend_default(room: &Room, secrets: &SecretStore) -> BackendManager {
+/// Returns the backend from session binding only (for commands without config access)
+async fn get_backend_from_binding(
+    room: &Room,
+    secrets: &SecretStore,
+    registry: &SessionRegistry,
+) -> BackendManager {
+    let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
-    if let Some(tag_backends) = get_tag_backend(room, secrets).await {
-        backends = tag_backends;
+    if let Some(binding) = registry.get_binding(&room_id).await {
+        if let Some(backend) = get_binding_backend(&binding) {
+            backends.push(backend);
+        }
     }
     if backends.is_empty() {
         BackendManager::new(&None, secrets.clone())
@@ -455,6 +465,7 @@ pub async fn get_context(
     room: &Room,
     config: &Config,
     secrets: &SecretStore,
+    registry: &SessionRegistry,
 ) -> Result<ChatContext, ()> {
     let mut context = ChatContext {
         messages: Vec::new(),
@@ -487,7 +498,7 @@ pub async fn get_context(
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {
                             let model = text_content.body.split_whitespace().nth(2);
                             if let Some(model) = model {
-                                if get_backend(room, config, secrets)
+                                if get_backend(room, config, secrets, registry)
                                     .await
                                     .validate_model(model)
                                     .is_ok()
@@ -552,20 +563,22 @@ pub async fn get_context(
             break;
         }
     }
-    let tags = Tags::new(room, "is.chaz.model").await;
-    if let Some(model) = tags.get_value("default") {
-        context.model = Some(model);
-    }
-    let tags = Tags::new(room, "is.chaz.role").await;
-    if let Some(role) = tags.get_value("chazdefault") {
-        if let Some(prompt) = tags.get_value(&role) {
-            context.role = Some(RoleDetails::new(&role, None, Some(prompt), None));
-        } else {
-            context.role = get_role(
-                Some(role),
-                config.roles.clone(),
-                DEFAULT_CONFIG.roles.clone(),
-            );
+    // Apply session config from registry
+    let room_id = room.room_id().to_string();
+    if let Some(binding) = registry.get_binding(&room_id).await {
+        if let Some(model) = &binding.model {
+            context.model = Some(model.clone());
+        }
+        if let Some(role_name) = &binding.role_name {
+            if let Some(prompt) = &binding.role_prompt {
+                context.role = Some(RoleDetails::new(role_name, None, Some(prompt.clone()), None));
+            } else {
+                context.role = get_role(
+                    Some(role_name.clone()),
+                    config.roles.clone(),
+                    DEFAULT_CONFIG.roles.clone(),
+                );
+            }
         }
     }
 

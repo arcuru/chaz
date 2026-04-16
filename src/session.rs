@@ -56,6 +56,24 @@ pub struct SessionBinding {
     /// Human-friendly alias for this session (e.g., "daily-standup")
     #[serde(default)]
     pub name: Option<String>,
+    /// Model override for this session
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Role name for this session (references a config/built-in role, or a custom one)
+    #[serde(default)]
+    pub role_name: Option<String>,
+    /// Custom role prompt (when role_name is a session-defined role, not a config one)
+    #[serde(default)]
+    pub role_prompt: Option<String>,
+    /// Backend name override for this session
+    #[serde(default)]
+    pub backend_name: Option<String>,
+    /// Backend API base URL (for session-defined backends)
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    /// SecretStore reference for the backend API key (for session-defined backends)
+    #[serde(default)]
+    pub backend_key_ref: Option<String>,
 }
 
 /// Per-conversation state backed by its own eidetica Database.
@@ -320,6 +338,12 @@ impl SessionRegistry {
                 session_db_id: db.root_id().to_string(),
                 agent_name: None,
                 name: None,
+                model: None,
+                role_name: None,
+                role_prompt: None,
+                backend_name: None,
+                backend_url: None,
+                backend_key_ref: None,
             })
             .await?;
         txn.commit().await?;
@@ -463,6 +487,39 @@ impl SessionRegistry {
                     }
                 }
             }
+        }
+    }
+
+    /// Get the session binding for a transport ID.
+    pub async fn get_binding(&self, transport_id: &str) -> Option<SessionBinding> {
+        let txn = self.registry_db.new_transaction().await.ok()?;
+        let bindings = txn
+            .get_store::<Table<SessionBinding>>("bindings")
+            .await
+            .ok()?;
+        let results = bindings
+            .search(|b| b.transport_id == transport_id)
+            .await
+            .ok()?;
+        results.into_iter().next().map(|(_, b)| b)
+    }
+
+    /// Update a binding field. The `updater` closure mutates the binding in-place.
+    pub async fn update_binding(
+        &self,
+        transport_id: &str,
+        updater: impl FnOnce(&mut SessionBinding),
+    ) -> anyhow::Result<()> {
+        let txn = self.registry_db.new_transaction().await?;
+        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
+        let results = bindings.search(|b| b.transport_id == transport_id).await?;
+        if let Some((key, mut binding)) = results.into_iter().next() {
+            updater(&mut binding);
+            bindings.set(&key, binding).await?;
+            txn.commit().await?;
+            Ok(())
+        } else {
+            anyhow::bail!("No session found for transport ID '{transport_id}'");
         }
     }
 }

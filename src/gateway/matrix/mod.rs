@@ -7,7 +7,6 @@ use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 
-use headjack::Tags;
 use headjack::*;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use std::collections::{HashMap, HashSet};
@@ -79,9 +78,13 @@ impl Gateway for MatrixGateway {
         )
         .await;
 
+        // Wrap registry in Arc for sharing across command closures
+        let registry = server.registry_arc();
+
         {
             let config = config.clone();
             let secrets = self.secrets.clone();
+            let registry = registry.clone();
             bot.register_text_command(
                 "print",
                 None,
@@ -89,8 +92,10 @@ impl Gateway for MatrixGateway {
                 move |_, _, room| {
                     let config = config.clone();
                     let secrets = secrets.clone();
+                    let registry = registry.clone();
                     async move {
-                        let context = get_context(&room, &config, &secrets).await.unwrap();
+                        let context =
+                            get_context(&room, &config, &secrets, &registry).await.unwrap();
                         let content =
                             RoomMessageEventContent::notice_plain(context.string_prompt());
                         room.send(content).await.unwrap();
@@ -107,6 +112,7 @@ impl Gateway for MatrixGateway {
             let config = config.clone();
             let counts = message_counts.clone();
             let secrets = self.secrets.clone();
+            let registry = registry.clone();
             bot.register_text_command(
                 "send",
                 "<message>".to_string(),
@@ -115,7 +121,11 @@ impl Gateway for MatrixGateway {
                     let config = config.clone();
                     let counts = counts.clone();
                     let secrets = secrets.clone();
-                    async move { commands::send(sender, text, room, &config, &counts, &secrets).await }
+                    let registry = registry.clone();
+                    async move {
+                        commands::send(sender, text, room, &config, &counts, &secrets, &registry)
+                            .await
+                    }
                 },
             )
             .await;
@@ -123,29 +133,44 @@ impl Gateway for MatrixGateway {
 
         {
             let secrets = self.secrets.clone();
+            let registry = registry.clone();
             bot.register_text_command(
                 "model",
                 "<model>".to_string(),
                 "Select the model to use".to_string(),
                 move |sender, text, room| {
                     let secrets = secrets.clone();
-                    async move { commands::set_model(sender, text, room, &secrets).await }
+                    let registry = registry.clone();
+                    async move {
+                        commands::set_model(sender, text, room, &secrets, &registry).await
+                    }
                 },
             )
             .await;
         }
 
-        bot.register_text_command(
-            "backend",
-            "<name> <api_base> <api_key>".to_string(),
-            "Manually enter an OpenAI Compatible Backend".to_string(),
-            commands::set_backend,
-        )
-        .await;
+        {
+            let secrets = self.secrets.clone();
+            let registry = registry.clone();
+            bot.register_text_command(
+                "backend",
+                "<name> <api_base> <api_key>".to_string(),
+                "Manually enter an OpenAI Compatible Backend".to_string(),
+                move |sender, text, room| {
+                    let secrets = secrets.clone();
+                    let registry = registry.clone();
+                    async move {
+                        commands::set_backend(sender, text, room, &secrets, &registry).await
+                    }
+                },
+            )
+            .await;
+        }
 
         {
             let config = config.clone();
             let secrets = self.secrets.clone();
+            let registry = registry.clone();
             bot.register_text_command(
                 "role",
                 "[<role>] [<prompt>]".to_string(),
@@ -153,7 +178,10 @@ impl Gateway for MatrixGateway {
                 move |sender, text, room| {
                     let config = config.clone();
                     let secrets = secrets.clone();
-                    async move { commands::set_role(sender, text, room, &config, &secrets).await }
+                    let registry = registry.clone();
+                    async move {
+                        commands::set_role(sender, text, room, &config, &secrets, &registry).await
+                    }
                 },
             )
             .await;
@@ -162,6 +190,7 @@ impl Gateway for MatrixGateway {
         {
             let config = config.clone();
             let secrets = self.secrets.clone();
+            let registry = registry.clone();
             bot.register_text_command(
                 "list",
                 "".to_string(),
@@ -169,7 +198,11 @@ impl Gateway for MatrixGateway {
                 move |sender, text, room| {
                     let config = config.clone();
                     let secrets = secrets.clone();
-                    async move { commands::list_models(sender, text, room, &config, &secrets).await }
+                    let registry = registry.clone();
+                    async move {
+                        commands::list_models(sender, text, room, &config, &secrets, &registry)
+                            .await
+                    }
                 },
             )
             .await;
@@ -194,6 +227,7 @@ impl Gateway for MatrixGateway {
             let config = config.clone();
             let counts = message_counts.clone();
             let secrets = self.secrets.clone();
+            let registry = registry.clone();
             bot.register_text_command(
                 "rename",
                 "".to_string(),
@@ -202,7 +236,11 @@ impl Gateway for MatrixGateway {
                     let config = config.clone();
                     let counts = counts.clone();
                     let secrets = secrets.clone();
-                    async move { commands::rename(sender, text, room, &config, &counts, &secrets).await }
+                    let registry = registry.clone();
+                    async move {
+                        commands::rename(sender, text, room, &config, &counts, &secrets, &registry)
+                            .await
+                    }
                 },
             )
             .await;
@@ -261,10 +299,14 @@ impl Gateway for MatrixGateway {
                         return Ok(());
                     }
 
-                    let agent_override = {
-                        let tags = Tags::new(&room, "is.chaz.agent").await;
-                        tags.get_value("default")
-                    };
+                    let room_id = room.room_id().to_string();
+
+                    // Read agent override from session registry binding
+                    let agent_override = server
+                        .registry()
+                        .get_binding(&room_id)
+                        .await
+                        .and_then(|b| b.agent_name.clone());
 
                     let body = if body.starts_with("!chaz") {
                         body.trim_start_matches("!chaz").trim().to_string()
@@ -272,8 +314,8 @@ impl Gateway for MatrixGateway {
                         body
                     };
 
-                    let backend = get_backend(&room, &config, &secrets).await;
-                    let room_id = room.room_id().to_string();
+                    let backend =
+                        get_backend(&room, &config, &secrets, server.registry()).await;
 
                     // Get or create session DB
                     let (_conv_id, session_db) =
