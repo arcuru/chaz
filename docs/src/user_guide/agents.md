@@ -34,6 +34,7 @@ agents:
       - read_file
       - write_file
       - calculate
+      - "filesystem.*"  # Glob: all tools from "filesystem" MCP server
     presets:
       quick:
         max_iterations: 5
@@ -51,10 +52,10 @@ agents:
 
 Tool access is controlled at two levels:
 
-1. **Agent definition**: `allowed_tools` restricts which tools an agent can see
+1. **Agent definition**: `allowed_tools` restricts which tools an agent can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace).
 2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `allowed_tools`
 
-This means a child agent can never have more tools than its parent, even if its definition allows them.
+This means a child agent can never have more tools than its parent, even if its definition allows them. Glob patterns in child allowlists are expanded against the registry and intersected with the parent's scope.
 
 ```mermaid
 graph TD

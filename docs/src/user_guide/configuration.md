@@ -76,9 +76,33 @@ security:
   tool_policies:
     shell:
       approval: Always
+      rate_limit: 5  # max 5 calls per minute
     web_fetch:
       approval: UnlessAutoApproved
       timeout: 30
+
+# MCP external tools (subprocess JSON-RPC)
+mcp_servers:
+  - name: filesystem
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+    default_policy:
+      risk: medium
+      approval: unless_auto_approved
+      timeout: 30
+
+# Scheduled tasks
+schedules:
+  - name: daily-check
+    session: daily-standup  # Session name, DB ID, or transport ID
+    task: "Run the daily status check"
+    cron: "0 9 * * *"
+    enabled: true
+
+# Context window management
+context:
+  max_context_tokens: 128000
+  reserved_output_tokens: 4096
 ```
 
 ## Backends
@@ -95,7 +119,19 @@ Agent definitions control which tools an agent can use, which other agents it ca
 
 ## Security
 
-Security settings control tool approval, network access, shell sandboxing, and secret leak detection. See [Security](security.md) for details.
+Security settings control tool approval, network access, shell sandboxing, secret leak detection, and tool rate limiting. See [Security](security.md) for details.
+
+## MCP Servers
+
+External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) for details.
+
+## Schedules
+
+Cron-driven task injection into sessions. Each schedule writes a `Directive` entry to the target session on a cron schedule. Sessions can be referenced by name, eidetica DB ID, or transport ID.
+
+## Context
+
+Token budgeting for the LLM context window. Uses tiktoken (cl100k_base) for accurate token counting. `max_context_tokens` sets the total budget, `reserved_output_tokens` is subtracted for the LLM's response. Per-agent overrides via `max_context_tokens` on agent definitions.
 
 ## State Directory
 

@@ -28,13 +28,17 @@ graph TD
 
 Each tool call passes through multiple security checks:
 
-1. **Approval gate**: Checks the tool's `ApprovalRequirement` against the `SecurityContext`. If approval is needed, sends an `ApprovalExchange` to the gateway and waits for the user's decision (Approve, Deny, ApproveAll).
+1. **Rate limiting**: If the tool has a `rate_limit` policy, a sliding-window counter checks the call frequency. Excess calls are rejected before execution.
 
-2. **Timeout**: Tool execution is wrapped in `tokio::time::timeout`. Default varies by tool policy.
+2. **Approval gate**: Checks the tool's `ApprovalRequirement` against the `SecurityContext`. If approval is needed, sends an `ApprovalExchange` to the gateway and waits for the user's decision (Approve, Deny, ApproveAll).
 
-3. **Leak detection**: Tool output is scanned against 12 secret patterns. Detected secrets are redacted or the output is blocked, depending on `leak_policy`.
+3. **Timeout**: Tool execution is wrapped in `tokio::time::timeout`. Default varies by tool policy.
 
-4. **Injection detection**: Tool output is scanned for prompt injection patterns (role markers, instruction overrides). Currently warning-only -- detections are logged but not blocked.
+4. **Leak detection**: Tool output is scanned against 12 secret patterns. Detected secrets are redacted or the output is blocked, depending on `leak_policy`.
+
+5. **Injection detection**: Tool output is scanned for prompt injection patterns (role markers, instruction overrides). Currently warning-only -- detections are logged but not blocked.
+
+6. **XML wrapping**: Tool results are wrapped in `<tool_output tool="name">` delimiters with angle-bracket escaping before being fed back to the LLM, preventing injection through tool output.
 
 ## Event Sink
 

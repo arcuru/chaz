@@ -6,15 +6,17 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 
 | Tool          | Risk   | Approval           | Description                                  |
 | ------------- | ------ | ------------------ | -------------------------------------------- |
-| `get_time`    | Low    | Never              | Returns the current UTC time                 |
-| `calculate`   | Low    | Never              | Evaluates math expressions (via meval)       |
-| `read_file`   | Low    | Never              | Reads file contents from disk                |
-| `remember`    | Low    | Never              | Stores a key-value fact in persistent memory |
-| `recall`      | Low    | Never              | Searches stored facts by keyword             |
-| `write_file`  | Medium | UnlessAutoApproved | Writes content to a file                     |
-| `web_fetch`   | Medium | UnlessAutoApproved | HTTP GET or POST requests                    |
-| `spawn_agent` | Medium | UnlessAutoApproved | Delegates a task to a sub-agent              |
-| `shell`       | High   | Always             | Executes a shell command                     |
+| `get_time`      | Low    | Never              | Returns the current UTC time                            |
+| `calculate`     | Low    | Never              | Evaluates math expressions (via meval)                  |
+| `read_file`     | Low    | Never              | Reads file contents from disk                           |
+| `remember`      | Low    | Never              | Stores a key-value fact in agent-scoped memory          |
+| `recall`        | Low    | Never              | Searches agent-scoped memory by keyword                 |
+| `describe_tool` | Low    | Never              | Returns full description/schema for a tool (discovery)  |
+| `compact`       | Low    | Never              | Summarize and compact conversation context              |
+| `write_file`    | Medium | UnlessAutoApproved | Writes content to a file                                |
+| `web_fetch`     | Medium | UnlessAutoApproved | HTTP GET or POST requests                               |
+| `spawn_agent`   | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                         |
+| `shell`         | High   | Always             | Executes a shell command                                |
 
 ## Risk Levels
 
@@ -72,12 +74,24 @@ Executes a shell command. Subject to command allowlist/denylist filtering.
 
 ### remember / recall
 
-Persistent key-value memory shared across all sessions.
+Persistent key-value memory, isolated per agent. Each agent has its own memory namespace (`memory:{agent_name}` in the central eidetica DB), so agents cannot read or write each other's memories.
 
 ```json
 {"key": "user_timezone", "value": "America/New_York"}
 {"query": "timezone"}
 ```
+
+### describe_tool
+
+Returns the full description and JSON Schema for any registered tool. Useful when tool profiles hide details (Brief or Summary mode) and the agent needs the full specification.
+
+```json
+{ "tool": "filesystem.read_file" }
+```
+
+### compact
+
+Summarizes the conversation history via an LLM call and writes a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, effectively compacting older messages.
 
 ### spawn_agent
 
@@ -91,10 +105,16 @@ Delegates a task to another agent in a child session. See [Agents](agents.md).
 }
 ```
 
+## External Tools (MCP)
+
+Chaz supports external tools via the Model Context Protocol. MCP servers run as subprocesses and their tools are registered alongside built-ins, subject to the same policy layer. See [MCP External Tools](mcp.md) for configuration and details.
+
 ## Security Controls
 
 All tool outputs are scanned for secret patterns (API keys, tokens, etc.) before entering the LLM context. The leak detector supports 12 patterns and can either redact or block the output.
 
-Tool execution is wrapped in a configurable timeout (default varies by tool).
+Tool results fed back to the LLM are wrapped in XML delimiters (`<tool_output tool="name">...</tool_output>`) with angle-bracket escaping, preventing prompt injection through tool output.
 
-See [Security](security.md) for details on network policies, shell sandboxing, and approval configuration.
+Tool execution is wrapped in a configurable timeout (default varies by tool). Tools can also have a `rate_limit` (max calls per minute) configured in their policy.
+
+See [Security](security.md) for details on network policies, shell sandboxing, rate limiting, and approval configuration.

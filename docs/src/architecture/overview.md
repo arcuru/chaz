@@ -65,6 +65,8 @@ The callback-driven server watches session databases and spawns agent tasks:
 3. If it's a `Message` from a non-agent or a `Directive`, the server spawns an agent task
 4. The agent writes its response to the session DB, triggering gateway callbacks
 
+Per-session serialization ensures only one agent task runs per session at a time, preventing duplicate responses from concurrent writes.
+
 The server also handles child session registration for `spawn_agent`, propagating call depth, tool scope, and completion signals.
 
 **Source**: `src/server.rs`
@@ -106,7 +108,10 @@ src/
   session.rs       SessionEntry, EntryType, Session, SessionRegistry
   server.rs        Callback-driven server, agent task spawning
   runtime.rs       ReAct loop, RuntimeEvent, approval gates
-  tool.rs          Tool trait, ToolPolicy, ToolRegistry, ScopedTools
+  context.rs       ContextBuilder — token-budgeted context assembly (tiktoken)
+  tool.rs          Tool trait, ToolPolicy, ToolRegistry, ScopedTools, RateLimiter
+  mcp.rs           MCP subprocess server management, auto-restart, tool discovery
+  scheduler.rs     Cron-driven scheduled task execution
   backends.rs      LLMBackend trait, BackendManager, ChatContext
   openai.rs        OpenAI-compatible backend implementation
   role.rs          Role/system prompt management
@@ -116,7 +121,9 @@ src/
     shell.rs       shell execution with allowlist/denylist
     file.rs        read_file, write_file
     web.rs         web_fetch with network policy
-    memory.rs      remember, recall
+    memory.rs      remember, recall (per-agent isolated memory)
+    compact.rs     compact — write Summary entry for context compaction
+    describe.rs    describe_tool — on-demand tool discovery
     time.rs        get_time
     calculate.rs   calculate (meval)
   security/

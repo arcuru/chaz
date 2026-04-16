@@ -31,6 +31,7 @@ struct ToolPolicy {
     approval: ApprovalRequirement, // Never, UnlessAutoApproved, Always
     timeout: u64,                  // seconds
     sensitive_params: Vec<String>, // redacted in approval display
+    rate_limit: Option<u32>,      // max calls per minute (None = unlimited)
 }
 ```
 
@@ -54,15 +55,18 @@ When agent A spawns agent B, B's tools are computed as the intersection of A's c
 ```rust,ignore
 struct ScopedTools {
     registry: Arc<ToolRegistry>,
-    allowed: Option<Vec<String>>,  // None = all tools
+    allowed: Option<Vec<String>>,  // None = all tools; supports globs like "namespace.*"
 }
 
 impl ScopedTools {
     fn narrow(&self, child_allowed: Option<&[String]>) -> ScopedTools {
         // Intersects parent's allowed with child's allowed
+        // Glob patterns (e.g., "filesystem.*") are expanded against the registry
     }
 }
 ```
+
+Allowlist entries support glob patterns: `"filesystem.*"` matches all tools with that namespace prefix (requires a dot after the prefix). This is useful for MCP tool namespaces. Glob patterns work across all ScopedTools operations: `definitions()`, `get()`, `is_empty()`, and `narrow()`.
 
 ## ToolContext
 

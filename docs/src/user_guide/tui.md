@@ -40,10 +40,15 @@ The TUI has three sections:
 | `/help`, `/?`     | Show all commands and key bindings                                |
 | `/sessions`, `/s` | Open session picker                                               |
 | `/new`            | Create a new session                                              |
-| `/join <id>`      | Switch to a session by transport ID                               |
-| `/info`           | Show current session details (entry counts, debug state)          |
+| `/join <id>`      | Switch to a session by name, DB ID, or transport ID               |
+| `/name <alias>`   | Set a human-friendly name for the current session                 |
+| `/name`           | Clear the session name                                            |
+| `/info`           | Show current session details (name, DB ID, entry counts)          |
 | `/share`          | Generate a shareable ticket URL for the current session           |
 | `/sync <ticket>`  | Sync a remote session via a ticket URL                            |
+| `/schedules`      | List configured schedules with status and timing                  |
+| `/run <name>`     | Trigger a schedule immediately                                    |
+| `/compact`        | Summarize and compact conversation history                        |
 | `/clear`          | Clear the display (entries remain in the database)                |
 | `/raw`            | Dump all raw entry data (index, timestamp, type, sender, content) |
 | `/debug`          | Toggle debug mode                                                 |
@@ -101,7 +106,23 @@ The picker shows all sessions from the registry, including:
 - Child sessions created by `spawn_agent`
 - Sessions synced from remote instances
 
-The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+The current session is marked with `*`. Named sessions display their alias (e.g., `tui "daily-standup" *`). Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+
+## Named Sessions
+
+Give sessions human-friendly names instead of opaque IDs:
+
+```text
+/name daily-standup
+```
+
+Named sessions can be referenced anywhere a session identifier is accepted:
+
+```text
+/join daily-standup
+```
+
+The name appears in the status bar, session picker, and `/info` output. Names must be unique across all sessions. Use `/name` (with no argument) to clear the name.
 
 ## Entry Types
 

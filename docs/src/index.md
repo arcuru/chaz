@@ -4,13 +4,15 @@ Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects t
 
 ## Key Features
 
-- **ReAct tool-calling loop** with 9 built-in tools (shell, file I/O, web fetch, memory, math, sub-agents)
+- **ReAct tool-calling loop** with 11 built-in tools + external MCP tools
 - **Multi-agent orchestration** with depth limiting and transitive tool narrowing
-- **Persistent sessions** backed by [eidetica](https://github.com/arcuru/eidetica) (CRDT-based, syncable)
+- **Persistent sessions** backed by [eidetica](https://github.com/arcuru/eidetica) (CRDT-based, syncable) with named sessions
 - **Session sharing** between instances via eidetica sync and shareable ticket URLs
+- **MCP external tools** with auto-restart, policy enforcement, and tool profiles
 - **TUI mode** for local testing, debugging, and session management
 - **Matrix integration** for production deployment as a chat bot
-- **Security controls** including leak detection, SSRF protection, shell sandboxing, and tool approval gates
+- **Scheduled tasks** via cron-driven directive injection
+- **Security controls** including leak detection, SSRF protection, XML output wrapping, tool rate limiting, shell sandboxing, and approval gates
 
 ## Quick Start
 

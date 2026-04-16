@@ -10,6 +10,7 @@
 - [Matrix Bot](user_guide/matrix.md)
 - [Session Sharing](user_guide/session_sharing.md)
 - [Tools](user_guide/tools.md)
+- [MCP External Tools](user_guide/mcp.md)
 - [Agents](user_guide/agents.md)
 - [Security](user_guide/security.md)
 

@@ -51,17 +51,21 @@ The `SessionRegistry` maps transport IDs to eidetica databases:
 - **Session DB**: A dedicated eidetica `Database` for that conversation
 - **Binding**: A `SessionBinding` record in the central registry DB
 
-The registry creates new databases on demand and persists bindings across restarts.
+The registry creates new databases on demand and persists bindings across restarts. Bindings include an optional human-friendly `name` for the session.
 
 ```mermaid
 graph LR
     TID1["!room:matrix.org"] --> DB1[(Session DB 1)]
-    TID2["tui"] --> DB2[(Session DB 2)]
+    TID2["tui 'daily-standup'"] --> DB2[(Session DB 2)]
     TID3["spawn:abc-123"] --> DB3[(Session DB 3)]
     REG[(Registry DB)] -.->|bindings| TID1
     REG -.->|bindings| TID2
     REG -.->|bindings| TID3
 ```
+
+### Named Sessions
+
+Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name <alias>`). Names are unique and persisted in the registry binding. The `resolve_session()` method tries name → DB ID → transport ID, so names work everywhere a session identifier is accepted (join, schedules, etc.).
 
 ## Context Building
 
@@ -73,7 +77,7 @@ graph LR
 4. Fill from newest messages backward until the token budget is exhausted
 5. Map senders to roles: current agent name = `assistant`, everything else = `user`
 
-Token estimation uses a `chars.div_ceil(4)` heuristic. The budget is `max_context_tokens - reserved_output_tokens`, configurable globally and per-agent.
+Token estimation uses tiktoken (`cl100k_base` BPE tokenizer) for accurate counting. The budget is `max_context_tokens - reserved_output_tokens`, configurable globally and per-agent.
 
 ### Compaction
 
