@@ -78,8 +78,13 @@ pub enum LLMResponse {
 ///
 /// If tools are registered and the backend supports tool calling,
 /// runs a ReAct loop. Otherwise falls back to a single-shot execute.
+///
+/// Accepts pre-built `RuntimeMessage`s from the `ContextBuilder`.
+/// The `context` is still needed for backend selection (model routing)
+/// and the simple-execution fallback path.
 pub async fn execute(
     context: &ChatContext,
+    initial_messages: Vec<RuntimeMessage>,
     backend: &BackendManager,
     security: &SecurityContext,
     tool_ctx: &ToolContext,
@@ -87,15 +92,25 @@ pub async fn execute(
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
 ) -> Result<String, String> {
     let tools = &tool_ctx.tools;
+    let model = backend.resolve_model(context);
 
     // Fast path: no tools or backend doesn't support them → single-shot
+    // Use chat_with_tools with empty tools — it sends RuntimeMessages directly.
     if tools.is_empty() || !backend.supports_tools(context) {
-        return backend.execute(context).await;
+        return match backend
+            .chat_with_tools(context, &initial_messages, &[], &model)
+            .await
+        {
+            Ok(LLMResponse::Text(text)) => Ok(text),
+            Ok(LLMResponse::ToolCalls { .. }) => {
+                Err("Unexpected tool calls in no-tools fallback".to_string())
+            }
+            Err(e) => Err(e),
+        };
     }
 
-    let tool_defs = tools.definitions();
-    let model = backend.resolve_model(context);
-    let mut messages = context_to_messages(context);
+    let tool_defs = tools.definitions(&tool_ctx.profile);
+    let mut messages = initial_messages;
     let mut approve_all = false; // tracks if user chose "approve all" this turn
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
@@ -313,8 +328,10 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
     }
 }
 
-/// Convert a ChatContext into RuntimeMessages for the ReAct loop
-fn context_to_messages(context: &ChatContext) -> Vec<RuntimeMessage> {
+/// Convert a ChatContext into RuntimeMessages for the ReAct loop.
+/// Used by the simple-execution fallback and /compact summarization.
+#[allow(dead_code)]
+pub fn context_to_messages(context: &ChatContext) -> Vec<RuntimeMessage> {
     let mut messages = Vec::new();
 
     // System prompt from role
