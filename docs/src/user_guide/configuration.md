@@ -27,6 +27,8 @@ backends:
     type: openaicompatible
     api_key: "not-needed"
     api_base: http://localhost:11434/v1
+    request_timeout: 30  # LLM request timeout in seconds (default: 120)
+    max_retries: 5        # Retry attempts for transient errors (default: 3)
     models:
       - name: llama3
 
@@ -112,6 +114,17 @@ Each backend requires a `name`, `type`, `api_base`, and optionally `api_key` and
 The `api_key` field supports environment variable references: `"${VAR_NAME}"` or `"$VAR_NAME"`. Keys are resolved at startup and stored in eidetica's SecretStore. They are never included in LLM context.
 
 When multiple backends are defined, model names are prefixed with the backend name (e.g., `openrouter:anthropic/claude-sonnet-4`). With a single backend, no prefix is needed.
+
+### Resilience
+
+All LLM HTTP requests are wrapped in a configurable timeout and retried on transient failures:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `request_timeout` | `120` | Seconds before an LLM request times out |
+| `max_retries` | `3` | Retry attempts for transient errors (429, 5xx, timeouts, network) |
+
+Retries use exponential backoff (1s, 2s, 4s, … capped at 30s). Rate-limit responses (HTTP 429) with a `Retry-After` header are honored as the minimum delay. Non-retryable errors (401, 403, 400) fail immediately.
 
 ## Agents
 
