@@ -116,6 +116,13 @@ impl Server {
             server_clone.processing_loop(notify_rx).await;
         });
 
+        // Spawn the new-session watcher — auto-registers callbacks for
+        // sessions created via sync, schedules, or other non-gateway sources
+        let server_clone = server.clone();
+        tokio::spawn(async move {
+            server_clone.new_session_watcher().await;
+        });
+
         server
     }
 
@@ -284,6 +291,30 @@ impl Server {
                     error!("Error processing session {}: {e}", transport_id);
                 }
             }
+        }
+    }
+
+    /// Watch for new sessions from the registry and log them.
+    ///
+    /// Sessions created by eidetica sync, scheduled tasks, or other non-gateway
+    /// sources will be detected here. Currently logs for awareness; gateways
+    /// should call `register_session` to enable agent processing on these sessions.
+    async fn new_session_watcher(&self) {
+        let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        while let Some(event) = rx.recv().await {
+            if !seen.insert(event.transport_id.clone()) {
+                continue;
+            }
+            if event.transport_id.starts_with("spawn:") {
+                continue;
+            }
+            info!(
+                "New session detected: {} (db: {})",
+                event.transport_id, event.session_db_id
+            );
         }
     }
 

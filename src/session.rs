@@ -6,7 +6,7 @@ use eidetica::store::Table;
 use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info};
 
 /// Type of session entry. Participants (users and agents alike) write entries
@@ -200,6 +200,13 @@ impl Session {
 ///
 /// The registry also holds a separate "chaz-central" Database for shared data
 /// (memory store, secrets) that isn't per-conversation.
+/// Notification emitted when a new session is created in the registry.
+#[derive(Debug, Clone)]
+pub struct NewSessionEvent {
+    pub transport_id: String,
+    pub session_db_id: String,
+}
+
 pub struct SessionRegistry {
     /// Eidetica instance (Clone = cheap Arc handle)
     instance: eidetica::Instance,
@@ -211,6 +218,10 @@ pub struct SessionRegistry {
     central_db: Database,
     /// Agent registry
     pub agents: Arc<AgentRegistry>,
+    /// Channel to notify listeners when new sessions are created
+    new_session_tx: mpsc::Sender<NewSessionEvent>,
+    /// Receiver for new session events (taken by the consumer via subscribe())
+    new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
 }
 
 impl SessionRegistry {
@@ -226,6 +237,32 @@ impl SessionRegistry {
     ) -> anyhow::Result<Self> {
         let registry_db = find_or_create_db(&mut user, "chaz-registry").await?;
         let central_db = find_or_create_db(&mut user, "chaz-central").await?;
+        let (new_session_tx, new_session_rx) = mpsc::channel(64);
+
+        // Watch the registry DB for writes (including remote sync).
+        // When a new binding appears (from sync or other sources), notify listeners.
+        let sync_tx = new_session_tx.clone();
+        registry_db.on_local_write(move |_entry, db, _instance| {
+            let sync_tx = sync_tx.clone();
+            let db = db.clone();
+            Box::pin(async move {
+                // Read all bindings and notify for any we haven't seen.
+                // This is coarse-grained — the consumer deduplicates.
+                if let Ok(txn) = db.new_transaction().await {
+                    if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
+                        if let Ok(results) = bindings.search(|_| true).await {
+                            for (_, binding) in results {
+                                let _ = sync_tx.try_send(NewSessionEvent {
+                                    transport_id: binding.transport_id,
+                                    session_db_id: binding.session_db_id,
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })?;
 
         Ok(Self {
             instance,
@@ -233,7 +270,16 @@ impl SessionRegistry {
             registry_db,
             central_db,
             agents,
+            new_session_tx,
+            new_session_rx: Mutex::new(Some(new_session_rx)),
         })
+    }
+
+    /// Take the new-session event receiver. Can only be called once; subsequent
+    /// calls return None. The consumer (typically the Server) uses this to
+    /// auto-detect sessions created by sync, schedules, or other sources.
+    pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
+        self.new_session_rx.lock().await.take()
     }
 
     /// Get the central shared database (for memory tools, secrets, etc.)
@@ -349,6 +395,15 @@ impl SessionRegistry {
         txn.commit().await?;
 
         info!("Created new session DB for {}", transport_id);
+
+        // Notify listeners about the new session
+        let _ = self
+            .new_session_tx
+            .try_send(NewSessionEvent {
+                transport_id: transport_id.to_string(),
+                session_db_id: db.root_id().to_string(),
+            });
+
         Ok((conversation_id, db))
     }
 
