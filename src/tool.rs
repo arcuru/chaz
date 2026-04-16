@@ -311,9 +311,27 @@ impl ToolRegistry {
     }
 }
 
+/// Check if a tool name matches an allowlist pattern.
+///
+/// Supports exact matches and glob-style `prefix.*` patterns.
+/// `"filesystem.*"` matches `"filesystem.read_file"` but not `"filesystemx"`.
+fn pattern_matches(pattern: &str, tool_name: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        tool_name.starts_with(prefix) && tool_name[prefix.len()..].starts_with('.')
+    } else {
+        pattern == tool_name
+    }
+}
+
+/// Check if a tool name is allowed by any pattern in the allowlist.
+fn is_allowed_by(allowed: &[String], tool_name: &str) -> bool {
+    allowed.iter().any(|p| pattern_matches(p, tool_name))
+}
+
 /// Owned, narrowable view of the tool registry.
 ///
 /// Carries an Arc to the full registry plus an optional allowlist.
+/// Allowlist entries can be exact names or glob patterns (`"filesystem.*"`).
 /// Narrowing via `narrow()` produces a new ScopedTools with a tighter allowlist,
 /// enabling transitive tool restriction down the agent spawn tree.
 #[derive(Clone)]
@@ -331,12 +349,41 @@ impl ScopedTools {
     ///
     /// Returns a new ScopedTools whose allowlist is the intersection of
     /// this scope's allowlist and the child's allowed_tools.
+    ///
+    /// For glob patterns, a child entry is kept if the parent allows it
+    /// (either by exact match or by a parent glob that covers it).
+    /// For exact names, both parent and child must allow the tool.
     pub fn narrow(&self, child_allowed: Option<&[String]>) -> Self {
         let narrowed = match (&self.allowed, child_allowed) {
             (None, None) => None,
             (None, Some(c)) => Some(c.to_vec()),
             (Some(p), None) => Some(p.clone()),
-            (Some(p), Some(c)) => Some(c.iter().filter(|t| p.contains(t)).cloned().collect()),
+            (Some(parent), Some(child)) => {
+                // Keep child entries that are covered by at least one parent pattern.
+                // For glob entries in child, expand them against the registry to find
+                // concrete tool names, then intersect with parent.
+                let mut result: Vec<String> = Vec::new();
+                for child_pattern in child {
+                    if child_pattern.ends_with(".*") {
+                        // Child glob: expand to matching registry tools, keep if parent allows
+                        for tool in &self.registry.tools {
+                            let name = tool.descriptor().name;
+                            if pattern_matches(child_pattern, &name)
+                                && is_allowed_by(parent, &name)
+                                && !result.contains(&name)
+                            {
+                                result.push(name);
+                            }
+                        }
+                    } else {
+                        // Exact name: keep if parent allows it
+                        if is_allowed_by(parent, child_pattern) && !result.contains(child_pattern) {
+                            result.push(child_pattern.clone());
+                        }
+                    }
+                }
+                Some(result)
+            }
         };
         Self {
             registry: self.registry.clone(),
@@ -351,7 +398,7 @@ impl ScopedTools {
                 .registry
                 .tools
                 .iter()
-                .any(|t| allowed.contains(&t.descriptor().name)),
+                .any(|t| is_allowed_by(allowed, &t.descriptor().name)),
         }
     }
 
@@ -361,7 +408,7 @@ impl ScopedTools {
             .iter()
             .filter(|t| match &self.allowed {
                 None => true,
-                Some(allowed) => allowed.contains(&t.descriptor().name),
+                Some(allowed) => is_allowed_by(allowed, &t.descriptor().name),
             })
             .filter_map(|t| {
                 let desc = t.descriptor();
@@ -377,7 +424,7 @@ impl ScopedTools {
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         if let Some(allowed) = &self.allowed {
-            if !allowed.contains(&name.to_string()) {
+            if !is_allowed_by(allowed, name) {
                 return None;
             }
         }
@@ -491,5 +538,33 @@ mod tests {
         assert_eq!(first_sentence("Hello world. More text."), "Hello world.");
         assert_eq!(first_sentence("No period here"), "No period here");
         assert_eq!(first_sentence("End.\nNew line."), "End.");
+    }
+
+    #[test]
+    fn test_pattern_matches_exact() {
+        assert!(pattern_matches("shell", "shell"));
+        assert!(!pattern_matches("shell", "shell2"));
+        assert!(!pattern_matches("shell", "shel"));
+    }
+
+    #[test]
+    fn test_pattern_matches_glob() {
+        assert!(pattern_matches("filesystem.*", "filesystem.read_file"));
+        assert!(pattern_matches("filesystem.*", "filesystem.write"));
+        // Must have a dot after the prefix
+        assert!(!pattern_matches("filesystem.*", "filesystemx"));
+        assert!(!pattern_matches("filesystem.*", "filesystem"));
+        // Different namespace
+        assert!(!pattern_matches("filesystem.*", "github.pr"));
+    }
+
+    #[test]
+    fn test_is_allowed_by() {
+        let allowed = vec!["shell".to_string(), "filesystem.*".to_string()];
+        assert!(is_allowed_by(&allowed, "shell"));
+        assert!(is_allowed_by(&allowed, "filesystem.read_file"));
+        assert!(is_allowed_by(&allowed, "filesystem.write"));
+        assert!(!is_allowed_by(&allowed, "web_fetch"));
+        assert!(!is_allowed_by(&allowed, "filesystemx"));
     }
 }
