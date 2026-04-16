@@ -37,3 +37,4 @@ uuid = { version = "1", features = ["v4"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-stream = "0.1"
+tiktoken-rs = "0.11"

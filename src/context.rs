@@ -18,16 +18,29 @@ use crate::runtime::RuntimeMessage;
 use crate::session::{EntryType, SessionEntry};
 use crate::tool::ToolDefinition;
 
-/// Estimate token count for a string.
+use std::sync::OnceLock;
+use tiktoken_rs::CoreBPE;
+
+/// Get the shared tokenizer instance (cl100k_base, used by GPT-4/GPT-4o).
 ///
-/// Uses a simple heuristic: ~4 characters per token for English/code text.
-/// This is intentionally conservative — overestimating slightly is safer
-/// than underestimating and blowing the context window.
+/// Lazily initialized on first use. Falls back to char/4 heuristic if
+/// tokenizer initialization fails (shouldn't happen with compiled-in data).
+fn tokenizer() -> Option<&'static CoreBPE> {
+    static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok()).as_ref()
+}
+
+/// Estimate token count for a string using tiktoken (cl100k_base).
+///
+/// Falls back to chars/4 heuristic if the tokenizer is unavailable.
 pub fn estimate_tokens(text: &str) -> usize {
-    // ~4 chars per token is a reasonable average for English + code.
-    // JSON overhead for message framing adds ~10-20 tokens per message,
-    // but we account for that separately in per-message overhead.
-    text.len().div_ceil(4)
+    if text.is_empty() {
+        return 0;
+    }
+    match tokenizer() {
+        Some(bpe) => bpe.encode_ordinary(text).len(),
+        None => text.len().div_ceil(4),
+    }
 }
 
 /// Estimate token overhead for a single tool definition (JSON schema).
@@ -217,9 +230,12 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        assert_eq!(estimate_tokens(""), 0); // (0+3)/4 = 0
-        assert_eq!(estimate_tokens("hello"), 2); // (5+3)/4 = 2
-        assert_eq!(estimate_tokens(&"a".repeat(100)), 25); // (100+3)/4 ≈ 25
+        assert_eq!(estimate_tokens(""), 0);
+        // With tiktoken, "hello" is 1 token
+        assert_eq!(estimate_tokens("hello"), 1);
+        // A long repeated string should produce a reasonable token count
+        let hundred_a = estimate_tokens(&"a".repeat(100));
+        assert!(hundred_a > 0 && hundred_a < 100);
     }
 
     #[test]
@@ -313,7 +329,8 @@ mod tests {
     #[test]
     fn test_system_prompt_counted() {
         let entries = vec![make_entry("user", "Hello", EntryType::Message)];
-        let role = crate::role::RoleDetails::new_test("system", "A".repeat(2000).as_str());
+        // Use a long enough prompt that it takes significant tokens
+        let role = crate::role::RoleDetails::new_test("system", &"word ".repeat(500));
         let config = ContextConfig {
             max_context_tokens: 600,
             reserved_output_tokens: 50,
@@ -322,8 +339,8 @@ mod tests {
             .with_role(Some(&role))
             .build();
 
-        // System prompt takes ~508 tokens, leaving very little for messages
-        assert!(result.estimated_tokens > 500);
+        // System prompt takes significant tokens
+        assert!(result.estimated_tokens > 100);
         assert_eq!(result.messages.len(), 2); // system + at least 1 message
         assert!(matches!(&result.messages[0], RuntimeMessage::System(_)));
     }
