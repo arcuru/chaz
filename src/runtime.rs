@@ -15,7 +15,6 @@ use crate::backends::{BackendManager, ChatContext};
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
-use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -326,32 +325,4 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
     } else {
         arguments_json.to_string()
     }
-}
-
-/// Convert a ChatContext into RuntimeMessages for the ReAct loop.
-/// Used by the simple-execution fallback and /compact summarization.
-#[allow(dead_code)]
-pub fn context_to_messages(context: &ChatContext) -> Vec<RuntimeMessage> {
-    let mut messages = Vec::new();
-
-    // System prompt from role
-    if let Some(role) = &context.role {
-        let prompt = role.get_prompt();
-        if !prompt.is_empty() {
-            messages.push(RuntimeMessage::System(prompt));
-        }
-    }
-
-    // Conversation history
-    for msg in &context.messages {
-        let rm = match msg.role {
-            MessageRole::system => RuntimeMessage::System(msg.content.clone()),
-            MessageRole::user => RuntimeMessage::User(msg.content.clone()),
-            MessageRole::assistant => RuntimeMessage::Assistant(msg.content.clone()),
-            _ => continue,
-        };
-        messages.push(rm);
-    }
-
-    messages
 }

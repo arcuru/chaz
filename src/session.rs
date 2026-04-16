@@ -1,20 +1,13 @@
 use crate::agent::{Agent, AgentRegistry};
-use crate::backends::{ChatContext, Message};
-use crate::role::RoleDetails;
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
 use eidetica::store::Table;
 use eidetica::Database;
-use openai_api_rs::v1::chat_completion::MessageRole;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-
-/// Maximum messages to include in context sent to the LLM.
-/// Older messages are dropped to stay within token limits.
-const MAX_CONTEXT_MESSAGES: usize = 50;
 
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
@@ -33,6 +26,9 @@ pub enum EntryType {
     Ack,
     /// An error that occurred during processing
     Error,
+    /// A compacted summary of older messages, written by /compact or the compact tool.
+    /// Context builder treats the most recent Summary as the start boundary.
+    Summary,
 }
 
 /// An entry in a session. Participants (human users and AI agents) are
@@ -159,38 +155,6 @@ impl Session {
         }
     }
 
-    /// Build a ChatContext from session history with truncation.
-    ///
-    /// The `agent_name` parameter determines perspective: entries from this sender
-    /// become assistant messages, all others become user messages. Only `Message`
-    /// entries are included (Ack, Error are excluded from LLM context).
-    pub fn build_context(
-        &self,
-        agent_name: &str,
-        role: Option<RoleDetails>,
-        model: Option<String>,
-    ) -> ChatContext {
-        let start = self.entries.len().saturating_sub(MAX_CONTEXT_MESSAGES);
-        let messages = self.entries[start..]
-            .iter()
-            .filter(|e| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
-            .map(|e| {
-                let msg_role = if e.sender == agent_name {
-                    MessageRole::assistant
-                } else {
-                    MessageRole::user
-                };
-                Message::new(msg_role, e.content.clone())
-            })
-            .collect();
-
-        ChatContext {
-            messages,
-            model,
-            role,
-        }
-    }
-
     /// Get the most recent entry, if any
     pub fn latest_entry(&self) -> Option<&SessionEntry> {
         self.entries.last()
@@ -279,9 +243,7 @@ impl SessionRegistry {
     ) -> anyhow::Result<(String, ConversationId, Database)> {
         let txn = self.registry_db.new_transaction().await?;
         let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        let results = bindings
-            .search(|b| b.session_db_id == db_id)
-            .await?;
+        let results = bindings.search(|b| b.session_db_id == db_id).await?;
 
         let (_, binding) = results
             .into_iter()
@@ -292,7 +254,10 @@ impl SessionRegistry {
         let db = {
             let user = self.user.lock().await;
             let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
-                anyhow::anyhow!("Failed to parse session DB ID '{}': {e}", binding.session_db_id)
+                anyhow::anyhow!(
+                    "Failed to parse session DB ID '{}': {e}",
+                    binding.session_db_id
+                )
             })?;
             user.open_database(&root_id).await?
         };
