@@ -15,7 +15,7 @@ name = "chaz"
 [dependencies]
 headjack = { git = "https://github.com/arcuru/vibe-headjack" }
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util"] }
 tracing-subscriber = "0.3"
 tracing = "0.1"
 matrix-sdk = { version = "0.7", default-features = false, features = ["native-tls"] }

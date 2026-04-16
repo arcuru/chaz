@@ -33,6 +33,17 @@ impl RoleDetails {
         }
     }
 
+    /// Create a minimal RoleDetails for testing
+    #[cfg(test)]
+    pub fn new_test(name: &str, prompt: &str) -> Self {
+        RoleDetails {
+            name: name.to_owned(),
+            description: None,
+            prompt: Some(prompt.to_owned()),
+            example: None,
+        }
+    }
+
     pub fn get_prompt(&self) -> String {
         if let Some(prompt) = &self.prompt {
             return prompt.clone();

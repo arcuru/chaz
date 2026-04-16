@@ -1,8 +1,10 @@
 mod agent;
 mod backends;
 mod config;
+mod context;
 mod defaults;
 mod gateway;
+mod mcp;
 mod openai;
 mod role;
 mod runtime;
@@ -143,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tool_registry = tool::ToolRegistry::new();
     tool_registry.register(tools::GetTime);
     tool_registry.register(tools::Calculate);
+    tool_registry.register(tools::DescribeTool);
     tool_registry.register(tools::ShellExec::new(
         sec.shell_allowlist.clone(),
         sec.shell_denylist.clone(),
@@ -152,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::WebFetch::new(network_policy));
     tool_registry.register(tools::Remember::new(central_db.clone()));
     tool_registry.register(tools::Recall::new(central_db.clone()));
+    tool_registry.register(tools::Compact);
     // SpawnAgent routes through the server — OnceLock is set after Server::new
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
     tool_registry.register(tools::SpawnAgent {
@@ -160,15 +164,44 @@ async fn main() -> anyhow::Result<()> {
         security: security_ctx.clone(),
     });
 
+    // Start MCP servers and register their tools
+    if let Some(mcp_configs) = &config.mcp_servers {
+        let mcp_tools = mcp::start_mcp_servers(mcp_configs).await;
+        for t in mcp_tools {
+            tool_registry.register_boxed(t);
+        }
+    }
+
     let tool_registry = std::sync::Arc::new(tool_registry);
 
+    // Build tool profiles from config
+    let tool_profiles: std::collections::HashMap<String, tool::ToolProfile> = config
+        .tool_profiles
+        .as_ref()
+        .map(|profiles| {
+            profiles
+                .iter()
+                .map(|(name, cfg)| {
+                    let profile = tool::ToolProfile {
+                        default_mode: cfg.default.clone().unwrap_or_default(),
+                        tool_modes: cfg.tools.clone().unwrap_or_default(),
+                    };
+                    (name.clone(), profile)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Create the callback-driven server
+    let context_config = config.context.clone().unwrap_or_default();
     let server = server::Server::new(
         registry,
         agent_registry,
         tool_registry,
         policies,
         security_ctx,
+        tool_profiles,
+        context_config,
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),
@@ -198,8 +231,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Run the selected gateway
     let result = if args.tui {
-        let gateway =
-            gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
+        let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
         gateway.run(server).await
     } else {
         let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;

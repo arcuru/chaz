@@ -86,6 +86,102 @@ impl ToolPolicy {
     }
 }
 
+/// How a tool's definition is presented to the LLM.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationMode {
+    /// Full name, description, and parameter schema
+    #[default]
+    Full,
+    /// Name + first sentence of description, parameter names only (no descriptions)
+    Brief,
+    /// Name only — no description, minimal schema. Agent must use describe_tool to learn more.
+    Summary,
+    /// Not sent to LLM at all
+    Hidden,
+}
+
+/// Controls how tool definitions are presented to the LLM.
+///
+/// Each tool resolves to a `PresentationMode` via: exact name match → glob prefix match → default.
+/// Profiles are defined in config and referenced by agents, presets, or sessions.
+#[derive(Clone, Debug)]
+pub struct ToolProfile {
+    pub default_mode: PresentationMode,
+    pub tool_modes: HashMap<String, PresentationMode>,
+}
+
+impl Default for ToolProfile {
+    fn default() -> Self {
+        Self {
+            default_mode: PresentationMode::Full,
+            tool_modes: HashMap::new(),
+        }
+    }
+}
+
+impl ToolProfile {
+    /// Resolve the presentation mode for a tool by name.
+    /// Priority: exact match → glob prefix match (e.g., "filesystem.*") → default.
+    pub fn resolve_mode(&self, tool_name: &str) -> &PresentationMode {
+        // Exact match
+        if let Some(mode) = self.tool_modes.get(tool_name) {
+            return mode;
+        }
+        // Glob prefix match: "namespace.*" matches "namespace.anything"
+        for (pattern, mode) in &self.tool_modes {
+            if let Some(prefix) = pattern.strip_suffix(".*") {
+                if tool_name.starts_with(prefix) && tool_name[prefix.len()..].starts_with('.') {
+                    return mode;
+                }
+            }
+        }
+        &self.default_mode
+    }
+
+    /// Transform a tool definition according to its presentation mode.
+    /// Returns None for Hidden tools.
+    pub fn apply(&self, def: &ToolDefinition) -> Option<ToolDefinition> {
+        match self.resolve_mode(&def.name) {
+            PresentationMode::Full => Some(def.clone()),
+            PresentationMode::Brief => Some(ToolDefinition {
+                name: def.name.clone(),
+                description: first_sentence(&def.description),
+                parameters: strip_param_descriptions(&def.parameters),
+            }),
+            PresentationMode::Summary => Some(ToolDefinition {
+                name: def.name.clone(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }),
+            PresentationMode::Hidden => None,
+        }
+    }
+}
+
+/// Extract the first sentence from a description.
+fn first_sentence(desc: &str) -> String {
+    // Split on ". " or ".\n" to find first sentence
+    if let Some(pos) = desc.find(". ").or_else(|| desc.find(".\n")) {
+        desc[..=pos].to_string()
+    } else {
+        desc.to_string()
+    }
+}
+
+/// Strip description fields from parameter properties, keeping only type and name info.
+fn strip_param_descriptions(params: &Value) -> Value {
+    let mut result = params.clone();
+    if let Some(props) = result.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for (_key, schema) in props.iter_mut() {
+            if let Some(obj) = schema.as_object_mut() {
+                obj.remove("description");
+            }
+        }
+    }
+    result
+}
+
 /// Context provided by the runtime to tools during execution.
 pub struct ToolContext {
     /// Name of the agent currently executing
@@ -96,6 +192,10 @@ pub struct ToolContext {
     pub max_call_depth: usize,
     /// Scoped tool set for this agent — narrowed transitively down the spawn tree
     pub tools: ScopedTools,
+    /// Controls how tool definitions are presented to the LLM
+    pub profile: ToolProfile,
+    /// Handle to the current session (for tools that need to write entries, e.g. compact)
+    pub session: std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
 }
 
 /// A tool that can be invoked by the LLM during a ReAct loop.
@@ -178,6 +278,10 @@ impl ToolRegistry {
         self.tools.push(Box::new(tool));
     }
 
+    pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -251,7 +355,7 @@ impl ScopedTools {
         }
     }
 
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    pub fn definitions(&self, profile: &ToolProfile) -> Vec<ToolDefinition> {
         self.registry
             .tools
             .iter()
@@ -259,13 +363,14 @@ impl ScopedTools {
                 None => true,
                 Some(allowed) => allowed.contains(&t.descriptor().name),
             })
-            .map(|t| {
+            .filter_map(|t| {
                 let desc = t.descriptor();
-                ToolDefinition {
+                let def = ToolDefinition {
                     name: desc.name,
                     description: desc.description,
                     parameters: desc.parameters,
-                }
+                };
+                profile.apply(&def)
             })
             .collect()
     }
@@ -277,5 +382,114 @@ impl ScopedTools {
             }
         }
         self.registry.get(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_profile_resolve_exact_match() {
+        let profile = ToolProfile {
+            default_mode: PresentationMode::Full,
+            tool_modes: HashMap::from([("shell".to_string(), PresentationMode::Hidden)]),
+        };
+        assert_eq!(profile.resolve_mode("shell"), &PresentationMode::Hidden);
+        assert_eq!(profile.resolve_mode("recall"), &PresentationMode::Full);
+    }
+
+    #[test]
+    fn test_profile_resolve_glob_prefix() {
+        let profile = ToolProfile {
+            default_mode: PresentationMode::Full,
+            tool_modes: HashMap::from([("filesystem.*".to_string(), PresentationMode::Summary)]),
+        };
+        assert_eq!(
+            profile.resolve_mode("filesystem.read_file"),
+            &PresentationMode::Summary
+        );
+        assert_eq!(
+            profile.resolve_mode("filesystem.write_file"),
+            &PresentationMode::Summary
+        );
+        // Not matching — no dot after prefix
+        assert_eq!(profile.resolve_mode("filesystemx"), &PresentationMode::Full);
+        assert_eq!(profile.resolve_mode("github.pr"), &PresentationMode::Full);
+    }
+
+    #[test]
+    fn test_profile_apply_full() {
+        let profile = ToolProfile::default();
+        let def = ToolDefinition {
+            name: "shell".to_string(),
+            description: "Execute a shell command. Dangerous.".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "The command"}}}),
+        };
+        let result = profile.apply(&def).unwrap();
+        assert_eq!(result.description, def.description);
+    }
+
+    #[test]
+    fn test_profile_apply_brief() {
+        let profile = ToolProfile {
+            default_mode: PresentationMode::Brief,
+            tool_modes: HashMap::new(),
+        };
+        let def = ToolDefinition {
+            name: "shell".to_string(),
+            description: "Execute a shell command. This is dangerous and should be used carefully."
+                .to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "The command to run"}}}),
+        };
+        let result = profile.apply(&def).unwrap();
+        assert_eq!(result.description, "Execute a shell command.");
+        // Parameter description should be stripped
+        assert!(result.parameters["properties"]["cmd"]
+            .get("description")
+            .is_none());
+        // But type should remain
+        assert_eq!(result.parameters["properties"]["cmd"]["type"], "string");
+    }
+
+    #[test]
+    fn test_profile_apply_summary() {
+        let profile = ToolProfile {
+            default_mode: PresentationMode::Summary,
+            tool_modes: HashMap::new(),
+        };
+        let def = ToolDefinition {
+            name: "shell".to_string(),
+            description: "Execute a command".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+        };
+        let result = profile.apply(&def).unwrap();
+        assert_eq!(result.name, "shell");
+        assert!(result.description.is_empty());
+        assert!(result.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_profile_apply_hidden() {
+        let profile = ToolProfile {
+            default_mode: PresentationMode::Hidden,
+            tool_modes: HashMap::new(),
+        };
+        let def = ToolDefinition {
+            name: "shell".to_string(),
+            description: "Execute a command".to_string(),
+            parameters: serde_json::json!({}),
+        };
+        assert!(profile.apply(&def).is_none());
+    }
+
+    #[test]
+    fn test_first_sentence() {
+        assert_eq!(first_sentence("Hello world. More text."), "Hello world.");
+        assert_eq!(first_sentence("No period here"), "No period here");
+        assert_eq!(first_sentence("End.\nNew line."), "End.");
     }
 }

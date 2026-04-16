@@ -351,16 +351,31 @@ impl Gateway for TuiGateway {
                                             if let Some(ref sched) = self.scheduler {
                                                 let schedules = sched.list().await;
                                                 if schedules.is_empty() {
-                                                    show_system_msg(&mut app, "No schedules configured.".to_string());
+                                                    show_system_msg(
+                                                        &mut app,
+                                                        "No schedules configured.".to_string(),
+                                                    );
                                                 } else {
                                                     let mut msg = String::from("Schedules:\n");
                                                     for s in &schedules {
-                                                        let status = if s.enabled { "enabled" } else { "disabled" };
-                                                        let last = s.last_run
-                                                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                                                        let status = if s.enabled {
+                                                            "enabled"
+                                                        } else {
+                                                            "disabled"
+                                                        };
+                                                        let last = s
+                                                            .last_run
+                                                            .map(|t| {
+                                                                t.format("%Y-%m-%d %H:%M:%S")
+                                                                    .to_string()
+                                                            })
                                                             .unwrap_or_else(|| "never".to_string());
-                                                        let next = s.next_run
-                                                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                                                        let next = s
+                                                            .next_run
+                                                            .map(|t| {
+                                                                t.format("%Y-%m-%d %H:%M:%S")
+                                                                    .to_string()
+                                                            })
                                                             .unwrap_or_else(|| "n/a".to_string());
                                                         msg.push_str(&format!(
                                                             "\n  {} [{}]\n    session: {}\n    task: {}\n    last: {} | next: {}\n",
@@ -370,21 +385,74 @@ impl Gateway for TuiGateway {
                                                     show_system_msg(&mut app, msg);
                                                 }
                                             } else {
-                                                show_system_msg(&mut app, "No scheduler configured.".to_string());
+                                                show_system_msg(
+                                                    &mut app,
+                                                    "No scheduler configured.".to_string(),
+                                                );
                                             }
                                         }
                                         ChatCommand::TriggerSchedule(name) => {
                                             if let Some(ref sched) = self.scheduler {
                                                 match sched.trigger(&name).await {
                                                     Ok(()) => {
-                                                        show_system_msg(&mut app, format!("Triggered schedule '{name}'."));
+                                                        show_system_msg(
+                                                            &mut app,
+                                                            format!("Triggered schedule '{name}'."),
+                                                        );
                                                     }
                                                     Err(e) => {
-                                                        show_error(&mut app, format!("Failed to trigger '{name}': {e}"));
+                                                        show_error(
+                                                            &mut app,
+                                                            format!(
+                                                                "Failed to trigger '{name}': {e}"
+                                                            ),
+                                                        );
                                                     }
                                                 }
                                             } else {
-                                                show_error(&mut app, "No scheduler configured.".to_string());
+                                                show_error(
+                                                    &mut app,
+                                                    "No scheduler configured.".to_string(),
+                                                );
+                                            }
+                                        }
+                                        ChatCommand::CompactSession => {
+                                            show_system_msg(
+                                                &mut app,
+                                                "Compacting session...".to_string(),
+                                            );
+                                            // Re-render to show the "compacting" message
+                                            terminal.draw(|f| ui(f, &app))?;
+
+                                            match compact_session(
+                                                &app.entries,
+                                                &app.current_agent,
+                                                &backend,
+                                                &session_db,
+                                            )
+                                            .await
+                                            {
+                                                Ok(summary_preview) => {
+                                                    // Reload entries from DB to pick up the Summary entry
+                                                    let session = Session::new(
+                                                        crate::types::ConversationId(
+                                                            app.transport_id.clone(),
+                                                        ),
+                                                        session_db.clone(),
+                                                    )
+                                                    .await;
+                                                    app.entries = session.entries().to_vec();
+                                                    show_system_msg(&mut app, format!(
+                                                        "Session compacted. Summary ({} chars) written.",
+                                                        summary_preview.len()
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    show_error(
+                                                        &mut app,
+                                                        format!("Compact failed: {e}"),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -463,6 +531,7 @@ enum ChatCommand {
     SyncTicket(String),
     ListSchedules,
     TriggerSchedule(String),
+    CompactSession,
 }
 
 /// Switch to a different session. Registers with server and returns the new DB, entries, and agent name.
@@ -534,6 +603,88 @@ async fn sync_from_ticket(server: &Server, ticket_str: &str) -> anyhow::Result<S
         "Synced database {}. Use /sessions to find and open it.",
         db_id
     ))
+}
+
+/// Compact the session by summarizing entries via the LLM and writing a Summary entry.
+async fn compact_session(
+    entries: &[SessionEntry],
+    agent_name: &str,
+    backend: &BackendManager,
+    session_db: &eidetica::Database,
+) -> anyhow::Result<String> {
+    use crate::backends::{ChatContext, Message};
+    use openai_api_rs::v1::chat_completion::MessageRole;
+
+    // Collect contextable entries for summarization
+    let contextable: Vec<&SessionEntry> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.entry_type,
+                EntryType::Message | EntryType::Directive | EntryType::Summary
+            )
+        })
+        .collect();
+
+    if contextable.len() < 3 {
+        anyhow::bail!("Not enough messages to compact (need at least 3)");
+    }
+
+    // Build a transcript for the LLM to summarize
+    let mut transcript = String::new();
+    for entry in &contextable {
+        let role_label = if entry.sender == agent_name {
+            "assistant"
+        } else {
+            &entry.sender
+        };
+        let type_label = match entry.entry_type {
+            EntryType::Summary => " [previous summary]",
+            EntryType::Directive => " [directive]",
+            _ => "",
+        };
+        transcript.push_str(&format!("{role_label}{type_label}: {}\n\n", entry.content));
+    }
+
+    // Ask the LLM to summarize
+    let system_prompt = "You are a conversation summarizer. Produce a thorough, structured summary of the conversation below. Include: key topics discussed, decisions made, tasks completed or in progress, important facts and state, and any open questions. The summary replaces older messages in the context window, so it must be complete enough for the assistant to continue working without the original messages.".to_string();
+
+    let context = ChatContext {
+        messages: vec![
+            Message::new(MessageRole::system, system_prompt),
+            Message::new(
+                MessageRole::user,
+                format!(
+                    "Summarize this conversation:\n\n{transcript}\n\n\
+                     Produce a structured summary that captures everything needed to continue the conversation."
+                ),
+            ),
+        ],
+        model: None,
+        role: None,
+    };
+
+    let summary = backend
+        .execute(&context)
+        .await
+        .map_err(|e| anyhow::anyhow!("LLM summarization failed: {e}"))?;
+
+    // Write Summary entry to the session DB
+    let entry = SessionEntry {
+        sender: "system".to_string(),
+        content: summary.clone(),
+        timestamp: chrono::Utc::now(),
+        entry_type: EntryType::Summary,
+    };
+
+    let txn = session_db.new_transaction().await?;
+    let store = txn
+        .get_store::<eidetica::store::Table<SessionEntry>>("entries")
+        .await?;
+    store.insert(entry).await?;
+    txn.commit().await?;
+
+    Ok(summary)
 }
 
 /// Show a system message in the TUI.
@@ -621,6 +772,9 @@ async fn handle_chat_key(
                         }
                         return None;
                     }
+                    "/compact" => {
+                        return Some(ChatCommand::CompactSession);
+                    }
                     "/schedules" => {
                         return Some(ChatCommand::ListSchedules);
                     }
@@ -644,6 +798,7 @@ async fn handle_chat_key(
                                 "  /sync <ticket> — sync a remote session via ticket",
                                 "  /schedules     — list configured schedules",
                                 "  /run <name>    — trigger a schedule immediately",
+                                "  /compact       — summarize and compact conversation history",
                                 "  /clear         — clear display (entries still in DB)",
                                 "  /raw           — dump raw entry data for debugging",
                                 "  /debug         — toggle debug mode (Ctrl+D)",
@@ -930,6 +1085,22 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
                     format!("{debug_prefix}  ERROR {}: {}", entry.sender, entry.content),
                     Style::default().fg(Color::Red),
                 )]));
+                lines.push(Line::from(""));
+            }
+            EntryType::Summary => {
+                let label = format!("{debug_prefix}--- context summary ---");
+                lines.push(Line::from(vec![Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                for content_line in entry.content.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {content_line}"),
+                        Style::default().fg(Color::Magenta),
+                    )]));
+                }
                 lines.push(Line::from(""));
             }
         }

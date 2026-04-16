@@ -1,4 +1,5 @@
 use crate::role::RoleDetails;
+use crate::tool::PresentationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -35,6 +36,12 @@ pub struct Config {
     pub security: Option<SecurityConfig>,
     /// Scheduled tasks
     pub schedules: Option<Vec<ScheduleConfig>>,
+    /// MCP (Model Context Protocol) subprocess servers
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Named tool profiles controlling how tool definitions are presented to the LLM
+    pub tool_profiles: Option<HashMap<String, ToolProfileConfig>>,
+    /// Context window management settings
+    pub context: Option<ContextConfig>,
 }
 
 /// Configuration for an agent
@@ -59,6 +66,10 @@ pub struct AgentConfig {
     pub autonomous: bool,
     /// Named override bundles for spawn-time configuration
     pub presets: Option<HashMap<String, AgentPreset>>,
+    /// Tool profile name (references a key in top-level tool_profiles)
+    pub tool_profile: Option<String>,
+    /// Override context token limit for this agent
+    pub max_context_tokens: Option<usize>,
 }
 
 /// A named bundle of overrides that can be selected at spawn time.
@@ -72,6 +83,8 @@ pub struct AgentPreset {
     pub tools: Option<Vec<String>>,
     /// Appended to the base system prompt
     pub role_suffix: Option<String>,
+    /// Tool profile override (references a key in top-level tool_profiles)
+    pub tool_profile: Option<String>,
 }
 
 /// Configuration info for a backend
@@ -171,6 +184,30 @@ pub struct SecurityConfig {
     pub tool_policies: Option<std::collections::HashMap<String, crate::tool::ToolPolicy>>,
 }
 
+/// Configuration for a tool profile — controls how tool definitions are presented to the LLM.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolProfileConfig {
+    /// Default presentation mode for tools not explicitly listed
+    pub default: Option<PresentationMode>,
+    /// Per-tool presentation mode overrides (supports "namespace.*" glob patterns)
+    pub tools: Option<HashMap<String, PresentationMode>>,
+}
+
+/// Configuration for an MCP subprocess server
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerConfig {
+    /// Name used as namespace prefix for tools (e.g., "filesystem" → "filesystem.read_file")
+    pub name: String,
+    /// Command to spawn the MCP server subprocess
+    pub command: String,
+    /// Arguments for the command
+    pub args: Option<Vec<String>>,
+    /// Environment variables for the subprocess
+    pub env: Option<HashMap<String, String>>,
+    /// Default policy for all tools from this server (overrides MCP baseline)
+    pub default_policy: Option<crate::tool::ToolPolicy>,
+}
+
 /// An allowed endpoint for network policy
 #[derive(Debug, Deserialize, Clone)]
 pub struct EndpointConfig {
@@ -180,4 +217,32 @@ pub struct EndpointConfig {
     pub path_prefix: Option<String>,
     /// Allowed HTTP methods (None = all)
     pub methods: Option<Vec<String>>,
+}
+
+/// Context window management configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextConfig {
+    /// Maximum tokens for the context window (default: 128000)
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: usize,
+    /// Tokens reserved for the LLM's response (default: 4096)
+    #[serde(default = "default_reserved_output_tokens")]
+    pub reserved_output_tokens: usize,
+}
+
+fn default_max_context_tokens() -> usize {
+    128_000
+}
+
+fn default_reserved_output_tokens() -> usize {
+    4096
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            max_context_tokens: default_max_context_tokens(),
+            reserved_output_tokens: default_reserved_output_tokens(),
+        }
+    }
 }

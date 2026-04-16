@@ -22,6 +22,10 @@ pub struct Agent {
     pub autonomous: bool,
     /// Named override bundles for spawn-time configuration.
     pub presets: HashMap<String, AgentPreset>,
+    /// Tool profile name (references a key in top-level tool_profiles config).
+    pub tool_profile: Option<String>,
+    /// Override context token limit for this agent (None = use global default).
+    pub max_context_tokens: Option<usize>,
 }
 
 /// Resolved overrides for a spawn_agent call.
@@ -31,6 +35,7 @@ pub struct ResolvedOverrides {
     pub max_iterations: u32,
     pub allowed_tools: Option<Vec<String>>,
     pub role_suffix: Option<String>,
+    pub tool_profile: Option<String>,
 }
 
 impl Agent {
@@ -50,6 +55,8 @@ impl Agent {
             max_iterations: agent_config.max_iterations.unwrap_or(10),
             autonomous: agent_config.autonomous,
             presets: agent_config.presets.clone().unwrap_or_default(),
+            tool_profile: agent_config.tool_profile.clone(),
+            max_context_tokens: agent_config.max_context_tokens,
         }
     }
 
@@ -66,6 +73,7 @@ impl Agent {
         let mut max_iterations = self.max_iterations;
         let mut allowed_tools = self.allowed_tools.clone();
         let mut role_suffix = None;
+        let mut tool_profile = self.tool_profile.clone();
 
         // Apply preset if specified
         if let Some(preset_name) = preset {
@@ -81,6 +89,9 @@ impl Agent {
                     allowed_tools = Some(intersect_tools(&allowed_tools, t));
                 }
                 role_suffix = p.role_suffix.clone();
+                if let Some(ref tp) = p.tool_profile {
+                    tool_profile = Some(tp.clone());
+                }
             }
         }
 
@@ -101,6 +112,7 @@ impl Agent {
             max_iterations,
             allowed_tools,
             role_suffix,
+            tool_profile,
         }
     }
 }
@@ -150,6 +162,8 @@ impl AgentRegistry {
                 max_iterations: 10,
                 autonomous: false,
                 presets: HashMap::new(),
+                tool_profile: None,
+                max_context_tokens: None,
             }]
         };
 
@@ -237,6 +251,8 @@ mod tests {
             max_iterations: 10,
             autonomous: false,
             presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
         }
     }
 
@@ -303,6 +319,7 @@ mod tests {
                 max_iterations: Some(40),
                 tools: None,
                 role_suffix: Some("Be thorough.".to_string()),
+                tool_profile: None,
             },
         );
 
@@ -322,6 +339,7 @@ mod tests {
                 max_iterations: Some(40),
                 tools: None,
                 role_suffix: None,
+                tool_profile: None,
             },
         );
 

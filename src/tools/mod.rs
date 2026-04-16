@@ -1,5 +1,7 @@
 mod agent;
 mod calculate;
+mod compact;
+mod describe;
 mod file;
 mod memory;
 mod shell;
@@ -8,6 +10,8 @@ mod web;
 
 pub use agent::SpawnAgent;
 pub use calculate::Calculate;
+pub use compact::Compact;
+pub use describe::DescribeTool;
 pub use file::{ReadFile, WriteFile};
 pub use memory::{Recall, Remember};
 pub use shell::ShellExec;
