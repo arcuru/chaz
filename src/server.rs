@@ -9,9 +9,9 @@
 //! agent execution. Gateways (Matrix, TUI) register their own callbacks on
 //! session DBs to detect agent responses and deliver them to their transports.
 //!
-//! **Known limitation**: concurrent writes to the same session may cause
-//! duplicate agent runs. Each callback independently checks the latest
-//! entry — no per-session locking. Acceptable for now.
+//! Per-session serialization prevents duplicate agent runs: a `processing`
+//! set tracks which sessions have an active agent task. Concurrent writes
+//! to the same session are skipped while an agent is running.
 
 use crate::agent::AgentRegistry;
 use crate::backends::BackendManager;
@@ -53,6 +53,8 @@ struct SpawnContext {
     max_call_depth: usize,
     parent_tools: Option<ScopedTools>,
     completion_tx: Option<mpsc::Sender<()>>,
+    /// Per-session processing lock — cleared when the task completes
+    processing: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Callback-driven agent server.
@@ -75,6 +77,8 @@ pub struct Server {
     sessions: Arc<Mutex<HashMap<String, SessionMeta>>>,
     /// Track which session DBs have server callbacks registered
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Sessions currently being processed (prevents concurrent agent runs per session)
+    processing: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Internal notification channel — callbacks send transport_id here
     notify_tx: mpsc::Sender<String>,
 }
@@ -102,6 +106,7 @@ impl Server {
             context_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             notify_tx,
         });
 
@@ -278,6 +283,9 @@ impl Server {
     }
 
     /// Check a session for new entries and act on them.
+    ///
+    /// Skips processing if an agent task is already running for this session,
+    /// preventing duplicate responses from concurrent writes.
     async fn process_session(&self, transport_id: &str) -> anyhow::Result<()> {
         let (conversation_id, session_db) =
             self.registry.get_or_create_session_db(transport_id).await?;
@@ -300,6 +308,15 @@ impl Server {
         if !should_process {
             return Ok(());
         }
+
+        // Per-session serialization: skip if an agent task is already running
+        {
+            let mut processing = self.processing.lock().await;
+            if !processing.insert(transport_id.to_string()) {
+                // Already processing — the running task will see the new entry
+                return Ok(());
+            }
+        }
         let (backend, agent_override, approval_tx, spawn_ctx) = {
             let sessions = self.sessions.lock().await;
             match sessions.get(transport_id) {
@@ -312,6 +329,7 @@ impl Server {
                         max_call_depth: m.max_call_depth,
                         parent_tools: m.parent_tools.clone(),
                         completion_tx: m.completion_tx.clone(),
+                        processing: self.processing.clone(),
                     },
                 ),
                 None => return Ok(()),
@@ -515,6 +533,12 @@ impl Server {
                 }
             }
             drop(s);
+
+            // Clear per-session processing lock
+            {
+                let mut proc = spawn.processing.lock().await;
+                proc.remove(&transport_id);
+            }
 
             // Signal completion for synchronous callers (e.g., spawn_agent)
             if let Some(tx) = spawn.completion_tx {
