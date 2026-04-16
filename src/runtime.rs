@@ -102,7 +102,7 @@ pub async fn execute(
             Ok(LLMResponse::ToolCalls { .. }) => {
                 Err("Unexpected tool calls in no-tools fallback".to_string())
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.to_string()),
         };
     }
 
@@ -117,20 +117,43 @@ pub async fn execute(
             .await
         {
             Ok(resp) => resp,
-            Err(e) if iteration == 0 => {
-                // First call failed with tools — retry without tools as fallback.
-                // Some models/providers don't support function calling.
-                info!("Tool-aware call failed ({e}), falling back to no-tools execution");
+            Err(ref e) if e.is_retryable() && iteration == 0 => {
+                // Transient error on first call with tools — retry without tools
+                // in case this model/provider doesn't support function calling.
+                info!(
+                    error = %e,
+                    retryable = e.is_retryable(),
+                    "Tool-aware call failed, falling back to no-tools execution"
+                );
                 return match backend
                     .chat_with_tools_for_model(model, &messages, &[], &resolved_model)
                     .await
                 {
                     Ok(LLMResponse::Text(text)) => Ok(text),
                     Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
-                    Err(e) => Err(e),
+                    Err(e) => Err(e.to_string()),
                 };
             }
-            Err(e) => return Err(e),
+            Err(e) if e.is_retryable() => {
+                // Transient error mid-loop — log and propagate (retry layer will wrap this later)
+                warn!(
+                    error = %e,
+                    status = ?e.status(),
+                    iteration,
+                    "Transient LLM error during ReAct loop"
+                );
+                return Err(e.to_string());
+            }
+            Err(e) => {
+                // Non-retryable error — stop immediately
+                warn!(
+                    error = %e,
+                    status = ?e.status(),
+                    retryable = false,
+                    "LLM error during ReAct loop"
+                );
+                return Err(e.to_string());
+            }
         };
 
         match response {
@@ -320,7 +343,7 @@ pub async fn execute(
         .await
     {
         Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),
-        _ => {
+        Ok(_) | Err(_) => {
             // Last resort: return the last tool result
             for msg in messages.iter().rev() {
                 if let RuntimeMessage::ToolResult { content, .. } = msg {

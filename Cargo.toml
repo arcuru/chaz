@@ -15,6 +15,7 @@ name = "chaz"
 [dependencies]
 headjack = { git = "https://github.com/arcuru/vibe-headjack" }
 anyhow = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util"] }
 tracing-subscriber = "0.3"
 tracing = "0.1"

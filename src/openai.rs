@@ -13,6 +13,7 @@ use openai_api_rs::v1::{
 use crate::{
     backends::{ChatContext, LLMBackend},
     config::Backend,
+    error::LlmError,
     runtime::{LLMResponse, RuntimeMessage, ToolCallRequest},
     security::SecretStore,
     tool::ToolDefinition,
@@ -35,7 +36,7 @@ impl OpenAI {
         }
     }
 
-    fn build_client(&self) -> Result<OpenAIClient, String> {
+    fn build_client(&self) -> Result<OpenAIClient, LlmError> {
         // Host-boundary injection: resolve API key from SecretStore by reference,
         // falling back to the raw api_key field for backward compatibility.
         let api_key = self
@@ -44,17 +45,23 @@ impl OpenAI {
             .as_ref()
             .and_then(|r| self.secrets.get(r))
             .or_else(|| self.backend.api_key.clone())
-            .ok_or("API key doesn't exist")?;
+            .ok_or_else(|| LlmError::Configuration {
+                message: "API key not configured".to_string(),
+            })?;
         let api_base = self
             .backend
             .api_base
             .clone()
-            .ok_or("API base doesn't exist")?;
+            .ok_or_else(|| LlmError::Configuration {
+                message: "API base URL not configured".to_string(),
+            })?;
         OpenAIClient::builder()
             .with_endpoint(api_base)
             .with_api_key(api_key)
             .build()
-            .map_err(|e| e.to_string())
+            .map_err(|e| LlmError::Configuration {
+                message: e.to_string(),
+            })
     }
 
     /// Execute a single LLM call with tool definitions, returning a structured response.
@@ -66,7 +73,7 @@ impl OpenAI {
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         model: &str,
-    ) -> Result<LLMResponse, String> {
+    ) -> Result<LLMResponse, LlmError> {
         let client = self.build_client()?;
 
         let openai_messages = convert_runtime_messages(messages);
@@ -80,13 +87,22 @@ impl OpenAI {
         let response = client
             .chat_completion(request)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(LlmError::from_api_error)?;
 
-        let choice = response.choices.first().ok_or("No choices in response")?;
+        let choice = response
+            .choices
+            .first()
+            .ok_or_else(|| LlmError::EmptyResponse {
+                message: "No choices in response".to_string(),
+            })?;
 
         tracing::debug!(
             "LLM response: content={:?} tool_calls={:?} finish_reason={:?}",
-            choice.message.content.as_ref().map(|c| &c[..c.len().min(100)]),
+            choice
+                .message
+                .content
+                .as_ref()
+                .map(|c| &c[..c.len().min(100)]),
             choice.message.tool_calls.as_ref().map(|tc| tc.len()),
             choice.finish_reason
         );
@@ -146,12 +162,12 @@ impl LLMBackend for OpenAI {
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         model: &str,
-    ) -> Result<LLMResponse, String> {
+    ) -> Result<LLMResponse, LlmError> {
         self.chat_with_tools_impl(messages, tools, model).await
     }
 
     /// Execute a simple chat request (no tools)
-    async fn execute(&self, context: &ChatContext) -> Result<String, String> {
+    async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
         let client = self.build_client()?;
         let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
         let request =
@@ -163,8 +179,10 @@ impl LLMBackend for OpenAI {
             "LLM request"
         );
 
-        let response = client.chat_completion(request).await;
-        let response = response.map_err(|e| e.to_string())?;
+        let response = client
+            .chat_completion(request)
+            .await
+            .map_err(LlmError::from_api_error)?;
 
         Ok(response.choices[0]
             .message

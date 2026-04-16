@@ -6,6 +6,7 @@ use tracing::debug;
 
 use crate::{
     config::Backend,
+    error::LlmError,
     openai::OpenAI,
     role::RoleDetails,
     runtime::{LLMResponse, RuntimeMessage},
@@ -17,7 +18,7 @@ pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;
     fn default_model(&self) -> Option<String>;
     /// Execute a simple chat request (no tools). Used by /compact and Matrix commands.
-    async fn execute(&self, context: &ChatContext) -> Result<String, String>;
+    async fn execute(&self, context: &ChatContext) -> Result<String, LlmError>;
 
     /// Whether this backend supports tool/function calling
     fn supports_tools(&self) -> bool {
@@ -31,8 +32,10 @@ pub trait LLMBackend {
         _messages: &[RuntimeMessage],
         _tools: &[ToolDefinition],
         _model: &str,
-    ) -> Result<LLMResponse, String> {
-        Err("Tool calling not supported by this backend".to_string())
+    ) -> Result<LLMResponse, LlmError> {
+        Err(LlmError::Configuration {
+            message: "Tool calling not supported by this backend".to_string(),
+        })
     }
 }
 
@@ -179,9 +182,11 @@ impl BackendManager {
 
     /// Execute a ChatContext (simple, no tools).
     /// Used by Matrix commands and /compact — not by the runtime.
-    pub async fn execute(&self, context: &ChatContext) -> Result<String, String> {
+    pub async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
         if self.backends.is_empty() {
-            return Err("No backends configured".to_string());
+            return Err(LlmError::Configuration {
+                message: "No backends configured".to_string(),
+            });
         }
         let backend = self.select_backend(context);
         OpenAI::new(backend, &self.secrets).execute(context).await
@@ -228,9 +233,11 @@ impl BackendManager {
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         resolved_model: &str,
-    ) -> Result<LLMResponse, String> {
+    ) -> Result<LLMResponse, LlmError> {
         if self.backends.is_empty() {
-            return Err("No backends configured".to_string());
+            return Err(LlmError::Configuration {
+                message: "No backends configured".to_string(),
+            });
         }
         let backend = self.select_backend_for_model(model);
         OpenAI::new(backend, &self.secrets)

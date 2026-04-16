@@ -3,6 +3,7 @@ mod backends;
 mod config;
 mod context;
 mod defaults;
+mod error;
 mod gateway;
 mod mcp;
 mod openai;
@@ -242,7 +243,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Run the selected gateway
-    info!(mode = if args.tui { "tui" } else { "matrix" }, "Starting gateway");
+    info!(
+        mode = if args.tui { "tui" } else { "matrix" },
+        "Starting gateway"
+    );
     let result = if args.tui {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
         gateway.run(server).await
