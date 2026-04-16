@@ -12,6 +12,7 @@ use crate::gateway::{ApprovalDecision, ApprovalExchange};
 use crate::tool::{ApprovalRequirement, ToolApprovalInfo};
 use std::collections::HashSet;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, info, warn};
 
 /// Security context threaded through the runtime.
 #[derive(Clone)]
@@ -37,16 +38,24 @@ impl SecurityContext {
     /// Request approval for a tool call. Returns the decision.
     /// If no approval channel is set, defaults to Deny for safety.
     pub async fn request_approval(&self, info: ToolApprovalInfo) -> ApprovalDecision {
-        match &self.approval_callback {
+        let tool_name = info.name.clone();
+        debug!(tool = %tool_name, risk = ?info.risk_level, "Requesting approval");
+        let decision = match &self.approval_callback {
             Some(tx) => {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 let exchange = ApprovalExchange { info, decision_tx };
                 if tx.send(exchange).await.is_err() {
+                    warn!(tool = %tool_name, "Approval channel closed, denying");
                     return ApprovalDecision::Deny;
                 }
                 decision_rx.await.unwrap_or(ApprovalDecision::Deny)
             }
-            None => ApprovalDecision::Deny,
-        }
+            None => {
+                info!(tool = %tool_name, "No approval channel, denying");
+                ApprovalDecision::Deny
+            }
+        };
+        info!(tool = %tool_name, decision = ?decision, "Approval decision");
+        decision
     }
 }

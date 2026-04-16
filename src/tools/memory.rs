@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use tracing::debug;
 
 /// Derive the eidetica store name for an agent's memory.
 ///
@@ -93,6 +94,7 @@ impl Tool for Remember {
                 .await
                 .map_err(|e| format!("Failed to commit memory: {e}"))?;
 
+            debug!(agent = %ctx.agent_name, %key, "Memory stored");
             Ok(format!("Remembered: {key} = {value}"))
         })
     }
@@ -158,6 +160,7 @@ impl Tool for Recall {
                 .await
                 .map_err(|e| format!("Failed to search memory: {e}"))?;
 
+            debug!(agent = %ctx.agent_name, %query, matches = records.len(), "Memory recall");
             if records.is_empty() {
                 return Ok(format!("No memories found matching '{query}'."));
             }

@@ -2,6 +2,7 @@ use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescrip
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use tracing::{debug, info, warn};
 
 /// Execute a shell command and return its output.
 ///
@@ -120,13 +121,17 @@ impl Tool for ShellExec {
                 .ok_or_else(|| "Missing 'command' argument".to_string())?;
 
             // Check against allowlist/denylist
-            self.check_command(command)?;
+            self.check_command(command).map_err(|e| {
+                warn!(command = %command, "Shell command denied: {e}");
+                e
+            })?;
 
             let working_dir = arguments
                 .get("working_dir")
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            info!(command = %command, "Executing shell command");
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(command);
 
@@ -162,6 +167,7 @@ impl Tool for ShellExec {
             if result.is_empty() {
                 result.push_str("[no output]");
             }
+            debug!(exit_code, output_len = result.len(), "Shell command completed");
 
             // Truncate very long output
             if result.len() > 10000 {

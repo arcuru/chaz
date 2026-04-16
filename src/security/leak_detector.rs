@@ -1,5 +1,6 @@
 use regex::Regex;
 use std::sync::LazyLock;
+use tracing::warn;
 
 /// Policy for handling detected secret leaks
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -91,8 +92,14 @@ impl LeakDetector {
             return Ok(text.to_string());
         }
 
+        let names: Vec<&str> = detections.iter().map(|(n, _)| *n).collect();
+
         match self.policy {
             LeakPolicy::Redact => {
+                warn!(
+                    patterns = ?names,
+                    "Secret detected in output, redacting"
+                );
                 let mut result = text.to_string();
                 for (name, pattern) in &detections {
                     result = pattern
@@ -102,7 +109,10 @@ impl LeakDetector {
                 Ok(result)
             }
             LeakPolicy::Block => {
-                let names: Vec<&str> = detections.iter().map(|(n, _)| *n).collect();
+                warn!(
+                    patterns = ?names,
+                    "Secret detected in output, blocking"
+                );
                 Err(format!(
                     "Tool output blocked: detected potential secrets ({})",
                     names.join(", ")

@@ -2,6 +2,7 @@ use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescrip
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use tracing::{debug, info};
 
 /// Read the contents of a file
 pub struct ReadFile;
@@ -35,9 +36,11 @@ impl Tool for ReadFile {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing 'path' argument".to_string())?;
 
+            debug!(path, "Reading file");
             let content = tokio::fs::read_to_string(path)
                 .await
                 .map_err(|e| format!("Failed to read file: {e}"))?;
+            debug!(path, bytes = content.len(), "File read complete");
 
             // Truncate very long files
             if content.len() > 50000 {
@@ -100,6 +103,7 @@ impl Tool for WriteFile {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing 'content' argument".to_string())?;
 
+            info!(path, bytes = content.len(), "Writing file");
             tokio::fs::write(path, content)
                 .await
                 .map_err(|e| format!("Failed to write file: {e}"))?;

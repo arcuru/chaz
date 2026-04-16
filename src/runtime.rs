@@ -17,7 +17,7 @@ use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Events emitted during the ReAct loop for audit trail / observability.
 #[allow(dead_code)]
@@ -233,10 +233,11 @@ pub async fn execute(
 
                             match exec_result {
                                 Ok(Ok(output)) => {
-                                    info!(
-                                        "Tool {} returned: {}",
-                                        call.name,
-                                        &output[..output.len().min(100)]
+                                    debug!(
+                                        tool = %call.name,
+                                        len = output.len(),
+                                        "Tool returned: {}",
+                                        &output[..output.len().min(200)]
                                     );
 
                                     // --- Security: scan for injection patterns (warning-only) ---
@@ -258,7 +259,10 @@ pub async fn execute(
                                         }
                                     }
                                 }
-                                Ok(Err(e)) => format!("Tool error: {e}"),
+                                Ok(Err(e)) => {
+                                    warn!(tool = %call.name, "Tool execution error: {e}");
+                                    format!("Tool error: {e}")
+                                }
                                 Err(_) => {
                                     warn!(
                                         tool = %call.name,
@@ -269,7 +273,10 @@ pub async fn execute(
                                 }
                             }
                         }
-                        None => format!("Unknown tool: {}", call.name),
+                        None => {
+                            warn!(tool = %call.name, "Unknown tool requested by LLM");
+                            format!("Unknown tool: {}", call.name)
+                        }
                     };
 
                     // Emit tool result event
@@ -286,9 +293,10 @@ pub async fn execute(
                             .await;
                     }
 
-                    info!(
-                        "Tool result for {}: {}",
-                        call.id,
+                    debug!(
+                        call_id = %call.id,
+                        tool = %call.name,
+                        "Tool result: {}",
                         &result[..result.len().min(200)]
                     );
                     // Wrap tool output in XML delimiters to prevent injection

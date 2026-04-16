@@ -40,11 +40,14 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = ChazArgs::parse();
+    info!(config = %args.config.display(), tui = args.tui, "Starting chaz");
+
     let mut file = File::open(&args.config)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
     let mut config: Config = serde_yaml::from_str(&contents)?;
+    info!("Config loaded from {}", args.config.display());
 
     // Resolve state directory for persistence
     let state_dir = config
@@ -80,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
+    info!(
+        agents = agent_registry.names().len(),
+        "Agent registry initialized"
+    );
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
     let central_db = registry.central_db().clone();
 
@@ -167,11 +174,16 @@ async fn main() -> anyhow::Result<()> {
     // Start MCP servers and register their tools
     if let Some(mcp_configs) = &config.mcp_servers {
         let mcp_tools = mcp::start_mcp_servers(mcp_configs).await;
+        let mcp_count = mcp_tools.len();
         for t in mcp_tools {
             tool_registry.register_boxed(t);
         }
+        if mcp_count > 0 {
+            info!(mcp_tools = mcp_count, "MCP tools registered");
+        }
     }
 
+    info!("Tool registry initialized");
     let tool_registry = std::sync::Arc::new(tool_registry);
 
     // Build tool profiles from config
@@ -230,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Run the selected gateway
+    info!(mode = if args.tui { "tui" } else { "matrix" }, "Starting gateway");
     let result = if args.tui {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
         gateway.run(server).await

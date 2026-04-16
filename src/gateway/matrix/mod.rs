@@ -90,7 +90,7 @@ impl Gateway for MatrixGateway {
         bot.join_rooms();
 
         if let Err(e) = bot.sync().await {
-            info!("Error syncing: {e}");
+            tracing::warn!("Initial Matrix sync error: {e}");
         }
 
         info!("The client is ready! Listening to new messages…");

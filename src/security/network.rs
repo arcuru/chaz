@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use tracing::warn;
 use url::Url;
 
 /// An allowed endpoint pattern for network access control.
@@ -76,9 +77,9 @@ impl NetworkPolicy {
             return Ok(());
         }
 
-        Err(format!(
-            "Network policy denied: {method} {url_str} not in allowed endpoints"
-        ))
+        let msg = format!("Network policy denied: {method} {url_str} not in allowed endpoints");
+        warn!(%method, url = %url_str, "Network request blocked by policy");
+        Err(msg)
     }
 
     /// Check if a host matches a pattern (exact or wildcard).
@@ -106,6 +107,7 @@ impl NetworkPolicy {
             .unwrap_or(host);
         if let Ok(ip) = bare_host.parse::<IpAddr>() {
             if is_private_ip(&ip) {
+                warn!(%ip, "SSRF: blocked request to private IP");
                 return Err(format!("SSRF protection: private IP {ip} not allowed"));
             }
         }
@@ -117,6 +119,7 @@ impl NetworkPolicy {
             || lower.ends_with(".internal")
             || lower.ends_with(".local")
         {
+            warn!(%host, "SSRF: blocked request to internal hostname");
             return Err(format!(
                 "SSRF protection: internal hostname '{host}' not allowed"
             ));

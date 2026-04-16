@@ -84,10 +84,10 @@ impl OpenAI {
 
         let choice = response.choices.first().ok_or("No choices in response")?;
 
-        tracing::info!(
-            "chat_with_tools response: content={:?} tool_calls={:?} finish_reason={:?}",
-            choice.message.content,
-            choice.message.tool_calls,
+        tracing::debug!(
+            "LLM response: content={:?} tool_calls={:?} finish_reason={:?}",
+            choice.message.content.as_ref().map(|c| &c[..c.len().min(100)]),
+            choice.message.tool_calls.as_ref().map(|tc| tc.len()),
             choice.finish_reason
         );
 
@@ -157,11 +157,10 @@ impl LLMBackend for OpenAI {
         let request =
             convert_to_chatcompletionrequest(context, &model_prefix, &self.default_model());
 
-        tracing::info!(
-            "OpenAI execute: endpoint={:?} model={} messages={}",
-            self.backend.api_base,
-            request.model,
-            request.messages.len()
+        tracing::debug!(
+            model = %request.model,
+            messages = request.messages.len(),
+            "LLM request"
         );
 
         let response = client.chat_completion(request).await;

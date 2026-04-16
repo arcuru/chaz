@@ -2,6 +2,7 @@
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
 use openai_api_rs::v1::chat_completion::MessageRole;
+use tracing::debug;
 
 use crate::{
     config::Backend,
@@ -211,6 +212,12 @@ impl BackendManager {
                 .default_model()
                 .unwrap_or_default();
         }
+        debug!(
+            requested = ?model,
+            resolved = %resolved,
+            backend = %backend.get_name(),
+            "Model resolved"
+        );
         resolved
     }
 

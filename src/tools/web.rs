@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, info};
 
 /// Fetch a URL via HTTP. Network policy enforced before requests.
 pub struct WebFetch {
@@ -71,6 +72,7 @@ impl Tool for WebFetch {
 
             // Enforce network policy
             self.network_policy.check(url, &method)?;
+            info!(%method, %url, "Fetching URL");
 
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -98,6 +100,7 @@ impl Tool for WebFetch {
                 .text()
                 .await
                 .map_err(|e| format!("Failed to read response body: {e}"))?;
+            debug!(%status, body_len = body.len(), %url, "HTTP response received");
 
             let mut result = format!("[{status}]\n{body}");
 
