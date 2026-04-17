@@ -3,10 +3,11 @@ use crate::security::SecretStore;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
@@ -39,6 +40,11 @@ pub struct McpServer {
     config: McpServerConfig,
     /// Consecutive restart attempts (reset to 0 on successful request).
     restart_attempts: AtomicU8,
+    /// Set when the server sends `notifications/tools/list_changed`.
+    tools_changed: AtomicBool,
+    /// Shared metadata for each tool, keyed by raw tool name.
+    /// Updated on re-discovery so McpTool::descriptor() returns fresh data.
+    tool_metadata: RwLock<HashMap<String, McpToolMetadata>>,
 }
 
 impl McpServer {
@@ -55,6 +61,8 @@ impl McpServer {
             _child: Mutex::new(child),
             config: config.clone(),
             restart_attempts: AtomicU8::new(0),
+            tools_changed: AtomicBool::new(false),
+            tool_metadata: RwLock::new(HashMap::new()),
         };
 
         server.initialize().await?;
@@ -200,8 +208,66 @@ impl McpServer {
         Ok(tools)
     }
 
+    /// Re-discover tools from the server and update shared metadata.
+    ///
+    /// Called lazily when `tools_changed` flag is set. Updates existing tool
+    /// metadata in-place. New tools are logged but can't be added to the
+    /// registry at runtime (they'll appear on next restart). Removed tools
+    /// will return errors on next call.
+    async fn refresh_tools(&self) -> Result<(), String> {
+        self.tools_changed.store(false, Ordering::Relaxed);
+        let tools = self.list_tools().await?;
+
+        let mut metadata = self.tool_metadata.write().unwrap();
+        let mut added = 0;
+        let mut updated = 0;
+        for info in &tools {
+            let new_meta = McpToolMetadata {
+                description: info.description.clone(),
+                input_schema: info.input_schema.clone(),
+            };
+            if let Some(existing) = metadata.get_mut(&info.name) {
+                if existing.description != new_meta.description
+                    || existing.input_schema != new_meta.input_schema
+                {
+                    *existing = new_meta;
+                    updated += 1;
+                }
+            } else {
+                metadata.insert(info.name.clone(), new_meta);
+                added += 1;
+            }
+        }
+
+        if updated > 0 || added > 0 {
+            info!(
+                server = %self.name,
+                updated,
+                added,
+                total = tools.len(),
+                "MCP tools refreshed"
+            );
+        }
+        if added > 0 {
+            warn!(
+                server = %self.name,
+                added,
+                "New MCP tools discovered but cannot be added to registry at runtime — restart to pick them up"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Call a tool on the MCP server, with auto-restart on process death.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, String> {
+        // Lazy refresh: if the server signaled tools/list_changed, re-discover before calling
+        if self.tools_changed.load(Ordering::Relaxed) {
+            if let Err(e) = self.refresh_tools().await {
+                warn!(server = %self.name, error = %e, "Failed to refresh tools after list_changed");
+            }
+        }
+
         let params = json!({
             "name": name,
             "arguments": arguments
@@ -308,11 +374,20 @@ impl McpServer {
 
             debug!("MCP '{}' ← {trimmed}", self.name);
 
-            // Skip notifications (no id field)
+            // Handle notifications (no id field)
             let resp_id = match parsed.get("id") {
                 Some(id_val) => id_val.as_u64(),
                 None => {
-                    debug!("MCP '{}' notification: {trimmed}", self.name);
+                    let method = parsed
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+                    if method == "notifications/tools/list_changed" {
+                        info!("MCP '{}' signaled tools/list_changed", self.name);
+                        self.tools_changed.store(true, Ordering::Relaxed);
+                    } else {
+                        debug!("MCP '{}' notification: {trimmed}", self.name);
+                    }
                     continue;
                 }
             };
@@ -375,26 +450,42 @@ struct McpToolInfo {
     input_schema: Value,
 }
 
+/// Shared, updatable metadata for a tool. Read by McpTool::descriptor(),
+/// written by McpServer::refresh_tools().
+#[derive(Clone, Debug)]
+struct McpToolMetadata {
+    description: String,
+    input_schema: Value,
+}
+
 /// Wraps a single MCP tool as a `Tool` trait implementation.
 ///
 /// Each discovered tool from an MCP server becomes one `McpTool` instance,
 /// registered in the `ToolRegistry` with a namespaced name (`server.tool`).
+/// Description and schema are read from the server's shared metadata map,
+/// so they update automatically when the server re-discovers tools.
 pub struct McpTool {
     server: Arc<McpServer>,
     /// Raw tool name as the MCP server knows it
     raw_name: String,
     /// Namespaced name: `server_name.tool_name`
     namespaced_name: String,
-    description: String,
-    input_schema: Value,
 }
 
 impl Tool for McpTool {
     fn descriptor(&self) -> ToolDescriptor {
-        ToolDescriptor {
-            name: self.namespaced_name.clone(),
-            description: self.description.clone(),
-            parameters: self.input_schema.clone(),
+        let metadata = self.server.tool_metadata.read().unwrap();
+        match metadata.get(&self.raw_name) {
+            Some(meta) => ToolDescriptor {
+                name: self.namespaced_name.clone(),
+                description: meta.description.clone(),
+                parameters: meta.input_schema.clone(),
+            },
+            None => ToolDescriptor {
+                name: self.namespaced_name.clone(),
+                description: String::new(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
         }
     }
 
@@ -478,6 +569,19 @@ pub async fn start_mcp_servers(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>
     for config in configs {
         match start_one_server(config).await {
             Ok((server, tool_infos)) => {
+                // Populate the server's shared metadata map
+                {
+                    let mut metadata = server.tool_metadata.write().unwrap();
+                    for info in &tool_infos {
+                        metadata.insert(
+                            info.name.clone(),
+                            McpToolMetadata {
+                                description: info.description.clone(),
+                                input_schema: info.input_schema.clone(),
+                            },
+                        );
+                    }
+                }
                 let server = Arc::new(server);
                 let count = tool_infos.len();
                 for info in tool_infos {
@@ -490,8 +594,6 @@ pub async fn start_mcp_servers(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>
                         server: server.clone(),
                         raw_name: info.name,
                         namespaced_name: namespaced,
-                        description: info.description,
-                        input_schema: info.input_schema,
                     }));
                 }
                 info!("MCP server '{}': registered {count} tool(s)", config.name);
