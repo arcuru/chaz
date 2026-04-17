@@ -218,6 +218,10 @@
           ];
 
           RUST_SRC_PATH = "${rustSrc}/lib/rustlib/src/rust/library";
+
+          # Ensure dynamically-linked test binaries can find openssl at runtime.
+          # inputsFrom provides headers/pkg-config for compilation but not LD_LIBRARY_PATH.
+          LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
         };
       };
     };
