@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phases 0–12 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience). Recent: loop detection (tool call fingerprinting), LLM request timeout, retry with exponential backoff, room tag migration to registry DB, Matrix approval UX (reactions + commands), named sessions, MCP auto-restart, tiktoken tokenization, glob tool allowlists, per-session serialization, XML injection defense, per-agent memory isolation, tool rate limiting.
+**Status**: Active development — Phases 0–13 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience). Recent: MCP Streamable HTTP transport, MCP tool directory scanning, dynamic tool re-discovery (tools/list_changed), loop detection (tool call fingerprinting), LLM request timeout, retry with exponential backoff.
 
 ## Build & Development Commands
 
@@ -24,7 +24,7 @@ just nix check      # nix flake check
 
 Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
 
-77 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), secret resolution, and loop detection. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
+81 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), secret resolution, loop detection, and MCP directory scanning. Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-share
 session.rs           SessionRegistry (central DB with bindings + new-session events) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error, Summary) + SessionBinding (transport→DB mapping + per-session config: model, role, backend)
 context.rs           ContextBuilder — token-budgeted context assembly from session entries, with Summary boundary support
 tool.rs              Tool trait, ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools, ToolProfile, PresentationMode
-mcp.rs               MCP subprocess server management: McpServer (JSON-RPC over stdin/stdout), McpTool (Tool wrapper), startup orchestration
+mcp.rs               MCP server management: Transport enum (Stdio/Http), McpServer (transport-agnostic), McpTool (Tool wrapper), directory scanning, startup orchestration
 tools/
   mod.rs             Re-exports all tools
   agent.rs           spawn_agent — delegate to another agent via server's session messaging (sync/async modes)
@@ -100,7 +100,7 @@ defaults.rs          Built-in default config and roles
 - **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll. Matrix surfaces approval requests as room messages with reaction support (✅❌⏭) and text commands (!chaz approve/deny).
 - **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM.
 - **Tool profiles**: Named configurations (in `tool_profiles:` config) controlling tool definition presentation. PresentationMode: Full (default), Brief (first sentence, no param descriptions), Summary (name only), Hidden. Supports glob prefix matching (`"filesystem.*": summary`). Configured per agent (`tool_profile:`), per preset, or per session. Applied at `ScopedTools::definitions()` call.
-- **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout). Config: `mcp_servers:` with name, command, args, env, default_policy. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details. Auto-restart with exponential backoff (1s–16s, max 5 attempts) on subprocess crash.
+- **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout) or Streamable HTTP (POST + SSE). Config: `mcp_servers:` with name, command/url, args, env, default_policy. Also `mcp_server_dir:` for manifest directory scanning (.yaml/.json files). Transport selected by config: `url` → HTTP, `command` → stdio. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details. Auto-restart with exponential backoff (1s–16s, max 5 attempts) on subprocess crash. Dynamic re-discovery: `notifications/tools/list_changed` detected in JSON-RPC exchanges, triggers lazy `tools/list` refresh before next call. McpTool metadata stored in shared `RwLock` map — `descriptor()` returns live data.
 - **Tool allowlist globs**: Agent tool allowlists support `"namespace.*"` glob patterns (e.g., `"filesystem.*"` matches all tools from that MCP server). Works in ScopedTools filtering, access checks, and transitive narrowing.
 - **Per-session serialization**: Server tracks which sessions have active agent tasks. Concurrent writes to the same session are skipped while an agent is running, preventing duplicate responses.
 - **XML tool output wrapping**: Tool results fed back to the LLM are wrapped in `<tool_output tool="name">` delimiters with angle-bracket escaping, preventing injection attacks through tool output.
@@ -163,6 +163,7 @@ Add to config — no code changes needed:
 
 ```yaml
 mcp_servers:
+  # Subprocess (stdio) transport
   - name: filesystem
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
@@ -172,9 +173,15 @@ mcp_servers:
       risk: medium
       approval: unless_auto_approved
       timeout: 30
+  # Streamable HTTP transport
+  - name: remote-tools
+    url: "http://localhost:8080/mcp"
+
+# Or scan a directory for manifest files (.yaml/.json)
+mcp_server_dir: "/etc/chaz/mcp.d"
 ```
 
-Tools are discovered via MCP `tools/list` at startup and registered as `server_name.tool_name` (e.g., `filesystem.read_file`). Policy overrides work the same as built-in tools via `security.tool_policies`. Use `tool_profiles` to control context usage when many MCP tools are present.
+Tools are discovered via MCP `tools/list` at startup and registered as `server_name.tool_name` (e.g., `filesystem.read_file`). Policy overrides work the same as built-in tools via `security.tool_policies`. Use `tool_profiles` to control context usage when many MCP tools are present. Tool schemas update dynamically when servers send `notifications/tools/list_changed`.
 
 ## CI
 
