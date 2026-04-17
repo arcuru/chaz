@@ -606,85 +606,106 @@ impl McpServer {
                 .await
                 .map_err(|e| format!("MCP '{}' HTTP body error: {e}", self.name))?;
             debug!("MCP '{}' ← {body}", self.name);
-
-            let parsed: Value = serde_json::from_str(&body)
-                .map_err(|e| format!("MCP '{}' invalid JSON response: {e}", self.name))?;
-
-            if let Some(err) = parsed.get("error") {
-                let msg = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                return Err(format!("MCP '{}' error: {msg}", self.name));
-            }
-
-            parsed
-                .get("result")
-                .cloned()
-                .ok_or_else(|| format!("MCP '{}': response missing result", self.name))
+            parse_jsonrpc_response(&self.name, &body)
         }
     }
 
     /// Parse an SSE response stream for the JSON-RPC result.
-    ///
-    /// SSE events are `data: <json>\n\n`. We look for the first event
-    /// containing a JSON-RPC response (has "result" or "error") and
-    /// process any notifications along the way.
     async fn parse_sse_response(&self, resp: reqwest::Response) -> Result<Value, String> {
         let body = resp
             .text()
             .await
             .map_err(|e| format!("MCP '{}' SSE read error: {e}", self.name))?;
 
-        for line in body.lines() {
-            let data = match line.strip_prefix("data: ") {
-                Some(d) => d.trim(),
-                None => continue,
-            };
+        parse_sse_body(&self.name, &body, &self.tools_changed)
+    }
+}
 
-            if data.is_empty() {
-                continue;
-            }
+// ============================================================================
+// SSE parsing (extracted for testability)
+// ============================================================================
 
-            let parsed: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+/// Parse an SSE body for a JSON-RPC response.
+///
+/// Handles both `data: {...}` (with space) and `data:{...}` (without space)
+/// formats. Processes notifications inline, setting `tools_changed` flag
+/// when `notifications/tools/list_changed` is encountered. Returns the
+/// first JSON-RPC result found, or an error.
+fn parse_sse_body(
+    server_name: &str,
+    body: &str,
+    tools_changed: &AtomicBool,
+) -> Result<Value, String> {
+    for line in body.lines() {
+        // SSE spec: "data:" followed by optional space, then the value
+        let data = if let Some(d) = line.strip_prefix("data: ") {
+            d.trim()
+        } else if let Some(d) = line.strip_prefix("data:") {
+            d.trim()
+        } else {
+            continue;
+        };
 
-            debug!("MCP '{}' ← (SSE) {data}", self.name);
-
-            // Check if this is a notification
-            if parsed.get("id").is_none() {
-                let method = parsed
-                    .get("method")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("");
-                if method == "notifications/tools/list_changed" {
-                    info!("MCP '{}' signaled tools/list_changed", self.name);
-                    self.tools_changed.store(true, Ordering::Relaxed);
-                }
-                continue;
-            }
-
-            // This is a response
-            if let Some(err) = parsed.get("error") {
-                let msg = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                return Err(format!("MCP '{}' error: {msg}", self.name));
-            }
-
-            if let Some(result) = parsed.get("result").cloned() {
-                return Ok(result);
-            }
+        if data.is_empty() {
+            continue;
         }
 
-        Err(format!(
-            "MCP '{}': no JSON-RPC response in SSE stream",
-            self.name
-        ))
+        let parsed: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        debug!("MCP '{server_name}' ← (SSE) {data}");
+
+        // Check if this is a notification (no "id" field)
+        if parsed.get("id").is_none() {
+            let method = parsed
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            if method == "notifications/tools/list_changed" {
+                info!("MCP '{server_name}' signaled tools/list_changed");
+                tools_changed.store(true, Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        // This is a response — check for error first
+        if let Some(err) = parsed.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("MCP '{server_name}' error: {msg}"));
+        }
+
+        if let Some(result) = parsed.get("result").cloned() {
+            return Ok(result);
+        }
     }
+
+    Err(format!(
+        "MCP '{server_name}': no JSON-RPC response in SSE stream"
+    ))
+}
+
+/// Parse a JSON-RPC response body, extracting the result or error.
+fn parse_jsonrpc_response(server_name: &str, body: &str) -> Result<Value, String> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|e| format!("MCP '{server_name}' invalid JSON response: {e}"))?;
+
+    if let Some(err) = parsed.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("MCP '{server_name}' error: {msg}"));
+    }
+
+    parsed
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("MCP '{server_name}': response missing result"))
 }
 
 // ============================================================================
@@ -896,6 +917,469 @@ fn extract_text_content(result: &Value) -> String {
 mod tests {
     use super::*;
 
+    // ================================================================
+    // extract_text_content
+    // ================================================================
+
+    #[test]
+    fn test_extract_text_single_item() {
+        let result = json!({
+            "content": [{"type": "text", "text": "hello world"}]
+        });
+        assert_eq!(extract_text_content(&result), "hello world");
+    }
+
+    #[test]
+    fn test_extract_text_multiple_items() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "line 1"},
+                {"type": "text", "text": "line 2"}
+            ]
+        });
+        assert_eq!(extract_text_content(&result), "line 1\nline 2");
+    }
+
+    #[test]
+    fn test_extract_text_no_content_field() {
+        let result = json!({"something": "else"});
+        assert_eq!(extract_text_content(&result), "");
+    }
+
+    #[test]
+    fn test_extract_text_empty_content_array() {
+        let result = json!({"content": []});
+        assert_eq!(extract_text_content(&result), "");
+    }
+
+    #[test]
+    fn test_extract_text_content_not_array() {
+        let result = json!({"content": "just a string"});
+        assert_eq!(extract_text_content(&result), "");
+    }
+
+    #[test]
+    fn test_extract_text_skips_non_text_types() {
+        let result = json!({
+            "content": [
+                {"type": "image", "data": "base64..."},
+                {"type": "text", "text": "the text part"}
+            ]
+        });
+        assert_eq!(extract_text_content(&result), "the text part");
+    }
+
+    #[test]
+    fn test_extract_text_missing_text_field() {
+        // type is "text" but the "text" field is missing
+        let result = json!({
+            "content": [{"type": "text"}]
+        });
+        assert_eq!(extract_text_content(&result), "");
+    }
+
+    // ================================================================
+    // parse_jsonrpc_response
+    // ================================================================
+
+    #[test]
+    fn test_jsonrpc_response_success() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let result = parse_jsonrpc_response("test", body).unwrap();
+        assert_eq!(result, json!({"tools": []}));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_error() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let err = parse_jsonrpc_response("test", body).unwrap_err();
+        assert!(err.contains("Invalid Request"));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_error_missing_message() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600}}"#;
+        let err = parse_jsonrpc_response("test", body).unwrap_err();
+        assert!(err.contains("unknown error"));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_missing_result() {
+        // Has id but neither result nor error — malformed
+        let body = r#"{"jsonrpc":"2.0","id":1}"#;
+        let err = parse_jsonrpc_response("test", body).unwrap_err();
+        assert!(err.contains("response missing result"));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_invalid_json() {
+        let err = parse_jsonrpc_response("test", "not json at all").unwrap_err();
+        assert!(err.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_null_result() {
+        // result is explicitly null — valid JSON-RPC
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let result = parse_jsonrpc_response("test", body).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    // ================================================================
+    // parse_sse_body
+    // ================================================================
+
+    #[test]
+    fn test_sse_basic_response() {
+        let flag = AtomicBool::new(false);
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"value\":42}}\n\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!({"value": 42}));
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sse_no_space_after_data_colon() {
+        // Some SSE implementations omit the space
+        let flag = AtomicBool::new(false);
+        let body = "data:{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!({"ok": true}));
+    }
+
+    #[test]
+    fn test_sse_error_response() {
+        let flag = AtomicBool::new(false);
+        let body =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"boom\"}}\n\n";
+        let err = parse_sse_body("test", body, &flag).unwrap_err();
+        assert!(err.contains("boom"));
+    }
+
+    #[test]
+    fn test_sse_notification_before_response() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
+\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\
+\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!({"tools": []}));
+        // The notification should have set the flag
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sse_only_notifications_no_response() {
+        let flag = AtomicBool::new(false);
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        let err = parse_sse_body("test", body, &flag).unwrap_err();
+        assert!(err.contains("no JSON-RPC response"));
+    }
+
+    #[test]
+    fn test_sse_empty_body() {
+        let flag = AtomicBool::new(false);
+        let err = parse_sse_body("test", "", &flag).unwrap_err();
+        assert!(err.contains("no JSON-RPC response"));
+    }
+
+    #[test]
+    fn test_sse_non_data_lines_ignored() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+event: message\n\
+id: 1\n\
+retry: 5000\n\
+: this is a comment\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n\
+\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!("ok"));
+    }
+
+    #[test]
+    fn test_sse_empty_data_line_skipped() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+data: \n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":true}\n\
+\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!(true));
+    }
+
+    #[test]
+    fn test_sse_invalid_json_data_skipped() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+data: not valid json\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"found it\"}\n\
+\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!("found it"));
+    }
+
+    #[test]
+    fn test_sse_response_with_id_null() {
+        // id: null is present (not absent), so it shouldn't be treated as notification
+        let flag = AtomicBool::new(false);
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"result\":\"null-id\"}\n\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!("null-id"));
+    }
+
+    #[test]
+    fn test_sse_multiple_notifications_set_flag_once() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}\n\
+\n";
+        let result = parse_sse_body("test", body, &flag).unwrap();
+        assert_eq!(result, json!("done"));
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    // ================================================================
+    // Tool metadata & McpTool::descriptor()
+    // ================================================================
+
+    /// Build an McpServer with fake HTTP transport for metadata testing.
+    /// The HTTP transport won't be called — we just need the metadata map.
+    fn make_test_server(name: &str) -> McpServer {
+        McpServer {
+            name: name.to_string(),
+            transport: Transport::new_http("http://unused"),
+            next_id: AtomicU64::new(1),
+            default_policy: None,
+            tools_changed: AtomicBool::new(false),
+            tool_metadata: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn test_mcp_tool_descriptor_from_metadata() {
+        let server = make_test_server("srv");
+        server.tool_metadata.write().unwrap().insert(
+            "my_tool".to_string(),
+            McpToolMetadata {
+                description: "Does things".to_string(),
+                input_schema: json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+            },
+        );
+        let server = Arc::new(server);
+        let tool = McpTool {
+            server: server.clone(),
+            raw_name: "my_tool".to_string(),
+            namespaced_name: "srv.my_tool".to_string(),
+        };
+
+        let desc = tool.descriptor();
+        assert_eq!(desc.name, "srv.my_tool");
+        assert_eq!(desc.description, "Does things");
+        assert_eq!(
+            desc.parameters,
+            json!({"type": "object", "properties": {"x": {"type": "string"}}})
+        );
+    }
+
+    #[test]
+    fn test_mcp_tool_descriptor_missing_metadata() {
+        // Tool exists in registry but metadata was removed (e.g., server removed the tool)
+        let server = Arc::new(make_test_server("srv"));
+        let tool = McpTool {
+            server: server.clone(),
+            raw_name: "gone_tool".to_string(),
+            namespaced_name: "srv.gone_tool".to_string(),
+        };
+
+        let desc = tool.descriptor();
+        assert_eq!(desc.name, "srv.gone_tool");
+        assert_eq!(desc.description, "");
+        assert_eq!(
+            desc.parameters,
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn test_mcp_tool_descriptor_updates_after_metadata_change() {
+        let server = make_test_server("srv");
+        server.tool_metadata.write().unwrap().insert(
+            "evolving".to_string(),
+            McpToolMetadata {
+                description: "v1".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+        );
+        let server = Arc::new(server);
+        let tool = McpTool {
+            server: server.clone(),
+            raw_name: "evolving".to_string(),
+            namespaced_name: "srv.evolving".to_string(),
+        };
+
+        assert_eq!(tool.descriptor().description, "v1");
+
+        // Simulate metadata update (as refresh_tools would do)
+        server.tool_metadata.write().unwrap().insert(
+            "evolving".to_string(),
+            McpToolMetadata {
+                description: "v2 with new params".to_string(),
+                input_schema: json!({"type": "object", "properties": {"new_param": {"type": "number"}}}),
+            },
+        );
+
+        let desc = tool.descriptor();
+        assert_eq!(desc.description, "v2 with new params");
+        assert!(desc.parameters["properties"]["new_param"].is_object());
+    }
+
+    #[test]
+    fn test_mcp_tool_default_policy_no_override() {
+        let server = Arc::new(make_test_server("srv"));
+        let tool = McpTool {
+            server,
+            raw_name: "t".to_string(),
+            namespaced_name: "srv.t".to_string(),
+        };
+        let policy = tool.default_policy();
+        assert_eq!(policy.risk, RiskLevel::Medium);
+        assert_eq!(policy.approval, ApprovalRequirement::UnlessAutoApproved);
+        assert_eq!(policy.timeout, 60);
+    }
+
+    #[test]
+    fn test_mcp_tool_default_policy_with_server_override() {
+        let mut server = make_test_server("srv");
+        server.default_policy = Some(ToolPolicy {
+            risk: RiskLevel::High,
+            approval: ApprovalRequirement::Always,
+            timeout: 10,
+            sensitive_params: vec!["secret".to_string()],
+            rate_limit: Some(5),
+        });
+        let server = Arc::new(server);
+        let tool = McpTool {
+            server,
+            raw_name: "t".to_string(),
+            namespaced_name: "srv.t".to_string(),
+        };
+        let policy = tool.default_policy();
+        assert_eq!(policy.risk, RiskLevel::High);
+        assert_eq!(policy.timeout, 10);
+        assert_eq!(policy.sensitive_params, vec!["secret"]);
+        assert_eq!(policy.rate_limit, Some(5));
+    }
+
+    // ================================================================
+    // tools_changed flag
+    // ================================================================
+
+    #[test]
+    fn test_tools_changed_flag_default_false() {
+        let server = make_test_server("srv");
+        assert!(!server.tools_changed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tools_changed_flag_set_by_sse_notification() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n";
+        let _ = parse_sse_body("test", body, &flag);
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tools_changed_flag_not_set_by_other_notifications() {
+        let flag = AtomicBool::new(false);
+        let body = "\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50}}\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n";
+        let _ = parse_sse_body("test", body, &flag);
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    // ================================================================
+    // Transport::is_process_dead_error
+    // ================================================================
+
+    #[test]
+    fn test_http_transport_never_detects_process_death() {
+        let transport = Transport::new_http("http://example.com");
+        assert!(!transport.is_process_dead_error("closed stdout"));
+        assert!(!transport.is_process_dead_error("write error"));
+        assert!(!transport.is_process_dead_error("Broken pipe"));
+    }
+
+    // ================================================================
+    // Config deserialization
+    // ================================================================
+
+    #[test]
+    fn test_config_stdio_transport() {
+        let yaml = "name: test\ncommand: echo\nargs: [\"hello\"]";
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.name, "test");
+        assert_eq!(config.command, "echo");
+        assert!(config.url.is_none());
+    }
+
+    #[test]
+    fn test_config_http_transport() {
+        let yaml = "name: remote\nurl: http://localhost:8080/mcp";
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.name, "remote");
+        assert_eq!(config.url.as_deref(), Some("http://localhost:8080/mcp"));
+        assert_eq!(config.command, ""); // default empty string
+    }
+
+    #[test]
+    fn test_config_with_url_and_command() {
+        // Both set — url takes precedence in McpServer::start
+        let yaml = "name: both\ncommand: echo\nurl: http://localhost/mcp";
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.url.is_some());
+        assert_eq!(config.command, "echo");
+    }
+
+    #[test]
+    fn test_config_with_default_policy() {
+        let yaml = r#"
+name: secure
+command: echo
+default_policy:
+  risk: high
+  approval: always
+  timeout: 10
+"#;
+        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let policy = config.default_policy.unwrap();
+        assert_eq!(policy.risk, RiskLevel::High);
+        assert_eq!(policy.approval, ApprovalRequirement::Always);
+        assert_eq!(policy.timeout, 10);
+    }
+
+    #[test]
+    fn test_config_mcp_server_dir() {
+        let yaml = r#"
+homeserver_url: ""
+username: ""
+mcp_server_dir: "/etc/chaz/mcp.d"
+"#;
+        let config: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.mcp_server_dir.as_deref(), Some("/etc/chaz/mcp.d"));
+    }
+
+    // ================================================================
+    // Directory scanning
+    // ================================================================
+
     fn test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("chaz-mcp-test-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -951,5 +1435,39 @@ mod tests {
     fn test_load_server_configs_nonexistent_dir() {
         let configs = load_server_configs_from_dir(std::path::Path::new("/nonexistent/path"));
         assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn test_load_server_configs_yml_extension() {
+        let dir = test_dir("yml");
+        std::fs::write(dir.join("server.yml"), "name: yml-server\ncommand: cat").unwrap();
+        let configs = load_server_configs_from_dir(&dir);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "yml-server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_server_configs_http_manifest() {
+        let dir = test_dir("http-manifest");
+        std::fs::write(
+            dir.join("remote.yaml"),
+            "name: remote\nurl: http://localhost:9090/mcp",
+        )
+        .unwrap();
+        let configs = load_server_configs_from_dir(&dir);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].url.as_deref(), Some("http://localhost:9090/mcp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ================================================================
+    // Output truncation
+    // ================================================================
+
+    #[test]
+    fn test_max_output_bytes_constant() {
+        // Sanity check — should be 100 KB
+        assert_eq!(MAX_OUTPUT_BYTES, 100 * 1024);
     }
 }
