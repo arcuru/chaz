@@ -24,7 +24,7 @@ just nix check      # nix flake check
 
 Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
 
-122 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), secret resolution, loop detection, and MCP (SSE parsing, JSON-RPC response handling, tool metadata, config deserialization, directory scanning). Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
+145 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), secret resolution, loop detection, and MCP (SSE parsing, JSON-RPC response handling, tool metadata refresh/removal, config deserialization, directory scanning, subprocess integration lifecycle/error/death). Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 
