@@ -417,6 +417,57 @@ impl Tool for McpTool {
     }
 }
 
+/// Load MCP server configs from a directory.
+///
+/// Scans for `.yaml`, `.yml`, and `.json` files. Each file should contain a single
+/// `McpServerConfig`. Invalid files are logged and skipped.
+pub fn load_server_configs_from_dir(dir: &std::path::Path) -> Vec<McpServerConfig> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            error!("Failed to read MCP server directory '{}': {e}", dir.display());
+            return Vec::new();
+        }
+    };
+
+    let mut configs = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "yaml" | "yml" | "json") {
+            continue;
+        }
+
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to read MCP manifest '{}': {e}", path.display());
+                continue;
+            }
+        };
+
+        let config: Result<McpServerConfig, String> = match ext {
+            "json" => serde_json::from_str(&contents)
+                .map_err(|e| e.to_string()),
+            _ => serde_yaml::from_str(&contents)
+                .map_err(|e| e.to_string()),
+        };
+
+        match config {
+            Ok(cfg) => {
+                info!("Loaded MCP server manifest '{}' from {}", cfg.name, path.display());
+                configs.push(cfg);
+            }
+            Err(e) => {
+                warn!("Failed to parse MCP manifest '{}': {e}", path.display());
+            }
+        }
+    }
+
+    configs
+}
+
 /// Start all configured MCP servers and return their tools.
 ///
 /// Failed servers are logged and skipped — they don't block startup.
@@ -484,4 +535,66 @@ fn extract_text_content(result: &Value) -> String {
     }
 
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("chaz-mcp-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_load_server_configs_from_dir_yaml() {
+        let dir = test_dir("yaml");
+        std::fs::write(
+            dir.join("test-server.yaml"),
+            "name: test-server\ncommand: echo\nargs: [\"hello\"]",
+        )
+        .unwrap();
+
+        let configs = load_server_configs_from_dir(&dir);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "test-server");
+        assert_eq!(configs[0].command, "echo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_server_configs_from_dir_json() {
+        let dir = test_dir("json");
+        std::fs::write(
+            dir.join("test-server.json"),
+            r#"{"name": "json-server", "command": "cat", "args": ["-"]}"#,
+        )
+        .unwrap();
+
+        let configs = load_server_configs_from_dir(&dir);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "json-server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_server_configs_skips_invalid() {
+        let dir = test_dir("invalid");
+        std::fs::write(dir.join("good.yaml"), "name: good\ncommand: echo").unwrap();
+        std::fs::write(dir.join("bad.yaml"), "not: [valid: mcp config").unwrap();
+        std::fs::write(dir.join("readme.txt"), "not a manifest").unwrap();
+
+        let configs = load_server_configs_from_dir(&dir);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "good");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_server_configs_nonexistent_dir() {
+        let configs = load_server_configs_from_dir(std::path::Path::new("/nonexistent/path"));
+        assert!(configs.is_empty());
+    }
 }

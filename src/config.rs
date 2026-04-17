@@ -40,6 +40,10 @@ pub struct Config {
     pub mcp_servers: Option<Vec<McpServerConfig>>,
     /// Named tool profiles controlling how tool definitions are presented to the LLM
     pub tool_profiles: Option<HashMap<String, ToolProfileConfig>>,
+    /// Directory to scan for MCP server manifest files (.yaml/.json).
+    /// Each file should contain a single McpServerConfig object.
+    /// Merged with inline `mcp_servers` entries; name collisions are logged and skipped.
+    pub mcp_server_dir: Option<String>,
     /// Context window management settings
     pub context: Option<ContextConfig>,
 }

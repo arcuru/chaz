@@ -172,9 +172,25 @@ async fn main() -> anyhow::Result<()> {
         security: security_ctx.clone(),
     });
 
+    // Collect MCP server configs from inline config + directory scanning
+    let mut mcp_configs: Vec<config::McpServerConfig> =
+        config.mcp_servers.clone().unwrap_or_default();
+    if let Some(dir) = &config.mcp_server_dir {
+        let dir_path = std::path::Path::new(dir);
+        let dir_configs = mcp::load_server_configs_from_dir(dir_path);
+        if !dir_configs.is_empty() {
+            info!(
+                count = dir_configs.len(),
+                dir = %dir,
+                "Loaded MCP server configs from directory"
+            );
+        }
+        mcp_configs.extend(dir_configs);
+    }
+
     // Start MCP servers and register their tools
-    if let Some(mcp_configs) = &config.mcp_servers {
-        let mcp_tools = mcp::start_mcp_servers(mcp_configs).await;
+    if !mcp_configs.is_empty() {
+        let mcp_tools = mcp::start_mcp_servers(&mcp_configs).await;
         let mcp_count = mcp_tools.len();
         for t in mcp_tools {
             tool_registry.register_boxed(t);
