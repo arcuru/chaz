@@ -141,68 +141,12 @@ fn backoff_delay(attempt: u32, error: &LlmError) -> Duration {
     }
 }
 
-/// Execute an LLM call with retry for transient errors, with fallback model support.
+/// Execute an LLM call with retry for transient errors.
 ///
 /// Retries up to `max_retries` times with exponential backoff for errors
 /// classified as retryable (429, 5xx, timeouts, network errors).
-/// Non-retryable errors (auth, bad request, config) fail immediately on the
-/// current model but trigger a fallback attempt if fallback models are configured.
-///
-/// When all retries are exhausted for the primary model, each fallback model is
-/// tried in order with the same retry budget.
+/// Non-retryable errors (auth, bad request, config) fail immediately.
 async fn llm_call_with_retry(
-    backend: &BackendManager,
-    model: Option<&str>,
-    messages: &[RuntimeMessage],
-    tools: &[crate::tool::ToolDefinition],
-    resolved_model: &str,
-    max_retries: u32,
-    fallback_models: &[String],
-) -> Result<LLMResponse, LlmError> {
-    // Try the primary model first
-    match llm_call_with_retry_single(backend, model, messages, tools, resolved_model, max_retries)
-        .await
-    {
-        Ok(response) => Ok(response),
-        Err(e) if fallback_models.is_empty() => Err(e),
-        Err(e) => {
-            warn!(
-                error = %e,
-                primary_model = %resolved_model,
-                fallback_count = fallback_models.len(),
-                "Primary model failed, trying fallback models"
-            );
-            // Try each fallback model in order
-            let mut last_error = e;
-            for fallback in fallback_models {
-                info!(model = %fallback, "Attempting fallback model");
-                match llm_call_with_retry_single(
-                    backend,
-                    model,
-                    messages,
-                    tools,
-                    fallback,
-                    max_retries,
-                )
-                .await
-                {
-                    Ok(response) => {
-                        info!(model = %fallback, "Fallback model succeeded");
-                        return Ok(response);
-                    }
-                    Err(e) => {
-                        warn!(model = %fallback, error = %e, "Fallback model failed");
-                        last_error = e;
-                    }
-                }
-            }
-            Err(last_error)
-        }
-    }
-}
-
-/// Try a single model with retries and exponential backoff.
-async fn llm_call_with_retry_single(
     backend: &BackendManager,
     model: Option<&str>,
     messages: &[RuntimeMessage],
@@ -255,7 +199,6 @@ pub async fn execute(
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
-    let fallback_models = backend.fallback_models_for_model(model);
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
     if tools.is_empty() || !backend.supports_tools_for_model(model) {
@@ -266,7 +209,6 @@ pub async fn execute(
             &[],
             &resolved_model,
             max_retries,
-            &fallback_models,
         )
         .await
         {
@@ -292,7 +234,6 @@ pub async fn execute(
             &tool_defs,
             &resolved_model,
             max_retries,
-            &fallback_models,
         )
         .await
         {
@@ -311,8 +252,7 @@ pub async fn execute(
                     &[],
                     &resolved_model,
                     max_retries,
-                    &fallback_models,
-                )
+                        )
                 .await
                 {
                     Ok(LLMResponse::Text(text)) => Ok(text),
@@ -540,7 +480,6 @@ pub async fn execute(
         &[],
         &resolved_model,
         max_retries,
-        &fallback_models,
     )
     .await
     {
