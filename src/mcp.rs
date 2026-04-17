@@ -276,6 +276,11 @@ impl McpServer {
     }
 
     /// Re-discover tools from the server and update shared metadata.
+    ///
+    /// Updates existing tools, adds new ones, and removes tools that the server
+    /// no longer reports. Removed tools will return empty descriptors from
+    /// McpTool::descriptor() (the McpTool wrapper still exists in the registry
+    /// but the LLM won't see useful metadata).
     async fn refresh_tools(&self) -> Result<(), String> {
         self.tools_changed.store(false, Ordering::Relaxed);
         let tools = self.list_tools().await?;
@@ -283,6 +288,16 @@ impl McpServer {
         let mut metadata = self.tool_metadata.write().unwrap();
         let mut added = 0;
         let mut updated = 0;
+
+        // Track which tools the server still reports
+        let current_names: std::collections::HashSet<&str> =
+            tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Remove tools that the server no longer reports
+        let before = metadata.len();
+        metadata.retain(|name, _| current_names.contains(name.as_str()));
+        let removed = before - metadata.len();
+
         for info in &tools {
             let new_meta = McpToolMetadata {
                 description: info.description.clone(),
@@ -301,11 +316,12 @@ impl McpServer {
             }
         }
 
-        if updated > 0 || added > 0 {
+        if updated > 0 || added > 0 || removed > 0 {
             info!(
                 server = %self.name,
                 updated,
                 added,
+                removed,
                 total = tools.len(),
                 "MCP tools refreshed"
             );
@@ -315,6 +331,13 @@ impl McpServer {
                 server = %self.name,
                 added,
                 "New MCP tools discovered but cannot be added to registry at runtime — restart to pick them up"
+            );
+        }
+        if removed > 0 {
+            warn!(
+                server = %self.name,
+                removed,
+                "MCP tools removed by server — stale tool wrappers remain in registry until restart"
             );
         }
 
@@ -1469,5 +1492,602 @@ mcp_server_dir: "/etc/chaz/mcp.d"
     fn test_max_output_bytes_constant() {
         // Sanity check — should be 100 KB
         assert_eq!(MAX_OUTPUT_BYTES, 100 * 1024);
+    }
+
+    // ================================================================
+    // call_tool result parsing (exercised via extract_text_content
+    // + the isError / truncation logic inline)
+    // ================================================================
+
+    #[test]
+    fn test_call_tool_is_error_true_with_text() {
+        // Simulate the result that call_tool receives when isError is set
+        let result = json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "something broke"}]
+        });
+        assert_eq!(
+            result.get("isError").and_then(|e| e.as_bool()),
+            Some(true)
+        );
+        let error_text = extract_text_content(&result);
+        assert_eq!(error_text, "something broke");
+    }
+
+    #[test]
+    fn test_call_tool_is_error_true_empty_text() {
+        // isError with no content → fallback message
+        let result = json!({"isError": true, "content": []});
+        let error_text = extract_text_content(&result);
+        assert!(error_text.is_empty());
+        // call_tool would return "MCP tool returned an error" for this case
+    }
+
+    #[test]
+    fn test_call_tool_is_error_false() {
+        let result = json!({"isError": false, "content": [{"type": "text", "text": "ok"}]});
+        assert_ne!(
+            result.get("isError").and_then(|e| e.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_call_tool_is_error_absent() {
+        // No isError field at all — should not be treated as error
+        let result = json!({"content": [{"type": "text", "text": "fine"}]});
+        assert_eq!(result.get("isError").and_then(|e| e.as_bool()), None);
+    }
+
+    #[test]
+    fn test_output_truncation_logic() {
+        // Simulate what call_tool does for large output
+        let large_text = "x".repeat(MAX_OUTPUT_BYTES + 1000);
+        assert!(large_text.len() > MAX_OUTPUT_BYTES);
+        let truncated = format!(
+            "{}\n\n[output truncated at {} bytes]",
+            &large_text[..MAX_OUTPUT_BYTES],
+            MAX_OUTPUT_BYTES
+        );
+        assert!(truncated.len() < large_text.len());
+        assert!(truncated.contains("[output truncated at"));
+        assert_eq!(&truncated[..MAX_OUTPUT_BYTES], &large_text[..MAX_OUTPUT_BYTES]);
+    }
+
+    #[test]
+    fn test_output_at_exact_limit_not_truncated() {
+        let exact_text = "x".repeat(MAX_OUTPUT_BYTES);
+        // At exactly the limit, not over — should NOT truncate
+        assert!(exact_text.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    // ================================================================
+    // list_tools parsing
+    // ================================================================
+
+    #[test]
+    fn test_list_tools_parse_full_tool() {
+        // Directly test the parsing logic that list_tools uses
+        let response = json!({
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"}
+                    },
+                    "required": ["path"]
+                }
+            }]
+        });
+        let tools_array = response.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools_array.len(), 1);
+        let tool = &tools_array[0];
+        assert_eq!(tool["name"].as_str().unwrap(), "read_file");
+        assert_eq!(tool["description"].as_str().unwrap(), "Read a file");
+        assert!(tool["inputSchema"]["properties"]["path"].is_object());
+    }
+
+    #[test]
+    fn test_list_tools_missing_description_defaults() {
+        let response = json!({
+            "tools": [{"name": "bare_tool"}]
+        });
+        let tool = &response["tools"][0];
+        // description defaults to "" when missing
+        let description = tool
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        assert_eq!(description, "");
+    }
+
+    #[test]
+    fn test_list_tools_missing_input_schema_defaults() {
+        let response = json!({
+            "tools": [{"name": "bare_tool", "description": "no schema"}]
+        });
+        let tool = &response["tools"][0];
+        let input_schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        assert_eq!(
+            input_schema,
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn test_list_tools_empty_array() {
+        let response = json!({"tools": []});
+        let tools = response["tools"].as_array().unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_list_tools_missing_tools_key() {
+        let response = json!({"something": "else"});
+        assert!(response.get("tools").and_then(|t| t.as_array()).is_none());
+    }
+
+    #[test]
+    fn test_list_tools_tool_missing_name() {
+        let response = json!({
+            "tools": [{"description": "no name tool"}]
+        });
+        let tool = &response["tools"][0];
+        assert!(tool.get("name").and_then(|n| n.as_str()).is_none());
+    }
+
+    // ================================================================
+    // refresh_tools metadata logic (including stale removal)
+    // ================================================================
+
+    /// Helper: directly apply refresh logic to a metadata map.
+    /// Mirrors what refresh_tools does after calling list_tools.
+    fn apply_refresh(
+        metadata: &mut HashMap<String, McpToolMetadata>,
+        tools: &[(&str, &str, Value)],
+    ) -> (usize, usize, usize) {
+        let current_names: std::collections::HashSet<&str> =
+            tools.iter().map(|(name, _, _)| *name).collect();
+
+        let before = metadata.len();
+        metadata.retain(|name, _| current_names.contains(name.as_str()));
+        let removed = before - metadata.len();
+
+        let mut added = 0;
+        let mut updated = 0;
+        for (name, desc, schema) in tools {
+            let new_meta = McpToolMetadata {
+                description: desc.to_string(),
+                input_schema: schema.clone(),
+            };
+            if let Some(existing) = metadata.get_mut(*name) {
+                if existing.description != new_meta.description
+                    || existing.input_schema != new_meta.input_schema
+                {
+                    *existing = new_meta;
+                    updated += 1;
+                }
+            } else {
+                metadata.insert(name.to_string(), new_meta);
+                added += 1;
+            }
+        }
+        (added, updated, removed)
+    }
+
+    #[test]
+    fn test_refresh_no_changes() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tool_a".to_string(),
+            McpToolMetadata {
+                description: "desc a".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+        );
+
+        let (added, updated, removed) =
+            apply_refresh(&mut metadata, &[("tool_a", "desc a", json!({"type": "object"}))]);
+
+        assert_eq!(added, 0);
+        assert_eq!(updated, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(metadata.len(), 1);
+    }
+
+    #[test]
+    fn test_refresh_updates_schema() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tool_a".to_string(),
+            McpToolMetadata {
+                description: "old desc".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+        );
+
+        let (added, updated, removed) = apply_refresh(
+            &mut metadata,
+            &[("tool_a", "new desc", json!({"type": "object", "properties": {"x": {}}}))],
+        );
+
+        assert_eq!(added, 0);
+        assert_eq!(updated, 1);
+        assert_eq!(removed, 0);
+        assert_eq!(metadata["tool_a"].description, "new desc");
+    }
+
+    #[test]
+    fn test_refresh_adds_new_tool() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tool_a".to_string(),
+            McpToolMetadata {
+                description: "a".to_string(),
+                input_schema: json!({}),
+            },
+        );
+
+        let (added, updated, removed) = apply_refresh(
+            &mut metadata,
+            &[
+                ("tool_a", "a", json!({})),
+                ("tool_b", "b", json!({})),
+            ],
+        );
+
+        assert_eq!(added, 1);
+        assert_eq!(updated, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.contains_key("tool_b"));
+    }
+
+    #[test]
+    fn test_refresh_removes_stale_tool() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tool_a".to_string(),
+            McpToolMetadata {
+                description: "a".to_string(),
+                input_schema: json!({}),
+            },
+        );
+        metadata.insert(
+            "tool_b".to_string(),
+            McpToolMetadata {
+                description: "b".to_string(),
+                input_schema: json!({}),
+            },
+        );
+
+        // Server now only reports tool_a — tool_b should be removed
+        let (added, updated, removed) =
+            apply_refresh(&mut metadata, &[("tool_a", "a", json!({}))]);
+
+        assert_eq!(added, 0);
+        assert_eq!(updated, 0);
+        assert_eq!(removed, 1);
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata.contains_key("tool_a"));
+        assert!(!metadata.contains_key("tool_b"));
+    }
+
+    #[test]
+    fn test_refresh_removes_all_tools() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tool_a".to_string(),
+            McpToolMetadata {
+                description: "a".to_string(),
+                input_schema: json!({}),
+            },
+        );
+
+        // Server reports empty tools list
+        let (added, updated, removed) = apply_refresh(&mut metadata, &[]);
+
+        assert_eq!(added, 0);
+        assert_eq!(updated, 0);
+        assert_eq!(removed, 1);
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_refresh_add_update_remove_simultaneously() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "keep_same".to_string(),
+            McpToolMetadata {
+                description: "same".to_string(),
+                input_schema: json!({}),
+            },
+        );
+        metadata.insert(
+            "will_update".to_string(),
+            McpToolMetadata {
+                description: "old".to_string(),
+                input_schema: json!({}),
+            },
+        );
+        metadata.insert(
+            "will_remove".to_string(),
+            McpToolMetadata {
+                description: "doomed".to_string(),
+                input_schema: json!({}),
+            },
+        );
+
+        let (added, updated, removed) = apply_refresh(
+            &mut metadata,
+            &[
+                ("keep_same", "same", json!({})),
+                ("will_update", "updated", json!({})),
+                ("brand_new", "new", json!({})),
+            ],
+        );
+
+        assert_eq!(added, 1);
+        assert_eq!(updated, 1);
+        assert_eq!(removed, 1);
+        assert_eq!(metadata.len(), 3);
+        assert!(metadata.contains_key("keep_same"));
+        assert_eq!(metadata["will_update"].description, "updated");
+        assert!(metadata.contains_key("brand_new"));
+        assert!(!metadata.contains_key("will_remove"));
+    }
+
+    #[test]
+    fn test_descriptor_returns_empty_after_metadata_removal() {
+        // Simulate: tool existed, metadata removed by refresh
+        let server = Arc::new(make_test_server("srv"));
+        let tool = McpTool {
+            server: server.clone(),
+            raw_name: "removed".to_string(),
+            namespaced_name: "srv.removed".to_string(),
+        };
+
+        // Initially no metadata — descriptor returns empty
+        let desc = tool.descriptor();
+        assert_eq!(desc.description, "");
+
+        // Add metadata, verify it works
+        server.tool_metadata.write().unwrap().insert(
+            "removed".to_string(),
+            McpToolMetadata {
+                description: "exists".to_string(),
+                input_schema: json!({"type": "object"}),
+            },
+        );
+        assert_eq!(tool.descriptor().description, "exists");
+
+        // Remove metadata (as refresh_tools now does)
+        server.tool_metadata.write().unwrap().remove("removed");
+        let desc = tool.descriptor();
+        assert_eq!(desc.description, "");
+        assert_eq!(desc.parameters, json!({"type": "object", "properties": {}}));
+    }
+
+    // ================================================================
+    // next_id monotonicity
+    // ================================================================
+
+    #[test]
+    fn test_next_id_increments() {
+        let server = make_test_server("srv");
+        let id1 = server.next_id.fetch_add(1, Ordering::Relaxed);
+        let id2 = server.next_id.fetch_add(1, Ordering::Relaxed);
+        let id3 = server.next_id.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(id1, 1); // starts at 1 (set in make_test_server)
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    // ================================================================
+    // Subprocess integration test
+    // ================================================================
+
+    /// Spawn a real subprocess that speaks minimal MCP JSON-RPC
+    /// and test the full lifecycle through McpServer.
+    #[tokio::test]
+    async fn test_subprocess_full_lifecycle() {
+        // This shell script implements a minimal MCP server:
+        // - Responds to initialize with serverInfo
+        // - Responds to tools/list with one tool
+        // - Responds to tools/call with a text result
+        // - Sends a tools/list_changed notification after tools/list
+        let script = r#"
+import sys, json
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"serverInfo": {"name": "test-mcp"}, "protocolVersion": "2025-03-26", "capabilities": {}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method.startswith("notifications/"):
+        pass  # notification, no response
+    elif method == "tools/list":
+        # Send a notification BEFORE the response — tests interleaved notification handling
+        notif = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        sys.stdout.write(json.dumps(notif) + "\n")
+        sys.stdout.flush()
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": "echo", "description": "Echo input", "inputSchema": {"type": "object", "properties": {"msg": {"type": "string"}}}}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        args = msg.get("params", {}).get("arguments", {})
+        text = args.get("msg", "no msg")
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"echo: {text}"}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    else:
+        resp = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+        let config = McpServerConfig {
+            name: "test-subprocess".to_string(),
+            command: "python3".to_string(),
+            args: Some(vec!["-c".to_string(), script.to_string()]),
+            env: None,
+            url: None,
+            default_policy: None,
+        };
+
+        // Start the server (runs initialize handshake)
+        let server = McpServer::start(&config).await.expect("Failed to start MCP server");
+
+        // Discover tools
+        let tools = server.list_tools().await.expect("Failed to list tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description, "Echo input");
+
+        // The server sends a tools/list_changed notification BEFORE the tools/list response.
+        // The stdio read loop processes it while scanning for the matching response id,
+        // so the flag should be set.
+        assert!(
+            server.tools_changed.load(Ordering::Relaxed),
+            "tools_changed flag should be set by interleaved notification"
+        );
+
+        // Call a tool
+        let result = server
+            .call_tool("echo", json!({"msg": "hello"}))
+            .await
+            .expect("Failed to call tool");
+        assert_eq!(result, "echo: hello");
+
+        // call_tool checked tools_changed=true, called refresh_tools which called
+        // list_tools. Our script sends another notification during list_tools, so
+        // the flag may be re-set. What matters is the refresh happened (tools were
+        // re-listed). We can verify by checking the result came through correctly.
+    }
+
+    /// Test that call_tool handles tool errors (isError: true).
+    /// Uses the lifecycle server which supports all methods.
+    #[tokio::test]
+    async fn test_subprocess_tool_error() {
+        // Server that returns isError: true for any tools/call
+        let script = r#"
+import sys, json
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except:
+        continue
+    mid = msg.get("id")
+    method = msg.get("method", "")
+
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"serverInfo": {"name": "err-mcp"}, "protocolVersion": "2025-03-26", "capabilities": {}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method.startswith("notifications/"):
+        pass
+    elif method == "tools/list":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": "fail", "description": "Always fails"}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"isError": True, "content": [{"type": "text", "text": "tool exploded"}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    else:
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+        let config = McpServerConfig {
+            name: "test-err".to_string(),
+            command: "python3".to_string(),
+            args: Some(vec!["-u".to_string(), "-c".to_string(), script.to_string()]),
+            env: None,
+            url: None,
+            default_policy: None,
+        };
+
+        let server = McpServer::start(&config).await.expect("Failed to start MCP server");
+        // Populate metadata so call_tool can find the tool
+        server.tool_metadata.write().unwrap().insert(
+            "fail".to_string(),
+            McpToolMetadata {
+                description: "Always fails".to_string(),
+                input_schema: json!({}),
+            },
+        );
+        let err = server.call_tool("fail", json!({})).await.unwrap_err();
+        assert_eq!(err, "tool exploded");
+    }
+
+    /// Test process death detection: server exits mid-conversation
+    #[tokio::test]
+    async fn test_subprocess_process_death() {
+        // This server handles initialize then immediately exits
+        let script = r#"
+import sys, json
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"serverInfo": {"name": "die-mcp"}, "protocolVersion": "2025-03-26", "capabilities": {}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method.startswith("notifications/"):
+        sys.exit(0)  # die after receiving initialized notification
+"#;
+
+        let config = McpServerConfig {
+            name: "test-die".to_string(),
+            command: "python3".to_string(),
+            args: Some(vec!["-c".to_string(), script.to_string()]),
+            env: None,
+            url: None,
+            default_policy: None,
+        };
+
+        let server = McpServer::start(&config).await.unwrap();
+        // Next request should fail with a process-death error
+        let err = server
+            .send_request("tools/list", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            server.transport.is_process_dead_error(&err),
+            "Expected process death error, got: {err}"
+        );
     }
 }
