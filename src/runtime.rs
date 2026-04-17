@@ -252,7 +252,7 @@ pub async fn execute(
                     &[],
                     &resolved_model,
                     max_retries,
-                        )
+                )
                 .await
                 {
                     Ok(LLMResponse::Text(text)) => Ok(text),
@@ -473,16 +473,7 @@ pub async fn execute(
             "Please summarize what you found so far and respond to the user.".to_string(),
         ));
     }
-    match llm_call_with_retry(
-        backend,
-        model,
-        &messages,
-        &[],
-        &resolved_model,
-        max_retries,
-    )
-    .await
-    {
+    match llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries).await {
         Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),
         Ok(_) | Err(_) => {
             // Last resort: return the last tool result
@@ -663,10 +654,7 @@ mod tests {
 
     #[test]
     fn test_loop_detector_fingerprint_deterministic() {
-        let calls = vec![
-            make_tool_call("a", "1"),
-            make_tool_call("b", "2"),
-        ];
+        let calls = vec![make_tool_call("a", "1"), make_tool_call("b", "2")];
         let fp1 = LoopDetector::fingerprint(&calls);
         let fp2 = LoopDetector::fingerprint(&calls);
         assert_eq!(fp1, fp2);

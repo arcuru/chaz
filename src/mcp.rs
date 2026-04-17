@@ -411,7 +411,10 @@ impl McpServer {
                 url,
                 client,
                 session_id,
-            } => self.send_request_http(url, client, session_id, &request).await,
+            } => {
+                self.send_request_http(url, client, session_id, &request)
+                    .await
+            }
         }
     }
 
@@ -426,8 +429,7 @@ impl McpServer {
         match &self.transport {
             Transport::Stdio { stdin, .. } => {
                 let mut stdin = stdin.lock().await;
-                let notif_str =
-                    serde_json::to_string(&notification).map_err(|e| e.to_string())?;
+                let notif_str = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
                 debug!("MCP '{}' → {notif_str}", self.name);
                 stdin
                     .write_all(notif_str.as_bytes())
@@ -448,8 +450,7 @@ impl McpServer {
                 client,
                 session_id,
             } => {
-                let notif_str =
-                    serde_json::to_string(&notification).map_err(|e| e.to_string())?;
+                let notif_str = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
                 debug!("MCP '{}' → {notif_str}", self.name);
 
                 let mut req = client
@@ -537,10 +538,7 @@ impl McpServer {
             let resp_id = match parsed.get("id") {
                 Some(id_val) => id_val.as_u64(),
                 None => {
-                    let method = parsed
-                        .get("method")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("");
+                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     if method == "notifications/tools/list_changed" {
                         info!("MCP '{}' signaled tools/list_changed", self.name);
                         self.tools_changed.store(true, Ordering::Relaxed);
@@ -682,10 +680,7 @@ fn parse_sse_body(
 
         // Check if this is a notification (no "id" field)
         if parsed.get("id").is_none() {
-            let method = parsed
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
             if method == "notifications/tools/list_changed" {
                 info!("MCP '{server_name}' signaled tools/list_changed");
                 tools_changed.store(true, Ordering::Relaxed);
@@ -1014,7 +1009,8 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_response_error() {
-        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
         let err = parse_jsonrpc_response("test", body).unwrap_err();
         assert!(err.contains("Invalid Request"));
     }
@@ -1222,10 +1218,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}\n\
         let desc = tool.descriptor();
         assert_eq!(desc.name, "srv.gone_tool");
         assert_eq!(desc.description, "");
-        assert_eq!(
-            desc.parameters,
-            json!({"type": "object", "properties": {}})
-        );
+        assert_eq!(desc.parameters, json!({"type": "object", "properties": {}}));
     }
 
     #[test]
@@ -1506,10 +1499,7 @@ mcp_server_dir: "/etc/chaz/mcp.d"
             "isError": true,
             "content": [{"type": "text", "text": "something broke"}]
         });
-        assert_eq!(
-            result.get("isError").and_then(|e| e.as_bool()),
-            Some(true)
-        );
+        assert_eq!(result.get("isError").and_then(|e| e.as_bool()), Some(true));
         let error_text = extract_text_content(&result);
         assert_eq!(error_text, "something broke");
     }
@@ -1526,10 +1516,7 @@ mcp_server_dir: "/etc/chaz/mcp.d"
     #[test]
     fn test_call_tool_is_error_false() {
         let result = json!({"isError": false, "content": [{"type": "text", "text": "ok"}]});
-        assert_ne!(
-            result.get("isError").and_then(|e| e.as_bool()),
-            Some(true)
-        );
+        assert_ne!(result.get("isError").and_then(|e| e.as_bool()), Some(true));
     }
 
     #[test]
@@ -1551,7 +1538,10 @@ mcp_server_dir: "/etc/chaz/mcp.d"
         );
         assert!(truncated.len() < large_text.len());
         assert!(truncated.contains("[output truncated at"));
-        assert_eq!(&truncated[..MAX_OUTPUT_BYTES], &large_text[..MAX_OUTPUT_BYTES]);
+        assert_eq!(
+            &truncated[..MAX_OUTPUT_BYTES],
+            &large_text[..MAX_OUTPUT_BYTES]
+        );
     }
 
     #[test]
@@ -1613,10 +1603,7 @@ mcp_server_dir: "/etc/chaz/mcp.d"
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-        assert_eq!(
-            input_schema,
-            json!({"type": "object", "properties": {}})
-        );
+        assert_eq!(input_schema, json!({"type": "object", "properties": {}}));
     }
 
     #[test]
@@ -1691,8 +1678,10 @@ mcp_server_dir: "/etc/chaz/mcp.d"
             },
         );
 
-        let (added, updated, removed) =
-            apply_refresh(&mut metadata, &[("tool_a", "desc a", json!({"type": "object"}))]);
+        let (added, updated, removed) = apply_refresh(
+            &mut metadata,
+            &[("tool_a", "desc a", json!({"type": "object"}))],
+        );
 
         assert_eq!(added, 0);
         assert_eq!(updated, 0);
@@ -1713,7 +1702,11 @@ mcp_server_dir: "/etc/chaz/mcp.d"
 
         let (added, updated, removed) = apply_refresh(
             &mut metadata,
-            &[("tool_a", "new desc", json!({"type": "object", "properties": {"x": {}}}))],
+            &[(
+                "tool_a",
+                "new desc",
+                json!({"type": "object", "properties": {"x": {}}}),
+            )],
         );
 
         assert_eq!(added, 0);
@@ -1735,10 +1728,7 @@ mcp_server_dir: "/etc/chaz/mcp.d"
 
         let (added, updated, removed) = apply_refresh(
             &mut metadata,
-            &[
-                ("tool_a", "a", json!({})),
-                ("tool_b", "b", json!({})),
-            ],
+            &[("tool_a", "a", json!({})), ("tool_b", "b", json!({}))],
         );
 
         assert_eq!(added, 1);
@@ -1767,8 +1757,7 @@ mcp_server_dir: "/etc/chaz/mcp.d"
         );
 
         // Server now only reports tool_a — tool_b should be removed
-        let (added, updated, removed) =
-            apply_refresh(&mut metadata, &[("tool_a", "a", json!({}))]);
+        let (added, updated, removed) = apply_refresh(&mut metadata, &[("tool_a", "a", json!({}))]);
 
         assert_eq!(added, 0);
         assert_eq!(updated, 0);
@@ -1951,7 +1940,9 @@ while True:
         };
 
         // Start the server (runs initialize handshake)
-        let server = McpServer::start(&config).await.expect("Failed to start MCP server");
+        let server = McpServer::start(&config)
+            .await
+            .expect("Failed to start MCP server");
 
         // Discover tools
         let tools = server.list_tools().await.expect("Failed to list tools");
@@ -2031,7 +2022,9 @@ while True:
             default_policy: None,
         };
 
-        let server = McpServer::start(&config).await.expect("Failed to start MCP server");
+        let server = McpServer::start(&config)
+            .await
+            .expect("Failed to start MCP server");
         // Populate metadata so call_tool can find the tool
         server.tool_metadata.write().unwrap().insert(
             "fail".to_string(),
