@@ -213,17 +213,26 @@ pub struct ToolProfileConfig {
     pub tools: Option<HashMap<String, PresentationMode>>,
 }
 
-/// Configuration for an MCP subprocess server
+/// Configuration for an MCP server (subprocess or HTTP).
+///
+/// Transport is determined by which fields are set:
+/// - `command` (with optional `args`, `env`): stdio subprocess transport
+/// - `url`: Streamable HTTP transport (POST + SSE)
+///
+/// At least one of `command` or `url` must be set.
 #[derive(Debug, Deserialize, Clone)]
 pub struct McpServerConfig {
     /// Name used as namespace prefix for tools (e.g., "filesystem" → "filesystem.read_file")
     pub name: String,
-    /// Command to spawn the MCP server subprocess
+    /// Command to spawn the MCP server subprocess (stdio transport)
+    #[serde(default)]
     pub command: String,
-    /// Arguments for the command
+    /// Arguments for the command (stdio transport)
     pub args: Option<Vec<String>>,
-    /// Environment variables for the subprocess
+    /// Environment variables for the subprocess (stdio transport)
     pub env: Option<HashMap<String, String>>,
+    /// URL for Streamable HTTP transport. When set, `command` is ignored.
+    pub url: Option<String>,
     /// Default policy for all tools from this server (overrides MCP baseline)
     pub default_policy: Option<crate::tool::ToolPolicy>,
 }

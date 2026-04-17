@@ -19,57 +19,60 @@ const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 /// MCP protocol version we advertise.
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Maximum restart attempts before giving up.
+/// Maximum restart attempts before giving up (stdio transport).
 const MAX_RESTART_ATTEMPTS: u8 = 5;
 
 /// Base backoff delay in milliseconds (doubles each attempt: 1s, 2s, 4s, 8s, 16s).
 const BASE_BACKOFF_MS: u64 = 1000;
 
-/// Manages a single MCP subprocess server and its JSON-RPC transport.
+// ============================================================================
+// Transport layer
+// ============================================================================
+
+/// Transport for communicating with an MCP server.
 ///
-/// Supports automatic restart with exponential backoff when the subprocess crashes.
-pub struct McpServer {
-    name: String,
-    stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
-    next_id: AtomicU64,
-    default_policy: Option<ToolPolicy>,
-    /// Kept alive so the child process isn't killed on drop of Child fields.
-    _child: Mutex<Child>,
-    /// Config for restarting the server.
-    config: McpServerConfig,
-    /// Consecutive restart attempts (reset to 0 on successful request).
-    restart_attempts: AtomicU8,
-    /// Set when the server sends `notifications/tools/list_changed`.
-    tools_changed: AtomicBool,
-    /// Shared metadata for each tool, keyed by raw tool name.
-    /// Updated on re-discovery so McpTool::descriptor() returns fresh data.
-    tool_metadata: RwLock<HashMap<String, McpToolMetadata>>,
+/// Two variants:
+/// - **Stdio**: subprocess with JSON-RPC over stdin/stdout (original)
+/// - **Http**: Streamable HTTP transport (POST requests, JSON or SSE responses)
+enum Transport {
+    Stdio {
+        stdin: Mutex<ChildStdin>,
+        stdout: Mutex<BufReader<ChildStdout>>,
+        _child: Box<Mutex<Child>>,
+        config: Box<McpServerConfig>,
+        restart_attempts: AtomicU8,
+    },
+    Http {
+        url: String,
+        client: reqwest::Client,
+        /// MCP session ID returned by the server (tracked across requests).
+        session_id: Mutex<Option<String>>,
+    },
 }
 
-impl McpServer {
-    /// Spawn the MCP server subprocess and perform the initialize handshake.
-    pub async fn start(config: &McpServerConfig) -> Result<Self, String> {
+impl Transport {
+    /// Create a stdio transport by spawning a subprocess.
+    fn new_stdio(config: &McpServerConfig) -> Result<Self, String> {
         let (child, stdin, stdout) = Self::spawn_process(config)?;
-
-        let server = Self {
-            name: config.name.clone(),
+        Ok(Transport::Stdio {
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
-            next_id: AtomicU64::new(1),
-            default_policy: config.default_policy.clone(),
-            _child: Mutex::new(child),
-            config: config.clone(),
+            _child: Box::new(Mutex::new(child)),
+            config: Box::new(config.clone()),
             restart_attempts: AtomicU8::new(0),
-            tools_changed: AtomicBool::new(false),
-            tool_metadata: RwLock::new(HashMap::new()),
-        };
-
-        server.initialize().await?;
-        Ok(server)
+        })
     }
 
-    /// Spawn the subprocess, returning the child and its stdio handles.
+    /// Create an HTTP transport targeting the given URL.
+    fn new_http(url: &str) -> Self {
+        Transport::Http {
+            url: url.to_string(),
+            client: reqwest::Client::new(),
+            session_id: Mutex::new(None),
+        }
+    }
+
+    /// Spawn a subprocess for stdio transport.
     fn spawn_process(config: &McpServerConfig) -> Result<(Child, ChildStdin, ChildStdout), String> {
         let mut cmd = tokio::process::Command::new(&config.command);
         if let Some(args) = &config.args {
@@ -105,38 +108,103 @@ impl McpServer {
         Ok((child, stdin, stdout))
     }
 
-    /// Attempt to restart the subprocess with exponential backoff.
-    ///
-    /// Returns Ok if restart succeeded, Err if max attempts exhausted.
-    async fn restart(&self) -> Result<(), String> {
-        let attempt = self.restart_attempts.fetch_add(1, Ordering::Relaxed);
-        if attempt >= MAX_RESTART_ATTEMPTS {
-            return Err(format!(
-                "MCP server '{}' exceeded max restart attempts ({MAX_RESTART_ATTEMPTS})",
-                self.name
-            ));
+    /// Check if an error indicates the subprocess has died (stdio only).
+    fn is_process_dead_error(&self, error: &str) -> bool {
+        matches!(self, Transport::Stdio { .. })
+            && (error.contains("closed stdout")
+                || error.contains("write error")
+                || error.contains("read error")
+                || error.contains("Broken pipe"))
+    }
+
+    /// Attempt to restart the subprocess (stdio only). No-op for HTTP.
+    async fn restart(&self, name: &str) -> Result<(), String> {
+        match self {
+            Transport::Stdio {
+                stdin,
+                stdout,
+                _child,
+                config,
+                restart_attempts,
+            } => {
+                let attempt = restart_attempts.fetch_add(1, Ordering::Relaxed);
+                if attempt >= MAX_RESTART_ATTEMPTS {
+                    return Err(format!(
+                        "MCP server '{name}' exceeded max restart attempts ({MAX_RESTART_ATTEMPTS})"
+                    ));
+                }
+
+                let backoff_ms = BASE_BACKOFF_MS * (1u64 << attempt.min(5));
+                warn!(
+                    "MCP server '{name}' restarting (attempt {}/{MAX_RESTART_ATTEMPTS}, backoff {backoff_ms}ms)",
+                    attempt + 1
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+
+                let (child, new_stdin, new_stdout) = Self::spawn_process(config)?;
+                *_child.lock().await = child;
+                *stdin.lock().await = new_stdin;
+                *stdout.lock().await = BufReader::new(new_stdout);
+
+                Ok(())
+            }
+            Transport::Http { .. } => Ok(()), // HTTP doesn't need restart
         }
+    }
 
-        let backoff_ms = BASE_BACKOFF_MS * (1u64 << attempt.min(5));
-        warn!(
-            "MCP server '{}' restarting (attempt {}/{MAX_RESTART_ATTEMPTS}, backoff {backoff_ms}ms)",
-            self.name,
-            attempt + 1
-        );
-        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+    /// Reset restart counter (stdio only). Called on successful request.
+    fn reset_restart_counter(&self) {
+        if let Transport::Stdio {
+            restart_attempts, ..
+        } = self
+        {
+            restart_attempts.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
-        let (child, stdin, stdout) = Self::spawn_process(&self.config)?;
+// ============================================================================
+// McpServer — transport-agnostic MCP server manager
+// ============================================================================
 
-        // Replace the process handles
-        *self._child.lock().await = child;
-        *self.stdin.lock().await = stdin;
-        *self.stdout.lock().await = BufReader::new(stdout);
+/// Manages a single MCP server connection and its tool metadata.
+///
+/// Works with both stdio (subprocess) and HTTP (Streamable HTTP) transports.
+pub struct McpServer {
+    name: String,
+    transport: Transport,
+    next_id: AtomicU64,
+    default_policy: Option<ToolPolicy>,
+    /// Set when the server sends `notifications/tools/list_changed`.
+    tools_changed: AtomicBool,
+    /// Shared metadata for each tool, keyed by raw tool name.
+    tool_metadata: RwLock<HashMap<String, McpToolMetadata>>,
+}
 
-        // Re-initialize
-        self.initialize().await?;
+impl McpServer {
+    /// Start an MCP server using the configured transport.
+    ///
+    /// For stdio: spawns a subprocess. For HTTP: connects to the URL.
+    /// Both perform the initialize handshake and are ready for tool discovery.
+    pub async fn start(config: &McpServerConfig) -> Result<Self, String> {
+        let transport = if let Some(ref url) = config.url {
+            info!("MCP server '{}': connecting via HTTP to {url}", config.name);
+            Transport::new_http(url)
+        } else {
+            Transport::new_stdio(config)?
+        };
 
-        info!("MCP server '{}' restarted successfully", self.name);
-        Ok(())
+        let server = Self {
+            name: config.name.clone(),
+            transport,
+            next_id: AtomicU64::new(1),
+            default_policy: config.default_policy.clone(),
+            tools_changed: AtomicBool::new(false),
+            tool_metadata: RwLock::new(HashMap::new()),
+        };
+
+        server.initialize().await?;
+        Ok(server)
     }
 
     /// Perform the MCP initialize handshake.
@@ -165,7 +233,6 @@ impl McpServer {
             );
         }
 
-        // Send initialized notification (no id, no response expected)
         self.send_notification("notifications/initialized", json!({}))
             .await?;
 
@@ -209,11 +276,6 @@ impl McpServer {
     }
 
     /// Re-discover tools from the server and update shared metadata.
-    ///
-    /// Called lazily when `tools_changed` flag is set. Updates existing tool
-    /// metadata in-place. New tools are logged but can't be added to the
-    /// registry at runtime (they'll appear on next restart). Removed tools
-    /// will return errors on next call.
     async fn refresh_tools(&self) -> Result<(), String> {
         self.tools_changed.store(false, Ordering::Relaxed);
         let tools = self.list_tools().await?;
@@ -275,16 +337,16 @@ impl McpServer {
 
         let result = match self.send_request("tools/call", params.clone()).await {
             Ok(r) => r,
-            Err(e) if self.is_process_dead_error(&e) => {
-                // Process died — attempt restart and retry
-                self.restart().await?;
+            Err(e) if self.transport.is_process_dead_error(&e) => {
+                self.transport.restart(&self.name).await?;
+                self.initialize().await?;
+                info!("MCP server '{}' restarted successfully", self.name);
                 self.send_request("tools/call", params).await?
             }
             Err(e) => return Err(e),
         };
 
-        // Reset restart counter on success
-        self.restart_attempts.store(0, Ordering::Relaxed);
+        self.transport.reset_restart_counter();
 
         // Check if the result indicates an error
         if result.get("isError").and_then(|e| e.as_bool()) == Some(true) {
@@ -297,7 +359,6 @@ impl McpServer {
         }
 
         let text = extract_text_content(&result);
-        // Truncate large outputs
         if text.len() > MAX_OUTPUT_BYTES {
             Ok(format!(
                 "{}\n\n[output truncated at {} bytes]",
@@ -309,15 +370,7 @@ impl McpServer {
         }
     }
 
-    /// Check if an error indicates the subprocess has died.
-    fn is_process_dead_error(&self, error: &str) -> bool {
-        error.contains("closed stdout")
-            || error.contains("write error")
-            || error.contains("read error")
-            || error.contains("Broken pipe")
-    }
-
-    /// Send a JSON-RPC request and wait for the matching response.
+    /// Send a JSON-RPC request and wait for the response.
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({
@@ -327,11 +380,95 @@ impl McpServer {
             "params": params
         });
 
-        let mut stdin = self.stdin.lock().await;
-        let mut stdout = self.stdout.lock().await;
+        match &self.transport {
+            Transport::Stdio { stdin, stdout, .. } => {
+                self.send_request_stdio(stdin, stdout, &request, id).await
+            }
+            Transport::Http {
+                url,
+                client,
+                session_id,
+            } => self.send_request_http(url, client, session_id, &request).await,
+        }
+    }
 
-        // Write request as a single line
-        let request_str = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    /// Send a JSON-RPC notification (no response expected).
+    async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        });
+
+        match &self.transport {
+            Transport::Stdio { stdin, .. } => {
+                let mut stdin = stdin.lock().await;
+                let notif_str =
+                    serde_json::to_string(&notification).map_err(|e| e.to_string())?;
+                debug!("MCP '{}' → {notif_str}", self.name);
+                stdin
+                    .write_all(notif_str.as_bytes())
+                    .await
+                    .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|e| format!("MCP '{}' flush error: {e}", self.name))?;
+                Ok(())
+            }
+            Transport::Http {
+                url,
+                client,
+                session_id,
+            } => {
+                let notif_str =
+                    serde_json::to_string(&notification).map_err(|e| e.to_string())?;
+                debug!("MCP '{}' → {notif_str}", self.name);
+
+                let mut req = client
+                    .post(url)
+                    .header("Content-Type", "application/json")
+                    .body(notif_str);
+
+                if let Some(sid) = session_id.lock().await.as_ref() {
+                    req = req.header("Mcp-Session-Id", sid);
+                }
+
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| format!("MCP '{}' HTTP error: {e}", self.name))?;
+
+                if !resp.status().is_success() {
+                    warn!(
+                        "MCP '{}' notification HTTP {}: {}",
+                        self.name,
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // === Stdio transport implementation ===
+
+    async fn send_request_stdio(
+        &self,
+        stdin: &Mutex<ChildStdin>,
+        stdout: &Mutex<BufReader<ChildStdout>>,
+        request: &Value,
+        id: u64,
+    ) -> Result<Value, String> {
+        let mut stdin = stdin.lock().await;
+        let mut stdout = stdout.lock().await;
+
+        let request_str = serde_json::to_string(request).map_err(|e| e.to_string())?;
         debug!("MCP '{}' → {request_str}", self.name);
         stdin
             .write_all(request_str.as_bytes())
@@ -346,7 +483,6 @@ impl McpServer {
             .await
             .map_err(|e| format!("MCP '{}' flush error: {e}", self.name))?;
 
-        // Read lines until we find a response with matching id
         let mut line = String::new();
         loop {
             line.clear();
@@ -393,7 +529,6 @@ impl McpServer {
             };
 
             if resp_id == Some(id) {
-                // Check for JSON-RPC error
                 if let Some(err) = parsed.get("error") {
                     let msg = err
                         .get("message")
@@ -407,7 +542,6 @@ impl McpServer {
                     .ok_or_else(|| format!("MCP '{}': response missing result", self.name));
             }
 
-            // Mismatched id — log and keep reading
             warn!(
                 "MCP '{}' unexpected response id {:?} (expected {id})",
                 self.name, resp_id
@@ -415,33 +549,147 @@ impl McpServer {
         }
     }
 
-    /// Send a JSON-RPC notification (no id, no response expected).
-    async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params
-        });
+    // === HTTP transport implementation ===
 
-        let mut stdin = self.stdin.lock().await;
-        let notif_str = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
-        debug!("MCP '{}' → {notif_str}", self.name);
-        stdin
-            .write_all(notif_str.as_bytes())
-            .await
-            .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("MCP '{}' flush error: {e}", self.name))?;
+    async fn send_request_http(
+        &self,
+        url: &str,
+        client: &reqwest::Client,
+        session_id: &Mutex<Option<String>>,
+        request: &Value,
+    ) -> Result<Value, String> {
+        let request_str = serde_json::to_string(request).map_err(|e| e.to_string())?;
+        debug!("MCP '{}' → {request_str}", self.name);
 
-        Ok(())
+        let mut req = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+
+        if let Some(sid) = session_id.lock().await.as_ref() {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+
+        let resp = req
+            .body(request_str)
+            .send()
+            .await
+            .map_err(|e| format!("MCP '{}' HTTP error: {e}", self.name))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("MCP '{}' HTTP {status}: {body}", self.name));
+        }
+
+        // Track session ID from response headers
+        if let Some(sid) = resp.headers().get("mcp-session-id") {
+            if let Ok(sid_str) = sid.to_str() {
+                *session_id.lock().await = Some(sid_str.to_string());
+            }
+        }
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("text/event-stream") {
+            // SSE response: parse events until we find our JSON-RPC response
+            self.parse_sse_response(resp).await
+        } else {
+            // Direct JSON response
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| format!("MCP '{}' HTTP body error: {e}", self.name))?;
+            debug!("MCP '{}' ← {body}", self.name);
+
+            let parsed: Value = serde_json::from_str(&body)
+                .map_err(|e| format!("MCP '{}' invalid JSON response: {e}", self.name))?;
+
+            if let Some(err) = parsed.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                return Err(format!("MCP '{}' error: {msg}", self.name));
+            }
+
+            parsed
+                .get("result")
+                .cloned()
+                .ok_or_else(|| format!("MCP '{}': response missing result", self.name))
+        }
+    }
+
+    /// Parse an SSE response stream for the JSON-RPC result.
+    ///
+    /// SSE events are `data: <json>\n\n`. We look for the first event
+    /// containing a JSON-RPC response (has "result" or "error") and
+    /// process any notifications along the way.
+    async fn parse_sse_response(&self, resp: reqwest::Response) -> Result<Value, String> {
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("MCP '{}' SSE read error: {e}", self.name))?;
+
+        for line in body.lines() {
+            let data = match line.strip_prefix("data: ") {
+                Some(d) => d.trim(),
+                None => continue,
+            };
+
+            if data.is_empty() {
+                continue;
+            }
+
+            let parsed: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            debug!("MCP '{}' ← (SSE) {data}", self.name);
+
+            // Check if this is a notification
+            if parsed.get("id").is_none() {
+                let method = parsed
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
+                if method == "notifications/tools/list_changed" {
+                    info!("MCP '{}' signaled tools/list_changed", self.name);
+                    self.tools_changed.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            // This is a response
+            if let Some(err) = parsed.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                return Err(format!("MCP '{}' error: {msg}", self.name));
+            }
+
+            if let Some(result) = parsed.get("result").cloned() {
+                return Ok(result);
+            }
+        }
+
+        Err(format!(
+            "MCP '{}': no JSON-RPC response in SSE stream",
+            self.name
+        ))
     }
 }
+
+// ============================================================================
+// Tool types
+// ============================================================================
 
 /// Metadata for a single tool discovered from an MCP server.
 struct McpToolInfo {
@@ -460,15 +708,11 @@ struct McpToolMetadata {
 
 /// Wraps a single MCP tool as a `Tool` trait implementation.
 ///
-/// Each discovered tool from an MCP server becomes one `McpTool` instance,
-/// registered in the `ToolRegistry` with a namespaced name (`server.tool`).
 /// Description and schema are read from the server's shared metadata map,
 /// so they update automatically when the server re-discovers tools.
 pub struct McpTool {
     server: Arc<McpServer>,
-    /// Raw tool name as the MCP server knows it
     raw_name: String,
-    /// Namespaced name: `server_name.tool_name`
     namespaced_name: String,
 }
 
@@ -508,6 +752,10 @@ impl Tool for McpTool {
     }
 }
 
+// ============================================================================
+// Directory scanning & startup
+// ============================================================================
+
 /// Load MCP server configs from a directory.
 ///
 /// Scans for `.yaml`, `.yml`, and `.json` files. Each file should contain a single
@@ -516,7 +764,10 @@ pub fn load_server_configs_from_dir(dir: &std::path::Path) -> Vec<McpServerConfi
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            error!("Failed to read MCP server directory '{}': {e}", dir.display());
+            error!(
+                "Failed to read MCP server directory '{}': {e}",
+                dir.display()
+            );
             return Vec::new();
         }
     };
@@ -539,15 +790,17 @@ pub fn load_server_configs_from_dir(dir: &std::path::Path) -> Vec<McpServerConfi
         };
 
         let config: Result<McpServerConfig, String> = match ext {
-            "json" => serde_json::from_str(&contents)
-                .map_err(|e| e.to_string()),
-            _ => serde_yaml::from_str(&contents)
-                .map_err(|e| e.to_string()),
+            "json" => serde_json::from_str(&contents).map_err(|e| e.to_string()),
+            _ => serde_yaml::from_str(&contents).map_err(|e| e.to_string()),
         };
 
         match config {
             Ok(cfg) => {
-                info!("Loaded MCP server manifest '{}' from {}", cfg.name, path.display());
+                info!(
+                    "Loaded MCP server manifest '{}' from {}",
+                    cfg.name,
+                    path.display()
+                );
                 configs.push(cfg);
             }
             Err(e) => {
