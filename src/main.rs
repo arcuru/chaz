@@ -1,5 +1,6 @@
 mod agent;
 mod agent_db;
+mod agent_index;
 mod backends;
 mod commands;
 mod config;
@@ -105,6 +106,12 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
     let central_db = registry.central_db().clone();
+
+    // Stage 2 of Living Agents: maintain a local index of which Agent DBs
+    // this peer hosts. Needed for O(1) routing in Stage 3 (eidetica has no
+    // inverse "DBs where key K has permission P" query).
+    let agent_index_store = agent_index::AgentIndex::new(central_db.clone());
+    agent_index_store.sync_from_bootstrap(&agent_dbs).await?;
 
     // Build secret store backed by the central eidetica database.
     let secret_store = security::SecretStore::new(central_db.clone()).await;

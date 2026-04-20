@@ -26,6 +26,7 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
 use crate::grants::Grants;
 use chrono::{DateTime, Utc};
+use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
@@ -194,13 +195,15 @@ pub fn agent_db_name(display_name: &str) -> String {
 
 /// Create a new Agent DB. Generates a fresh key on `user`, creates the DB
 /// signed by that key with `name: agent:<display_name>` in settings, then
-/// populates the config/meta stores from `agent_cfg` and `meta`.
+/// populates the config/meta stores from `agent_cfg` and `meta`. Returns
+/// the DB handle alongside the fresh pubkey so the caller can register it
+/// in the agents-I-host index.
 pub async fn create_agent_db(
     user: &mut User,
     display_name: &str,
     agent_cfg: &AgentDbConfig,
     meta: &AgentMeta,
-) -> anyhow::Result<AgentDb> {
+) -> anyhow::Result<(AgentDb, PublicKey)> {
     let key = user
         .add_private_key(Some(&format!("agent:{display_name}")))
         .await?;
@@ -218,17 +221,27 @@ pub async fn create_agent_db(
     agent_db.ensure_stores().await?;
     agent_db.write_config(agent_cfg).await?;
     agent_db.write_meta(meta).await?;
-    Ok(agent_db)
+    Ok((agent_db, key))
 }
 
-/// Look up an existing Agent DB by display name. Returns `None` if none found.
-pub async fn find_agent_db(user: &User, display_name: &str) -> Option<AgentDb> {
+/// Look up an existing Agent DB by display name. Returns `(AgentDb, pubkey)`
+/// where pubkey is the key this user holds for the DB. Returns `None` if no
+/// DB with the given display name is tracked by this user.
+pub async fn find_agent_db(user: &User, display_name: &str) -> Option<(AgentDb, PublicKey)> {
     let name = agent_db_name(display_name);
     // `find_database` returns `Err(DatabaseNotFoundByName)` when no matches —
     // collapse any lookup error to None; real errors surface on subsequent
     // operations.
-    let matches = user.find_database(&name).await.ok()?;
-    matches.into_iter().next().map(AgentDb::from_database)
+    let database = user.find_database(&name).await.ok()?.into_iter().next()?;
+    let pubkey = user.find_key(database.root_id()).ok().flatten()?;
+    Some((AgentDb::from_database(database), pubkey))
+}
+
+/// One bootstrapped agent: the opened DB plus the pubkey this peer holds for it.
+#[derive(Clone)]
+pub struct BootstrappedAgent {
+    pub db: AgentDb,
+    pub pubkey: PublicKey,
 }
 
 /// Stage 1 bootstrap: materialize an Agent DB for each yaml agent entry.
@@ -237,7 +250,7 @@ pub async fn find_agent_db(user: &User, display_name: &str) -> Option<AgentDb> {
 pub async fn bootstrap_from_config(
     user: &mut User,
     config: &Config,
-) -> anyhow::Result<HashMap<String, AgentDb>> {
+) -> anyhow::Result<HashMap<String, BootstrappedAgent>> {
     let mut out = HashMap::new();
     let Some(agent_configs) = config.agents.as_ref() else {
         return Ok(out);
@@ -250,18 +263,21 @@ pub async fn bootstrap_from_config(
             ..Default::default()
         };
 
-        let agent_db = match find_agent_db(user, &ac.name).await {
-            Some(db) => {
+        let agent = match find_agent_db(user, &ac.name).await {
+            Some((db, pubkey)) => {
                 info!(agent = %ac.name, db_id = %db.id(), "Reusing existing Agent DB");
                 db.ensure_stores().await?;
                 db.write_config(&agent_cfg).await?;
                 db.write_meta(&meta).await?;
-                db
+                BootstrappedAgent { db, pubkey }
             }
-            None => create_agent_db(user, &ac.name, &agent_cfg, &meta).await?,
+            None => {
+                let (db, pubkey) = create_agent_db(user, &ac.name, &agent_cfg, &meta).await?;
+                BootstrappedAgent { db, pubkey }
+            }
         };
 
-        out.insert(ac.name.clone(), agent_db);
+        out.insert(ac.name.clone(), agent);
     }
 
     Ok(out)
@@ -346,12 +362,14 @@ mod tests {
             avatar: None,
         };
 
-        let db = create_agent_db(&mut user, "researcher", &cfg, &meta)
+        let (db, pubkey) = create_agent_db(&mut user, "researcher", &cfg, &meta)
             .await
             .unwrap();
 
         assert_eq!(db.read_config().await.unwrap(), cfg);
         assert_eq!(db.read_meta().await.unwrap(), meta);
+        // Returned pubkey is an actual key the user holds for this DB.
+        assert_eq!(user.find_key(&db.id()).unwrap(), Some(pubkey));
     }
 
     #[tokio::test]
@@ -365,7 +383,7 @@ mod tests {
             display_name: Some("r".to_string()),
             ..Default::default()
         };
-        let db = create_agent_db(&mut user, "r", &cfg, &meta).await.unwrap();
+        let (db, _) = create_agent_db(&mut user, "r", &cfg, &meta).await.unwrap();
         let id = db.id();
 
         let reopened = user.open_database(&id).await.unwrap();
@@ -381,13 +399,15 @@ mod tests {
 
         let first = bootstrap_from_config(&mut user, &config).await.unwrap();
         assert_eq!(first.len(), 2);
-        let alpha_id_1 = first["alpha"].id();
-        let beta_id_1 = first["beta"].id();
+        let alpha_id_1 = first["alpha"].db.id();
+        let beta_id_1 = first["beta"].db.id();
+        let alpha_key_1 = first["alpha"].pubkey.clone();
 
-        // Same yaml → same DBs (no new ones created).
+        // Same yaml → same DBs and same pubkeys (no new ones created).
         let second = bootstrap_from_config(&mut user, &config).await.unwrap();
-        assert_eq!(second["alpha"].id(), alpha_id_1);
-        assert_eq!(second["beta"].id(), beta_id_1);
+        assert_eq!(second["alpha"].db.id(), alpha_id_1);
+        assert_eq!(second["beta"].db.id(), beta_id_1);
+        assert_eq!(second["alpha"].pubkey, alpha_key_1);
 
         // And no extra keys were generated on the second pass.
         // (Creator key on create_database, one key per agent created on first pass.)
@@ -403,7 +423,7 @@ mod tests {
         cfg.max_iterations = Some(5);
         let config = empty_config_with_agents(vec![cfg]);
         let dbs = bootstrap_from_config(&mut user, &config).await.unwrap();
-        let id = dbs["chatter"].id();
+        let id = dbs["chatter"].db.id();
 
         // Bump max_iterations in yaml, re-bootstrap.
         let mut cfg2 = agent_cfg("chatter");
@@ -412,9 +432,14 @@ mod tests {
         let dbs2 = bootstrap_from_config(&mut user, &config2).await.unwrap();
 
         // Same DB, refreshed config.
-        assert_eq!(dbs2["chatter"].id(), id);
+        assert_eq!(dbs2["chatter"].db.id(), id);
         assert_eq!(
-            dbs2["chatter"].read_config().await.unwrap().max_iterations,
+            dbs2["chatter"]
+                .db
+                .read_config()
+                .await
+                .unwrap()
+                .max_iterations,
             Some(99)
         );
     }
