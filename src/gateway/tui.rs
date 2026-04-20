@@ -190,7 +190,10 @@ impl Gateway for TuiGateway {
 
         let mut app = App::new(agent_names, session_db_id.clone());
         {
-            let agent = server.registry().resolve_agent(&session_db_id, None).await;
+            let agent = server
+                .registry()
+                .resolve_agent(&session_db_id, None, server.agent_index())
+                .await;
             app.current_agent = agent.name.clone();
             let session = Session::new(
                 crate::types::ConversationId(session_db_id.clone()),

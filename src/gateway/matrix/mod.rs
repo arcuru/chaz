@@ -128,7 +128,10 @@ async fn dispatch_in_room(
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(&room, &config, &secrets, server.registry()).await;
     let meta = crate::session::read_meta_from_db(&session_db).await;
-    let agent = server.registry().resolve_agent(&session_db_id, None).await;
+    let agent = server
+        .registry()
+        .resolve_agent(&session_db_id, None, server.agent_index())
+        .await;
     let config_roles = Some(get_role_names(config.roles.clone()));
 
     let ctx = CommandContext {

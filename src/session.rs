@@ -770,24 +770,79 @@ impl SessionRegistry {
     }
 
     /// Resolve which agent should handle a session.
-    /// Priority: explicit override > session meta > default agent.
-    pub async fn resolve_agent(&self, session_db_id: &str, override_name: Option<&str>) -> Agent {
+    ///
+    /// Priority:
+    /// 1. Explicit name override (used by `!chaz run` / scheduled one-shots).
+    /// 2. Key-possession routing (Stage 3c): walk the session's AuthSettings;
+    ///    the first Active+Write pubkey we find in `agent_index` wins and we
+    ///    resolve its display_name against the in-memory `AgentRegistry`.
+    /// 3. Legacy `SessionMeta.agent_name` fallback — preserved so existing
+    ///    sessions keep working until migrated.
+    /// 4. Default agent.
+    ///
+    /// Turn-taking in multi-agent sessions (mention-based + host fallback)
+    /// is Stage 4; v1 takes the first matching authorized agent.
+    pub async fn resolve_agent(
+        &self,
+        session_db_id: &str,
+        override_name: Option<&str>,
+        agent_index: &crate::agent_index::AgentIndex,
+    ) -> Agent {
         if let Some(name) = override_name {
             if let Some(agent) = self.agents.get(name) {
                 return agent.clone();
             }
         }
 
-        if let Ok((_conv_id, db)) = self.open_session(session_db_id).await {
-            let meta = read_meta_from_db(&db).await;
-            if let Some(agent_name) = meta.agent_name.as_deref() {
-                if let Some(agent) = self.agents.get(agent_name) {
-                    return agent.clone();
-                }
+        let Ok((_conv_id, db)) = self.open_session(session_db_id).await else {
+            return self.agents.default_agent().clone();
+        };
+
+        if let Some(agent) = self.resolve_from_auth(&db, agent_index).await {
+            return agent;
+        }
+
+        let meta = read_meta_from_db(&db).await;
+        if let Some(agent_name) = meta.agent_name.as_deref() {
+            if let Some(agent) = self.agents.get(agent_name) {
+                return agent.clone();
             }
         }
 
         self.agents.default_agent().clone()
+    }
+
+    /// Look up the first agent authorized on this session via key-possession.
+    async fn resolve_from_auth(
+        &self,
+        session_db: &Database,
+        agent_index: &crate::agent_index::AgentIndex,
+    ) -> Option<Agent> {
+        use eidetica::auth::crypto::PublicKey;
+        use eidetica::auth::types::KeyStatus;
+
+        let settings = session_db.get_settings().await.ok()?;
+        let auth = settings.auth_snapshot().await.ok()?;
+        let keys = auth.get_all_keys().ok()?;
+
+        for (pubkey_str, key_info) in keys {
+            if !matches!(key_info.status(), KeyStatus::Active) {
+                continue;
+            }
+            if !matches!(key_info.permissions(), Permission::Write(_)) {
+                continue;
+            }
+            let Ok(pubkey) = PublicKey::from_prefixed_string(&pubkey_str) else {
+                continue;
+            };
+            let Ok(Some(entry)) = agent_index.find_by_pubkey(&pubkey).await else {
+                continue;
+            };
+            if let Some(agent) = self.agents.get(&entry.display_name) {
+                return Some(agent.clone());
+            }
+        }
+        None
     }
 }
 
@@ -996,6 +1051,105 @@ mod tests {
 
         let meta = read_meta_from_db(&session_db).await;
         assert_eq!(meta.agents.len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3c: key-possession routing
+    // -------------------------------------------------------------------------
+
+    use crate::agent_index::AgentIndex;
+
+    /// Build a registry with a single yaml-declared agent named `alpha` so
+    /// the in-memory AgentRegistry can resolve the display_name back to an
+    /// Agent struct in `resolve_from_auth`.
+    async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, AgentIndex) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+
+        let cfg = crate::config::Config {
+            homeserver_url: String::new(),
+            username: String::new(),
+            password: None,
+            allow_list: None,
+            message_limit: None,
+            room_size_limit: None,
+            state_dir: None,
+            chat_summary_model: None,
+            role: None,
+            roles: None,
+            backends: None,
+            agents: Some(vec![crate::config::AgentConfig {
+                name: "alpha".to_string(),
+                role: None,
+                model: None,
+                tools: None,
+                can_spawn: None,
+                allowed_callers: None,
+                max_iterations: None,
+                autonomous: false,
+                presets: None,
+                tool_profile: None,
+                max_context_tokens: None,
+                grants: None,
+            }]),
+            security: None,
+            schedules: None,
+            mcp_servers: None,
+            tool_profiles: None,
+            mcp_server_dir: None,
+            context: None,
+        };
+        let agents = Arc::new(AgentRegistry::from_config(&cfg));
+        let registry = Arc::new(
+            SessionRegistry::new(instance.clone(), user, agents)
+                .await
+                .unwrap(),
+        );
+        let index = AgentIndex::new(registry.central_db().clone());
+        (instance, registry, index)
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_via_session_auth_key() {
+        let (_instance, registry, index) = make_registry_with_alpha_agent().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let agent_entry = make_agent_entry(&registry, "alpha").await;
+        index.register(agent_entry.clone()).await.unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &agent_entry)
+            .await
+            .unwrap();
+
+        // Deliberately set a WRONG agent_name to prove the auth-based path wins.
+        update_meta_on_db(&session_db, |m| {
+            m.agent_name = Some("not-real".to_string());
+        })
+        .await
+        .unwrap();
+
+        let resolved = registry.resolve_agent(&session_id, None, &index).await;
+        assert_eq!(resolved.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_falls_back_to_agent_name_when_no_auth_match() {
+        let (_instance, registry, index) = make_registry_with_alpha_agent().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        // No agent attached via auth. Legacy agent_name points at alpha.
+        update_meta_on_db(&session_db, |m| {
+            m.agent_name = Some("alpha".to_string());
+        })
+        .await
+        .unwrap();
+
+        let resolved = registry.resolve_agent(&session_id, None, &index).await;
+        assert_eq!(resolved.name, "alpha");
     }
 
     #[tokio::test]

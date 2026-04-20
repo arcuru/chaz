@@ -234,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
     let server = server::Server::new(
         registry,
         agent_registry,
+        agent_index_store,
         tool_registry,
         policies,
         security_ctx,

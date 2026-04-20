@@ -190,7 +190,7 @@ async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
     let agent = ctx
         .server
         .registry()
-        .resolve_agent(&session_db_id, None)
+        .resolve_agent(&session_db_id, None, ctx.server.agent_index())
         .await;
     CommandOutcome::SessionSwitched(Box::new(SessionSwitch {
         session_db_id,
@@ -213,7 +213,7 @@ async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOu
     let agent = ctx
         .server
         .registry()
-        .resolve_agent(&session_db_id, None)
+        .resolve_agent(&session_db_id, None, ctx.server.agent_index())
         .await;
 
     CommandOutcome::SessionSwitched(Box::new(SessionSwitch {

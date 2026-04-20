@@ -14,6 +14,7 @@
 //! to the same session are skipped while an agent is running.
 
 use crate::agent::AgentRegistry;
+use crate::agent_index::AgentIndex;
 use crate::backends::BackendManager;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
@@ -62,6 +63,7 @@ struct SpawnContext {
 pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
+    agent_index: AgentIndex,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -79,9 +81,11 @@ pub struct Server {
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
+        agent_index: AgentIndex,
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
@@ -93,6 +97,7 @@ impl Server {
         let server = Arc::new(Self {
             registry,
             agents,
+            agent_index,
             tools,
             policies,
             security,
@@ -116,6 +121,10 @@ impl Server {
         });
 
         server
+    }
+
+    pub fn agent_index(&self) -> &AgentIndex {
+        &self.agent_index
     }
 
     pub fn registry(&self) -> &SessionRegistry {
@@ -351,7 +360,7 @@ impl Server {
 
         let agent = self
             .registry
-            .resolve_agent(session_db_id, agent_override.as_deref())
+            .resolve_agent(session_db_id, agent_override.as_deref(), &self.agent_index)
             .await;
 
         self.spawn_agent_task(
