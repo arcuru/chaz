@@ -1,6 +1,8 @@
 use crate::backends::BackendManager;
+use crate::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
+use crate::role::get_role_names;
 use crate::scheduler::Scheduler;
 use crate::security::SecretStore;
 use crate::server::Server;
@@ -8,11 +10,11 @@ use crate::session::{EntryType, Session, SessionEntry};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::Terminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
-use ratatui::Terminal;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -53,13 +55,14 @@ enum TuiMode {
     SessionPicker,
 }
 
-/// A session listing entry for the picker
-struct SessionInfo {
-    transport_id: String,
-    agent_name: Option<String>,
-    name: Option<String>,
-    entry_count: usize,
-    last_message: Option<String>,
+/// Outcome of a chat-mode key press that the event loop needs to act on.
+enum ChatAction {
+    /// Dispatch a transport-neutral command.
+    Dispatch(Command),
+    /// Open the session picker (after loading the session list).
+    OpenPicker,
+    /// Send a regular chat message to the agent.
+    SendMessage(String),
 }
 
 /// Centralized TUI application state
@@ -145,54 +148,6 @@ async fn setup_session(
     Ok(())
 }
 
-/// Load session list from registry, with entry counts and last message previews.
-async fn load_session_list(server: &Server) -> Vec<SessionInfo> {
-    let bindings = match server.registry().list_sessions().await {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut sessions = Vec::new();
-    for binding in bindings {
-        // Try to load entry count and last message
-        let (entry_count, last_message) = match server
-            .registry()
-            .get_or_create_session_db(&binding.transport_id)
-            .await
-        {
-            Ok((conv_id, db)) => {
-                let session = Session::new(conv_id, db).await;
-                let count = session.entries().len();
-                let last = session
-                    .entries()
-                    .iter()
-                    .rev()
-                    .find(|e| e.entry_type == EntryType::Message)
-                    .map(|e| {
-                        let preview = e.content.lines().next().unwrap_or("");
-                        if preview.len() > 60 {
-                            format!("{}: {}…", e.sender, &preview[..60])
-                        } else {
-                            format!("{}: {}", e.sender, preview)
-                        }
-                    });
-                (count, last)
-            }
-            Err(_) => (0, None),
-        };
-
-        sessions.push(SessionInfo {
-            transport_id: binding.transport_id,
-            agent_name: binding.agent_name,
-            name: binding.name,
-            entry_count,
-            last_message,
-        });
-    }
-
-    sessions
-}
-
 impl Gateway for TuiGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let default_transport = "tui".to_string();
@@ -253,6 +208,9 @@ impl Gateway for TuiGateway {
         let mut terminal = init_terminal()?;
         let mut events = EventStream::new();
 
+        let config_role_names = get_role_names(self.config.roles.clone());
+        let default_role = self.config.role.clone();
+
         // Event loop
         loop {
             terminal.draw(|f| ui(f, &app))?;
@@ -282,258 +240,124 @@ impl Gateway for TuiGateway {
                     } else {
                         match app.mode {
                             TuiMode::Chat => {
-                                let switch = handle_chat_key(&mut app, key, &session_db).await;
-
-                                if let Some(cmd) = switch {
-                                    match cmd {
-                                        ChatCommand::OpenPicker => {
-                                            app.session_list = load_session_list(&server).await;
-                                            // Pre-select current session
-                                            app.picker_index = app
-                                                .session_list
-                                                .iter()
-                                                .position(|s| s.transport_id == app.transport_id)
-                                                .unwrap_or(0);
-                                            app.mode = TuiMode::SessionPicker;
+                                if let Some(chat_action) =
+                                    handle_chat_key(&mut app, key, &session_db).await
+                                {
+                                    match chat_action {
+                                        ChatAction::SendMessage(text) => {
+                                            let mut session = Session::new(
+                                                crate::types::ConversationId(
+                                                    app.transport_id.clone(),
+                                                ),
+                                                session_db.clone(),
+                                            )
+                                            .await;
+                                            session
+                                                .add_entry(SessionEntry {
+                                                    sender: "user".to_string(),
+                                                    content: text,
+                                                    timestamp: chrono::Utc::now(),
+                                                    entry_type: EntryType::Message,
+                                                })
+                                                .await;
+                                            app.waiting = true;
                                         }
-                                        ChatCommand::SwitchSession(id) => {
-                                            match switch_session(
+                                        ChatAction::OpenPicker => {
+                                            let ctx = CommandContext {
+                                                server: &server,
+                                                scheduler: self.scheduler.as_ref(),
+                                                secrets: &self.secrets,
+                                                backend: &backend,
+                                                transport_id: &app.transport_id,
+                                                session_db: &session_db,
+                                                current_agent: &app.current_agent,
+                                                session_name: app.session_name.as_deref(),
+                                                config_roles: Some(config_role_names.clone()),
+                                                default_role: default_role.as_deref(),
+                                            };
+                                            match commands::dispatch(Command::ListSessions, &ctx)
+                                                .await
+                                            {
+                                                CommandOutcome::SessionsList(list) => {
+                                                    app.session_list = list;
+                                                    app.picker_index = app
+                                                        .session_list
+                                                        .iter()
+                                                        .position(|s| {
+                                                            s.transport_id == app.transport_id
+                                                        })
+                                                        .unwrap_or(0);
+                                                    app.mode = TuiMode::SessionPicker;
+                                                }
+                                                other => {
+                                                    render_outcome(
+                                                        &mut app,
+                                                        other,
+                                                        &server,
+                                                        &backend,
+                                                        &approval_tx,
+                                                        &notify_tx,
+                                                        &mut session_db,
+                                                    )
+                                                    .await
+                                                }
+                                            }
+                                        }
+                                        ChatAction::Dispatch(cmd) => {
+                                            let ctx = CommandContext {
+                                                server: &server,
+                                                scheduler: self.scheduler.as_ref(),
+                                                secrets: &self.secrets,
+                                                backend: &backend,
+                                                transport_id: &app.transport_id,
+                                                session_db: &session_db,
+                                                current_agent: &app.current_agent,
+                                                session_name: app.session_name.as_deref(),
+                                                config_roles: Some(config_role_names.clone()),
+                                                default_role: default_role.as_deref(),
+                                            };
+                                            let outcome = commands::dispatch(cmd, &ctx).await;
+                                            render_outcome(
+                                                &mut app,
+                                                outcome,
                                                 &server,
-                                                &id,
                                                 &backend,
                                                 &approval_tx,
                                                 &notify_tx,
+                                                &mut session_db,
                                             )
-                                            .await
-                                            {
-                                                Ok(result) => {
-                                                    session_db = result.db;
-                                                    app.transport_id = result.transport_id;
-                                                    app.entries = result.entries;
-                                                    app.current_agent = result.agent_name;
-                                                    app.session_name = result.session_name;
-                                                    app.scroll_offset = 0;
-                                                    app.waiting = false;
-                                                }
-                                                Err(e) => {
-                                                    show_error(
-                                                        &mut app,
-                                                        format!("Failed to switch session: {e}"),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ChatCommand::ShareSession => {
-                                            match generate_share_ticket(&server, &session_db).await
-                                            {
-                                                Ok(ticket) => {
-                                                    show_system_msg(&mut app, format!(
-                                                        "Share this ticket to sync the current session:\n\n{ticket}"
-                                                    ));
-                                                }
-                                                Err(e) => {
-                                                    show_error(
-                                                        &mut app,
-                                                        format!("Failed to generate ticket: {e}"),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ChatCommand::SyncTicket(ticket_str) => {
-                                            match sync_from_ticket(&server, &ticket_str).await {
-                                                Ok(msg) => {
-                                                    show_system_msg(&mut app, msg);
-                                                }
-                                                Err(e) => {
-                                                    show_error(
-                                                        &mut app,
-                                                        format!("Sync failed: {e}"),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ChatCommand::ListSchedules => {
-                                            if let Some(ref sched) = self.scheduler {
-                                                let schedules = sched.list().await;
-                                                if schedules.is_empty() {
-                                                    show_system_msg(
-                                                        &mut app,
-                                                        "No schedules configured.".to_string(),
-                                                    );
-                                                } else {
-                                                    let mut msg = String::from("Schedules:\n");
-                                                    for s in &schedules {
-                                                        let status = if s.enabled {
-                                                            "enabled"
-                                                        } else {
-                                                            "disabled"
-                                                        };
-                                                        let last = s
-                                                            .last_run
-                                                            .map(|t| {
-                                                                t.format("%Y-%m-%d %H:%M:%S")
-                                                                    .to_string()
-                                                            })
-                                                            .unwrap_or_else(|| "never".to_string());
-                                                        let next = s
-                                                            .next_run
-                                                            .map(|t| {
-                                                                t.format("%Y-%m-%d %H:%M:%S")
-                                                                    .to_string()
-                                                            })
-                                                            .unwrap_or_else(|| "n/a".to_string());
-                                                        msg.push_str(&format!(
-                                                            "\n  {} [{}]\n    session: {}\n    task: {}\n    last: {} | next: {}\n",
-                                                            s.name, status, s.session, s.task, last, next
-                                                        ));
-                                                    }
-                                                    show_system_msg(&mut app, msg);
-                                                }
-                                            } else {
-                                                show_system_msg(
-                                                    &mut app,
-                                                    "No scheduler configured.".to_string(),
-                                                );
-                                            }
-                                        }
-                                        ChatCommand::TriggerSchedule(name) => {
-                                            if let Some(ref sched) = self.scheduler {
-                                                match sched.trigger(&name).await {
-                                                    Ok(()) => {
-                                                        show_system_msg(
-                                                            &mut app,
-                                                            format!("Triggered schedule '{name}'."),
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        show_error(
-                                                            &mut app,
-                                                            format!(
-                                                                "Failed to trigger '{name}': {e}"
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                show_error(
-                                                    &mut app,
-                                                    "No scheduler configured.".to_string(),
-                                                );
-                                            }
-                                        }
-                                        ChatCommand::CompactSession => {
-                                            show_system_msg(
-                                                &mut app,
-                                                "Compacting session...".to_string(),
-                                            );
-                                            // Re-render to show the "compacting" message
-                                            terminal.draw(|f| ui(f, &app))?;
-
-                                            match compact_session(
-                                                &app.entries,
-                                                &app.current_agent,
-                                                &backend,
-                                                &session_db,
-                                            )
-                                            .await
-                                            {
-                                                Ok(summary_preview) => {
-                                                    // Reload entries from DB to pick up the Summary entry
-                                                    let session = Session::new(
-                                                        crate::types::ConversationId(
-                                                            app.transport_id.clone(),
-                                                        ),
-                                                        session_db.clone(),
-                                                    )
-                                                    .await;
-                                                    app.entries = session.entries().to_vec();
-                                                    show_system_msg(&mut app, format!(
-                                                        "Session compacted. Summary ({} chars) written.",
-                                                        summary_preview.len()
-                                                    ));
-                                                }
-                                                Err(e) => {
-                                                    show_error(
-                                                        &mut app,
-                                                        format!("Compact failed: {e}"),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ChatCommand::NameSession(name) => {
-                                            match server
-                                                .registry()
-                                                .set_session_name(&app.transport_id, name.clone())
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    app.session_name = Some(name.clone());
-                                                    show_system_msg(
-                                                        &mut app,
-                                                        format!(
-                                                            "Session named '{name}'. Use /join {name} to switch here."
-                                                        ),
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    show_error(
-                                                        &mut app,
-                                                        format!("Failed to name session: {e}"),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ChatCommand::ClearSessionName => {
-                                            match server
-                                                .registry()
-                                                .clear_session_name(&app.transport_id)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    app.session_name = None;
-                                                    show_system_msg(
-                                                        &mut app,
-                                                        "Session name cleared.".to_string(),
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    show_error(
-                                                        &mut app,
-                                                        format!("Failed to clear name: {e}"),
-                                                    );
-                                                }
-                                            }
+                                            .await;
                                         }
                                     }
                                 }
                             }
                             TuiMode::SessionPicker => {
                                 if let Some(selected) = handle_picker_key(&mut app, key) {
-                                    match switch_session(
+                                    let ctx = CommandContext {
+                                        server: &server,
+                                        scheduler: self.scheduler.as_ref(),
+                                        secrets: &self.secrets,
+                                        backend: &backend,
+                                        transport_id: &app.transport_id,
+                                        session_db: &session_db,
+                                        current_agent: &app.current_agent,
+                                        session_name: app.session_name.as_deref(),
+                                        config_roles: Some(config_role_names.clone()),
+                                        default_role: default_role.as_deref(),
+                                    };
+                                    let outcome =
+                                        commands::dispatch(Command::SwitchSession(selected), &ctx)
+                                            .await;
+                                    render_outcome(
+                                        &mut app,
+                                        outcome,
                                         &server,
-                                        &selected,
                                         &backend,
                                         &approval_tx,
                                         &notify_tx,
+                                        &mut session_db,
                                     )
-                                    .await
-                                    {
-                                        Ok(result) => {
-                                            session_db = result.db;
-                                            app.transport_id = result.transport_id;
-                                            app.entries = result.entries;
-                                            app.current_agent = result.agent_name;
-                                            app.session_name = result.session_name;
-                                            app.scroll_offset = 0;
-                                            app.waiting = false;
-                                        }
-                                        Err(e) => {
-                                            show_error(
-                                                &mut app,
-                                                format!("Failed to switch session: {e}"),
-                                            );
-                                        }
-                                    }
+                                    .await;
                                     app.mode = TuiMode::Chat;
                                 }
                             }
@@ -573,196 +397,77 @@ impl Gateway for TuiGateway {
     }
 }
 
-/// Commands returned by chat key handler that require session-level action.
-enum ChatCommand {
-    OpenPicker,
-    SwitchSession(String),
-    ShareSession,
-    SyncTicket(String),
-    ListSchedules,
-    TriggerSchedule(String),
-    CompactSession,
-    NameSession(String),
-    ClearSessionName,
-}
-
-/// Result of switching to a session.
-struct SwitchResult {
-    db: eidetica::Database,
-    entries: Vec<SessionEntry>,
-    agent_name: String,
-    transport_id: String,
-    session_name: Option<String>,
-}
-
-/// Switch to a different session. Resolves the identifier as a name, DB ID, or transport ID.
-/// Registers with server and returns session state.
-async fn switch_session(
+/// Apply a dispatched command's outcome to the TUI app state.
+async fn render_outcome(
+    app: &mut App,
+    outcome: CommandOutcome,
     server: &Server,
-    identifier: &str,
     backend: &BackendManager,
     approval_tx: &mpsc::Sender<ApprovalExchange>,
     notify_tx: &mpsc::Sender<()>,
-) -> anyhow::Result<SwitchResult> {
-    let (transport_id, conv_id, session_db) = server.registry().resolve_session(identifier).await?;
-
-    setup_session(
-        server,
-        &transport_id,
-        &session_db,
-        backend.clone(),
-        approval_tx.clone(),
-        notify_tx.clone(),
-    )
-    .await?;
-
-    // Look up the session name from the binding
-    let session_name = server
-        .registry()
-        .list_sessions()
-        .await
-        .ok()
-        .and_then(|bindings| {
-            bindings
-                .into_iter()
-                .find(|b| b.transport_id == transport_id)
-                .and_then(|b| b.name)
-        });
-
-    let agent = server.registry().resolve_agent(&transport_id, None).await;
-    let session = Session::new(conv_id, session_db.clone()).await;
-    let entries = session.entries().to_vec();
-    Ok(SwitchResult {
-        db: session_db,
-        entries,
-        agent_name: agent.name,
-        transport_id,
-        session_name,
-    })
-}
-
-/// Generate a shareable DatabaseTicket for the current session.
-async fn generate_share_ticket(
-    server: &Server,
-    session_db: &eidetica::Database,
-) -> anyhow::Result<String> {
-    let instance = server.registry().instance();
-    let sync = instance
-        .sync()
-        .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
-
-    let mut ticket = eidetica::sync::DatabaseTicket::new(session_db.root_id().clone());
-
-    // Add all known server addresses as hints
-    if let Ok(addresses) = sync.get_all_server_addresses().await {
-        for (transport_type, address) in addresses {
-            ticket.add_address(eidetica::sync::Address::new(transport_type, address));
+    session_db: &mut eidetica::Database,
+) {
+    match outcome {
+        CommandOutcome::Text(t) => show_system_msg(app, t),
+        CommandOutcome::Error(e) => show_error(app, e),
+        CommandOutcome::SessionsList(list) => {
+            // Render as text when the caller didn't request the picker modal.
+            if list.is_empty() {
+                show_system_msg(app, "No sessions found.".to_string());
+            } else {
+                let mut msg = String::from("Sessions:\n");
+                for info in &list {
+                    let agent = info.agent_name.as_deref().unwrap_or("default");
+                    let name = info
+                        .name
+                        .as_deref()
+                        .map(|n| format!(" \"{n}\""))
+                        .unwrap_or_default();
+                    msg.push_str(&format!(
+                        "\n  {}{} ({}, {} entries)",
+                        info.transport_id, name, agent, info.entry_count
+                    ));
+                    if let Some(preview) = &info.last_message {
+                        msg.push_str(&format!("\n    {preview}"));
+                    }
+                }
+                show_system_msg(app, msg);
+            }
+        }
+        CommandOutcome::SessionSwitched(switch) => {
+            let crate::commands::SessionSwitch {
+                transport_id,
+                conv_id,
+                db,
+                agent_name,
+                session_name,
+            } = *switch;
+            if let Err(e) = setup_session(
+                server,
+                &transport_id,
+                &db,
+                backend.clone(),
+                approval_tx.clone(),
+                notify_tx.clone(),
+            )
+            .await
+            {
+                show_error(app, format!("Failed to register session: {e}"));
+                return;
+            }
+            *session_db = db.clone();
+            let session = Session::new(conv_id, db).await;
+            app.entries = session.entries().to_vec();
+            app.transport_id = transport_id;
+            app.current_agent = agent_name;
+            app.session_name = session_name;
+            app.scroll_offset = 0;
+            app.waiting = false;
+        }
+        CommandOutcome::Quit => {
+            app.should_quit = true;
         }
     }
-
-    Ok(ticket.to_string())
-}
-
-/// Sync a remote session via a DatabaseTicket URL.
-async fn sync_from_ticket(server: &Server, ticket_str: &str) -> anyhow::Result<String> {
-    let instance = server.registry().instance();
-    let sync = instance
-        .sync()
-        .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
-
-    let ticket: eidetica::sync::DatabaseTicket = ticket_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid ticket: {e}"))?;
-
-    let db_id = ticket.database_id().clone();
-    sync.sync_with_ticket(&ticket).await?;
-
-    Ok(format!(
-        "Synced database {}. Use /sessions to find and open it.",
-        db_id
-    ))
-}
-
-/// Compact the session by summarizing entries via the LLM and writing a Summary entry.
-async fn compact_session(
-    entries: &[SessionEntry],
-    agent_name: &str,
-    backend: &BackendManager,
-    session_db: &eidetica::Database,
-) -> anyhow::Result<String> {
-    use crate::backends::{ChatContext, Message};
-    use openai_api_rs::v1::chat_completion::MessageRole;
-
-    // Collect contextable entries for summarization
-    let contextable: Vec<&SessionEntry> = entries
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.entry_type,
-                EntryType::Message | EntryType::Directive | EntryType::Summary
-            )
-        })
-        .collect();
-
-    if contextable.len() < 3 {
-        anyhow::bail!("Not enough messages to compact (need at least 3)");
-    }
-
-    // Build a transcript for the LLM to summarize
-    let mut transcript = String::new();
-    for entry in &contextable {
-        let role_label = if entry.sender == agent_name {
-            "assistant"
-        } else {
-            &entry.sender
-        };
-        let type_label = match entry.entry_type {
-            EntryType::Summary => " [previous summary]",
-            EntryType::Directive => " [directive]",
-            _ => "",
-        };
-        transcript.push_str(&format!("{role_label}{type_label}: {}\n\n", entry.content));
-    }
-
-    // Ask the LLM to summarize
-    let system_prompt = "You are a conversation summarizer. Produce a thorough, structured summary of the conversation below. Include: key topics discussed, decisions made, tasks completed or in progress, important facts and state, and any open questions. The summary replaces older messages in the context window, so it must be complete enough for the assistant to continue working without the original messages.".to_string();
-
-    let context = ChatContext {
-        messages: vec![
-            Message::new(MessageRole::system, system_prompt),
-            Message::new(
-                MessageRole::user,
-                format!(
-                    "Summarize this conversation:\n\n{transcript}\n\n\
-                     Produce a structured summary that captures everything needed to continue the conversation."
-                ),
-            ),
-        ],
-        model: None,
-        role: None,
-    };
-
-    let summary = backend
-        .execute(&context)
-        .await
-        .map_err(|e| anyhow::anyhow!("LLM summarization failed: {e}"))?;
-
-    // Write Summary entry to the session DB
-    let entry = SessionEntry {
-        sender: "system".to_string(),
-        content: summary.clone(),
-        timestamp: chrono::Utc::now(),
-        entry_type: EntryType::Summary,
-    };
-
-    let txn = session_db.new_transaction().await?;
-    let store = txn
-        .get_store::<eidetica::store::Table<SessionEntry>>("entries")
-        .await?;
-    store.insert(entry).await?;
-    txn.commit().await?;
-
-    Ok(summary)
 }
 
 /// Show a system message in the TUI.
@@ -785,13 +490,13 @@ fn show_error(app: &mut App, content: String) {
     });
 }
 
-/// Handle a key event in chat mode. Returns a ChatCommand if the event loop
-/// needs to take session-level action (switching, opening picker).
+/// Handle a key event in chat mode. Returns a `ChatAction` if the event loop
+/// needs to take further action.
 async fn handle_chat_key(
     app: &mut App,
     key: KeyEvent,
     session_db: &eidetica::Database,
-) -> Option<ChatCommand> {
+) -> Option<ChatAction> {
     // Handle approval mode
     if let Some(exchange) = app.pending_approval.take() {
         let decision = match key.code {
@@ -814,186 +519,7 @@ async fn handle_chat_key(
             if !app.input.is_empty() {
                 let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
-
-                // Handle commands
-                match text.as_str() {
-                    "/quit" | "/exit" | "/q" => {
-                        app.should_quit = true;
-                        return None;
-                    }
-                    "/sessions" | "/s" => {
-                        return Some(ChatCommand::OpenPicker);
-                    }
-                    "/clear" => {
-                        app.entries.clear();
-                        app.scroll_offset = 0;
-                        return None;
-                    }
-                    _ if text.starts_with("/join ") => {
-                        let identifier = text.strip_prefix("/join ").unwrap().trim().to_string();
-                        if !identifier.is_empty() {
-                            return Some(ChatCommand::SwitchSession(identifier));
-                        }
-                        return None;
-                    }
-                    _ if text.starts_with("/name ") => {
-                        let name = text.strip_prefix("/name ").unwrap().trim().to_string();
-                        if !name.is_empty() {
-                            return Some(ChatCommand::NameSession(name));
-                        }
-                        return None;
-                    }
-                    "/name" => {
-                        return Some(ChatCommand::ClearSessionName);
-                    }
-                    "/new" => {
-                        let tid = format!("tui:{}", uuid::Uuid::new_v4());
-                        return Some(ChatCommand::SwitchSession(tid));
-                    }
-                    "/share" => {
-                        return Some(ChatCommand::ShareSession);
-                    }
-                    _ if text.starts_with("/sync ") => {
-                        let ticket = text.strip_prefix("/sync ").unwrap().trim().to_string();
-                        if !ticket.is_empty() {
-                            return Some(ChatCommand::SyncTicket(ticket));
-                        }
-                        return None;
-                    }
-                    "/compact" => {
-                        return Some(ChatCommand::CompactSession);
-                    }
-                    "/schedules" => {
-                        return Some(ChatCommand::ListSchedules);
-                    }
-                    _ if text.starts_with("/run ") => {
-                        let name = text.strip_prefix("/run ").unwrap().trim().to_string();
-                        if !name.is_empty() {
-                            return Some(ChatCommand::TriggerSchedule(name));
-                        }
-                        return None;
-                    }
-                    "/help" | "/?" => {
-                        app.entries.push(SessionEntry {
-                            sender: "system".to_string(),
-                            content: [
-                                "Commands:",
-                                "  /sessions, /s  — open session picker",
-                                "  /new           — create a new session",
-                                "  /join <id>     — switch to session by name, DB ID, or transport ID",
-                                "  /name <alias>  — set a human-friendly name for this session",
-                                "  /name          — clear the session name",
-                                "  /info          — show current session info",
-                                "  /share         — generate shareable ticket for current session",
-                                "  /sync <ticket> — sync a remote session via ticket",
-                                "  /schedules     — list configured schedules",
-                                "  /run <name>    — trigger a schedule immediately",
-                                "  /compact       — summarize and compact conversation history",
-                                "  /clear         — clear display (entries still in DB)",
-                                "  /raw           — dump raw entry data for debugging",
-                                "  /debug         — toggle debug mode (Ctrl+D)",
-                                "  /quit, /q      — exit",
-                                "",
-                                "Keys:",
-                                "  Ctrl+D         — toggle debug mode (shows timestamps, types)",
-                                "  Ctrl+C         — quit",
-                                "  Up/Down        — scroll messages",
-                            ]
-                            .join("\n"),
-                            timestamp: chrono::Utc::now(),
-                            entry_type: EntryType::Message,
-                        });
-                        return None;
-                    }
-                    "/info" => {
-                        let msg_count = app
-                            .entries
-                            .iter()
-                            .filter(|e| e.entry_type == EntryType::Message)
-                            .count();
-                        let tool_count = app
-                            .entries
-                            .iter()
-                            .filter(|e| e.entry_type == EntryType::ToolCall)
-                            .count();
-                        let directive_count = app
-                            .entries
-                            .iter()
-                            .filter(|e| e.entry_type == EntryType::Directive)
-                            .count();
-                        let error_count = app
-                            .entries
-                            .iter()
-                            .filter(|e| e.entry_type == EntryType::Error)
-                            .count();
-                        let db_id = session_db.root_id().to_string();
-                        let name_line = match &app.session_name {
-                            Some(name) => format!("\nName: {name}"),
-                            None => String::new(),
-                        };
-                        app.entries.push(SessionEntry {
-                            sender: "system".to_string(),
-                            content: format!(
-                                "Session: {}{name_line}\nDatabase ID: {}\nTotal entries: {}\nMessages: {} | Directives: {} | Tool calls: {} | Errors: {}\nDebug mode: {}",
-                                app.transport_id,
-                                db_id,
-                                app.entries.len(),
-                                msg_count,
-                                directive_count,
-                                tool_count,
-                                error_count,
-                                if app.debug_mode { "on" } else { "off" },
-                            ),
-                            timestamp: chrono::Utc::now(),
-                            entry_type: EntryType::Message,
-                        });
-                        return None;
-                    }
-                    "/raw" => {
-                        let mut raw = String::new();
-                        for (i, entry) in app.entries.iter().enumerate() {
-                            let ts = entry.timestamp.format("%H:%M:%S%.3f");
-                            let typ = format!("{:?}", entry.entry_type);
-                            let content_preview = if entry.content.len() > 80 {
-                                format!("{}...", &entry.content[..80])
-                            } else {
-                                entry.content.replace('\n', "\\n")
-                            };
-                            raw.push_str(&format!(
-                                "#{i:3} [{ts}] {typ:<12} {:<15} {content_preview}\n",
-                                entry.sender
-                            ));
-                        }
-                        app.entries.push(SessionEntry {
-                            sender: "system".to_string(),
-                            content: raw,
-                            timestamp: chrono::Utc::now(),
-                            entry_type: EntryType::Message,
-                        });
-                        return None;
-                    }
-                    "/debug" => {
-                        app.debug_mode = !app.debug_mode;
-                        return None;
-                    }
-                    _ => {}
-                }
-
-                // Regular message — write to session DB
-                let mut session = Session::new(
-                    crate::types::ConversationId(app.transport_id.clone()),
-                    session_db.clone(),
-                )
-                .await;
-                session
-                    .add_entry(SessionEntry {
-                        sender: "user".to_string(),
-                        content: text,
-                        timestamp: chrono::Utc::now(),
-                        entry_type: EntryType::Message,
-                    })
-                    .await;
-                app.waiting = true;
+                return parse_chat_line(app, &text, session_db);
             }
         }
         KeyCode::Char(c) => {
@@ -1055,8 +581,178 @@ async fn handle_chat_key(
     None
 }
 
+/// Parse a submitted line. Returns the ChatAction to take, if any.
+/// TUI-only behaviors (toggle debug, dump raw, clear display, help) are
+/// applied inline to `app` and return None.
+fn parse_chat_line(
+    app: &mut App,
+    text: &str,
+    session_db: &eidetica::Database,
+) -> Option<ChatAction> {
+    // Unified commands (dispatched through commands::dispatch)
+    match text {
+        "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
+        "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
+        "/share" => return Some(ChatAction::Dispatch(Command::Share)),
+        "/compact" => return Some(ChatAction::Dispatch(Command::Compact)),
+        "/schedules" => return Some(ChatAction::Dispatch(Command::ListSchedules)),
+        "/info" => return Some(ChatAction::Dispatch(Command::Info)),
+        "/print" => return Some(ChatAction::Dispatch(Command::Print)),
+        "/backends" => return Some(ChatAction::Dispatch(Command::ListBackends)),
+        "/new" => {
+            let tid = format!("tui:{}", uuid::Uuid::new_v4());
+            return Some(ChatAction::Dispatch(Command::SwitchSession(tid)));
+        }
+        "/name" => return Some(ChatAction::Dispatch(Command::ClearSessionName)),
+        "/role" => return Some(ChatAction::Dispatch(Command::Role(None))),
+        "/model" => return Some(ChatAction::Dispatch(Command::Model(None))),
+        _ => {}
+    }
+
+    if let Some(arg) = text.strip_prefix("/join ") {
+        let id = arg.trim().to_string();
+        if !id.is_empty() {
+            return Some(ChatAction::Dispatch(Command::SwitchSession(id)));
+        }
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/name ") {
+        let name = arg.trim().to_string();
+        if !name.is_empty() {
+            return Some(ChatAction::Dispatch(Command::NameSession(name)));
+        }
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/sync ") {
+        let ticket = arg.trim().to_string();
+        if !ticket.is_empty() {
+            return Some(ChatAction::Dispatch(Command::Sync(ticket)));
+        }
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/run ") {
+        let name = arg.trim().to_string();
+        if !name.is_empty() {
+            return Some(ChatAction::Dispatch(Command::TriggerSchedule(name)));
+        }
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/model ") {
+        let model = arg.trim().to_string();
+        if !model.is_empty() {
+            return Some(ChatAction::Dispatch(Command::Model(Some(model))));
+        }
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/role ") {
+        let rest = arg.trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let prompt = parts.next().map(|s| s.trim().to_string());
+        if !name.is_empty() {
+            return Some(ChatAction::Dispatch(Command::Role(Some((name, prompt)))));
+        }
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/backend ") {
+        let mut parts = arg.split_whitespace();
+        if let (Some(name), Some(url), Some(key)) = (parts.next(), parts.next(), parts.next()) {
+            return Some(ChatAction::Dispatch(Command::SetBackend {
+                name: name.to_string(),
+                url: url.to_string(),
+                api_key: key.to_string(),
+            }));
+        }
+        show_error(
+            app,
+            "Usage: /backend <name> <api_base> <api_key>".to_string(),
+        );
+        return None;
+    }
+
+    // TUI-only commands (handled inline, don't dispatch)
+    match text {
+        "/clear" => {
+            app.entries.clear();
+            app.scroll_offset = 0;
+            return None;
+        }
+        "/debug" => {
+            app.debug_mode = !app.debug_mode;
+            return None;
+        }
+        "/raw" => {
+            let mut raw = String::new();
+            for (i, entry) in app.entries.iter().enumerate() {
+                let ts = entry.timestamp.format("%H:%M:%S%.3f");
+                let typ = format!("{:?}", entry.entry_type);
+                let content_preview = if entry.content.len() > 80 {
+                    format!("{}...", &entry.content[..80])
+                } else {
+                    entry.content.replace('\n', "\\n")
+                };
+                raw.push_str(&format!(
+                    "#{i:3} [{ts}] {typ:<12} {:<15} {content_preview}\n",
+                    entry.sender
+                ));
+            }
+            show_system_msg(app, raw);
+            return None;
+        }
+        "/help" | "/?" => {
+            show_system_msg(app, help_text(session_db));
+            return None;
+        }
+        _ => {}
+    }
+
+    // Unknown command starting with '/' — refuse rather than sending to agent
+    if text.starts_with('/') {
+        show_error(
+            app,
+            format!("Unknown command: {text}. Type /help for available commands."),
+        );
+        return None;
+    }
+
+    // Regular message
+    Some(ChatAction::SendMessage(text.to_string()))
+}
+
+fn help_text(_session_db: &eidetica::Database) -> String {
+    [
+        "Commands:",
+        "  /sessions, /s         — open session picker",
+        "  /new                  — create a new session",
+        "  /join <id>            — switch to session by name, DB ID, or transport ID",
+        "  /name [<alias>]       — set (or clear, if no arg) a session alias",
+        "  /info                 — show current session info",
+        "  /share                — generate shareable ticket for current session",
+        "  /sync <ticket>        — sync a remote session via ticket",
+        "  /compact              — summarize and compact conversation history",
+        "  /print                — dump the transcript",
+        "  /model [<model>]      — show or set the model for this session",
+        "  /role [<name> [<prompt>]] — show, select, or define a role",
+        "  /backend <name> <url> <key> — add a custom backend for this session",
+        "  /backends             — list known backends and models",
+        "  /schedules            — list configured schedules",
+        "  /run <name>           — trigger a schedule immediately",
+        "  /clear                — clear display (entries still in DB)",
+        "  /raw                  — dump raw entry data for debugging",
+        "  /debug                — toggle debug mode (Ctrl+D)",
+        "  /help, /?             — this help",
+        "  /quit, /exit, /q      — exit",
+        "",
+        "Keys:",
+        "  Ctrl+D                — toggle debug mode (shows timestamps, types)",
+        "  Ctrl+C                — quit",
+        "  Up/Down, PageUp/Dn    — scroll messages",
+    ]
+    .join("\n")
+}
+
 /// Handle a key event in session picker mode.
-/// Returns Some(transport_id) if a session was selected.
+/// Returns Some(identifier) if a session was selected.
 fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
     match key.code {
         KeyCode::Up => {

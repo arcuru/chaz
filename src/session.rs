@@ -2,11 +2,11 @@ use crate::agent::{Agent, AgentRegistry};
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::store::Table;
 use eidetica::Database;
+use eidetica::store::Table;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info};
 
 /// Type of session entry. Participants (users and agents alike) write entries

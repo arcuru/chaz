@@ -1,5 +1,6 @@
 mod agent;
 mod backends;
+mod commands;
 mod config;
 mod context;
 mod defaults;
@@ -267,7 +268,8 @@ async fn main() -> anyhow::Result<()> {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
         gateway.run(server).await
     } else {
-        let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
+        let gateway =
+            gateway::matrix::MatrixGateway::new(config, secret_store)?.with_scheduler(scheduler);
         gateway.run(server).await
     };
 

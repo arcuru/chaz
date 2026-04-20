@@ -1,18 +1,25 @@
+//! Matrix-specific gateway commands.
+//!
+//! Commands that have a cross-transport analogue (model/role/compact/share/…)
+//! are handled by `crate::commands::dispatch`. This module keeps only the
+//! Matrix-specific glue: rate limiting, backend selection for a room, legacy
+//! history reconstruction for `send`/`rename`, and the `rename`/`send` bodies.
+
 use crate::backends::{BackendManager, ChatContext, Message};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{get_role, get_role_names, RoleDetails};
+use crate::role::{RoleDetails, get_role};
 use crate::security::SecretStore;
 use crate::session::SessionRegistry;
 
 use headjack::*;
 use matrix_sdk::{
+    Room, RoomMemberships,
     room::MessagesOptions,
     ruma::{
-        events::room::message::{MessageType, RoomMessageEventContent},
         OwnedUserId,
+        events::room::message::{MessageType, RoomMessageEventContent},
     },
-    Room, RoomMemberships,
 };
 use openai_api_rs::v1::chat_completion::MessageRole;
 use regex::Regex;
@@ -63,95 +70,7 @@ pub async fn rate_limit(
     true
 }
 
-/// List the available models
-pub async fn list_models(
-    _: OwnedUserId,
-    _: String,
-    room: Room,
-    config: &Config,
-    secrets: &SecretStore,
-    registry: &SessionRegistry,
-) -> Result<(), ()> {
-    let context = get_context(&room, config, secrets, registry).await.unwrap();
-    let backends = get_backend(&room, config, secrets, registry).await;
-    let response = format!(
-        "!chaz Current Model: {}\n\nKnown Backends:\n{}\n\nKnown Models:\n{}",
-        context
-            .model
-            .unwrap_or(backends.default_model().unwrap_or("unknown".to_string())),
-        backends.list_known_backends().join("\n"),
-        backends.list_known_models().join("\n")
-    );
-    room.send(RoomMessageEventContent::notice_plain(response))
-        .await
-        .unwrap();
-    Ok(())
-}
-
-/// Control the roles
-pub async fn set_role(
-    _: OwnedUserId,
-    text: String,
-    room: Room,
-    config: &Config,
-    secrets: &SecretStore,
-    registry: &SessionRegistry,
-) -> Result<(), ()> {
-    let room_id = room.room_id().to_string();
-    let mut words = text.split_whitespace().skip(2);
-    if let Some(name) = words.next() {
-        let custom_prompt = words
-            .next()
-            .map(|prompt| words.fold(prompt.to_string(), |acc, x| format!("{} {}", acc, x)));
-        if let Err(e) = registry
-            .update_binding(&room_id, |b| {
-                b.role_name = Some(name.to_string());
-                if let Some(ref prompt) = custom_prompt {
-                    b.role_prompt = Some(prompt.clone());
-                }
-            })
-            .await
-        {
-            error!("Failed to set role: {e}");
-        }
-        room.send(RoomMessageEventContent::notice_plain(format!(
-            "!chaz Role set to \"{}\"",
-            name
-        )))
-        .await
-        .unwrap();
-    } else {
-        let context = get_context(&room, config, secrets, registry).await?;
-        let config_roles = get_role_names(config.roles.clone());
-        let default_roles = get_role_names(DEFAULT_CONFIG.roles.clone());
-        let current_role = {
-            if let Some(role) = context.role {
-                role.name
-            } else {
-                "unknown".to_string()
-            }
-        };
-        let mut response_parts = vec![format!("!chaz Current Role: {}", current_role)];
-
-        if !config_roles.is_empty() {
-            response_parts.push(format!(
-                "\n\nConfigured Roles:\n{}",
-                config_roles.join("\n")
-            ));
-        }
-
-        if !default_roles.is_empty() {
-            response_parts.push(format!("\n\nBuiltin Roles:\n{}", default_roles.join("\n")));
-        }
-        let response = response_parts.join("");
-        room.send(RoomMessageEventContent::notice_plain(response))
-            .await
-            .unwrap();
-    }
-    Ok(())
-}
-
-/// Send a message without context
+/// Send a message without context (Matrix-only legacy command).
 pub async fn send(
     sender: matrix_sdk::ruma::OwnedUserId,
     text: String,
@@ -198,112 +117,8 @@ pub async fn send(
     Ok(())
 }
 
-/// Add a backend provider for this session
-pub async fn set_backend(
-    _: OwnedUserId,
-    text: String,
-    room: Room,
-    secrets: &SecretStore,
-    registry: &SessionRegistry,
-) -> Result<(), ()> {
-    let room_id = room.room_id().to_string();
-    let mut split = text.split_whitespace();
-    split.next();
-    split.next();
-    if let (Some(name), Some(url), Some(token)) = (split.next(), split.next(), split.next()) {
-        let ref_id = format!("session:{room_id}:{name}");
-        secrets.insert(ref_id.clone(), token.to_string()).await;
-        if let Err(e) = registry
-            .update_binding(&room_id, |b| {
-                b.backend_name = Some(name.to_string());
-                b.backend_url = Some(url.to_string());
-                b.backend_key_ref = Some(ref_id.clone());
-            })
-            .await
-        {
-            error!("Failed to set backend: {e}");
-        }
-        room.send(RoomMessageEventContent::notice_plain(format!(
-            "!chaz Successfully added backend {}",
-            name
-        )))
-        .await
-        .unwrap();
-    } else {
-        room.send(RoomMessageEventContent::notice_plain(
-            "!chaz Error: invalid arguments. Usage: !chaz backend <name> <api_base> <api_key>",
-        ))
-        .await
-        .unwrap();
-    }
-    Ok(())
-}
-
-/// Set the model to use for this chat
-pub async fn set_model(
-    sender: OwnedUserId,
-    text: String,
-    room: Room,
-    secrets: &SecretStore,
-    registry: &SessionRegistry,
-) -> Result<(), ()> {
-    let room_id = room.room_id().to_string();
-    let model = text.split_whitespace().nth(2);
-    if let Some(model) = model {
-        let backend = get_backend_from_binding(&room, secrets, registry).await;
-        if backend.is_known_model(model) {
-            let response = format!("!chaz Model set to \"{}\"", model);
-            room.send(RoomMessageEventContent::notice_plain(response))
-                .await
-                .unwrap();
-        } else if let Err(e) = backend.validate_model(model) {
-            let response = format!("!chaz Error: {}", e);
-            room.send(RoomMessageEventContent::notice_plain(response))
-                .await
-                .unwrap();
-        } else {
-            let response = format!(
-                "!chaz Model {} is unknown, but may be valid. Please manually verify that it is supported by your desired backend.",
-                model
-            );
-            room.send(RoomMessageEventContent::notice_plain(response))
-                .await
-                .unwrap();
-        }
-        if let Err(e) = registry
-            .update_binding(&room_id, |b| {
-                b.model = Some(model.to_string());
-            })
-            .await
-        {
-            error!("Failed to set model: {e}");
-        }
-    } else {
-        list_models_default(sender, text, room, secrets, registry).await?;
-    }
-    Ok(())
-}
-
-/// List models fallback for set_model (no config available in old-style command handler)
-async fn list_models_default(
-    _: OwnedUserId,
-    _: String,
-    room: Room,
-    secrets: &SecretStore,
-    registry: &SessionRegistry,
-) -> Result<(), ()> {
-    let backends = get_backend_from_binding(&room, secrets, registry).await;
-    let response = format!(
-        "!chaz Known Backends:\n{}\n\nKnown Models:\n{}",
-        backends.list_known_backends().join("\n"),
-        backends.list_known_models().join("\n")
-    );
-    room.send(RoomMessageEventContent::notice_plain(response))
-        .await
-        .unwrap();
-    Ok(())
-}
-
+/// Rename the Matrix room and set its topic based on the conversation
+/// (Matrix-only — operates on the room, not the session).
 pub async fn rename(
     sender: OwnedUserId,
     _: String,
@@ -423,26 +238,6 @@ pub async fn get_backend(
     }
 }
 
-/// Returns the backend from session binding only (for commands without config access)
-async fn get_backend_from_binding(
-    room: &Room,
-    secrets: &SecretStore,
-    registry: &SessionRegistry,
-) -> BackendManager {
-    let room_id = room.room_id().to_string();
-    let mut backends = Vec::new();
-    if let Some(binding) = registry.get_binding(&room_id).await {
-        if let Some(backend) = get_binding_backend(&binding) {
-            backends.push(backend);
-        }
-    }
-    if backends.is_empty() {
-        BackendManager::new(&None, secrets.clone())
-    } else {
-        BackendManager::new(&Some(backends), secrets.clone())
-    }
-}
-
 /// Try to clean up the response from the model containing a summary
 fn clean_summary_response(response: &str, max_length: Option<usize>) -> String {
     let response = {
@@ -460,7 +255,7 @@ fn clean_summary_response(response: &str, max_length: Option<usize>) -> String {
 }
 
 /// Gets the context of the current conversation from Matrix room history.
-/// Used by legacy commands (print, send, rename, role, list) that bypass the router.
+/// Used by legacy commands (send, rename) that bypass the session DB.
 pub async fn get_context(
     room: &Room,
     config: &Config,

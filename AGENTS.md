@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phases 0–13 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience). Recent: MCP Streamable HTTP transport, MCP tool directory scanning, dynamic tool re-discovery (tools/list_changed), loop detection (tool call fingerprinting), LLM request timeout, retry with exponential backoff.
+**Status**: Active development — Phases 0–14 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience, gateway command unification). Recent: transport-neutral `commands::dispatch` — both TUI and Matrix now share one dispatch path for session ops (sessions/info/name/share/sync/compact/print/schedules/run/model/role/backend), MCP Streamable HTTP transport, MCP tool directory scanning, dynamic tool re-discovery (tools/list_changed), loop detection, LLM request timeout, retry with exponential backoff.
 
 ## Build & Development Commands
 
@@ -30,6 +30,7 @@ Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. 
 
 ```
 main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
+commands.rs          Transport-neutral session commands: Command enum, CommandContext, CommandOutcome, dispatch(). Gateways parse their syntax → Command → dispatch → render.
 config.rs            Config, Backend (api_key_ref → SecretStore), AgentConfig, SecurityConfig types
 types.rs             ConversationId (gateway-agnostic)
 agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-shared, YAML-configurable)
@@ -59,10 +60,10 @@ server.rs            Callback-driven Server: registers on_local_write on session
 gateway/
   mod.rs             Gateway trait, ApprovalExchange/ApprovalDecision
   matrix/
-    mod.rs           MatrixGateway — lifecycle, sync, retry, text handler
-    commands.rs      Matrix-specific commands (!chaz model/role/backend/list/etc.)
+    mod.rs           MatrixGateway — lifecycle, sync, retry, text handler, `dispatch_in_room` helper. Parses `!chaz <cmd>` into Command → commands::dispatch → renders outcome to room.
+    commands.rs      Matrix-specific glue: rate_limit, room backend resolution, `send` (no-context), `rename` (renames Matrix room)
     history.rs       Room history reading for backfill
-  tui.rs             TuiGateway — ratatui async terminal app, Elm architecture (App/Action/ui)
+  tui.rs             TuiGateway — ratatui async terminal app, Elm architecture (App/Action/ui). Parses `/<cmd>` into Command → commands::dispatch → renders outcome. TUI-only: picker modal, /debug, /raw, /clear (display).
 error.rs             Structured error types: top-level Error enum, LlmError (retryable/permanent classification, thiserror)
 backends.rs          BackendManager (model-based routing), LLMBackend trait, ChatContext (legacy: Matrix commands, /compact), Message
 openai.rs            OpenAI-compatible backend implementing LLMBackend
@@ -94,9 +95,9 @@ defaults.rs          Built-in default config and roles
 - **Agent registry**: YAML-configurable agents with per-agent tool visibility (ScopedTools with transitive narrowing)
 - **Backend abstraction**: LLMBackend trait with tool support; runtime dispatches through BackendManager. BackendManager carries SecretStore for host-boundary key injection. Backend methods return `Result<_, LlmError>` with structured error classification (retryable/permanent/auth/config). Runtime converts to `String` at the server boundary. All LLM HTTP calls wrapped in `tokio::time::timeout` (configurable per backend, default 120s). Transient errors (429, 5xx, timeout, network) retried with exponential backoff (1s–30s, honors `Retry-After`, configurable `max_retries` default 3).
 - **Secret store**: SecretStore backed by eidetica DocStore ("secrets" subtree) with in-memory HashMap cache. API keys extracted from config at startup, persisted to DocStore, only rewritten if changed. Backend structs carry opaque `api_key_ref` IDs, never raw keys. Secrets resolved at HTTP client boundary (`OpenAI::build_client`). Supports env var references: `"${VAR_NAME}"` in config.
-- **Matrix commands**: `!chaz model/role/backend/list/clear/rename/send/print` handled directly in MatrixGateway, bypass the server
+- **Command dispatch**: User-facing session commands are parsed to a transport-neutral `commands::Command`, run through `commands::dispatch(cmd, ctx) -> CommandOutcome`, and rendered by the gateway. Both TUI (`/<cmd>`) and Matrix (`!chaz <cmd>`) share the same command set: `sessions`, `info`, `name`, `share`, `sync`, `compact`, `print`, `schedules`, `run`, `model`, `role`, `backend`, `backends`. `CommandContext` carries `{server, scheduler, secrets, backend, transport_id, session_db, current_agent, session_name, config_roles, default_role}`. `CommandOutcome` variants: `Text` / `Error` / `SessionsList` / `SessionSwitched(Box<…>)` / `Quit`. Transport-specific extras stay in the gateway: TUI has `/debug`, `/raw`, `/clear` (display), picker modal, `/quit`; Matrix has `party`, `rename` (room), `send` (no-context), `clear` (history marker), `approve`/`deny`.
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
-- **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Supports session picker, debug mode (Ctrl+D), session sharing (/share, /sync), and slash commands (/sessions, /new, /join, /info, /raw, /clear). Renders all entry types with distinct styles. Tool approval inline with y/n/a keys.
+- **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Parses slash commands into `Command` and routes through `commands::dispatch`; `SessionsList` outcome opens the picker modal, `SessionSwitched` re-registers session with approval/notify channels. Debug mode (Ctrl+D), inline tool approval (y/n/a).
 - **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll. Matrix surfaces approval requests as room messages with reaction support (✅❌⏭) and text commands (!chaz approve/deny).
 - **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM.
 - **Tool profiles**: Named configurations (in `tool_profiles:` config) controlling tool definition presentation. PresentationMode: Full (default), Brief (first sentence, no param descriptions), Summary (name only), Hidden. Supports glob prefix matching (`"filesystem.*": summary`). Configured per agent (`tool_profile:`), per preset, or per session. Applied at `ScopedTools::definitions()` call.
@@ -240,7 +241,9 @@ nix develop .# -c cargo run -- --config ~/chaz-test/config.yaml --tui
 nix develop .# -c cargo run -- --config ~/chaz-test/config-tui.yaml --tui
 ```
 
-TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/name <alias>` (name session), `/join <name|id>` (switch), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/compact` (summarize and compact context), `/debug` (toggle timestamps/types), `/raw` (dump entries).
+TUI commands: `/help` for full list. Key ones: `/sessions` (picker), `/name <alias>` (name session), `/join <name|id>` (switch), `/share` (generate ticket), `/sync <ticket>` (sync remote session), `/compact` (summarize and compact context), `/model`, `/role`, `/backend`, `/backends`, `/schedules`, `/run`, `/info`, `/print`, `/debug` (toggle timestamps/types), `/raw` (dump entries).
+
+Matrix has the same set of session commands under `!chaz <cmd>` (sessions, info, name, share, sync, compact, print, schedules, run, model, role, backend, backends/list). Matrix-only: `!chaz party/rename/send/clear/approve/deny`. TUI-only: `/debug`, `/raw`, `/clear` (display), `/quit`, `/new`, `/join`, picker modal.
 
 ### Session sharing between instances
 

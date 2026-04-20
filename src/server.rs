@@ -26,7 +26,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.

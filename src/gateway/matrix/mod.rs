@@ -1,22 +1,26 @@
 mod commands;
 mod history;
 
+use crate::commands::{self as shared_commands, Command, CommandContext, CommandOutcome};
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
+use crate::role::get_role_names;
+use crate::scheduler::Scheduler;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 
 use headjack::*;
+use matrix_sdk::Room;
+use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::ruma::OwnedEventId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{error, info};
 
-use commands::{get_backend, get_context, rate_limit};
+use commands::{get_backend, rate_limit};
 use history::read_room_history;
 
 /// Pending approval requests keyed by the Matrix event ID of the approval message.
@@ -51,6 +55,7 @@ fn make_room_approval_tx(
 pub struct MatrixGateway {
     config: Config,
     secrets: SecretStore,
+    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl MatrixGateway {
@@ -61,8 +66,106 @@ impl MatrixGateway {
         if config.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
-        Ok(Self { config, secrets })
+        Ok(Self {
+            config,
+            secrets,
+            scheduler: None,
+        })
     }
+
+    pub fn with_scheduler(mut self, scheduler: Option<Arc<Scheduler>>) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+}
+
+/// Run a transport-neutral command in the context of a Matrix room:
+/// builds a `CommandContext` scoped to the room's session, dispatches, and
+/// renders the outcome as a room message.
+async fn dispatch_in_room(
+    cmd: Command,
+    room: Room,
+    server: Arc<Server>,
+    scheduler: Option<Arc<Scheduler>>,
+    config: Arc<Config>,
+    secrets: SecretStore,
+) -> anyhow::Result<()> {
+    let room_id = room.room_id().to_string();
+
+    let backend = get_backend(&room, &config, &secrets, server.registry()).await;
+    let (_conv_id, session_db) = server.registry().get_or_create_session_db(&room_id).await?;
+    let agent = server.registry().resolve_agent(&room_id, None).await;
+    let session_name = server
+        .registry()
+        .get_binding(&room_id)
+        .await
+        .and_then(|b| b.name);
+    let config_roles = Some(get_role_names(config.roles.clone()));
+
+    let ctx = CommandContext {
+        server: &server,
+        scheduler: scheduler.as_ref(),
+        secrets: &secrets,
+        backend: &backend,
+        transport_id: &room_id,
+        session_db: &session_db,
+        current_agent: &agent.name,
+        session_name: session_name.as_deref(),
+        config_roles,
+        default_role: config.role.as_deref(),
+    };
+
+    let outcome = shared_commands::dispatch(cmd, &ctx).await;
+    render_outcome_to_room(&room, outcome).await;
+    Ok(())
+}
+
+/// Render a dispatch outcome into a Matrix room as a notice / text message.
+async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
+    let text = match outcome {
+        CommandOutcome::Text(t) => t,
+        CommandOutcome::Error(e) => format!("!chaz Error: {e}"),
+        CommandOutcome::SessionsList(list) => {
+            if list.is_empty() {
+                "No sessions found.".to_string()
+            } else {
+                let mut s = String::from("Sessions:");
+                for info in &list {
+                    let agent = info.agent_name.as_deref().unwrap_or("default");
+                    let name = info
+                        .name
+                        .as_deref()
+                        .map(|n| format!(" \"{n}\""))
+                        .unwrap_or_default();
+                    s.push_str(&format!(
+                        "\n  {}{} ({}, {} entries)",
+                        info.transport_id, name, agent, info.entry_count
+                    ));
+                    if let Some(preview) = &info.last_message {
+                        s.push_str(&format!("\n    {preview}"));
+                    }
+                }
+                s
+            }
+        }
+        CommandOutcome::SessionSwitched(_) => {
+            "!chaz Session switching is not supported from Matrix rooms — each room has its own session.".to_string()
+        }
+        CommandOutcome::Quit => return,
+    };
+
+    if let Err(e) = room.send(RoomMessageEventContent::notice_plain(text)).await {
+        tracing::error!("Failed to send command response: {e}");
+    }
+}
+
+/// Parse the argument portion of a Matrix command.
+/// `text` looks like `!chaz <cmd> <args...>` — returns the joined args, trimmed.
+fn matrix_args(text: &str) -> String {
+    text.split_whitespace()
+        .skip(2)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Gateway for MatrixGateway {
@@ -248,42 +351,195 @@ impl Gateway for MatrixGateway {
         )
         .await;
 
-        // Wrap registry in Arc for sharing across command closures
-        let registry = server.registry_arc();
+        let scheduler = self.scheduler.clone();
+        let message_counts: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        {
-            let config = config.clone();
-            let secrets = self.secrets.clone();
-            let registry = registry.clone();
-            bot.register_text_command(
-                "print",
-                None,
-                Some("Print the conversation".to_string()),
-                move |_, _, room| {
-                    let config = config.clone();
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    async move {
-                        let context = get_context(&room, &config, &secrets, &registry)
-                            .await
-                            .unwrap();
-                        let content =
-                            RoomMessageEventContent::notice_plain(context.string_prompt());
-                        room.send(content).await.unwrap();
-                        Ok(())
-                    }
-                },
-            )
-            .await;
+        // Helper to register a simple dispatch-based command.
+        macro_rules! register_shared {
+            ($name:expr, $usage:expr, $desc:expr, |$text_ident:ident| $cmd_expr:expr) => {{
+                let server = server.clone();
+                let scheduler = scheduler.clone();
+                let config = config.clone();
+                let secrets = self.secrets.clone();
+                bot.register_text_command(
+                    $name,
+                    $usage,
+                    $desc.to_string(),
+                    move |_, $text_ident, room| {
+                        let server = server.clone();
+                        let scheduler = scheduler.clone();
+                        let config = config.clone();
+                        let secrets = secrets.clone();
+                        let cmd: Option<Command> = $cmd_expr;
+                        async move {
+                            if let Some(cmd) = cmd {
+                                if let Err(e) =
+                                    dispatch_in_room(cmd, room, server, scheduler, config, secrets)
+                                        .await
+                                {
+                                    tracing::error!("Command dispatch failed: {e}");
+                                }
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+            }};
         }
 
-        let message_counts: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        // --- Session ops (parity with TUI) ---
+        register_shared!(
+            "sessions",
+            "".to_string(),
+            "List all known sessions",
+            |_t| { Some(Command::ListSessions) }
+        );
+        register_shared!("info", "".to_string(), "Show current session info", |_t| {
+            Some(Command::Info)
+        });
+        register_shared!(
+            "name",
+            "[<alias>]".to_string(),
+            "Set (or clear, with no arg) a human-friendly alias for this session",
+            |text| {
+                let arg = matrix_args(&text);
+                if arg.trim().is_empty() {
+                    Some(Command::ClearSessionName)
+                } else {
+                    Some(Command::NameSession(arg.trim().to_string()))
+                }
+            }
+        );
+        register_shared!(
+            "share",
+            "".to_string(),
+            "Generate a shareable ticket for the current session",
+            |_t| { Some(Command::Share) }
+        );
+        register_shared!(
+            "sync",
+            "<ticket>".to_string(),
+            "Sync a remote session via ticket URL",
+            |text| {
+                let arg = matrix_args(&text);
+                if arg.trim().is_empty() {
+                    None
+                } else {
+                    Some(Command::Sync(arg.trim().to_string()))
+                }
+            }
+        );
+        register_shared!(
+            "compact",
+            "".to_string(),
+            "Summarize and compact conversation history",
+            |_t| { Some(Command::Compact) }
+        );
+        register_shared!("print", "".to_string(), "Print the transcript", |_t| {
+            Some(Command::Print)
+        });
+
+        // --- Scheduler ---
+        register_shared!(
+            "schedules",
+            "".to_string(),
+            "List configured schedules",
+            |_t| { Some(Command::ListSchedules) }
+        );
+        register_shared!(
+            "run",
+            "<name>".to_string(),
+            "Trigger a schedule immediately",
+            |text| {
+                let arg = matrix_args(&text);
+                if arg.trim().is_empty() {
+                    None
+                } else {
+                    Some(Command::TriggerSchedule(arg.trim().to_string()))
+                }
+            }
+        );
+
+        // --- LLM config ---
+        register_shared!(
+            "model",
+            "[<model>]".to_string(),
+            "Show or set the model",
+            |text| {
+                let arg = matrix_args(&text);
+                let arg = arg.trim();
+                Some(Command::Model(if arg.is_empty() {
+                    None
+                } else {
+                    Some(arg.to_string())
+                }))
+            }
+        );
+        register_shared!(
+            "role",
+            "[<role> [<prompt>]]".to_string(),
+            "Show, select, or define a role",
+            |text| {
+                let rest = matrix_args(&text);
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    Some(Command::Role(None))
+                } else {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let name = parts.next().unwrap_or("").trim().to_string();
+                    let prompt = parts.next().map(|s| s.trim().to_string());
+                    Some(Command::Role(Some((name, prompt))))
+                }
+            }
+        );
+        register_shared!(
+            "backend",
+            "<name> <api_base> <api_key>".to_string(),
+            "Register a custom backend for this session",
+            |text| {
+                let mut parts = text.split_whitespace().skip(2);
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(n), Some(u), Some(k)) => Some(Command::SetBackend {
+                        name: n.to_string(),
+                        url: u.to_string(),
+                        api_key: k.to_string(),
+                    }),
+                    _ => None,
+                }
+            }
+        );
+        register_shared!(
+            "backends",
+            "".to_string(),
+            "List known backends + models",
+            |_t| { Some(Command::ListBackends) }
+        );
+        register_shared!(
+            "list",
+            "".to_string(),
+            "List available models (alias of backends)",
+            |_t| { Some(Command::ListBackends) }
+        );
+
+        // --- Matrix-only commands ---
+        bot.register_text_command(
+            "party",
+            "".to_string(),
+            "Party!".to_string(),
+            |_, _, room| async move {
+                let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
+                room.send(content).await.unwrap();
+                Ok(())
+            },
+        )
+        .await;
 
         {
             let config = config.clone();
             let counts = message_counts.clone();
             let secrets = self.secrets.clone();
-            let registry = registry.clone();
+            let registry = server.registry_arc();
             bot.register_text_command(
                 "send",
                 "<message>".to_string(),
@@ -295,83 +551,6 @@ impl Gateway for MatrixGateway {
                     let registry = registry.clone();
                     async move {
                         commands::send(sender, text, room, &config, &counts, &secrets, &registry)
-                            .await
-                    }
-                },
-            )
-            .await;
-        }
-
-        {
-            let secrets = self.secrets.clone();
-            let registry = registry.clone();
-            bot.register_text_command(
-                "model",
-                "<model>".to_string(),
-                "Select the model to use".to_string(),
-                move |sender, text, room| {
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    async move {
-                        commands::set_model(sender, text, room, &secrets, &registry).await
-                    }
-                },
-            )
-            .await;
-        }
-
-        {
-            let secrets = self.secrets.clone();
-            let registry = registry.clone();
-            bot.register_text_command(
-                "backend",
-                "<name> <api_base> <api_key>".to_string(),
-                "Manually enter an OpenAI Compatible Backend".to_string(),
-                move |sender, text, room| {
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    async move {
-                        commands::set_backend(sender, text, room, &secrets, &registry).await
-                    }
-                },
-            )
-            .await;
-        }
-
-        {
-            let config = config.clone();
-            let secrets = self.secrets.clone();
-            let registry = registry.clone();
-            bot.register_text_command(
-                "role",
-                "[<role>] [<prompt>]".to_string(),
-                "Get the role info, set the role, or define a new role".to_string(),
-                move |sender, text, room| {
-                    let config = config.clone();
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    async move {
-                        commands::set_role(sender, text, room, &config, &secrets, &registry).await
-                    }
-                },
-            )
-            .await;
-        }
-
-        {
-            let config = config.clone();
-            let secrets = self.secrets.clone();
-            let registry = registry.clone();
-            bot.register_text_command(
-                "list",
-                "".to_string(),
-                "List available models".to_string(),
-                move |sender, text, room| {
-                    let config = config.clone();
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    async move {
-                        commands::list_models(sender, text, room, &config, &secrets, &registry)
                             .await
                     }
                 },
@@ -398,7 +577,7 @@ impl Gateway for MatrixGateway {
             let config = config.clone();
             let counts = message_counts.clone();
             let secrets = self.secrets.clone();
-            let registry = registry.clone();
+            let registry = server.registry_arc();
             bot.register_text_command(
                 "rename",
                 "".to_string(),
