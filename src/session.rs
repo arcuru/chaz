@@ -67,12 +67,17 @@ pub struct AgentRef {
 /// `agent_name` is still read for backward compatibility and as a fallback
 /// when `agents` is empty — Stage 3 keeps both; later stages remove
 /// `agent_name` once all sessions are migrated.
+///
+/// `host_agent_db_id` designates which agent answers when no @mention
+/// pins the turn (Stage 4 turn-taking). Must be the `db_id` of an entry
+/// in `agents`; set via `/agent host <ref>`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub name: Option<String>,
     pub agent_name: Option<String>,
     #[serde(default)]
     pub agents: Vec<AgentRef>,
+    pub host_agent_db_id: Option<String>,
     pub model: Option<String>,
     pub role_name: Option<String>,
     pub role_prompt: Option<String>,
@@ -243,6 +248,7 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         name: store.get_string("name").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
         agents,
+        host_agent_db_id: store.get_string("host_agent_db_id").await.ok(),
         model: store.get_string("model").await.ok(),
         role_name: store.get_string("role_name").await.ok(),
         role_prompt: store.get_string("role_prompt").await.ok(),
@@ -271,6 +277,12 @@ where
         let json = serde_json::to_string(&current.agents)?;
         store.set_string("agents", json).await?;
     }
+    write_field(
+        &store,
+        "host_agent_db_id",
+        current.host_agent_db_id.as_deref(),
+    )
+    .await?;
     write_field(&store, "model", current.model.as_deref()).await?;
     write_field(&store, "role_name", current.role_name.as_deref()).await?;
     write_field(&store, "role_prompt", current.role_prompt.as_deref()).await?;
@@ -818,13 +830,34 @@ impl SessionRegistry {
         session_db: &Database,
         agent_index: &crate::agent_index::AgentIndex,
     ) -> Option<Agent> {
+        let authorized = self.authorized_agents(session_db, agent_index).await;
+        authorized
+            .into_iter()
+            .find_map(|e| self.agents.get(&e.display_name).cloned())
+    }
+
+    /// Return every agent that (a) has an Active Write key on this session
+    /// and (b) exists in the peer's agent_index. Used by the mention-aware
+    /// turn-taking router as the candidate set.
+    async fn authorized_agents(
+        &self,
+        session_db: &Database,
+        agent_index: &crate::agent_index::AgentIndex,
+    ) -> Vec<crate::agent_index::AgentIndexEntry> {
         use eidetica::auth::crypto::PublicKey;
         use eidetica::auth::types::KeyStatus;
 
-        let settings = session_db.get_settings().await.ok()?;
-        let auth = settings.auth_snapshot().await.ok()?;
-        let keys = auth.get_all_keys().ok()?;
+        let Ok(settings) = session_db.get_settings().await else {
+            return Vec::new();
+        };
+        let Ok(auth) = settings.auth_snapshot().await else {
+            return Vec::new();
+        };
+        let Ok(keys) = auth.get_all_keys() else {
+            return Vec::new();
+        };
 
+        let mut out = Vec::new();
         for (pubkey_str, key_info) in keys {
             if !matches!(key_info.status(), KeyStatus::Active) {
                 continue;
@@ -835,15 +868,102 @@ impl SessionRegistry {
             let Ok(pubkey) = PublicKey::from_prefixed_string(&pubkey_str) else {
                 continue;
             };
-            let Ok(Some(entry)) = agent_index.find_by_pubkey(&pubkey).await else {
-                continue;
-            };
-            if let Some(agent) = self.agents.get(&entry.display_name) {
-                return Some(agent.clone());
+            if let Ok(Some(entry)) = agent_index.find_by_pubkey(&pubkey).await {
+                out.push(entry);
             }
         }
-        None
+        out
     }
+
+    /// Mention-aware routing (Stage 4a). Turn precedence:
+    /// 1. Explicit name override (scheduler / `/run`).
+    /// 2. First `@<display_name>` token in `trigger_text` that matches an
+    ///    agent authorized on the session.
+    /// 3. `SessionMeta.host_agent_db_id` if it points at an authorized agent.
+    /// 4. First authorized agent on the session (Stage 3c behavior).
+    /// 5. Legacy `SessionMeta.agent_name`.
+    /// 6. Default agent.
+    pub async fn resolve_agent_for_entry(
+        &self,
+        session_db_id: &str,
+        override_name: Option<&str>,
+        agent_index: &crate::agent_index::AgentIndex,
+        trigger_text: Option<&str>,
+    ) -> Agent {
+        if let Some(name) = override_name {
+            if let Some(agent) = self.agents.get(name) {
+                return agent.clone();
+            }
+        }
+
+        let Ok((_conv_id, db)) = self.open_session(session_db_id).await else {
+            return self.agents.default_agent().clone();
+        };
+
+        let authorized = self.authorized_agents(&db, agent_index).await;
+
+        // (2) @mention.
+        if let Some(text) = trigger_text {
+            for mention in parse_mentions(text) {
+                if let Some(entry) = authorized
+                    .iter()
+                    .find(|e| e.display_name.eq_ignore_ascii_case(&mention))
+                {
+                    if let Some(agent) = self.agents.get(&entry.display_name) {
+                        return agent.clone();
+                    }
+                }
+            }
+        }
+
+        let meta = read_meta_from_db(&db).await;
+
+        // (3) designated host agent.
+        if let Some(host_id) = meta.host_agent_db_id.as_deref() {
+            if let Some(entry) = authorized.iter().find(|e| e.db_id.to_string() == host_id) {
+                if let Some(agent) = self.agents.get(&entry.display_name) {
+                    return agent.clone();
+                }
+            }
+        }
+
+        // (4) first authorized agent.
+        if let Some(entry) = authorized.first() {
+            if let Some(agent) = self.agents.get(&entry.display_name) {
+                return agent.clone();
+            }
+        }
+
+        // (5) legacy agent_name.
+        if let Some(name) = meta.agent_name.as_deref() {
+            if let Some(agent) = self.agents.get(name) {
+                return agent.clone();
+            }
+        }
+
+        self.agents.default_agent().clone()
+    }
+}
+
+/// Extract `@<token>` mentions from free-form text. Returns the tokens
+/// without the leading `@`, in appearance order. Tokens are split on
+/// whitespace; punctuation directly adjacent to a mention is trimmed
+/// from the tail (`@alpha,` → `alpha`).
+pub fn parse_mentions(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        let Some(rest) = token.strip_prefix('@') else {
+            continue;
+        };
+        let trimmed: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+            .collect();
+        if !trimmed.is_empty() {
+            out.push(trimmed);
+        }
+    }
+    out
 }
 
 /// Find or create a named eidetica database for a user.
@@ -1170,5 +1290,185 @@ mod tests {
 
         let meta = read_meta_from_db(&session_db).await;
         assert!(meta.agents.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 4a: mention-aware routing + host agent
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_mentions_basic() {
+        assert_eq!(
+            parse_mentions("hey @alpha can you help @beta?"),
+            vec!["alpha", "beta"]
+        );
+        assert!(parse_mentions("no mentions here").is_empty());
+        assert_eq!(parse_mentions("email a@b.com only"), Vec::<String>::new());
+        assert_eq!(parse_mentions("@alpha-bot,"), vec!["alpha-bot"]);
+    }
+
+    /// Build a registry with two declared agents (alpha, beta) — both exist
+    /// in the in-memory AgentRegistry so routing can resolve by display_name.
+    async fn make_registry_with_two_agents() -> (Instance, Arc<SessionRegistry>, AgentIndex) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+
+        let mk = |name: &str| crate::config::AgentConfig {
+            name: name.to_string(),
+            role: None,
+            model: None,
+            tools: None,
+            can_spawn: None,
+            allowed_callers: None,
+            max_iterations: None,
+            autonomous: false,
+            presets: None,
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: None,
+        };
+
+        let cfg = crate::config::Config {
+            homeserver_url: String::new(),
+            username: String::new(),
+            password: None,
+            allow_list: None,
+            message_limit: None,
+            room_size_limit: None,
+            state_dir: None,
+            chat_summary_model: None,
+            role: None,
+            roles: None,
+            backends: None,
+            agents: Some(vec![mk("alpha"), mk("beta")]),
+            security: None,
+            schedules: None,
+            mcp_servers: None,
+            tool_profiles: None,
+            mcp_server_dir: None,
+            context: None,
+        };
+        let agents = Arc::new(AgentRegistry::from_config(&cfg));
+        let registry = Arc::new(
+            SessionRegistry::new(instance.clone(), user, agents)
+                .await
+                .unwrap(),
+        );
+        let index = AgentIndex::new(registry.central_db().clone());
+        (instance, registry, index)
+    }
+
+    #[tokio::test]
+    async fn mention_routes_to_named_agent() {
+        let (_instance, registry, index) = make_registry_with_two_agents().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let alpha = make_agent_entry(&registry, "alpha").await;
+        let beta = make_agent_entry(&registry, "beta").await;
+        index.register(alpha.clone()).await.unwrap();
+        index.register(beta.clone()).await.unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &beta)
+            .await
+            .unwrap();
+
+        // Mentioning @beta should pick beta, even though alpha was attached first.
+        let resolved = registry
+            .resolve_agent_for_entry(&session_id, None, &index, Some("yo @beta what's up"))
+            .await;
+        assert_eq!(resolved.name, "beta");
+
+        // Mentioning @alpha picks alpha.
+        let resolved = registry
+            .resolve_agent_for_entry(&session_id, None, &index, Some("hey @alpha"))
+            .await;
+        assert_eq!(resolved.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn no_mention_falls_back_to_host_agent() {
+        let (_instance, registry, index) = make_registry_with_two_agents().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let alpha = make_agent_entry(&registry, "alpha").await;
+        let beta = make_agent_entry(&registry, "beta").await;
+        index.register(alpha.clone()).await.unwrap();
+        index.register(beta.clone()).await.unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &beta)
+            .await
+            .unwrap();
+
+        // Designate beta as host.
+        let beta_db_id = beta.db_id.to_string();
+        update_meta_on_db(&session_db, |m| {
+            m.host_agent_db_id = Some(beta_db_id.clone());
+        })
+        .await
+        .unwrap();
+
+        // Plain message (no @mention) should go to the host.
+        let resolved = registry
+            .resolve_agent_for_entry(&session_id, None, &index, Some("hello everyone"))
+            .await;
+        assert_eq!(resolved.name, "beta");
+    }
+
+    #[tokio::test]
+    async fn override_beats_mention() {
+        let (_instance, registry, index) = make_registry_with_two_agents().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let alpha = make_agent_entry(&registry, "alpha").await;
+        let beta = make_agent_entry(&registry, "beta").await;
+        index.register(alpha.clone()).await.unwrap();
+        index.register(beta.clone()).await.unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &beta)
+            .await
+            .unwrap();
+
+        // Even with @beta in the text, an explicit override should win.
+        let resolved = registry
+            .resolve_agent_for_entry(&session_id, Some("alpha"), &index, Some("@beta help"))
+            .await;
+        assert_eq!(resolved.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn unknown_mention_falls_through_to_first_authorized() {
+        let (_instance, registry, index) = make_registry_with_two_agents().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let alpha = make_agent_entry(&registry, "alpha").await;
+        index.register(alpha.clone()).await.unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+
+        // @gamma isn't attached; router should fall back to first authorized (alpha).
+        let resolved = registry
+            .resolve_agent_for_entry(&session_id, None, &index, Some("@gamma huh?"))
+            .await;
+        assert_eq!(resolved.name, "alpha");
     }
 }

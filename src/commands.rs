@@ -57,6 +57,9 @@ pub enum Command {
     AgentRemove(String),
     /// List agents currently attached to the session.
     AgentsList,
+    /// Designate the "host agent" — answers when no @mention pins a turn.
+    /// `Some(ref)` sets it; `None` clears it.
+    AgentSetHost(Option<String>),
 
     // --- Scheduler ---
     ListSchedules,
@@ -131,6 +134,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentAdd(r) => agent_add(&r, ctx).await,
         Command::AgentRemove(r) => agent_remove(&r, ctx).await,
         Command::AgentsList => agents_list(ctx).await,
+        Command::AgentSetHost(arg) => agent_set_host(arg.as_deref(), ctx).await,
         Command::ListSchedules => list_schedules(ctx).await,
         Command::TriggerSchedule(name) => trigger_schedule(&name, ctx).await,
         Command::Model(arg) => model(arg, ctx).await,
@@ -723,10 +727,60 @@ async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
             "No Living Agents attached to this session. Legacy agent: {fallback}"
         ));
     }
+    let host = meta.host_agent_db_id.as_deref();
     let lines: Vec<String> = meta
         .agents
         .iter()
-        .map(|a| format!("  {} ({})", a.display_name, a.db_id))
+        .map(|a| {
+            let marker = if host == Some(a.db_id.as_str()) {
+                " *host*"
+            } else {
+                ""
+            };
+            format!("  {}{} ({})", a.display_name, marker, a.db_id)
+        })
         .collect();
     CommandOutcome::Text(format!("Agents on this session:\n{}", lines.join("\n")))
+}
+
+async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
+
+    match arg {
+        None => {
+            if let Err(e) = session.update_meta(|m| m.host_agent_db_id = None).await {
+                return CommandOutcome::Error(format!("Failed to clear host agent: {e}"));
+            }
+            CommandOutcome::Text("Cleared host agent for this session".to_string())
+        }
+        Some(agent_ref) => {
+            let entry = match resolve_agent_ref(agent_ref, ctx).await {
+                Ok(e) => e,
+                Err(msg) => return CommandOutcome::Error(msg),
+            };
+
+            // Host must be attached — catch the "set host on un-attached agent" footgun.
+            let meta = crate::session::read_meta_from_db(ctx.session_db).await;
+            let db_id = entry.db_id.to_string();
+            if !meta.agents.iter().any(|a| a.db_id == db_id) {
+                return CommandOutcome::Error(format!(
+                    "Agent '{}' is not attached to this session. Attach it first with /agent add {}",
+                    entry.display_name, agent_ref
+                ));
+            }
+
+            let name = entry.display_name.clone();
+            if let Err(e) = session
+                .update_meta(move |m| m.host_agent_db_id = Some(db_id))
+                .await
+            {
+                return CommandOutcome::Error(format!("Failed to set host agent: {e}"));
+            }
+            CommandOutcome::Text(format!("Set host agent to '{name}'"))
+        }
+    }
 }

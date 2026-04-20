@@ -465,8 +465,8 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|list <name|db_id>".to_string(),
-            "Attach or detach an agent on this session",
+            "add|remove|host|list <name|db_id>".to_string(),
+            "Attach, detach, designate host, or list agents on this session",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -477,6 +477,11 @@ impl Gateway for MatrixGateway {
                     "remove" | "rm" if !rest.is_empty() => {
                         Some(Command::AgentRemove(rest.to_string()))
                     }
+                    "host" => Some(Command::AgentSetHost(if rest.is_empty() {
+                        None
+                    } else {
+                        Some(rest.to_string())
+                    })),
                     "list" | "" => Some(Command::AgentsList),
                     _ => None,
                 }

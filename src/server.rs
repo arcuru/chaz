@@ -360,7 +360,12 @@ impl Server {
 
         let agent = self
             .registry
-            .resolve_agent(session_db_id, agent_override.as_deref(), &self.agent_index)
+            .resolve_agent_for_entry(
+                session_db_id,
+                agent_override.as_deref(),
+                &self.agent_index,
+                Some(&latest.content),
+            )
             .await;
 
         self.spawn_agent_task(

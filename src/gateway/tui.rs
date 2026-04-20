@@ -617,6 +617,19 @@ fn parse_chat_line(
         show_error(app, "Usage: /agent remove <name|db_id>".to_string());
         return None;
     }
+    if let Some(arg) = text.strip_prefix("/agent host ") {
+        let r = arg.trim();
+        return Some(ChatAction::Dispatch(Command::AgentSetHost(
+            if r.is_empty() {
+                None
+            } else {
+                Some(r.to_string())
+            },
+        )));
+    }
+    if text == "/agent host" {
+        return Some(ChatAction::Dispatch(Command::AgentSetHost(None)));
+    }
     if text == "/agent" || text == "/agent list" {
         return Some(ChatAction::Dispatch(Command::AgentsList));
     }
