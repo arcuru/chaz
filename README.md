@@ -53,19 +53,26 @@ chaz --config config.yaml --tui
 
 #### TUI Commands
 
-| Command           | Description                                   |
-| ----------------- | --------------------------------------------- |
-| `/help`           | Show all commands and key bindings            |
-| `/sessions`, `/s` | Open session picker                           |
-| `/new`            | Create a new session                          |
-| `/join <id>`      | Switch to session by name or eidetica DB ID   |
-| `/info`           | Show current session details                  |
-| `/share`          | Generate shareable ticket for current session |
-| `/sync <ticket>`  | Sync a remote session via ticket              |
-| `/clear`          | Clear display (entries remain in DB)          |
-| `/raw`            | Dump raw entry data for debugging             |
-| `/debug`          | Toggle debug mode (also Ctrl+D)               |
-| `/quit`, `/q`     | Exit                                          |
+| Command                                             | Description                                        |
+| --------------------------------------------------- | -------------------------------------------------- |
+| `/help`                                             | Show all commands and key bindings                 |
+| `/sessions`, `/s`                                   | Open session picker                                |
+| `/new`                                              | Create a new session                               |
+| `/join <id>`                                        | Switch to session by name or eidetica DB ID        |
+| `/info`                                             | Show current session details                       |
+| `/share`                                            | Generate shareable ticket for current session      |
+| `/sync <ticket>`                                    | Sync a remote session via ticket                   |
+| `/agents`, `/agent list`                            | List agents attached to this session (host marked) |
+| `/agent add <ref>`                                  | Attach an agent (`<ref>` = display name or DB ID)  |
+| `/agent remove <ref>`                               | Detach an agent                                    |
+| `/agent host [<ref>]`                               | Set (or with no arg, clear) the host agent         |
+| `/heartbeat list`                                   | List heartbeat rules on this session               |
+| `/heartbeat add <id> <cron(6 fields)> <ref> <task>` | Upsert a cron-driven heartbeat rule                |
+| `/heartbeat remove <id>`                            | Remove a heartbeat rule                            |
+| `/clear`                                            | Clear display (entries remain in DB)               |
+| `/raw`                                              | Dump raw entry data for debugging                  |
+| `/debug`                                            | Toggle debug mode (also Ctrl+D)                    |
+| `/quit`, `/q`                                       | Exit                                               |
 
 #### TUI Key Bindings
 
@@ -133,6 +140,16 @@ When in a Matrix room, Chaz responds to `!chaz` prefixed commands. In DMs, it re
 !chaz list      — List available models
 !chaz clear     — Ignore messages before this point
 !chaz rename    — Rename the room based on conversation
+!chaz agents    — List agents attached to this session
+!chaz agent add <ref>     — Attach an agent to this session
+!chaz agent remove <ref>  — Detach an agent
+!chaz agent host [<ref>]  — Set or clear the host agent
+!chaz heartbeat list                                         — List heartbeat rules
+!chaz heartbeat add <id> <cron(6 fields)> <ref> <task...>    — Upsert a heartbeat rule
+!chaz heartbeat remove <id>                                  — Remove a rule
+!chaz attach <session>    — Bind this room to a session
+!chaz detach              — Unbind this room
+!chaz channels  — List rooms attached to this session
 ```
 
 ## Configuration

@@ -1,10 +1,10 @@
 # Agents
 
-Chaz supports multiple agent definitions with different roles, tool access, and spawn permissions. Agents are configured in YAML and orchestrated at runtime.
+Chaz agents have persistent identity as _Living Agents_ — each agent is its own eidetica database signed by a per-agent key. Whoever holds the key hosts the agent. Sessions declare participating agents by listing their pubkeys in the session's AuthSettings; routing follows key possession.
 
-## Defining Agents
+YAML `agents:` config is the bootstrap path: at startup, chaz materializes one Agent DB per yaml entry (idempotent), populating its `config` and `meta` stores from the yaml. Existing yaml workflows keep working; the DBs are what travel with eidetica sync.
 
-Agents are defined in the `agents` section of the config:
+## Defining Agents (bootstrap via YAML)
 
 ```yaml
 agents:
@@ -42,22 +42,82 @@ agents:
         max_iterations: 30
 ```
 
-## Agent Selection
+At startup, each yaml entry becomes an Agent DB named `agent:<display_name>`. Re-running with the same yaml reuses the existing DB and refreshes its stored `config` + `meta` from yaml — edits in yaml propagate back into the DB.
 
-Agent selection is a per-session setting (stored in the session's `meta.agent_name`), not a per-room setting. That means a session's agent choice travels with the session over eidetica sync and is shared between every channel attached to it.
+## Agent DB schema
 
-- **Matrix**: The session attached to the room determines the agent. Change it by running `!chaz attach` to a different session or by setting a new agent via configuration/spawn-level overrides.
-- **TUI**: The agent is read from the current session's `meta`. Switch sessions with `/join` or `/new` to change context.
-- **spawn_agent**: The calling agent names the target agent explicitly.
+Each Agent DB contains four well-known stores:
+
+| Store     | Kind                         | Contents                                                                                |
+| --------- | ---------------------------- | --------------------------------------------------------------------------------------- |
+| `config`  | DocStore                     | Serialized `AgentDbConfig`: role, model, allowed_tools, max_iterations, grants, presets |
+| `memory`  | `Table<MemoryEntry>`         | Per-agent facts (schema reserved; memory tool migration lands in a later stage)         |
+| `meta`    | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar                            |
+| `history` | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                            |
+
+The peer maintains a local `hosted_agents` index in its central DB mapping `db_id → (display_name, pubkey)` so session-routing lookups stay O(1).
+
+## Session participation
+
+A session's _authoritative_ participant list is its eidetica AuthSettings. Adding an agent to a session grants its pubkey `Permission::Write` on the session DB; revoking removes it. The `SessionMeta.agents: Vec<AgentRef>` field is a readable cache that stays in sync.
+
+### `/agent` commands
+
+Every transport uses the same set of commands. TUI: `/agent <sub>`. Matrix: `!chaz agent <sub>`.
+
+Every ref is either an agent's display name or its eidetica DB ID; resolution tries display name first.
+
+| Command                      | What                                                                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `/agent add <ref>`           | Grant the agent Write permission on the session, append to `SessionMeta.agents`, log entry in the agent's history. Idempotent. |
+| `/agent remove <ref>`        | Revoke the agent's session key and remove from `SessionMeta.agents`. History is append-only and is preserved.                  |
+| `/agent list` (or `/agents`) | List agents attached to the current session. The _host_ agent is marked.                                                       |
+| `/agent host <ref>`          | Designate the session's host agent (see turn-taking). Agent must already be attached.                                          |
+| `/agent host` (no arg)       | Clear the host agent.                                                                                                          |
+
+## Turn-taking
+
+When a message arrives on a multi-agent session, routing picks one agent in this precedence:
+
+1. Explicit override (scheduler `/run`, gateway directives).
+2. **`@<name>` mention** in the message text — first token matching an attached agent's display_name wins. `@alpha`, `@beta-bot,`, `@gamma.` all work; `a@b.com` is ignored (no leading `@` at token start).
+3. **Host agent** (`SessionMeta.host_agent_db_id`) if that agent is still attached.
+4. First attached agent in AuthSettings order.
+5. Legacy `SessionMeta.agent_name` (pre-Living-Agents sessions).
+6. Default agent from yaml.
+
+Mentions are case-insensitive and match exact display names. No prefix matching.
+
+## Heartbeat rules
+
+A heartbeat rule is a cron-scheduled trigger stored inside the session. The `HeartbeatRunner` on every peer polls hosted sessions every 30s; rules targeting agents this peer hosts get fired. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
+
+`last_fired` is tracked peer-locally in the central DB, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
+
+### `/heartbeat` commands
+
+Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+
+| Command                                                                        | What                                                         |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| `/heartbeat list` (or bare `/heartbeat`)                                       | List rules on the current session.                           |
+| `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a rule keyed by `<id>`. Task may contain `@mentions`. |
+| `/heartbeat remove <id>`                                                       | Remove a rule by id.                                         |
+
+Example — make `researcher` post a morning briefing to the current session weekdays at 09:00:
+
+```text
+/heartbeat add brief 0 0 9 * * Mon-Fri researcher Summarize overnight activity and surface anything urgent.
+```
 
 ## Tool Narrowing
 
 Tool access is controlled at two levels:
 
 1. **Agent definition**: `allowed_tools` restricts which tools an agent can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace).
-2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `allowed_tools`
+2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `allowed_tools`.
 
-This means a child agent can never have more tools than its parent, even if its definition allows them. Glob patterns in child allowlists are expanded against the registry and intersected with the parent's scope.
+This means a child agent can never have more tools than its parent, even if its definition allows them.
 
 ```mermaid
 graph TD
@@ -70,8 +130,8 @@ graph TD
 
 The `can_spawn` field controls which agents can be delegated to. Permissions are checked bidirectionally:
 
-- The calling agent must list the target in `can_spawn`
-- The target agent must exist in the registry
+- The calling agent must list the target in `can_spawn`.
+- The target agent must exist in the registry.
 
 Spawn depth is limited by `max_iterations` to prevent infinite recursion.
 
@@ -108,11 +168,11 @@ Async spawns return the child session ID, which can be found via `/sessions` in 
 
 When an agent calls `spawn_agent`:
 
-1. A new session database is created via the server's `register_child_session`
-2. A `Directive` entry is written to the child session
-3. The server's `on_local_write` callback detects the directive and spawns an agent task
-4. The agent runs the ReAct loop, writing Ack, ToolCall, ToolResult, and response entries
-5. A completion signal notifies the parent (for synchronous spawns)
-6. The parent reads the response from the child session
+1. A new session database is created via the server's `register_child_session`.
+2. A `Directive` entry is written to the child session.
+3. The server's `on_local_write` callback detects the directive and spawns an agent task.
+4. The agent runs the ReAct loop, writing Ack, ToolCall, ToolResult, and response entries.
+5. A completion signal notifies the parent (for synchronous spawns).
+6. The parent reads the response from the child session.
 
 This routes through the same server processing path as user messages, unifying all agent invocation.
