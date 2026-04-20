@@ -382,10 +382,13 @@ pub async fn execute(
 
                             // --- Security: execute with timeout ---
                             let timeout = policy.timeout_duration();
-                            // Build a per-call context with the resolved policy's grants,
-                            // so tools can read their capability grants via ctx.grants().
+                            // Build per-call grants: config-level policy grants, with
+                            // per-agent overlay merged on top (per-kind replacement).
+                            let call_grants = policy
+                                .grants
+                                .merge_over(tool_ctx.agent_grants.get(&call.name));
                             let mut call_ctx = tool_ctx.clone();
-                            call_ctx.grants = policy.grants.clone();
+                            call_ctx.grants = call_grants;
                             let exec_result =
                                 tokio::time::timeout(timeout, tool.execute(args, &call_ctx)).await;
 

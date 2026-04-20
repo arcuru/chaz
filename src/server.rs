@@ -404,6 +404,7 @@ impl Server {
         let default_role = agent.default_role.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
+        let agent_grants = agent.grants.clone();
         // Use override if set, otherwise fall back to agent's own max_iterations
         let max_call_depth = if spawn.max_call_depth > 0 {
             spawn.max_call_depth
@@ -463,6 +464,7 @@ impl Server {
                 profile,
                 session: session.clone(),
                 grants: Default::default(),
+                agent_grants,
             };
 
             // Build context using ContextBuilder (token-budgeted)

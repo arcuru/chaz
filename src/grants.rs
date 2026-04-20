@@ -19,6 +19,22 @@ pub struct Grants {
     pub fs: Option<FsGrant>,
 }
 
+impl Grants {
+    /// Return a new `Grants` that is `self` with each kind in `overlay` replacing
+    /// the corresponding kind in `self`. Per-kind replacement, not union — the
+    /// most-specific layer that sets a kind wins.
+    pub fn merge_over(&self, overlay: Option<&Grants>) -> Grants {
+        match overlay {
+            None => self.clone(),
+            Some(o) => Grants {
+                shell: o.shell.clone().or_else(|| self.shell.clone()),
+                network: o.network.clone().or_else(|| self.network.clone()),
+                fs: o.fs.clone().or_else(|| self.fs.clone()),
+            },
+        }
+    }
+}
+
 /// Shell command capability grant.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ShellGrant {
@@ -203,5 +219,75 @@ mod tests {
         let sec = SecurityConfig::default();
         let merged = merge_legacy_security(HashMap::new(), &sec);
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_over_none_returns_self() {
+        let base = Grants {
+            shell: Some(ShellGrant {
+                allow: vec!["git".into()],
+                deny: vec![],
+            }),
+            ..Default::default()
+        };
+        let merged = base.merge_over(None);
+        assert!(merged.shell.is_some());
+        assert_eq!(merged.shell.unwrap().allow, vec!["git".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_over_replaces_set_kinds() {
+        let base = Grants {
+            shell: Some(ShellGrant {
+                allow: vec!["git".into()],
+                deny: vec![],
+            }),
+            network: Some(NetworkGrant {
+                endpoints: vec![EndpointPattern {
+                    host: "base.example.com".into(),
+                    path_prefix: None,
+                    methods: None,
+                }],
+                allow_private: false,
+            }),
+            ..Default::default()
+        };
+        let overlay = Grants {
+            shell: Some(ShellGrant {
+                allow: vec!["ls".into()],
+                deny: vec![],
+            }),
+            ..Default::default()
+        };
+        let merged = base.merge_over(Some(&overlay));
+        // Agent shell overlay wins
+        assert_eq!(merged.shell.unwrap().allow, vec!["ls".to_string()]);
+        // Network unchanged — overlay didn't set it
+        assert_eq!(
+            merged.network.unwrap().endpoints[0].host,
+            "base.example.com"
+        );
+    }
+
+    #[test]
+    fn test_merge_over_falls_through_unset_kinds() {
+        let base = Grants {
+            shell: Some(ShellGrant {
+                allow: vec!["git".into()],
+                deny: vec![],
+            }),
+            ..Default::default()
+        };
+        // Overlay sets only `network`; `shell` should fall through to base
+        let overlay = Grants {
+            network: Some(NetworkGrant {
+                endpoints: vec![],
+                allow_private: true,
+            }),
+            ..Default::default()
+        };
+        let merged = base.merge_over(Some(&overlay));
+        assert_eq!(merged.shell.unwrap().allow, vec!["git".to_string()]);
+        assert!(merged.network.unwrap().allow_private);
     }
 }

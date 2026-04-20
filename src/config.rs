@@ -74,6 +74,11 @@ pub struct AgentConfig {
     pub tool_profile: Option<String>,
     /// Override context token limit for this agent
     pub max_context_tokens: Option<usize>,
+    /// Per-tool grant overrides for this agent. Merged per-kind over
+    /// `security.tool_policies.<tool>.grants`: if the agent sets `shell`
+    /// grant for a tool, it replaces the config grant; unset kinds fall
+    /// through to the config/default.
+    pub grants: Option<HashMap<String, crate::grants::Grants>>,
 }
 
 /// A named bundle of overrides that can be selected at spawn time.

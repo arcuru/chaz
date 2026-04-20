@@ -247,8 +247,13 @@ pub struct ToolContext {
     /// Handle to the current session (for tools that need to write entries, e.g. compact)
     pub session: std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
     /// Resolved capability grants for the tool currently executing.
-    /// Populated by the runtime from `ToolPolicyRegistry::resolve()` before each call.
+    /// Populated by the runtime before each call with config grants merged
+    /// with per-agent overlays (see `Grants::merge_over`).
     pub grants: Grants,
+    /// Per-tool grant overrides from the running agent's config.
+    /// The runtime merges the grants for the currently-executing tool over
+    /// the tool's resolved policy grants when building each call's `grants`.
+    pub agent_grants: HashMap<String, Grants>,
 }
 
 impl ToolContext {

@@ -1,5 +1,6 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
 use crate::defaults::DEFAULT_CONFIG;
+use crate::grants::Grants;
 use crate::role::{RoleDetails, get_role};
 use std::collections::HashMap;
 use tracing::warn;
@@ -26,6 +27,9 @@ pub struct Agent {
     pub tool_profile: Option<String>,
     /// Override context token limit for this agent (None = use global default).
     pub max_context_tokens: Option<usize>,
+    /// Per-tool grant overrides. Merged per-kind over the config-level grants
+    /// at tool-call time (see `Grants::merge_over`).
+    pub grants: HashMap<String, Grants>,
 }
 
 /// Resolved overrides for a spawn_agent call.
@@ -57,6 +61,7 @@ impl Agent {
             presets: agent_config.presets.clone().unwrap_or_default(),
             tool_profile: agent_config.tool_profile.clone(),
             max_context_tokens: agent_config.max_context_tokens,
+            grants: agent_config.grants.clone().unwrap_or_default(),
         }
     }
 
@@ -164,6 +169,7 @@ impl AgentRegistry {
                 presets: HashMap::new(),
                 tool_profile: None,
                 max_context_tokens: None,
+                grants: HashMap::new(),
             }]
         };
 
@@ -253,6 +259,7 @@ mod tests {
             presets: HashMap::new(),
             tool_profile: None,
             max_context_tokens: None,
+            grants: HashMap::new(),
         }
     }
 
