@@ -37,6 +37,7 @@ agent.rs             Agent (with spawn perms, presets), AgentRegistry (Arc-share
 session.rs           SessionRegistry (central DB with bindings + new-session events) + Session (per-conversation eidetica DB) + EntryType (Message, Directive, ToolCall, ToolResult, Ack, Error, Summary) + SessionBinding (transport→DB mapping + per-session config: model, role, backend)
 context.rs           ContextBuilder — token-budgeted context assembly from session entries, with Summary boundary support
 tool.rs              Tool trait, ToolDescriptor, ToolPolicy, ToolPolicyRegistry, ToolRegistry, ScopedTools, ToolProfile, PresentationMode
+grants.rs            Typed capability grants (Grants, ShellGrant, NetworkGrant, FsGrant, EndpointPattern), per-kind merge_over, legacy SecurityConfig migration shim
 mcp.rs               MCP server management: Transport enum (Stdio/Http), McpServer (transport-agnostic), McpTool (Tool wrapper), directory scanning, startup orchestration
 tools/
   mod.rs             Re-exports all tools
@@ -45,9 +46,9 @@ tools/
   describe.rs        describe_tool — returns full tool description/schema for on-demand discovery (Low risk)
   time.rs            get_time — current UTC time (Low risk)
   calculate.rs       calculate — math expressions (Low risk)
-  shell.rs           shell — execute commands (High risk, approval required, command allow/denylist)
+  shell.rs           shell — execute commands (High risk, approval required; allowlist/denylist read from ctx.grants().shell)
   file.rs            read_file (Low), write_file (Medium, approval unless auto-approved)
-  web.rs             web_fetch — HTTP GET/POST (Medium risk, network policy enforced, SSRF protection)
+  web.rs             web_fetch — HTTP GET/POST (Medium risk; endpoint policy + SSRF toggle read from ctx.grants().network)
   memory.rs          remember, recall — persistent key-value memory (Low risk)
 security/
   mod.rs             SecurityContext (leak detector, auto-approved tools, approval channel)
@@ -98,8 +99,9 @@ defaults.rs          Built-in default config and roles
 - **Command dispatch**: User-facing session commands are parsed to a transport-neutral `commands::Command`, run through `commands::dispatch(cmd, ctx) -> CommandOutcome`, and rendered by the gateway. Both TUI (`/<cmd>`) and Matrix (`!chaz <cmd>`) share the same command set: `sessions`, `info`, `name`, `share`, `sync`, `compact`, `print`, `schedules`, `run`, `model`, `role`, `backend`, `backends`. `CommandContext` carries `{server, scheduler, secrets, backend, transport_id, session_db, current_agent, session_name, config_roles, default_role}`. `CommandOutcome` variants: `Text` / `Error` / `SessionsList` / `SessionSwitched(Box<…>)` / `Quit`. Transport-specific extras stay in the gateway: TUI has `/debug`, `/raw`, `/clear` (display), picker modal, `/quit`; Matrix has `party`, `rename` (room), `send` (no-context), `clear` (history marker), `approve`/`deny`.
 - **Security context**: Built from SecurityConfig, threaded through server to runtime per-session. Contains leak detector, auto-approved tool set, and approval channel from gateway.
 - **TUI (ratatui)**: Elm architecture — `App` state struct, `Action` enum, `tokio::select!` event loop over crossterm `EventStream` + session notify + approval channel. Parses slash commands into `Command` and routes through `commands::dispatch`; `SessionsList` outcome opens the picker modal, `SessionSwitched` re-registers session with approval/notify channels. Debug mode (Ctrl+D), inline tool approval (y/n/a).
-- **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll. Matrix surfaces approval requests as room messages with reaction support (✅❌⏭) and text commands (!chaz approve/deny).
-- **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM.
+- **Tool policy**: Tools provide `default_policy()` (risk, approval, timeout, grants). Config `security.tool_policies` overrides per tool. `ToolPolicyRegistry` resolves effective policy. Runtime checks against resolved policy, sends ApprovalExchange to gateway via mpsc channel. Approval decisions: Approve/Deny/ApproveAll. Matrix surfaces approval requests as room messages with reaction support (✅❌⏭) and text commands (!chaz approve/deny).
+- **Grants**: Typed capability grants attached to each `ToolPolicy` (`shell`, `network`, `fs` — extensible). Tools read them via `ctx.grants()` at execute time; no tool is constructed with capability-specific args. Config shape: `security.tool_policies.<tool>.grants.<kind>`. Per-agent overlay via `agents[].grants.<tool>`; runtime merges per-kind (`agent > config > default`, replacement not union). Legacy `security.shell_allowlist` / `shell_denylist` / `allowed_endpoints` still parse but are migrated at startup by `grants::merge_legacy_security` with a deprecation `warn!`.
+- **ToolContext**: agent_name, call_depth, max_call_depth, tools (ScopedTools), profile (ToolProfile), grants (resolved per call), agent_grants (per-tool overlays from the running agent). The `tools` field carries the transitively-narrowed tool set for this agent — each spawn level intersects the parent's scope with the child's allowed_tools. The `profile` controls how tool definitions are presented to the LLM. `grants` is populated per tool call by merging the tool's resolved-policy grants with `agent_grants.get(tool_name)`.
 - **Tool profiles**: Named configurations (in `tool_profiles:` config) controlling tool definition presentation. PresentationMode: Full (default), Brief (first sentence, no param descriptions), Summary (name only), Hidden. Supports glob prefix matching (`"filesystem.*": summary`). Configured per agent (`tool_profile:`), per preset, or per session. Applied at `ScopedTools::definitions()` call.
 - **MCP tools**: External tool servers via subprocess JSON-RPC (stdin/stdout) or Streamable HTTP (POST + SSE). Config: `mcp_servers:` with name, command/url, args, env, default_policy. Also `mcp_server_dir:` for manifest directory scanning (.yaml/.json files). Transport selected by config: `url` → HTTP, `command` → stdio. Tools namespaced as `server.tool` (e.g., `filesystem.read_file`). Eagerly started at boot, tools registered in ToolRegistry alongside built-ins. Default policy: Medium/UnlessAutoApproved/60s. `describe_tool` enables discovery when profiles hide details. Auto-restart with exponential backoff (1s–16s, max 5 attempts) on subprocess crash. Dynamic re-discovery: `notifications/tools/list_changed` detected in JSON-RPC exchanges, triggers lazy `tools/list` refresh before next call. McpTool metadata stored in shared `RwLock` map — `descriptor()` returns live data.
 - **Tool allowlist globs**: Agent tool allowlists support `"namespace.*"` glob patterns (e.g., `"filesystem.*"` matches all tools from that MCP server). Works in ScopedTools filtering, access checks, and transitive narrowing.
@@ -107,7 +109,7 @@ defaults.rs          Built-in default config and roles
 - **XML tool output wrapping**: Tool results fed back to the LLM are wrapped in `<tool_output tool="name">` delimiters with angle-bracket escaping, preventing injection attacks through tool output.
 - **Tool rate limiting**: Per-tool `rate_limit` (calls/minute) in policy config. Sliding-window RateLimiter enforced in the ReAct loop before tool execution.
 - **Leak detection**: All tool outputs scanned for 12 secret patterns before entering LLM context. Policy: redact (default) or block.
-- **Network policy**: WebFetch enforces endpoint allowlisting and SSRF protection. Private IPs always blocked.
+- **Network policy**: WebFetch builds a `NetworkPolicy` per call from `ctx.grants().network`: endpoint allowlist (empty = allow-all) + SSRF blocking (on by default; `allow_private: true` in the grant opts out).
 - **Retry loop**: MatrixGateway retries on all `bot.run()` errors with 5s backoff
 - **Config**: Immutable after load, threaded via `Arc<Config>` in Matrix gateway
 - **Session config**: Per-session model, role, and backend overrides stored in SessionBinding (registry DB). Replaces headjack Tags — config is transport-independent and syncs with eidetica.
@@ -156,7 +158,38 @@ RUST_LOG=error chaz --config config.yaml --tui
 2. Add `mod my_tool;` and `pub use` to `src/tools/mod.rs`
 3. Register in `main.rs`: `tools.register(tools::MyTool);`
 
-The `Tool` trait requires: `descriptor()` (returns `ToolDescriptor` with name, description, parameters JSON Schema) and `execute()` (returns boxed future for async support). Optional `default_policy()` returns `ToolPolicy` (risk, approval, timeout, sensitive_params) — config overrides via `security.tool_policies` take precedence. `ToolPolicyRegistry` resolves effective policy per tool.
+The `Tool` trait requires: `descriptor()` (returns `ToolDescriptor` with name, description, parameters JSON Schema) and `execute()` (returns boxed future for async support). Optional `default_policy()` returns `ToolPolicy` (risk, approval, timeout, sensitive_params, grants) — config overrides via `security.tool_policies` take precedence. `ToolPolicyRegistry` resolves effective policy per tool.
+
+Tools that need capability data (shell commands to allow, network endpoints, fs paths) should read them from `ctx.grants()` at execute time — never take capability-specific constructor args. Add new grant kinds in `src/grants.rs` (`ShellGrant`, `NetworkGrant`, `FsGrant`, …) and reference them via `ctx.grants().<kind>`. Config shape:
+
+```yaml
+security:
+  tool_policies:
+    my_tool:
+      risk: high
+      approval: always
+      grants:
+        shell:
+          allow: ["git", "ls"]
+          deny: ["rm -rf"]
+        network:
+          endpoints:
+            - host: "*.example.com"
+              methods: ["GET"]
+          allow_private: false
+```
+
+Agents can overlay grants per tool (merged per-kind, most specific wins):
+
+```yaml
+agents:
+  - name: researcher
+    grants:
+      web_fetch:
+        network:
+          endpoints:
+            - host: "*.wikipedia.org"
+```
 
 ### External (MCP)
 
