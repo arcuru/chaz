@@ -462,6 +462,7 @@ impl Server {
                 tools: scoped_tools,
                 profile,
                 session: session.clone(),
+                grants: Default::default(),
             };
 
             // Build context using ContextBuilder (token-budgeted)

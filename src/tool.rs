@@ -1,3 +1,4 @@
+use crate::grants::Grants;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -66,6 +67,10 @@ pub struct ToolPolicy {
     /// Maximum calls per minute (None = unlimited)
     #[serde(default)]
     pub rate_limit: Option<u32>,
+    /// Typed capability grants (shell commands, network endpoints, fs paths).
+    /// Tools read these from `ToolContext::grants()` at execute time.
+    #[serde(default)]
+    pub grants: Grants,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -80,6 +85,7 @@ impl Default for ToolPolicy {
             timeout: 60,
             sensitive_params: Vec::new(),
             rate_limit: None,
+            grants: Grants::default(),
         }
     }
 }
@@ -226,6 +232,7 @@ fn strip_param_descriptions(params: &Value) -> Value {
 }
 
 /// Context provided by the runtime to tools during execution.
+#[derive(Clone)]
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
@@ -239,6 +246,16 @@ pub struct ToolContext {
     pub profile: ToolProfile,
     /// Handle to the current session (for tools that need to write entries, e.g. compact)
     pub session: std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
+    /// Resolved capability grants for the tool currently executing.
+    /// Populated by the runtime from `ToolPolicyRegistry::resolve()` before each call.
+    pub grants: Grants,
+}
+
+impl ToolContext {
+    /// Read the resolved capability grants for the currently-executing tool.
+    pub fn grants(&self) -> &Grants {
+        &self.grants
+    }
 }
 
 /// A tool that can be invoked by the LLM during a ReAct loop.

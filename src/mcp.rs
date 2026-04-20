@@ -787,6 +787,7 @@ impl Tool for McpTool {
             timeout: 60,
             sensitive_params: Vec::new(),
             rate_limit: None,
+            grants: Default::default(),
         })
     }
 }
@@ -1277,6 +1278,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}\n\
             timeout: 10,
             sensitive_params: vec!["secret".to_string()],
             rate_limit: Some(5),
+            grants: Default::default(),
         });
         let server = Arc::new(server);
         let tool = McpTool {

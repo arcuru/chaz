@@ -6,6 +6,7 @@ mod context;
 mod defaults;
 mod error;
 mod gateway;
+mod grants;
 mod mcp;
 mod openai;
 mod role;
