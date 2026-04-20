@@ -1,7 +1,10 @@
 use crate::agent::{Agent, AgentRegistry};
+use crate::agent_db::{AgentDb, SessionHistoryEntry};
+use crate::agent_index::AgentIndexEntry;
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
+use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::store::{DocStore, Table};
 use eidetica::Database;
 use serde::{Deserialize, Serialize};
@@ -632,6 +635,140 @@ impl SessionRegistry {
     // Agent resolution
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // Agent participation (Living Agents Stage 3b)
+    //
+    // Authoritative: session's AuthSettings (the set of pubkeys with Write
+    // permission on this session's DB) IS the participant list. SessionMeta's
+    // `agents` mirrors it as an easy-to-read cache, and the agent's own
+    // `history` store gets a log entry for each attachment.
+    // -------------------------------------------------------------------------
+
+    /// Attach an agent to a session. Grants the agent's pubkey Write
+    /// permission on the session DB, mirrors into SessionMeta.agents, and
+    /// appends to the agent DB's session-history log.
+    ///
+    /// Idempotent at the auth layer (set_auth_key upserts) and at the meta
+    /// layer (dedup by db_id). The history log appends on every call —
+    /// re-attaching a previously detached agent is a meaningful event.
+    pub async fn attach_agent_to_session(
+        &self,
+        session_db_id: &str,
+        agent: &AgentIndexEntry,
+    ) -> anyhow::Result<()> {
+        // 1. Session DB: grant Write permission to the agent's pubkey.
+        let (_conv, session_db) = self.open_session(session_db_id).await?;
+        let agent_key_name = format!("agent:{}", agent.display_name);
+        {
+            let txn = session_db.new_transaction().await?;
+            let settings = txn.get_settings()?;
+            settings
+                .set_auth_key(
+                    &agent.pubkey,
+                    AuthKey::active(Some(&agent_key_name), Permission::Write(10)),
+                )
+                .await?;
+            txn.commit().await?;
+        }
+
+        // 2. SessionMeta: upsert the AgentRef (dedup by db_id).
+        let agent_ref = AgentRef {
+            db_id: agent.db_id.to_string(),
+            display_name: agent.display_name.clone(),
+        };
+        update_meta_on_db(&session_db, |m| {
+            if let Some(existing) = m.agents.iter_mut().find(|a| a.db_id == agent_ref.db_id) {
+                existing.display_name = agent_ref.display_name.clone();
+            } else {
+                m.agents.push(agent_ref.clone());
+            }
+        })
+        .await?;
+
+        // 3. Agent DB: append history entry. Best-effort — a failure here
+        //    doesn't unwind the attach (the session-side change has already
+        //    committed and sync'd).
+        if let Err(e) = self.append_agent_history(&agent.db_id, session_db_id).await {
+            warn!(
+                agent = %agent.display_name,
+                agent_db_id = %agent.db_id,
+                session_db_id,
+                "Failed to append agent history on attach: {e}"
+            );
+        }
+
+        info!(
+            agent = %agent.display_name,
+            agent_db_id = %agent.db_id,
+            session_db_id,
+            "Attached agent to session"
+        );
+        Ok(())
+    }
+
+    /// Detach an agent from a session. Revokes the agent's pubkey on the
+    /// session DB and removes the matching AgentRef from SessionMeta.agents.
+    /// The agent's history store is append-only — detach does not rewrite it.
+    pub async fn detach_agent_from_session(
+        &self,
+        session_db_id: &str,
+        agent: &AgentIndexEntry,
+    ) -> anyhow::Result<()> {
+        let (_conv, session_db) = self.open_session(session_db_id).await?;
+
+        {
+            let txn = session_db.new_transaction().await?;
+            let settings = txn.get_settings()?;
+            // `revoke_auth_key` is idempotent-ish: errors if the key isn't
+            // present, so tolerate that case.
+            if let Err(e) = settings.revoke_auth_key(&agent.pubkey).await {
+                warn!(
+                    agent = %agent.display_name,
+                    "revoke_auth_key returned {e} — continuing with meta update"
+                );
+            }
+            txn.commit().await?;
+        }
+
+        update_meta_on_db(&session_db, |m| {
+            m.agents.retain(|a| a.db_id != agent.db_id.to_string());
+        })
+        .await?;
+
+        info!(
+            agent = %agent.display_name,
+            agent_db_id = %agent.db_id,
+            session_db_id,
+            "Detached agent from session"
+        );
+        Ok(())
+    }
+
+    /// Open the agent's DB via this user and append a SessionHistoryEntry.
+    async fn append_agent_history(
+        &self,
+        agent_db_id: &eidetica::entry::ID,
+        session_db_id: &str,
+    ) -> anyhow::Result<()> {
+        let user = self.user.lock().await;
+        let agent_db = user.open_database(agent_db_id).await?;
+        let agent_handle = AgentDb::from_database(agent_db);
+        agent_handle.ensure_stores().await?;
+
+        let txn = agent_handle.database().new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionHistoryEntry>>(crate::agent_db::HISTORY_STORE)
+            .await?;
+        store
+            .insert(SessionHistoryEntry {
+                session_db_id: session_db_id.to_string(),
+                joined_at: Utc::now(),
+            })
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     /// Resolve which agent should handle a session.
     /// Priority: explicit override > session meta > default agent.
     pub async fn resolve_agent(&self, session_db_id: &str, override_name: Option<&str>) -> Agent {
@@ -751,5 +888,133 @@ mod tests {
         assert_eq!(meta.agent_name.as_deref(), Some("legacy"));
         assert_eq!(meta.agents.len(), 1);
         assert_eq!(meta.agents[0].display_name, "modern");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3b: attach/detach agent
+    // -------------------------------------------------------------------------
+
+    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+
+    async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+        let agents = Arc::new(AgentRegistry::from_config(&crate::config::Config {
+            homeserver_url: String::new(),
+            username: String::new(),
+            password: None,
+            allow_list: None,
+            message_limit: None,
+            room_size_limit: None,
+            state_dir: None,
+            chat_summary_model: None,
+            role: None,
+            roles: None,
+            backends: None,
+            agents: None,
+            security: None,
+            schedules: None,
+            mcp_servers: None,
+            tool_profiles: None,
+            mcp_server_dir: None,
+            context: None,
+        }));
+        let registry = SessionRegistry::new(instance.clone(), user, agents)
+            .await
+            .unwrap();
+        (instance, Arc::new(registry))
+    }
+
+    async fn make_agent_entry(registry: &SessionRegistry, name: &str) -> AgentIndexEntry {
+        let cfg = AgentDbConfig::default();
+        let meta = AgentMeta {
+            display_name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let mut user = registry.user.lock().await;
+        let (db, pubkey) = create_agent_db(&mut user, name, &cfg, &meta).await.unwrap();
+        AgentIndexEntry {
+            db_id: db.id(),
+            display_name: name.to_string(),
+            pubkey,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_agent_updates_auth_meta_and_history() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let agent = make_agent_entry(&registry, "alpha").await;
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        // 1. Session AuthSettings now includes the agent's pubkey.
+        let settings = session_db.get_settings().await.unwrap();
+        let auth = settings.get_auth_key(&agent.pubkey).await.unwrap();
+        assert!(matches!(auth.permissions(), Permission::Write(_)));
+
+        // 2. SessionMeta.agents includes the AgentRef.
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 1);
+        assert_eq!(meta.agents[0].display_name, "alpha");
+        assert_eq!(meta.agents[0].db_id, agent.db_id.to_string());
+
+        // 3. Agent's history store has one entry for this session.
+        let user = registry.user.lock().await;
+        let agent_db = user.open_database(&agent.db_id).await.unwrap();
+        let txn = agent_db.new_transaction().await.unwrap();
+        let history = txn
+            .get_store::<Table<SessionHistoryEntry>>(crate::agent_db::HISTORY_STORE)
+            .await
+            .unwrap();
+        let rows = history.search(|_| true).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.session_db_id, session_id);
+    }
+
+    #[tokio::test]
+    async fn attach_is_idempotent_in_meta() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+        let agent = make_agent_entry(&registry, "alpha").await;
+
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn detach_removes_from_meta() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+        let agent = make_agent_entry(&registry, "alpha").await;
+
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+        registry
+            .detach_agent_from_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert!(meta.agents.is_empty());
     }
 }
