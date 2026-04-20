@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Each field is optional. Absence means "no grant configured" — tools decide
 /// their own permissive-or-restrictive default for unconfigured grants.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Grants {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellGrant>,
@@ -36,7 +36,7 @@ impl Grants {
 }
 
 /// Shell command capability grant.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShellGrant {
     /// Command prefixes that are allowed. Empty = allow-all (no allowlist).
     #[serde(default)]
@@ -47,7 +47,7 @@ pub struct ShellGrant {
 }
 
 /// Network capability grant.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkGrant {
     /// Allowed endpoint patterns. Empty = allow-all (no allowlist).
     #[serde(default)]
@@ -58,7 +58,7 @@ pub struct NetworkGrant {
 }
 
 /// Filesystem capability grant (schema stub; not enforced yet).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FsGrant {
     #[serde(default)]
     pub allow_read: Vec<String>,
@@ -69,7 +69,7 @@ pub struct FsGrant {
 /// An allowed endpoint pattern for a network grant.
 ///
 /// Canonical serializable form shared by config parsing and policy evaluation.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EndpointPattern {
     /// Host to match. Exact ("api.example.com") or wildcard ("*.example.com").
     pub host: String,

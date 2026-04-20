@@ -82,7 +82,7 @@ pub struct AgentConfig {
 }
 
 /// A named bundle of overrides that can be selected at spawn time.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct AgentPreset {
     /// Override the model
     pub model: Option<String>,

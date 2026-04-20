@@ -1,4 +1,5 @@
 mod agent;
+mod agent_db;
 mod backends;
 mod commands;
 mod config;
@@ -70,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
     let instance = eidetica::Instance::open(Box::new(backend)).await?;
     let _ = instance.create_user("chaz", None).await; // OK if already exists
-    let user = instance.login_user("chaz", None).await?;
+    let mut user = instance.login_user("chaz", None).await?;
 
     // Enable eidetica sync with HTTP transport for session sharing
     instance.enable_sync().await?;
@@ -90,6 +91,18 @@ async fn main() -> anyhow::Result<()> {
         agents = agent_registry.names().len(),
         "Agent registry initialized"
     );
+
+    // Stage 1 of Living Agents: materialize an eidetica DB per yaml-declared
+    // agent. Idempotent on re-runs. Routing still uses the in-memory
+    // AgentRegistry; Stage 3 switches that to key-possession checks.
+    let agent_dbs = agent_db::bootstrap_from_config(&mut user, &config).await?;
+    if !agent_dbs.is_empty() {
+        info!(
+            count = agent_dbs.len(),
+            "Agent DBs bootstrapped from config"
+        );
+    }
+
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
     let central_db = registry.central_db().clone();
 
