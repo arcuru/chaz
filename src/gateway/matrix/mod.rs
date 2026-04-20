@@ -199,6 +199,31 @@ fn matrix_args(text: &str) -> String {
         .join(" ")
 }
 
+/// Parse the positional form of `!chaz heartbeat add` (mirrors TUI syntax):
+/// `<id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>`.
+/// Returns `None` if any field is missing — the caller renders a usage hint.
+fn parse_heartbeat_add(rest: &str) -> Option<Command> {
+    let mut tokens = rest.split_whitespace();
+    let id = tokens.next()?;
+    let c1 = tokens.next()?;
+    let c2 = tokens.next()?;
+    let c3 = tokens.next()?;
+    let c4 = tokens.next()?;
+    let c5 = tokens.next()?;
+    let c6 = tokens.next()?;
+    let agent_ref = tokens.next()?;
+    let task = tokens.collect::<Vec<_>>().join(" ");
+    if task.is_empty() {
+        return None;
+    }
+    Some(Command::HeartbeatAdd {
+        id: id.to_string(),
+        cron: format!("{c1} {c2} {c3} {c4} {c5} {c6}"),
+        agent_ref: agent_ref.to_string(),
+        task,
+    })
+}
+
 impl Gateway for MatrixGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let config = Arc::new(self.config);
@@ -462,6 +487,26 @@ impl Gateway for MatrixGateway {
             "".to_string(),
             "List agents attached to this session",
             |_t| { Some(Command::AgentsList) }
+        );
+        register_shared!(
+            "heartbeat",
+            "add|remove|list [args]".to_string(),
+            "Manage heartbeat rules on this session",
+            |text| {
+                let arg = matrix_args(&text);
+                let trimmed = arg.trim();
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("").trim();
+                let rest = parts.next().unwrap_or("").trim();
+                match sub {
+                    "list" | "" => Some(Command::HeartbeatList),
+                    "remove" | "rm" if !rest.is_empty() => {
+                        Some(Command::HeartbeatRemove(rest.to_string()))
+                    }
+                    "add" => parse_heartbeat_add(rest),
+                    _ => None,
+                }
+            }
         );
         register_shared!(
             "agent",

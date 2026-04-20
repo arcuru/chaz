@@ -61,6 +61,19 @@ pub enum Command {
     /// `Some(ref)` sets it; `None` clears it.
     AgentSetHost(Option<String>),
 
+    // --- Heartbeat rules (Stage 4b) ---
+    /// Add or upsert a heartbeat rule on the current session.
+    HeartbeatAdd {
+        id: String,
+        cron: String,
+        agent_ref: String,
+        task: String,
+    },
+    /// Remove a heartbeat rule by id.
+    HeartbeatRemove(String),
+    /// List heartbeat rules on the current session.
+    HeartbeatList,
+
     // --- Scheduler ---
     ListSchedules,
     TriggerSchedule(String),
@@ -135,6 +148,14 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentRemove(r) => agent_remove(&r, ctx).await,
         Command::AgentsList => agents_list(ctx).await,
         Command::AgentSetHost(arg) => agent_set_host(arg.as_deref(), ctx).await,
+        Command::HeartbeatAdd {
+            id,
+            cron,
+            agent_ref,
+            task,
+        } => heartbeat_add(&id, &cron, &agent_ref, &task, ctx).await,
+        Command::HeartbeatRemove(id) => heartbeat_remove(&id, ctx).await,
+        Command::HeartbeatList => heartbeat_list(ctx).await,
         Command::ListSchedules => list_schedules(ctx).await,
         Command::TriggerSchedule(name) => trigger_schedule(&name, ctx).await,
         Command::Model(arg) => model(arg, ctx).await,
@@ -741,6 +762,73 @@ async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
         })
         .collect();
     CommandOutcome::Text(format!("Agents on this session:\n{}", lines.join("\n")))
+}
+
+// -----------------------------------------------------------------------------
+// Heartbeat rules (Living Agents Stage 4b)
+// -----------------------------------------------------------------------------
+
+async fn heartbeat_add(
+    id: &str,
+    cron: &str,
+    agent_ref: &str,
+    task: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    use cron::Schedule;
+    use std::str::FromStr;
+
+    if let Err(e) = Schedule::from_str(cron) {
+        return CommandOutcome::Error(format!("Invalid cron '{cron}': {e}"));
+    }
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    let rule = crate::heartbeat::HeartbeatRule {
+        id: id.to_string(),
+        name: id.to_string(),
+        cron: cron.to_string(),
+        task: task.to_string(),
+        target_agent_db_id: entry.db_id.to_string(),
+        enabled: true,
+    };
+    match crate::heartbeat::upsert_rule(ctx.session_db, rule).await {
+        Ok(()) => CommandOutcome::Text(format!(
+            "Heartbeat rule '{id}' set: cron='{cron}' → {} — {task}",
+            entry.display_name
+        )),
+        Err(e) => CommandOutcome::Error(format!("Failed to save rule: {e}")),
+    }
+}
+
+async fn heartbeat_remove(id: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    match crate::heartbeat::remove_rule(ctx.session_db, id).await {
+        Ok(true) => CommandOutcome::Text(format!("Removed heartbeat rule '{id}'")),
+        Ok(false) => CommandOutcome::Error(format!("No heartbeat rule with id '{id}'")),
+        Err(e) => CommandOutcome::Error(format!("Failed to remove rule: {e}")),
+    }
+}
+
+async fn heartbeat_list(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let rules = match crate::heartbeat::list_rules(ctx.session_db).await {
+        Ok(r) => r,
+        Err(e) => return CommandOutcome::Error(format!("Failed to list rules: {e}")),
+    };
+    if rules.is_empty() {
+        return CommandOutcome::Text("No heartbeat rules on this session".to_string());
+    }
+    let lines: Vec<String> = rules
+        .iter()
+        .map(|r| {
+            let state = if r.enabled { "" } else { " (disabled)" };
+            format!(
+                "  {} [{}]{state} → {} — {}",
+                r.id, r.cron, r.target_agent_db_id, r.task
+            )
+        })
+        .collect();
+    CommandOutcome::Text(format!("Heartbeat rules:\n{}", lines.join("\n")))
 }
 
 async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {

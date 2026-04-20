@@ -9,6 +9,7 @@ mod defaults;
 mod error;
 mod gateway;
 mod grants;
+mod heartbeat;
 mod mcp;
 mod openai;
 mod role;
@@ -254,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
                     schedules,
                     server.clone(),
                     backends::BackendManager::new(&config.backends, secret_store.clone()),
-                    central_db,
+                    central_db.clone(),
                 )
                 .await,
             );
@@ -266,6 +267,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Start the heartbeat runner. Polls every 30s across all hosted sessions
+    // for due rules whose target agent this peer hosts.
+    let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), central_db);
+    heartbeat_runner.start();
 
     // Run the selected gateway
     info!(
