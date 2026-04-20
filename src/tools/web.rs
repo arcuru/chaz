@@ -1,19 +1,34 @@
+use crate::grants::NetworkGrant;
 use crate::security::NetworkPolicy;
+use crate::security::network::EndpointPattern as PolicyEndpoint;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use tracing::{debug, info};
 
-/// Fetch a URL via HTTP. Network policy enforced before requests.
-pub struct WebFetch {
-    network_policy: Arc<NetworkPolicy>,
-}
+/// Fetch a URL via HTTP. Network policy is built per call from the resolved
+/// `NetworkGrant` in `ToolContext::grants()`. Private-IP blocking is always on
+/// unless the grant opts in via `allow_private: true`.
+pub struct WebFetch;
 
 impl WebFetch {
-    pub fn new(network_policy: Arc<NetworkPolicy>) -> Self {
-        Self { network_policy }
+    fn build_policy(grant: Option<&NetworkGrant>) -> NetworkPolicy {
+        let (endpoints, allow_private) = match grant {
+            Some(g) => (
+                g.endpoints
+                    .iter()
+                    .map(|e| PolicyEndpoint {
+                        host: e.host.clone(),
+                        path_prefix: e.path_prefix.clone(),
+                        methods: e.methods.clone(),
+                    })
+                    .collect(),
+                g.allow_private,
+            ),
+            None => (Vec::new(), false),
+        };
+        NetworkPolicy::new(endpoints, !allow_private)
     }
 }
 
@@ -53,11 +68,11 @@ impl Tool for WebFetch {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let url = arguments
                 .get("url")
@@ -70,8 +85,9 @@ impl Tool for WebFetch {
                 .unwrap_or("GET")
                 .to_uppercase();
 
-            // Enforce network policy
-            self.network_policy.check(url, &method)?;
+            // Enforce network policy built from the resolved NetworkGrant
+            let policy = Self::build_policy(ctx.grants().network.as_ref());
+            policy.check(url, &method)?;
             info!(%method, %url, "Fetching URL");
 
             let client = reqwest::Client::builder()
@@ -112,5 +128,44 @@ impl Tool for WebFetch {
 
             Ok(result)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grants::EndpointPattern;
+
+    #[test]
+    fn test_no_grant_blocks_private_ips_allows_public() {
+        let p = WebFetch::build_policy(None);
+        assert!(p.check("https://example.com/", "GET").is_ok());
+        assert!(p.check("http://127.0.0.1/", "GET").is_err());
+    }
+
+    #[test]
+    fn test_grant_endpoint_allowlist() {
+        let grant = NetworkGrant {
+            endpoints: vec![EndpointPattern {
+                host: "api.example.com".into(),
+                path_prefix: None,
+                methods: Some(vec!["GET".into()]),
+            }],
+            allow_private: false,
+        };
+        let p = WebFetch::build_policy(Some(&grant));
+        assert!(p.check("https://api.example.com/foo", "GET").is_ok());
+        assert!(p.check("https://api.example.com/foo", "POST").is_err());
+        assert!(p.check("https://evil.com/", "GET").is_err());
+    }
+
+    #[test]
+    fn test_allow_private_opens_internal_hosts() {
+        let grant = NetworkGrant {
+            endpoints: vec![],
+            allow_private: true,
+        };
+        let p = WebFetch::build_policy(Some(&grant));
+        assert!(p.check("http://127.0.0.1/", "GET").is_ok());
     }
 }

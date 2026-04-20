@@ -1,3 +1,4 @@
+use crate::grants::ShellGrant;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
@@ -6,25 +7,16 @@ use tracing::{debug, info, warn};
 
 /// Execute a shell command and return its output.
 ///
-/// Security: High risk, always requires approval. Supports command
-/// allowlist/denylist filtering via SecurityConfig.
-pub struct ShellExec {
-    /// If set, only commands starting with these prefixes are allowed
-    allowlist: Option<Vec<String>>,
-    /// Commands starting with these prefixes are always denied
-    denylist: Vec<String>,
-}
+/// Security: High risk, always requires approval. The runtime supplies a
+/// `ShellGrant` via `ToolContext::grants()` at execute time; if the grant is
+/// absent, commands are unrestricted (matching the "no allowlist configured"
+/// behavior). Denylist entries always apply.
+pub struct ShellExec;
 
 impl ShellExec {
-    pub fn new(allowlist: Option<Vec<String>>, denylist: Option<Vec<String>>) -> Self {
-        Self {
-            allowlist,
-            denylist: denylist.unwrap_or_default(),
-        }
-    }
-
-    /// Check if a command is allowed by the allowlist/denylist.
-    fn check_command(&self, command: &str) -> Result<(), String> {
+    /// Check if a command is allowed by the grant's allowlist/denylist.
+    /// An empty `allow` list means allow-all (no allowlist enforced).
+    fn check_command(command: &str, grant: Option<&ShellGrant>) -> Result<(), String> {
         // Extract all command tokens (handles pipes, &&, ||, ;, $())
         let commands = Self::extract_commands(command);
 
@@ -34,16 +26,17 @@ impl ShellExec {
                 continue;
             }
 
-            // Check denylist first
-            for denied in &self.denylist {
-                if binary.starts_with(denied) {
-                    return Err(format!("Command '{binary}' is denied by security policy"));
+            if let Some(g) = grant {
+                // Check denylist first
+                for denied in &g.deny {
+                    if binary.starts_with(denied) {
+                        return Err(format!("Command '{binary}' is denied by security policy"));
+                    }
                 }
-            }
 
-            // Check allowlist if configured
-            if let Some(allowlist) = &self.allowlist {
-                if !allowlist.iter().any(|allowed| binary.starts_with(allowed)) {
+                // Check allowlist if configured (non-empty)
+                if !g.allow.is_empty() && !g.allow.iter().any(|allowed| binary.starts_with(allowed))
+                {
                     return Err(format!(
                         "Command '{binary}' is not in the allowed commands list"
                     ));
@@ -109,19 +102,19 @@ impl Tool for ShellExec {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let command = arguments
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing 'command' argument".to_string())?;
 
-            // Check against allowlist/denylist
-            self.check_command(command).map_err(|e| {
+            // Check against allowlist/denylist from the resolved grant
+            Self::check_command(command, ctx.grants().shell.as_ref()).map_err(|e| {
                 warn!(command = %command, "Shell command denied: {e}");
                 e
             })?;
@@ -181,5 +174,62 @@ impl Tool for ShellExec {
 
             Ok(result)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_grant_is_permissive() {
+        assert!(ShellExec::check_command("rm -rf /", None).is_ok());
+    }
+
+    #[test]
+    fn test_empty_grant_is_permissive() {
+        let g = ShellGrant::default();
+        assert!(ShellExec::check_command("git status", Some(&g)).is_ok());
+    }
+
+    #[test]
+    fn test_allowlist_restricts() {
+        let g = ShellGrant {
+            allow: vec!["git".to_string(), "ls".to_string()],
+            deny: vec![],
+        };
+        assert!(ShellExec::check_command("git status", Some(&g)).is_ok());
+        assert!(ShellExec::check_command("ls -la", Some(&g)).is_ok());
+        assert!(ShellExec::check_command("rm -rf /", Some(&g)).is_err());
+    }
+
+    #[test]
+    fn test_denylist_blocks() {
+        let g = ShellGrant {
+            allow: vec![],
+            deny: vec!["rm".to_string()],
+        };
+        assert!(ShellExec::check_command("ls", Some(&g)).is_ok());
+        assert!(ShellExec::check_command("rm -rf /", Some(&g)).is_err());
+    }
+
+    #[test]
+    fn test_denylist_beats_allowlist() {
+        let g = ShellGrant {
+            allow: vec!["rm".to_string()],
+            deny: vec!["rm".to_string()],
+        };
+        assert!(ShellExec::check_command("rm foo", Some(&g)).is_err());
+    }
+
+    #[test]
+    fn test_pipes_check_every_command() {
+        let g = ShellGrant {
+            allow: vec!["cat".to_string()],
+            deny: vec![],
+        };
+        assert!(ShellExec::check_command("cat file.txt", Some(&g)).is_ok());
+        // A piped disallowed command is rejected
+        assert!(ShellExec::check_command("cat file.txt | grep foo", Some(&g)).is_err());
     }
 }

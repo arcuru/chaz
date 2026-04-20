@@ -119,19 +119,6 @@ async fn main() -> anyhow::Result<()> {
         _ => security::LeakPolicy::Redact,
     };
     let leak_detector = security::LeakDetector::new(leak_policy);
-    let network_policy = std::sync::Arc::new(security::NetworkPolicy::new(
-        sec.allowed_endpoints
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| security::network::EndpointPattern {
-                host: e.host,
-                path_prefix: e.path_prefix,
-                methods: e.methods,
-            })
-            .collect(),
-        true, // always deny private IPs
-    ));
     let auto_approved: std::collections::HashSet<String> = sec
         .auto_approved_tools
         .clone()
@@ -156,13 +143,10 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::GetTime);
     tool_registry.register(tools::Calculate);
     tool_registry.register(tools::DescribeTool);
-    tool_registry.register(tools::ShellExec::new(
-        sec.shell_allowlist.clone(),
-        sec.shell_denylist.clone(),
-    ));
+    tool_registry.register(tools::ShellExec);
     tool_registry.register(tools::ReadFile);
     tool_registry.register(tools::WriteFile);
-    tool_registry.register(tools::WebFetch::new(network_policy));
+    tool_registry.register(tools::WebFetch);
     tool_registry.register(tools::Remember::new(central_db.clone()));
     tool_registry.register(tools::Recall::new(central_db.clone()));
     tool_registry.register(tools::Compact);
