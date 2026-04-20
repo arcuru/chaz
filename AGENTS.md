@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chaz is an AI agent orchestrator for Matrix written in Rust. It connects to Matrix rooms via headjack/matrix-sdk and responds using OpenAI-compatible LLM backends (e.g., OpenRouter). Features a ReAct tool-calling loop, session-based conversation history (via eidetica), and a TUI mode for testing without Matrix.
 
-**Status**: Active development — Phases 0–14 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience, gateway command unification). Recent: transport-neutral `commands::dispatch` — both TUI and Matrix now share one dispatch path for session ops (sessions/info/name/share/sync/compact/print/schedules/run/model/role/backend), MCP Streamable HTTP transport, MCP tool directory scanning, dynamic tool re-discovery (tools/list_changed), loop detection, LLM request timeout, retry with exponential backoff.
+**Status**: Active development — Phases 0–15 complete (architecture, tools, security, multi-agent, sessions, scheduling, MCP, tool profiles, structured errors, LLM resilience, gateway command unification, grant config unification). Recent: typed capability grants (`Grants`/`ShellGrant`/`NetworkGrant`/`FsGrant`) attached to each `ToolPolicy`, read by tools via `ctx.grants()`; per-agent grant overlays merge per-kind over config; legacy `shell_allowlist`/`allowed_endpoints` migrated at startup with a deprecation warn. Earlier: transport-neutral `commands::dispatch`, MCP Streamable HTTP transport, MCP tool directory scanning, dynamic tool re-discovery (tools/list_changed), loop detection, LLM request timeout, retry with exponential backoff.
 
 ## Build & Development Commands
 
@@ -24,7 +24,7 @@ just nix check      # nix flake check
 
 Note: `nix develop` may pick up eidetica's dev shell due to the git dependency. Use `nix develop .#` to explicitly select chaz's shell.
 
-145 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), secret resolution, loop detection, and MCP (SSE parsing, JSON-RPC response handling, tool metadata refresh/removal, config deserialization, directory scanning, subprocess integration lifecycle/error/death). Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
+161 unit tests covering security (leak detection, SSRF, sanitizer, XML wrapping, rate limiting), context budgeting (tiktoken), agent spawn permissions, tool profiles (globs), secret resolution, loop detection, MCP (SSE parsing, JSON-RPC response handling, tool metadata refresh/removal, config deserialization, directory scanning, subprocess integration lifecycle/error/death), and grants (shell/network checks, legacy migration, per-kind merge). Use `CARGO_TARGET_DIR=target-test cargo test --bin chaz`. Build deps: `pkg-config`, `openssl`, `sqlite`.
 
 ## Architecture
 

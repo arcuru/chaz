@@ -170,13 +170,28 @@ agents:
 security:
   auto_approved_tools:
     ["get_time", "calculate", "read_file", "remember", "recall"]
-  shell_allowlist: ["ls", "cat", "grep", "find"]
-  shell_denylist: ["rm", "sudo"]
-  allowed_endpoints:
-    - host: "api.example.com"
   tool_policies:
     shell:
       approval: Always
+      grants:
+        shell:
+          allow: ["ls", "cat", "grep", "find"]
+          deny: ["rm", "sudo"]
+    web_fetch:
+      grants:
+        network:
+          endpoints:
+            - host: "api.example.com"
+          allow_private: false # SSRF blocking (default)
+
+# Per-agent grant overlays are merged per-kind over the config above:
+# agents:
+#   - name: researcher
+#     grants:
+#       web_fetch:
+#         network:
+#           endpoints:
+#             - host: "*.wikipedia.org"
 ```
 
 ## Install
