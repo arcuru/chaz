@@ -456,6 +456,33 @@ impl Gateway for MatrixGateway {
             Some(Command::Print)
         });
 
+        // --- Living Agents: per-session agent participation ---
+        register_shared!(
+            "agents",
+            "".to_string(),
+            "List agents attached to this session",
+            |_t| { Some(Command::AgentsList) }
+        );
+        register_shared!(
+            "agent",
+            "add|remove|list <name|db_id>".to_string(),
+            "Attach or detach an agent on this session",
+            |text| {
+                let arg = matrix_args(&text);
+                let mut parts = arg.trim().splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("").trim();
+                let rest = parts.next().unwrap_or("").trim();
+                match sub {
+                    "add" if !rest.is_empty() => Some(Command::AgentAdd(rest.to_string())),
+                    "remove" | "rm" if !rest.is_empty() => {
+                        Some(Command::AgentRemove(rest.to_string()))
+                    }
+                    "list" | "" => Some(Command::AgentsList),
+                    _ => None,
+                }
+            }
+        );
+
         // --- Matrix channel ops (attach/detach are gateway-local so we can
         //     install the response callback on the new session immediately) ---
         {

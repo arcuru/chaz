@@ -50,6 +50,14 @@ pub enum Command {
     /// List Matrix rooms currently attached to the current session.
     ListChannels,
 
+    // --- Agents participating in the current session (Living Agents) ---
+    /// Attach an agent (by name or DB ID) to the current session.
+    AgentAdd(String),
+    /// Detach an agent (by name or DB ID) from the current session.
+    AgentRemove(String),
+    /// List agents currently attached to the session.
+    AgentsList,
+
     // --- Scheduler ---
     ListSchedules,
     TriggerSchedule(String),
@@ -120,6 +128,9 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::Compact => compact(ctx).await,
         Command::Print => print_transcript(ctx).await,
         Command::ListChannels => list_channels(ctx).await,
+        Command::AgentAdd(r) => agent_add(&r, ctx).await,
+        Command::AgentRemove(r) => agent_remove(&r, ctx).await,
+        Command::AgentsList => agents_list(ctx).await,
         Command::ListSchedules => list_schedules(ctx).await,
         Command::TriggerSchedule(name) => trigger_schedule(&name, ctx).await,
         Command::Model(arg) => model(arg, ctx).await,
@@ -640,4 +651,82 @@ async fn list_backends(ctx: &CommandContext<'_>) -> CommandOutcome {
         ctx.backend.list_known_models().join("\n")
     );
     CommandOutcome::Text(msg)
+}
+
+// -----------------------------------------------------------------------------
+// Agent participation (Living Agents Stage 3d)
+// -----------------------------------------------------------------------------
+
+/// Resolve a user-supplied ref — either an agent display name or an eidetica
+/// DB ID — to an `AgentIndexEntry`.
+async fn resolve_agent_ref(
+    agent_ref: &str,
+    ctx: &CommandContext<'_>,
+) -> Result<crate::agent_index::AgentIndexEntry, String> {
+    let index = ctx.server.agent_index();
+    if let Ok(Some(entry)) = index.find_by_name(agent_ref).await {
+        return Ok(entry);
+    }
+    if let Ok(id) = eidetica::entry::ID::parse(agent_ref) {
+        if let Ok(Some(entry)) = index.find_by_id(&id).await {
+            return Ok(entry);
+        }
+    }
+    Err(format!(
+        "No hosted agent matches '{agent_ref}' (try a display name from /agents or an agent DB ID)"
+    ))
+}
+
+async fn agent_add(agent_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    match ctx
+        .server
+        .registry()
+        .attach_agent_to_session(ctx.session_db_id, &entry)
+        .await
+    {
+        Ok(()) => CommandOutcome::Text(format!(
+            "Attached agent '{}' to this session",
+            entry.display_name
+        )),
+        Err(e) => CommandOutcome::Error(format!("Failed to attach agent: {e}")),
+    }
+}
+
+async fn agent_remove(agent_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    match ctx
+        .server
+        .registry()
+        .detach_agent_from_session(ctx.session_db_id, &entry)
+        .await
+    {
+        Ok(()) => CommandOutcome::Text(format!(
+            "Detached agent '{}' from this session",
+            entry.display_name
+        )),
+        Err(e) => CommandOutcome::Error(format!("Failed to detach agent: {e}")),
+    }
+}
+
+async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let meta = crate::session::read_meta_from_db(ctx.session_db).await;
+    if meta.agents.is_empty() {
+        let fallback = meta.agent_name.unwrap_or_else(|| "<default>".to_string());
+        return CommandOutcome::Text(format!(
+            "No Living Agents attached to this session. Legacy agent: {fallback}"
+        ));
+    }
+    let lines: Vec<String> = meta
+        .agents
+        .iter()
+        .map(|a| format!("  {} ({})", a.display_name, a.db_id))
+        .collect();
+    CommandOutcome::Text(format!("Agents on this session:\n{}", lines.join("\n")))
 }

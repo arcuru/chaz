@@ -597,7 +597,28 @@ fn parse_chat_line(
         "/role" => return Some(ChatAction::Dispatch(Command::Role(None))),
         "/model" => return Some(ChatAction::Dispatch(Command::Model(None))),
         "/channels" => return Some(ChatAction::Dispatch(Command::ListChannels)),
+        "/agents" => return Some(ChatAction::Dispatch(Command::AgentsList)),
         _ => {}
+    }
+
+    if let Some(arg) = text.strip_prefix("/agent add ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::AgentAdd(r)));
+        }
+        show_error(app, "Usage: /agent add <name|db_id>".to_string());
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/agent remove ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::AgentRemove(r)));
+        }
+        show_error(app, "Usage: /agent remove <name|db_id>".to_string());
+        return None;
+    }
+    if text == "/agent" || text == "/agent list" {
+        return Some(ChatAction::Dispatch(Command::AgentsList));
     }
 
     if let Some(arg) = text.strip_prefix("/join ") {
