@@ -25,31 +25,47 @@ To send without the `!chaz` prefix in a DM, just type normally.
 
 ## Commands
 
-Commands are sent as Matrix messages:
+Commands are sent as Matrix messages. Session ops (sessions, info, name, share, sync, compact, print, schedules, run, model, role, backend, backends, channels) go through the same transport-neutral dispatch as the TUI — so both gateways stay in sync.
 
-| Command                                     | Description                                   |
-| ------------------------------------------- | --------------------------------------------- |
-| `!chaz help`                                | Show available commands                       |
-| `!chaz print`                               | Print the current conversation context        |
-| `!chaz send <msg>`                          | Send a message without conversation context   |
-| `!chaz model <model>`                       | Set the model for this room                   |
-| `!chaz backend <name> <api_base> <api_key>` | Add a custom backend                          |
-| `!chaz role`                                | Show current role and available roles         |
-| `!chaz role <name>`                         | Set role for this room                        |
-| `!chaz role <name> <prompt>`                | Define a new role                             |
-| `!chaz list`                                | List available models                         |
-| `!chaz clear`                               | Ignore all messages before this point         |
-| `!chaz rename`                              | Rename the room based on conversation content |
+| Command                                     | Description                                            |
+| ------------------------------------------- | ------------------------------------------------------ |
+| `!chaz sessions`                            | List every session known to the registry               |
+| `!chaz info`                                | Show details for the session attached to this room     |
+| `!chaz name [<alias>]`                      | Set (or clear) a human-friendly alias for this session |
+| `!chaz attach <session>`                    | Bind this room to a specific session (name or DB ID)   |
+| `!chaz detach`                              | Detach this room from its session                      |
+| `!chaz channels`                            | List Matrix rooms currently attached to this session   |
+| `!chaz share`                               | Generate a shareable ticket URL for this session       |
+| `!chaz sync <ticket>`                       | Sync a remote session via ticket URL                   |
+| `!chaz compact`                             | Summarize and compact conversation history             |
+| `!chaz print`                               | Print the current conversation context                 |
+| `!chaz schedules`                           | List configured schedules                              |
+| `!chaz run <name>`                          | Trigger a schedule immediately                         |
+| `!chaz model <model>`                       | Set the model for this session                         |
+| `!chaz role [<name> [<prompt>]]`            | Show, select, or define a role                         |
+| `!chaz backend <name> <api_base> <api_key>` | Register a custom backend for this session             |
+| `!chaz backends`, `!chaz list`              | List known backends and models                         |
+| `!chaz approve` / `!chaz deny`              | Decide the pending tool approval                       |
+| `!chaz send <msg>`                          | One-shot message with no conversation context          |
+| `!chaz clear`                               | Ignore all messages before this point                  |
+| `!chaz rename`                              | Rename the Matrix room based on conversation content   |
+| `!chaz party`                               | 🎉                                                     |
 
-## Per-Room Settings
+## Session Attachment
 
-Each room stores its own model, role, and backend selection using Matrix room tags in the `is.chaz.*` namespace. These persist across restarts.
+A Matrix room is connected to a session through an explicit _channel_ record (`room_id → session_db_id`). The first time you talk to the bot in a new room it auto-creates a session and attaches the room to it.
+
+Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next message in the room creates a fresh session.
+
+At gateway startup, the bot re-installs response-delivery callbacks for every persisted channel whose room it's joined to. This is what makes scheduled-task responses reach a Matrix room even when no user is currently active there.
+
+## Per-Session Settings
+
+Model, role, and backend selections live in the session's own eidetica database (under a `meta` DocStore), not on the room. That means a session's config travels with it across eidetica sync — sharing a session shares its name, agent, model, role, and backend reference.
 
 ## Session Persistence
 
-Each Matrix room maps to a dedicated eidetica session database. Conversation history survives bot restarts. The Matrix sync token is persisted by headjack, so the bot resumes from where it left off.
-
-Message batching prevents duplicate responses after a restart: messages received during the catch-up sync that were already processed are skipped.
+Conversation history lives in per-session eidetica databases and survives bot restarts. The Matrix sync token is persisted by headjack, so the bot resumes from where it left off. Message batching prevents duplicate responses after a restart: messages received during the catch-up sync that were already processed are skipped.
 
 ## Retry Behavior
 
@@ -57,4 +73,4 @@ If the Matrix connection drops, the bot retries with a 5-second backoff. The ret
 
 ## Tool Approval
 
-Tool approval in Matrix is not yet implemented (TUI-only for now). Tools that require approval will time out and be denied when running via Matrix. Configure `security.auto_approved_tools` for tools you want to run without approval.
+The bot surfaces approval requests as markdown notices in the room. Respond either via reactions (✅ approve · ❌ deny · ⏭ approve all) or by sending `!chaz approve` / `!chaz deny`. To skip approval altogether for specific low-risk tools, add them to `security.auto_approved_tools`.

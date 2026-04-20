@@ -120,6 +120,6 @@ See [Agents](agents.md) for details on tool narrowing.
 
 ## Limitations
 
-- **Subprocess only**: Currently supports stdin/stdout JSON-RPC transport. SSE/HTTP transport is planned.
-- **No dynamic re-discovery**: Tools are discovered once at startup (or restart). The `notifications/tools/list_changed` notification is not yet handled.
 - **No streaming**: Tool results are returned as a single response, not streamed.
+
+Supported: stdio (subprocess JSON-RPC via `command`) and Streamable HTTP (POST + SSE via `url`). Dynamic re-discovery via `notifications/tools/list_changed` is handled — metadata refreshes lazily before the next tool call. Stdio subprocesses auto-restart with exponential backoff on crash.

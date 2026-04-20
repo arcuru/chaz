@@ -87,7 +87,7 @@ The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event s
 
 ### Session Model
 
-Each conversation is an eidetica `Database` containing a `Table<SessionEntry>`. Entries have a sender, content, timestamp, and type. The `SessionRegistry` maps transport IDs to session databases.
+Each conversation is an eidetica `Database` containing a `Table<SessionEntry>` (history) and a `DocStore` called `meta` (session config: name, agent, model, role, backend). Sessions are identified globally by their DB root ID. The `SessionRegistry` holds index stores only: `sessions`, `matrix_channels` (Matrix `room_id` → `session_db_id`, fan-out supported), and `session_names`.
 
 See [Session Model](sessions.md) for details.
 

@@ -44,9 +44,11 @@ agents:
 
 ## Agent Selection
 
-- **Matrix**: Each room can be bound to a specific agent via `!chaz role` or room tags
-- **TUI**: The default agent is used. Agent binding per session is planned.
-- **spawn_agent**: The calling agent specifies which agent to spawn by name
+Agent selection is a per-session setting (stored in the session's `meta.agent_name`), not a per-room setting. That means a session's agent choice travels with the session over eidetica sync and is shared between every channel attached to it.
+
+- **Matrix**: The session attached to the room determines the agent. Change it by running `!chaz attach` to a different session or by setting a new agent via configuration/spawn-level overrides.
+- **TUI**: The agent is read from the current session's `meta`. Switch sessions with `/join` or `/new` to change context.
+- **spawn_agent**: The calling agent names the target agent explicitly.
 
 ## Tool Narrowing
 

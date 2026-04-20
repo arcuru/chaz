@@ -96,7 +96,7 @@ mcp_servers:
 # Scheduled tasks
 schedules:
   - name: daily-check
-    session: daily-standup # Session name, DB ID, or transport ID
+    session: daily-standup # Session name or eidetica DB root ID
     task: "Run the daily status check"
     cron: "0 9 * * *"
     enabled: true
@@ -140,7 +140,7 @@ External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) 
 
 ## Schedules
 
-Cron-driven task injection into sessions. Each schedule writes a `Directive` entry to the target session on a cron schedule. Sessions can be referenced by name, eidetica DB ID, or transport ID.
+Cron-driven task injection into sessions. Each schedule writes a `Directive` entry to the target session on a cron schedule. Sessions are referenced by name or eidetica DB root ID. Responses from scheduled runs are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
 
 ## Context
 

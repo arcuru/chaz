@@ -58,7 +58,7 @@ chaz --config config.yaml --tui
 | `/help`           | Show all commands and key bindings            |
 | `/sessions`, `/s` | Open session picker                           |
 | `/new`            | Create a new session                          |
-| `/join <id>`      | Switch to session by transport ID             |
+| `/join <id>`      | Switch to session by name or eidetica DB ID   |
 | `/info`           | Show current session details                  |
 | `/share`          | Generate shareable ticket for current session |
 | `/sync <ticket>`  | Sync a remote session via ticket              |

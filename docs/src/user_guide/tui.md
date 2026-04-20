@@ -35,24 +35,30 @@ The TUI has three sections:
 
 ## Commands
 
-| Command           | Description                                                       |
-| ----------------- | ----------------------------------------------------------------- |
-| `/help`, `/?`     | Show all commands and key bindings                                |
-| `/sessions`, `/s` | Open session picker                                               |
-| `/new`            | Create a new session                                              |
-| `/join <id>`      | Switch to a session by name, DB ID, or transport ID               |
-| `/name <alias>`   | Set a human-friendly name for the current session                 |
-| `/name`           | Clear the session name                                            |
-| `/info`           | Show current session details (name, DB ID, entry counts)          |
-| `/share`          | Generate a shareable ticket URL for the current session           |
-| `/sync <ticket>`  | Sync a remote session via a ticket URL                            |
-| `/schedules`      | List configured schedules with status and timing                  |
-| `/run <name>`     | Trigger a schedule immediately                                    |
-| `/compact`        | Summarize and compact conversation history                        |
-| `/clear`          | Clear the display (entries remain in the database)                |
-| `/raw`            | Dump all raw entry data (index, timestamp, type, sender, content) |
-| `/debug`          | Toggle debug mode                                                 |
-| `/quit`, `/q`     | Exit                                                              |
+| Command                       | Description                                                       |
+| ----------------------------- | ----------------------------------------------------------------- |
+| `/help`, `/?`                 | Show all commands and key bindings                                |
+| `/sessions`, `/s`             | Open session picker                                               |
+| `/new`                        | Create a new session                                              |
+| `/join <id>`                  | Switch to a session by name or eidetica DB ID                     |
+| `/name <alias>`               | Set a human-friendly name for the current session                 |
+| `/name`                       | Clear the session name                                            |
+| `/info`                       | Show current session details (name, DB ID, entry counts)          |
+| `/share`                      | Generate a shareable ticket URL for the current session           |
+| `/sync <ticket>`              | Sync a remote session via a ticket URL                            |
+| `/schedules`                  | List configured schedules with status and timing                  |
+| `/run <name>`                 | Trigger a schedule immediately                                    |
+| `/channels`                   | List Matrix rooms currently attached to the session               |
+| `/compact`                    | Summarize and compact conversation history                        |
+| `/print`                      | Dump the transcript                                               |
+| `/model [<m>]`                | Show or set the model for the session                             |
+| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                    |
+| `/backend <name> <url> <key>` | Add a custom backend for the session                              |
+| `/backends`                   | List known backends and models                                    |
+| `/clear`                      | Clear the display (entries remain in the database)                |
+| `/raw`                        | Dump all raw entry data (index, timestamp, type, sender, content) |
+| `/debug`                      | Toggle debug mode                                                 |
+| `/quit`, `/q`                 | Exit                                                              |
 
 ## Key Bindings
 
@@ -85,28 +91,21 @@ Open with `/sessions` or `/s`:
 ```text
 +--[ Sessions ]---------------------------------------+
 |                                                     |
-| > tui * (default, 15 entries)                       |
+| > sha256:abc… "tui" * (default, 15 entries)         |
 |     user: What's the current time?                  |
 |                                                     |
-|   !room123:matrix.org (default, 42 entries)         |
+|   sha256:def… (default, 42 entries)                 |
 |     user: Tell me about quantum computing           |
 |                                                     |
-|   spawn:abc-123 (researcher, 3 entries)             |
-|     default: Research the latest AI papers           |
+|   sha256:xyz… (researcher, 3 entries)               |
+|     default: Research the latest AI papers          |
 |                                                     |
 +-----------------------------------------------------+
 | [Up/Down] navigate | [Enter] select | [n] new | ... |
 +-----------------------------------------------------+
 ```
 
-The picker shows all sessions from the registry, including:
-
-- Matrix room sessions
-- TUI sessions
-- Child sessions created by `spawn_agent`
-- Sessions synced from remote instances
-
-The current session is marked with `*`. Named sessions display their alias (e.g., `tui "daily-standup" *`). Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+Sessions are listed by their eidetica DB root ID; any attached Matrix rooms or human-friendly names appear alongside. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
 
 ## Named Sessions
 
