@@ -26,14 +26,15 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
 
-/// Per-session metadata needed for agent processing.
-struct SessionMeta {
+/// Per-session runtime state needed for agent processing.
+/// Keyed by `session_db_id` in `Server::sessions`.
+struct SessionRuntime {
     backend: BackendManager,
     agent_override: Option<String>,
     approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
@@ -58,10 +59,6 @@ struct SpawnContext {
 }
 
 /// Callback-driven agent server.
-///
-/// Watches session databases for new entries. When a non-agent message appears,
-/// spawns an agent task. Transport-agnostic — gateways handle their own response
-/// delivery by registering callbacks on session DBs.
 pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
@@ -69,17 +66,15 @@ pub struct Server {
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
     semaphore: Arc<Semaphore>,
-    /// Named tool profiles from config
     tool_profiles: HashMap<String, ToolProfile>,
-    /// Context window management config
     context_config: ContextConfig,
-    /// Per-session metadata (backend, agent override, approval channel)
-    sessions: Arc<Mutex<HashMap<String, SessionMeta>>>,
+    /// Per-session runtime state keyed by session_db_id
+    sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     /// Track which session DBs have server callbacks registered
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Internal notification channel — callbacks send transport_id here
+    /// Internal notification channel — callbacks send session_db_id here
     notify_tx: mpsc::Sender<String>,
 }
 
@@ -110,14 +105,11 @@ impl Server {
             notify_tx,
         });
 
-        // Spawn the processing loop
         let server_clone = server.clone();
         tokio::spawn(async move {
             server_clone.processing_loop(notify_rx).await;
         });
 
-        // Spawn the new-session watcher — auto-registers callbacks for
-        // sessions created via sync, schedules, or other non-gateway sources
         let server_clone = server.clone();
         tokio::spawn(async move {
             server_clone.new_session_watcher().await;
@@ -126,86 +118,85 @@ impl Server {
         server
     }
 
-    /// Get the session registry
     pub fn registry(&self) -> &SessionRegistry {
         &self.registry
     }
 
-    /// Get a shared Arc handle to the session registry
     pub fn registry_arc(&self) -> Arc<SessionRegistry> {
         self.registry.clone()
     }
 
-    /// Get the agent registry
     pub fn agents(&self) -> &AgentRegistry {
         &self.agents
     }
 
+    pub fn agents_arc(&self) -> Arc<AgentRegistry> {
+        self.agents.clone()
+    }
+
     /// Register a session for callback-driven agent processing.
     ///
-    /// Call this when a gateway first encounters a transport (e.g., a Matrix room).
-    /// Registers an `on_local_write` callback on the session database that triggers
-    /// agent processing when new non-agent messages appear.
+    /// Installs an `on_local_write` callback on the session DB (if not already
+    /// present) that triggers agent processing when new non-agent messages or
+    /// directives appear. Stores per-session runtime state (backend, agent
+    /// override, approval channel) keyed by the session DB ID.
     ///
     /// Gateways should register their own callbacks on the session DB to handle
-    /// response delivery (e.g., sending agent messages to a Matrix room).
+    /// response delivery.
     ///
     /// Safe to call multiple times — updates metadata, skips duplicate callback registration.
     pub async fn register_session(
         &self,
-        transport_id: &str,
         session_db: &eidetica::Database,
         backend: BackendManager,
         agent_override: Option<String>,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
-        // Update session metadata
+        let session_db_id = session_db.root_id().to_string();
+
         {
             let mut sessions = self.sessions.lock().await;
             sessions.insert(
-                transport_id.to_string(),
-                SessionMeta {
+                session_db_id.clone(),
+                SessionRuntime {
                     backend,
                     agent_override,
                     approval_tx,
                     call_depth: 0,
-                    max_call_depth: 0, // 0 = use agent's own max_iterations
+                    max_call_depth: 0,
                     parent_tools: None,
                     completion_tx: None,
                 },
             );
         }
 
-        // Register server callback if not already done for this session DB
-        let db_id = session_db.root_id().to_string();
         let mut watched = self.watched.lock().await;
-        if watched.contains(&db_id) {
+        if watched.contains(&session_db_id) {
             return Ok(());
         }
-        watched.insert(db_id);
+        watched.insert(session_db_id.clone());
         drop(watched);
 
         let tx = self.notify_tx.clone();
-        let tid = transport_id.to_string();
+        let sid = session_db_id.clone();
         session_db.on_local_write(move |_entry, _db, _instance| {
             let tx = tx.clone();
-            let tid = tid.clone();
+            let sid = sid.clone();
             Box::pin(async move {
-                let _ = tx.send(tid).await;
+                let _ = tx.send(sid).await;
                 Ok(())
             })
         })?;
 
-        info!("Server watching session DB for {}", transport_id);
+        info!(session_db_id = %session_db_id, "Server watching session");
         Ok(())
     }
 
-    /// Register a child session for agent-to-agent communication.
+    /// Create and register a child session for agent-to-agent communication.
     ///
-    /// Creates a new session DB via the registry, registers it for callback-driven
-    /// processing, and returns the session info plus a completion receiver. The caller
-    /// writes a Directive entry to trigger agent execution, then awaits the receiver
-    /// for the response.
+    /// Creates a fresh session DB via the registry, installs server callbacks,
+    /// and returns the session info plus a completion receiver. The caller
+    /// writes a Directive entry to trigger execution, then awaits the receiver.
     pub async fn register_child_session(
         &self,
         agent_name: &str,
@@ -214,27 +205,18 @@ impl Server {
         call_depth: usize,
         max_call_depth: usize,
         parent_tools: ScopedTools,
-    ) -> anyhow::Result<(
-        String,
-        ConversationId,
-        eidetica::Database,
-        mpsc::Receiver<()>,
-    )> {
-        let transport_id = format!("spawn:{}", uuid::Uuid::new_v4());
-
-        let (conversation_id, session_db) = self
-            .registry
-            .get_or_create_session_db(&transport_id)
-            .await?;
+    ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
+        let source = format!("spawn:{}", uuid::Uuid::new_v4());
+        let (conversation_id, session_db) = self.registry.create_session(Some(&source)).await?;
+        let session_db_id = session_db.root_id().to_string();
 
         let (completion_tx, completion_rx) = mpsc::channel(1);
 
-        // Store metadata with spawn context
         {
             let mut sessions = self.sessions.lock().await;
             sessions.insert(
-                transport_id.clone(),
-                SessionMeta {
+                session_db_id.clone(),
+                SessionRuntime {
                     backend,
                     agent_override: Some(agent_name.to_string()),
                     approval_tx,
@@ -246,85 +228,81 @@ impl Server {
             );
         }
 
-        // Register on_local_write callback for server processing
-        let db_id = session_db.root_id().to_string();
         let mut watched = self.watched.lock().await;
-        if !watched.contains(&db_id) {
-            watched.insert(db_id);
+        if !watched.contains(&session_db_id) {
+            watched.insert(session_db_id.clone());
             drop(watched);
 
             let tx = self.notify_tx.clone();
-            let tid = transport_id.clone();
+            let sid = session_db_id.clone();
             session_db.on_local_write(move |_entry, _db, _instance| {
                 let tx = tx.clone();
-                let tid = tid.clone();
+                let sid = sid.clone();
                 Box::pin(async move {
-                    let _ = tx.send(tid).await;
+                    let _ = tx.send(sid).await;
                     Ok(())
                 })
             })?;
 
             info!(
-                "Server watching child session DB for {} (agent: {})",
-                transport_id, agent_name
+                session_db_id = %session_db_id,
+                agent = %agent_name,
+                "Server watching child session"
             );
         } else {
             drop(watched);
         }
 
-        Ok((transport_id, conversation_id, session_db, completion_rx))
+        Ok((conversation_id, session_db, completion_rx))
     }
 
-    /// Main processing loop. Receives notifications from callbacks and processes sessions.
     async fn processing_loop(&self, mut notify_rx: mpsc::Receiver<String>) {
-        while let Some(transport_id) = notify_rx.recv().await {
+        while let Some(session_db_id) = notify_rx.recv().await {
             // Debounce: drain any pending notifications, dedup
-            let mut to_process = vec![transport_id];
-            while let Ok(tid) = notify_rx.try_recv() {
-                if !to_process.contains(&tid) {
-                    to_process.push(tid);
+            let mut to_process = vec![session_db_id];
+            while let Ok(sid) = notify_rx.try_recv() {
+                if !to_process.contains(&sid) {
+                    to_process.push(sid);
                 }
             }
 
-            for transport_id in to_process {
-                if let Err(e) = self.process_session(&transport_id).await {
-                    error!("Error processing session {}: {e}", transport_id);
+            for sid in to_process {
+                if let Err(e) = self.process_session(&sid).await {
+                    error!("Error processing session {sid}: {e}");
                 }
             }
         }
     }
 
-    /// Watch for new sessions from the registry and log them.
-    ///
-    /// Sessions created by eidetica sync, scheduled tasks, or other non-gateway
-    /// sources will be detected here. Currently logs for awareness; gateways
-    /// should call `register_session` to enable agent processing on these sessions.
+    /// Watch for new sessions appearing in the registry (local creates, sync, etc.)
+    /// and log them. Gateways are responsible for calling `register_session` to
+    /// wire up agent processing and response delivery for their channels.
     async fn new_session_watcher(&self) {
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;
         };
         let mut seen = std::collections::HashSet::new();
         while let Some(event) = rx.recv().await {
-            if !seen.insert(event.transport_id.clone()) {
+            if !seen.insert(event.session_db_id.clone()) {
                 continue;
             }
-            if event.transport_id.starts_with("spawn:") {
+            if event
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("spawn:"))
+            {
                 continue;
             }
             info!(
-                "New session detected: {} (db: {})",
-                event.transport_id, event.session_db_id
+                session_db_id = %event.session_db_id,
+                source = ?event.source,
+                "New session detected"
             );
         }
     }
 
-    /// Check a session for new entries and act on them.
-    ///
-    /// Skips processing if an agent task is already running for this session,
-    /// preventing duplicate responses from concurrent writes.
-    async fn process_session(&self, transport_id: &str) -> anyhow::Result<()> {
-        let (conversation_id, session_db) =
-            self.registry.get_or_create_session_db(transport_id).await?;
+    async fn process_session(&self, session_db_id: &str) -> anyhow::Result<()> {
+        let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
@@ -333,9 +311,6 @@ impl Server {
             None => return Ok(()),
         };
 
-        // Determine if this entry should trigger agent execution:
-        // - Message from a non-agent sender (user input)
-        // - Directive from any sender (spawn_agent, scheduler, system)
         let should_process = match latest.entry_type {
             EntryType::Message => self.agents.get(&latest.sender).is_none(),
             EntryType::Directive => true,
@@ -345,17 +320,15 @@ impl Server {
             return Ok(());
         }
 
-        // Per-session serialization: skip if an agent task is already running
         {
             let mut processing = self.processing.lock().await;
-            if !processing.insert(transport_id.to_string()) {
-                // Already processing — the running task will see the new entry
+            if !processing.insert(session_db_id.to_string()) {
                 return Ok(());
             }
         }
         let (backend, agent_override, approval_tx, spawn_ctx) = {
             let sessions = self.sessions.lock().await;
-            match sessions.get(transport_id) {
+            match sessions.get(session_db_id) {
                 Some(m) => (
                     m.backend.clone(),
                     m.agent_override.clone(),
@@ -368,17 +341,21 @@ impl Server {
                         processing: self.processing.clone(),
                     },
                 ),
-                None => return Ok(()),
+                None => {
+                    // Session not registered for processing — clear lock and bail.
+                    self.processing.lock().await.remove(session_db_id);
+                    return Ok(());
+                }
             }
         };
 
         let agent = self
             .registry
-            .resolve_agent(transport_id, agent_override.as_deref())
+            .resolve_agent(session_db_id, agent_override.as_deref())
             .await;
 
         self.spawn_agent_task(
-            transport_id.to_string(),
+            session_db_id.to_string(),
             session,
             agent,
             approval_tx,
@@ -390,10 +367,9 @@ impl Server {
         Ok(())
     }
 
-    /// Spawn a tokio task to run an agent's ReAct loop.
     async fn spawn_agent_task(
         &self,
-        transport_id: String,
+        session_db_id: String,
         session: Session,
         agent: crate::agent::Agent,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
@@ -405,14 +381,12 @@ impl Server {
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
         let agent_grants = agent.grants.clone();
-        // Use override if set, otherwise fall back to agent's own max_iterations
         let max_call_depth = if spawn.max_call_depth > 0 {
             spawn.max_call_depth
         } else {
             agent.max_iterations as usize
         };
 
-        // Resolve tool profile: agent default (preset resolution happens at spawn_agent level)
         let profile = agent
             .tool_profile
             .as_ref()
@@ -431,7 +405,6 @@ impl Server {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
             let session = Arc::new(Mutex::new(session));
 
-            // Write Ack entry so clients show "thinking..." immediately
             {
                 let mut s = session.lock().await;
                 s.add_entry(SessionEntry {
@@ -449,8 +422,6 @@ impl Server {
                 approval_callback: approval_tx,
             };
 
-            // Build tool scope: if parent provided a narrowed scope, narrow further
-            // with this agent's allowed_tools. Otherwise use agent defaults.
             let scoped_tools = match spawn.parent_tools {
                 Some(parent) => parent.narrow(allowed_tools.as_deref()),
                 None => ScopedTools::new(tools, allowed_tools),
@@ -467,7 +438,6 @@ impl Server {
                 agent_grants,
             };
 
-            // Build context using ContextBuilder (token-budgeted)
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
             let assembled = {
                 let s = session.lock().await;
@@ -485,7 +455,6 @@ impl Server {
                 );
             }
 
-            // Set up event sink for ToolCall/ToolResult audit trail
             let (event_tx, mut event_rx) = mpsc::channel::<runtime::RuntimeEvent>(64);
             let event_session = session.clone();
             let event_agent = agent_name.clone();
@@ -543,8 +512,6 @@ impl Server {
             )
             .await;
 
-            // event_tx was moved into runtime::execute and dropped on return,
-            // so event_writer will drain remaining events and exit
             let _ = event_writer.await;
 
             drop(_permit);
@@ -561,7 +528,7 @@ impl Server {
                     .await;
                 }
                 Err(err) => {
-                    error!("Agent error for {}: {err}", transport_id);
+                    error!("Agent error for {}: {err}", session_db_id);
                     s.add_entry(SessionEntry {
                         sender: agent_name,
                         content: format!("Error: {err}"),
@@ -573,13 +540,11 @@ impl Server {
             }
             drop(s);
 
-            // Clear per-session processing lock
             {
                 let mut proc = spawn.processing.lock().await;
-                proc.remove(&transport_id);
+                proc.remove(&session_db_id);
             }
 
-            // Signal completion for synchronous callers (e.g., spawn_agent)
             if let Some(tx) = spawn.completion_tx {
                 let _ = tx.send(()).await;
             }

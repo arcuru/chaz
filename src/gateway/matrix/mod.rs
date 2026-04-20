@@ -11,29 +11,25 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 
 use headjack::*;
-use matrix_sdk::Room;
-use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::OwnedEventId;
+use matrix_sdk::Room;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{error, info};
 
 use commands::{get_backend, rate_limit};
 use history::read_room_history;
 
-/// Pending approval requests keyed by the Matrix event ID of the approval message.
-/// When a user reacts or replies, we look up the decision channel here.
 type PendingApprovals = Arc<Mutex<HashMap<OwnedEventId, oneshot::Sender<ApprovalDecision>>>>;
 
-/// An approval request tagged with the room it belongs to.
 struct RoomApprovalRequest {
     room_id: String,
     exchange: ApprovalExchange,
 }
 
-/// Create a per-room approval sender that forwards exchanges to the shared relay.
 fn make_room_approval_tx(
     room_id: String,
     relay_tx: mpsc::Sender<RoomApprovalRequest>,
@@ -79,9 +75,42 @@ impl MatrixGateway {
     }
 }
 
-/// Run a transport-neutral command in the context of a Matrix room:
-/// builds a `CommandContext` scoped to the room's session, dispatches, and
-/// renders the outcome as a room message.
+/// Install a response-delivery callback on a session DB that forwards any
+/// agent `Message` entries to the given Matrix room. Idempotent: the
+/// `attached` set is the caller's dedupe gate.
+fn attach_response_callback(
+    session_db: &eidetica::Database,
+    room: Room,
+    agents: Arc<crate::agent::AgentRegistry>,
+) -> anyhow::Result<()> {
+    let session_db_id = session_db.root_id().to_string();
+    session_db.on_local_write(move |_entry, db, _instance| {
+        let room = room.clone();
+        let agents = agents.clone();
+        let db = db.clone();
+        let sid = session_db_id.clone();
+        Box::pin(async move {
+            let session = Session::new(crate::types::ConversationId(sid), db).await;
+            if let Some(latest) = session.latest_entry() {
+                if latest.entry_type == EntryType::Message && agents.get(&latest.sender).is_some() {
+                    info!(
+                        "→ Matrix({}): {}",
+                        room.room_id(),
+                        latest.content.replace('\n', " ")
+                    );
+                    let content = RoomMessageEventContent::text_markdown(&latest.content);
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send to Matrix: {e}");
+                    }
+                }
+            }
+            Ok(())
+        })
+    })?;
+    Ok(())
+}
+
+/// Dispatch a shared command in the context of a Matrix room.
 async fn dispatch_in_room(
     cmd: Command,
     room: Room,
@@ -92,14 +121,14 @@ async fn dispatch_in_room(
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
-    let backend = get_backend(&room, &config, &secrets, server.registry()).await;
-    let (_conv_id, session_db) = server.registry().get_or_create_session_db(&room_id).await?;
-    let agent = server.registry().resolve_agent(&room_id, None).await;
-    let session_name = server
+    let (_conv_id, session_db) = server
         .registry()
-        .get_binding(&room_id)
-        .await
-        .and_then(|b| b.name);
+        .get_or_create_matrix_session(&room_id)
+        .await?;
+    let session_db_id = session_db.root_id().to_string();
+    let backend = get_backend(&room, &config, &secrets, server.registry()).await;
+    let meta = crate::session::read_meta_from_db(&session_db).await;
+    let agent = server.registry().resolve_agent(&session_db_id, None).await;
     let config_roles = Some(get_role_names(config.roles.clone()));
 
     let ctx = CommandContext {
@@ -107,10 +136,10 @@ async fn dispatch_in_room(
         scheduler: scheduler.as_ref(),
         secrets: &secrets,
         backend: &backend,
-        transport_id: &room_id,
+        session_db_id: &session_db_id,
         session_db: &session_db,
         current_agent: &agent.name,
-        session_name: session_name.as_deref(),
+        session_name: meta.name.as_deref(),
         config_roles,
         default_role: config.role.as_deref(),
     };
@@ -120,7 +149,6 @@ async fn dispatch_in_room(
     Ok(())
 }
 
-/// Render a dispatch outcome into a Matrix room as a notice / text message.
 async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
     let text = match outcome {
         CommandOutcome::Text(t) => t,
@@ -139,7 +167,7 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
                         .unwrap_or_default();
                     s.push_str(&format!(
                         "\n  {}{} ({}, {} entries)",
-                        info.transport_id, name, agent, info.entry_count
+                        info.session_db_id, name, agent, info.entry_count
                     ));
                     if let Some(preview) = &info.last_message {
                         s.push_str(&format!("\n    {preview}"));
@@ -149,7 +177,8 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
             }
         }
         CommandOutcome::SessionSwitched(_) => {
-            "!chaz Session switching is not supported from Matrix rooms — each room has its own session.".to_string()
+            "!chaz To bind this room to a different session, use `!chaz attach <session>`."
+                .to_string()
         }
         CommandOutcome::Quit => return,
     };
@@ -160,7 +189,6 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
 }
 
 /// Parse the argument portion of a Matrix command.
-/// `text` looks like `!chaz <cmd> <args...>` — returns the joined args, trimmed.
 fn matrix_args(text: &str) -> String {
     text.split_whitespace()
         .skip(2)
@@ -202,8 +230,6 @@ impl Gateway for MatrixGateway {
         let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
         let (approval_relay_tx, mut approval_relay_rx) = mpsc::channel::<RoomApprovalRequest>(64);
 
-        // Spawn relay task: receives approval requests, sends notices to rooms,
-        // stores pending decisions for reaction/command handling
         {
             let pending = pending_approvals.clone();
             let client = bot.client().clone();
@@ -235,7 +261,6 @@ impl Gateway for MatrixGateway {
                         }
                         Err(e) => {
                             tracing::error!("Failed to send approval request: {e}");
-                            // Deny by default if we can't ask
                             let _ = req.exchange.decision_tx.send(ApprovalDecision::Deny);
                         }
                     }
@@ -243,7 +268,6 @@ impl Gateway for MatrixGateway {
             });
         }
 
-        // Register reaction handler for approval decisions
         {
             let pending = pending_approvals.clone();
             bot.client().add_event_handler(
@@ -274,7 +298,6 @@ impl Gateway for MatrixGateway {
             );
         }
 
-        // Register approve/deny text commands
         {
             let pending = pending_approvals.clone();
             bot.register_text_command(
@@ -337,24 +360,14 @@ impl Gateway for MatrixGateway {
             .await;
         }
 
-        // === Register commands (handled directly, not routed through server) ===
-
-        bot.register_text_command(
-            "party",
-            "".to_string(),
-            "Party!".to_string(),
-            |_, _, room| async move {
-                let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
-                room.send(content).await.unwrap();
-                Ok(())
-            },
-        )
-        .await;
-
         let scheduler = self.scheduler.clone();
         let message_counts: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        // Helper to register a simple dispatch-based command.
+        // Track which session DBs have the Matrix response callback installed.
+        // Keyed by session_db_id because a single session may be attached to
+        // multiple rooms (fan-out delivery).
+        let attached_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
         macro_rules! register_shared {
             ($name:expr, $usage:expr, $desc:expr, |$text_ident:ident| $cmd_expr:expr) => {{
                 let server = server.clone();
@@ -439,6 +452,134 @@ impl Gateway for MatrixGateway {
         register_shared!("print", "".to_string(), "Print the transcript", |_t| {
             Some(Command::Print)
         });
+
+        // --- Matrix channel ops (attach/detach are gateway-local so we can
+        //     install the response callback on the new session immediately) ---
+        {
+            let server = server.clone();
+            let secrets = self.secrets.clone();
+            let config = config.clone();
+            let attached_sessions = attached_sessions.clone();
+            bot.register_text_command(
+                "attach",
+                "<session>".to_string(),
+                "Bind this room to a specific session (by name or DB ID)".to_string(),
+                move |_, text, room| {
+                    let server = server.clone();
+                    let secrets = secrets.clone();
+                    let config = config.clone();
+                    let attached_sessions = attached_sessions.clone();
+                    async move {
+                        let arg = matrix_args(&text);
+                        let arg = arg.trim();
+                        if arg.is_empty() {
+                            let _ = room
+                                .send(RoomMessageEventContent::notice_plain(
+                                    "Usage: !chaz attach <session-name-or-id>",
+                                ))
+                                .await;
+                            return Ok(());
+                        }
+                        let room_id = room.room_id().to_string();
+                        let (_cv, target_db) = match server.registry().resolve_session(arg).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = room
+                                    .send(RoomMessageEventContent::notice_plain(format!(
+                                        "!chaz Error: unknown session '{arg}': {e}"
+                                    )))
+                                    .await;
+                                return Ok(());
+                            }
+                        };
+                        let target_sid = target_db.root_id().to_string();
+                        if let Err(e) = server
+                            .registry()
+                            .attach_matrix_room(&room_id, &target_sid)
+                            .await
+                        {
+                            let _ = room
+                                .send(RoomMessageEventContent::notice_plain(format!(
+                                    "!chaz Error: failed to attach: {e}"
+                                )))
+                                .await;
+                            return Ok(());
+                        }
+
+                        // Install the response callback on the newly-attached
+                        // session so future writes (including scheduler fires)
+                        // reach this room.
+                        let backend =
+                            get_backend(&room, &config, &secrets, server.registry()).await;
+                        let agent_override = crate::session::read_meta_from_db(&target_db)
+                            .await
+                            .agent_name;
+                        let _ = server
+                            .register_session(&target_db, backend, agent_override, None)
+                            .await;
+                        let mut attached = attached_sessions.lock().await;
+                        if attached.insert(target_sid.clone()) {
+                            drop(attached);
+                            if let Err(e) = attach_response_callback(
+                                &target_db,
+                                room.clone(),
+                                server.agents_arc(),
+                            ) {
+                                error!("Failed to attach response callback: {e}");
+                            }
+                        }
+
+                        let _ = room
+                            .send(RoomMessageEventContent::notice_plain(format!(
+                                "Attached this room to session {target_sid}."
+                            )))
+                            .await;
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }
+
+        {
+            let server = server.clone();
+            bot.register_text_command(
+                "detach",
+                "".to_string(),
+                "Detach this room from its session".to_string(),
+                move |_, _text, room| {
+                    let server = server.clone();
+                    async move {
+                        let room_id = room.room_id().to_string();
+                        match server.registry().detach_matrix_room(&room_id).await {
+                            Ok(()) => {
+                                let _ = room
+                                    .send(RoomMessageEventContent::notice_plain(
+                                        "Room detached. Future messages will create a fresh session.",
+                                    ))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = room
+                                    .send(RoomMessageEventContent::notice_plain(format!(
+                                        "!chaz Error: {e}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }
+
+        register_shared!(
+            "channels",
+            "".to_string(),
+            "List Matrix rooms attached to this session",
+            |_t| { Some(Command::ListChannels) }
+        );
 
         // --- Scheduler ---
         register_shared!(
@@ -598,19 +739,47 @@ impl Gateway for MatrixGateway {
 
         // === Text handler — bridges Matrix events to session DB entries ===
 
-        // Track which session DBs have gateway response callbacks registered
-        let gateway_watched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // --- Startup: attach response callbacks + server processing to every
+        //     existing Matrix channel for which the bot is joined to the room.
+        //     This is what makes scheduled-session responses actually deliver
+        //     when no user has recently spoken in the room. ---
+        {
+            let server = server.clone();
+            let client = bot.client().clone();
+            let attached_sessions = attached_sessions.clone();
+            let config = config.clone();
+            let secrets = self.secrets.clone();
+            tokio::spawn(async move {
+                match server.registry().list_matrix_channels().await {
+                    Ok(channels) => {
+                        for (room_id, session_db_id) in channels {
+                            attach_existing_channel(
+                                &server,
+                                &client,
+                                &attached_sessions,
+                                &config,
+                                &secrets,
+                                &room_id,
+                                &session_db_id,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => error!("Failed to list matrix channels at startup: {e}"),
+                }
+            });
+        }
 
         {
             let config = config.clone();
             let counts = message_counts;
             let secrets = self.secrets.clone();
             let server = server.clone();
-            let gateway_watched = gateway_watched.clone();
             let approval_relay_tx = approval_relay_tx.clone();
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+            let attached_sessions = attached_sessions.clone();
             bot.register_text_handler(move |sender, body: String, room, event| {
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
@@ -618,10 +787,9 @@ impl Gateway for MatrixGateway {
                 let counts = counts.clone();
                 let secrets = secrets.clone();
                 let server = server.clone();
-                let gateway_watched = gateway_watched.clone();
                 let approval_relay_tx = approval_relay_tx.clone();
+                let attached_sessions = attached_sessions.clone();
                 async move {
-                    // Deduplicate events across sync restarts
                     {
                         let mut seen = seen_events.lock().await;
                         if !seen.insert(event.event_id.to_string()) {
@@ -653,13 +821,6 @@ impl Gateway for MatrixGateway {
 
                     let room_id = room.room_id().to_string();
 
-                    // Read agent override from session registry binding
-                    let agent_override = server
-                        .registry()
-                        .get_binding(&room_id)
-                        .await
-                        .and_then(|b| b.agent_name.clone());
-
                     let body = if body.starts_with("!chaz") {
                         body.trim_start_matches("!chaz").trim().to_string()
                     } else {
@@ -668,84 +829,52 @@ impl Gateway for MatrixGateway {
 
                     let backend = get_backend(&room, &config, &secrets, server.registry()).await;
 
-                    // Get or create session DB
-                    let (_conv_id, session_db) =
-                        match server.registry().get_or_create_session_db(&room_id).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Failed to get session DB: {e}");
-                                return Ok(());
-                            }
-                        };
+                    let (_conv_id, session_db) = match server
+                        .registry()
+                        .get_or_create_matrix_session(&room_id)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Failed to get session for {room_id}: {e}");
+                            return Ok(());
+                        }
+                    };
+                    let session_db_id = session_db.root_id().to_string();
 
-                    // Create per-room approval channel that feeds the shared relay
+                    // Read agent override from session meta
+                    let agent_override = crate::session::read_meta_from_db(&session_db)
+                        .await
+                        .agent_name;
+
                     let approval_tx =
                         make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
 
-                    // Register server callback (agent processing)
                     if let Err(e) = server
-                        .register_session(
-                            &room_id,
-                            &session_db,
-                            backend,
-                            agent_override,
-                            Some(approval_tx),
-                        )
+                        .register_session(&session_db, backend, agent_override, Some(approval_tx))
                         .await
                     {
                         error!("Failed to register session: {e}");
                         return Ok(());
                     }
 
-                    // Register gateway callback (response delivery to Matrix room)
+                    // Install response callback if we haven't already.
                     {
-                        let db_id = session_db.root_id().to_string();
-                        let mut watched = gateway_watched.lock().await;
-                        if !watched.contains(&db_id) {
-                            watched.insert(db_id);
-                            drop(watched);
-
-                            let matrix_room = room.clone();
-                            let agents = server.agents().clone();
-                            let rid = room_id.clone();
-                            if let Err(e) =
-                                session_db.on_local_write(move |_entry, db, _instance| {
-                                    let matrix_room = matrix_room.clone();
-                                    let agents = agents.clone();
-                                    let db = db.clone();
-                                    let rid = rid.clone();
-                                    Box::pin(async move {
-                                        // Read latest entry
-                                        let session =
-                                            Session::new(crate::types::ConversationId(rid), db)
-                                                .await;
-                                        if let Some(latest) = session.latest_entry() {
-                                            // Send agent messages to Matrix
-                                            if latest.entry_type == EntryType::Message
-                                                && agents.get(&latest.sender).is_some()
-                                            {
-                                                info!(
-                                                    "→ Matrix: {}",
-                                                    latest.content.replace('\n', " ")
-                                                );
-                                                let content =
-                                                    RoomMessageEventContent::text_markdown(
-                                                        &latest.content,
-                                                    );
-                                                if let Err(e) = matrix_room.send(content).await {
-                                                    tracing::error!(
-                                                        "Failed to send to Matrix: {e}"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Ok(())
-                                    })
-                                })
-                            {
-                                error!("Failed to register gateway callback: {e}");
+                        let mut attached = attached_sessions.lock().await;
+                        if attached.insert(session_db_id.clone()) {
+                            drop(attached);
+                            if let Err(e) = attach_response_callback(
+                                &session_db,
+                                room.clone(),
+                                server.agents_arc(),
+                            ) {
+                                error!("Failed to register response callback: {e}");
                             } else {
-                                info!("Gateway watching session DB for {}", room_id);
+                                info!(
+                                    session_db_id = %session_db_id,
+                                    room_id = %room_id,
+                                    "Matrix response callback installed"
+                                );
                             }
                         }
                     }
@@ -754,10 +883,10 @@ impl Gateway for MatrixGateway {
                     {
                         let mut backfilled = backfilled_rooms.lock().await;
                         if backfilled.insert(room_id.clone()) {
-                            info!("Backfilling history for room {}", room_id);
+                            info!("Backfilling history for room {room_id}");
                             let history = read_room_history(&room).await;
                             let mut session = Session::new(
-                                crate::types::ConversationId(room_id.clone()),
+                                crate::types::ConversationId(session_db_id.clone()),
                                 session_db.clone(),
                             )
                             .await;
@@ -765,10 +894,9 @@ impl Gateway for MatrixGateway {
                         }
                     }
 
-                    // Write user entry to session DB — triggers server callback → agent runs
-                    // Agent response → triggers gateway callback → sends to Matrix room
+                    // Write user entry to session DB — triggers server → agent → response
                     let mut session =
-                        Session::new(crate::types::ConversationId(room_id), session_db).await;
+                        Session::new(crate::types::ConversationId(session_db_id), session_db).await;
                     session
                         .add_entry(SessionEntry {
                             sender: sender.to_string(),
@@ -793,5 +921,62 @@ impl Gateway for MatrixGateway {
                 }
             }
         }
+    }
+}
+
+/// Install server processing + response-delivery for a persisted channel at
+/// startup. Skips rooms the bot isn't joined to, or sessions that fail to open.
+///
+/// Without an active user in the room, we pass no approval channel — scheduled
+/// Directives fire autonomously. When the user next speaks, the text handler
+/// re-registers the session with an approval channel bound to that message.
+async fn attach_existing_channel(
+    server: &Arc<Server>,
+    client: &matrix_sdk::Client,
+    attached_sessions: &Arc<Mutex<HashSet<String>>>,
+    config: &Arc<Config>,
+    secrets: &SecretStore,
+    room_id: &str,
+    session_db_id: &str,
+) {
+    let Ok(room_id_parsed) = matrix_sdk::ruma::RoomId::parse(room_id) else {
+        return;
+    };
+    let Some(room) = client.get_room(&room_id_parsed) else {
+        tracing::debug!(room_id, "Not joined to room; skipping channel attach");
+        return;
+    };
+
+    let Ok((_conv_id, session_db)) = server.registry().open_session(session_db_id).await else {
+        tracing::warn!(session_db_id, "Stale matrix channel — session not openable");
+        return;
+    };
+
+    let agent_override = crate::session::read_meta_from_db(&session_db)
+        .await
+        .agent_name;
+    let backend = get_backend(&room, config, secrets, server.registry()).await;
+    if let Err(e) = server
+        .register_session(&session_db, backend, agent_override, None)
+        .await
+    {
+        error!(session_db_id, "Failed to register session at startup: {e}");
+        return;
+    }
+
+    {
+        let mut attached = attached_sessions.lock().await;
+        if !attached.insert(session_db_id.to_string()) {
+            return;
+        }
+    }
+
+    if let Err(e) = attach_response_callback(&session_db, room, server.agents_arc()) {
+        error!("Failed to attach response callback at startup: {e}");
+    } else {
+        info!(
+            session_db_id,
+            room_id, "Matrix channel attached at startup (server + response callbacks installed)"
+        );
     }
 }

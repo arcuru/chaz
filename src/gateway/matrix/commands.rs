@@ -8,18 +8,18 @@
 use crate::backends::{BackendManager, ChatContext, Message};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{RoleDetails, get_role};
+use crate::role::{get_role, RoleDetails};
 use crate::security::SecretStore;
-use crate::session::SessionRegistry;
+use crate::session::{SessionMeta, SessionRegistry};
 
 use headjack::*;
 use matrix_sdk::{
-    Room, RoomMemberships,
     room::MessagesOptions,
     ruma::{
-        OwnedUserId,
         events::room::message::{MessageType, RoomMessageEventContent},
+        OwnedUserId,
     },
+    Room, RoomMemberships,
 };
 use openai_api_rs::v1::chat_completion::MessageRole;
 use regex::Regex;
@@ -202,11 +202,11 @@ pub async fn rename(
     Ok(())
 }
 
-/// Get the backend defined in the session binding.
-fn get_binding_backend(binding: &crate::session::SessionBinding) -> Option<Backend> {
-    let name = binding.backend_name.as_ref()?;
-    let url = binding.backend_url.as_ref()?;
-    let key_ref = binding.backend_key_ref.as_ref()?;
+/// Get the backend defined in the session meta, if any.
+fn meta_backend(meta: &SessionMeta) -> Option<Backend> {
+    let name = meta.backend_name.as_ref()?;
+    let url = meta.backend_url.as_ref()?;
+    let key_ref = meta.backend_key_ref.as_ref()?;
     let mut backend = Backend::new(BackendType::OpenAICompatible);
     backend.name = Some(name.clone());
     backend.api_base = Some(url.clone());
@@ -214,7 +214,8 @@ fn get_binding_backend(binding: &crate::session::SessionBinding) -> Option<Backe
     Some(backend)
 }
 
-/// Returns the backend based on the config and session binding
+/// Returns the BackendManager for a Matrix room — merges session meta overrides
+/// (if any) with the config backends.
 pub async fn get_backend(
     room: &Room,
     config: &Config,
@@ -223,9 +224,12 @@ pub async fn get_backend(
 ) -> BackendManager {
     let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
-    if let Some(binding) = registry.get_binding(&room_id).await {
-        if let Some(backend) = get_binding_backend(&binding) {
-            backends.push(backend);
+    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await {
+        if let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await {
+            let meta = crate::session::read_meta_from_db(&db).await;
+            if let Some(backend) = meta_backend(&meta) {
+                backends.push(backend);
+            }
         }
     }
     if let Some(config_backends) = &config.backends {
@@ -358,26 +362,29 @@ pub async fn get_context(
             break;
         }
     }
-    // Apply session config from registry
+    // Apply session meta overrides from the session DB
     let room_id = room.room_id().to_string();
-    if let Some(binding) = registry.get_binding(&room_id).await {
-        if let Some(model) = &binding.model {
-            context.model = Some(model.clone());
-        }
-        if let Some(role_name) = &binding.role_name {
-            if let Some(prompt) = &binding.role_prompt {
-                context.role = Some(RoleDetails::new(
-                    role_name,
-                    None,
-                    Some(prompt.clone()),
-                    None,
-                ));
-            } else {
-                context.role = get_role(
-                    Some(role_name.clone()),
-                    config.roles.clone(),
-                    DEFAULT_CONFIG.roles.clone(),
-                );
+    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await {
+        if let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await {
+            let meta = crate::session::read_meta_from_db(&db).await;
+            if let Some(model) = &meta.model {
+                context.model = Some(model.clone());
+            }
+            if let Some(role_name) = &meta.role_name {
+                if let Some(prompt) = &meta.role_prompt {
+                    context.role = Some(RoleDetails::new(
+                        role_name,
+                        None,
+                        Some(prompt.clone()),
+                        None,
+                    ));
+                } else {
+                    context.role = get_role(
+                        Some(role_name.clone()),
+                        config.roles.clone(),
+                        DEFAULT_CONFIG.roles.clone(),
+                    );
+                }
             }
         }
     }

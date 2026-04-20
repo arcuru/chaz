@@ -2,12 +2,12 @@ use crate::agent::{Agent, AgentRegistry};
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
+use eidetica::store::{DocStore, Table};
 use eidetica::Database;
-use eidetica::store::Table;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{error, info, warn};
 
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
@@ -43,44 +43,36 @@ pub struct SessionEntry {
     pub entry_type: EntryType,
 }
 
-/// A binding record stored in the central registry database.
-/// Maps a transport ID (e.g., Matrix room ID) to a session database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionBinding {
-    pub transport_id: String,
-    pub conversation_id: String,
-    /// Eidetica database root ID for this session's DB
-    pub session_db_id: String,
-    /// Agent name bound to this conversation, if any
-    pub agent_name: Option<String>,
-    /// Human-friendly alias for this session (e.g., "daily-standup")
-    #[serde(default)]
+/// Metadata stored in each session's own eidetica DB (under the "meta" DocStore).
+///
+/// This is the authoritative source for per-session configuration. It travels
+/// with the session via eidetica sync — sharing a session also shares its
+/// name, agent, model, role, and backend choices.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionMeta {
     pub name: Option<String>,
-    /// Model override for this session
-    #[serde(default)]
+    pub agent_name: Option<String>,
     pub model: Option<String>,
-    /// Role name for this session (references a config/built-in role, or a custom one)
-    #[serde(default)]
     pub role_name: Option<String>,
-    /// Custom role prompt (when role_name is a session-defined role, not a config one)
-    #[serde(default)]
     pub role_prompt: Option<String>,
-    /// Backend name override for this session
-    #[serde(default)]
     pub backend_name: Option<String>,
-    /// Backend API base URL (for session-defined backends)
-    #[serde(default)]
     pub backend_url: Option<String>,
-    /// SecretStore reference for the backend API key (for session-defined backends)
-    #[serde(default)]
     pub backend_key_ref: Option<String>,
+}
+
+/// Registry index entry — exists for every session known to this instance.
+#[derive(Debug, Clone)]
+pub struct SessionIndex {
+    pub session_db_id: String,
+    /// Free-form origin tag for debugging ("matrix:!room", "tui", "spawn:uuid").
+    pub source: Option<String>,
 }
 
 /// Per-conversation state backed by its own eidetica Database.
 ///
-/// Each session owns a dedicated eidetica Database containing a single
-/// `Table<SessionEntry>` store. Entries are loaded from the DB on
-/// creation and kept in memory for context building.
+/// Each session owns a dedicated eidetica Database containing:
+/// - `entries` (Table<SessionEntry>) — message/directive/tool-call history
+/// - `meta` (DocStore) — session configuration (name, agent, model, etc.)
 pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
@@ -88,6 +80,8 @@ pub struct Session {
     /// Store name — "entries" for regular, "entries:{id}" for ephemeral
     store_name: String,
 }
+
+const META_STORE: &str = "meta";
 
 impl Session {
     /// Open a session, loading existing entries from its database.
@@ -190,46 +184,122 @@ impl Session {
     pub fn database(&self) -> &Database {
         &self.database
     }
+
+    /// Read session metadata from the session's own DB.
+    /// Returns `SessionMeta::default()` if no meta has been written yet.
+    pub async fn read_meta(&self) -> SessionMeta {
+        read_meta_from_db(&self.database).await
+    }
+
+    /// Mutate session metadata in the session's own DB.
+    /// The closure receives the current meta (default if unset) and may modify it.
+    pub async fn update_meta<F>(&self, mutator: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut SessionMeta),
+    {
+        update_meta_on_db(&self.database, mutator).await
+    }
 }
 
-/// Central registry mapping transport IDs to per-session eidetica Databases.
-///
-/// The registry itself is backed by an eidetica Database ("chaz-registry") containing
-/// a `Table<SessionBinding>` that persists transport_id → session DB mappings across
-/// restarts. Each session gets its own eidetica Database for message storage.
-///
-/// The registry also holds a separate "chaz-central" Database for shared data
-/// (memory store, secrets) that isn't per-conversation.
-/// Notification emitted when a new session is created in the registry.
+/// Read the meta DocStore of a session DB. Returns default on any error.
+pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
+    let Ok(txn) = database.new_transaction().await else {
+        return SessionMeta::default();
+    };
+    let Ok(store) = txn.get_store::<DocStore>(META_STORE).await else {
+        return SessionMeta::default();
+    };
+
+    SessionMeta {
+        name: store.get_string("name").await.ok(),
+        agent_name: store.get_string("agent_name").await.ok(),
+        model: store.get_string("model").await.ok(),
+        role_name: store.get_string("role_name").await.ok(),
+        role_prompt: store.get_string("role_prompt").await.ok(),
+        backend_name: store.get_string("backend_name").await.ok(),
+        backend_url: store.get_string("backend_url").await.ok(),
+        backend_key_ref: store.get_string("backend_key_ref").await.ok(),
+    }
+}
+
+/// Apply a mutator to the meta DocStore of a session DB and commit.
+pub async fn update_meta_on_db<F>(database: &Database, mutator: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut SessionMeta),
+{
+    let mut current = read_meta_from_db(database).await;
+    mutator(&mut current);
+
+    let txn = database.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(META_STORE).await?;
+
+    write_field(&store, "name", current.name.as_deref()).await?;
+    write_field(&store, "agent_name", current.agent_name.as_deref()).await?;
+    write_field(&store, "model", current.model.as_deref()).await?;
+    write_field(&store, "role_name", current.role_name.as_deref()).await?;
+    write_field(&store, "role_prompt", current.role_prompt.as_deref()).await?;
+    write_field(&store, "backend_name", current.backend_name.as_deref()).await?;
+    write_field(&store, "backend_url", current.backend_url.as_deref()).await?;
+    write_field(
+        &store,
+        "backend_key_ref",
+        current.backend_key_ref.as_deref(),
+    )
+    .await?;
+
+    txn.commit().await?;
+    Ok(())
+}
+
+async fn write_field(store: &DocStore, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+    match value {
+        Some(v) => {
+            store.set_string(key, v).await?;
+        }
+        None => {
+            // Ignore KeyNotFound on delete — just means it wasn't set.
+            let _ = store.delete(key).await;
+        }
+    }
+    Ok(())
+}
+
+/// Notification emitted when a new session is indexed in the registry.
 #[derive(Debug, Clone)]
 pub struct NewSessionEvent {
-    pub transport_id: String,
     pub session_db_id: String,
+    pub source: Option<String>,
 }
 
+/// Central registry. Holds *indices* into session databases — nothing load-bearing
+/// about sessions themselves lives here. Canonical session config lives in each
+/// session's own DB (see [`SessionMeta`]).
+///
+/// Stores (all DocStore in a single `chaz-registry` database):
+/// - `sessions`        — `session_db_id` → `source` (origin tag)
+/// - `matrix_channels` — `room_id` → `session_db_id`
+/// - `session_names`   — `name` → `session_db_id`
+///
+/// Also owns the `chaz-central` DB for shared, cross-session data (memory tools,
+/// secrets, schedule state).
 pub struct SessionRegistry {
-    /// Eidetica instance (Clone = cheap Arc handle)
     instance: eidetica::Instance,
     /// User for creating new session databases (behind Mutex since create_database needs &mut)
     user: Arc<Mutex<eidetica::user::User>>,
-    /// Central registry database — holds SessionBinding table
+    /// Index DB — holds `sessions`, `matrix_channels`, `session_names` DocStores.
     registry_db: Database,
-    /// Central shared database — for memory tools, secrets, etc.
+    /// Central shared database (memory tools, secrets, schedules)
     central_db: Database,
-    /// Agent registry
     pub agents: Arc<AgentRegistry>,
-    /// Channel to notify listeners when new sessions are created
     new_session_tx: mpsc::Sender<NewSessionEvent>,
-    /// Receiver for new session events (taken by the consumer via subscribe())
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
 }
 
+const STORE_SESSIONS: &str = "sessions";
+const STORE_MATRIX_CHANNELS: &str = "matrix_channels";
+const STORE_SESSION_NAMES: &str = "session_names";
+
 impl SessionRegistry {
-    /// Create or open the session registry.
-    ///
-    /// Finds or creates two databases:
-    /// - "chaz-registry" — bindings table mapping transport IDs to session DBs
-    /// - "chaz-central" — shared data (memory, secrets)
     pub async fn new(
         instance: eidetica::Instance,
         mut user: eidetica::user::User,
@@ -240,21 +310,21 @@ impl SessionRegistry {
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
 
         // Watch the registry DB for writes (including remote sync).
-        // When a new binding appears (from sync or other sources), notify listeners.
+        // On each write, re-scan the sessions index and fire events for each known session.
+        // Consumers dedupe via their own `seen` set.
         let sync_tx = new_session_tx.clone();
         registry_db.on_local_write(move |_entry, db, _instance| {
             let sync_tx = sync_tx.clone();
             let db = db.clone();
             Box::pin(async move {
-                // Read all bindings and notify for any we haven't seen.
-                // This is coarse-grained — the consumer deduplicates.
                 if let Ok(txn) = db.new_transaction().await {
-                    if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
-                        if let Ok(results) = bindings.search(|_| true).await {
-                            for (_, binding) in results {
+                    if let Ok(store) = txn.get_store::<DocStore>(STORE_SESSIONS).await {
+                        if let Ok(doc) = store.get_all().await {
+                            for (key, value) in doc.iter() {
+                                let source: Option<String> = value.try_into().ok();
                                 let _ = sync_tx.try_send(NewSessionEvent {
-                                    transport_id: binding.transport_id,
-                                    session_db_id: binding.session_db_id,
+                                    session_db_id: key.clone(),
+                                    source,
                                 });
                             }
                         }
@@ -275,305 +345,279 @@ impl SessionRegistry {
         })
     }
 
-    /// Take the new-session event receiver. Can only be called once; subsequent
-    /// calls return None. The consumer (typically the Server) uses this to
-    /// auto-detect sessions created by sync, schedules, or other sources.
+    /// Take the new-session event receiver. Can only be called once.
     pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
         self.new_session_rx.lock().await.take()
     }
 
-    /// Get the central shared database (for memory tools, secrets, etc.)
     pub fn central_db(&self) -> &Database {
         &self.central_db
     }
 
-    /// Get the eidetica Instance handle
     pub fn instance(&self) -> &eidetica::Instance {
         &self.instance
     }
 
-    /// List all known session bindings.
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionBinding>> {
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        let results = bindings.search(|_| true).await?;
-        Ok(results.into_iter().map(|(_, b)| b).collect())
-    }
+    // -------------------------------------------------------------------------
+    // Session creation & opening
+    // -------------------------------------------------------------------------
 
-    /// Open a session database by its eidetica root ID.
-    ///
-    /// Returns the transport_id (from the registry binding) and the database handle.
-    /// Fails if no binding exists for this root ID.
-    pub async fn open_session_by_db_id(
+    /// Create a new session database and register it in the sessions index.
+    /// `source` is an optional free-form tag used for listing/debugging only.
+    pub async fn create_session(
         &self,
-        db_id: &str,
-    ) -> anyhow::Result<(String, ConversationId, Database)> {
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        let results = bindings.search(|b| b.session_db_id == db_id).await?;
-
-        let (_, binding) = results
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No session found for DB ID '{db_id}'"))?;
-
-        let conversation_id = ConversationId(binding.conversation_id);
-        let db = {
-            let user = self.user.lock().await;
-            let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse session DB ID '{}': {e}",
-                    binding.session_db_id
-                )
-            })?;
-            user.open_database(&root_id).await?
-        };
-
-        Ok((binding.transport_id, conversation_id, db))
-    }
-
-    /// Look up a transport ID and return the session Database, creating one if needed.
-    ///
-    /// On first call for a transport_id, creates a new eidetica Database and persists
-    /// the binding. On subsequent calls (including after restart), opens the existing DB.
-    pub async fn get_or_create_session_db(
-        &self,
-        transport_id: &str,
+        source: Option<&str>,
     ) -> anyhow::Result<(ConversationId, Database)> {
-        // Check registry for existing binding
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-
-        let existing = bindings.search(|b| b.transport_id == transport_id).await?;
-
-        if let Some((_, binding)) = existing.into_iter().next() {
-            // Found existing binding — open the session DB
-            let conversation_id = ConversationId(binding.conversation_id);
-            let db = {
-                let user = self.user.lock().await;
-                let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to parse session DB ID '{}': {e}",
-                        binding.session_db_id
-                    )
-                })?;
-                user.open_database(&root_id).await?
-            };
-            return Ok((conversation_id, db));
-        }
-        drop(txn); // release before creating DB
-
-        // No binding — create a new session DB
-        let conversation_id = ConversationId(transport_id.to_string());
-        let db_name = format!("session:{}", transport_id);
         let db = {
             let mut user = self.user.lock().await;
             let mut settings = eidetica::crdt::Doc::new();
-            settings.set("name", db_name.as_str());
+            // Best-effort display name for the DB itself
+            let display_name = format!("session:{}", source.unwrap_or("new"));
+            settings.set("name", display_name.as_str());
             let key_id = user.get_default_key()?;
             user.create_database(settings, &key_id).await?
         };
 
-        // Persist the binding
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        bindings
-            .insert(SessionBinding {
-                transport_id: transport_id.to_string(),
-                conversation_id: conversation_id.0.clone(),
-                session_db_id: db.root_id().to_string(),
-                agent_name: None,
-                name: None,
-                model: None,
-                role_name: None,
-                role_prompt: None,
-                backend_name: None,
-                backend_url: None,
-                backend_key_ref: None,
-            })
-            .await?;
-        txn.commit().await?;
+        let session_db_id = db.root_id().to_string();
+        let conv_id = ConversationId(session_db_id.clone());
 
-        info!("Created new session DB for {}", transport_id);
+        // Add to sessions index
+        {
+            let txn = self.registry_db.new_transaction().await?;
+            let store = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
+            store
+                .set_string(&session_db_id, source.unwrap_or(""))
+                .await?;
+            txn.commit().await?;
+        }
 
-        // Notify listeners about the new session
+        info!(
+            session_db_id = %session_db_id,
+            source = ?source,
+            "Created new session"
+        );
+
         let _ = self.new_session_tx.try_send(NewSessionEvent {
-            transport_id: transport_id.to_string(),
-            session_db_id: db.root_id().to_string(),
+            session_db_id: session_db_id.clone(),
+            source: source.map(|s| s.to_string()),
         });
 
-        Ok((conversation_id, db))
+        Ok((conv_id, db))
     }
 
-    /// Resolve which agent should handle a conversation.
-    /// Priority: explicit override > persisted binding > default agent.
-    pub async fn resolve_agent(&self, transport_id: &str, override_name: Option<&str>) -> Agent {
-        // Check explicit override first
+    /// Open an existing session database by its eidetica root ID.
+    pub async fn open_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let root_id = eidetica::entry::ID::parse(session_db_id)
+            .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let user = self.user.lock().await;
+        let db = user.open_database(&root_id).await?;
+        Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    // -------------------------------------------------------------------------
+    // Session listing
+    // -------------------------------------------------------------------------
+
+    /// List every session known to the registry.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionIndex>> {
+        let txn = self.registry_db.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
+        let doc = store.get_all().await?;
+        Ok(doc
+            .iter()
+            .map(|(key, value)| {
+                let source: Option<String> =
+                    value.try_into().ok().filter(|s: &String| !s.is_empty());
+                SessionIndex {
+                    session_db_id: key.clone(),
+                    source,
+                }
+            })
+            .collect())
+    }
+
+    // -------------------------------------------------------------------------
+    // Resolution
+    // -------------------------------------------------------------------------
+
+    /// Resolve an identifier (session name or session DB ID) to an open session.
+    pub async fn resolve_session(
+        &self,
+        identifier: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        if let Some(id) = self.find_by_name(identifier).await? {
+            return self.open_session(&id).await;
+        }
+        // Assume it's a session DB ID
+        self.open_session(identifier).await
+    }
+
+    // -------------------------------------------------------------------------
+    // Name index
+    // -------------------------------------------------------------------------
+
+    pub async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let txn = self.registry_db.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
+        Ok(store.get_string(name).await.ok())
+    }
+
+    /// Associate a human-friendly name with a session. Fails if the name is taken
+    /// by a different session.
+    pub async fn set_session_name(&self, session_db_id: &str, name: String) -> anyhow::Result<()> {
+        {
+            let txn = self.registry_db.new_transaction().await?;
+            let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
+            if let Ok(existing) = store.get_string(&name).await {
+                if existing != session_db_id {
+                    anyhow::bail!("Name '{name}' is already used by another session");
+                }
+            }
+            store.set_string(&name, session_db_id).await?;
+            txn.commit().await?;
+        }
+
+        // Mirror into the session's own meta
+        let (_conv_id, db) = self.open_session(session_db_id).await?;
+        update_meta_on_db(&db, |m| m.name = Some(name.clone())).await?;
+
+        Ok(())
+    }
+
+    pub async fn clear_session_name(&self, session_db_id: &str) -> anyhow::Result<()> {
+        // Fetch current name from meta so we can find the index entry
+        let (_conv_id, db) = self.open_session(session_db_id).await?;
+        let current = read_meta_from_db(&db).await;
+        if let Some(name) = current.name.as_deref() {
+            let txn = self.registry_db.new_transaction().await?;
+            let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
+            let _ = store.delete(name).await;
+            txn.commit().await?;
+        }
+        update_meta_on_db(&db, |m| m.name = None).await?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Matrix channels
+    // -------------------------------------------------------------------------
+
+    /// Return the session bound to a Matrix room, if any.
+    pub async fn matrix_channel_for_room(&self, room_id: &str) -> anyhow::Result<Option<String>> {
+        let txn = self.registry_db.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
+        Ok(store.get_string(room_id).await.ok())
+    }
+
+    /// Attach a Matrix room to a session. Overwrites any existing binding for this room.
+    pub async fn attach_matrix_room(
+        &self,
+        room_id: &str,
+        session_db_id: &str,
+    ) -> anyhow::Result<()> {
+        let txn = self.registry_db.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
+        store.set_string(room_id, session_db_id).await?;
+        txn.commit().await?;
+        info!(room_id, session_db_id, "Matrix room attached to session");
+        Ok(())
+    }
+
+    pub async fn detach_matrix_room(&self, room_id: &str) -> anyhow::Result<()> {
+        let txn = self.registry_db.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
+        let _ = store.delete(room_id).await;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// List every (room_id, session_db_id) pair.
+    pub async fn list_matrix_channels(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let txn = self.registry_db.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
+        let doc = store.get_all().await?;
+        Ok(doc
+            .iter()
+            .filter_map(|(k, v)| {
+                let session_db_id: String = v.try_into().ok()?;
+                Some((k.clone(), session_db_id))
+            })
+            .collect())
+    }
+
+    /// List all Matrix rooms currently attached to a session.
+    pub async fn matrix_channels_for_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .list_matrix_channels()
+            .await?
+            .into_iter()
+            .filter_map(|(room, sid)| {
+                if sid == session_db_id {
+                    Some(room)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Convenience for the Matrix gateway: get (or create) the session bound to a room.
+    ///
+    /// If no binding exists, creates a fresh session, attaches the room to it, and
+    /// returns it.
+    pub async fn get_or_create_matrix_session(
+        &self,
+        room_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        if let Some(session_db_id) = self.matrix_channel_for_room(room_id).await? {
+            match self.open_session(&session_db_id).await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    warn!(
+                        room_id,
+                        session_db_id,
+                        "Dangling matrix channel — session unreadable, recreating: {e}"
+                    );
+                    let _ = self.detach_matrix_room(room_id).await;
+                }
+            }
+        }
+        let source = format!("matrix:{room_id}");
+        let (conv_id, db) = self.create_session(Some(&source)).await?;
+        let session_db_id = db.root_id().to_string();
+        self.attach_matrix_room(room_id, &session_db_id).await?;
+        Ok((conv_id, db))
+    }
+
+    // -------------------------------------------------------------------------
+    // Agent resolution
+    // -------------------------------------------------------------------------
+
+    /// Resolve which agent should handle a session.
+    /// Priority: explicit override > session meta > default agent.
+    pub async fn resolve_agent(&self, session_db_id: &str, override_name: Option<&str>) -> Agent {
         if let Some(name) = override_name {
             if let Some(agent) = self.agents.get(name) {
                 return agent.clone();
             }
         }
 
-        // Check persisted binding
-        if let Ok(txn) = self.registry_db.new_transaction().await {
-            if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
-                if let Ok(results) = bindings.search(|b| b.transport_id == transport_id).await {
-                    if let Some((_, binding)) = results.into_iter().next() {
-                        if let Some(agent_name) = &binding.agent_name {
-                            if let Some(agent) = self.agents.get(agent_name) {
-                                return agent.clone();
-                            }
-                        }
-                    }
+        if let Ok((_conv_id, db)) = self.open_session(session_db_id).await {
+            let meta = read_meta_from_db(&db).await;
+            if let Some(agent_name) = meta.agent_name.as_deref() {
+                if let Some(agent) = self.agents.get(agent_name) {
+                    return agent.clone();
                 }
             }
         }
 
         self.agents.default_agent().clone()
-    }
-
-    /// Look up a session by its human-friendly name.
-    ///
-    /// Returns the transport_id, ConversationId, and Database handle.
-    /// Fails if no session has this name.
-    pub async fn open_session_by_name(
-        &self,
-        name: &str,
-    ) -> anyhow::Result<(String, ConversationId, Database)> {
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        let results = bindings.search(|b| b.name.as_deref() == Some(name)).await?;
-
-        let (_, binding) = results
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No session named '{name}'"))?;
-
-        let conversation_id = ConversationId(binding.conversation_id);
-        let db = {
-            let user = self.user.lock().await;
-            let root_id = eidetica::entry::ID::parse(&binding.session_db_id).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse session DB ID '{}': {e}",
-                    binding.session_db_id
-                )
-            })?;
-            user.open_database(&root_id).await?
-        };
-
-        Ok((binding.transport_id, conversation_id, db))
-    }
-
-    /// Set a human-friendly name for a session (persisted).
-    ///
-    /// Returns an error if the name is already taken by another session.
-    pub async fn set_session_name(&self, transport_id: &str, name: String) -> anyhow::Result<()> {
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-
-        // Check for name collision
-        let existing = bindings
-            .search(|b| b.name.as_deref() == Some(&name) && b.transport_id != transport_id)
-            .await?;
-        if !existing.is_empty() {
-            anyhow::bail!("Name '{name}' is already used by another session");
-        }
-
-        // Update the binding
-        let results = bindings.search(|b| b.transport_id == transport_id).await?;
-        if let Some((key, mut binding)) = results.into_iter().next() {
-            binding.name = Some(name);
-            bindings.set(&key, binding).await?;
-            txn.commit().await?;
-        } else {
-            anyhow::bail!("No session found for transport ID '{transport_id}'");
-        }
-
-        Ok(())
-    }
-
-    /// Clear the name from a session (persisted).
-    pub async fn clear_session_name(&self, transport_id: &str) -> anyhow::Result<()> {
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        let results = bindings.search(|b| b.transport_id == transport_id).await?;
-        if let Some((key, mut binding)) = results.into_iter().next() {
-            binding.name = None;
-            bindings.set(&key, binding).await?;
-            txn.commit().await?;
-        }
-        Ok(())
-    }
-
-    /// Resolve a session identifier that could be a name, DB ID, or transport ID.
-    ///
-    /// Tries in order: name → DB ID → transport ID (creates if needed).
-    pub async fn resolve_session(
-        &self,
-        identifier: &str,
-    ) -> anyhow::Result<(String, ConversationId, Database)> {
-        // Try name first
-        if let Ok(result) = self.open_session_by_name(identifier).await {
-            return Ok(result);
-        }
-
-        // Try DB ID
-        if let Ok(result) = self.open_session_by_db_id(identifier).await {
-            return Ok(result);
-        }
-
-        // Fall back to transport ID (creates if needed)
-        let (conv_id, db) = self.get_or_create_session_db(identifier).await?;
-        Ok((identifier.to_string(), conv_id, db))
-    }
-
-    /// Bind a conversation to a specific agent (persisted).
-    pub async fn set_agent_binding(&self, transport_id: &str, agent_name: String) {
-        if let Ok(txn) = self.registry_db.new_transaction().await {
-            if let Ok(bindings) = txn.get_store::<Table<SessionBinding>>("bindings").await {
-                if let Ok(results) = bindings.search(|b| b.transport_id == transport_id).await {
-                    if let Some((key, mut binding)) = results.into_iter().next() {
-                        binding.agent_name = Some(agent_name);
-                        let _ = bindings.set(&key, binding).await;
-                        let _ = txn.commit().await;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Get the session binding for a transport ID.
-    pub async fn get_binding(&self, transport_id: &str) -> Option<SessionBinding> {
-        let txn = self.registry_db.new_transaction().await.ok()?;
-        let bindings = txn
-            .get_store::<Table<SessionBinding>>("bindings")
-            .await
-            .ok()?;
-        let results = bindings
-            .search(|b| b.transport_id == transport_id)
-            .await
-            .ok()?;
-        results.into_iter().next().map(|(_, b)| b)
-    }
-
-    /// Update a binding field. The `updater` closure mutates the binding in-place.
-    pub async fn update_binding(
-        &self,
-        transport_id: &str,
-        updater: impl FnOnce(&mut SessionBinding),
-    ) -> anyhow::Result<()> {
-        let txn = self.registry_db.new_transaction().await?;
-        let bindings = txn.get_store::<Table<SessionBinding>>("bindings").await?;
-        let results = bindings.search(|b| b.transport_id == transport_id).await?;
-        if let Some((key, mut binding)) = results.into_iter().next() {
-            updater(&mut binding);
-            bindings.set(&key, binding).await?;
-            txn.commit().await?;
-            Ok(())
-        } else {
-            anyhow::bail!("No session found for transport ID '{transport_id}'");
-        }
     }
 }
 

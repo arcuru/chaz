@@ -13,8 +13,8 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::Database;
 use eidetica::store::Table;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ struct ScheduleState {
 /// A parsed schedule ready for execution.
 struct ScheduleRecord {
     name: String,
-    /// Session identifier — can be a name, DB ID, or transport ID (resolved at fire time)
+    /// Session identifier — session name or eidetica DB root ID (resolved at fire time)
     session_id: String,
     task: String,
     cron: Schedule,
@@ -240,19 +240,14 @@ impl Scheduler {
     async fn fire_schedule(&self, name: &str, session_id: &str, task: &str) -> anyhow::Result<()> {
         info!(schedule = %name, session = %session_id, "Firing scheduled task");
 
-        // Resolve the session identifier (name, DB ID, or transport ID)
-        let (transport_id, conversation_id, session_db) =
+        // Resolve the session identifier (name or DB ID)
+        let (conversation_id, session_db) =
             self.server.registry().resolve_session(session_id).await?;
 
-        // Ensure the server is watching this session
+        // Ensure the server is watching this session. No approval channel —
+        // scheduled runs are autonomous.
         self.server
-            .register_session(
-                &transport_id,
-                &session_db,
-                self.backend.clone(),
-                None,
-                None, // No approval channel — scheduled runs are autonomous
-            )
+            .register_session(&session_db, self.backend.clone(), None, None)
             .await?;
 
         // Write the directive

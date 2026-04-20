@@ -13,7 +13,7 @@ graph TD
 
     subgraph Server
         SV[Server<br/>on_local_write callbacks]
-        SR[SessionRegistry<br/>transport_id to DB mapping]
+        SR[SessionRegistry<br/>indices: sessions, matrix_channels, session_names]
     end
 
     subgraph "Agent Runtime"
@@ -24,7 +24,7 @@ graph TD
 
     subgraph Storage
         EI[(eidetica<br/>per-session DBs)]
-        REG[(Registry DB<br/>session bindings)]
+        REG[(Registry DB<br/>index stores)]
         CEN[(Central DB<br/>memory, secrets)]
     end
 

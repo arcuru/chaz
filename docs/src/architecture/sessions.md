@@ -45,27 +45,33 @@ sequenceDiagram
 
 ## Session Registry
 
-The `SessionRegistry` maps transport IDs to eidetica databases:
+A session is identified solely by the root ID of its own eidetica `Database`. The central `SessionRegistry` holds three index stores — nothing load-bearing about a session lives here:
 
-- **Transport ID**: An opaque string identifying the source (e.g., `!room:matrix.org`, `tui`, `spawn:uuid`)
-- **Session DB**: A dedicated eidetica `Database` for that conversation
-- **Binding**: A `SessionBinding` record in the central registry DB
+- **`sessions`**: every known `session_db_id` → origin tag (for debugging/listing)
+- **`matrix_channels`**: Matrix `room_id` → `session_db_id` (fan-out supported — one session may receive responses on many rooms)
+- **`session_names`**: human-friendly `name` → `session_db_id`
 
-The registry creates new databases on demand and persists bindings across restarts. Bindings include an optional human-friendly `name` for the session.
+The canonical per-session configuration (name, agent, model, role, backend) lives in each session's own DB under a `meta` DocStore as a `SessionMeta`. Because it lives in the session, it syncs with the session via eidetica — sharing a session also shares its config.
 
 ```mermaid
 graph LR
-    TID1["!room:matrix.org"] --> DB1[(Session DB 1)]
-    TID2["tui 'daily-standup'"] --> DB2[(Session DB 2)]
-    TID3["spawn:abc-123"] --> DB3[(Session DB 3)]
-    REG[(Registry DB)] -.->|bindings| TID1
-    REG -.->|bindings| TID2
-    REG -.->|bindings| TID3
+    ROOM["Matrix room !r:ex.org"] -->|matrix_channels| SID1["session_db_id A"]
+    SID1 --> DB1[(Session DB A<br/>entries + meta)]
+    ROOM2["Matrix room !q:ex.org"] -->|matrix_channels| SID1
+    NAME["name 'daily-standup'"] -->|session_names| SID1
+    SID2["spawn:abc-123"] --> DB2[(Session DB B)]
+    REG[(Registry<br/>indices only)] -.-> ROOM
+    REG -.-> ROOM2
+    REG -.-> NAME
 ```
+
+### Matrix channels
+
+A Matrix channel is an explicit `(room_id → session_db_id)` attachment. A room's first message auto-creates a session and a channel. `!chaz attach <session>` rebinds a room to a different session; `!chaz detach` removes the binding; `!chaz channels` lists rooms attached to the current session. At Matrix gateway startup, every persisted channel for a joined room receives both server-processing and response-delivery callbacks — this is how scheduled-session responses reach Matrix even when no user is active in the room.
 
 ### Named Sessions
 
-Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name <alias>`). Names are unique and persisted in the registry binding. The `resolve_session()` method tries name → DB ID → transport ID, so names work everywhere a session identifier is accepted (join, schedules, etc.).
+Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name <alias>`). Names are persisted in the registry's `session_names` index and mirrored into the session's `meta` doc. `resolve_session()` tries name → DB ID, so names work everywhere a session identifier is accepted (`/join`, schedules, etc.).
 
 ## Context Building
 

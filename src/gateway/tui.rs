@@ -10,16 +10,20 @@ use crate::session::{EntryType, Session, SessionEntry};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::Terminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::Terminal;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
+
+/// Name used for the TUI's default/home session. Created on first TUI launch,
+/// reopened on subsequent launches.
+const TUI_DEFAULT_NAME: &str = "tui";
 
 pub struct TuiGateway {
     config: Config,
@@ -42,33 +46,25 @@ impl TuiGateway {
     }
 }
 
-/// Actions processed by the event loop
 enum Action {
     Key(KeyEvent),
     SessionChanged,
     ApprovalRequest(ApprovalExchange),
 }
 
-/// Which screen the TUI is showing
 enum TuiMode {
     Chat,
     SessionPicker,
 }
 
-/// Outcome of a chat-mode key press that the event loop needs to act on.
 enum ChatAction {
-    /// Dispatch a transport-neutral command.
     Dispatch(Command),
-    /// Open the session picker (after loading the session list).
     OpenPicker,
-    /// Send a regular chat message to the agent.
     SendMessage(String),
 }
 
-/// Centralized TUI application state
 struct App {
     mode: TuiMode,
-    // Chat state
     input: String,
     cursor: usize,
     scroll_offset: u16,
@@ -78,17 +74,15 @@ struct App {
     agent_names: HashSet<String>,
     should_quit: bool,
     debug_mode: bool,
-    // Current session
-    transport_id: String,
+    session_db_id: String,
     current_agent: String,
     session_name: Option<String>,
-    // Session picker state
     session_list: Vec<SessionInfo>,
     picker_index: usize,
 }
 
 impl App {
-    fn new(agent_names: HashSet<String>, transport_id: String) -> Self {
+    fn new(agent_names: HashSet<String>, session_db_id: String) -> Self {
         Self {
             mode: TuiMode::Chat,
             input: String::new(),
@@ -100,7 +94,7 @@ impl App {
             agent_names,
             should_quit: false,
             debug_mode: false,
-            transport_id,
+            session_db_id,
             current_agent: String::new(),
             session_name: None,
             session_list: Vec::new(),
@@ -126,17 +120,15 @@ fn restore_terminal() {
 /// Register a session DB for server processing and TUI notifications.
 async fn setup_session(
     server: &Server,
-    transport_id: &str,
     session_db: &eidetica::Database,
     backend: BackendManager,
     approval_tx: mpsc::Sender<ApprovalExchange>,
     notify_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
     server
-        .register_session(transport_id, session_db, backend, None, Some(approval_tx))
+        .register_session(session_db, backend, None, Some(approval_tx))
         .await?;
 
-    // Register TUI notification callback — fires on any session write
     session_db.on_local_write(move |_entry, _db, _instance| {
         let tx = notify_tx.clone();
         Box::pin(async move {
@@ -148,25 +140,40 @@ async fn setup_session(
     Ok(())
 }
 
+/// Find an existing session named "tui", or create one and name it.
+async fn default_tui_session(
+    server: &Server,
+) -> anyhow::Result<(crate::types::ConversationId, eidetica::Database)> {
+    if let Some(id) = server.registry().find_by_name(TUI_DEFAULT_NAME).await? {
+        match server.registry().open_session(&id).await {
+            Ok(r) => return Ok(r),
+            Err(e) => tracing::warn!(id, "Default TUI session unreadable, recreating: {e}"),
+        }
+    }
+    let (conv_id, db) = server.registry().create_session(Some("tui")).await?;
+    let session_db_id = db.root_id().to_string();
+    if let Err(e) = server
+        .registry()
+        .set_session_name(&session_db_id, TUI_DEFAULT_NAME.to_string())
+        .await
+    {
+        tracing::warn!("Failed to name default TUI session: {e}");
+    }
+    Ok((conv_id, db))
+}
+
 impl Gateway for TuiGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
-        let default_transport = "tui".to_string();
-
-        // Channels shared across session switches
         let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalExchange>(8);
         let (notify_tx, mut notify_rx) = mpsc::channel::<()>(16);
 
-        // Set up default session
-        let (_conv_id, mut session_db) = server
-            .registry()
-            .get_or_create_session_db(&default_transport)
-            .await?;
+        let (_conv_id, mut session_db) = default_tui_session(&server).await?;
+        let session_db_id = session_db.root_id().to_string();
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
         setup_session(
             &server,
-            &default_transport,
             &session_db,
             backend.clone(),
             approval_tx.clone(),
@@ -174,7 +181,6 @@ impl Gateway for TuiGateway {
         )
         .await?;
 
-        // Collect agent names for display styling
         let agent_names: HashSet<String> = server
             .agents()
             .names()
@@ -182,23 +188,19 @@ impl Gateway for TuiGateway {
             .map(|s| s.to_string())
             .collect();
 
-        // Initialize app state
-        let mut app = App::new(agent_names, default_transport.clone());
+        let mut app = App::new(agent_names, session_db_id.clone());
         {
-            let agent = server
-                .registry()
-                .resolve_agent(&default_transport, None)
-                .await;
+            let agent = server.registry().resolve_agent(&session_db_id, None).await;
             app.current_agent = agent.name.clone();
             let session = Session::new(
-                crate::types::ConversationId(default_transport.clone()),
+                crate::types::ConversationId(session_db_id.clone()),
                 session_db.clone(),
             )
             .await;
+            app.session_name = session.read_meta().await.name;
             app.entries = session.entries().to_vec();
         }
 
-        // Set up terminal with panic hook
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore_terminal();
@@ -211,7 +213,6 @@ impl Gateway for TuiGateway {
         let config_role_names = get_role_names(self.config.roles.clone());
         let default_role = self.config.role.clone();
 
-        // Event loop
         loop {
             terminal.draw(|f| ui(f, &app))?;
 
@@ -228,7 +229,6 @@ impl Gateway for TuiGateway {
 
             match action {
                 Action::Key(key) => {
-                    // Global key bindings
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -247,7 +247,7 @@ impl Gateway for TuiGateway {
                                         ChatAction::SendMessage(text) => {
                                             let mut session = Session::new(
                                                 crate::types::ConversationId(
-                                                    app.transport_id.clone(),
+                                                    app.session_db_id.clone(),
                                                 ),
                                                 session_db.clone(),
                                             )
@@ -268,7 +268,7 @@ impl Gateway for TuiGateway {
                                                 scheduler: self.scheduler.as_ref(),
                                                 secrets: &self.secrets,
                                                 backend: &backend,
-                                                transport_id: &app.transport_id,
+                                                session_db_id: &app.session_db_id,
                                                 session_db: &session_db,
                                                 current_agent: &app.current_agent,
                                                 session_name: app.session_name.as_deref(),
@@ -284,7 +284,7 @@ impl Gateway for TuiGateway {
                                                         .session_list
                                                         .iter()
                                                         .position(|s| {
-                                                            s.transport_id == app.transport_id
+                                                            s.session_db_id == app.session_db_id
                                                         })
                                                         .unwrap_or(0);
                                                     app.mode = TuiMode::SessionPicker;
@@ -309,7 +309,7 @@ impl Gateway for TuiGateway {
                                                 scheduler: self.scheduler.as_ref(),
                                                 secrets: &self.secrets,
                                                 backend: &backend,
-                                                transport_id: &app.transport_id,
+                                                session_db_id: &app.session_db_id,
                                                 session_db: &session_db,
                                                 current_agent: &app.current_agent,
                                                 session_name: app.session_name.as_deref(),
@@ -338,16 +338,19 @@ impl Gateway for TuiGateway {
                                         scheduler: self.scheduler.as_ref(),
                                         secrets: &self.secrets,
                                         backend: &backend,
-                                        transport_id: &app.transport_id,
+                                        session_db_id: &app.session_db_id,
                                         session_db: &session_db,
                                         current_agent: &app.current_agent,
                                         session_name: app.session_name.as_deref(),
                                         config_roles: Some(config_role_names.clone()),
                                         default_role: default_role.as_deref(),
                                     };
-                                    let outcome =
-                                        commands::dispatch(Command::SwitchSession(selected), &ctx)
-                                            .await;
+                                    let cmd = if selected == "__new__" {
+                                        Command::NewSession
+                                    } else {
+                                        Command::SwitchSession(selected)
+                                    };
+                                    let outcome = commands::dispatch(cmd, &ctx).await;
                                     render_outcome(
                                         &mut app,
                                         outcome,
@@ -365,10 +368,9 @@ impl Gateway for TuiGateway {
                     }
                 }
                 Action::SessionChanged => {
-                    // Reload current session entries
                     if let TuiMode::Chat = app.mode {
                         let session = Session::new(
-                            crate::types::ConversationId(app.transport_id.clone()),
+                            crate::types::ConversationId(app.session_db_id.clone()),
                             session_db.clone(),
                         )
                         .await;
@@ -397,7 +399,6 @@ impl Gateway for TuiGateway {
     }
 }
 
-/// Apply a dispatched command's outcome to the TUI app state.
 async fn render_outcome(
     app: &mut App,
     outcome: CommandOutcome,
@@ -411,7 +412,6 @@ async fn render_outcome(
         CommandOutcome::Text(t) => show_system_msg(app, t),
         CommandOutcome::Error(e) => show_error(app, e),
         CommandOutcome::SessionsList(list) => {
-            // Render as text when the caller didn't request the picker modal.
             if list.is_empty() {
                 show_system_msg(app, "No sessions found.".to_string());
             } else {
@@ -425,7 +425,7 @@ async fn render_outcome(
                         .unwrap_or_default();
                     msg.push_str(&format!(
                         "\n  {}{} ({}, {} entries)",
-                        info.transport_id, name, agent, info.entry_count
+                        info.session_db_id, name, agent, info.entry_count
                     ));
                     if let Some(preview) = &info.last_message {
                         msg.push_str(&format!("\n    {preview}"));
@@ -436,7 +436,7 @@ async fn render_outcome(
         }
         CommandOutcome::SessionSwitched(switch) => {
             let crate::commands::SessionSwitch {
-                transport_id,
+                session_db_id,
                 conv_id,
                 db,
                 agent_name,
@@ -444,7 +444,6 @@ async fn render_outcome(
             } = *switch;
             if let Err(e) = setup_session(
                 server,
-                &transport_id,
                 &db,
                 backend.clone(),
                 approval_tx.clone(),
@@ -458,7 +457,7 @@ async fn render_outcome(
             *session_db = db.clone();
             let session = Session::new(conv_id, db).await;
             app.entries = session.entries().to_vec();
-            app.transport_id = transport_id;
+            app.session_db_id = session_db_id;
             app.current_agent = agent_name;
             app.session_name = session_name;
             app.scroll_offset = 0;
@@ -470,7 +469,6 @@ async fn render_outcome(
     }
 }
 
-/// Show a system message in the TUI.
 fn show_system_msg(app: &mut App, content: String) {
     app.entries.push(SessionEntry {
         sender: "system".to_string(),
@@ -480,7 +478,6 @@ fn show_system_msg(app: &mut App, content: String) {
     });
 }
 
-/// Show an error in the TUI.
 fn show_error(app: &mut App, content: String) {
     app.entries.push(SessionEntry {
         sender: "system".to_string(),
@@ -490,14 +487,11 @@ fn show_error(app: &mut App, content: String) {
     });
 }
 
-/// Handle a key event in chat mode. Returns a `ChatAction` if the event loop
-/// needs to take further action.
 async fn handle_chat_key(
     app: &mut App,
     key: KeyEvent,
     session_db: &eidetica::Database,
 ) -> Option<ChatAction> {
-    // Handle approval mode
     if let Some(exchange) = app.pending_approval.take() {
         let decision = match key.code {
             KeyCode::Char('y') => Some(ApprovalDecision::Approve),
@@ -581,15 +575,11 @@ async fn handle_chat_key(
     None
 }
 
-/// Parse a submitted line. Returns the ChatAction to take, if any.
-/// TUI-only behaviors (toggle debug, dump raw, clear display, help) are
-/// applied inline to `app` and return None.
 fn parse_chat_line(
     app: &mut App,
     text: &str,
     session_db: &eidetica::Database,
 ) -> Option<ChatAction> {
-    // Unified commands (dispatched through commands::dispatch)
     match text {
         "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
@@ -599,13 +589,11 @@ fn parse_chat_line(
         "/info" => return Some(ChatAction::Dispatch(Command::Info)),
         "/print" => return Some(ChatAction::Dispatch(Command::Print)),
         "/backends" => return Some(ChatAction::Dispatch(Command::ListBackends)),
-        "/new" => {
-            let tid = format!("tui:{}", uuid::Uuid::new_v4());
-            return Some(ChatAction::Dispatch(Command::SwitchSession(tid)));
-        }
+        "/new" => return Some(ChatAction::Dispatch(Command::NewSession)),
         "/name" => return Some(ChatAction::Dispatch(Command::ClearSessionName)),
         "/role" => return Some(ChatAction::Dispatch(Command::Role(None))),
         "/model" => return Some(ChatAction::Dispatch(Command::Model(None))),
+        "/channels" => return Some(ChatAction::Dispatch(Command::ListChannels)),
         _ => {}
     }
 
@@ -670,7 +658,6 @@ fn parse_chat_line(
         return None;
     }
 
-    // TUI-only commands (handled inline, don't dispatch)
     match text {
         "/clear" => {
             app.entries.clear();
@@ -706,7 +693,6 @@ fn parse_chat_line(
         _ => {}
     }
 
-    // Unknown command starting with '/' — refuse rather than sending to agent
     if text.starts_with('/') {
         show_error(
             app,
@@ -715,7 +701,6 @@ fn parse_chat_line(
         return None;
     }
 
-    // Regular message
     Some(ChatAction::SendMessage(text.to_string()))
 }
 
@@ -723,10 +708,11 @@ fn help_text(_session_db: &eidetica::Database) -> String {
     [
         "Commands:",
         "  /sessions, /s         — open session picker",
-        "  /new                  — create a new session",
-        "  /join <id>            — switch to session by name, DB ID, or transport ID",
-        "  /name [<alias>]       — set (or clear, if no arg) a session alias",
+        "  /new                  — create a new session (use picker 'n' key)",
+        "  /join <id>            — switch to session by name or DB ID",
+        "  /name [<alias>]       — set (or clear) a session alias",
         "  /info                 — show current session info",
+        "  /channels             — list Matrix rooms attached to this session",
         "  /share                — generate shareable ticket for current session",
         "  /sync <ticket>        — sync a remote session via ticket",
         "  /compact              — summarize and compact conversation history",
@@ -751,8 +737,6 @@ fn help_text(_session_db: &eidetica::Database) -> String {
     .join("\n")
 }
 
-/// Handle a key event in session picker mode.
-/// Returns Some(identifier) if a session was selected.
 fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
     match key.code {
         KeyCode::Up => {
@@ -770,14 +754,9 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
         KeyCode::Enter => app
             .session_list
             .get(app.picker_index)
-            .map(|info| info.transport_id.clone()),
-        KeyCode::Char('n') => {
-            // Create new session with a UUID transport ID
-            let tid = format!("tui:{}", uuid::Uuid::new_v4());
-            Some(tid)
-        }
+            .map(|info| info.session_db_id.clone()),
+        KeyCode::Char('n') => Some("__new__".to_string()),
         KeyCode::Esc => {
-            // Cancel — return to chat without switching
             app.mode = TuiMode::Chat;
             None
         }
@@ -794,17 +773,15 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 
 fn ui_chat(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::vertical([
-        Constraint::Min(1),    // messages
-        Constraint::Length(1), // status bar
-        Constraint::Length(3), // input box
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .split(f.area());
 
-    // === Messages area ===
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in &app.entries {
-        // Debug prefix: timestamp + entry type
         let debug_prefix = if app.debug_mode {
             let ts = entry.timestamp.format("%H:%M:%S");
             let typ = format!("{:?}", entry.entry_type);
@@ -896,7 +873,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    // Tool approval prompt
     if let Some(ref exchange) = app.pending_approval {
         let info = &exchange.info;
         lines.push(Line::from(vec![Span::styled(
@@ -919,7 +895,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         lines.push(Line::from(""));
     }
 
-    // Thinking indicator
     if app.waiting {
         lines.push(Line::from(vec![Span::styled(
             "  thinking...",
@@ -927,7 +902,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         )]));
     }
 
-    // Compute scroll to pin to bottom
     let messages_height = chunks[0].height.saturating_sub(2);
     let content_height = lines.len() as u16;
     let scroll = if content_height > messages_height {
@@ -944,7 +918,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         .block(Block::bordered().title(" Chaz "));
     f.render_widget(messages, chunks[0]);
 
-    // === Status bar ===
     let msg_count = app
         .entries
         .iter()
@@ -952,8 +925,8 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         .count();
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let session_label = match &app.session_name {
-        Some(name) => format!("{} ({})", name, app.transport_id),
-        None => app.transport_id.clone(),
+        Some(name) => format!("{} ({})", name, app.session_db_id),
+        None => app.session_db_id.clone(),
     };
     let status_text = format!(
         " {} | agent: {} | messages: {}{} | /help",
@@ -963,22 +936,16 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(status, chunks[1]);
 
-    // === Input area ===
     let input = Paragraph::new(app.input.as_str()).block(Block::bordered().title(" > "));
     f.render_widget(input, chunks[2]);
 
-    // Position cursor in input box
     let cursor_x = chunks[2].x + app.cursor as u16 + 1;
     let cursor_y = chunks[2].y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn ui_picker(f: &mut ratatui::Frame, app: &App) {
-    let chunks = Layout::vertical([
-        Constraint::Min(1),    // session list
-        Constraint::Length(1), // help bar
-    ])
-    .split(f.area());
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
@@ -991,7 +958,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
     } else {
         for (i, info) in app.session_list.iter().enumerate() {
             let is_selected = i == app.picker_index;
-            let is_current = info.transport_id == app.transport_id;
+            let is_current = info.session_db_id == app.session_db_id;
 
             let marker = if is_selected { "> " } else { "  " };
             let current_marker = if is_current { " *" } else { "" };
@@ -1005,7 +972,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
 
             let header = format!(
                 "{}{}{}{} ({}, {} entries)",
-                marker, info.transport_id, name_str, current_marker, agent_str, info.entry_count
+                marker, info.session_db_id, name_str, current_marker, agent_str, info.entry_count
             );
 
             let style = if is_selected {
@@ -1020,7 +987,6 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
 
             lines.push(Line::from(vec![Span::styled(header, style)]));
 
-            // Show last message preview
             if let Some(ref preview) = info.last_message {
                 lines.push(Line::from(vec![Span::styled(
                     format!("    {preview}"),

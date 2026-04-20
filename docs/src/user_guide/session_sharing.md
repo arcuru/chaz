@@ -109,5 +109,5 @@ See the [eidetica documentation](https://github.com/arcuru/eidetica) for details
 
 - The sync server address is not yet configurable (random port)
 - No authentication on the sync connection (any peer with the ticket can sync)
-- Session registry entries (transport_id mappings) are not synced -- only the session database contents
-- The synced session appears with a generated transport ID, not the original room ID
+- Registry index entries (Matrix channel bindings, name index) are local to each peer — only the session database contents (entries + meta) sync.
+- To make a synced session reachable from a specific Matrix room on the receiver, run `!chaz attach <name-or-id>` in that room after syncing.

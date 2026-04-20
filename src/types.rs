@@ -1,4 +1,5 @@
-/// Unique identifier for a conversation (e.g., Matrix room ID, TUI session)
+/// Display identifier for a conversation. In the current model this is the
+/// eidetica DB root ID of the session; used for logging and context assembly.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct ConversationId(pub String);
 

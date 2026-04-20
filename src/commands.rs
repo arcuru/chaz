@@ -27,8 +27,9 @@ pub enum Command {
     // --- Session management ---
     /// Enumerate all known sessions (TUI opens a picker; Matrix renders text).
     ListSessions,
-    /// Resolve identifier (name | DB ID | transport ID) and switch to it.
-    /// If the identifier is a fresh one, a new session is created.
+    /// Create a fresh session and switch to it.
+    NewSession,
+    /// Resolve identifier (name | DB ID) and switch to it.
     SwitchSession(String),
     /// Show info about the current session.
     Info,
@@ -45,32 +46,30 @@ pub enum Command {
     /// Dump the transcript of the current session.
     Print,
 
+    // --- Matrix channel management ---
+    /// List Matrix rooms currently attached to the current session.
+    ListChannels,
+
     // --- Scheduler ---
     ListSchedules,
     TriggerSchedule(String),
 
     // --- LLM configuration (per-session) ---
-    /// Show current model + known models (None), or bind a model for this session (Some).
     Model(Option<String>),
-    /// Show current role (None), select role (Some(name, None)),
-    /// or define a new role (Some(name, Some(prompt))).
     Role(Option<(String, Option<String>)>),
-    /// Register a custom backend for this session.
     SetBackend {
         name: String,
         url: String,
         api_key: String,
     },
-    /// Show known backends + models (no current-model row).
     ListBackends,
 
-    /// Signal to end the session (TUI quits; Matrix ignores).
     Quit,
 }
 
 /// Data about a session, used to render a picker (TUI) or a listing (Matrix).
 pub struct SessionInfo {
-    pub transport_id: String,
+    pub session_db_id: String,
     pub agent_name: Option<String>,
     pub name: Option<String>,
     pub entry_count: usize,
@@ -83,43 +82,35 @@ pub struct CommandContext<'a> {
     pub scheduler: Option<&'a Arc<Scheduler>>,
     pub secrets: &'a SecretStore,
     pub backend: &'a BackendManager,
-    pub transport_id: &'a str,
+    /// The eidetica root ID of the currently active session.
+    pub session_db_id: &'a str,
     pub session_db: &'a eidetica::Database,
     pub current_agent: &'a str,
     pub session_name: Option<&'a str>,
-    /// User-visible role names configured at the top level (for `Role(None)` listing).
     pub config_roles: Option<Vec<String>>,
-    /// Default role name from config, used as a fallback for "current role".
     pub default_role: Option<&'a str>,
 }
 
-/// Payload for `CommandOutcome::SessionSwitched`.
 pub struct SessionSwitch {
-    pub transport_id: String,
+    pub session_db_id: String,
     pub conv_id: ConversationId,
     pub db: eidetica::Database,
     pub agent_name: String,
     pub session_name: Option<String>,
 }
 
-/// Structured outcome of dispatching a command.
 pub enum CommandOutcome {
-    /// Plain text to show the user.
     Text(String),
-    /// Error message.
     Error(String),
-    /// List of sessions — TUI renders a modal picker, Matrix renders text.
     SessionsList(Vec<SessionInfo>),
-    /// The command switched the active session — gateway re-registers and reloads.
     SessionSwitched(Box<SessionSwitch>),
-    /// User requested to quit (TUI honors; Matrix ignores).
     Quit,
 }
 
-/// Run a parsed command against the given context.
 pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
     match cmd {
         Command::ListSessions => list_sessions(ctx).await,
+        Command::NewSession => new_session(ctx).await,
         Command::SwitchSession(id) => switch_session(&id, ctx).await,
         Command::Info => info(ctx).await,
         Command::NameSession(name) => name_session(&name, ctx).await,
@@ -128,6 +119,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::Sync(ticket) => sync_ticket(&ticket, ctx).await,
         Command::Compact => compact(ctx).await,
         Command::Print => print_transcript(ctx).await,
+        Command::ListChannels => list_channels(ctx).await,
         Command::ListSchedules => list_schedules(ctx).await,
         Command::TriggerSchedule(name) => trigger_schedule(&name, ctx).await,
         Command::Model(arg) => model(arg, ctx).await,
@@ -143,21 +135,22 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
 // -----------------------------------------------------------------------------
 
 async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let bindings = match ctx.server.registry().list_sessions().await {
+    let indices = match ctx.server.registry().list_sessions().await {
         Ok(b) => b,
         Err(e) => return CommandOutcome::Error(format!("Failed to list sessions: {e}")),
     };
 
     let mut sessions = Vec::new();
-    for binding in bindings {
-        let (entry_count, last_message) = match ctx
+    for index in indices {
+        let (entry_count, last_message, meta_name, meta_agent) = match ctx
             .server
             .registry()
-            .get_or_create_session_db(&binding.transport_id)
+            .open_session(&index.session_db_id)
             .await
         {
             Ok((conv_id, db)) => {
                 let session = Session::new(conv_id, db).await;
+                let meta = session.read_meta().await;
                 let count = session.entries().len();
                 let last = session
                     .entries()
@@ -172,14 +165,14 @@ async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
                             format!("{}: {}", e.sender, preview)
                         }
                     });
-                (count, last)
+                (count, last, meta.name, meta.agent_name)
             }
-            Err(_) => (0, None),
+            Err(_) => (0, None, None, None),
         };
         sessions.push(SessionInfo {
-            transport_id: binding.transport_id,
-            agent_name: binding.agent_name,
-            name: binding.name,
+            session_db_id: index.session_db_id,
+            agent_name: meta_agent,
+            name: meta_name,
             entry_count,
             last_message,
         });
@@ -188,38 +181,53 @@ async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
     CommandOutcome::SessionsList(sessions)
 }
 
+async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let (conv_id, db) = match ctx.server.registry().create_session(Some("tui")).await {
+        Ok(r) => r,
+        Err(e) => return CommandOutcome::Error(format!("Failed to create session: {e}")),
+    };
+    let session_db_id = db.root_id().to_string();
+    let agent = ctx
+        .server
+        .registry()
+        .resolve_agent(&session_db_id, None)
+        .await;
+    CommandOutcome::SessionSwitched(Box::new(SessionSwitch {
+        session_db_id,
+        conv_id,
+        db,
+        agent_name: agent.name,
+        session_name: None,
+    }))
+}
+
 async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let (transport_id, conv_id, db) = match ctx.server.registry().resolve_session(identifier).await
-    {
+    let (conv_id, db) = match ctx.server.registry().resolve_session(identifier).await {
         Ok(r) => r,
         Err(e) => return CommandOutcome::Error(format!("Failed to switch session: {e}")),
     };
 
-    let session_name = ctx
-        .server
-        .registry()
-        .get_binding(&transport_id)
-        .await
-        .and_then(|b| b.name);
+    let session_db_id = db.root_id().to_string();
+    let meta = crate::session::read_meta_from_db(&db).await;
 
     let agent = ctx
         .server
         .registry()
-        .resolve_agent(&transport_id, None)
+        .resolve_agent(&session_db_id, None)
         .await;
 
     CommandOutcome::SessionSwitched(Box::new(SessionSwitch {
-        transport_id,
+        session_db_id,
         conv_id,
         db,
         agent_name: agent.name,
-        session_name,
+        session_name: meta.name,
     }))
 }
 
 async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
-        ConversationId(ctx.transport_id.to_string()),
+        ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
     .await;
@@ -240,14 +248,24 @@ async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
         .iter()
         .filter(|e| e.entry_type == EntryType::Error)
         .count();
-    let db_id = ctx.session_db.root_id().to_string();
     let name_line = match ctx.session_name {
         Some(n) => format!("\nName: {n}"),
         None => String::new(),
     };
+    let channels = ctx
+        .server
+        .registry()
+        .matrix_channels_for_session(ctx.session_db_id)
+        .await
+        .unwrap_or_default();
+    let channels_line = if channels.is_empty() {
+        String::new()
+    } else {
+        format!("\nMatrix rooms: {}", channels.join(", "))
+    };
     CommandOutcome::Text(format!(
-        "Session: {}{name_line}\nAgent: {}\nDatabase ID: {db_id}\nTotal entries: {}\nMessages: {msg_count} | Directives: {directive_count} | Tool calls: {tool_count} | Errors: {error_count}",
-        ctx.transport_id,
+        "Session: {}{name_line}\nAgent: {}{channels_line}\nTotal entries: {}\nMessages: {msg_count} | Directives: {directive_count} | Tool calls: {tool_count} | Errors: {error_count}",
+        ctx.session_db_id,
         ctx.current_agent,
         entries.len(),
     ))
@@ -260,7 +278,7 @@ async fn name_session(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx
         .server
         .registry()
-        .set_session_name(ctx.transport_id, name.to_string())
+        .set_session_name(ctx.session_db_id, name.to_string())
         .await
     {
         Ok(()) => CommandOutcome::Text(format!("Session named '{name}'. Use it with join {name}.")),
@@ -272,7 +290,7 @@ async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx
         .server
         .registry()
-        .clear_session_name(ctx.transport_id)
+        .clear_session_name(ctx.session_db_id)
         .await
     {
         Ok(()) => CommandOutcome::Text("Session name cleared.".to_string()),
@@ -316,7 +334,7 @@ async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutco
 
 async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
-        ConversationId(ctx.transport_id.to_string()),
+        ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
     .await;
@@ -399,7 +417,7 @@ async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
 
 async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
-        ConversationId(ctx.transport_id.to_string()),
+        ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
     .await;
@@ -427,6 +445,28 @@ async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
         CommandOutcome::Text("(empty)".to_string())
     } else {
         CommandOutcome::Text(buf)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Matrix channels (listing is transport-neutral; attach/detach are per-gateway)
+// -----------------------------------------------------------------------------
+
+async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
+    match ctx
+        .server
+        .registry()
+        .matrix_channels_for_session(ctx.session_db_id)
+        .await
+    {
+        Ok(channels) if channels.is_empty() => {
+            CommandOutcome::Text("No Matrix rooms attached to this session.".to_string())
+        }
+        Ok(channels) => CommandOutcome::Text(format!(
+            "Matrix rooms attached to this session:\n  {}",
+            channels.join("\n  ")
+        )),
+        Err(e) => CommandOutcome::Error(format!("Failed to list channels: {e}")),
     }
 }
 
@@ -476,14 +516,16 @@ async fn trigger_schedule(name: &str, ctx: &CommandContext<'_>) -> CommandOutcom
 // -----------------------------------------------------------------------------
 
 async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
     match arg {
         None => {
-            let current = ctx
-                .server
-                .registry()
-                .get_binding(ctx.transport_id)
-                .await
-                .and_then(|b| b.model)
+            let meta = session.read_meta().await;
+            let current = meta
+                .model
                 .or_else(|| ctx.backend.default_model())
                 .unwrap_or_else(|| "unknown".to_string());
             let mut msg = format!(
@@ -506,14 +548,7 @@ async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome 
                 }
             };
             let m_clone = m.clone();
-            if let Err(e) = ctx
-                .server
-                .registry()
-                .update_binding(ctx.transport_id, |b| {
-                    b.model = Some(m_clone);
-                })
-                .await
-            {
+            if let Err(e) = session.update_meta(|meta| meta.model = Some(m_clone)).await {
                 return CommandOutcome::Error(format!("Failed to set model: {e}"));
             }
             CommandOutcome::Text(note)
@@ -522,12 +557,16 @@ async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome 
 }
 
 async fn role(arg: Option<(String, Option<String>)>, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
     match arg {
         None => {
-            let binding = ctx.server.registry().get_binding(ctx.transport_id).await;
-            let current_role = binding
-                .as_ref()
-                .and_then(|b| b.role_name.clone())
+            let meta = session.read_meta().await;
+            let current_role = meta
+                .role_name
                 .or_else(|| ctx.default_role.map(|s| s.to_string()))
                 .unwrap_or_else(|| "unknown".to_string());
             let config_roles = ctx.config_roles.clone().unwrap_or_default();
@@ -547,13 +586,11 @@ async fn role(arg: Option<(String, Option<String>)>, ctx: &CommandContext<'_>) -
         Some((name, prompt)) => {
             let name_clone = name.clone();
             let prompt_clone = prompt.clone();
-            if let Err(e) = ctx
-                .server
-                .registry()
-                .update_binding(ctx.transport_id, |b| {
-                    b.role_name = Some(name_clone);
+            if let Err(e) = session
+                .update_meta(|meta| {
+                    meta.role_name = Some(name_clone);
                     if let Some(p) = prompt_clone {
-                        b.role_prompt = Some(p);
+                        meta.role_prompt = Some(p);
                     }
                 })
                 .await
@@ -571,20 +608,23 @@ async fn set_backend(
     api_key: &str,
     ctx: &CommandContext<'_>,
 ) -> CommandOutcome {
-    let ref_id = format!("session:{}:{name}", ctx.transport_id);
+    let ref_id = format!("session:{}:{name}", ctx.session_db_id);
     ctx.secrets
         .insert(ref_id.clone(), api_key.to_string())
         .await;
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
     let name_owned = name.to_string();
     let url_owned = url.to_string();
     let ref_id_clone = ref_id.clone();
-    if let Err(e) = ctx
-        .server
-        .registry()
-        .update_binding(ctx.transport_id, |b| {
-            b.backend_name = Some(name_owned);
-            b.backend_url = Some(url_owned);
-            b.backend_key_ref = Some(ref_id_clone);
+    if let Err(e) = session
+        .update_meta(|meta| {
+            meta.backend_name = Some(name_owned);
+            meta.backend_url = Some(url_owned);
+            meta.backend_key_ref = Some(ref_id_clone);
         })
         .await
     {

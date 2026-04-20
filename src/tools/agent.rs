@@ -139,7 +139,7 @@ impl Tool for SpawnAgent {
             let child_max_depth = resolved.max_iterations as usize;
 
             // Register a child session with the server
-            let (_transport_id, conversation_id, session_db, mut completion_rx) = server
+            let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session(
                     agent_name,
                     self.backend.clone(),

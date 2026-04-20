@@ -72,7 +72,7 @@ sequenceDiagram
 
     P->>SA: execute("researcher", "find papers")
     SA->>SV: register_child_session(agent, backend, tools, depth)
-    SV-->>SA: (transport_id, session_db, completion_rx)
+    SV-->>SA: (conversation_id, session_db, completion_rx)
     SA->>CS: write Directive entry
     CS-->>SV: on_local_write callback
     SV->>CA: spawn agent task
