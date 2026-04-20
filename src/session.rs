@@ -43,15 +43,33 @@ pub struct SessionEntry {
     pub entry_type: EntryType,
 }
 
+/// A reference to an agent authorized to participate in a session.
+///
+/// `db_id` is the agent's eidetica Database root ID — its global identity.
+/// `display_name` caches the name so listings don't require opening the
+/// agent's DB. Name is advisory; the DB id is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRef {
+    pub db_id: String,
+    pub display_name: String,
+}
+
 /// Metadata stored in each session's own eidetica DB (under the "meta" DocStore).
 ///
 /// This is the authoritative source for per-session configuration. It travels
 /// with the session via eidetica sync — sharing a session also shares its
 /// name, agent, model, role, and backend choices.
+///
+/// `agents` is the Living-Agents list of participating Agent DBs. The legacy
+/// `agent_name` is still read for backward compatibility and as a fallback
+/// when `agents` is empty — Stage 3 keeps both; later stages remove
+/// `agent_name` once all sessions are migrated.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub name: Option<String>,
     pub agent_name: Option<String>,
+    #[serde(default)]
+    pub agents: Vec<AgentRef>,
     pub model: Option<String>,
     pub role_name: Option<String>,
     pub role_prompt: Option<String>,
@@ -210,9 +228,18 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         return SessionMeta::default();
     };
 
+    let agents: Vec<AgentRef> = match store.get_string("agents").await {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            warn!("Malformed agents list in SessionMeta, ignoring: {e}");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    };
+
     SessionMeta {
         name: store.get_string("name").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
+        agents,
         model: store.get_string("model").await.ok(),
         role_name: store.get_string("role_name").await.ok(),
         role_prompt: store.get_string("role_prompt").await.ok(),
@@ -235,6 +262,12 @@ where
 
     write_field(&store, "name", current.name.as_deref()).await?;
     write_field(&store, "agent_name", current.agent_name.as_deref()).await?;
+    if current.agents.is_empty() {
+        let _ = store.delete("agents").await;
+    } else {
+        let json = serde_json::to_string(&current.agents)?;
+        store.set_string("agents", json).await?;
+    }
     write_field(&store, "model", current.model.as_deref()).await?;
     write_field(&store, "role_name", current.role_name.as_deref()).await?;
     write_field(&store, "role_prompt", current.role_prompt.as_deref()).await?;
@@ -634,5 +667,89 @@ async fn find_or_create_db(
             let key_id = user.get_default_key()?;
             Ok(user.create_database(settings, &key_id).await?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
+
+    /// Test-only fixture: fresh in-memory peer with one database ready for
+    /// SessionMeta round-trip tests. Returns the Instance+User so they stay
+    /// alive while the Database is in use (dropping the Instance closes the
+    /// backend and invalidates the Database handle).
+    async fn test_session_db() -> (Instance, eidetica::user::User, Database) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let mut user = instance.login_user("test", None).await.unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut settings = eidetica::crdt::Doc::new();
+        settings.set("name", "test-session");
+        let db = user.create_database(settings, &key).await.unwrap();
+        (instance, user, db)
+    }
+
+    #[tokio::test]
+    async fn session_meta_agents_round_trip() {
+        let (_instance, _user, db) = test_session_db().await;
+
+        let agents = vec![
+            AgentRef {
+                db_id: "sha256:abc".to_string(),
+                display_name: "alpha".to_string(),
+            },
+            AgentRef {
+                db_id: "sha256:def".to_string(),
+                display_name: "beta".to_string(),
+            },
+        ];
+
+        let expected = agents.clone();
+        update_meta_on_db(&db, |m| m.agents = agents).await.unwrap();
+
+        let read_back = read_meta_from_db(&db).await;
+        assert_eq!(read_back.agents, expected);
+    }
+
+    #[tokio::test]
+    async fn session_meta_empty_agents_clears_field() {
+        let (_instance, _user, db) = test_session_db().await;
+
+        // Populate then clear.
+        update_meta_on_db(&db, |m| {
+            m.agents.push(AgentRef {
+                db_id: "sha256:x".to_string(),
+                display_name: "alpha".to_string(),
+            });
+        })
+        .await
+        .unwrap();
+
+        update_meta_on_db(&db, |m| m.agents.clear()).await.unwrap();
+
+        let read_back = read_meta_from_db(&db).await;
+        assert!(read_back.agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_meta_coexists_with_agent_name() {
+        let (_instance, _user, db) = test_session_db().await;
+        update_meta_on_db(&db, |m| {
+            m.agent_name = Some("legacy".to_string());
+            m.agents.push(AgentRef {
+                db_id: "sha256:a".to_string(),
+                display_name: "modern".to_string(),
+            });
+        })
+        .await
+        .unwrap();
+
+        let meta = read_meta_from_db(&db).await;
+        assert_eq!(meta.agent_name.as_deref(), Some("legacy"));
+        assert_eq!(meta.agents.len(), 1);
+        assert_eq!(meta.agents[0].display_name, "modern");
     }
 }
