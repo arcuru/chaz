@@ -132,8 +132,10 @@ async fn main() -> anyhow::Result<()> {
         approval_callback: None, // set per-session by server
     };
 
-    // Build tool policy registry from config
-    let policy_overrides = sec.tool_policies.clone().unwrap_or_default();
+    // Build tool policy registry from config, merging legacy SecurityConfig
+    // fields (shell_allowlist/denylist, allowed_endpoints) into per-tool grants.
+    let policy_overrides =
+        grants::merge_legacy_security(sec.tool_policies.clone().unwrap_or_default(), &sec);
     let policies = std::sync::Arc::new(tool::ToolPolicyRegistry::new(policy_overrides));
 
     let registry = std::sync::Arc::new(registry);

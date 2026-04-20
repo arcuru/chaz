@@ -190,17 +190,20 @@ fn default_enabled() -> bool {
 /// Security configuration
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SecurityConfig {
-    /// Allowed endpoints for web_fetch (empty = allow all, non-empty = deny-all default)
+    /// Deprecated — use `tool_policies.web_fetch.grants.network.endpoints`.
+    /// Still parsed for backward compatibility and migrated to grants at startup.
     pub allowed_endpoints: Option<Vec<EndpointConfig>>,
-    /// Shell commands allowed (if set, only these command prefixes are permitted)
+    /// Deprecated — use `tool_policies.shell.grants.shell.allow`.
+    /// Still parsed for backward compatibility and migrated to grants at startup.
     pub shell_allowlist: Option<Vec<String>>,
-    /// Shell commands denied (blocked even without an allowlist)
+    /// Deprecated — use `tool_policies.shell.grants.shell.deny`.
+    /// Still parsed for backward compatibility and migrated to grants at startup.
     pub shell_denylist: Option<Vec<String>>,
     /// Tools that are auto-approved (skip approval for UnlessAutoApproved tools)
     pub auto_approved_tools: Option<Vec<String>>,
     /// Leak detection policy: "redact" (default) or "block"
     pub leak_policy: Option<String>,
-    /// Per-tool policy overrides (risk, approval, timeout, sensitive_params)
+    /// Per-tool policy overrides (risk, approval, timeout, sensitive_params, grants)
     pub tool_policies: Option<std::collections::HashMap<String, crate::tool::ToolPolicy>>,
 }
 
