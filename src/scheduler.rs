@@ -330,3 +330,114 @@ pub struct ScheduleInfo {
     pub last_run: Option<DateTime<Utc>>,
     pub next_run: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
+
+    async fn test_db() -> (Instance, Database) {
+        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let mut user = instance.login_user("test", None).await.unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut s = eidetica::crdt::Doc::new();
+        s.set("name", "central");
+        let db = user.create_database(s, &key).await.unwrap();
+        (instance, db)
+    }
+
+    // ================================================================
+    // next_run_after
+    // ================================================================
+
+    #[test]
+    fn next_run_after_respects_last_run() {
+        // Fire at every minute
+        let cron = Schedule::from_str("0 * * * * *").unwrap();
+        let last_run = Utc.with_ymd_and_hms(2026, 4, 21, 10, 0, 0).unwrap();
+        let next = next_run_after(&cron, Some(last_run)).unwrap();
+        // Cron "0 * * * * *" fires at second 0 each minute; next after 10:00:00
+        // should be 10:01:00.
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 21, 10, 1, 0).unwrap());
+    }
+
+    #[test]
+    fn next_run_after_without_last_run_uses_now() {
+        // Daily at 03:00
+        let cron = Schedule::from_str("0 0 3 * * *").unwrap();
+        let next = next_run_after(&cron, None).unwrap();
+        // Always in the future
+        assert!(next > Utc::now());
+    }
+
+    #[test]
+    fn next_run_after_returns_none_for_exhausted_cron() {
+        // A one-shot cron in the past — `after(last_run)` still has future
+        // occurrences unless the cron uses a specific year. Use a year in the
+        // past to force exhaustion.
+        let cron = Schedule::from_str("0 0 0 1 1 * 2020").unwrap();
+        let last_run = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap();
+        assert!(next_run_after(&cron, Some(last_run)).is_none());
+    }
+
+    // ================================================================
+    // save_schedule_state + load_schedule_states round-trip
+    // ================================================================
+
+    #[tokio::test]
+    async fn save_and_load_single_schedule() {
+        let (_instance, db) = test_db().await;
+        let now = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
+        save_schedule_state(&db, "daily_ping", now).await.unwrap();
+
+        let states = load_schedule_states(&db).await;
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].name, "daily_ping");
+        let parsed = DateTime::parse_from_rfc3339(&states[0].last_run)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(parsed, now);
+    }
+
+    #[tokio::test]
+    async fn save_updates_existing_schedule() {
+        let (_instance, db) = test_db().await;
+        let t1 = Utc.with_ymd_and_hms(2026, 4, 21, 10, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 4, 21, 11, 0, 0).unwrap();
+
+        save_schedule_state(&db, "daily_ping", t1).await.unwrap();
+        save_schedule_state(&db, "daily_ping", t2).await.unwrap();
+
+        let states = load_schedule_states(&db).await;
+        // Only one entry; it was updated, not duplicated.
+        assert_eq!(states.len(), 1);
+        let parsed = DateTime::parse_from_rfc3339(&states[0].last_run)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(parsed, t2);
+    }
+
+    #[tokio::test]
+    async fn save_multiple_schedules_independent() {
+        let (_instance, db) = test_db().await;
+        let t1 = Utc.with_ymd_and_hms(2026, 4, 21, 10, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 4, 21, 11, 0, 0).unwrap();
+        save_schedule_state(&db, "job_a", t1).await.unwrap();
+        save_schedule_state(&db, "job_b", t2).await.unwrap();
+
+        let states = load_schedule_states(&db).await;
+        assert_eq!(states.len(), 2);
+        let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"job_a"));
+        assert!(names.contains(&"job_b"));
+    }
+
+    #[tokio::test]
+    async fn load_on_empty_db_returns_empty() {
+        let (_instance, db) = test_db().await;
+        assert!(load_schedule_states(&db).await.is_empty());
+    }
+}
