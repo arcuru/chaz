@@ -283,3 +283,220 @@ impl Default for ContextConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal_config() {
+        // The only two nominally required fields both have #[serde(default)],
+        // so an empty document parses cleanly.
+        let cfg: Config = serde_yaml::from_str("").unwrap();
+        assert!(cfg.homeserver_url.is_empty());
+        assert!(cfg.username.is_empty());
+        assert!(cfg.password.is_none());
+        assert!(cfg.agents.is_none());
+    }
+
+    #[test]
+    fn parse_full_matrix_stub() {
+        let yaml = r#"
+homeserver_url: "https://matrix.org"
+username: "@bot:matrix.org"
+password: "s3cret"
+allow_list: "@alice:matrix.org|@bob:matrix.org"
+message_limit: 500
+room_size_limit: 100
+state_dir: "/var/lib/chaz"
+chat_summary_model: "gpt-4"
+role: "assistant"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.homeserver_url, "https://matrix.org");
+        assert_eq!(cfg.username, "@bot:matrix.org");
+        assert_eq!(cfg.password.as_deref(), Some("s3cret"));
+        assert_eq!(cfg.message_limit, Some(500));
+        assert_eq!(cfg.role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn parse_agents_section() {
+        let yaml = r#"
+agents:
+  - name: researcher
+    role: analyst
+    model: gpt-4
+    tools: [web_fetch, calculate]
+    max_iterations: 20
+    autonomous: true
+  - name: default
+    max_iterations: 5
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let agents = cfg.agents.unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "researcher");
+        assert_eq!(agents[0].role.as_deref(), Some("analyst"));
+        assert_eq!(agents[0].model.as_deref(), Some("gpt-4"));
+        assert_eq!(agents[0].max_iterations, Some(20));
+        assert!(agents[0].autonomous);
+        assert_eq!(agents[0].tools.as_ref().unwrap().len(), 2);
+        // `autonomous` defaults to false when unset
+        assert!(!agents[1].autonomous);
+    }
+
+    #[test]
+    fn parse_backend_roundtrip_and_defaults() {
+        let yaml = r#"
+backends:
+  - type: openaicompatible
+    name: openrouter
+    api_base: "https://openrouter.ai/api/v1"
+    api_key: "${OPENROUTER_KEY}"
+    models:
+      - name: "gpt-4"
+      - name: "claude-3"
+    request_timeout: 60
+    max_retries: 5
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let backends = cfg.backends.unwrap();
+        assert_eq!(backends.len(), 1);
+        let b = &backends[0];
+        assert_eq!(b.get_name(), "openrouter");
+        assert_eq!(b.api_base.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(b.api_key.as_deref(), Some("${OPENROUTER_KEY}"));
+        assert_eq!(b.request_timeout().as_secs(), 60);
+        assert_eq!(b.max_retries(), 5);
+        assert_eq!(b.models.as_ref().unwrap().len(), 2);
+        // secret_key scopes to backend name
+        assert_eq!(b.secret_key(), "backend:openrouter");
+    }
+
+    #[test]
+    fn backend_defaults_when_fields_missing() {
+        let b = Backend::new(BackendType::OpenAICompatible);
+        assert_eq!(b.get_name(), "openai"); // default when name is None
+        assert_eq!(b.request_timeout().as_secs(), 120);
+        assert_eq!(b.max_retries(), 3);
+    }
+
+    #[test]
+    fn parse_schedule_defaults_enabled_to_true() {
+        let yaml = r#"
+schedules:
+  - name: daily_report
+    session: "tui"
+    task: "Generate the daily report."
+    cron: "0 9 * * * *"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let schedules = cfg.schedules.unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].name, "daily_report");
+        // enabled defaults to true
+        assert!(schedules[0].enabled);
+    }
+
+    #[test]
+    fn parse_schedule_explicit_disabled() {
+        let yaml = r#"
+schedules:
+  - name: paused_job
+    session: "tui"
+    task: "noop"
+    cron: "0 0 * * * *"
+    enabled: false
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.schedules.unwrap()[0].enabled);
+    }
+
+    #[test]
+    fn parse_mcp_servers_stdio_and_http() {
+        let yaml = r#"
+mcp_servers:
+  - name: filesystem
+    command: npx
+    args: ["-y", "@mcp/server-filesystem", "/home"]
+    env:
+      NODE_ENV: production
+  - name: remote
+    url: "http://localhost:8080/mcp"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let servers = cfg.mcp_servers.unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "filesystem");
+        assert_eq!(servers[0].command, "npx");
+        assert_eq!(servers[0].args.as_ref().unwrap().len(), 3);
+        assert_eq!(servers[0].env.as_ref().unwrap().get("NODE_ENV").unwrap(), "production");
+        assert_eq!(servers[1].url.as_deref(), Some("http://localhost:8080/mcp"));
+        // command defaults to empty string when unset
+        assert_eq!(servers[1].command, "");
+    }
+
+    #[test]
+    fn parse_context_config_defaults() {
+        let yaml = "context: {}";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let ctx = cfg.context.unwrap();
+        assert_eq!(ctx.max_context_tokens, 128_000);
+        assert_eq!(ctx.reserved_output_tokens, 4096);
+    }
+
+    #[test]
+    fn parse_context_config_overrides() {
+        let yaml = r#"
+context:
+  max_context_tokens: 32000
+  reserved_output_tokens: 2048
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let ctx = cfg.context.unwrap();
+        assert_eq!(ctx.max_context_tokens, 32000);
+        assert_eq!(ctx.reserved_output_tokens, 2048);
+    }
+
+    #[test]
+    fn parse_security_with_legacy_fields() {
+        // Legacy fields still deserialize — migration happens at startup.
+        let yaml = r#"
+security:
+  shell_allowlist: ["git", "ls"]
+  shell_denylist: ["rm -rf"]
+  leak_policy: "block"
+  auto_approved_tools: ["calculate", "get_time"]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let sec = cfg.security.unwrap();
+        assert_eq!(sec.shell_allowlist.as_ref().unwrap().len(), 2);
+        assert_eq!(sec.shell_denylist.as_ref().unwrap().len(), 1);
+        assert_eq!(sec.leak_policy.as_deref(), Some("block"));
+        assert_eq!(sec.auto_approved_tools.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn agent_preset_round_trip() {
+        // AgentPreset is the only config type with Serialize (for storage).
+        let preset = AgentPreset {
+            model: Some("gpt-4".into()),
+            max_iterations: Some(10),
+            tools: Some(vec!["shell".into()]),
+            role_suffix: Some("be concise".into()),
+            tool_profile: Some("brief".into()),
+        };
+        let yaml = serde_yaml::to_string(&preset).unwrap();
+        let parsed: AgentPreset = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, preset);
+    }
+
+    #[test]
+    fn agent_preset_defaults_all_none() {
+        let preset = AgentPreset::default();
+        assert!(preset.model.is_none());
+        assert!(preset.max_iterations.is_none());
+        assert!(preset.tools.is_none());
+    }
+}
