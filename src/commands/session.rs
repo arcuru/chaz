@@ -1,176 +1,25 @@
-//! Transport-neutral session command dispatch.
+//! Session, Matrix-channel, scheduler, and LLM-config handlers.
 //!
-//! Gateways (Matrix, TUI, future HTTP/etc.) parse their own syntax into a
-//! `Command`, call `dispatch`, and render the `CommandOutcome` to their
-//! transport. All the session/registry/scheduler/backend mutation logic
-//! lives here — gateways are pure adapters.
-//!
-//! Transport-specific commands (e.g. Matrix room `rename`, TUI `/debug`)
-//! stay in the gateway modules — this file is only for the session ops
-//! that make sense across transports.
+//! These are the "operate on the current session" commands: list, create,
+//! switch, info, name, share/sync, compact, print, channel listing,
+//! scheduler pointers, and per-session LLM config (model/role/backend).
 
-use crate::backends::{BackendManager, ChatContext, Message};
+use crate::backends::{ChatContext, Message};
 use crate::defaults::DEFAULT_CONFIG;
 use crate::role::get_role_names;
-use crate::scheduler::Scheduler;
-use crate::security::SecretStore;
-use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
 
 use eidetica::store::Table;
 use openai_api_rs::v1::chat_completion::MessageRole;
-use std::sync::Arc;
 
-/// Parsed, transport-neutral command intent.
-pub enum Command {
-    // --- Session management ---
-    /// Enumerate all known sessions (TUI opens a picker; Matrix renders text).
-    ListSessions,
-    /// Create a fresh session and switch to it.
-    NewSession,
-    /// Resolve identifier (name | DB ID) and switch to it.
-    SwitchSession(String),
-    /// Show info about the current session.
-    Info,
-    /// Give the current session a human-friendly alias.
-    NameSession(String),
-    /// Remove the current session's alias.
-    ClearSessionName,
-    /// Generate a shareable ticket URL for the current session.
-    Share,
-    /// Sync a remote session via ticket URL.
-    Sync(String),
-    /// Summarize and compact the current session's context.
-    Compact,
-    /// Dump the transcript of the current session.
-    Print,
-
-    // --- Matrix channel management ---
-    /// List Matrix rooms currently attached to the current session.
-    ListChannels,
-
-    // --- Agents participating in the current session (Living Agents) ---
-    /// Attach an agent (by name or DB ID) to the current session.
-    AgentAdd(String),
-    /// Detach an agent (by name or DB ID) from the current session.
-    AgentRemove(String),
-    /// List agents currently attached to the session.
-    AgentsList,
-    /// Designate the "host agent" — answers when no @mention pins a turn.
-    /// `Some(ref)` sets it; `None` clears it.
-    AgentSetHost(Option<String>),
-
-    // --- Heartbeat rules (Stage 4b) ---
-    /// Add or upsert a heartbeat rule on the current session.
-    HeartbeatAdd {
-        id: String,
-        cron: String,
-        agent_ref: String,
-        task: String,
-    },
-    /// Remove a heartbeat rule by id.
-    HeartbeatRemove(String),
-    /// List heartbeat rules on the current session.
-    HeartbeatList,
-
-    // --- Scheduler ---
-    ListSchedules,
-    TriggerSchedule(String),
-
-    // --- LLM configuration (per-session) ---
-    Model(Option<String>),
-    Role(Option<(String, Option<String>)>),
-    SetBackend {
-        name: String,
-        url: String,
-        api_key: String,
-    },
-    ListBackends,
-
-    Quit,
-}
-
-/// Data about a session, used to render a picker (TUI) or a listing (Matrix).
-pub struct SessionInfo {
-    pub session_db_id: String,
-    pub agent_name: Option<String>,
-    pub name: Option<String>,
-    pub entry_count: usize,
-    pub last_message: Option<String>,
-}
-
-/// Everything a command handler needs. Borrowed from the gateway.
-pub struct CommandContext<'a> {
-    pub server: &'a Arc<Server>,
-    pub scheduler: Option<&'a Arc<Scheduler>>,
-    pub secrets: &'a SecretStore,
-    pub backend: &'a BackendManager,
-    /// The eidetica root ID of the currently active session.
-    pub session_db_id: &'a str,
-    pub session_db: &'a eidetica::Database,
-    pub current_agent: &'a str,
-    pub session_name: Option<&'a str>,
-    pub config_roles: Option<Vec<String>>,
-    pub default_role: Option<&'a str>,
-}
-
-pub struct SessionSwitch {
-    pub session_db_id: String,
-    pub conv_id: ConversationId,
-    pub db: eidetica::Database,
-    pub agent_name: String,
-    pub session_name: Option<String>,
-}
-
-pub enum CommandOutcome {
-    Text(String),
-    Error(String),
-    SessionsList(Vec<SessionInfo>),
-    SessionSwitched(Box<SessionSwitch>),
-    Quit,
-}
-
-pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
-    match cmd {
-        Command::ListSessions => list_sessions(ctx).await,
-        Command::NewSession => new_session(ctx).await,
-        Command::SwitchSession(id) => switch_session(&id, ctx).await,
-        Command::Info => info(ctx).await,
-        Command::NameSession(name) => name_session(&name, ctx).await,
-        Command::ClearSessionName => clear_session_name(ctx).await,
-        Command::Share => share(ctx).await,
-        Command::Sync(ticket) => sync_ticket(&ticket, ctx).await,
-        Command::Compact => compact(ctx).await,
-        Command::Print => print_transcript(ctx).await,
-        Command::ListChannels => list_channels(ctx).await,
-        Command::AgentAdd(r) => agent_add(&r, ctx).await,
-        Command::AgentRemove(r) => agent_remove(&r, ctx).await,
-        Command::AgentsList => agents_list(ctx).await,
-        Command::AgentSetHost(arg) => agent_set_host(arg.as_deref(), ctx).await,
-        Command::HeartbeatAdd {
-            id,
-            cron,
-            agent_ref,
-            task,
-        } => heartbeat_add(&id, &cron, &agent_ref, &task, ctx).await,
-        Command::HeartbeatRemove(id) => heartbeat_remove(&id, ctx).await,
-        Command::HeartbeatList => heartbeat_list(ctx).await,
-        Command::ListSchedules => list_schedules(ctx).await,
-        Command::TriggerSchedule(name) => trigger_schedule(&name, ctx).await,
-        Command::Model(arg) => model(arg, ctx).await,
-        Command::Role(arg) => role(arg, ctx).await,
-        Command::SetBackend { name, url, api_key } => set_backend(&name, &url, &api_key, ctx).await,
-        Command::ListBackends => list_backends(ctx).await,
-        Command::Quit => CommandOutcome::Quit,
-    }
-}
+use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 
 // -----------------------------------------------------------------------------
-// Session ops
+// Session CRUD
 // -----------------------------------------------------------------------------
 
-async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
     let indices = match ctx.server.registry().list_sessions().await {
         Ok(b) => b,
         Err(e) => return CommandOutcome::Error(format!("Failed to list sessions: {e}")),
@@ -217,7 +66,7 @@ async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
     CommandOutcome::SessionsList(sessions)
 }
 
-async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
     let (conv_id, db) = match ctx.server.registry().create_session(Some("tui")).await {
         Ok(r) => r,
         Err(e) => return CommandOutcome::Error(format!("Failed to create session: {e}")),
@@ -237,7 +86,7 @@ async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
     }))
 }
 
-async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     let (conv_id, db) = match ctx.server.registry().resolve_session(identifier).await {
         Ok(r) => r,
         Err(e) => return CommandOutcome::Error(format!("Failed to switch session: {e}")),
@@ -261,7 +110,7 @@ async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOu
     }))
 }
 
-async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -307,7 +156,7 @@ async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
-async fn name_session(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn name_session(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     if name.is_empty() {
         return CommandOutcome::Error("Usage: name <alias>".to_string());
     }
@@ -322,7 +171,7 @@ async fn name_session(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     }
 }
 
-async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx
         .server
         .registry()
@@ -334,7 +183,7 @@ async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutcome {
     }
 }
 
-async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     let instance = ctx.server.registry().instance();
     let Some(sync) = instance.sync() else {
         return CommandOutcome::Error("Sync not enabled".to_string());
@@ -350,7 +199,7 @@ async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
-async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     let instance = ctx.server.registry().instance();
     let Some(sync) = instance.sync() else {
         return CommandOutcome::Error("Sync not enabled".to_string());
@@ -368,7 +217,7 @@ async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutco
     }
 }
 
-async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -451,7 +300,7 @@ async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
-async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -488,7 +337,7 @@ async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
 // Matrix channels (listing is transport-neutral; attach/detach are per-gateway)
 // -----------------------------------------------------------------------------
 
-async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx
         .server
         .registry()
@@ -510,7 +359,7 @@ async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
 // Scheduler
 // -----------------------------------------------------------------------------
 
-async fn list_schedules(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn list_schedules(ctx: &CommandContext<'_>) -> CommandOutcome {
     let Some(sched) = ctx.scheduler else {
         return CommandOutcome::Text("No scheduler configured.".to_string());
     };
@@ -537,7 +386,7 @@ async fn list_schedules(ctx: &CommandContext<'_>) -> CommandOutcome {
     CommandOutcome::Text(msg)
 }
 
-async fn trigger_schedule(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn trigger_schedule(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     let Some(sched) = ctx.scheduler else {
         return CommandOutcome::Error("No scheduler configured.".to_string());
     };
@@ -548,10 +397,10 @@ async fn trigger_schedule(name: &str, ctx: &CommandContext<'_>) -> CommandOutcom
 }
 
 // -----------------------------------------------------------------------------
-// LLM config
+// LLM config (per-session)
 // -----------------------------------------------------------------------------
 
-async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -592,7 +441,10 @@ async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome 
     }
 }
 
-async fn role(arg: Option<(String, Option<String>)>, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn role(
+    arg: Option<(String, Option<String>)>,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -638,7 +490,7 @@ async fn role(arg: Option<(String, Option<String>)>, ctx: &CommandContext<'_>) -
     }
 }
 
-async fn set_backend(
+pub(super) async fn set_backend(
     name: &str,
     url: &str,
     api_key: &str,
@@ -669,206 +521,11 @@ async fn set_backend(
     CommandOutcome::Text(format!("Successfully added backend {name}"))
 }
 
-async fn list_backends(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn list_backends(ctx: &CommandContext<'_>) -> CommandOutcome {
     let msg = format!(
         "Known Backends:\n{}\n\nKnown Models:\n{}",
         ctx.backend.list_known_backends().join("\n"),
         ctx.backend.list_known_models().join("\n")
     );
     CommandOutcome::Text(msg)
-}
-
-// -----------------------------------------------------------------------------
-// Agent participation (Living Agents Stage 3d)
-// -----------------------------------------------------------------------------
-
-/// Resolve a user-supplied ref — either an agent display name or an eidetica
-/// DB ID — to an `AgentIndexEntry`.
-async fn resolve_agent_ref(
-    agent_ref: &str,
-    ctx: &CommandContext<'_>,
-) -> Result<crate::agent_index::AgentIndexEntry, String> {
-    let index = ctx.server.agent_index();
-    if let Ok(Some(entry)) = index.find_by_name(agent_ref).await {
-        return Ok(entry);
-    }
-    if let Ok(id) = eidetica::entry::ID::parse(agent_ref) {
-        if let Ok(Some(entry)) = index.find_by_id(&id).await {
-            return Ok(entry);
-        }
-    }
-    Err(format!(
-        "No hosted agent matches '{agent_ref}' (try a display name from /agents or an agent DB ID)"
-    ))
-}
-
-async fn agent_add(agent_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let entry = match resolve_agent_ref(agent_ref, ctx).await {
-        Ok(e) => e,
-        Err(msg) => return CommandOutcome::Error(msg),
-    };
-    match ctx
-        .server
-        .registry()
-        .attach_agent_to_session(ctx.session_db_id, &entry)
-        .await
-    {
-        Ok(()) => CommandOutcome::Text(format!(
-            "Attached agent '{}' to this session",
-            entry.display_name
-        )),
-        Err(e) => CommandOutcome::Error(format!("Failed to attach agent: {e}")),
-    }
-}
-
-async fn agent_remove(agent_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let entry = match resolve_agent_ref(agent_ref, ctx).await {
-        Ok(e) => e,
-        Err(msg) => return CommandOutcome::Error(msg),
-    };
-    match ctx
-        .server
-        .registry()
-        .detach_agent_from_session(ctx.session_db_id, &entry)
-        .await
-    {
-        Ok(()) => CommandOutcome::Text(format!(
-            "Detached agent '{}' from this session",
-            entry.display_name
-        )),
-        Err(e) => CommandOutcome::Error(format!("Failed to detach agent: {e}")),
-    }
-}
-
-async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let meta = crate::session::read_meta_from_db(ctx.session_db).await;
-    if meta.agents.is_empty() {
-        let fallback = meta.agent_name.unwrap_or_else(|| "<default>".to_string());
-        return CommandOutcome::Text(format!(
-            "No Living Agents attached to this session. Legacy agent: {fallback}"
-        ));
-    }
-    let host = meta.host_agent_db_id.as_deref();
-    let lines: Vec<String> = meta
-        .agents
-        .iter()
-        .map(|a| {
-            let marker = if host == Some(a.db_id.as_str()) {
-                " *host*"
-            } else {
-                ""
-            };
-            format!("  {}{} ({})", a.display_name, marker, a.db_id)
-        })
-        .collect();
-    CommandOutcome::Text(format!("Agents on this session:\n{}", lines.join("\n")))
-}
-
-// -----------------------------------------------------------------------------
-// Heartbeat rules (Living Agents Stage 4b)
-// -----------------------------------------------------------------------------
-
-async fn heartbeat_add(
-    id: &str,
-    cron: &str,
-    agent_ref: &str,
-    task: &str,
-    ctx: &CommandContext<'_>,
-) -> CommandOutcome {
-    use cron::Schedule;
-    use std::str::FromStr;
-
-    if let Err(e) = Schedule::from_str(cron) {
-        return CommandOutcome::Error(format!("Invalid cron '{cron}': {e}"));
-    }
-    let entry = match resolve_agent_ref(agent_ref, ctx).await {
-        Ok(e) => e,
-        Err(msg) => return CommandOutcome::Error(msg),
-    };
-    let rule = crate::heartbeat::HeartbeatRule {
-        id: id.to_string(),
-        name: id.to_string(),
-        cron: cron.to_string(),
-        task: task.to_string(),
-        target_agent_db_id: entry.db_id.to_string(),
-        enabled: true,
-    };
-    match crate::heartbeat::upsert_rule(ctx.session_db, rule).await {
-        Ok(()) => CommandOutcome::Text(format!(
-            "Heartbeat rule '{id}' set: cron='{cron}' → {} — {task}",
-            entry.display_name
-        )),
-        Err(e) => CommandOutcome::Error(format!("Failed to save rule: {e}")),
-    }
-}
-
-async fn heartbeat_remove(id: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    match crate::heartbeat::remove_rule(ctx.session_db, id).await {
-        Ok(true) => CommandOutcome::Text(format!("Removed heartbeat rule '{id}'")),
-        Ok(false) => CommandOutcome::Error(format!("No heartbeat rule with id '{id}'")),
-        Err(e) => CommandOutcome::Error(format!("Failed to remove rule: {e}")),
-    }
-}
-
-async fn heartbeat_list(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let rules = match crate::heartbeat::list_rules(ctx.session_db).await {
-        Ok(r) => r,
-        Err(e) => return CommandOutcome::Error(format!("Failed to list rules: {e}")),
-    };
-    if rules.is_empty() {
-        return CommandOutcome::Text("No heartbeat rules on this session".to_string());
-    }
-    let lines: Vec<String> = rules
-        .iter()
-        .map(|r| {
-            let state = if r.enabled { "" } else { " (disabled)" };
-            format!(
-                "  {} [{}]{state} → {} — {}",
-                r.id, r.cron, r.target_agent_db_id, r.task
-            )
-        })
-        .collect();
-    CommandOutcome::Text(format!("Heartbeat rules:\n{}", lines.join("\n")))
-}
-
-async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = Session::new(
-        ConversationId(ctx.session_db_id.to_string()),
-        ctx.session_db.clone(),
-    )
-    .await;
-
-    match arg {
-        None => {
-            if let Err(e) = session.update_meta(|m| m.host_agent_db_id = None).await {
-                return CommandOutcome::Error(format!("Failed to clear host agent: {e}"));
-            }
-            CommandOutcome::Text("Cleared host agent for this session".to_string())
-        }
-        Some(agent_ref) => {
-            let entry = match resolve_agent_ref(agent_ref, ctx).await {
-                Ok(e) => e,
-                Err(msg) => return CommandOutcome::Error(msg),
-            };
-
-            // Host must be attached — catch the "set host on un-attached agent" footgun.
-            let meta = crate::session::read_meta_from_db(ctx.session_db).await;
-            let db_id = entry.db_id.to_string();
-            if !meta.agents.iter().any(|a| a.db_id == db_id) {
-                return CommandOutcome::Error(format!(
-                    "Agent '{}' is not attached to this session. Attach it first with /agent add {}",
-                    entry.display_name, agent_ref
-                ));
-            }
-
-            let name = entry.display_name.clone();
-            if let Err(e) = session
-                .update_meta(move |m| m.host_agent_db_id = Some(db_id))
-                .await
-            {
-                return CommandOutcome::Error(format!("Failed to set host agent: {e}"));
-            }
-            CommandOutcome::Text(format!("Set host agent to '{name}'"))
-        }
-    }
 }
