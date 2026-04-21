@@ -253,3 +253,230 @@ impl BackendManager {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Backend, BackendType, Model};
+    use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
+
+    async fn empty_secrets() -> SecretStore {
+        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
+        let _ = instance.create_user("t", None).await;
+        let mut user = instance.login_user("t", None).await.unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut s = eidetica::crdt::Doc::new();
+        s.set("name", "central");
+        let db = user.create_database(s, &key).await.unwrap();
+        SecretStore::new(db).await
+    }
+
+    fn backend(name: &str, models: &[&str]) -> Backend {
+        let mut b = Backend::new(BackendType::OpenAICompatible);
+        b.name = Some(name.to_string());
+        b.models = Some(
+            models
+                .iter()
+                .map(|m| Model {
+                    name: m.to_string(),
+                })
+                .collect(),
+        );
+        b
+    }
+
+    // ================================================================
+    // Message
+    // ================================================================
+
+    #[test]
+    fn message_display_formats_role_uppercase() {
+        let m = Message::new(MessageRole::user, "hello");
+        assert_eq!(m.to_string(), "USER: hello");
+        let m = Message::new(MessageRole::assistant, "hi");
+        assert_eq!(m.to_string(), "ASSISTANT: hi");
+        let m = Message::new(MessageRole::system, "ok");
+        assert_eq!(m.to_string(), "SYSTEM: ok");
+    }
+
+    // ================================================================
+    // ChatContext::string_prompt
+    // ================================================================
+
+    #[test]
+    fn string_prompt_concatenates_with_trailing_assistant() {
+        let ctx = ChatContext {
+            messages: vec![
+                Message::new(MessageRole::system, "be helpful"),
+                Message::new(MessageRole::user, "hi"),
+            ],
+            model: None,
+            role: None,
+        };
+        let out = ctx.string_prompt();
+        assert!(out.starts_with("SYSTEM: be helpful"));
+        assert!(out.contains("\nUSER: hi\n"));
+        assert!(out.ends_with("ASSISTANT: "));
+    }
+
+    // ================================================================
+    // BackendManager construction + listing
+    // ================================================================
+
+    #[tokio::test]
+    async fn empty_backend_manager_reports_nothing() {
+        let secrets = empty_secrets().await;
+        let mgr = BackendManager::new(&None, secrets);
+        assert!(mgr.list_known_backends().is_empty());
+        assert!(mgr.list_known_models().is_empty());
+        assert!(mgr.default_model().is_none());
+        assert!(!mgr.is_known_model("gpt-4"));
+    }
+
+    #[tokio::test]
+    async fn single_backend_lists_unprefixed_models() {
+        let secrets = empty_secrets().await;
+        let backends = Some(vec![backend("openai", &["gpt-4", "gpt-3.5"])]);
+        let mgr = BackendManager::new(&backends, secrets);
+        assert_eq!(mgr.list_known_backends(), vec!["openai"]);
+        // Single backend: no prefix on models.
+        let models = mgr.list_known_models();
+        assert!(models.contains(&"gpt-4".to_string()));
+        assert!(models.contains(&"gpt-3.5".to_string()));
+        assert!(mgr.is_known_model("gpt-4"));
+    }
+
+    #[tokio::test]
+    async fn multi_backend_prefixes_models() {
+        let secrets = empty_secrets().await;
+        let backends = Some(vec![
+            backend("openai", &["gpt-4"]),
+            backend("anthropic", &["claude-3"]),
+        ]);
+        let mgr = BackendManager::new(&backends, secrets);
+        let models = mgr.list_known_models();
+        assert!(models.contains(&"openai:gpt-4".to_string()));
+        assert!(models.contains(&"anthropic:claude-3".to_string()));
+        // Raw model name without prefix is NOT known in multi-backend mode.
+        assert!(!mgr.is_known_model("gpt-4"));
+        assert!(mgr.is_known_model("openai:gpt-4"));
+    }
+
+    // ================================================================
+    // validate_model
+    // ================================================================
+
+    #[tokio::test]
+    async fn validate_model_accepts_known_single_backend() {
+        let secrets = empty_secrets().await;
+        let backends = Some(vec![backend("openai", &["gpt-4"])]);
+        let mgr = BackendManager::new(&backends, secrets);
+        assert!(mgr.validate_model("gpt-4").is_ok());
+        // Single backend is permissive: unknown model names pass too.
+        assert!(mgr.validate_model("mystery-model").is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_model_requires_prefix_when_multi() {
+        let secrets = empty_secrets().await;
+        let backends = Some(vec![
+            backend("openai", &["gpt-4"]),
+            backend("anthropic", &["claude-3"]),
+        ]);
+        let mgr = BackendManager::new(&backends, secrets);
+        // Known prefixed model passes.
+        assert!(mgr.validate_model("openai:gpt-4").is_ok());
+        // Unknown-but-prefixed passes (allows caller to use new models).
+        assert!(mgr.validate_model("openai:new-model").is_ok());
+        // Unprefixed unknown model fails.
+        assert!(mgr.validate_model("random-model").is_err());
+    }
+
+    // ================================================================
+    // resolve_model_name
+    // ================================================================
+
+    #[tokio::test]
+    async fn resolve_model_name_strips_backend_prefix() {
+        let secrets = empty_secrets().await;
+        let backends = Some(vec![
+            backend("openai", &["gpt-4"]),
+            backend("anthropic", &["claude-3"]),
+        ]);
+        let mgr = BackendManager::new(&backends, secrets);
+        assert_eq!(mgr.resolve_model_name(Some("anthropic:claude-3")), "claude-3");
+        assert_eq!(mgr.resolve_model_name(Some("openai:gpt-4")), "gpt-4");
+    }
+
+    #[tokio::test]
+    async fn resolve_model_name_falls_back_to_default() {
+        let secrets = empty_secrets().await;
+        let backends = Some(vec![backend("openai", &["gpt-4", "gpt-3.5"])]);
+        let mgr = BackendManager::new(&backends, secrets);
+        // None → default model of the first backend.
+        let default = mgr.resolve_model_name(None);
+        assert!(!default.is_empty(), "expected a default, got empty");
+    }
+
+    #[tokio::test]
+    async fn resolve_model_name_empty_when_no_backends() {
+        let secrets = empty_secrets().await;
+        let mgr = BackendManager::new(&None, secrets);
+        assert_eq!(mgr.resolve_model_name(Some("any-model")), "");
+    }
+
+    // ================================================================
+    // max_retries_for_model
+    // ================================================================
+
+    #[tokio::test]
+    async fn max_retries_uses_backend_config() {
+        let secrets = empty_secrets().await;
+        let mut b = backend("openai", &["gpt-4"]);
+        b.max_retries = Some(7);
+        let backends = Some(vec![b]);
+        let mgr = BackendManager::new(&backends, secrets);
+        assert_eq!(mgr.max_retries_for_model(Some("gpt-4")), 7);
+    }
+
+    #[tokio::test]
+    async fn max_retries_default_when_no_backends() {
+        let secrets = empty_secrets().await;
+        let mgr = BackendManager::new(&None, secrets);
+        // Falls back to 3 even without a backend so the runtime retry loop
+        // stays well-defined.
+        assert_eq!(mgr.max_retries_for_model(None), 3);
+    }
+
+    // ================================================================
+    // execute / chat_with_tools_for_model without backends
+    // ================================================================
+
+    #[tokio::test]
+    async fn execute_without_backends_is_configuration_error() {
+        let secrets = empty_secrets().await;
+        let mgr = BackendManager::new(&None, secrets);
+        let ctx = ChatContext {
+            messages: vec![Message::new(MessageRole::user, "hi")],
+            model: None,
+            role: None,
+        };
+        let err = mgr.execute(&ctx).await.unwrap_err();
+        assert!(matches!(err, LlmError::Configuration { .. }));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_without_backends_is_configuration_error() {
+        let secrets = empty_secrets().await;
+        let mgr = BackendManager::new(&None, secrets);
+        let result = mgr
+            .chat_with_tools_for_model(Some("any"), &[], &[], "any")
+            .await;
+        match result {
+            Err(LlmError::Configuration { .. }) => {}
+            Err(other) => panic!("expected Configuration, got {other}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+}
