@@ -177,7 +177,13 @@ async fn llm_call_with_retry(
             Err(e) => return Err(e),
         }
     }
-    Err(last_error.unwrap())
+    // Unreachable: the for-loop's final iteration (attempt == max_retries)
+    // either returns Ok or falls into the non-retryable match arm which also
+    // returns. Kept as a defensive fallback; surfaces the last retryable
+    // error rather than panicking if the invariant is ever broken.
+    Err(last_error.unwrap_or(LlmError::Configuration {
+        message: "llm_call_with_retry reached end of loop with no stored error".into(),
+    }))
 }
 
 /// Run the agent runtime for a single turn.

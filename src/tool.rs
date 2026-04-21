@@ -112,6 +112,14 @@ impl RateLimiter {
     /// Check if a tool call is allowed under its rate limit.
     /// Returns Ok(()) if allowed, Err(message) if rate limited.
     pub fn check(&mut self, tool_name: &str, limit: u32) -> Result<(), String> {
+        // A limit of 0 means the tool is disabled outright — block without
+        // touching `timestamps` (which may be empty and would panic on `.first()`).
+        if limit == 0 {
+            return Err(format!(
+                "Rate limited: {tool_name} has rate_limit=0 (disabled)."
+            ));
+        }
+
         let now = std::time::Instant::now();
         let window = Duration::from_secs(60);
 
@@ -121,7 +129,8 @@ impl RateLimiter {
         timestamps.retain(|t| now.duration_since(*t) < window);
 
         if timestamps.len() >= limit as usize {
-            let oldest = timestamps.first().unwrap();
+            // Safe: we guarded limit > 0 above, and len >= limit implies len >= 1.
+            let oldest = timestamps.first().expect("non-empty per limit > 0 guard");
             let retry_after = window.saturating_sub(now.duration_since(*oldest));
             return Err(format!(
                 "Rate limited: {} exceeded {limit} calls/minute. Retry in {}s.",
@@ -650,5 +659,14 @@ mod tests {
         assert!(rl.check("shell", 1).is_err());
         // Different tool has its own counter
         assert!(rl.check("web_fetch", 1).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_limit_blocks_without_panic() {
+        // Regression: limit=0 previously called timestamps.first().unwrap() on
+        // an empty vec and panicked. Should return an error cleanly.
+        let mut rl = RateLimiter::new();
+        let err = rl.check("shell", 0).unwrap_err();
+        assert!(err.contains("disabled"), "unexpected error: {err}");
     }
 }
