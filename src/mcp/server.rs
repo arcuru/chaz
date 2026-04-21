@@ -1,171 +1,25 @@
+//! `McpServer` — manages one MCP server connection, its tool metadata,
+//! and the `McpTool` wrapper that exposes each discovered tool as a
+//! `Tool` trait impl.
+
 use crate::config::McpServerConfig;
-use crate::security::SecretStore;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
+
+use super::transport::Transport;
 
 /// Maximum tool output size (100 KB).
 const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 
 /// MCP protocol version we advertise.
 const PROTOCOL_VERSION: &str = "2025-03-26";
-
-/// Maximum restart attempts before giving up (stdio transport).
-const MAX_RESTART_ATTEMPTS: u8 = 5;
-
-/// Base backoff delay in milliseconds (doubles each attempt: 1s, 2s, 4s, 8s, 16s).
-const BASE_BACKOFF_MS: u64 = 1000;
-
-// ============================================================================
-// Transport layer
-// ============================================================================
-
-/// Transport for communicating with an MCP server.
-///
-/// Two variants:
-/// - **Stdio**: subprocess with JSON-RPC over stdin/stdout (original)
-/// - **Http**: Streamable HTTP transport (POST requests, JSON or SSE responses)
-enum Transport {
-    Stdio {
-        stdin: Mutex<ChildStdin>,
-        stdout: Mutex<BufReader<ChildStdout>>,
-        _child: Box<Mutex<Child>>,
-        config: Box<McpServerConfig>,
-        restart_attempts: AtomicU8,
-    },
-    Http {
-        url: String,
-        client: reqwest::Client,
-        /// MCP session ID returned by the server (tracked across requests).
-        session_id: Mutex<Option<String>>,
-    },
-}
-
-impl Transport {
-    /// Create a stdio transport by spawning a subprocess.
-    fn new_stdio(config: &McpServerConfig) -> Result<Self, String> {
-        let (child, stdin, stdout) = Self::spawn_process(config)?;
-        Ok(Transport::Stdio {
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
-            _child: Box::new(Mutex::new(child)),
-            config: Box::new(config.clone()),
-            restart_attempts: AtomicU8::new(0),
-        })
-    }
-
-    /// Create an HTTP transport targeting the given URL.
-    fn new_http(url: &str) -> Self {
-        Transport::Http {
-            url: url.to_string(),
-            client: reqwest::Client::new(),
-            session_id: Mutex::new(None),
-        }
-    }
-
-    /// Spawn a subprocess for stdio transport.
-    fn spawn_process(config: &McpServerConfig) -> Result<(Child, ChildStdin, ChildStdout), String> {
-        let mut cmd = tokio::process::Command::new(&config.command);
-        if let Some(args) = &config.args {
-            let resolved: Vec<String> = args
-                .iter()
-                .map(|a| SecretStore::resolve_env(a).unwrap_or_else(|_| a.clone()))
-                .collect();
-            cmd.args(&resolved);
-        }
-        if let Some(env) = &config.env {
-            for (k, v) in env {
-                let resolved = SecretStore::resolve_env(v).unwrap_or_else(|_| v.clone());
-                cmd.env(k, resolved);
-            }
-        }
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn MCP server '{}': {e}", config.name))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("No stdin for MCP server '{}'", config.name))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("No stdout for MCP server '{}'", config.name))?;
-
-        Ok((child, stdin, stdout))
-    }
-
-    /// Check if an error indicates the subprocess has died (stdio only).
-    fn is_process_dead_error(&self, error: &str) -> bool {
-        matches!(self, Transport::Stdio { .. })
-            && (error.contains("closed stdout")
-                || error.contains("write error")
-                || error.contains("read error")
-                || error.contains("Broken pipe"))
-    }
-
-    /// Attempt to restart the subprocess (stdio only). No-op for HTTP.
-    async fn restart(&self, name: &str) -> Result<(), String> {
-        match self {
-            Transport::Stdio {
-                stdin,
-                stdout,
-                _child,
-                config,
-                restart_attempts,
-            } => {
-                let attempt = restart_attempts.fetch_add(1, Ordering::Relaxed);
-                if attempt >= MAX_RESTART_ATTEMPTS {
-                    return Err(format!(
-                        "MCP server '{name}' exceeded max restart attempts ({MAX_RESTART_ATTEMPTS})"
-                    ));
-                }
-
-                let backoff_ms = BASE_BACKOFF_MS * (1u64 << attempt.min(5));
-                warn!(
-                    "MCP server '{name}' restarting (attempt {}/{MAX_RESTART_ATTEMPTS}, backoff {backoff_ms}ms)",
-                    attempt + 1
-                );
-                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-
-                let (child, new_stdin, new_stdout) = Self::spawn_process(config)?;
-                *_child.lock().await = child;
-                *stdin.lock().await = new_stdin;
-                *stdout.lock().await = BufReader::new(new_stdout);
-
-                Ok(())
-            }
-            Transport::Http { .. } => Ok(()), // HTTP doesn't need restart
-        }
-    }
-
-    /// Reset restart counter (stdio only). Called on successful request.
-    fn reset_restart_counter(&self) {
-        if let Transport::Stdio {
-            restart_attempts, ..
-        } = self
-        {
-            restart_attempts.store(0, Ordering::Relaxed);
-        }
-    }
-}
-
-// ============================================================================
-// McpServer — transport-agnostic MCP server manager
-// ============================================================================
 
 /// Manages a single MCP server connection and its tool metadata.
 ///
@@ -178,7 +32,7 @@ pub struct McpServer {
     /// Set when the server sends `notifications/tools/list_changed`.
     tools_changed: AtomicBool,
     /// Shared metadata for each tool, keyed by raw tool name.
-    tool_metadata: RwLock<HashMap<String, McpToolMetadata>>,
+    pub(super) tool_metadata: RwLock<HashMap<String, McpToolMetadata>>,
 }
 
 impl McpServer {
@@ -240,7 +94,7 @@ impl McpServer {
     }
 
     /// Discover tools from the MCP server.
-    async fn list_tools(&self) -> Result<Vec<McpToolInfo>, String> {
+    pub(super) async fn list_tools(&self) -> Result<Vec<McpToolInfo>, String> {
         let result = self.send_request("tools/list", json!({})).await?;
 
         let tools_array = result
@@ -402,20 +256,9 @@ impl McpServer {
             "method": method,
             "params": params
         });
-
-        match &self.transport {
-            Transport::Stdio { stdin, stdout, .. } => {
-                self.send_request_stdio(stdin, stdout, &request, id).await
-            }
-            Transport::Http {
-                url,
-                client,
-                session_id,
-            } => {
-                self.send_request_http(url, client, session_id, &request)
-                    .await
-            }
-        }
+        self.transport
+            .send_request(&self.name, &request, id, &self.tools_changed)
+            .await
     }
 
     /// Send a JSON-RPC notification (no response expected).
@@ -425,324 +268,25 @@ impl McpServer {
             "method": method,
             "params": params
         });
-
-        match &self.transport {
-            Transport::Stdio { stdin, .. } => {
-                let mut stdin = stdin.lock().await;
-                let notif_str = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
-                debug!("MCP '{}' → {notif_str}", self.name);
-                stdin
-                    .write_all(notif_str.as_bytes())
-                    .await
-                    .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
-                stdin
-                    .write_all(b"\n")
-                    .await
-                    .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
-                stdin
-                    .flush()
-                    .await
-                    .map_err(|e| format!("MCP '{}' flush error: {e}", self.name))?;
-                Ok(())
-            }
-            Transport::Http {
-                url,
-                client,
-                session_id,
-            } => {
-                let notif_str = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
-                debug!("MCP '{}' → {notif_str}", self.name);
-
-                let mut req = client
-                    .post(url)
-                    .header("Content-Type", "application/json")
-                    .body(notif_str);
-
-                if let Some(sid) = session_id.lock().await.as_ref() {
-                    req = req.header("Mcp-Session-Id", sid);
-                }
-
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| format!("MCP '{}' HTTP error: {e}", self.name))?;
-
-                if !resp.status().is_success() {
-                    warn!(
-                        "MCP '{}' notification HTTP {}: {}",
-                        self.name,
-                        resp.status(),
-                        resp.text().await.unwrap_or_default()
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
-
-    // === Stdio transport implementation ===
-
-    async fn send_request_stdio(
-        &self,
-        stdin: &Mutex<ChildStdin>,
-        stdout: &Mutex<BufReader<ChildStdout>>,
-        request: &Value,
-        id: u64,
-    ) -> Result<Value, String> {
-        let mut stdin = stdin.lock().await;
-        let mut stdout = stdout.lock().await;
-
-        let request_str = serde_json::to_string(request).map_err(|e| e.to_string())?;
-        debug!("MCP '{}' → {request_str}", self.name);
-        stdin
-            .write_all(request_str.as_bytes())
+        self.transport
+            .send_notification(&self.name, &notification)
             .await
-            .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("MCP '{}' write error: {e}", self.name))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("MCP '{}' flush error: {e}", self.name))?;
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes_read = stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| format!("MCP '{}' read error: {e}", self.name))?;
-
-            if bytes_read == 0 {
-                return Err(format!("MCP server '{}' closed stdout", self.name));
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let parsed: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("MCP '{}' non-JSON line: {e}", self.name);
-                    continue;
-                }
-            };
-
-            debug!("MCP '{}' ← {trimmed}", self.name);
-
-            // Handle notifications (no id field)
-            let resp_id = match parsed.get("id") {
-                Some(id_val) => id_val.as_u64(),
-                None => {
-                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                    if method == "notifications/tools/list_changed" {
-                        info!("MCP '{}' signaled tools/list_changed", self.name);
-                        self.tools_changed.store(true, Ordering::Relaxed);
-                    } else {
-                        debug!("MCP '{}' notification: {trimmed}", self.name);
-                    }
-                    continue;
-                }
-            };
-
-            if resp_id == Some(id) {
-                if let Some(err) = parsed.get("error") {
-                    let msg = err
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown error");
-                    return Err(format!("MCP '{}' error: {msg}", self.name));
-                }
-                return parsed
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| format!("MCP '{}': response missing result", self.name));
-            }
-
-            warn!(
-                "MCP '{}' unexpected response id {:?} (expected {id})",
-                self.name, resp_id
-            );
-        }
-    }
-
-    // === HTTP transport implementation ===
-
-    async fn send_request_http(
-        &self,
-        url: &str,
-        client: &reqwest::Client,
-        session_id: &Mutex<Option<String>>,
-        request: &Value,
-    ) -> Result<Value, String> {
-        let request_str = serde_json::to_string(request).map_err(|e| e.to_string())?;
-        debug!("MCP '{}' → {request_str}", self.name);
-
-        let mut req = client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
-
-        if let Some(sid) = session_id.lock().await.as_ref() {
-            req = req.header("Mcp-Session-Id", sid);
-        }
-
-        let resp = req
-            .body(request_str)
-            .send()
-            .await
-            .map_err(|e| format!("MCP '{}' HTTP error: {e}", self.name))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("MCP '{}' HTTP {status}: {body}", self.name));
-        }
-
-        // Track session ID from response headers
-        if let Some(sid) = resp.headers().get("mcp-session-id") {
-            if let Ok(sid_str) = sid.to_str() {
-                *session_id.lock().await = Some(sid_str.to_string());
-            }
-        }
-
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        if content_type.contains("text/event-stream") {
-            // SSE response: parse events until we find our JSON-RPC response
-            self.parse_sse_response(resp).await
-        } else {
-            // Direct JSON response
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| format!("MCP '{}' HTTP body error: {e}", self.name))?;
-            debug!("MCP '{}' ← {body}", self.name);
-            parse_jsonrpc_response(&self.name, &body)
-        }
-    }
-
-    /// Parse an SSE response stream for the JSON-RPC result.
-    async fn parse_sse_response(&self, resp: reqwest::Response) -> Result<Value, String> {
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("MCP '{}' SSE read error: {e}", self.name))?;
-
-        parse_sse_body(&self.name, &body, &self.tools_changed)
     }
 }
-
-// ============================================================================
-// SSE parsing (extracted for testability)
-// ============================================================================
-
-/// Parse an SSE body for a JSON-RPC response.
-///
-/// Handles both `data: {...}` (with space) and `data:{...}` (without space)
-/// formats. Processes notifications inline, setting `tools_changed` flag
-/// when `notifications/tools/list_changed` is encountered. Returns the
-/// first JSON-RPC result found, or an error.
-fn parse_sse_body(
-    server_name: &str,
-    body: &str,
-    tools_changed: &AtomicBool,
-) -> Result<Value, String> {
-    for line in body.lines() {
-        // SSE spec: "data:" followed by optional space, then the value
-        let data = if let Some(d) = line.strip_prefix("data: ") {
-            d.trim()
-        } else if let Some(d) = line.strip_prefix("data:") {
-            d.trim()
-        } else {
-            continue;
-        };
-
-        if data.is_empty() {
-            continue;
-        }
-
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        debug!("MCP '{server_name}' ← (SSE) {data}");
-
-        // Check if this is a notification (no "id" field)
-        if parsed.get("id").is_none() {
-            let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            if method == "notifications/tools/list_changed" {
-                info!("MCP '{server_name}' signaled tools/list_changed");
-                tools_changed.store(true, Ordering::Relaxed);
-            }
-            continue;
-        }
-
-        // This is a response — check for error first
-        if let Some(err) = parsed.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
-            return Err(format!("MCP '{server_name}' error: {msg}"));
-        }
-
-        if let Some(result) = parsed.get("result").cloned() {
-            return Ok(result);
-        }
-    }
-
-    Err(format!(
-        "MCP '{server_name}': no JSON-RPC response in SSE stream"
-    ))
-}
-
-/// Parse a JSON-RPC response body, extracting the result or error.
-fn parse_jsonrpc_response(server_name: &str, body: &str) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_str(body)
-        .map_err(|e| format!("MCP '{server_name}' invalid JSON response: {e}"))?;
-
-    if let Some(err) = parsed.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("MCP '{server_name}' error: {msg}"));
-    }
-
-    parsed
-        .get("result")
-        .cloned()
-        .ok_or_else(|| format!("MCP '{server_name}': response missing result"))
-}
-
-// ============================================================================
-// Tool types
-// ============================================================================
 
 /// Metadata for a single tool discovered from an MCP server.
-struct McpToolInfo {
-    name: String,
-    description: String,
-    input_schema: Value,
+pub(super) struct McpToolInfo {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) input_schema: Value,
 }
 
 /// Shared, updatable metadata for a tool. Read by McpTool::descriptor(),
 /// written by McpServer::refresh_tools().
 #[derive(Clone, Debug)]
-struct McpToolMetadata {
-    description: String,
-    input_schema: Value,
+pub(super) struct McpToolMetadata {
+    pub(super) description: String,
+    pub(super) input_schema: Value,
 }
 
 /// Wraps a single MCP tool as a `Tool` trait implementation.
@@ -750,9 +294,9 @@ struct McpToolMetadata {
 /// Description and schema are read from the server's shared metadata map,
 /// so they update automatically when the server re-discovers tools.
 pub struct McpTool {
-    server: Arc<McpServer>,
-    raw_name: String,
-    namespaced_name: String,
+    pub(super) server: Arc<McpServer>,
+    pub(super) raw_name: String,
+    pub(super) namespaced_name: String,
 }
 
 impl Tool for McpTool {
@@ -792,124 +336,8 @@ impl Tool for McpTool {
     }
 }
 
-// ============================================================================
-// Directory scanning & startup
-// ============================================================================
-
-/// Load MCP server configs from a directory.
-///
-/// Scans for `.yaml`, `.yml`, and `.json` files. Each file should contain a single
-/// `McpServerConfig`. Invalid files are logged and skipped.
-pub fn load_server_configs_from_dir(dir: &std::path::Path) -> Vec<McpServerConfig> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            error!(
-                "Failed to read MCP server directory '{}': {e}",
-                dir.display()
-            );
-            return Vec::new();
-        }
-    };
-
-    let mut configs = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext, "yaml" | "yml" | "json") {
-            continue;
-        }
-
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read MCP manifest '{}': {e}", path.display());
-                continue;
-            }
-        };
-
-        let config: Result<McpServerConfig, String> = match ext {
-            "json" => serde_json::from_str(&contents).map_err(|e| e.to_string()),
-            _ => serde_yaml::from_str(&contents).map_err(|e| e.to_string()),
-        };
-
-        match config {
-            Ok(cfg) => {
-                info!(
-                    "Loaded MCP server manifest '{}' from {}",
-                    cfg.name,
-                    path.display()
-                );
-                configs.push(cfg);
-            }
-            Err(e) => {
-                warn!("Failed to parse MCP manifest '{}': {e}", path.display());
-            }
-        }
-    }
-
-    configs
-}
-
-/// Start all configured MCP servers and return their tools.
-///
-/// Failed servers are logged and skipped — they don't block startup.
-pub async fn start_mcp_servers(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
-    let mut all_tools: Vec<Box<dyn Tool>> = Vec::new();
-    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for config in configs {
-        match start_one_server(config).await {
-            Ok((server, tool_infos)) => {
-                // Populate the server's shared metadata map
-                {
-                    let mut metadata = server.tool_metadata.write().unwrap();
-                    for info in &tool_infos {
-                        metadata.insert(
-                            info.name.clone(),
-                            McpToolMetadata {
-                                description: info.description.clone(),
-                                input_schema: info.input_schema.clone(),
-                            },
-                        );
-                    }
-                }
-                let server = Arc::new(server);
-                let count = tool_infos.len();
-                for info in tool_infos {
-                    let namespaced = format!("{}.{}", config.name, info.name);
-                    if !seen_names.insert(namespaced.clone()) {
-                        warn!("MCP tool name collision: '{namespaced}' — skipping duplicate");
-                        continue;
-                    }
-                    all_tools.push(Box::new(McpTool {
-                        server: server.clone(),
-                        raw_name: info.name,
-                        namespaced_name: namespaced,
-                    }));
-                }
-                info!("MCP server '{}': registered {count} tool(s)", config.name);
-            }
-            Err(e) => {
-                error!("MCP server '{}' failed to start: {e}", config.name);
-            }
-        }
-    }
-
-    all_tools
-}
-
-async fn start_one_server(
-    config: &McpServerConfig,
-) -> Result<(McpServer, Vec<McpToolInfo>), String> {
-    let server = McpServer::start(config).await?;
-    let tools = server.list_tools().await?;
-    Ok((server, tools))
-}
-
 /// Extract concatenated text from MCP content array.
-fn extract_text_content(result: &Value) -> String {
+pub(super) fn extract_text_content(result: &Value) -> String {
     let Some(content) = result.get("content").and_then(|c| c.as_array()) else {
         return String::new();
     };
@@ -998,172 +426,6 @@ mod tests {
     }
 
     // ================================================================
-    // parse_jsonrpc_response
-    // ================================================================
-
-    #[test]
-    fn test_jsonrpc_response_success() {
-        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let result = parse_jsonrpc_response("test", body).unwrap();
-        assert_eq!(result, json!({"tools": []}));
-    }
-
-    #[test]
-    fn test_jsonrpc_response_error() {
-        let body =
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
-        let err = parse_jsonrpc_response("test", body).unwrap_err();
-        assert!(err.contains("Invalid Request"));
-    }
-
-    #[test]
-    fn test_jsonrpc_response_error_missing_message() {
-        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600}}"#;
-        let err = parse_jsonrpc_response("test", body).unwrap_err();
-        assert!(err.contains("unknown error"));
-    }
-
-    #[test]
-    fn test_jsonrpc_response_missing_result() {
-        // Has id but neither result nor error — malformed
-        let body = r#"{"jsonrpc":"2.0","id":1}"#;
-        let err = parse_jsonrpc_response("test", body).unwrap_err();
-        assert!(err.contains("response missing result"));
-    }
-
-    #[test]
-    fn test_jsonrpc_response_invalid_json() {
-        let err = parse_jsonrpc_response("test", "not json at all").unwrap_err();
-        assert!(err.contains("invalid JSON"));
-    }
-
-    #[test]
-    fn test_jsonrpc_response_null_result() {
-        // result is explicitly null — valid JSON-RPC
-        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
-        let result = parse_jsonrpc_response("test", body).unwrap();
-        assert_eq!(result, Value::Null);
-    }
-
-    // ================================================================
-    // parse_sse_body
-    // ================================================================
-
-    #[test]
-    fn test_sse_basic_response() {
-        let flag = AtomicBool::new(false);
-        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"value\":42}}\n\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!({"value": 42}));
-        assert!(!flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_sse_no_space_after_data_colon() {
-        // Some SSE implementations omit the space
-        let flag = AtomicBool::new(false);
-        let body = "data:{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!({"ok": true}));
-    }
-
-    #[test]
-    fn test_sse_error_response() {
-        let flag = AtomicBool::new(false);
-        let body =
-            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"boom\"}}\n\n";
-        let err = parse_sse_body("test", body, &flag).unwrap_err();
-        assert!(err.contains("boom"));
-    }
-
-    #[test]
-    fn test_sse_notification_before_response() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
-\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\
-\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!({"tools": []}));
-        // The notification should have set the flag
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_sse_only_notifications_no_response() {
-        let flag = AtomicBool::new(false);
-        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
-        let err = parse_sse_body("test", body, &flag).unwrap_err();
-        assert!(err.contains("no JSON-RPC response"));
-    }
-
-    #[test]
-    fn test_sse_empty_body() {
-        let flag = AtomicBool::new(false);
-        let err = parse_sse_body("test", "", &flag).unwrap_err();
-        assert!(err.contains("no JSON-RPC response"));
-    }
-
-    #[test]
-    fn test_sse_non_data_lines_ignored() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-event: message\n\
-id: 1\n\
-retry: 5000\n\
-: this is a comment\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n\
-\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!("ok"));
-    }
-
-    #[test]
-    fn test_sse_empty_data_line_skipped() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-data: \n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":true}\n\
-\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!(true));
-    }
-
-    #[test]
-    fn test_sse_invalid_json_data_skipped() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-data: not valid json\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"found it\"}\n\
-\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!("found it"));
-    }
-
-    #[test]
-    fn test_sse_response_with_id_null() {
-        // id: null is present (not absent), so it shouldn't be treated as notification
-        let flag = AtomicBool::new(false);
-        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"result\":\"null-id\"}\n\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!("null-id"));
-    }
-
-    #[test]
-    fn test_sse_multiple_notifications_set_flag_once() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
-data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}\n\
-\n";
-        let result = parse_sse_body("test", body, &flag).unwrap();
-        assert_eq!(result, json!("done"));
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    // ================================================================
     // Tool metadata & McpTool::descriptor()
     // ================================================================
 
@@ -1196,7 +458,6 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}\n\
             raw_name: "my_tool".to_string(),
             namespaced_name: "srv.my_tool".to_string(),
         };
-
         let desc = tool.descriptor();
         assert_eq!(desc.name, "srv.my_tool");
         assert_eq!(desc.description, "Does things");
@@ -1293,190 +554,10 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}\n\
         assert_eq!(policy.rate_limit, Some(5));
     }
 
-    // ================================================================
-    // tools_changed flag
-    // ================================================================
-
     #[test]
     fn test_tools_changed_flag_default_false() {
         let server = make_test_server("srv");
         assert!(!server.tools_changed.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_tools_changed_flag_set_by_sse_notification() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n";
-        let _ = parse_sse_body("test", body, &flag);
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_tools_changed_flag_not_set_by_other_notifications() {
-        let flag = AtomicBool::new(false);
-        let body = "\
-data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50}}\n\
-data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n";
-        let _ = parse_sse_body("test", body, &flag);
-        assert!(!flag.load(Ordering::Relaxed));
-    }
-
-    // ================================================================
-    // Transport::is_process_dead_error
-    // ================================================================
-
-    #[test]
-    fn test_http_transport_never_detects_process_death() {
-        let transport = Transport::new_http("http://example.com");
-        assert!(!transport.is_process_dead_error("closed stdout"));
-        assert!(!transport.is_process_dead_error("write error"));
-        assert!(!transport.is_process_dead_error("Broken pipe"));
-    }
-
-    // ================================================================
-    // Config deserialization
-    // ================================================================
-
-    #[test]
-    fn test_config_stdio_transport() {
-        let yaml = "name: test\ncommand: echo\nargs: [\"hello\"]";
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.name, "test");
-        assert_eq!(config.command, "echo");
-        assert!(config.url.is_none());
-    }
-
-    #[test]
-    fn test_config_http_transport() {
-        let yaml = "name: remote\nurl: http://localhost:8080/mcp";
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.name, "remote");
-        assert_eq!(config.url.as_deref(), Some("http://localhost:8080/mcp"));
-        assert_eq!(config.command, ""); // default empty string
-    }
-
-    #[test]
-    fn test_config_with_url_and_command() {
-        // Both set — url takes precedence in McpServer::start
-        let yaml = "name: both\ncommand: echo\nurl: http://localhost/mcp";
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.url.is_some());
-        assert_eq!(config.command, "echo");
-    }
-
-    #[test]
-    fn test_config_with_default_policy() {
-        let yaml = r#"
-name: secure
-command: echo
-default_policy:
-  risk: high
-  approval: always
-  timeout: 10
-"#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
-        let policy = config.default_policy.unwrap();
-        assert_eq!(policy.risk, RiskLevel::High);
-        assert_eq!(policy.approval, ApprovalRequirement::Always);
-        assert_eq!(policy.timeout, 10);
-    }
-
-    #[test]
-    fn test_config_mcp_server_dir() {
-        let yaml = r#"
-homeserver_url: ""
-username: ""
-mcp_server_dir: "/etc/chaz/mcp.d"
-"#;
-        let config: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.mcp_server_dir.as_deref(), Some("/etc/chaz/mcp.d"));
-    }
-
-    // ================================================================
-    // Directory scanning
-    // ================================================================
-
-    fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("chaz-mcp-test-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn test_load_server_configs_from_dir_yaml() {
-        let dir = test_dir("yaml");
-        std::fs::write(
-            dir.join("test-server.yaml"),
-            "name: test-server\ncommand: echo\nargs: [\"hello\"]",
-        )
-        .unwrap();
-
-        let configs = load_server_configs_from_dir(&dir);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name, "test-server");
-        assert_eq!(configs[0].command, "echo");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_load_server_configs_from_dir_json() {
-        let dir = test_dir("json");
-        std::fs::write(
-            dir.join("test-server.json"),
-            r#"{"name": "json-server", "command": "cat", "args": ["-"]}"#,
-        )
-        .unwrap();
-
-        let configs = load_server_configs_from_dir(&dir);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name, "json-server");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_load_server_configs_skips_invalid() {
-        let dir = test_dir("invalid");
-        std::fs::write(dir.join("good.yaml"), "name: good\ncommand: echo").unwrap();
-        std::fs::write(dir.join("bad.yaml"), "not: [valid: mcp config").unwrap();
-        std::fs::write(dir.join("readme.txt"), "not a manifest").unwrap();
-
-        let configs = load_server_configs_from_dir(&dir);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name, "good");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_load_server_configs_nonexistent_dir() {
-        let configs = load_server_configs_from_dir(std::path::Path::new("/nonexistent/path"));
-        assert!(configs.is_empty());
-    }
-
-    #[test]
-    fn test_load_server_configs_yml_extension() {
-        let dir = test_dir("yml");
-        std::fs::write(dir.join("server.yml"), "name: yml-server\ncommand: cat").unwrap();
-        let configs = load_server_configs_from_dir(&dir);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name, "yml-server");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_load_server_configs_http_manifest() {
-        let dir = test_dir("http-manifest");
-        std::fs::write(
-            dir.join("remote.yaml"),
-            "name: remote\nurl: http://localhost:9090/mcp",
-        )
-        .unwrap();
-        let configs = load_server_configs_from_dir(&dir);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].url.as_deref(), Some("http://localhost:9090/mcp"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ================================================================
@@ -1488,11 +569,6 @@ mcp_server_dir: "/etc/chaz/mcp.d"
         // Sanity check — should be 100 KB
         assert_eq!(MAX_OUTPUT_BYTES, 100 * 1024);
     }
-
-    // ================================================================
-    // call_tool result parsing (exercised via extract_text_content
-    // + the isError / truncation logic inline)
-    // ================================================================
 
     #[test]
     fn test_call_tool_is_error_true_with_text() {
@@ -1864,10 +940,6 @@ mcp_server_dir: "/etc/chaz/mcp.d"
         assert_eq!(desc.parameters, json!({"type": "object", "properties": {}}));
     }
 
-    // ================================================================
-    // next_id monotonicity
-    // ================================================================
-
     #[test]
     fn test_next_id_increments() {
         let server = make_test_server("srv");
@@ -1880,7 +952,7 @@ mcp_server_dir: "/etc/chaz/mcp.d"
     }
 
     // ================================================================
-    // Subprocess integration test
+    // Subprocess integration tests
     // ================================================================
 
     /// Spawn a real subprocess that speaks minimal MCP JSON-RPC
