@@ -1,6 +1,7 @@
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
+use eidetica::entry::ID;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -10,15 +11,17 @@ use tracing::info;
 use crate::backends::BackendManager;
 use crate::security::SecurityContext;
 
-/// Spawn a new agent to handle a task in a child session.
+/// Delegate a task to a Living Agent in a new child session.
 ///
-/// Creates a new session via the server, writes a Directive entry,
-/// and waits for the server's callback-driven processing to run the
-/// agent and write the response. The response is then returned to the
-/// calling agent.
+/// Living Agents Stage 5: resolves `agent_ref` (display name or eidetica DB
+/// ID) via the agent index, creates a child session with parent→child
+/// delegation wired in (parent admins inherit admin on the child), attaches
+/// the agent's stable pubkey to the child session with Write(10), writes a
+/// Directive, and waits for the agent to respond.
 ///
-/// This routes through the same server processing loop as gateway messages,
-/// unifying all agent invocation paths.
+/// Use for delegating focused work to a persistent agent whose memory and
+/// config survive across runs. For one-shot, ephemeral work with no
+/// persistent identity, use `spawn_task`.
 pub struct SpawnAgent {
     pub server: Arc<OnceLock<Arc<Server>>>,
     pub backend: BackendManager,
@@ -29,13 +32,13 @@ impl Tool for SpawnAgent {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "spawn_agent".to_string(),
-            description: "Spawn a thread: creates a new session, runs the named agent with the given task, and returns the result. Use for delegating research, coding, or other focused work. Supports presets and per-field overrides.".to_string(),
+            description: "Delegate a task to a persistent agent. Creates a child session, attaches the agent by its stable identity (display name or DB ID), runs it with the given task, and returns the result. Use for agents with long-lived memory and config (e.g. 'researcher', 'coder'). For one-shot ephemeral work, use spawn_task.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "agent": {
+                    "agent_ref": {
                         "type": "string",
-                        "description": "Agent definition name (e.g. 'researcher', 'coder')"
+                        "description": "Agent display name (e.g. 'researcher') or eidetica DB ID"
                     },
                     "task": {
                         "type": "string",
@@ -43,7 +46,7 @@ impl Tool for SpawnAgent {
                     },
                     "context": {
                         "type": "string",
-                        "description": "Optional background info appended to the agent's system prompt"
+                        "description": "Optional background info appended to the task as additional context"
                     },
                     "preset": {
                         "type": "string",
@@ -59,10 +62,10 @@ impl Tool for SpawnAgent {
                     },
                     "async": {
                         "type": "boolean",
-                        "description": "If true, spawn the agent and return immediately without waiting for the result. The agent runs in the background."
+                        "description": "If true, spawn and return immediately without waiting for the result."
                     }
                 },
-                "required": ["agent", "task"]
+                "required": ["agent_ref", "task"]
             }),
         }
     }
@@ -80,7 +83,7 @@ impl Tool for SpawnAgent {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let server = self
                 .server
@@ -91,13 +94,16 @@ impl Tool for SpawnAgent {
                 return Err(format!(
                     "Maximum spawn depth ({}) reached. Cannot spawn further agents.",
                     ctx.max_call_depth
-                ));
+                )
+                .into());
             }
 
-            let agent_name = arguments
-                .get("agent")
+            // Accept `agent_ref` (new) or `agent` (legacy alias).
+            let agent_ref = arguments
+                .get("agent_ref")
+                .or_else(|| arguments.get("agent"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing 'agent' argument".to_string())?;
+                .ok_or_else(|| "Missing 'agent_ref' argument".to_string())?;
             let task = arguments
                 .get("task")
                 .and_then(|v| v.as_str())
@@ -114,42 +120,89 @@ impl Tool for SpawnAgent {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            if !server.agents().can_spawn(&ctx.agent_name, agent_name) {
+            // Resolve the agent ref against the agent index.
+            // Try as display name first (most common), then as DB ID.
+            let index = server.agent_index();
+            let index_entry = match index
+                .find_by_name(agent_ref)
+                .await
+                .map_err(|e| format!("Agent index lookup failed: {e}"))?
+            {
+                Some(e) => e,
+                None => {
+                    let id = ID::parse(agent_ref).map_err(|_| {
+                        format!("Unknown agent: '{agent_ref}' (not a display name or DB ID)")
+                    })?;
+                    index
+                        .find_by_id(&id)
+                        .await
+                        .map_err(|e| format!("Agent index lookup failed: {e}"))?
+                        .ok_or_else(|| format!("Unknown agent: '{agent_ref}'"))?
+                }
+            };
+
+            let agent_display = index_entry.display_name.clone();
+
+            // Permission check against yaml-backed AgentRegistry (can_spawn uses
+            // display names). Living Agents without a yaml entry are not
+            // spawnable via this tool yet — Stage 6 will revisit once agent
+            // definitions can live entirely in DBs.
+            if !server.agents().can_spawn(&ctx.agent_name, &agent_display) {
                 return Err(format!(
                     "Agent '{}' is not allowed to spawn '{}'",
-                    ctx.agent_name, agent_name
-                ));
+                    ctx.agent_name, agent_display
+                )
+                .into());
             }
 
             let agent_def = server
                 .agents()
-                .get(agent_name)
-                .ok_or_else(|| format!("Unknown agent: '{agent_name}'"))?;
+                .get(&agent_display)
+                .ok_or_else(|| format!("Unknown agent: '{agent_display}'"))?;
 
             let resolved =
                 agent_def.resolve_overrides(preset, model_override, max_iterations_override, None);
 
+            // Parent session ID for delegation wiring — the session this tool
+            // is being invoked from.
+            let parent_session_db_id = {
+                let s = ctx.session.lock().await;
+                s.database().root_id().to_string()
+            };
+
             info!(
                 caller = %ctx.agent_name,
-                target = %agent_name,
+                target = %agent_display,
                 depth = ctx.call_depth,
-                "Spawning agent via server"
+                parent_session = %parent_session_db_id,
+                "Spawning Living Agent via server"
             );
 
             let child_max_depth = resolved.max_iterations as usize;
 
-            // Register a child session with the server
+            // Register a child session with the server (with parent→child
+            // delegation so parent admins inherit admin on the child).
             let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session(
-                    agent_name,
+                    &agent_display,
                     self.backend.clone(),
                     self.security.approval_callback.clone(),
                     ctx.call_depth + 1,
                     child_max_depth,
                     ctx.tools.clone(),
+                    Some(&parent_session_db_id),
                 )
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;
+
+            // Attach the Living Agent's stable pubkey to the child session.
+            // This is the Stage 3b path: AuthSettings gets Write(10), SessionMeta
+            // gets the AgentRef, and the agent's history store records the join.
+            server
+                .registry()
+                .attach_agent_to_session(&conversation_id.0, &index_entry)
+                .await
+                .map_err(|e| format!("Failed to attach agent to child session: {e}"))?;
 
             // Build the directive content: task + optional context
             let mut directive = task.to_string();
@@ -169,14 +222,12 @@ impl Tool for SpawnAgent {
                 .await;
 
             if is_async {
-                // Fire-and-forget: return immediately, agent runs in background
                 return Ok(format!(
-                    "Agent '{agent_name}' spawned asynchronously in session {}",
+                    "Agent '{agent_display}' spawned asynchronously in session {}",
                     conversation_id.0
                 ));
             }
 
-            // Synchronous: wait for the server to process and the agent to complete
             completion_rx
                 .recv()
                 .await
@@ -186,8 +237,8 @@ impl Tool for SpawnAgent {
             let session = Session::new(conversation_id, session.database().clone()).await;
             match session.latest_entry() {
                 Some(e) if e.entry_type == EntryType::Message => Ok(e.content.clone()),
-                Some(e) if e.entry_type == EntryType::Error => Err(e.content.clone()),
-                _ => Err("No response from child agent".to_string()),
+                Some(e) if e.entry_type == EntryType::Error => Err(e.content.clone().into()),
+                _ => Err("No response from child agent".into()),
             }
         })
     }

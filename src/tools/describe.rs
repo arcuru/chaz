@@ -31,7 +31,7 @@ impl Tool for DescribeTool {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let name = arguments
                 .get("name")

@@ -203,7 +203,7 @@ impl Tool for Remember {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             require_memory_grant(ctx, |g| g.allow_self, "self")?;
             let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
@@ -216,6 +216,7 @@ impl Tool for Remember {
                 "own",
             )
             .await
+            .map_err(Into::into)
         })
     }
 }
@@ -256,7 +257,7 @@ impl Tool for Recall {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             require_memory_grant(ctx, |g| g.allow_self, "self")?;
             let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
@@ -268,6 +269,7 @@ impl Tool for Recall {
                 "own",
             )
             .await
+            .map_err(Into::into)
         })
     }
 }
@@ -303,7 +305,7 @@ impl Tool for GlobalRemember {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             require_memory_grant(ctx, |g| g.allow_global, "global")?;
             do_remember(
@@ -315,6 +317,7 @@ impl Tool for GlobalRemember {
                 "global",
             )
             .await
+            .map_err(Into::into)
         })
     }
 }
@@ -350,7 +353,7 @@ impl Tool for GlobalRecall {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             require_memory_grant(ctx, |g| g.allow_global, "global")?;
             do_recall(
@@ -361,6 +364,7 @@ impl Tool for GlobalRecall {
                 "global",
             )
             .await
+            .map_err(Into::into)
         })
     }
 }
@@ -610,7 +614,7 @@ mod tests {
             .execute(serde_json::json!({ "key": "x", "value": "y" }), &ctx)
             .await
             .unwrap_err();
-        assert!(err.contains("not granted"), "unexpected: {err}");
+        assert!(err.to_string().contains("not granted"), "unexpected: {err}");
     }
 
     #[tokio::test]
@@ -630,7 +634,7 @@ mod tests {
             .execute(serde_json::json!({ "key": "x", "value": "y" }), &ctx)
             .await
             .unwrap_err();
-        assert!(err.contains("not granted"));
+        assert!(err.to_string().contains("not granted"));
     }
 
     #[tokio::test]
@@ -702,7 +706,7 @@ mod tests {
             .execute(serde_json::json!({ "key": "x", "value": "y" }), &ctx)
             .await
             .unwrap_err();
-        assert!(err.contains("'global'"), "unexpected: {err}");
+        assert!(err.to_string().contains("'global'"), "unexpected: {err}");
     }
 
     #[tokio::test]

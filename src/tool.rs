@@ -276,6 +276,68 @@ impl ToolContext {
 ///
 /// Tools are object-safe via boxed futures. Implement this trait to add
 /// new capabilities to the agent.
+/// Typed failure mode for a tool execution.
+///
+/// Variants carry enough information for the runtime to decide whether to
+/// retry (Network), re-prompt the model with a clarification (InvalidArgument),
+/// surface to the user (ApprovalDenied), or just log-and-move-on (Execution).
+///
+/// Tools returning plain `String` errors are converted to `ToolError::Execution`
+/// via `From<String>`, so migrating a tool to a more specific variant is
+/// always opt-in.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolError {
+    /// The tool didn't produce a result before its configured timeout.
+    /// Usually constructed by the runtime's `tokio::time::timeout` wrapper;
+    /// tools may also emit this for internal deadlines. Retryable.
+    #[error("tool timed out after {secs}s")]
+    Timeout {
+        /// Seconds the tool was allowed before being cut off.
+        secs: u64,
+    },
+
+    /// The user (or approval gate) rejected the tool call. Not retryable.
+    #[error("tool approval denied")]
+    ApprovalDenied,
+
+    /// Network-level failure (HTTP, DNS, TLS). Retryable in principle — the
+    /// model's next turn might choose to retry, or the runtime could do so
+    /// automatically.
+    #[error("network error: {0}")]
+    Network(String),
+
+    /// The LLM supplied arguments that didn't match the tool's schema or
+    /// semantic expectations. Not retryable without new arguments; surfaces
+    /// to the model so it can correct its call.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// The tool ran but the operation itself failed (shell nonzero exit,
+    /// MCP `isError: true`, filesystem permission denied, etc). Not
+    /// transparently retryable.
+    #[error("{0}")]
+    Execution(String),
+}
+
+impl From<String> for ToolError {
+    fn from(s: String) -> Self {
+        ToolError::Execution(s)
+    }
+}
+
+impl From<&str> for ToolError {
+    fn from(s: &str) -> Self {
+        ToolError::Execution(s.to_string())
+    }
+}
+
+impl ToolError {
+    /// True for errors where retrying the same call later might succeed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ToolError::Timeout { .. } | ToolError::Network(_))
+    }
+}
+
 pub trait Tool: Send + Sync {
     /// Static metadata: name, description, JSON Schema parameters.
     fn descriptor(&self) -> ToolDescriptor;
@@ -285,7 +347,7 @@ pub trait Tool: Send + Sync {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
 
     /// Default policy for this tool. Used when no config override exists.
     /// Built-in tools override this with sensible defaults (e.g., shell → High/Always/30s).

@@ -23,7 +23,7 @@ impl Tool for GetTime {
         &self,
         _arguments: Value,
         _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + '_>> {
         Box::pin(async { Ok(chrono::Utc::now().to_rfc3339()) })
     }
 }

@@ -5,6 +5,7 @@ mod describe;
 mod file;
 mod memory;
 mod shell;
+mod task;
 mod time;
 mod web;
 
@@ -13,7 +14,8 @@ pub use calculate::Calculate;
 pub use compact::Compact;
 pub use describe::DescribeTool;
 pub use file::{ReadFile, WriteFile};
-pub use memory::{Recall, Remember};
+pub use memory::{GlobalRecall, GlobalRemember, Recall, Remember};
 pub use shell::ShellExec;
+pub use task::SpawnTask;
 pub use time::GetTime;
 pub use web::WebFetch;

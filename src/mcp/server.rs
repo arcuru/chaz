@@ -320,8 +320,13 @@ impl Tool for McpTool {
         &'a self,
         arguments: Value,
         _ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        Box::pin(async move { self.server.call_tool(&self.raw_name, arguments).await })
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.server
+                .call_tool(&self.raw_name, arguments)
+                .await
+                .map_err(Into::into)
+        })
     }
 
     fn default_policy(&self) -> ToolPolicy {

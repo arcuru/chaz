@@ -35,7 +35,7 @@ impl Tool for Compact {
         &'a self,
         arguments: Value,
         ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let summary = arguments
                 .get("summary")
@@ -43,7 +43,7 @@ impl Tool for Compact {
                 .ok_or_else(|| "Missing 'summary' argument".to_string())?;
 
             if summary.trim().is_empty() {
-                return Err("Summary cannot be empty".to_string());
+                return Err("Summary cannot be empty".into());
             }
 
             let entry = SessionEntry {
