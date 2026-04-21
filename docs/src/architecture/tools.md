@@ -12,12 +12,30 @@ Every tool implements the `Tool` trait:
 trait Tool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
     fn execute(&self, arguments: Value, ctx: &ToolContext)
-        -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+        -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send>>;
     fn default_policy(&self) -> ToolPolicy { /* defaults */ }
 }
 ```
 
 `ToolDescriptor` provides the tool's name, description, and a JSON Schema for its parameters. The LLM sees these as function definitions.
+
+## ToolError
+
+Tool execution failures are classified by a typed `ToolError` enum so the runtime can make retry/re-prompt decisions:
+
+<!-- Code block ignored: enum definition for illustration -->
+
+```rust,ignore
+enum ToolError {
+    Timeout { secs: u64 },       // retryable; runtime-enforced timeout fired
+    ApprovalDenied,              // user/gate rejected the call
+    Network(String),             // retryable; transport-level failure
+    InvalidArgument(String),     // LLM supplied bad input
+    Execution(String),           // generic operation failure
+}
+```
+
+`From<String>` and `From<&str>` are implemented so tools that produce untyped errors (e.g. via `?` on helpers returning `Result<_, String>`) auto-convert to `Execution`. `ToolError::is_retryable()` returns true for `Timeout` and `Network`; the runtime retries `Network` errors once with a 500ms backoff (`Timeout` is deliberately NOT retried because the partial work may have succeeded). The built-in MCP wrapper classifies transport-origin errors (HTTP connection failures, subprocess pipe breakage) as `Network`; `web_fetch` does the same for reqwest send/body failures.
 
 ## Tool Policy
 
