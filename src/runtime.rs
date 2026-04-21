@@ -703,4 +703,177 @@ mod tests {
         let fp2 = LoopDetector::fingerprint(&calls);
         assert_eq!(fp1, fp2);
     }
+
+    // ================================================================
+    // execute_with_retry
+    // ================================================================
+
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::Value;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// Fake tool whose next error is configurable per call. Counts invocations
+    /// so tests can assert how many times the runtime actually ran it.
+    struct ScriptedTool {
+        calls: StdArc<AtomicUsize>,
+        /// For each attempt i, return `scripts[i]`; last entry repeats if exhausted.
+        scripts: Vec<Result<&'static str, ToolError>>,
+    }
+
+    impl ScriptedTool {
+        fn new(scripts: Vec<Result<&'static str, ToolError>>) -> Self {
+            Self {
+                calls: StdArc::new(AtomicUsize::new(0)),
+                scripts,
+            }
+        }
+    }
+
+    impl Tool for ScriptedTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "scripted".into(),
+                description: "test tool".into(),
+                parameters: serde_json::json!({}),
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _arguments: Value,
+            _ctx: &'a ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+            let idx = self.calls.fetch_add(1, Ordering::Relaxed);
+            let script = self
+                .scripts
+                .get(idx)
+                .or_else(|| self.scripts.last())
+                .cloned();
+            Box::pin(async move {
+                match script {
+                    Some(Ok(s)) => Ok(s.to_string()),
+                    Some(Err(e)) => Err(e),
+                    None => Err(ToolError::Execution("script exhausted".into())),
+                }
+            })
+        }
+    }
+
+    // Need Clone for the scripts Vec lookup above.
+    impl Clone for ToolError {
+        fn clone(&self) -> Self {
+            match self {
+                ToolError::Timeout { secs } => ToolError::Timeout { secs: *secs },
+                ToolError::ApprovalDenied => ToolError::ApprovalDenied,
+                ToolError::Network(m) => ToolError::Network(m.clone()),
+                ToolError::InvalidArgument(m) => ToolError::InvalidArgument(m.clone()),
+                ToolError::Execution(m) => ToolError::Execution(m.clone()),
+            }
+        }
+    }
+
+    async fn blank_ctx() -> ToolContext {
+        use crate::tool::{ScopedTools, ToolProfile, ToolRegistry};
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+        // A ToolContext needs a session; construct a minimal stand-in.
+        // These tests never touch ctx fields beyond the call to Tool::execute,
+        // so a dummy session suffices.
+        let instance = eidetica::Instance::open(Box::new(
+            eidetica::backend::database::InMemory::new(),
+        ))
+        .await
+        .unwrap();
+        let _ = instance.create_user("t", None).await;
+        let mut user = instance.login_user("t", None).await.unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut s = eidetica::crdt::Doc::new();
+        s.set("name", "test");
+        let db = user.create_database(s, &key).await.unwrap();
+        let conv_id = crate::types::ConversationId(db.root_id().to_string());
+        let session = Arc::new(TokioMutex::new(
+            crate::session::Session::new(conv_id, db).await,
+        ));
+        ToolContext {
+            agent_name: "t".into(),
+            call_depth: 0,
+            max_call_depth: 5,
+            tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
+            profile: ToolProfile::default(),
+            session,
+            grants: Default::default(),
+            agent_grants: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_retries_network_once() {
+        let tool = ScriptedTool::new(vec![
+            Err(ToolError::Network("connection refused".into())),
+            Ok("success"),
+        ]);
+        let calls = tool.calls.clone();
+        let ctx = blank_ctx().await;
+        let result = execute_with_retry(
+            &tool,
+            serde_json::json!({}),
+            &ctx,
+            Duration::from_secs(5),
+            "scripted",
+        )
+        .await
+        .expect("did not time out");
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "should retry once");
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_no_retry_on_execution() {
+        let tool = ScriptedTool::new(vec![
+            Err(ToolError::Execution("file not found".into())),
+            Ok("late success"),
+        ]);
+        let calls = tool.calls.clone();
+        let ctx = blank_ctx().await;
+        let result = execute_with_retry(
+            &tool,
+            serde_json::json!({}),
+            &ctx,
+            Duration::from_secs(5),
+            "scripted",
+        )
+        .await
+        .expect("did not time out");
+        assert!(
+            matches!(result, Err(ToolError::Execution(_))),
+            "execution errors should not be retried"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "should NOT retry");
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_no_retry_on_timeout_variant() {
+        // ToolError::Timeout is is_retryable() but we deliberately don't
+        // retry it because partial work may have succeeded.
+        let tool = ScriptedTool::new(vec![
+            Err(ToolError::Timeout { secs: 30 }),
+            Ok("late success"),
+        ]);
+        let calls = tool.calls.clone();
+        let ctx = blank_ctx().await;
+        let result = execute_with_retry(
+            &tool,
+            serde_json::json!({}),
+            &ctx,
+            Duration::from_secs(5),
+            "scripted",
+        )
+        .await
+        .expect("did not time out");
+        assert!(matches!(result, Err(ToolError::Timeout { .. })));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 }
