@@ -105,3 +105,60 @@ roles:
       No code block, no English explanation, no newlines, and no start/end tags.
 "#).unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::role::get_role_names;
+
+    /// Force the lazy_static to parse. If the embedded YAML is malformed,
+    /// `unwrap()` inside DEFAULT_CONFIG's initializer would panic here.
+    /// This is the regression guard against someone adding a role/agent to
+    /// the default config with invalid YAML.
+    #[test]
+    fn default_config_parses() {
+        let _ = DEFAULT_CONFIG.homeserver_url.as_str();
+    }
+
+    #[test]
+    fn default_config_has_expected_required_roles() {
+        let names = get_role_names(DEFAULT_CONFIG.roles.clone());
+        // These five roles are documented in the user guide as the built-ins.
+        for expected in ["chaz", "chazmina", "bash", "fish", "zsh"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "default role '{expected}' missing; have {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_has_no_declared_agents() {
+        // Default config is expected to not declare any agents — users add
+        // theirs via yaml. If this changes, update the assertion rather than
+        // silently grow the default agent set.
+        assert!(DEFAULT_CONFIG.agents.is_none());
+    }
+
+    #[test]
+    fn default_config_has_no_backends() {
+        // Users are expected to configure their own LLM backend. If we ever
+        // ship a demo backend, change this test to document what it is.
+        assert!(DEFAULT_CONFIG.backends.is_none());
+    }
+
+    #[test]
+    fn default_roles_all_have_prompts() {
+        // Every role in defaults should have a non-empty prompt — otherwise
+        // the role is useless and it's a config bug.
+        let roles = DEFAULT_CONFIG.roles.as_ref().unwrap();
+        for role in roles {
+            let prompt = role.get_prompt();
+            assert!(
+                !prompt.trim().is_empty(),
+                "role '{}' has empty prompt",
+                role.name
+            );
+        }
+    }
+}
