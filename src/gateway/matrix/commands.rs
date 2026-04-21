@@ -392,3 +392,59 @@ pub async fn get_context(
     context.messages.reverse();
     Ok(context)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_summary_unwraps_quoted_response() {
+        // LLMs often return summaries wrapped in quotes — the first quoted
+        // substring is treated as the canonical summary.
+        assert_eq!(
+            clean_summary_response(r#"Sure, here's the summary: "A quick brown fox.""#, None),
+            "A quick brown fox."
+        );
+    }
+
+    #[test]
+    fn clean_summary_passthrough_when_unquoted() {
+        assert_eq!(
+            clean_summary_response("no quotes here", None),
+            "no quotes here"
+        );
+    }
+
+    #[test]
+    fn clean_summary_uses_first_quoted_chunk() {
+        // Multiple quoted chunks: first wins.
+        assert_eq!(
+            clean_summary_response(r#""first" and then "second""#, None),
+            "first"
+        );
+    }
+
+    #[test]
+    fn clean_summary_respects_max_length() {
+        assert_eq!(clean_summary_response("abcdefghij", Some(4)), "abcd");
+    }
+
+    #[test]
+    fn clean_summary_max_length_counts_chars_not_bytes() {
+        // "héllo" is 5 chars but 6 bytes because of the é.
+        // Truncating to 3 chars should give "hél", not a panic from byte-slicing.
+        assert_eq!(clean_summary_response("héllo", Some(3)), "hél");
+    }
+
+    #[test]
+    fn clean_summary_empty_input() {
+        assert_eq!(clean_summary_response("", None), "");
+        assert_eq!(clean_summary_response("", Some(10)), "");
+    }
+
+    #[test]
+    fn clean_summary_empty_quoted_substring() {
+        // Found a pair of quotes with nothing between — yields empty.
+        assert_eq!(clean_summary_response(r#"prefix "" suffix"#, None), "");
+    }
+}
