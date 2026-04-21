@@ -325,7 +325,7 @@ impl Tool for McpTool {
             self.server
                 .call_tool(&self.raw_name, arguments)
                 .await
-                .map_err(Into::into)
+                .map_err(classify_mcp_error)
         })
     }
 
@@ -338,6 +338,33 @@ impl Tool for McpTool {
             rate_limit: None,
             grants: Default::default(),
         })
+    }
+}
+
+/// Classify a stringly-typed MCP error into a typed `ToolError`.
+///
+/// The transport layer still returns `Result<_, String>` (MCP-internal
+/// protocol errors are heterogeneous enough that keeping them as strings
+/// is pragmatic). This shim maps transport-origin substrings to the
+/// retryable `Network` variant so the runtime can back off on transient
+/// HTTP/DNS/socket failures, and keeps everything else as `Execution`.
+fn classify_mcp_error(msg: String) -> crate::tool::ToolError {
+    use crate::tool::ToolError;
+    // Substrings produced by HttpTransport::{send_request, send_notification}
+    // and StdioTransport's read/write paths.
+    let network_markers = [
+        "HTTP error:",     // reqwest::send failure (DNS, connect, TLS)
+        "HTTP body error", // reqwest::text failure mid-stream
+        "SSE read error",  // SSE stream truncated
+        "closed stdout",   // subprocess died mid-conversation
+        "write error",     // subprocess pipe broke
+        "read error",      // subprocess pipe broke
+        "Broken pipe",     // OS-level pipe error
+    ];
+    if network_markers.iter().any(|m| msg.contains(m)) {
+        ToolError::Network(msg)
+    } else {
+        ToolError::Execution(msg)
     }
 }
 
@@ -368,6 +395,50 @@ pub(super) fn extract_text_content(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolError;
+
+    // ================================================================
+    // classify_mcp_error
+    // ================================================================
+
+    #[test]
+    fn test_classify_http_error_is_network() {
+        let err = classify_mcp_error("MCP 'srv' HTTP error: connection refused".to_string());
+        assert!(matches!(err, ToolError::Network(_)));
+    }
+
+    #[test]
+    fn test_classify_http_body_error_is_network() {
+        let err = classify_mcp_error("MCP 'srv' HTTP body error: premature eof".to_string());
+        assert!(matches!(err, ToolError::Network(_)));
+    }
+
+    #[test]
+    fn test_classify_closed_stdout_is_network() {
+        // Subprocess died — conceptually a network/transport failure for our purposes.
+        let err = classify_mcp_error("MCP server 'srv' closed stdout".to_string());
+        assert!(matches!(err, ToolError::Network(_)));
+    }
+
+    #[test]
+    fn test_classify_write_error_is_network() {
+        let err = classify_mcp_error("MCP 'srv' write error: Broken pipe".to_string());
+        assert!(matches!(err, ToolError::Network(_)));
+    }
+
+    #[test]
+    fn test_classify_tool_returned_error_is_execution() {
+        // Application-level tool failures stay as Execution.
+        let err = classify_mcp_error("file not found".to_string());
+        assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[test]
+    fn test_classify_protocol_error_is_execution() {
+        // JSON-RPC protocol errors aren't transport-level.
+        let err = classify_mcp_error("MCP 'srv' error: Method not found".to_string());
+        assert!(matches!(err, ToolError::Execution(_)));
+    }
 
     // ================================================================
     // extract_text_content

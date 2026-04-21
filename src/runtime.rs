@@ -141,6 +141,36 @@ fn backoff_delay(attempt: u32, error: &LlmError) -> Duration {
     }
 }
 
+/// Execute a tool with a one-shot retry on retryable errors
+/// (currently `ToolError::Network`; `Timeout` is deliberately not retried
+/// because the partial work may have succeeded). The retry fires after
+/// a 500ms backoff. The outer `tokio::time::timeout` bounds the TOTAL
+/// time spent across both attempts.
+async fn execute_with_retry(
+    tool: &dyn crate::tool::Tool,
+    args: serde_json::Value,
+    call_ctx: &crate::tool::ToolContext,
+    timeout: std::time::Duration,
+    tool_name: &str,
+) -> Result<Result<String, crate::tool::ToolError>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, async {
+        match tool.execute(args.clone(), call_ctx).await {
+            Ok(out) => Ok(out),
+            Err(e) if matches!(e, crate::tool::ToolError::Network(_)) => {
+                warn!(
+                    tool = %tool_name,
+                    error = %e,
+                    "Retryable tool error, retrying after 500ms"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tool.execute(args, call_ctx).await
+            }
+            Err(e) => Err(e),
+        }
+    })
+    .await
+}
+
 /// Execute an LLM call with retry for transient errors.
 ///
 /// Retries up to `max_retries` times with exponential backoff for errors
@@ -396,7 +426,8 @@ pub async fn execute(
                             let mut call_ctx = tool_ctx.clone();
                             call_ctx.grants = call_grants;
                             let exec_result =
-                                tokio::time::timeout(timeout, tool.execute(args, &call_ctx)).await;
+                                execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
+                                    .await;
 
                             match exec_result {
                                 Ok(Ok(output)) => {
