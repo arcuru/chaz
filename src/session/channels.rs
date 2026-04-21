@@ -62,7 +62,13 @@ impl SessionRegistry {
             .list_matrix_channels()
             .await?
             .into_iter()
-            .filter_map(|(room, sid)| if sid == session_db_id { Some(room) } else { None })
+            .filter_map(|(room, sid)| {
+                if sid == session_db_id {
+                    Some(room)
+                } else {
+                    None
+                }
+            })
             .collect())
     }
 

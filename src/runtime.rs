@@ -782,11 +782,10 @@ mod tests {
         // A ToolContext needs a session; construct a minimal stand-in.
         // These tests never touch ctx fields beyond the call to Tool::execute,
         // so a dummy session suffices.
-        let instance = eidetica::Instance::open(Box::new(
-            eidetica::backend::database::InMemory::new(),
-        ))
-        .await
-        .unwrap();
+        let instance =
+            eidetica::Instance::open(Box::new(eidetica::backend::database::InMemory::new()))
+                .await
+                .unwrap();
         let _ = instance.create_user("t", None).await;
         let mut user = instance.login_user("t", None).await.unwrap();
         let key = user.get_default_key().unwrap();

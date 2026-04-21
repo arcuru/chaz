@@ -405,7 +405,10 @@ mod tests {
             backend("anthropic", &["claude-3"]),
         ]);
         let mgr = BackendManager::new(&backends, secrets);
-        assert_eq!(mgr.resolve_model_name(Some("anthropic:claude-3")), "claude-3");
+        assert_eq!(
+            mgr.resolve_model_name(Some("anthropic:claude-3")),
+            "claude-3"
+        );
         assert_eq!(mgr.resolve_model_name(Some("openai:gpt-4")), "gpt-4");
     }
 

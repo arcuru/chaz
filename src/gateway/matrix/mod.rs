@@ -510,8 +510,8 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|host|list|hosted|new|delete|share|import <arg>".to_string(),
-            "Attach/detach, manage host, list, create/delete/share/import a Living Agent",
+            "add|remove|host|list|hosted|new|delete|share|import|set <arg>".to_string(),
+            "Attach/detach, manage host, list, create/delete/share/import/edit a Living Agent",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -551,6 +551,21 @@ impl Gateway for MatrixGateway {
                     }
                     "share" if !rest.is_empty() => Some(Command::AgentShare(rest.to_string())),
                     "import" if !rest.is_empty() => Some(Command::AgentImport(rest.to_string())),
+                    "set" if !rest.is_empty() => {
+                        let mut parts = rest.splitn(3, char::is_whitespace);
+                        let agent_ref = parts.next().unwrap_or("").trim();
+                        let field = parts.next().unwrap_or("").trim();
+                        let value = parts.next().unwrap_or("").trim();
+                        if agent_ref.is_empty() || field.is_empty() || value.is_empty() {
+                            None
+                        } else {
+                            Some(Command::AgentSet {
+                                agent_ref: agent_ref.to_string(),
+                                field: field.to_string(),
+                                value: value.to_string(),
+                            })
+                        }
+                    }
                     _ => None,
                 }
             }

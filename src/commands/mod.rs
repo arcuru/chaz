@@ -83,6 +83,13 @@ pub enum Command {
     /// Unregister a Living Agent locally (index + runtime registry). The
     /// agent DB is preserved for archive — memory and history stay readable.
     AgentDelete(String),
+    /// Edit a single field on a Living Agent's DB config. Takes effect on
+    /// the next message via Stage 8 hydration — no restart needed.
+    AgentSet {
+        agent_ref: String,
+        field: String,
+        value: String,
+    },
 
     // --- Heartbeat rules (Stage 4b) ---
     /// Add or upsert a heartbeat rule on the current session.
@@ -176,6 +183,11 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentImport(t) => agent::agent_import(&t, ctx).await,
         Command::AgentHosted => agent::agent_hosted(ctx).await,
         Command::AgentDelete(r) => agent::agent_delete(&r, ctx).await,
+        Command::AgentSet {
+            agent_ref,
+            field,
+            value,
+        } => agent::agent_set(&agent_ref, &field, &value, ctx).await,
         Command::HeartbeatAdd {
             id,
             cron,

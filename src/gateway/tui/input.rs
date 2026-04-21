@@ -185,6 +185,25 @@ fn parse_chat_line(
         show_error(app, "Usage: /agent delete <name|db_id>".to_string());
         return None;
     }
+    if let Some(arg) = text.strip_prefix("/agent set ") {
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(3, char::is_whitespace);
+        let agent_ref = parts.next().unwrap_or("").trim();
+        let field = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        if agent_ref.is_empty() || field.is_empty() || value.is_empty() {
+            show_error(
+                app,
+                "Usage: /agent set <name|db_id> <field> <value>".to_string(),
+            );
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::AgentSet {
+            agent_ref: agent_ref.to_string(),
+            field: field.to_string(),
+            value: value.to_string(),
+        }));
+    }
     if text == "/agent hosted" {
         return Some(ChatAction::Dispatch(Command::AgentHosted));
     }
@@ -382,7 +401,8 @@ fn help_text(_session_db: &eidetica::Database) -> String {
         "  /agent remove <ref>   — detach an agent",
         "  /agent host [<ref>]   — set (or clear) the session's host agent",
         "  /agent hosted         — list every Living Agent this peer hosts",
-        "  /agent new <name> [k=v...] — create a new Living Agent (role, model, max_iterations, tools)",
+        "  /agent new <name> [k=v...] — create a Living Agent (role|model|tools|can_spawn|allowed_callers|autonomous|max_iterations|tool_profile|max_context_tokens)",
+        "  /agent set <ref> <field> <value> — edit an agent field (same set as /agent new); takes effect next message",
         "  /agent delete <ref>   — unregister a Living Agent (DB preserved for archive)",
         "  /agent share <ref>    — generate a share ticket for an agent's DB",
         "  /agent import <ticket>— sync + register an agent DB from a ticket",

@@ -71,7 +71,10 @@ impl Transport {
         tools_changed: &AtomicBool,
     ) -> Result<Value, String> {
         match self {
-            Transport::Stdio(s) => s.send_request(server_name, request, id, tools_changed).await,
+            Transport::Stdio(s) => {
+                s.send_request(server_name, request, id, tools_changed)
+                    .await
+            }
             Transport::Http(h) => h.send_request(server_name, request, tools_changed).await,
         }
     }

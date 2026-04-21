@@ -269,9 +269,13 @@ pub async fn ensure_agent_db(
     Ok(BootstrappedAgent { db, pubkey })
 }
 
-/// Stage 1 bootstrap: materialize an Agent DB for each yaml agent entry.
-/// Idempotent — re-runs reuse the existing DB (matched by `agent:<name>`
-/// settings.name) and refresh config/meta to mirror the yaml.
+/// Bootstrap: materialize an Agent DB for each yaml agent entry.
+///
+/// yaml `agents:` is a **template** — it seeds new DBs but does not
+/// overwrite existing ones. On a re-run with a pre-existing DB, this
+/// function reuses the DB as-is; any `/agent set` edits or synced config
+/// from other peers survive restarts. AgentDb is the source of truth
+/// post-bootstrap (Stage 8 hydration reads live config per-message).
 pub async fn bootstrap_from_config(
     user: &mut User,
     config: &Config,
@@ -282,21 +286,18 @@ pub async fn bootstrap_from_config(
     };
 
     for ac in agent_configs {
-        let agent_cfg = AgentDbConfig::from_agent_config(ac);
-        let meta = AgentMeta {
-            display_name: Some(ac.name.clone()),
-            ..Default::default()
-        };
-
         let agent = match find_agent_db(user, &ac.name).await {
             Some((db, pubkey)) => {
-                info!(agent = %ac.name, db_id = %db.id(), "Reusing existing Agent DB");
+                info!(agent = %ac.name, db_id = %db.id(), "Reusing existing Agent DB (yaml is template; DB config preserved)");
                 db.ensure_stores().await?;
-                db.write_config(&agent_cfg).await?;
-                db.write_meta(&meta).await?;
                 BootstrappedAgent { db, pubkey }
             }
             None => {
+                let agent_cfg = AgentDbConfig::from_agent_config(ac);
+                let meta = AgentMeta {
+                    display_name: Some(ac.name.clone()),
+                    ..Default::default()
+                };
                 let (db, pubkey) = create_agent_db(user, &ac.name, &agent_cfg, &meta).await?;
                 BootstrappedAgent { db, pubkey }
             }
@@ -442,21 +443,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_refreshes_config_from_yaml() {
+    async fn bootstrap_preserves_db_config_on_rerun() {
+        // yaml is a template: once a DB exists, subsequent boots must not
+        // overwrite its config — `/agent set` edits and synced DB state
+        // need to survive restarts.
         let mut user = test_peer_user().await;
         let mut cfg = agent_cfg("chatter");
         cfg.max_iterations = Some(5);
         let config = empty_config_with_agents(vec![cfg]);
         let dbs = bootstrap_from_config(&mut user, &config).await.unwrap();
         let id = dbs["chatter"].db.id();
+        assert_eq!(
+            dbs["chatter"]
+                .db
+                .read_config()
+                .await
+                .unwrap()
+                .max_iterations,
+            Some(5)
+        );
 
-        // Bump max_iterations in yaml, re-bootstrap.
+        // Simulate a `/agent set` edit that bumps max_iterations past yaml.
+        dbs["chatter"]
+            .db
+            .write_config(&AgentDbConfig {
+                max_iterations: Some(77),
+                ..dbs["chatter"].db.read_config().await.unwrap()
+            })
+            .await
+            .unwrap();
+
+        // yaml changes to something else entirely; re-bootstrap must not clobber.
         let mut cfg2 = agent_cfg("chatter");
         cfg2.max_iterations = Some(99);
         let config2 = empty_config_with_agents(vec![cfg2]);
         let dbs2 = bootstrap_from_config(&mut user, &config2).await.unwrap();
 
-        // Same DB, refreshed config.
         assert_eq!(dbs2["chatter"].db.id(), id);
         assert_eq!(
             dbs2["chatter"]
@@ -465,7 +487,8 @@ mod tests {
                 .await
                 .unwrap()
                 .max_iterations,
-            Some(99)
+            Some(77),
+            "yaml should not overwrite existing DB config"
         );
     }
 }

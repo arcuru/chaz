@@ -431,7 +431,10 @@ mcp_servers:
         assert_eq!(servers[0].name, "filesystem");
         assert_eq!(servers[0].command, "npx");
         assert_eq!(servers[0].args.as_ref().unwrap().len(), 3);
-        assert_eq!(servers[0].env.as_ref().unwrap().get("NODE_ENV").unwrap(), "production");
+        assert_eq!(
+            servers[0].env.as_ref().unwrap().get("NODE_ENV").unwrap(),
+            "production"
+        );
         assert_eq!(servers[1].url.as_deref(), Some("http://localhost:8080/mcp"));
         // command defaults to empty string when unset
         assert_eq!(servers[1].command, "");

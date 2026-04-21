@@ -100,10 +100,7 @@ pub(super) async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
     CommandOutcome::Text(format!("Agents on this session:\n{}", lines.join("\n")))
 }
 
-pub(super) async fn agent_set_host(
-    arg: Option<&str>,
-    ctx: &CommandContext<'_>,
-) -> CommandOutcome {
+pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -149,46 +146,70 @@ pub(super) async fn agent_set_host(
 // Lifecycle (Living Agents Stage 6): /agent new | share | import | hosted | delete
 // -----------------------------------------------------------------------------
 
-/// Apply `/agent new`-style `key=value` overrides to a fresh `AgentDbConfig`.
+/// Supported `/agent new` and `/agent set` keys. Nested-structure fields
+/// (`grants`, `presets`) intentionally omitted — edit yaml template or add
+/// a dedicated command.
+const SUPPORTED_AGENT_FIELDS: &str = "role, model, tools, can_spawn, allowed_callers, autonomous, max_iterations, tool_profile, max_context_tokens";
+
+/// Apply a single `key=value` override to an `AgentDbConfig`. Used by
+/// `/agent new` (on a fresh config) and `/agent set` (on a DB-loaded one).
 /// Unknown keys surface as user-facing errors so typos aren't silently dropped.
+pub(super) fn apply_agent_field(
+    cfg: &mut crate::agent_db::AgentDbConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let comma_split = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let parse_bool = |v: &str| -> Result<bool, String> {
+        match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(format!("Invalid bool '{v}' (use true|false)")),
+        }
+    };
+
+    match key {
+        "role" => cfg.role = Some(value.to_string()),
+        "model" => cfg.model = Some(value.to_string()),
+        "tools" => cfg.tools = Some(comma_split(value)),
+        "can_spawn" => cfg.can_spawn = comma_split(value),
+        "allowed_callers" => cfg.allowed_callers = comma_split(value),
+        "autonomous" => cfg.autonomous = parse_bool(value)?,
+        "max_iterations" => {
+            cfg.max_iterations = Some(
+                value
+                    .parse::<u32>()
+                    .map_err(|e| format!("Invalid max_iterations '{value}': {e}"))?,
+            );
+        }
+        "tool_profile" => cfg.tool_profile = Some(value.to_string()),
+        "max_context_tokens" => {
+            cfg.max_context_tokens = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|e| format!("Invalid max_context_tokens '{value}': {e}"))?,
+            );
+        }
+        other => {
+            return Err(format!(
+                "Unknown agent field '{other}'. Supported: {SUPPORTED_AGENT_FIELDS}"
+            ))
+        }
+    }
+    Ok(())
+}
+
 fn apply_agent_new_overrides(
     cfg: &mut crate::agent_db::AgentDbConfig,
     overrides: &[(String, String)],
 ) -> Result<(), String> {
     for (key, value) in overrides {
-        match key.as_str() {
-            "role" => cfg.role = Some(value.clone()),
-            "model" => cfg.model = Some(value.clone()),
-            "tools" => {
-                cfg.tools = Some(
-                    value
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                );
-            }
-            "max_iterations" => {
-                cfg.max_iterations = Some(
-                    value
-                        .parse::<u32>()
-                        .map_err(|e| format!("Invalid max_iterations '{value}': {e}"))?,
-                );
-            }
-            "tool_profile" => cfg.tool_profile = Some(value.clone()),
-            "max_context_tokens" => {
-                cfg.max_context_tokens = Some(
-                    value
-                        .parse::<usize>()
-                        .map_err(|e| format!("Invalid max_context_tokens '{value}': {e}"))?,
-                );
-            }
-            other => {
-                return Err(format!(
-                    "Unknown /agent new override '{other}'. Supported: role, model, tools, max_iterations, tool_profile, max_context_tokens"
-                ))
-            }
-        }
+        apply_agent_field(cfg, key, value)?;
     }
     Ok(())
 }
@@ -429,6 +450,58 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
         msg.push_str(&format!(" Removed {sweep} heartbeat rule(s) targeting it."));
     }
     CommandOutcome::Text(msg)
+}
+
+/// Edit one field on a Living Agent's DB config. Stage 8 live hydration
+/// picks up the change on the next message — no restart. We also upsert
+/// the runtime `AgentRegistry` snapshot so the current session sees the
+/// edit immediately (hydration rebuilds on message, upsert is belt-and-
+/// suspenders for code paths that read registry state between messages).
+pub(super) async fn agent_set(
+    agent_ref: &str,
+    field: &str,
+    value: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    let agent_db = match ctx.server.registry().open_agent_db(&entry.db_id).await {
+        Ok(Some(db)) => db,
+        Ok(None) => {
+            return CommandOutcome::Error(format!(
+                "This peer holds no key for agent '{}' — can't edit a read-only import",
+                entry.display_name
+            ))
+        }
+        Err(e) => return CommandOutcome::Error(format!("Failed to open agent DB: {e}")),
+    };
+
+    let mut cfg = match agent_db.read_config().await {
+        Ok(c) => c,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read agent config: {e}")),
+    };
+
+    if let Err(msg) = apply_agent_field(&mut cfg, field, value) {
+        return CommandOutcome::Error(msg);
+    }
+
+    if let Err(e) = agent_db.write_config(&cfg).await {
+        return CommandOutcome::Error(format!("Failed to write agent config: {e}"));
+    }
+
+    let runtime_agent = ctx
+        .server
+        .agents()
+        .build_from_db_config(&entry.display_name, &cfg);
+    ctx.server.agents().upsert(runtime_agent);
+
+    CommandOutcome::Text(format!(
+        "Set {field}={value} on agent '{}' (takes effect next message)",
+        entry.display_name
+    ))
 }
 
 #[cfg(test)]
@@ -722,5 +795,151 @@ mod tests {
             after_detach.is_empty(),
             "detach should sweep heartbeat rules, got {after_detach:?}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // /agent new — extended field coverage (can_spawn / allowed_callers / autonomous)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_new_accepts_can_spawn_allowed_callers_autonomous() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+        let cmd = Command::AgentNew {
+            name: "alpha".to_string(),
+            overrides: vec![
+                ("can_spawn".into(), "beta,gamma".into()),
+                ("allowed_callers".into(), "chaz".into()),
+                ("autonomous".into(), "true".into()),
+            ],
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Text(_) => {}
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        let agent = server.agents().get("alpha").unwrap();
+        assert_eq!(
+            agent.can_spawn,
+            vec!["beta".to_string(), "gamma".to_string()]
+        );
+        assert_eq!(agent.allowed_callers, vec!["chaz".to_string()]);
+        assert!(agent.autonomous);
+
+        // And persisted to the DB.
+        let user = registry.user_for_tests().await;
+        let (db, _pk) = find_agent_db(&user, "alpha").await.unwrap();
+        drop(user);
+        let cfg = db.read_config().await.unwrap();
+        assert_eq!(cfg.can_spawn, vec!["beta".to_string(), "gamma".to_string()]);
+        assert_eq!(cfg.allowed_callers, vec!["chaz".to_string()]);
+        assert!(cfg.autonomous);
+    }
+
+    #[tokio::test]
+    async fn agent_new_rejects_invalid_bool_for_autonomous() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let cmd = Command::AgentNew {
+            name: "alpha".to_string(),
+            overrides: vec![("autonomous".into(), "maybe".into())],
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Error(msg) => assert!(msg.contains("Invalid bool"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // /agent set — edit a single field on an existing agent
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_set_updates_db_and_registry() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+        // Create with a baseline model.
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![("model".into(), "haiku".into())],
+            },
+            &ctx,
+        )
+        .await;
+
+        // Edit one field.
+        let cmd = Command::AgentSet {
+            agent_ref: "alpha".to_string(),
+            field: "model".to_string(),
+            value: "opus".to_string(),
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Text(msg) => assert!(msg.contains("alpha"), "got {msg}"),
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        // Runtime registry reflects the new value.
+        assert_eq!(
+            server
+                .agents()
+                .get("alpha")
+                .unwrap()
+                .default_model
+                .as_deref(),
+            Some("opus")
+        );
+
+        // DB reflects it too — Stage 8 hydration will read this on next message.
+        let user = registry.user_for_tests().await;
+        let (db, _pk) = find_agent_db(&user, "alpha").await.unwrap();
+        drop(user);
+        assert_eq!(
+            db.read_config().await.unwrap().model.as_deref(),
+            Some("opus")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_set_rejects_unknown_field() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+
+        let cmd = Command::AgentSet {
+            agent_ref: "alpha".to_string(),
+            field: "bogus".to_string(),
+            value: "x".to_string(),
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Error(msg) => assert!(msg.contains("Unknown"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_set_missing_agent_errors() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let cmd = Command::AgentSet {
+            agent_ref: "ghost".to_string(),
+            field: "model".to_string(),
+            value: "opus".to_string(),
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Error(msg) => assert!(msg.contains("No hosted agent"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
     }
 }
