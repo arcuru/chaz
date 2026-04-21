@@ -142,3 +142,117 @@ pub fn get_role(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn role(name: &str) -> RoleDetails {
+        RoleDetails::new_test(name, &format!("prompt-for-{name}"))
+    }
+
+    #[test]
+    fn get_role_names_empty_when_none() {
+        assert!(get_role_names(None).is_empty());
+    }
+
+    #[test]
+    fn get_role_names_preserves_order() {
+        let roles = vec![role("alpha"), role("beta"), role("gamma")];
+        assert_eq!(get_role_names(Some(roles)), vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn get_role_returns_none_for_none_name() {
+        assert!(get_role(None, Some(vec![role("alpha")]), None).is_none());
+    }
+
+    #[test]
+    fn get_role_finds_in_role_list_first() {
+        let role_list = Some(vec![role("shared")]);
+        let defaults = Some(vec![role("shared")]);
+        // Both lists have "shared" but role_list takes precedence.
+        let found = get_role(Some("shared".into()), role_list, defaults).unwrap();
+        assert_eq!(found.name, "shared");
+    }
+
+    #[test]
+    fn get_role_falls_back_to_defaults() {
+        let role_list = Some(vec![role("alpha")]);
+        let defaults = Some(vec![role("beta")]);
+        // "beta" isn't in role_list; should be found in defaults.
+        let found = get_role(Some("beta".into()), role_list, defaults);
+        assert_eq!(found.unwrap().name, "beta");
+    }
+
+    #[test]
+    fn get_role_missing_returns_none() {
+        let found = get_role(
+            Some("nonexistent".into()),
+            Some(vec![role("alpha")]),
+            Some(vec![role("beta")]),
+        );
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn get_role_works_with_empty_lists() {
+        assert!(get_role(Some("x".into()), Some(vec![]), Some(vec![])).is_none());
+        assert!(get_role(Some("x".into()), None, None).is_none());
+    }
+
+    #[test]
+    fn role_details_get_prompt_returns_set_prompt() {
+        let r = RoleDetails::new_test("a", "hello world");
+        assert_eq!(r.get_prompt(), "hello world");
+    }
+
+    #[test]
+    fn role_details_get_prompt_empty_when_unset() {
+        let r = RoleDetails::new("a", None, None, None);
+        assert_eq!(r.get_prompt(), "");
+    }
+
+    #[test]
+    fn message_role_parses_case_insensitively() {
+        // Lowercase
+        let m: MessageRole = serde_yaml::from_str("user").unwrap();
+        assert_eq!(m, MessageRole::User);
+        // Uppercase
+        let m: MessageRole = serde_yaml::from_str("ASSISTANT").unwrap();
+        assert_eq!(m, MessageRole::Assistant);
+        // Mixed case
+        let m: MessageRole = serde_yaml::from_str("UsEr").unwrap();
+        assert_eq!(m, MessageRole::User);
+    }
+
+    #[test]
+    fn message_role_rejects_unknown_variant() {
+        let result: Result<MessageRole, _> = serde_yaml::from_str("system");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn message_role_display() {
+        assert_eq!(MessageRole::User.to_string(), "USER");
+        assert_eq!(MessageRole::Assistant.to_string(), "ASSISTANT");
+    }
+
+    #[test]
+    fn role_details_deserializes_full_yaml() {
+        let yaml = r#"
+name: researcher
+description: "Does research"
+prompt: "You are a researcher."
+example:
+  - user: user
+    message: "hi"
+  - user: assistant
+    message: "hello"
+"#;
+        let role: RoleDetails = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(role.name, "researcher");
+        assert_eq!(role.get_prompt(), "You are a researcher.");
+        assert_eq!(role.example.as_ref().unwrap().len(), 2);
+    }
+}
