@@ -127,6 +127,29 @@ impl Server {
         &self.agent_index
     }
 
+    /// Rebuild the runtime snapshot for `agent` from its Living Agent DB's
+    /// `config` store (Stage 8). Returns the input unchanged if the agent
+    /// isn't in the peer-local agent index or the DB isn't readable on this
+    /// peer — preserves behavior for legacy agents without a DB.
+    ///
+    /// The rebuilt Agent is upserted back into the in-memory `AgentRegistry`
+    /// so subsequent `can_spawn` / `default_agent` / legacy lookups see the
+    /// refreshed config too.
+    pub async fn hydrate_agent_from_db(&self, agent: crate::agent::Agent) -> crate::agent::Agent {
+        let Ok(Some(entry)) = self.agent_index.find_by_name(&agent.name).await else {
+            return agent;
+        };
+        let Ok(Some(db)) = self.registry.open_agent_db(&entry.db_id).await else {
+            return agent;
+        };
+        let Ok(cfg) = db.read_config().await else {
+            return agent;
+        };
+        let rebuilt = self.agents.build_from_db_config(&agent.name, &cfg);
+        self.agents.upsert(rebuilt.clone());
+        rebuilt
+    }
+
     pub fn registry(&self) -> &SessionRegistry {
         &self.registry
     }
@@ -206,6 +229,13 @@ impl Server {
     /// Creates a fresh session DB via the registry, installs server callbacks,
     /// and returns the session info plus a completion receiver. The caller
     /// writes a Directive entry to trigger execution, then awaits the receiver.
+    ///
+    /// If `parent_session_db_id` is provided, wires a `DelegatedTreeRef`
+    /// (max = Admin(0)) from the child's auth settings back to the parent —
+    /// any key with Admin on the parent inherits Admin on the child
+    /// transparently. Stage 5 `spawn_agent`/`spawn_task` rely on this so the
+    /// invoking session's supervisor authority carries into the child.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_child_session(
         &self,
         agent_name: &str,
@@ -214,9 +244,17 @@ impl Server {
         call_depth: usize,
         max_call_depth: usize,
         parent_tools: ScopedTools,
+        parent_session_db_id: Option<&str>,
     ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
         let source = format!("spawn:{}", uuid::Uuid::new_v4());
-        let (conversation_id, session_db) = self.registry.create_session(Some(&source)).await?;
+        let (conversation_id, session_db) = match parent_session_db_id {
+            Some(parent) => {
+                self.registry
+                    .create_child_session(parent, Some(&source))
+                    .await?
+            }
+            None => self.registry.create_session(Some(&source)).await?,
+        };
         let session_db_id = session_db.root_id().to_string();
 
         let (completion_tx, completion_rx) = mpsc::channel(1);
@@ -367,6 +405,12 @@ impl Server {
                 Some(&latest.content),
             )
             .await;
+
+        // Stage 8 live hydration: if the resolved agent has a Living Agent DB
+        // on this peer, rebuild its runtime snapshot from the DB's `config`
+        // store so edits to the DB (local or synced from origin peer)
+        // propagate to the next run without a restart.
+        let agent = self.hydrate_agent_from_db(agent).await;
 
         self.spawn_agent_task(
             session_db_id.to_string(),
@@ -563,5 +607,191 @@ impl Server {
                 let _ = tx.send(()).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentRegistry;
+    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::agent_index::AgentIndexEntry;
+    use crate::config::Config;
+    use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
+
+    fn blank_config() -> Config {
+        Config {
+            homeserver_url: String::new(),
+            username: String::new(),
+            password: None,
+            allow_list: None,
+            message_limit: None,
+            room_size_limit: None,
+            state_dir: None,
+            chat_summary_model: None,
+            role: None,
+            roles: None,
+            backends: None,
+            agents: None,
+            security: None,
+            schedules: None,
+            mcp_servers: None,
+            tool_profiles: None,
+            mcp_server_dir: None,
+            context: None,
+        }
+    }
+
+    /// Build a Server with the minimum wiring needed to exercise hydration.
+    async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+        let agents = Arc::new(AgentRegistry::from_config(&blank_config()));
+        let registry = Arc::new(
+            crate::session::SessionRegistry::new(instance.clone(), user, agents.clone())
+                .await
+                .unwrap(),
+        );
+        let index = AgentIndex::new(registry.central_db().clone());
+        let tools = Arc::new(ToolRegistry::new());
+        let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
+        let security = SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        };
+        let server = Server::new(
+            registry.clone(),
+            agents,
+            index,
+            tools,
+            policies,
+            security,
+            HashMap::new(),
+            Default::default(),
+        );
+        (instance, server, registry)
+    }
+
+    #[tokio::test]
+    async fn hydrate_picks_up_db_config_edits() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        // Create an Agent DB with V1 config: haiku / 5 iters.
+        let (db, pubkey) = {
+            let mut user = registry.user_for_tests().await;
+            create_agent_db(
+                &mut user,
+                "alpha",
+                &AgentDbConfig {
+                    model: Some("haiku".to_string()),
+                    max_iterations: Some(5),
+                    ..Default::default()
+                },
+                &AgentMeta {
+                    display_name: Some("alpha".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        };
+        server
+            .agent_index()
+            .register(AgentIndexEntry {
+                db_id: db.id(),
+                display_name: "alpha".to_string(),
+                pubkey,
+            })
+            .await
+            .unwrap();
+
+        // Seed the in-memory registry with a stale entry (model="opus", iter=999)
+        // — exactly what would happen if yaml drifted from DB, or if a prior
+        // hydration happened before a DB edit.
+        let mut stale = crate::agent::Agent {
+            name: "alpha".to_string(),
+            default_role: None,
+            default_model: Some("opus".to_string()),
+            allowed_tools: None,
+            can_spawn: vec![],
+            allowed_callers: vec![],
+            max_iterations: 999,
+            autonomous: false,
+            presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: HashMap::new(),
+        };
+        server.agents().upsert(stale.clone());
+
+        // First hydrate: should pick up V1 from DB (haiku / 5).
+        let input = stale.clone();
+        let hydrated = server.hydrate_agent_from_db(input).await;
+        assert_eq!(hydrated.default_model.as_deref(), Some("haiku"));
+        assert_eq!(hydrated.max_iterations, 5);
+        // And the registry reflects the live state too.
+        assert_eq!(
+            server
+                .agents()
+                .get("alpha")
+                .unwrap()
+                .default_model
+                .as_deref(),
+            Some("haiku")
+        );
+
+        // Write V2 to the DB.
+        db.write_config(&AgentDbConfig {
+            model: Some("sonnet".to_string()),
+            max_iterations: Some(42),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        stale.default_model = Some("opus".to_string()); // re-enter with stale snapshot
+        let hydrated_v2 = server.hydrate_agent_from_db(stale).await;
+        assert_eq!(hydrated_v2.default_model.as_deref(), Some("sonnet"));
+        assert_eq!(hydrated_v2.max_iterations, 42);
+        assert_eq!(
+            server
+                .agents()
+                .get("alpha")
+                .unwrap()
+                .default_model
+                .as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_returns_input_when_agent_not_in_index() {
+        let (_instance, server, _registry) = server_fixture().await;
+
+        // No DB for "phantom"; hydration should return the input unchanged.
+        let input = crate::agent::Agent {
+            name: "phantom".to_string(),
+            default_role: None,
+            default_model: Some("ghost".to_string()),
+            allowed_tools: None,
+            can_spawn: vec![],
+            allowed_callers: vec![],
+            max_iterations: 7,
+            autonomous: false,
+            presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: HashMap::new(),
+        };
+        let result = server.hydrate_agent_from_db(input.clone()).await;
+        assert_eq!(result.name, "phantom");
+        assert_eq!(result.default_model.as_deref(), Some("ghost"));
+        assert_eq!(result.max_iterations, 7);
     }
 }

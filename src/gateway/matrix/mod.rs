@@ -510,8 +510,8 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|host|list <name|db_id>".to_string(),
-            "Attach, detach, designate host, or list agents on this session",
+            "add|remove|host|list|hosted|new|delete|share|import <arg>".to_string(),
+            "Attach/detach, manage host, list, create/delete/share/import a Living Agent",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -528,6 +528,29 @@ impl Gateway for MatrixGateway {
                         Some(rest.to_string())
                     })),
                     "list" | "" => Some(Command::AgentsList),
+                    "hosted" => Some(Command::AgentHosted),
+                    "new" if !rest.is_empty() => (|| {
+                        let mut toks = rest.split_whitespace();
+                        let name = toks.next().unwrap_or("").to_string();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        let mut overrides = Vec::new();
+                        for tok in toks {
+                            match tok.split_once('=') {
+                                Some((k, v)) if !k.is_empty() => {
+                                    overrides.push((k.to_string(), v.to_string()))
+                                }
+                                _ => return None,
+                            }
+                        }
+                        Some(Command::AgentNew { name, overrides })
+                    })(),
+                    "delete" | "del" if !rest.is_empty() => {
+                        Some(Command::AgentDelete(rest.to_string()))
+                    }
+                    "share" if !rest.is_empty() => Some(Command::AgentShare(rest.to_string())),
+                    "import" if !rest.is_empty() => Some(Command::AgentImport(rest.to_string())),
                     _ => None,
                 }
             }

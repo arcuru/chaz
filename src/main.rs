@@ -97,12 +97,23 @@ async fn main() -> anyhow::Result<()> {
     // Stage 1 of Living Agents: materialize an eidetica DB per yaml-declared
     // agent. Idempotent on re-runs. Routing still uses the in-memory
     // AgentRegistry; Stage 3 switches that to key-possession checks.
-    let agent_dbs = agent_db::bootstrap_from_config(&mut user, &config).await?;
+    let mut agent_dbs = agent_db::bootstrap_from_config(&mut user, &config).await?;
     if !agent_dbs.is_empty() {
         info!(
             count = agent_dbs.len(),
             "Agent DBs bootstrapped from config"
         );
+    }
+
+    // Every AgentRegistry entry needs an AgentDb for Stage 7 per-agent memory
+    // to resolve. The default `chaz` agent (when no yaml `agents:` block) has
+    // no bootstrap entry — fill it in here.
+    for name in agent_registry.names() {
+        if let std::collections::hash_map::Entry::Vacant(slot) = agent_dbs.entry(name.clone()) {
+            let bs = agent_db::ensure_agent_db(&mut user, &name).await?;
+            info!(agent = %name, db_id = %bs.db.id(), "Created default Agent DB");
+            slot.insert(bs);
+        }
     }
 
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
@@ -170,12 +181,26 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::ReadFile);
     tool_registry.register(tools::WriteFile);
     tool_registry.register(tools::WebFetch);
-    tool_registry.register(tools::Remember::new(central_db.clone()));
-    tool_registry.register(tools::Recall::new(central_db.clone()));
+    tool_registry.register(tools::Remember::new(
+        registry.clone(),
+        agent_index_store.clone(),
+    ));
+    tool_registry.register(tools::Recall::new(
+        registry.clone(),
+        agent_index_store.clone(),
+    ));
+    tool_registry.register(tools::GlobalRemember::new(central_db.clone()));
+    tool_registry.register(tools::GlobalRecall::new(central_db.clone()));
     tool_registry.register(tools::Compact);
-    // SpawnAgent routes through the server — OnceLock is set after Server::new
+    // SpawnAgent / SpawnTask both route through the server — a single OnceLock
+    // is shared; it's set once after Server::new below.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
     tool_registry.register(tools::SpawnAgent {
+        server: spawn_server_cell.clone(),
+        backend: backends::BackendManager::new(&config.backends, secret_store.clone()),
+        security: security_ctx.clone(),
+    });
+    tool_registry.register(tools::SpawnTask {
         server: spawn_server_cell.clone(),
         backend: backends::BackendManager::new(&config.backends, secret_store.clone()),
         security: security_ctx.clone(),
@@ -244,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),
-        "SpawnAgent server cell already set"
+        "Spawn tool server cell already set"
     );
 
     // Start the scheduler if any schedules are configured

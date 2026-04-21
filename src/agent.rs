@@ -65,6 +65,28 @@ impl Agent {
         }
     }
 
+    /// Build a runtime Agent from a Living Agent's DB config (Stage 6
+    /// `/agent new` and `/agent import`). Role resolution falls back to the
+    /// in-built defaults (`DEFAULT_CONFIG.roles`) so the agent participates
+    /// in ReAct even without a named role.
+    pub fn from_db_config(name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Self {
+        let default_role = get_role(cfg.role.clone(), None, DEFAULT_CONFIG.roles.clone());
+        Agent {
+            name: name.to_string(),
+            default_role,
+            default_model: cfg.model.clone(),
+            allowed_tools: cfg.tools.clone(),
+            can_spawn: cfg.can_spawn.clone(),
+            allowed_callers: cfg.allowed_callers.clone(),
+            max_iterations: cfg.max_iterations.unwrap_or(10),
+            autonomous: cfg.autonomous,
+            presets: cfg.presets.clone(),
+            tool_profile: cfg.tool_profile.clone(),
+            max_context_tokens: cfg.max_context_tokens,
+            grants: cfg.grants.clone(),
+        }
+    }
+
     /// Resolve overrides from a preset name and/or inline overrides.
     /// Resolution order: agent defaults → preset → inline overrides.
     pub fn resolve_overrides(
@@ -137,9 +159,18 @@ fn intersect_tools(base: &Option<Vec<String>>, override_tools: &[String]) -> Vec
 }
 
 /// Registry of named agents. Always has a default agent.
-#[derive(Clone)]
+///
+/// Backed by a `RwLock` so agents can be registered at runtime (via
+/// `/agent new`); yaml-bootstrapped agents land here at startup, and
+/// subsequently-created Living Agents join via [`AgentRegistry::register`].
+/// All read accessors clone out `Agent` values — Agent is cheap to clone.
+///
+/// `config_roles` stashes the user's `roles:` list so live hydration from
+/// `AgentDb::config` can resolve role names defined outside
+/// `DEFAULT_CONFIG.roles` (Stage 8).
 pub struct AgentRegistry {
-    agents: Vec<Agent>,
+    agents: std::sync::RwLock<Vec<Agent>>,
+    config_roles: Option<Vec<RoleDetails>>,
 }
 
 impl AgentRegistry {
@@ -173,35 +204,54 @@ impl AgentRegistry {
             }]
         };
 
-        let registry = Self { agents };
+        let registry = Self {
+            agents: std::sync::RwLock::new(agents),
+            config_roles: config.roles.clone(),
+        };
         registry.validate_references();
         registry
     }
 
-    /// Get the default agent (first in the list)
-    pub fn default_agent(&self) -> &Agent {
-        &self.agents[0]
+    /// Access the user-config roles stashed at registry-build time. Used by
+    /// live hydration from AgentDb::config so role names reference the same
+    /// roles that yaml-bootstrapped agents resolve against.
+    pub fn config_roles(&self) -> Option<&Vec<RoleDetails>> {
+        self.config_roles.as_ref()
     }
 
-    /// Look up an agent by name
-    pub fn get(&self, name: &str) -> Option<&Agent> {
-        self.agents.iter().find(|a| a.name == name)
+    /// Get the default agent (first in the list). Panics if the registry is
+    /// empty — callers rely on `from_config` always seeding at least one.
+    pub fn default_agent(&self) -> Agent {
+        let agents = self.agents.read().unwrap();
+        agents
+            .first()
+            .cloned()
+            .expect("AgentRegistry always has at least one agent")
     }
 
-    /// List all agent names
-    pub fn names(&self) -> Vec<&str> {
-        self.agents.iter().map(|a| a.name.as_str()).collect()
+    /// Look up an agent by name. Returns a cloned `Agent` to keep callers
+    /// lock-free after the read.
+    pub fn get(&self, name: &str) -> Option<Agent> {
+        let agents = self.agents.read().unwrap();
+        agents.iter().find(|a| a.name == name).cloned()
+    }
+
+    /// List all agent names (cloned).
+    pub fn names(&self) -> Vec<String> {
+        let agents = self.agents.read().unwrap();
+        agents.iter().map(|a| a.name.clone()).collect()
     }
 
     /// Check if a caller agent is allowed to spawn a target agent.
     /// Both sides must agree: caller's can_spawn includes target,
     /// AND target's allowed_callers includes caller (or is empty).
     pub fn can_spawn(&self, caller_name: &str, target_name: &str) -> bool {
-        let caller = match self.get(caller_name) {
+        let agents = self.agents.read().unwrap();
+        let caller = match agents.iter().find(|a| a.name == caller_name) {
             Some(a) => a,
             None => return false,
         };
-        let target = match self.get(target_name) {
+        let target = match agents.iter().find(|a| a.name == target_name) {
             Some(a) => a,
             None => return false,
         };
@@ -218,10 +268,71 @@ impl AgentRegistry {
         target.allowed_callers.contains(&caller_name.to_string())
     }
 
+    /// Register a new agent at runtime. Rejects duplicates by display name.
+    /// Used by `/agent new` and `/agent import` so Living Agents created
+    /// after startup are routable without a config-reload.
+    pub fn register(&self, agent: Agent) -> anyhow::Result<()> {
+        let mut agents = self.agents.write().unwrap();
+        if agents.iter().any(|a| a.name == agent.name) {
+            anyhow::bail!("Agent '{}' already registered", agent.name);
+        }
+        agents.push(agent);
+        Ok(())
+    }
+
+    /// Replace the runtime entry for `name` — or insert if absent. Used by
+    /// Stage 8 live hydration so edits to `AgentDb::config` propagate into
+    /// the in-memory registry at resolution time.
+    pub fn upsert(&self, agent: Agent) {
+        let mut agents = self.agents.write().unwrap();
+        if let Some(existing) = agents.iter_mut().find(|a| a.name == agent.name) {
+            *existing = agent;
+        } else {
+            agents.push(agent);
+        }
+    }
+
+    /// Remove the runtime entry for `name`. Returns `true` if an entry was
+    /// removed, `false` if no agent by that name existed. Used by `/agent
+    /// delete`; the DB-side record survives.
+    pub fn unregister(&self, name: &str) -> bool {
+        let mut agents = self.agents.write().unwrap();
+        let before = agents.len();
+        agents.retain(|a| a.name != name);
+        agents.len() != before
+    }
+
+    /// Build a runtime `Agent` from a Living Agent's DB config, resolving the
+    /// role name against this registry's `config_roles` (falling back to
+    /// `DEFAULT_CONFIG.roles`). Use this instead of `Agent::from_db_config`
+    /// when the user's yaml-defined roles need to be honored.
+    pub fn build_from_db_config(&self, name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Agent {
+        let default_role = get_role(
+            cfg.role.clone(),
+            self.config_roles.clone(),
+            DEFAULT_CONFIG.roles.clone(),
+        );
+        Agent {
+            name: name.to_string(),
+            default_role,
+            default_model: cfg.model.clone(),
+            allowed_tools: cfg.tools.clone(),
+            can_spawn: cfg.can_spawn.clone(),
+            allowed_callers: cfg.allowed_callers.clone(),
+            max_iterations: cfg.max_iterations.unwrap_or(10),
+            autonomous: cfg.autonomous,
+            presets: cfg.presets.clone(),
+            tool_profile: cfg.tool_profile.clone(),
+            max_context_tokens: cfg.max_context_tokens,
+            grants: cfg.grants.clone(),
+        }
+    }
+
     /// Validate that all names in can_spawn and allowed_callers reference existing agents.
     fn validate_references(&self) {
-        let names: Vec<&str> = self.agents.iter().map(|a| a.name.as_str()).collect();
-        for agent in &self.agents {
+        let agents = self.agents.read().unwrap();
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        for agent in agents.iter() {
             for target in &agent.can_spawn {
                 if !names.contains(&target.as_str()) {
                     warn!(
@@ -266,10 +377,11 @@ mod tests {
     #[test]
     fn test_spawn_permission_both_sides() {
         let registry = AgentRegistry {
-            agents: vec![
+            agents: std::sync::RwLock::new(vec![
                 make_agent("chaz", vec!["researcher"], vec![]),
                 make_agent("researcher", vec![], vec!["chaz"]),
-            ],
+            ]),
+            config_roles: None,
         };
         assert!(registry.can_spawn("chaz", "researcher"));
         assert!(!registry.can_spawn("researcher", "chaz"));
@@ -278,10 +390,11 @@ mod tests {
     #[test]
     fn test_spawn_permission_open_callers() {
         let registry = AgentRegistry {
-            agents: vec![
+            agents: std::sync::RwLock::new(vec![
                 make_agent("chaz", vec!["coder"], vec![]),
                 make_agent("coder", vec![], vec![]), // empty = anyone
-            ],
+            ]),
+            config_roles: None,
         };
         assert!(registry.can_spawn("chaz", "coder"));
     }
@@ -289,10 +402,11 @@ mod tests {
     #[test]
     fn test_spawn_permission_denied_by_callers() {
         let registry = AgentRegistry {
-            agents: vec![
+            agents: std::sync::RwLock::new(vec![
                 make_agent("chaz", vec!["mayor"], vec![]),
                 make_agent("mayor", vec![], vec!["researcher"]), // only researcher can call
-            ],
+            ]),
+            config_roles: None,
         };
         assert!(!registry.can_spawn("chaz", "mayor"));
     }
@@ -300,7 +414,8 @@ mod tests {
     #[test]
     fn test_spawn_unknown_target() {
         let registry = AgentRegistry {
-            agents: vec![make_agent("chaz", vec!["nonexistent"], vec![])],
+            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec!["nonexistent"], vec![])]),
+            config_roles: None,
         };
         assert!(!registry.can_spawn("chaz", "nonexistent"));
     }
@@ -370,5 +485,151 @@ mod tests {
             ),
             vec!["b", "c"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 6: runtime registration + from_db_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn registry_register_adds_and_rejects_duplicates() {
+        let registry = AgentRegistry {
+            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
+            config_roles: None,
+        };
+        let new_agent = make_agent("researcher", vec![], vec![]);
+        registry.register(new_agent).unwrap();
+        assert!(registry.get("researcher").is_some());
+
+        // Duplicate rejected.
+        let dup = make_agent("researcher", vec![], vec![]);
+        assert!(registry.register(dup).is_err());
+
+        // Names list reflects registration.
+        let names = registry.names();
+        assert!(names.contains(&"chaz".to_string()));
+        assert!(names.contains(&"researcher".to_string()));
+    }
+
+    #[test]
+    fn agent_from_db_config_maps_all_fields() {
+        let cfg = crate::agent_db::AgentDbConfig {
+            model: Some("opus".to_string()),
+            tools: Some(vec!["get_time".into()]),
+            can_spawn: vec!["alpha".into()],
+            allowed_callers: vec!["beta".into()],
+            max_iterations: Some(42),
+            tool_profile: Some("deep".to_string()),
+            max_context_tokens: Some(200_000),
+            ..Default::default()
+        };
+
+        let agent = Agent::from_db_config("new-agent", &cfg);
+        assert_eq!(agent.name, "new-agent");
+        assert_eq!(agent.default_model.as_deref(), Some("opus"));
+        assert_eq!(
+            agent.allowed_tools.as_deref(),
+            Some(&["get_time".to_string()][..])
+        );
+        assert_eq!(agent.can_spawn, vec!["alpha".to_string()]);
+        assert_eq!(agent.allowed_callers, vec!["beta".to_string()]);
+        assert_eq!(agent.max_iterations, 42);
+        assert_eq!(agent.tool_profile.as_deref(), Some("deep"));
+        assert_eq!(agent.max_context_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn agent_from_db_config_uses_defaults_for_empty_config() {
+        let cfg = crate::agent_db::AgentDbConfig::default();
+        let agent = Agent::from_db_config("fresh", &cfg);
+        assert_eq!(agent.name, "fresh");
+        assert_eq!(agent.max_iterations, 10);
+        assert!(agent.allowed_tools.is_none());
+        assert!(agent.can_spawn.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 8: live hydration from AgentDb config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_from_db_config_resolves_role_via_registry_config_roles() {
+        let custom_role = RoleDetails::new_test("custom", "you are custom");
+        let registry = AgentRegistry {
+            agents: std::sync::RwLock::new(vec![]),
+            config_roles: Some(vec![custom_role]),
+        };
+        let cfg = crate::agent_db::AgentDbConfig {
+            role: Some("custom".to_string()),
+            ..Default::default()
+        };
+        let agent = registry.build_from_db_config("alpha", &cfg);
+        let resolved = agent.default_role.expect("role should resolve");
+        assert_eq!(resolved.name, "custom");
+        assert_eq!(resolved.get_prompt(), "you are custom");
+    }
+
+    #[test]
+    fn upsert_replaces_existing_entry() {
+        let registry = AgentRegistry {
+            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
+            config_roles: None,
+        };
+        let mut updated = make_agent("chaz", vec!["researcher"], vec![]);
+        updated.default_model = Some("opus".to_string());
+        registry.upsert(updated);
+        let got = registry.get("chaz").unwrap();
+        assert_eq!(got.default_model.as_deref(), Some("opus"));
+        assert_eq!(got.can_spawn, vec!["researcher".to_string()]);
+        // Still one entry total (upsert didn't append a duplicate).
+        assert_eq!(registry.names().len(), 1);
+    }
+
+    #[test]
+    fn upsert_inserts_when_absent() {
+        let registry = AgentRegistry {
+            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
+            config_roles: None,
+        };
+        registry.upsert(make_agent("beta", vec![], vec![]));
+        assert_eq!(registry.names().len(), 2);
+        assert!(registry.get("beta").is_some());
+    }
+
+    #[test]
+    fn build_from_db_config_picks_up_edits() {
+        // Simulates: config writes V1 → runtime builds agent with V1 →
+        // config writes V2 → runtime rebuilds → sees V2.
+        let registry = AgentRegistry {
+            agents: std::sync::RwLock::new(vec![]),
+            config_roles: None,
+        };
+
+        let v1 = crate::agent_db::AgentDbConfig {
+            model: Some("haiku".to_string()),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let built_v1 = registry.build_from_db_config("alpha", &v1);
+        registry.upsert(built_v1);
+        assert_eq!(
+            registry.get("alpha").unwrap().default_model.as_deref(),
+            Some("haiku")
+        );
+        assert_eq!(registry.get("alpha").unwrap().max_iterations, 5);
+
+        // Second build after a config edit picks up the new values.
+        let v2 = crate::agent_db::AgentDbConfig {
+            model: Some("opus".to_string()),
+            max_iterations: Some(99),
+            ..Default::default()
+        };
+        let built_v2 = registry.build_from_db_config("alpha", &v2);
+        registry.upsert(built_v2);
+        assert_eq!(
+            registry.get("alpha").unwrap().default_model.as_deref(),
+            Some("opus")
+        );
+        assert_eq!(registry.get("alpha").unwrap().max_iterations, 99);
     }
 }

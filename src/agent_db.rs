@@ -244,6 +244,31 @@ pub struct BootstrappedAgent {
     pub pubkey: PublicKey,
 }
 
+/// Ensure the given agent has an AgentDb on this peer. Creates one with
+/// default config/meta if it doesn't exist. Idempotent.
+///
+/// Stage 7 (memory migration) relies on every `AgentRegistry` entry having a
+/// matching DB so the `remember`/`recall` tools can write to
+/// `AgentDb::memory`. The default `chaz` agent isn't in yaml `agents:`, so
+/// `bootstrap_from_config` alone doesn't cover it — `main.rs` calls this
+/// for every registry entry after bootstrap.
+pub async fn ensure_agent_db(
+    user: &mut User,
+    display_name: &str,
+) -> anyhow::Result<BootstrappedAgent> {
+    if let Some((db, pubkey)) = find_agent_db(user, display_name).await {
+        db.ensure_stores().await?;
+        return Ok(BootstrappedAgent { db, pubkey });
+    }
+    let meta = AgentMeta {
+        display_name: Some(display_name.to_string()),
+        ..Default::default()
+    };
+    let (db, pubkey) =
+        create_agent_db(user, display_name, &AgentDbConfig::default(), &meta).await?;
+    Ok(BootstrappedAgent { db, pubkey })
+}
+
 /// Stage 1 bootstrap: materialize an Agent DB for each yaml agent entry.
 /// Idempotent — re-runs reuse the existing DB (matched by `agent:<name>`
 /// settings.name) and refresh config/meta to mirror the yaml.
