@@ -73,11 +73,12 @@ impl Tool for WebFetch {
         arguments: Value,
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        use crate::tool::ToolError;
         Box::pin(async move {
             let url = arguments
                 .get("url")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing 'url' argument".to_string())?;
+                .ok_or_else(|| ToolError::InvalidArgument("Missing 'url' argument".into()))?;
 
             let method = arguments
                 .get("method")
@@ -109,13 +110,13 @@ impl Tool for WebFetch {
             let response = request
                 .send()
                 .await
-                .map_err(|e| format!("HTTP request failed: {e}"))?;
+                .map_err(|e| ToolError::Network(format!("HTTP request failed: {e}")))?;
 
             let status = response.status();
             let body = response
                 .text()
                 .await
-                .map_err(|e| format!("Failed to read response body: {e}"))?;
+                .map_err(|e| ToolError::Network(format!("Failed to read response body: {e}")))?;
             debug!(%status, body_len = body.len(), %url, "HTTP response received");
 
             let mut result = format!("[{status}]\n{body}");

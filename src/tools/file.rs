@@ -30,11 +30,12 @@ impl Tool for ReadFile {
         arguments: Value,
         _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + '_>> {
+        use crate::tool::ToolError;
         Box::pin(async move {
             let path = arguments
                 .get("path")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing 'path' argument".to_string())?;
+                .ok_or_else(|| ToolError::InvalidArgument("Missing 'path' argument".into()))?;
 
             debug!(path, "Reading file");
             let content = tokio::fs::read_to_string(path)
@@ -92,16 +93,17 @@ impl Tool for WriteFile {
         arguments: Value,
         _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + '_>> {
+        use crate::tool::ToolError;
         Box::pin(async move {
             let path = arguments
                 .get("path")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing 'path' argument".to_string())?;
+                .ok_or_else(|| ToolError::InvalidArgument("Missing 'path' argument".into()))?;
 
             let content = arguments
                 .get("content")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "Missing 'content' argument".to_string())?;
+                .ok_or_else(|| ToolError::InvalidArgument("Missing 'content' argument".into()))?;
 
             info!(path, bytes = content.len(), "Writing file");
             tokio::fs::write(path, content)
