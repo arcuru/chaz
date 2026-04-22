@@ -40,6 +40,7 @@ pub const CONFIG_STORE: &str = "config";
 pub const MEMORY_STORE: &str = "memory";
 pub const META_STORE: &str = "meta";
 pub const HISTORY_STORE: &str = "history";
+pub const MEMORY_BANKS_STORE: &str = "memory_banks";
 
 const BLOB_KEY: &str = "value";
 
@@ -109,6 +110,32 @@ pub struct SessionHistoryEntry {
     pub joined_at: DateTime<Utc>,
 }
 
+/// Permission this agent holds on a referenced memory bank.
+///
+/// Mirrors the relevant axis of eidetica's permission model at the agent
+/// level: a cached hint about what this agent can do. Actual authority
+/// still lives in the bank's `AuthSettings`; this field is a
+/// mirror/display cache written alongside the grant (same pattern as
+/// `SessionMeta.agents` mirroring session AuthSettings).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BankPermission {
+    Read,
+    Write,
+}
+
+/// Reference from an Agent DB to an external memory bank DB it has been
+/// granted access to. One row per bank in the `memory_banks` store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryBankRef {
+    /// Peer-local display name for this bank (how the LLM refers to it).
+    pub name: String,
+    /// Eidetica DB root ID of the bank (stable global identity).
+    pub db_id: String,
+    /// What this agent's key can do on the bank.
+    pub permission: BankPermission,
+}
+
 /// Handle over the eidetica `Database` that holds an agent's state.
 #[derive(Clone)]
 pub struct AgentDb {
@@ -157,8 +184,72 @@ impl AgentDb {
         txn.get_store::<DocStore>(META_STORE).await?;
         txn.get_store::<Table<SessionHistoryEntry>>(HISTORY_STORE)
             .await?;
+        txn.get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
+            .await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Memory bank references (Memory Banks Stage 9.B)
+    // -----------------------------------------------------------------
+
+    /// List every external memory bank this agent has been granted access
+    /// to. The agent's own DB (with its self `memory` subtree) is *not*
+    /// included — self memory is implicit.
+    pub async fn list_memory_banks(&self) -> anyhow::Result<Vec<MemoryBankRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
+            .await?;
+        let rows = store.search(|_: &MemoryBankRef| true).await?;
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// Add or update a memory bank reference. If a row with the same
+    /// `name` exists, it's replaced so the permission / db_id reflect the
+    /// latest grant. `name` is the caller-supplied peer-local alias.
+    pub async fn attach_memory_bank(&self, bank_ref: MemoryBankRef) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
+            .await?;
+        let existing = store
+            .search(|r: &MemoryBankRef| r.name == bank_ref.name)
+            .await?;
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        store.insert(bank_ref).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Remove the reference with the given peer-local name. Returns true
+    /// if a row was removed. No-op on an unknown name.
+    pub async fn detach_memory_bank(&self, name: &str) -> anyhow::Result<bool> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
+            .await?;
+        let existing = store.search(|r: &MemoryBankRef| r.name == name).await?;
+        let removed = !existing.is_empty();
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        txn.commit().await?;
+        Ok(removed)
+    }
+
+    /// Find a single bank reference by its peer-local name. Used by the
+    /// recall/remember tool path to resolve `bank` parameter → `db_id`.
+    pub async fn find_memory_bank(&self, name: &str) -> anyhow::Result<Option<MemoryBankRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
+            .await?;
+        let mut rows = store.search(|r: &MemoryBankRef| r.name == name).await?;
+        Ok(rows.pop().map(|(_, r)| r))
     }
 }
 
@@ -490,5 +581,120 @@ mod tests {
             Some(77),
             "yaml should not overwrite existing DB config"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Memory bank references (Stage 9.B)
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a fresh peer + create one AgentDb. Returns `(user,
+    /// db)` — the `user` must outlive the `db` or eidetica's Instance
+    /// drops and subsequent reads fail with "Instance has been dropped".
+    async fn peer_with_agent_db() -> (User, AgentDb) {
+        let mut user = test_peer_user().await;
+        let (db, _) = create_agent_db(
+            &mut user,
+            "alpha",
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some("alpha".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (user, db)
+    }
+
+    #[tokio::test]
+    async fn memory_banks_empty_by_default() {
+        let (_user, db) = peer_with_agent_db().await;
+        assert!(db.list_memory_banks().await.unwrap().is_empty());
+        assert!(db.find_memory_bank("anything").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_and_list_memory_banks() {
+        let (_user, db) = peer_with_agent_db().await;
+        let ref1 = MemoryBankRef {
+            name: "patrick".to_string(),
+            db_id: "sha256:aaaa".to_string(),
+            permission: BankPermission::Read,
+        };
+        let ref2 = MemoryBankRef {
+            name: "projects".to_string(),
+            db_id: "sha256:bbbb".to_string(),
+            permission: BankPermission::Write,
+        };
+        db.attach_memory_bank(ref1.clone()).await.unwrap();
+        db.attach_memory_bank(ref2.clone()).await.unwrap();
+
+        let mut banks = db.list_memory_banks().await.unwrap();
+        banks.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(banks, vec![ref1, ref2]);
+    }
+
+    #[tokio::test]
+    async fn attach_replaces_existing_by_name() {
+        // Re-attaching under the same name updates db_id + permission
+        // rather than leaving two rows.
+        let (_user, db) = peer_with_agent_db().await;
+        db.attach_memory_bank(MemoryBankRef {
+            name: "patrick".to_string(),
+            db_id: "sha256:aaaa".to_string(),
+            permission: BankPermission::Read,
+        })
+        .await
+        .unwrap();
+        db.attach_memory_bank(MemoryBankRef {
+            name: "patrick".to_string(),
+            db_id: "sha256:cccc".to_string(),
+            permission: BankPermission::Write,
+        })
+        .await
+        .unwrap();
+
+        let banks = db.list_memory_banks().await.unwrap();
+        assert_eq!(banks.len(), 1);
+        assert_eq!(banks[0].db_id, "sha256:cccc");
+        assert_eq!(banks[0].permission, BankPermission::Write);
+    }
+
+    #[tokio::test]
+    async fn detach_removes_and_reports_absence() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.attach_memory_bank(MemoryBankRef {
+            name: "patrick".to_string(),
+            db_id: "sha256:aaaa".to_string(),
+            permission: BankPermission::Read,
+        })
+        .await
+        .unwrap();
+        assert!(db.detach_memory_bank("patrick").await.unwrap());
+        assert!(db.list_memory_banks().await.unwrap().is_empty());
+        // Second detach is a no-op; returns false.
+        assert!(!db.detach_memory_bank("patrick").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn find_by_name_resolves_ref() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.attach_memory_bank(MemoryBankRef {
+            name: "patrick".to_string(),
+            db_id: "sha256:aaaa".to_string(),
+            permission: BankPermission::Write,
+        })
+        .await
+        .unwrap();
+
+        let found = db
+            .find_memory_bank("patrick")
+            .await
+            .unwrap()
+            .expect("found");
+        assert_eq!(found.db_id, "sha256:aaaa");
+        assert_eq!(found.permission, BankPermission::Write);
+
+        assert!(db.find_memory_bank("missing").await.unwrap().is_none());
     }
 }

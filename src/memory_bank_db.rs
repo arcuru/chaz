@@ -171,7 +171,9 @@ mod tests {
             display_name: Some("patrick".to_string()),
             description: Some("notes about Patrick".to_string()),
         };
-        let (bank, pubkey) = create_memory_bank(&mut user, "patrick", &meta).await.unwrap();
+        let (bank, pubkey) = create_memory_bank(&mut user, "patrick", &meta)
+            .await
+            .unwrap();
 
         assert_eq!(bank.read_meta().await.unwrap(), meta);
         // Returned pubkey is really the one held by the user for this DB.
@@ -185,7 +187,9 @@ mod tests {
             display_name: Some("projects".to_string()),
             ..Default::default()
         };
-        let (created, _) = create_memory_bank(&mut user, "projects", &meta).await.unwrap();
+        let (created, _) = create_memory_bank(&mut user, "projects", &meta)
+            .await
+            .unwrap();
         let created_id = created.id();
 
         let (found, _) = find_memory_bank(&user, "projects").await.expect("found");
