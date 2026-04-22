@@ -19,6 +19,7 @@ use crate::backends::BackendManager;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
 use crate::gateway::ApprovalExchange;
+use crate::memory_bank_index::MemoryBankIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
@@ -64,6 +65,7 @@ pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
     agent_index: AgentIndex,
+    memory_bank_index: MemoryBankIndex,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -86,6 +88,7 @@ impl Server {
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
         agent_index: AgentIndex,
+        memory_bank_index: MemoryBankIndex,
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
@@ -98,6 +101,7 @@ impl Server {
             registry,
             agents,
             agent_index,
+            memory_bank_index,
             tools,
             policies,
             security,
@@ -125,6 +129,10 @@ impl Server {
 
     pub fn agent_index(&self) -> &AgentIndex {
         &self.agent_index
+    }
+
+    pub fn memory_bank_index(&self) -> &MemoryBankIndex {
+        &self.memory_bank_index
     }
 
     /// Rebuild the runtime snapshot for `agent` from its Living Agent DB's
@@ -656,6 +664,7 @@ mod tests {
                 .unwrap(),
         );
         let index = AgentIndex::new(registry.central_db().clone());
+        let bank_index = MemoryBankIndex::new(registry.central_db().clone());
         let tools = Arc::new(ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = SecurityContext {
@@ -669,6 +678,7 @@ mod tests {
             registry.clone(),
             agents,
             index,
+            bank_index,
             tools,
             policies,
             security,

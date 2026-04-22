@@ -12,6 +12,7 @@ mod grants;
 mod heartbeat;
 mod mcp;
 mod memory_bank_db;
+mod memory_bank_index;
 mod openai;
 mod role;
 mod runtime;
@@ -125,6 +126,12 @@ async fn main() -> anyhow::Result<()> {
     // inverse "DBs where key K has permission P" query).
     let agent_index_store = agent_index::AgentIndex::new(central_db.clone());
     agent_index_store.sync_from_bootstrap(&agent_dbs).await?;
+
+    // Memory Banks Stage 9.D: peer-local index of bank DBs this peer hosts,
+    // maintained alongside the agent index. Same rationale (no inverse
+    // list-my-DBs query in eidetica). Populated by `/memory new` + `/memory
+    // import` — nothing populates it at startup yet.
+    let memory_bank_index_store = memory_bank_index::MemoryBankIndex::new(central_db.clone());
 
     // Build secret store backed by the central eidetica database.
     let secret_store = security::SecretStore::new(central_db.clone()).await;
@@ -266,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         agent_registry,
         agent_index_store,
+        memory_bank_index_store,
         tool_registry,
         policies,
         security_ctx,

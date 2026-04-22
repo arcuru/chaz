@@ -570,6 +570,38 @@ impl Gateway for MatrixGateway {
                 }
             }
         );
+        register_shared!(
+            "memory",
+            "new|list|delete <arg>".to_string(),
+            "Create, list, or delete a memory bank on this peer",
+            |text| {
+                let arg = matrix_args(&text);
+                let mut parts = arg.trim().splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("").trim();
+                let rest = parts.next().unwrap_or("").trim();
+                match sub {
+                    "list" | "" => Some(Command::MemoryList),
+                    "new" if !rest.is_empty() => {
+                        let (name, desc) = match rest.split_once(char::is_whitespace) {
+                            Some((n, r)) => (n.trim(), Some(r.trim().to_string())),
+                            None => (rest, None),
+                        };
+                        if name.is_empty() {
+                            None
+                        } else {
+                            Some(Command::MemoryNew {
+                                name: name.to_string(),
+                                description: desc.filter(|s| !s.is_empty()),
+                            })
+                        }
+                    }
+                    "delete" | "del" if !rest.is_empty() => {
+                        Some(Command::MemoryDelete(rest.to_string()))
+                    }
+                    _ => None,
+                }
+            }
+        );
 
         // --- Matrix channel ops (attach/detach are gateway-local so we can
         //     install the response callback on the new session immediately) ---

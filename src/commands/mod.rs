@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 mod agent;
 mod heartbeat;
+mod memory;
 mod session;
 
 /// Parsed, transport-neutral command intent.
@@ -90,6 +91,18 @@ pub enum Command {
         field: String,
         value: String,
     },
+
+    // --- Memory banks (Memory Banks Stage 9.D) ---
+    /// Create a new Memory Bank DB on this peer.
+    MemoryNew {
+        name: String,
+        description: Option<String>,
+    },
+    /// List every Memory Bank this peer hosts.
+    MemoryList,
+    /// Unregister a Memory Bank locally (index entry removed; DB preserved
+    /// for archive, same semantics as `AgentDelete`).
+    MemoryDelete(String),
 
     // --- Heartbeat rules (Stage 4b) ---
     /// Add or upsert a heartbeat rule on the current session.
@@ -188,6 +201,11 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             field,
             value,
         } => agent::agent_set(&agent_ref, &field, &value, ctx).await,
+        Command::MemoryNew { name, description } => {
+            memory::memory_new(&name, description.as_deref(), ctx).await
+        }
+        Command::MemoryList => memory::memory_list(ctx).await,
+        Command::MemoryDelete(r) => memory::memory_delete(&r, ctx).await,
         Command::HeartbeatAdd {
             id,
             cron,

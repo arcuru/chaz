@@ -224,6 +224,38 @@ fn parse_chat_line(
         return Some(ChatAction::Dispatch(Command::AgentsList));
     }
 
+    // --- /memory: bank CRUD (Stage 9.D) ---
+    if text == "/memory" || text == "/memory list" {
+        return Some(ChatAction::Dispatch(Command::MemoryList));
+    }
+    if let Some(arg) = text.strip_prefix("/memory new ") {
+        let trimmed = arg.trim();
+        // First token is the name; remainder (optional) is description.
+        let (name, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((n, r)) => (n.trim(), Some(r.trim().to_string())),
+            None => (trimmed, None),
+        };
+        if name.is_empty() {
+            show_error(
+                app,
+                "Usage: /memory new <name> [description...]".to_string(),
+            );
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::MemoryNew {
+            name: name.to_string(),
+            description: rest.filter(|s| !s.is_empty()),
+        }));
+    }
+    if let Some(arg) = text.strip_prefix("/memory delete ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::MemoryDelete(r)));
+        }
+        show_error(app, "Usage: /memory delete <name|db_id>".to_string());
+        return None;
+    }
+
     if text == "/heartbeat" || text == "/heartbeat list" {
         return Some(ChatAction::Dispatch(Command::HeartbeatList));
     }
@@ -406,6 +438,11 @@ fn help_text(_session_db: &eidetica::Database) -> String {
         "  /agent delete <ref>   — unregister a Living Agent (DB preserved for archive)",
         "  /agent share <ref>    — generate a share ticket for an agent's DB",
         "  /agent import <ticket>— sync + register an agent DB from a ticket",
+        "",
+        "Memory banks:",
+        "  /memory list          — list memory banks this peer hosts",
+        "  /memory new <name> [description...] — create a new bank on this peer",
+        "  /memory delete <ref>  — unregister a bank (DB preserved)",
         "",
         "Heartbeat:",
         "  /heartbeat list       — list heartbeat rules on this session",

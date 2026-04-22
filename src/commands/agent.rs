@@ -564,6 +564,7 @@ mod tests {
         );
         let central = registry.central_db().clone();
         let index = AgentIndex::new(central.clone());
+        let bank_index = crate::memory_bank_index::MemoryBankIndex::new(central.clone());
         let tools = Arc::new(crate::tool::ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = crate::security::SecurityContext {
@@ -577,6 +578,7 @@ mod tests {
             registry.clone(),
             agents,
             index,
+            bank_index,
             tools,
             policies,
             security,
