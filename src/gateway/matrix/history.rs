@@ -15,14 +15,12 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
 
     'outer: while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
-            if let Some((sender, content)) = message
-                .event
+            let raw = message.raw();
+            if let Some((sender, content)) = raw
                 .get_field::<String>("sender")
                 .unwrap_or(None)
                 .zip(
-                    message
-                        .event
-                        .get_field::<RoomMessageEventContent>("content")
+                    raw.get_field::<RoomMessageEventContent>("content")
                         .unwrap_or(None),
                 )
             {
@@ -60,8 +58,7 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
                     };
 
                     // Use event origin_server_ts if available, otherwise now
-                    let timestamp = message
-                        .event
+                    let timestamp = raw
                         .get_field::<u64>("origin_server_ts")
                         .unwrap_or(None)
                         .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts as i64))

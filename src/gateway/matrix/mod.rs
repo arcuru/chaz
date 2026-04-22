@@ -228,7 +228,7 @@ impl Gateway for MatrixGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let config = Arc::new(self.config);
 
-        let mut bot = Bot::new(BotConfig {
+        let mut bot = BotConfig {
             command_prefix: None,
             room_size_limit: config.room_size_limit,
             login: Login {
@@ -239,12 +239,9 @@ impl Gateway for MatrixGateway {
             name: Some("chaz".to_string()),
             allow_list: config.allow_list.clone(),
             state_dir: config.state_dir.clone(),
-        })
-        .await;
-
-        if let Err(e) = bot.login().await {
-            error!("Error logging in: {e}");
         }
+        .login()
+        .await?;
 
         bot.join_rooms();
 

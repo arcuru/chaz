@@ -281,14 +281,12 @@ pub async fn get_context(
 
     'outer: while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
-            if let Some((sender, content)) = message
-                .event
+            let raw = message.raw();
+            if let Some((sender, content)) = raw
                 .get_field::<String>("sender")
                 .unwrap_or(None)
                 .zip(
-                    message
-                        .event
-                        .get_field::<RoomMessageEventContent>("content")
+                    raw.get_field::<RoomMessageEventContent>("content")
                         .unwrap_or(None),
                 )
             {

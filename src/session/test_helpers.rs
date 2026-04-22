@@ -3,8 +3,6 @@
 //! Only compiled under `#[cfg(test)]` and used to avoid duplicating the
 //! ~30-LOC registry setup across agents/keys/registry test modules.
 
-#![cfg(test)]
-
 use super::*;
 use crate::agent::AgentRegistry;
 use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
