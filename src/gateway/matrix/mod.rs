@@ -572,8 +572,8 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "memory",
-            "new|list|delete|grant|revoke <arg>".to_string(),
-            "Create, list, delete, grant, or revoke a memory bank",
+            "new|list|delete|grant|revoke|share|import <arg>".to_string(),
+            "Manage memory banks: create/list/delete/grant/revoke/share/import",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -630,6 +630,8 @@ impl Gateway for MatrixGateway {
                             })
                         }
                     }
+                    "share" if !rest.is_empty() => Some(Command::MemoryShare(rest.to_string())),
+                    "import" if !rest.is_empty() => Some(Command::MemoryImport(rest.to_string())),
                     _ => None,
                 }
             }

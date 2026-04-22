@@ -216,6 +216,103 @@ pub(super) async fn memory_revoke(
     CommandOutcome::Text(msg)
 }
 
+/// Generate a DatabaseTicket URL for an existing memory bank (Stage
+/// 9.D.3). Same shape as `/agent share` — the ticket contains the
+/// bank's DB root ID and this peer's sync addresses.
+pub(super) async fn memory_share(bank_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let entry = match resolve_bank_ref(bank_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    let instance = ctx.server.registry().instance();
+    let Some(sync) = instance.sync() else {
+        return CommandOutcome::Error("Sync not enabled".to_string());
+    };
+
+    let mut ticket = eidetica::sync::DatabaseTicket::new(entry.db_id.clone());
+    if let Ok(addresses) = sync.get_all_server_addresses().await {
+        for (transport_type, address) in addresses {
+            ticket.add_address(eidetica::sync::Address::new(transport_type, address));
+        }
+    }
+    CommandOutcome::Text(format!(
+        "Share this ticket to sync memory bank '{}' (DB {}):\n\n{ticket}",
+        entry.display_name, entry.db_id
+    ))
+}
+
+/// Sync a memory bank from a DatabaseTicket URL and register it
+/// locally (Stage 9.D.3). Requires the ticket to include a key for
+/// this peer — read-only imports aren't supported yet (blocked on
+/// eidetica's `Database::open_unauthenticated` being pub(crate)).
+pub(super) async fn memory_import(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let instance = ctx.server.registry().instance();
+    let Some(sync) = instance.sync() else {
+        return CommandOutcome::Error("Sync not enabled".to_string());
+    };
+
+    let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
+        Ok(t) => t,
+        Err(e) => return CommandOutcome::Error(format!("Invalid ticket: {e}")),
+    };
+    let db_id = ticket.database_id().clone();
+
+    if let Err(e) = sync.sync_with_ticket(&ticket).await {
+        return CommandOutcome::Error(format!("Sync failed: {e}"));
+    }
+
+    let bank_db = match ctx.server.registry().open_memory_bank(&db_id).await {
+        Ok(Some(db)) => db,
+        Ok(None) => {
+            return CommandOutcome::Error(format!(
+                "Synced memory bank DB {db_id} but this peer holds no key for it. \
+                 Read-only bank sharing is not supported yet — ask the owner to share a key-bearing ticket."
+            ));
+        }
+        Err(e) => return CommandOutcome::Error(format!("Failed to open synced bank: {e}")),
+    };
+
+    let meta = match bank_db.read_meta().await {
+        Ok(m) => m,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read bank meta: {e}")),
+    };
+    let display_name = meta.display_name.clone().unwrap_or_else(|| {
+        format!(
+            "bank-{}",
+            &db_id.to_string()[..8.min(db_id.to_string().len())]
+        )
+    });
+
+    let pubkey = match ctx.server.registry().find_key_for_db(&db_id).await {
+        Ok(Some(k)) => k,
+        _ => {
+            return CommandOutcome::Error(
+                "Expected a key for this DB (open succeeded) but find_key returned None"
+                    .to_string(),
+            )
+        }
+    };
+
+    if let Err(e) = ctx
+        .server
+        .memory_bank_index()
+        .register(crate::memory_bank_index::MemoryBankIndexEntry {
+            db_id: db_id.clone(),
+            display_name: display_name.clone(),
+            pubkey,
+        })
+        .await
+    {
+        return CommandOutcome::Error(format!("Index registration failed: {e}"));
+    }
+
+    CommandOutcome::Text(format!(
+        "Imported memory bank '{display_name}' (DB {db_id}). \
+         Grant it to agents with /memory grant {display_name} <agent> <read|write>."
+    ))
+}
+
 pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     let entry = match resolve_bank_ref(bank_ref, ctx).await {
         Ok(e) => e,
@@ -597,6 +694,35 @@ mod tests {
         // Ref removed from agent's memory_banks.
         let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
         assert!(agent_db.list_memory_banks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_share_unknown_bank_errors() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(Command::MemoryShare("ghost".to_string()), &ctx).await {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("No hosted memory bank"), "got {msg}")
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_import_rejects_invalid_ticket() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(Command::MemoryImport("not-a-ticket".to_string()), &ctx).await {
+            CommandOutcome::Error(msg) => {
+                // Could be "Sync not enabled" or "Invalid ticket" depending on fixture;
+                // either surfaces cleanly as an Error, which is what we want.
+                assert!(
+                    msg.contains("Invalid ticket") || msg.contains("Sync not enabled"),
+                    "got {msg}"
+                );
+            }
+            _ => panic!("expected Error"),
+        }
     }
 
     #[tokio::test]

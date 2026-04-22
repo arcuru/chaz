@@ -299,6 +299,22 @@ fn parse_chat_line(
             agent_ref: agent.to_string(),
         }));
     }
+    if let Some(arg) = text.strip_prefix("/memory share ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::MemoryShare(r)));
+        }
+        show_error(app, "Usage: /memory share <bank>".to_string());
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/memory import ") {
+        let t = arg.trim().to_string();
+        if !t.is_empty() {
+            return Some(ChatAction::Dispatch(Command::MemoryImport(t)));
+        }
+        show_error(app, "Usage: /memory import <ticket>".to_string());
+        return None;
+    }
 
     if text == "/heartbeat" || text == "/heartbeat list" {
         return Some(ChatAction::Dispatch(Command::HeartbeatList));
@@ -489,6 +505,8 @@ fn help_text(_session_db: &eidetica::Database) -> String {
         "  /memory delete <ref>  — unregister a bank (DB preserved)",
         "  /memory grant <bank> <agent> <read|write> — grant an agent access to a bank",
         "  /memory revoke <bank> <agent> — revoke an agent's access",
+        "  /memory share <bank>  — generate a share ticket for a bank's DB",
+        "  /memory import <ticket>— sync + register a bank DB from a ticket",
         "",
         "Heartbeat:",
         "  /heartbeat list       — list heartbeat rules on this session",

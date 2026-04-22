@@ -116,6 +116,12 @@ pub enum Command {
         bank_ref: String,
         agent_ref: String,
     },
+    /// Generate a `DatabaseTicket` URL for a memory bank so another peer
+    /// can import it via `/memory import`.
+    MemoryShare(String),
+    /// Sync a memory bank from a `DatabaseTicket` URL and register it in
+    /// this peer's MemoryBankIndex.
+    MemoryImport(String),
 
     // --- Heartbeat rules (Stage 4b) ---
     /// Add or upsert a heartbeat rule on the current session.
@@ -228,6 +234,8 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             bank_ref,
             agent_ref,
         } => memory::memory_revoke(&bank_ref, &agent_ref, ctx).await,
+        Command::MemoryShare(r) => memory::memory_share(&r, ctx).await,
+        Command::MemoryImport(t) => memory::memory_import(&t, ctx).await,
         Command::HeartbeatAdd {
             id,
             cron,
