@@ -29,9 +29,10 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 | `write_file`  | Write to files                       |
 | `web_fetch`   | HTTP GET/POST                        |
 | `shell`       | Execute commands (approval required) |
-| `remember`    | Store key-value facts                |
-| `recall`      | Search stored facts                  |
-| `spawn_agent` | Delegate to sub-agents               |
+| `remember`           | Store key-value facts (own memory or a granted bank) |
+| `recall`             | Search stored facts                  |
+| `list_memory_banks`  | List shared memory banks this agent can access |
+| `spawn_agent`        | Delegate to sub-agents               |
 
 ## Running
 
