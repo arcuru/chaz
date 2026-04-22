@@ -11,6 +11,7 @@ mod gateway;
 mod grants;
 mod heartbeat;
 mod mcp;
+mod memory_bank_db;
 mod openai;
 mod role;
 mod runtime;
