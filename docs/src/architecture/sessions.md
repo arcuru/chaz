@@ -45,7 +45,7 @@ sequenceDiagram
 
 ## Session Registry
 
-A session is identified solely by the root ID of its own eidetica `Database`. The central `SessionRegistry` holds three index stores — nothing load-bearing about a session lives here:
+A session is identified solely by the root ID of its own eidetica `Database`. The `SessionRegistry` holds three index stores inside the peer-local `chazdb` — nothing load-bearing about a session lives here:
 
 - **`sessions`**: every known `session_db_id` → origin tag (for debugging/listing)
 - **`matrix_channels`**: Matrix `room_id` → `session_db_id` (fan-out supported — one session may receive responses on many rooms)

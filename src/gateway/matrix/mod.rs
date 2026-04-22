@@ -11,13 +11,13 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 
 use headjack::*;
+use matrix_sdk::Room;
+use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::ruma::OwnedEventId;
-use matrix_sdk::Room;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{error, info};
 
 use commands::{get_backend, rate_limit};

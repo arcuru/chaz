@@ -6,11 +6,11 @@
 use super::{CommandContext, CommandOutcome};
 
 /// Resolve a user-supplied ref — either a bank display name or an
-/// eidetica DB ID — to a `MemoryBankIndexEntry`.
+/// eidetica DB ID — to a `HostedEntry`.
 pub(super) async fn resolve_bank_ref(
     bank_ref: &str,
     ctx: &CommandContext<'_>,
-) -> Result<crate::memory_bank_index::MemoryBankIndexEntry, String> {
+) -> Result<crate::hosted_index::HostedEntry, String> {
     let index = ctx.server.memory_bank_index();
     if let Ok(Some(entry)) = index.find_by_name(bank_ref).await {
         return Ok(entry);
@@ -55,7 +55,7 @@ pub(super) async fn memory_new(
     if let Err(e) = ctx
         .server
         .memory_bank_index()
-        .register(crate::memory_bank_index::MemoryBankIndexEntry {
+        .register(crate::hosted_index::HostedEntry {
             db_id: bank.id(),
             display_name: name.to_string(),
             pubkey,
@@ -290,14 +290,14 @@ pub(super) async fn memory_import(ticket_str: &str, ctx: &CommandContext<'_>) ->
             return CommandOutcome::Error(
                 "Expected a key for this DB (open succeeded) but find_key returned None"
                     .to_string(),
-            )
+            );
         }
     };
 
     if let Err(e) = ctx
         .server
         .memory_bank_index()
-        .register(crate::memory_bank_index::MemoryBankIndexEntry {
+        .register(crate::hosted_index::HostedEntry {
             db_id: db_id.clone(),
             display_name: display_name.clone(),
             pubkey,
@@ -338,15 +338,14 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
-    use crate::agent_index::AgentIndex;
     use crate::backends::BackendManager;
-    use crate::memory_bank_index::MemoryBankIndex;
+    use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -391,9 +390,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let central = registry.central_db().clone();
-        let index = AgentIndex::new(central.clone());
-        let bank_index = MemoryBankIndex::new(central.clone());
+        let chazdb = registry.chazdb().clone();
+        let index = HostedIndex::agents(chazdb.clone());
+        let bank_index = HostedIndex::memory_banks(chazdb.clone());
         let tools = Arc::new(crate::tool::ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = crate::security::SecurityContext {
@@ -414,7 +413,7 @@ mod tests {
             std::collections::HashMap::new(),
             Default::default(),
         );
-        let secrets = SecretStore::new(central).await;
+        let secrets = SecretStore::new(chazdb).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
@@ -559,12 +558,14 @@ mod tests {
         }
 
         // Index row gone.
-        assert!(server
-            .memory_bank_index()
-            .find_by_name("patrick")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .memory_bank_index()
+                .find_by_name("patrick")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // DB itself is still openable (archive preserved).
         assert!(registry.open_memory_bank(&db_id).await.unwrap().is_some());

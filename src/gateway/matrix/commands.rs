@@ -8,18 +8,18 @@
 use crate::backends::{BackendManager, ChatContext, Message};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{get_role, RoleDetails};
+use crate::role::{RoleDetails, get_role};
 use crate::security::SecretStore;
 use crate::session::{SessionMeta, SessionRegistry};
 
 use headjack::*;
 use matrix_sdk::{
+    Room, RoomMemberships,
     room::MessagesOptions,
     ruma::{
-        events::room::message::{MessageType, RoomMessageEventContent},
         OwnedUserId,
+        events::room::message::{MessageType, RoomMessageEventContent},
     },
-    Room, RoomMemberships,
 };
 use openai_api_rs::v1::chat_completion::MessageRole;
 use regex::Regex;

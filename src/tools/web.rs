@@ -1,6 +1,6 @@
 use crate::grants::NetworkGrant;
-use crate::security::network::EndpointPattern as PolicyEndpoint;
 use crate::security::NetworkPolicy;
+use crate::security::network::EndpointPattern as PolicyEndpoint;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;

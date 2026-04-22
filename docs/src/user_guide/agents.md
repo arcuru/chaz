@@ -48,15 +48,15 @@ At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on 
 
 Each Agent DB contains five well-known stores:
 
-| Store          | Kind                         | Contents                                                                                |
-| -------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| `config`       | DocStore                     | Serialized `AgentDbConfig`: role, model, allowed_tools, max_iterations, grants, presets |
-| `memory`       | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)    |
-| `meta`         | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar                            |
-| `history`      | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                            |
+| Store          | Kind                         | Contents                                                                                    |
+| -------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
+| `config`       | DocStore                     | Serialized `AgentDbConfig`: role, model, allowed_tools, max_iterations, grants, presets     |
+| `memory`       | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)        |
+| `meta`         | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar                                |
+| `history`      | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                |
 | `memory_banks` | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission) |
 
-The peer maintains two local indexes in its central DB: `hosted_agents` (mapping `db_id → (display_name, pubkey)` for Living Agents) and `memory_banks_hosted` (same shape, for standalone Memory Bank DBs). Both exist because eidetica has no inverse "list DBs this key can access" query.
+The peer maintains two local indexes in its `chazdb` (the peer-local bookkeeping database): an `agents` DocStore for Living Agents and a `memory_banks` DocStore for standalone Memory Bank DBs. Both map `db_id → (display_name, pubkey)` and share the same `HostedIndex` type. Both exist because eidetica has no inverse "list DBs this key can access" query.
 
 ## Session participation
 
@@ -93,7 +93,7 @@ Mentions are case-insensitive and match exact display names. No prefix matching.
 
 A heartbeat rule is a cron-scheduled trigger stored inside the session. The `HeartbeatRunner` on every peer polls hosted sessions every 30s; rules targeting agents this peer hosts get fired. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
 
-`last_fired` is tracked peer-locally in the central DB, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
+`last_fired` is tracked peer-locally in the `chazdb`, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
 
 ### `/heartbeat` commands
 

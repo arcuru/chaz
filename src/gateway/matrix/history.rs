@@ -2,9 +2,9 @@ use crate::session::{EntryType, SessionEntry};
 
 use chrono::Utc;
 use matrix_sdk::{
+    Room,
     room::MessagesOptions,
     ruma::events::room::message::{MessageType, RoomMessageEventContent},
-    Room,
 };
 
 /// Read room message history as SessionEntries for backfilling.

@@ -7,7 +7,7 @@ use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{show_error, show_system_msg, App, ChatAction, TuiMode};
+use super::{App, ChatAction, TuiMode, show_error, show_system_msg};
 
 pub(super) async fn handle_chat_key(
     app: &mut App,

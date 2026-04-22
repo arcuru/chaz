@@ -712,8 +712,8 @@ mod tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fake tool whose next error is configurable per call. Counts invocations
     /// so tests can assert how many times the runtime actually ran it.

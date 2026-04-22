@@ -9,16 +9,16 @@
 //!
 //! There is no "global" scope. The older `MemoryGrant` capability
 //! type, `global_remember`/`global_recall` tools, and the
-//! central-DB `global_memory` store all went away in Stage 9.E —
+//! chazdb `global_memory` store all went away in Stage 9.E —
 //! anything cross-agent is now a shared bank DB.
 
 use crate::agent_db::MemoryEntry;
-use crate::agent_index::AgentIndex;
+use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use chrono::Utc;
-use eidetica::store::Table;
 use eidetica::Database;
+use eidetica::store::Table;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -31,7 +31,7 @@ use tracing::debug;
 async fn open_own_agent_db(
     ctx: &ToolContext,
     registry: &SessionRegistry,
-    index: &AgentIndex,
+    index: &HostedIndex,
 ) -> Result<crate::agent_db::AgentDb, String> {
     let entry = index
         .find_by_name(&ctx.agent_name)
@@ -133,11 +133,11 @@ async fn do_recall(
 /// Store a fact in the running agent's own persistent memory.
 pub struct Remember {
     registry: Arc<SessionRegistry>,
-    agent_index: AgentIndex,
+    agent_index: HostedIndex,
 }
 
 impl Remember {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: AgentIndex) -> Self {
+    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
         Self {
             registry,
             agent_index,
@@ -198,11 +198,11 @@ impl Tool for Remember {
 /// Search the running agent's own memory for facts.
 pub struct Recall {
     registry: Arc<SessionRegistry>,
-    agent_index: AgentIndex,
+    agent_index: HostedIndex,
 }
 
 impl Recall {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: AgentIndex) -> Self {
+    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
         Self {
             registry,
             agent_index,
@@ -359,11 +359,11 @@ async fn unknown_bank_error(
 /// self memory, then uses the names with `remember`/`recall`.
 pub struct ListMemoryBanks {
     registry: Arc<SessionRegistry>,
-    agent_index: AgentIndex,
+    agent_index: HostedIndex,
 }
 
 impl ListMemoryBanks {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: AgentIndex) -> Self {
+    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
         Self {
             registry,
             agent_index,
@@ -490,26 +490,26 @@ async fn search_memory(
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
-    use crate::agent_index::{AgentIndex, AgentIndexEntry};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+    use crate::hosted_index::{HostedEntry, HostedIndex};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
-    /// Full fixture: peer with a SessionRegistry + AgentIndex + one agent's
+    /// Full fixture: peer with a SessionRegistry + HostedIndex + one agent's
     /// DB registered, plus a dummy session so ToolContext has a valid handle.
     async fn fixture(
         agent_name: &str,
     ) -> (
         Instance,
         Arc<SessionRegistry>,
-        AgentIndex,
+        HostedIndex,
         Arc<TokioMutex<Session>>,
-        eidetica::Database, // central db for global tools
+        eidetica::Database, // chazdb handle for tests that need it
     ) {
         let backend = InMemory::new();
         let instance = Instance::open(Box::new(backend)).await.unwrap();
@@ -521,8 +521,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let central_db = registry.central_db().clone();
-        let index = AgentIndex::new(central_db.clone());
+        let chazdb = registry.chazdb().clone();
+        let index = HostedIndex::agents(chazdb.clone());
 
         // Create an Agent DB for the named agent.
         let (agent_db, pubkey) = {
@@ -540,7 +540,7 @@ mod tests {
             .unwrap()
         };
         index
-            .register(AgentIndexEntry {
+            .register(HostedEntry {
                 db_id: agent_db.id(),
                 display_name: agent_name.to_string(),
                 pubkey,
@@ -554,7 +554,7 @@ mod tests {
             Session::new(ConversationId(session_db.root_id().to_string()), session_db).await,
         ));
 
-        (instance, registry, index, session, central_db)
+        (instance, registry, index, session, chazdb)
     }
 
     fn blank_config() -> crate::config::Config {
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn remember_writes_to_own_agent_db() {
-        let (_instance, registry, index, session, _central) = fixture("alpha").await;
+        let (_instance, registry, index, session, _chazdb) = fixture("alpha").await;
         let tool = Remember::new(registry.clone(), index.clone());
         let ctx = make_ctx("alpha", session);
 
@@ -619,7 +619,7 @@ mod tests {
     async fn per_agent_memory_is_isolated() {
         // alpha and beta are separate agents on the same peer. Writing under
         // alpha must not appear under beta's recall.
-        let (_instance, registry, index, session, _central) = fixture("alpha").await;
+        let (_instance, registry, index, session, _chazdb) = fixture("alpha").await;
         let (beta_db, beta_pubkey) = {
             let mut user = registry.user_for_tests().await;
             create_agent_db(
@@ -635,7 +635,7 @@ mod tests {
             .unwrap()
         };
         index
-            .register(AgentIndexEntry {
+            .register(HostedEntry {
                 db_id: beta_db.id(),
                 display_name: "beta".to_string(),
                 pubkey: beta_pubkey,
@@ -717,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn remember_with_bank_writes_to_bank_and_recall_reads_back() {
-        let (_instance, registry, index, session, _central) = fixture("alpha").await;
+        let (_instance, registry, index, session, _chazdb) = fixture("alpha").await;
         let _ = provision_bank(
             &registry,
             "alpha",
@@ -771,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn remember_with_read_only_bank_errors() {
-        let (_instance, registry, index, session, _central) = fixture("alpha").await;
+        let (_instance, registry, index, session, _chazdb) = fixture("alpha").await;
         let _ = provision_bank(
             &registry,
             "alpha",
@@ -795,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_with_unknown_bank_lists_available() {
-        let (_instance, registry, index, session, _central) = fixture("alpha").await;
+        let (_instance, registry, index, session, _chazdb) = fixture("alpha").await;
         let _ = provision_bank(
             &registry,
             "alpha",
@@ -822,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_memory_banks_tool_returns_self_and_attached() {
-        let (_instance, registry, index, session, _central) = fixture("alpha").await;
+        let (_instance, registry, index, session, _chazdb) = fixture("alpha").await;
         let _ = provision_bank(
             &registry,
             "alpha",

@@ -258,8 +258,8 @@ impl BackendManager {
 mod tests {
     use super::*;
     use crate::config::{Backend, BackendType, Model};
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     async fn empty_secrets() -> SecretStore {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();

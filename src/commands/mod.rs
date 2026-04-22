@@ -79,7 +79,7 @@ pub enum Command {
     AgentShare(String),
     /// Sync an agent DB from a DatabaseTicket URL and register it locally.
     AgentImport(String),
-    /// List every Living Agent this peer hosts (from the hosted_agents index).
+    /// List every Living Agent this peer hosts (from the `agents` index).
     AgentHosted,
     /// Unregister a Living Agent locally (index + runtime registry). The
     /// agent DB is preserved for archive — memory and history stay readable.
@@ -120,7 +120,7 @@ pub enum Command {
     /// can import it via `/memory import`.
     MemoryShare(String),
     /// Sync a memory bank from a `DatabaseTicket` URL and register it in
-    /// this peer's MemoryBankIndex.
+    /// this peer's memory-banks index.
     MemoryImport(String),
 
     // --- Heartbeat rules (Stage 4b) ---

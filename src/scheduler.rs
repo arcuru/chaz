@@ -4,7 +4,7 @@
 //! on a cron schedule. The existing server callback machinery handles agent
 //! execution — the scheduler just provides the trigger.
 //!
-//! Schedule state (last_run) is persisted in the central eidetica database
+//! Schedule state (last_run) is persisted in the chazdb
 //! so that restarts don't cause duplicate or missed runs.
 
 use crate::backends::BackendManager;
@@ -13,15 +13,15 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::store::Table;
 use eidetica::Database;
+use eidetica::store::Table;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-/// Persisted schedule state in eidetica central DB.
+/// Persisted schedule state in eidetica chazdb.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScheduleState {
     name: String,
@@ -44,25 +44,25 @@ pub struct Scheduler {
     records: Arc<Mutex<Vec<ScheduleRecord>>>,
     server: Arc<Server>,
     backend: BackendManager,
-    central_db: Database,
+    chazdb: Database,
 }
 
 impl Scheduler {
     /// Create a new scheduler from config.
     ///
     /// Parses cron expressions, validates configs, and loads persisted last_run
-    /// times from the central eidetica database. Invalid schedules are logged
+    /// times from the chazdb. Invalid schedules are logged
     /// and skipped.
     pub async fn new(
         configs: Vec<ScheduleConfig>,
         server: Arc<Server>,
         backend: BackendManager,
-        central_db: Database,
+        chazdb: Database,
     ) -> Self {
         let mut records = Vec::new();
 
         // Load persisted state
-        let persisted = load_schedule_states(&central_db).await;
+        let persisted = load_schedule_states(&chazdb).await;
 
         for cfg in configs {
             if !cfg.enabled {
@@ -108,7 +108,7 @@ impl Scheduler {
             records: Arc::new(Mutex::new(records)),
             server,
             backend,
-            central_db,
+            chazdb,
         }
     }
 
@@ -231,7 +231,7 @@ impl Scheduler {
         }
 
         // Persist to eidetica
-        if let Err(e) = save_schedule_state(&self.central_db, name, now).await {
+        if let Err(e) = save_schedule_state(&self.chazdb, name, now).await {
             warn!(schedule = %name, "Failed to persist last_run: {e}");
         }
     }
@@ -281,7 +281,7 @@ fn next_run_after(cron: &Schedule, last_run: Option<DateTime<Utc>>) -> Option<Da
     }
 }
 
-/// Load all persisted schedule states from the central DB.
+/// Load all persisted schedule states from the chazdb.
 async fn load_schedule_states(db: &Database) -> Vec<ScheduleState> {
     let Ok(txn) = db.new_transaction().await else {
         return Vec::new();
@@ -295,7 +295,7 @@ async fn load_schedule_states(db: &Database) -> Vec<ScheduleState> {
     }
 }
 
-/// Persist a schedule's last_run to the central DB.
+/// Persist a schedule's last_run to the chazdb.
 async fn save_schedule_state(
     db: &Database,
     name: &str,
@@ -335,8 +335,8 @@ pub struct ScheduleInfo {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     async fn test_db() -> (Instance, Database) {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();

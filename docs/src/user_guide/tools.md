@@ -4,20 +4,20 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 
 ## Built-in Tools
 
-| Tool            | Risk   | Approval           | Description                                            |
-| --------------- | ------ | ------------------ | ------------------------------------------------------ |
-| `get_time`      | Low    | Never              | Returns the current UTC time                           |
-| `calculate`     | Low    | Never              | Evaluates math expressions (via meval)                 |
-| `read_file`     | Low    | Never              | Reads file contents from disk                          |
-| `remember`           | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank) |
-| `recall`             | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword        |
-| `list_memory_banks`  | Low    | Never              | Lists the memory banks this agent has been granted access to          |
-| `describe_tool`      | Low    | Never              | Returns full description/schema for a tool (discovery) |
-| `compact`            | Low    | Never              | Summarize and compact conversation context             |
-| `write_file`         | Medium | UnlessAutoApproved | Writes content to a file                               |
-| `web_fetch`          | Medium | UnlessAutoApproved | HTTP GET or POST requests                              |
-| `spawn_agent`        | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                        |
-| `shell`              | High   | Always             | Executes a shell command                               |
+| Tool                | Risk   | Approval           | Description                                                           |
+| ------------------- | ------ | ------------------ | --------------------------------------------------------------------- |
+| `get_time`          | Low    | Never              | Returns the current UTC time                                          |
+| `calculate`         | Low    | Never              | Evaluates math expressions (via meval)                                |
+| `read_file`         | Low    | Never              | Reads file contents from disk                                         |
+| `remember`          | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank) |
+| `recall`            | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword        |
+| `list_memory_banks` | Low    | Never              | Lists the memory banks this agent has been granted access to          |
+| `describe_tool`     | Low    | Never              | Returns full description/schema for a tool (discovery)                |
+| `compact`           | Low    | Never              | Summarize and compact conversation context                            |
+| `write_file`        | Medium | UnlessAutoApproved | Writes content to a file                                              |
+| `web_fetch`         | Medium | UnlessAutoApproved | HTTP GET or POST requests                                             |
+| `spawn_agent`       | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                                       |
+| `shell`             | High   | Always             | Executes a shell command                                              |
 
 ## Risk Levels
 

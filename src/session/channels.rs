@@ -1,18 +1,18 @@
 //! Matrix channel bindings (`room_id` ↔ `session_db_id`) as `impl SessionRegistry`.
-//! Stored in the registry DB's `matrix_channels` DocStore.
+//! Stored in the chazdb's `matrix_channels` DocStore.
 
 use crate::types::ConversationId;
 
-use eidetica::store::DocStore;
 use eidetica::Database;
+use eidetica::store::DocStore;
 use tracing::{info, warn};
 
-use super::registry::{SessionRegistry, STORE_MATRIX_CHANNELS};
+use super::registry::{STORE_MATRIX_CHANNELS, SessionRegistry};
 
 impl SessionRegistry {
     /// Return the session bound to a Matrix room, if any.
     pub async fn matrix_channel_for_room(&self, room_id: &str) -> anyhow::Result<Option<String>> {
-        let txn = self.registry_db.new_transaction().await?;
+        let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
         Ok(store.get_string(room_id).await.ok())
     }
@@ -23,7 +23,7 @@ impl SessionRegistry {
         room_id: &str,
         session_db_id: &str,
     ) -> anyhow::Result<()> {
-        let txn = self.registry_db.new_transaction().await?;
+        let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
         store.set_string(room_id, session_db_id).await?;
         txn.commit().await?;
@@ -32,7 +32,7 @@ impl SessionRegistry {
     }
 
     pub async fn detach_matrix_room(&self, room_id: &str) -> anyhow::Result<()> {
-        let txn = self.registry_db.new_transaction().await?;
+        let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
         let _ = store.delete(room_id).await;
         txn.commit().await?;
@@ -41,7 +41,7 @@ impl SessionRegistry {
 
     /// List every (room_id, session_db_id) pair.
     pub async fn list_matrix_channels(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let txn = self.registry_db.new_transaction().await?;
+        let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_MATRIX_CHANNELS).await?;
         let doc = store.get_all().await?;
         Ok(doc

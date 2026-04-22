@@ -14,12 +14,11 @@
 //! to the same session are skipped while an agent is running.
 
 use crate::agent::AgentRegistry;
-use crate::agent_index::AgentIndex;
 use crate::backends::BackendManager;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
 use crate::gateway::ApprovalExchange;
-use crate::memory_bank_index::MemoryBankIndex;
+use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
@@ -28,7 +27,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.
@@ -64,8 +63,8 @@ struct SpawnContext {
 pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
-    agent_index: AgentIndex,
-    memory_bank_index: MemoryBankIndex,
+    agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -87,8 +86,8 @@ impl Server {
     pub fn new(
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
-        agent_index: AgentIndex,
-        memory_bank_index: MemoryBankIndex,
+        agent_index: HostedIndex,
+        memory_bank_index: HostedIndex,
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
@@ -127,11 +126,11 @@ impl Server {
         server
     }
 
-    pub fn agent_index(&self) -> &AgentIndex {
+    pub fn agent_index(&self) -> &HostedIndex {
         &self.agent_index
     }
 
-    pub fn memory_bank_index(&self) -> &MemoryBankIndex {
+    pub fn memory_bank_index(&self) -> &HostedIndex {
         &self.memory_bank_index
     }
 
@@ -622,11 +621,11 @@ impl Server {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
-    use crate::agent_index::AgentIndexEntry;
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::config::Config;
-    use eidetica::backend::database::InMemory;
+    use crate::hosted_index::HostedEntry;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     fn blank_config() -> Config {
         Config {
@@ -663,8 +662,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let index = AgentIndex::new(registry.central_db().clone());
-        let bank_index = MemoryBankIndex::new(registry.central_db().clone());
+        let index = HostedIndex::agents(registry.chazdb().clone());
+        let bank_index = HostedIndex::memory_banks(registry.chazdb().clone());
         let tools = Arc::new(ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = SecurityContext {
@@ -713,7 +712,7 @@ mod tests {
         };
         server
             .agent_index()
-            .register(AgentIndexEntry {
+            .register(HostedEntry {
                 db_id: db.id(),
                 display_name: "alpha".to_string(),
                 pubkey,

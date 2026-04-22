@@ -12,21 +12,21 @@
 //! the Stage 4a mention-aware router (rules can say `@agent ...` in the
 //! `task` text to pin the turn).
 //!
-//! `last_fired` is peer-local (central DB) rather than a rule-DB field
+//! `last_fired` is peer-local (chazdb) rather than a rule-DB field
 //! because multiple peers may host the same rule's target agent, and each
 //! peer fires independently. Keeping `last_fired` out of the synced DB
 //! avoids cross-peer fire-coordination churn.
 
 #![allow(dead_code)]
 
-use crate::agent_index::AgentIndex;
+use crate::hosted_index::HostedIndex;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::store::{DocStore, Table};
 use eidetica::Database;
+use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -92,8 +92,8 @@ pub async fn list_rules(session_db: &Database) -> anyhow::Result<Vec<HeartbeatRu
 }
 
 /// Peer-local timestamp of the last successful fire for a given rule.
-async fn load_last_fired(central_db: &Database, rule_id: &str) -> Option<DateTime<Utc>> {
-    let txn = central_db.new_transaction().await.ok()?;
+async fn load_last_fired(chazdb: &Database, rule_id: &str) -> Option<DateTime<Utc>> {
+    let txn = chazdb.new_transaction().await.ok()?;
     let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await.ok()?;
     let iso = store.get_string(rule_id).await.ok()?;
     DateTime::parse_from_rfc3339(&iso)
@@ -102,11 +102,11 @@ async fn load_last_fired(central_db: &Database, rule_id: &str) -> Option<DateTim
 }
 
 async fn save_last_fired(
-    central_db: &Database,
+    chazdb: &Database,
     rule_id: &str,
     when: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let txn = central_db.new_transaction().await?;
+    let txn = chazdb.new_transaction().await?;
     let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await?;
     store.set_string(rule_id, when.to_rfc3339()).await?;
     txn.commit().await?;
@@ -117,16 +117,16 @@ async fn save_last_fired(
 /// agents this peer hosts.
 pub struct HeartbeatRunner {
     server: Arc<Server>,
-    central_db: Database,
+    chazdb: Database,
     poll_interval: Duration,
     stopped: Arc<Mutex<bool>>,
 }
 
 impl HeartbeatRunner {
-    pub fn new(server: Arc<Server>, central_db: Database) -> Arc<Self> {
+    pub fn new(server: Arc<Server>, chazdb: Database) -> Arc<Self> {
         Arc::new(Self {
             server,
-            central_db,
+            chazdb,
             poll_interval: Duration::from_secs(30),
             stopped: Arc::new(Mutex::new(false)),
         })
@@ -193,7 +193,7 @@ impl HeartbeatRunner {
         session_db_id: &str,
         session_db: &Database,
         rule: &HeartbeatRule,
-        agent_index: &AgentIndex,
+        agent_index: &HostedIndex,
     ) -> anyhow::Result<()> {
         if !rule.enabled {
             return Ok(());
@@ -217,7 +217,7 @@ impl HeartbeatRunner {
         };
 
         let now = Utc::now();
-        let last = load_last_fired(&self.central_db, &rule.id).await;
+        let last = load_last_fired(&self.chazdb, &rule.id).await;
         let next = match last {
             Some(lr) => schedule.after(&lr).next(),
             None => schedule.upcoming(Utc).next(),
@@ -256,7 +256,7 @@ impl HeartbeatRunner {
             })
             .await;
 
-        if let Err(e) = save_last_fired(&self.central_db, &rule.id, now).await {
+        if let Err(e) = save_last_fired(&self.chazdb, &rule.id, now).await {
             error!(rule = %rule.id, "Failed to persist last_fired: {e}");
         }
 
@@ -267,10 +267,10 @@ impl HeartbeatRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::user::User;
-    use eidetica::Instance;
 
     async fn test_session_db() -> (Instance, User, Database) {
         let backend = InMemory::new();

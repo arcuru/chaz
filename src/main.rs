@@ -1,6 +1,5 @@
 mod agent;
 mod agent_db;
-mod agent_index;
 mod backends;
 mod commands;
 mod config;
@@ -10,9 +9,9 @@ mod error;
 mod gateway;
 mod grants;
 mod heartbeat;
+mod hosted_index;
 mod mcp;
 mod memory_bank_db;
-mod memory_bank_index;
 mod openai;
 mod role;
 mod runtime;
@@ -119,22 +118,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
-    let central_db = registry.central_db().clone();
+    let chazdb = registry.chazdb().clone();
 
     // Stage 2 of Living Agents: maintain a local index of which Agent DBs
     // this peer hosts. Needed for O(1) routing in Stage 3 (eidetica has no
     // inverse "DBs where key K has permission P" query).
-    let agent_index_store = agent_index::AgentIndex::new(central_db.clone());
+    let agent_index_store = hosted_index::HostedIndex::agents(chazdb.clone());
     agent_index_store.sync_from_bootstrap(&agent_dbs).await?;
 
     // Memory Banks Stage 9.D: peer-local index of bank DBs this peer hosts,
-    // maintained alongside the agent index. Same rationale (no inverse
-    // list-my-DBs query in eidetica). Populated by `/memory new` + `/memory
+    // same shape as the agent index. Populated by `/memory new` + `/memory
     // import` — nothing populates it at startup yet.
-    let memory_bank_index_store = memory_bank_index::MemoryBankIndex::new(central_db.clone());
+    let memory_bank_index_store = hosted_index::HostedIndex::memory_banks(chazdb.clone());
 
-    // Build secret store backed by the central eidetica database.
-    let secret_store = security::SecretStore::new(central_db.clone()).await;
+    // Build secret store backed by the chazdb.
+    let secret_store = security::SecretStore::new(chazdb.clone()).await;
     if let Some(backends) = &mut config.backends {
         for backend in backends.iter_mut() {
             if let Some(raw_key) = backend.api_key.take() {
@@ -291,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
                     schedules,
                     server.clone(),
                     backends::BackendManager::new(&config.backends, secret_store.clone()),
-                    central_db.clone(),
+                    chazdb.clone(),
                 )
                 .await,
             );
@@ -306,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the heartbeat runner. Polls every 30s across all hosted sessions
     // for due rules whose target agent this peer hosts.
-    let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), central_db);
+    let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chazdb);
     heartbeat_runner.start();
 
     // Run the selected gateway

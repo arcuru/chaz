@@ -158,9 +158,11 @@ mod tests {
     fn test_permissive_allows_all() {
         let policy = NetworkPolicy::permissive();
         assert!(policy.check("https://example.com/foo", "GET").is_ok());
-        assert!(policy
-            .check("https://api.openai.com/v1/chat", "POST")
-            .is_ok());
+        assert!(
+            policy
+                .check("https://api.openai.com/v1/chat", "POST")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -187,12 +189,16 @@ mod tests {
             }],
             true,
         );
-        assert!(policy
-            .check("https://en.wikipedia.org/wiki/Rust", "GET")
-            .is_ok());
-        assert!(policy
-            .check("https://en.wikipedia.org/wiki/Rust", "POST")
-            .is_err());
+        assert!(
+            policy
+                .check("https://en.wikipedia.org/wiki/Rust", "GET")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check("https://en.wikipedia.org/wiki/Rust", "POST")
+                .is_err()
+        );
         assert!(policy.check("https://evil.com", "GET").is_err());
     }
 
@@ -206,12 +212,16 @@ mod tests {
             }],
             true,
         );
-        assert!(policy
-            .check("https://api.example.com/api/v1/data", "GET")
-            .is_ok());
-        assert!(policy
-            .check("https://api.example.com/admin", "GET")
-            .is_err());
+        assert!(
+            policy
+                .check("https://api.example.com/api/v1/data", "GET")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check("https://api.example.com/admin", "GET")
+                .is_err()
+        );
     }
 
     #[test]
@@ -229,9 +239,11 @@ mod tests {
     fn test_ssrf_blocks_internal_hostnames() {
         let policy = NetworkPolicy::permissive();
         assert!(policy.check("http://localhost/admin", "GET").is_err());
-        assert!(policy
-            .check("http://metadata.google.internal/", "GET")
-            .is_err());
+        assert!(
+            policy
+                .check("http://metadata.google.internal/", "GET")
+                .is_err()
+        );
         assert!(policy.check("http://foo.internal/bar", "GET").is_err());
         assert!(policy.check("http://printer.local/status", "GET").is_err());
     }

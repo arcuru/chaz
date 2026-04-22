@@ -15,11 +15,11 @@ use super::{CommandContext, CommandOutcome};
 // -----------------------------------------------------------------------------
 
 /// Resolve a user-supplied ref — either an agent display name or an eidetica
-/// DB ID — to an `AgentIndexEntry`.
+/// DB ID — to a `HostedEntry`.
 pub(super) async fn resolve_agent_ref(
     agent_ref: &str,
     ctx: &CommandContext<'_>,
-) -> Result<crate::agent_index::AgentIndexEntry, String> {
+) -> Result<crate::hosted_index::HostedEntry, String> {
     let index = ctx.server.agent_index();
     if let Ok(Some(entry)) = index.find_by_name(agent_ref).await {
         return Ok(entry);
@@ -198,7 +198,7 @@ pub(super) fn apply_agent_field(
         other => {
             return Err(format!(
                 "Unknown agent field '{other}'. Supported: {SUPPORTED_AGENT_FIELDS}"
-            ))
+            ));
         }
     }
     Ok(())
@@ -254,7 +254,7 @@ pub(super) async fn agent_new(
     if let Err(e) = ctx
         .server
         .agent_index()
-        .register(crate::agent_index::AgentIndexEntry {
+        .register(crate::hosted_index::HostedEntry {
             db_id: db_id.clone(),
             display_name: name.to_string(),
             pubkey: pubkey.clone(),
@@ -363,7 +363,7 @@ pub(super) async fn agent_import(ticket_str: &str, ctx: &CommandContext<'_>) -> 
     if let Err(e) = ctx
         .server
         .agent_index()
-        .register(crate::agent_index::AgentIndexEntry {
+        .register(crate::hosted_index::HostedEntry {
             db_id: db_id.clone(),
             display_name: display_name.clone(),
             pubkey,
@@ -474,7 +474,7 @@ pub(super) async fn agent_set(
             return CommandOutcome::Error(format!(
                 "This peer holds no key for agent '{}' — can't edit a read-only import",
                 entry.display_name
-            ))
+            ));
         }
         Err(e) => return CommandOutcome::Error(format!("Failed to open agent DB: {e}")),
     };
@@ -506,15 +506,15 @@ pub(super) async fn agent_set(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::agent_db::find_agent_db;
-    use crate::agent_index::AgentIndex;
     use crate::backends::BackendManager;
+    use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -562,9 +562,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let central = registry.central_db().clone();
-        let index = AgentIndex::new(central.clone());
-        let bank_index = crate::memory_bank_index::MemoryBankIndex::new(central.clone());
+        let chazdb = registry.chazdb().clone();
+        let index = HostedIndex::agents(chazdb.clone());
+        let bank_index = HostedIndex::memory_banks(chazdb.clone());
         let tools = Arc::new(crate::tool::ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = crate::security::SecurityContext {
@@ -585,7 +585,7 @@ mod tests {
             std::collections::HashMap::new(),
             Default::default(),
         );
-        let secrets = SecretStore::new(central).await;
+        let secrets = SecretStore::new(chazdb).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
@@ -727,13 +727,15 @@ mod tests {
 
         // Gone from runtime registry.
         assert!(server.agents().get("alpha").is_none());
-        // Gone from hosted_agents index.
-        assert!(server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .is_none());
+        // Gone from agents index.
+        assert!(
+            server
+                .agent_index()
+                .find_by_name("alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
         // But the DB is still present (preserved for archive).
         let user = registry.user_for_tests().await;
         assert!(find_agent_db(&user, "alpha").await.is_some());
