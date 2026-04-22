@@ -13,7 +13,7 @@
 //! anything cross-agent is now a shared bank DB.
 
 use crate::agent_db::MemoryEntry;
-use crate::hosted_index::HostedIndex;
+use crate::db_registry::DbRegistry;
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use chrono::Utc;
@@ -31,7 +31,7 @@ use tracing::debug;
 async fn open_own_agent_db(
     ctx: &ToolContext,
     registry: &SessionRegistry,
-    index: &HostedIndex,
+    index: &DbRegistry,
 ) -> Result<crate::agent_db::AgentDb, String> {
     let entry = index
         .find_by_name(&ctx.agent_name)
@@ -133,11 +133,11 @@ async fn do_recall(
 /// Store a fact in the running agent's own persistent memory.
 pub struct Remember {
     registry: Arc<SessionRegistry>,
-    agent_index: HostedIndex,
+    agent_index: DbRegistry,
 }
 
 impl Remember {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
+    pub fn new(registry: Arc<SessionRegistry>, agent_index: DbRegistry) -> Self {
         Self {
             registry,
             agent_index,
@@ -198,11 +198,11 @@ impl Tool for Remember {
 /// Search the running agent's own memory for facts.
 pub struct Recall {
     registry: Arc<SessionRegistry>,
-    agent_index: HostedIndex,
+    agent_index: DbRegistry,
 }
 
 impl Recall {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
+    pub fn new(registry: Arc<SessionRegistry>, agent_index: DbRegistry) -> Self {
         Self {
             registry,
             agent_index,
@@ -359,11 +359,11 @@ async fn unknown_bank_error(
 /// self memory, then uses the names with `remember`/`recall`.
 pub struct ListMemoryBanks {
     registry: Arc<SessionRegistry>,
-    agent_index: HostedIndex,
+    agent_index: DbRegistry,
 }
 
 impl ListMemoryBanks {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
+    pub fn new(registry: Arc<SessionRegistry>, agent_index: DbRegistry) -> Self {
         Self {
             registry,
             agent_index,
@@ -491,7 +491,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
-    use crate::hosted_index::{HostedEntry, HostedIndex};
+    use crate::db_registry::{DbEntry, DbRegistry};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
@@ -500,14 +500,14 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
-    /// Full fixture: peer with a SessionRegistry + HostedIndex + one agent's
+    /// Full fixture: peer with a SessionRegistry + DbRegistry + one agent's
     /// DB registered, plus a dummy session so ToolContext has a valid handle.
     async fn fixture(
         agent_name: &str,
     ) -> (
         Instance,
         Arc<SessionRegistry>,
-        HostedIndex,
+        DbRegistry,
         Arc<TokioMutex<Session>>,
         eidetica::Database, // chazdb handle for tests that need it
     ) {
@@ -522,7 +522,7 @@ mod tests {
                 .unwrap(),
         );
         let chazdb = registry.chazdb().clone();
-        let index = HostedIndex::agents(chazdb.clone());
+        let index = DbRegistry::agents(chazdb.clone());
 
         // Create an Agent DB for the named agent.
         let (agent_db, pubkey) = {
@@ -540,7 +540,7 @@ mod tests {
             .unwrap()
         };
         index
-            .register(HostedEntry {
+            .register(DbEntry {
                 db_id: agent_db.id(),
                 display_name: agent_name.to_string(),
                 pubkey,
@@ -635,7 +635,7 @@ mod tests {
             .unwrap()
         };
         index
-            .register(HostedEntry {
+            .register(DbEntry {
                 db_id: beta_db.id(),
                 display_name: "beta".to_string(),
                 pubkey: beta_pubkey,

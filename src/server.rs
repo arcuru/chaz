@@ -18,7 +18,7 @@ use crate::backends::BackendManager;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
 use crate::gateway::ApprovalExchange;
-use crate::hosted_index::HostedIndex;
+use crate::db_registry::DbRegistry;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
@@ -63,8 +63,8 @@ struct SpawnContext {
 pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
-    agent_index: HostedIndex,
-    memory_bank_index: HostedIndex,
+    agent_index: DbRegistry,
+    memory_bank_index: DbRegistry,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -86,8 +86,8 @@ impl Server {
     pub fn new(
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
-        agent_index: HostedIndex,
-        memory_bank_index: HostedIndex,
+        agent_index: DbRegistry,
+        memory_bank_index: DbRegistry,
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
@@ -126,11 +126,11 @@ impl Server {
         server
     }
 
-    pub fn agent_index(&self) -> &HostedIndex {
+    pub fn agent_index(&self) -> &DbRegistry {
         &self.agent_index
     }
 
-    pub fn memory_bank_index(&self) -> &HostedIndex {
+    pub fn memory_bank_index(&self) -> &DbRegistry {
         &self.memory_bank_index
     }
 
@@ -623,7 +623,7 @@ mod tests {
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::config::Config;
-    use crate::hosted_index::HostedEntry;
+    use crate::db_registry::DbEntry;
     use eidetica::Instance;
     use eidetica::backend::database::InMemory;
 
@@ -662,8 +662,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let index = HostedIndex::agents(registry.chazdb().clone());
-        let bank_index = HostedIndex::memory_banks(registry.chazdb().clone());
+        let index = DbRegistry::agents(registry.chazdb().clone());
+        let bank_index = DbRegistry::memory_banks(registry.chazdb().clone());
         let tools = Arc::new(ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = SecurityContext {
@@ -712,7 +712,7 @@ mod tests {
         };
         server
             .agent_index()
-            .register(HostedEntry {
+            .register(DbEntry {
                 db_id: db.id(),
                 display_name: "alpha".to_string(),
                 pubkey,

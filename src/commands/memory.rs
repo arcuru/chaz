@@ -6,11 +6,11 @@
 use super::{CommandContext, CommandOutcome};
 
 /// Resolve a user-supplied ref — either a bank display name or an
-/// eidetica DB ID — to a `HostedEntry`.
+/// eidetica DB ID — to a `DbEntry`.
 pub(super) async fn resolve_bank_ref(
     bank_ref: &str,
     ctx: &CommandContext<'_>,
-) -> Result<crate::hosted_index::HostedEntry, String> {
+) -> Result<crate::db_registry::DbEntry, String> {
     let index = ctx.server.memory_bank_index();
     if let Ok(Some(entry)) = index.find_by_name(bank_ref).await {
         return Ok(entry);
@@ -55,7 +55,7 @@ pub(super) async fn memory_new(
     if let Err(e) = ctx
         .server
         .memory_bank_index()
-        .register(crate::hosted_index::HostedEntry {
+        .register(crate::db_registry::DbEntry {
             db_id: bank.id(),
             display_name: name.to_string(),
             pubkey,
@@ -297,7 +297,7 @@ pub(super) async fn memory_import(ticket_str: &str, ctx: &CommandContext<'_>) ->
     if let Err(e) = ctx
         .server
         .memory_bank_index()
-        .register(crate::hosted_index::HostedEntry {
+        .register(crate::db_registry::DbEntry {
             db_id: db_id.clone(),
             display_name: display_name.clone(),
             pubkey,
@@ -341,7 +341,7 @@ mod tests {
     use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
-    use crate::hosted_index::HostedIndex;
+    use crate::db_registry::DbRegistry;
     use crate::security::SecretStore;
     use crate::server::Server;
     use eidetica::Instance;
@@ -391,8 +391,8 @@ mod tests {
                 .unwrap(),
         );
         let chazdb = registry.chazdb().clone();
-        let index = HostedIndex::agents(chazdb.clone());
-        let bank_index = HostedIndex::memory_banks(chazdb.clone());
+        let index = DbRegistry::agents(chazdb.clone());
+        let bank_index = DbRegistry::memory_banks(chazdb.clone());
         let tools = Arc::new(crate::tool::ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = crate::security::SecurityContext {

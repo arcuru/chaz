@@ -8,7 +8,7 @@
 //! indices in the chazdb.
 //!
 //! Agent and bank indices are structurally identical — same row shape,
-//! same read/write paths — so a single `HostedIndex` type serves both.
+//! same read/write paths — so a single `DbRegistry` type serves both.
 //! The store name (`agents` vs `memory_banks`) and a label for log
 //! messages are chosen at construction.
 //!
@@ -29,7 +29,7 @@ use tracing::{debug, info};
 /// same shape in both cases: the DB root ID, a display name, and the
 /// pubkey this peer holds for that DB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HostedEntry {
+pub struct DbEntry {
     pub db_id: ID,
     pub display_name: String,
     pub pubkey: PublicKey,
@@ -38,14 +38,14 @@ pub struct HostedEntry {
 /// Cheap handle over a DocStore in the chazdb. Clone-friendly;
 /// eidetica handles concurrency under the hood.
 #[derive(Clone)]
-pub struct HostedIndex {
+pub struct DbRegistry {
     chazdb: Database,
     store_name: &'static str,
     /// Used only in log messages (e.g. "agent", "bank").
     label: &'static str,
 }
 
-impl HostedIndex {
+impl DbRegistry {
     /// Construct the index of Agent DBs hosted on this peer
     /// (`agents` store in the chazdb).
     pub fn agents(chazdb: Database) -> Self {
@@ -67,7 +67,7 @@ impl HostedIndex {
     }
 
     /// Upsert one entry. Uses `db_id.to_string()` as the DocStore key.
-    pub async fn register(&self, entry: HostedEntry) -> anyhow::Result<()> {
+    pub async fn register(&self, entry: DbEntry) -> anyhow::Result<()> {
         let json = serde_json::to_string(&entry)?;
         let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(self.store_name).await?;
@@ -93,7 +93,7 @@ impl HostedIndex {
     }
 
     /// Return every entry in the index.
-    pub async fn list(&self) -> anyhow::Result<Vec<HostedEntry>> {
+    pub async fn list(&self) -> anyhow::Result<Vec<DbEntry>> {
         let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(self.store_name).await?;
         let doc = store.get_all().await?;
@@ -103,7 +103,7 @@ impl HostedIndex {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            match serde_json::from_str::<HostedEntry>(&json) {
+            match serde_json::from_str::<DbEntry>(&json) {
                 Ok(entry) => out.push(entry),
                 Err(e) => tracing::warn!(
                     kind = self.label,
@@ -115,7 +115,7 @@ impl HostedIndex {
         Ok(out)
     }
 
-    pub async fn find_by_id(&self, db_id: &ID) -> anyhow::Result<Option<HostedEntry>> {
+    pub async fn find_by_id(&self, db_id: &ID) -> anyhow::Result<Option<DbEntry>> {
         let txn = self.chazdb.new_transaction().await?;
         let store = txn.get_store::<DocStore>(self.store_name).await?;
         match store.get_string(db_id.to_string()).await {
@@ -127,7 +127,7 @@ impl HostedIndex {
 
     /// Linear scan — N is small. If this ever grows, maintain a
     /// name → db_id secondary index.
-    pub async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<HostedEntry>> {
+    pub async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<DbEntry>> {
         Ok(self
             .list()
             .await?
@@ -137,7 +137,7 @@ impl HostedIndex {
 
     /// Linear scan — N is small. Stage 3 routing calls this to resolve
     /// session-participant pubkeys to the agents they represent.
-    pub async fn find_by_pubkey(&self, pubkey: &PublicKey) -> anyhow::Result<Option<HostedEntry>> {
+    pub async fn find_by_pubkey(&self, pubkey: &PublicKey) -> anyhow::Result<Option<DbEntry>> {
         Ok(self.list().await?.into_iter().find(|e| &e.pubkey == pubkey))
     }
 
@@ -149,7 +149,7 @@ impl HostedIndex {
     ) -> anyhow::Result<usize> {
         let mut count = 0;
         for (name, agent) in agents {
-            let entry = HostedEntry {
+            let entry = DbEntry {
                 db_id: agent.db.id(),
                 display_name: name.clone(),
                 pubkey: agent.pubkey.clone(),
@@ -204,7 +204,7 @@ mod tests {
         BootstrappedAgent { db, pubkey }
     }
 
-    async fn make_bank_entry(user: &mut User, name: &str) -> HostedEntry {
+    async fn make_bank_entry(user: &mut User, name: &str) -> DbEntry {
         let (bank, pubkey) = create_memory_bank(
             user,
             name,
@@ -215,7 +215,7 @@ mod tests {
         )
         .await
         .unwrap();
-        HostedEntry {
+        DbEntry {
             db_id: bank.id(),
             display_name: name.to_string(),
             pubkey,
@@ -226,10 +226,10 @@ mod tests {
     async fn agents_register_and_find_round_trip() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::agents(chazdb);
+        let index = DbRegistry::agents(chazdb);
 
         let agent = make_agent(&mut user, "alpha").await;
-        let entry = HostedEntry {
+        let entry = DbEntry {
             db_id: agent.db.id(),
             display_name: "alpha".to_string(),
             pubkey: agent.pubkey.clone(),
@@ -254,12 +254,12 @@ mod tests {
     async fn list_returns_all_entries() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::agents(chazdb);
+        let index = DbRegistry::agents(chazdb);
 
         for name in ["alpha", "beta", "gamma"] {
             let agent = make_agent(&mut user, name).await;
             index
-                .register(HostedEntry {
+                .register(DbEntry {
                     db_id: agent.db.id(),
                     display_name: name.to_string(),
                     pubkey: agent.pubkey,
@@ -283,12 +283,12 @@ mod tests {
     async fn unregister_removes_entry() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::agents(chazdb);
+        let index = DbRegistry::agents(chazdb);
 
         let agent = make_agent(&mut user, "alpha").await;
         let id = agent.db.id();
         index
-            .register(HostedEntry {
+            .register(DbEntry {
                 db_id: id.clone(),
                 display_name: "alpha".to_string(),
                 pubkey: agent.pubkey,
@@ -306,7 +306,7 @@ mod tests {
     async fn unregister_missing_is_ok() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::agents(chazdb);
+        let index = DbRegistry::agents(chazdb);
         let agent = make_agent(&mut user, "alpha").await;
 
         index.unregister(&agent.db.id()).await.unwrap();
@@ -316,7 +316,7 @@ mod tests {
     async fn sync_from_bootstrap_registers_all() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::agents(chazdb);
+        let index = DbRegistry::agents(chazdb);
 
         let mut agents = HashMap::new();
         agents.insert("alpha".to_string(), make_agent(&mut user, "alpha").await);
@@ -334,7 +334,7 @@ mod tests {
     async fn sync_is_idempotent_and_overwrites() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::agents(chazdb);
+        let index = DbRegistry::agents(chazdb);
 
         let mut agents = HashMap::new();
         agents.insert("alpha".to_string(), make_agent(&mut user, "alpha").await);
@@ -349,7 +349,7 @@ mod tests {
     async fn banks_register_and_find_round_trip() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let index = HostedIndex::memory_banks(chazdb);
+        let index = DbRegistry::memory_banks(chazdb);
 
         let entry = make_bank_entry(&mut user, "patrick").await;
         index.register(entry.clone()).await.unwrap();
@@ -370,12 +370,12 @@ mod tests {
     async fn agents_and_banks_share_chazdb_without_collision() {
         let mut user = test_peer_user().await;
         let chazdb = test_chazdb(&mut user).await;
-        let agents = HostedIndex::agents(chazdb.clone());
-        let banks = HostedIndex::memory_banks(chazdb);
+        let agents = DbRegistry::agents(chazdb.clone());
+        let banks = DbRegistry::memory_banks(chazdb);
 
         let a = make_agent(&mut user, "alpha").await;
         agents
-            .register(HostedEntry {
+            .register(DbEntry {
                 db_id: a.db.id(),
                 display_name: "alpha".to_string(),
                 pubkey: a.pubkey,

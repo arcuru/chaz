@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use crate::hosted_index::HostedIndex;
+use crate::db_registry::DbRegistry;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
@@ -193,7 +193,7 @@ impl HeartbeatRunner {
         session_db_id: &str,
         session_db: &Database,
         rule: &HeartbeatRule,
-        agent_index: &HostedIndex,
+        agent_index: &DbRegistry,
     ) -> anyhow::Result<()> {
         if !rule.enabled {
             return Ok(());

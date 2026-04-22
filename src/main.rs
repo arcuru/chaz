@@ -4,12 +4,12 @@ mod backends;
 mod commands;
 mod config;
 mod context;
+mod db_registry;
 mod defaults;
 mod error;
 mod gateway;
 mod grants;
 mod heartbeat;
-mod hosted_index;
 mod mcp;
 mod memory_bank_db;
 mod openai;
@@ -123,13 +123,13 @@ async fn main() -> anyhow::Result<()> {
     // Stage 2 of Living Agents: maintain a local index of which Agent DBs
     // this peer hosts. Needed for O(1) routing in Stage 3 (eidetica has no
     // inverse "DBs where key K has permission P" query).
-    let agent_index_store = hosted_index::HostedIndex::agents(chazdb.clone());
+    let agent_index_store = db_registry::DbRegistry::agents(chazdb.clone());
     agent_index_store.sync_from_bootstrap(&agent_dbs).await?;
 
     // Memory Banks Stage 9.D: peer-local index of bank DBs this peer hosts,
     // same shape as the agent index. Populated by `/memory new` + `/memory
     // import` — nothing populates it at startup yet.
-    let memory_bank_index_store = hosted_index::HostedIndex::memory_banks(chazdb.clone());
+    let memory_bank_index_store = db_registry::DbRegistry::memory_banks(chazdb.clone());
 
     // Build secret store backed by the chazdb.
     let secret_store = security::SecretStore::new(chazdb.clone()).await;

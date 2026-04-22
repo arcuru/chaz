@@ -56,7 +56,7 @@ Each Agent DB contains five well-known stores:
 | `history`      | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                |
 | `memory_banks` | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission) |
 
-The peer maintains two local indexes in its `chazdb` (the peer-local bookkeeping database): an `agents` DocStore for Living Agents and a `memory_banks` DocStore for standalone Memory Bank DBs. Both map `db_id → (display_name, pubkey)` and share the same `HostedIndex` type. Both exist because eidetica has no inverse "list DBs this key can access" query.
+The peer maintains two local indexes in its `chazdb` (the peer-local bookkeeping database): an `agents` DocStore for Living Agents and a `memory_banks` DocStore for standalone Memory Bank DBs. Both map `db_id → (display_name, pubkey)` and share the same `DbRegistry` type. Both exist because eidetica has no inverse "list DBs this key can access" query.
 
 ## Session participation
 

@@ -30,8 +30,8 @@ pub struct NewSessionEvent {
 /// - `sessions`        (DocStore)  — `session_db_id` → `source` (origin tag)
 /// - `matrix_channels` (DocStore)  — `room_id` → `session_db_id`
 /// - `session_names`   (DocStore)  — `name` → `session_db_id`
-/// - `agents`          (DocStore)  — hosted Agent DBs (see `hosted_index`)
-/// - `memory_banks`    (DocStore)  — hosted Memory Bank DBs (see `hosted_index`)
+/// - `agents`          (DocStore)  — hosted Agent DBs (see `db_registry`)
+/// - `memory_banks`    (DocStore)  — hosted Memory Bank DBs (see `db_registry`)
 /// - `heartbeat_last_fired` (DocStore) — peer-local rule timestamps
 /// - `schedules`       (Table)     — scheduler last_run state
 /// - `secrets`         (DocStore)  — backend API keys, host-injected

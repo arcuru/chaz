@@ -9,7 +9,7 @@ use super::*;
 use crate::agent::AgentRegistry;
 use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
 use crate::config::{AgentConfig, Config};
-use crate::hosted_index::{HostedEntry, HostedIndex};
+use crate::db_registry::{DbEntry, DbRegistry};
 use eidetica::Instance;
 use eidetica::backend::database::InMemory;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
 
 /// Registry with one declared agent `alpha` — routing tests can then resolve
 /// display_name → Agent via AgentRegistry.
-pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, HostedIndex)
+pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, DbRegistry)
 {
     let backend = InMemory::new();
     let instance = Instance::open(Box::new(backend)).await.unwrap();
@@ -100,12 +100,12 @@ pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRe
             .await
             .unwrap(),
     );
-    let index = HostedIndex::agents(registry.chazdb().clone());
+    let index = DbRegistry::agents(registry.chazdb().clone());
     (instance, registry, index)
 }
 
 /// Registry with two declared agents (alpha, beta).
-pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionRegistry>, HostedIndex)
+pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionRegistry>, DbRegistry)
 {
     let backend = InMemory::new();
     let instance = Instance::open(Box::new(backend)).await.unwrap();
@@ -120,13 +120,13 @@ pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionReg
             .await
             .unwrap(),
     );
-    let index = HostedIndex::agents(registry.chazdb().clone());
+    let index = DbRegistry::agents(registry.chazdb().clone());
     (instance, registry, index)
 }
 
 /// Create a fresh Agent DB for `name` on the given registry and return a
-/// `HostedEntry` suitable for `attach_agent_to_session`.
-pub(crate) async fn make_agent_entry(registry: &SessionRegistry, name: &str) -> HostedEntry {
+/// `DbEntry` suitable for `attach_agent_to_session`.
+pub(crate) async fn make_agent_entry(registry: &SessionRegistry, name: &str) -> DbEntry {
     let cfg = AgentDbConfig::default();
     let meta = AgentMeta {
         display_name: Some(name.to_string()),
@@ -134,7 +134,7 @@ pub(crate) async fn make_agent_entry(registry: &SessionRegistry, name: &str) -> 
     };
     let mut user = registry.user.lock().await;
     let (db, pubkey) = create_agent_db(&mut user, name, &cfg, &meta).await.unwrap();
-    HostedEntry {
+    DbEntry {
         db_id: db.id(),
         display_name: name.to_string(),
         pubkey,
