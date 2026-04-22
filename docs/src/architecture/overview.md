@@ -25,7 +25,9 @@ graph TD
     subgraph Storage
         EI[(eidetica<br/>per-session DBs)]
         REG[(Registry DB<br/>index stores)]
-        CEN[(Central DB<br/>memory, secrets)]
+        CEN[(Central DB<br/>secrets, indexes)]
+        LA[(Living Agent DBs<br/>config, memory, meta)]
+        MB[(Memory Bank DBs<br/>shared memory)]
     end
 
     MG -->|write SessionEntry| EI
@@ -121,7 +123,7 @@ src/
     shell.rs       shell execution with allowlist/denylist
     file.rs        read_file, write_file
     web.rs         web_fetch with network policy
-    memory.rs      remember, recall (per-agent isolated memory)
+    memory.rs      remember, recall (optional `bank` arg for shared banks), list_memory_banks
     compact.rs     compact — write Summary entry for context compaction
     describe.rs    describe_tool — on-demand tool discovery
     time.rs        get_time

@@ -42,20 +42,21 @@ agents:
         max_iterations: 30
 ```
 
-At startup, each yaml entry becomes an Agent DB named `agent:<display_name>`. Re-running with the same yaml reuses the existing DB and refreshes its stored `config` + `meta` from yaml — edits in yaml propagate back into the DB.
+At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. On subsequent boots, existing DBs are reused without overwriting their `config` — yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
 
 ## Agent DB schema
 
-Each Agent DB contains four well-known stores:
+Each Agent DB contains five well-known stores:
 
-| Store     | Kind                         | Contents                                                                                |
-| --------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| `config`  | DocStore                     | Serialized `AgentDbConfig`: role, model, allowed_tools, max_iterations, grants, presets |
-| `memory`  | `Table<MemoryEntry>`         | Per-agent facts (schema reserved; memory tool migration lands in a later stage)         |
-| `meta`    | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar                            |
-| `history` | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                            |
+| Store          | Kind                         | Contents                                                                                |
+| -------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
+| `config`       | DocStore                     | Serialized `AgentDbConfig`: role, model, allowed_tools, max_iterations, grants, presets |
+| `memory`       | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)    |
+| `meta`         | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar                            |
+| `history`      | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                            |
+| `memory_banks` | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission) |
 
-The peer maintains a local `hosted_agents` index in its central DB mapping `db_id → (display_name, pubkey)` so session-routing lookups stay O(1).
+The peer maintains two local indexes in its central DB: `hosted_agents` (mapping `db_id → (display_name, pubkey)` for Living Agents) and `memory_banks_hosted` (same shape, for standalone Memory Bank DBs). Both exist because eidetica has no inverse "list DBs this key can access" query.
 
 ## Session participation
 

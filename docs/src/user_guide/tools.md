@@ -9,14 +9,15 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 | `get_time`      | Low    | Never              | Returns the current UTC time                           |
 | `calculate`     | Low    | Never              | Evaluates math expressions (via meval)                 |
 | `read_file`     | Low    | Never              | Reads file contents from disk                          |
-| `remember`      | Low    | Never              | Stores a key-value fact in agent-scoped memory         |
-| `recall`        | Low    | Never              | Searches agent-scoped memory by keyword                |
-| `describe_tool` | Low    | Never              | Returns full description/schema for a tool (discovery) |
-| `compact`       | Low    | Never              | Summarize and compact conversation context             |
-| `write_file`    | Medium | UnlessAutoApproved | Writes content to a file                               |
-| `web_fetch`     | Medium | UnlessAutoApproved | HTTP GET or POST requests                              |
-| `spawn_agent`   | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                        |
-| `shell`         | High   | Always             | Executes a shell command                               |
+| `remember`           | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank) |
+| `recall`             | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword        |
+| `list_memory_banks`  | Low    | Never              | Lists the memory banks this agent has been granted access to          |
+| `describe_tool`      | Low    | Never              | Returns full description/schema for a tool (discovery) |
+| `compact`            | Low    | Never              | Summarize and compact conversation context             |
+| `write_file`         | Medium | UnlessAutoApproved | Writes content to a file                               |
+| `web_fetch`          | Medium | UnlessAutoApproved | HTTP GET or POST requests                              |
+| `spawn_agent`        | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                        |
+| `shell`              | High   | Always             | Executes a shell command                               |
 
 ## Risk Levels
 
@@ -74,12 +75,25 @@ Executes a shell command. Subject to command allowlist/denylist filtering.
 
 ### remember / recall
 
-Persistent key-value memory, isolated per agent. Each agent has its own memory namespace (`memory:{agent_name}` in the central eidetica DB), so agents cannot read or write each other's memories.
+Persistent key-value memory. By default writes to the agent's own memory (its own Living Agent DB's `memory` subtree), which travels with the agent through eidetica sync and is naturally isolated from other agents.
 
 ```json
 {"key": "user_timezone", "value": "America/New_York"}
 {"query": "timezone"}
 ```
+
+**Shared memory banks.** Pass an optional `bank` argument to read or write a shared bank the agent has been granted access to. Banks are separate eidetica DBs (or other Agent DBs) configured by an operator via `/memory grant`; the agent's own grants are listed by `list_memory_banks`. Write access requires `write` permission on the bank.
+
+```json
+{"key": "deadline", "value": "Friday", "bank": "project-alpha"}
+{"query": "deadline", "bank": "project-alpha"}
+```
+
+There is no "global" scope: cross-agent sharing is always a bank with an explicit grant. Access is authoritatively enforced by the bank DB's eidetica `AuthSettings` — the agent's key must be authorized on the bank DB itself.
+
+### list_memory_banks
+
+Lists the memory banks this agent has been granted access to, with the permission level (Read or Write) for each. `self` is always listed — that's the agent's own memory. Use the names it returns with `remember` / `recall`'s `bank` argument.
 
 ### describe_tool
 

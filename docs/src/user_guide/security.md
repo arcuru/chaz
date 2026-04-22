@@ -134,5 +134,5 @@ API keys are stored in eidetica's SecretStore and resolved at the HTTP client bo
 - **Spawn permissions**: `can_spawn` controls which agents can be delegated to
 - **Depth limiting**: Spawn depth is capped to prevent infinite recursion
 - **Concurrency**: Global semaphore limits concurrent LLM calls to 10
-- **Memory isolation**: Each agent has its own namespaced memory store — agents cannot read or write each other's memories
+- **Memory isolation**: Each agent's own memory lives in its own Living Agent DB (keyed access, enforced by eidetica). Cross-agent sharing requires an explicit `/memory grant` on a shared bank — there is no peer-wide "global" memory
 - **Per-session serialization**: Only one agent task runs per session at a time, preventing duplicate responses from concurrent writes

@@ -94,7 +94,7 @@ fn read_schema_banks() -> Value {
 }
 
 /// Parse `{key, value}`, write the entry to `(db, store)`, return the
-/// success string. Shared by `Remember` and `GlobalRemember`.
+/// success string. Shared by `Remember`'s self-memory and bank paths.
 async fn do_remember(
     ctx: &ToolContext,
     arguments: &Value,
@@ -116,7 +116,7 @@ async fn do_remember(
 }
 
 /// Parse `{query}`, search `(db, store)`, return the formatted result.
-/// Shared by `Recall` and `GlobalRecall`.
+/// Shared by `Recall`'s self-memory and bank paths.
 async fn do_recall(
     ctx: &ToolContext,
     arguments: &Value,
