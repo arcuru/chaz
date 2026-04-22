@@ -44,6 +44,55 @@ impl SessionRegistry {
         }
     }
 
+    /// Open a Memory Bank DB via this peer's user (Memory Banks Stage
+    /// 9.C). Returns `None` if this peer holds no key for the DB —
+    /// expected for bank references an agent's key was revoked from, or
+    /// for references we haven't synced yet.
+    ///
+    /// Known gap: `User::open_database` picks the first key `find_key`
+    /// returns rather than the agent's specific key. When the DB is
+    /// write-granted to multiple keys on this peer, writes may be signed
+    /// by the wrong one. Tracked as the `open_database_with_key` gap in
+    /// Eidetica Feedback.
+    pub async fn open_memory_bank(
+        &self,
+        bank_db_id: &eidetica::entry::ID,
+    ) -> anyhow::Result<Option<crate::memory_bank_db::MemoryBankDb>> {
+        let user = self.user.lock().await;
+        match user.find_key(bank_db_id)? {
+            Some(_) => {
+                let db = user.open_database(bank_db_id).await?;
+                Ok(Some(crate::memory_bank_db::MemoryBankDb::from_database(db)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Create a Memory Bank DB for the `/memory new` command (Stage
+    /// 9.D). Wraps `memory_bank_db::create_memory_bank` with the
+    /// registry's user mutex; rejects duplicate display names so
+    /// peer-local names stay unique.
+    pub async fn create_new_memory_bank(
+        &self,
+        display_name: &str,
+        meta: &crate::memory_bank_db::MemoryBankMeta,
+    ) -> anyhow::Result<(
+        crate::memory_bank_db::MemoryBankDb,
+        eidetica::auth::crypto::PublicKey,
+    )> {
+        let mut user = self.user.lock().await;
+        if let Some((existing, _)) =
+            crate::memory_bank_db::find_memory_bank(&user, display_name).await
+        {
+            anyhow::bail!(
+                "Memory bank '{}' already exists (DB {})",
+                display_name,
+                existing.id()
+            );
+        }
+        crate::memory_bank_db::create_memory_bank(&mut user, display_name, meta).await
+    }
+
     /// Test-only: lock the internal user mutex and return a guard. Lets
     /// fixtures call `create_agent_db` directly without duplicating the
     /// user-mutex plumbing.

@@ -192,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
     ));
     tool_registry.register(tools::GlobalRemember::new(central_db.clone()));
     tool_registry.register(tools::GlobalRecall::new(central_db.clone()));
+    tool_registry.register(tools::ListMemoryBanks::new(
+        registry.clone(),
+        agent_index_store.clone(),
+    ));
     tool_registry.register(tools::Compact);
     // SpawnAgent / SpawnTask both route through the server — a single OnceLock
     // is shared; it's set once after Server::new below.
