@@ -103,6 +103,19 @@ pub enum Command {
     /// Unregister a Memory Bank locally (index entry removed; DB preserved
     /// for archive, same semantics as `AgentDelete`).
     MemoryDelete(String),
+    /// Grant an agent access to a memory bank. Writes the agent's pubkey
+    /// to the bank's AuthSettings (authoritative) and mirrors a
+    /// `MemoryBankRef` into the agent's `memory_banks` subtree (view).
+    MemoryGrant {
+        bank_ref: String,
+        agent_ref: String,
+        permission: crate::agent_db::BankPermission,
+    },
+    /// Revoke an agent's access to a memory bank. Reverse of MemoryGrant.
+    MemoryRevoke {
+        bank_ref: String,
+        agent_ref: String,
+    },
 
     // --- Heartbeat rules (Stage 4b) ---
     /// Add or upsert a heartbeat rule on the current session.
@@ -206,6 +219,15 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         }
         Command::MemoryList => memory::memory_list(ctx).await,
         Command::MemoryDelete(r) => memory::memory_delete(&r, ctx).await,
+        Command::MemoryGrant {
+            bank_ref,
+            agent_ref,
+            permission,
+        } => memory::memory_grant(&bank_ref, &agent_ref, permission, ctx).await,
+        Command::MemoryRevoke {
+            bank_ref,
+            agent_ref,
+        } => memory::memory_revoke(&bank_ref, &agent_ref, ctx).await,
         Command::HeartbeatAdd {
             id,
             cron,

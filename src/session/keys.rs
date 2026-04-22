@@ -150,6 +150,60 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Authorize a pubkey on a Memory Bank DB (Stage 9.D.2). Used by
+    /// `/memory grant` to give an agent's key `Read` or `Write` on the
+    /// bank's AuthSettings. `power` matters for `Write` (higher power
+    /// can revoke lower); `Read` ignores it.
+    pub async fn grant_on_memory_bank(
+        &self,
+        bank_db_id: &eidetica::entry::ID,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+        key_label: &str,
+        permission: crate::agent_db::BankPermission,
+    ) -> anyhow::Result<()> {
+        let bank = self
+            .open_memory_bank(bank_db_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Peer holds no key for memory bank {bank_db_id}"))?;
+        let eidetica_perm = match permission {
+            crate::agent_db::BankPermission::Read => Permission::Read,
+            crate::agent_db::BankPermission::Write => Permission::Write(10),
+        };
+        let txn = bank.database().new_transaction().await?;
+        let settings = txn.get_settings()?;
+        settings
+            .set_auth_key(pubkey, AuthKey::active(Some(key_label), eidetica_perm))
+            .await?;
+        txn.commit().await?;
+        info!(
+            bank_db_id = %bank_db_id,
+            key_label,
+            permission = ?permission,
+            "Granted key on memory bank"
+        );
+        Ok(())
+    }
+
+    /// Revoke a pubkey on a Memory Bank DB (Stage 9.D.2). Used by
+    /// `/memory revoke` to withdraw an agent's access. Historical
+    /// entries signed by the key remain verifiable; no new writes.
+    pub async fn revoke_on_memory_bank(
+        &self,
+        bank_db_id: &eidetica::entry::ID,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<()> {
+        let bank = self
+            .open_memory_bank(bank_db_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Peer holds no key for memory bank {bank_db_id}"))?;
+        let txn = bank.database().new_transaction().await?;
+        let settings = txn.get_settings()?;
+        settings.revoke_auth_key(pubkey).await?;
+        txn.commit().await?;
+        info!(bank_db_id = %bank_db_id, "Revoked key on memory bank");
+        Ok(())
+    }
+
     /// Revoke a pubkey on a session. Used by `spawn_task` after the task
     /// completes — historical entries signed by the key remain verifiable,
     /// but no new entries can be written.

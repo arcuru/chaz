@@ -572,8 +572,8 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "memory",
-            "new|list|delete <arg>".to_string(),
-            "Create, list, or delete a memory bank on this peer",
+            "new|list|delete|grant|revoke <arg>".to_string(),
+            "Create, list, delete, grant, or revoke a memory bank",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -597,6 +597,38 @@ impl Gateway for MatrixGateway {
                     }
                     "delete" | "del" if !rest.is_empty() => {
                         Some(Command::MemoryDelete(rest.to_string()))
+                    }
+                    "grant" if !rest.is_empty() => (|| {
+                        let mut gparts = rest.splitn(3, char::is_whitespace);
+                        let bank = gparts.next().unwrap_or("").trim();
+                        let agent = gparts.next().unwrap_or("").trim();
+                        let perm = gparts.next().unwrap_or("").trim();
+                        let permission = match perm.to_ascii_lowercase().as_str() {
+                            "read" | "r" => crate::agent_db::BankPermission::Read,
+                            "write" | "w" => crate::agent_db::BankPermission::Write,
+                            _ => return None,
+                        };
+                        if bank.is_empty() || agent.is_empty() {
+                            return None;
+                        }
+                        Some(Command::MemoryGrant {
+                            bank_ref: bank.to_string(),
+                            agent_ref: agent.to_string(),
+                            permission,
+                        })
+                    })(),
+                    "revoke" if !rest.is_empty() => {
+                        let mut rparts = rest.splitn(2, char::is_whitespace);
+                        let bank = rparts.next().unwrap_or("").trim();
+                        let agent = rparts.next().unwrap_or("").trim();
+                        if bank.is_empty() || agent.is_empty() {
+                            None
+                        } else {
+                            Some(Command::MemoryRevoke {
+                                bank_ref: bank.to_string(),
+                                agent_ref: agent.to_string(),
+                            })
+                        }
                     }
                     _ => None,
                 }

@@ -90,6 +90,132 @@ pub(super) async fn memory_list(ctx: &CommandContext<'_>) -> CommandOutcome {
     CommandOutcome::Text(format!("Memory banks on this peer:\n{}", lines.join("\n")))
 }
 
+/// Grant an agent access to a memory bank (Stage 9.D.2).
+///
+/// Order matters: we write auth first (the authoritative side), then
+/// mirror the ref into the agent's `memory_banks` subtree. If the ref
+/// write fails, best-effort revoke the auth so the two stores stay
+/// consistent. The opposite order would leave a brief window where the
+/// agent thinks it has access it doesn't.
+pub(super) async fn memory_grant(
+    bank_ref: &str,
+    agent_ref: &str,
+    permission: crate::agent_db::BankPermission,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let bank = match resolve_bank_ref(bank_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    let agent = match super::agent::resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    let key_label = format!("memory:{}:{}", bank.display_name, agent.display_name);
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .grant_on_memory_bank(&bank.db_id, &agent.pubkey, &key_label, permission)
+        .await
+    {
+        return CommandOutcome::Error(format!("Failed to authorize agent on bank: {e}"));
+    }
+
+    // Now mirror the ref into the agent's view. On failure, roll back the auth
+    // so the two sides stay consistent.
+    let agent_db = match ctx.server.registry().open_agent_db(&agent.db_id).await {
+        Ok(Some(db)) => db,
+        Ok(None) => {
+            // Rollback — the agent is in index but we can't open its DB. Shouldn't
+            // happen on this peer, but bail cleanly.
+            let _ = ctx
+                .server
+                .registry()
+                .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+                .await;
+            return CommandOutcome::Error(format!(
+                "Granted auth but can't open agent '{}'s DB to record the ref — rolled back",
+                agent.display_name
+            ));
+        }
+        Err(e) => {
+            let _ = ctx
+                .server
+                .registry()
+                .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+                .await;
+            return CommandOutcome::Error(format!(
+                "Granted auth but failed to open agent DB — rolled back: {e}"
+            ));
+        }
+    };
+
+    let ref_entry = crate::agent_db::MemoryBankRef {
+        name: bank.display_name.clone(),
+        db_id: bank.db_id.to_string(),
+        permission,
+    };
+    if let Err(e) = agent_db.attach_memory_bank(ref_entry).await {
+        let _ = ctx
+            .server
+            .registry()
+            .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+            .await;
+        return CommandOutcome::Error(format!(
+            "Granted auth but failed to write ref to agent DB — rolled back: {e}"
+        ));
+    }
+
+    CommandOutcome::Text(format!(
+        "Granted agent '{}' {:?} access to memory bank '{}'",
+        agent.display_name, permission, bank.display_name
+    ))
+}
+
+/// Revoke an agent's access to a memory bank (Stage 9.D.2). Revokes
+/// auth first; then best-effort detaches the ref. If the ref detach
+/// fails, the agent may still list the bank but eidetica will refuse
+/// writes (authority is gone) — stale state, not a security issue.
+pub(super) async fn memory_revoke(
+    bank_ref: &str,
+    agent_ref: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let bank = match resolve_bank_ref(bank_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    let agent = match super::agent::resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+        .await
+    {
+        return CommandOutcome::Error(format!("Failed to revoke auth: {e}"));
+    }
+
+    // Best-effort ref cleanup.
+    let ref_removed = match ctx.server.registry().open_agent_db(&agent.db_id).await {
+        Ok(Some(db)) => db.detach_memory_bank(&bank.display_name).await.ok(),
+        _ => None,
+    };
+
+    let mut msg = format!(
+        "Revoked agent '{}'s access to memory bank '{}'",
+        agent.display_name, bank.display_name
+    );
+    if ref_removed != Some(true) {
+        msg.push_str(" (note: couldn't remove the ref from the agent's memory_banks subtree — auth is revoked regardless)");
+    }
+    CommandOutcome::Text(msg)
+}
+
 pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     let entry = match resolve_bank_ref(bank_ref, ctx).await {
         Ok(e) => e,
@@ -352,6 +478,150 @@ mod tests {
         let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
         match dispatch(Command::MemoryDelete("ghost".to_string()), &ctx).await {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("No hosted memory bank"), "got {msg}")
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 9.D.2 — grant / revoke
+    // -------------------------------------------------------------------------
+
+    /// Helper: create an agent + bank through the command dispatch so the
+    /// index + runtime state are consistent. Returns the agent's DB id and
+    /// the bank's DB id for assertion convenience.
+    async fn provision_agent_and_bank(
+        ctx: &CommandContext<'_>,
+        agent: &str,
+        bank: &str,
+    ) -> (eidetica::entry::ID, eidetica::entry::ID) {
+        dispatch(
+            Command::AgentNew {
+                name: agent.to_string(),
+                overrides: vec![],
+            },
+            ctx,
+        )
+        .await;
+        dispatch(
+            Command::MemoryNew {
+                name: bank.to_string(),
+                description: None,
+            },
+            ctx,
+        )
+        .await;
+        let a_id = ctx
+            .server
+            .agent_index()
+            .find_by_name(agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .db_id;
+        let b_id = ctx
+            .server
+            .memory_bank_index()
+            .find_by_name(bank)
+            .await
+            .unwrap()
+            .unwrap()
+            .db_id;
+        (a_id, b_id)
+    }
+
+    #[tokio::test]
+    async fn memory_grant_writes_auth_and_ref() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let (agent_db_id, bank_db_id) = provision_agent_and_bank(&ctx, "alpha", "patrick").await;
+
+        let cmd = Command::MemoryGrant {
+            bank_ref: "patrick".to_string(),
+            agent_ref: "alpha".to_string(),
+            permission: crate::agent_db::BankPermission::Write,
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Text(msg) => {
+                assert!(msg.contains("patrick"), "got {msg}");
+                assert!(msg.contains("Write"), "got {msg}");
+            }
+            CommandOutcome::Error(e) => panic!("unexpected: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        // Ref mirrored into agent's memory_banks subtree.
+        let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
+        let banks = agent_db.list_memory_banks().await.unwrap();
+        assert_eq!(banks.len(), 1);
+        assert_eq!(banks[0].name, "patrick");
+        assert_eq!(banks[0].db_id, bank_db_id.to_string());
+        assert_eq!(banks[0].permission, crate::agent_db::BankPermission::Write);
+    }
+
+    #[tokio::test]
+    async fn memory_revoke_reverses_grant() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let (agent_db_id, _bank_db_id) = provision_agent_and_bank(&ctx, "alpha", "patrick").await;
+
+        dispatch(
+            Command::MemoryGrant {
+                bank_ref: "patrick".to_string(),
+                agent_ref: "alpha".to_string(),
+                permission: crate::agent_db::BankPermission::Read,
+            },
+            &ctx,
+        )
+        .await;
+        // Sanity: ref present before revoke.
+        let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
+        assert_eq!(agent_db.list_memory_banks().await.unwrap().len(), 1);
+
+        match dispatch(
+            Command::MemoryRevoke {
+                bank_ref: "patrick".to_string(),
+                agent_ref: "alpha".to_string(),
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => assert!(msg.contains("Revoked"), "got {msg}"),
+            CommandOutcome::Error(e) => panic!("unexpected: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        // Ref removed from agent's memory_banks.
+        let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
+        assert!(agent_db.list_memory_banks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_grant_unknown_bank_errors() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+
+        match dispatch(
+            Command::MemoryGrant {
+                bank_ref: "nope".to_string(),
+                agent_ref: "alpha".to_string(),
+                permission: crate::agent_db::BankPermission::Read,
+            },
+            &ctx,
+        )
+        .await
+        {
             CommandOutcome::Error(msg) => {
                 assert!(msg.contains("No hosted memory bank"), "got {msg}")
             }

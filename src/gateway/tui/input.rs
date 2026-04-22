@@ -255,6 +255,50 @@ fn parse_chat_line(
         show_error(app, "Usage: /memory delete <name|db_id>".to_string());
         return None;
     }
+    if let Some(arg) = text.strip_prefix("/memory grant ") {
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(3, char::is_whitespace);
+        let bank = parts.next().unwrap_or("").trim();
+        let agent = parts.next().unwrap_or("").trim();
+        let perm = parts.next().unwrap_or("").trim();
+        let permission = match perm.to_ascii_lowercase().as_str() {
+            "read" | "r" => crate::agent_db::BankPermission::Read,
+            "write" | "w" => crate::agent_db::BankPermission::Write,
+            _ => {
+                show_error(
+                    app,
+                    "Usage: /memory grant <bank> <agent> <read|write>".to_string(),
+                );
+                return None;
+            }
+        };
+        if bank.is_empty() || agent.is_empty() {
+            show_error(
+                app,
+                "Usage: /memory grant <bank> <agent> <read|write>".to_string(),
+            );
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::MemoryGrant {
+            bank_ref: bank.to_string(),
+            agent_ref: agent.to_string(),
+            permission,
+        }));
+    }
+    if let Some(arg) = text.strip_prefix("/memory revoke ") {
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let bank = parts.next().unwrap_or("").trim();
+        let agent = parts.next().unwrap_or("").trim();
+        if bank.is_empty() || agent.is_empty() {
+            show_error(app, "Usage: /memory revoke <bank> <agent>".to_string());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::MemoryRevoke {
+            bank_ref: bank.to_string(),
+            agent_ref: agent.to_string(),
+        }));
+    }
 
     if text == "/heartbeat" || text == "/heartbeat list" {
         return Some(ChatAction::Dispatch(Command::HeartbeatList));
@@ -443,6 +487,8 @@ fn help_text(_session_db: &eidetica::Database) -> String {
         "  /memory list          — list memory banks this peer hosts",
         "  /memory new <name> [description...] — create a new bank on this peer",
         "  /memory delete <ref>  — unregister a bank (DB preserved)",
+        "  /memory grant <bank> <agent> <read|write> — grant an agent access to a bank",
+        "  /memory revoke <bank> <agent> — revoke an agent's access",
         "",
         "Heartbeat:",
         "  /heartbeat list       — list heartbeat rules on this session",
