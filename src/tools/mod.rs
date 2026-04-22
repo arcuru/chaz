@@ -14,7 +14,7 @@ pub use calculate::Calculate;
 pub use compact::Compact;
 pub use describe::DescribeTool;
 pub use file::{ReadFile, WriteFile};
-pub use memory::{GlobalRecall, GlobalRemember, ListMemoryBanks, Recall, Remember};
+pub use memory::{ListMemoryBanks, Recall, Remember};
 pub use shell::ShellExec;
 pub use task::SpawnTask;
 pub use time::GetTime;

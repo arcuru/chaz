@@ -17,8 +17,6 @@ pub struct Grants {
     pub network: Option<NetworkGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fs: Option<FsGrant>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<MemoryGrant>,
 }
 
 impl Grants {
@@ -32,7 +30,6 @@ impl Grants {
                 shell: o.shell.clone().or_else(|| self.shell.clone()),
                 network: o.network.clone().or_else(|| self.network.clone()),
                 fs: o.fs.clone().or_else(|| self.fs.clone()),
-                memory: o.memory.clone().or_else(|| self.memory.clone()),
             },
         }
     }
@@ -67,35 +64,6 @@ pub struct FsGrant {
     pub allow_read: Vec<String>,
     #[serde(default)]
     pub allow_write: Vec<String>,
-}
-
-/// Memory capability grant. Splits self-memory (the running agent's own
-/// `AgentDb::memory` store) from peer-global memory (a shared store on
-/// central DB).
-///
-/// Default: `allow_self = true`, `allow_global = false` — every agent reads
-/// and writes its own memory out of the box, but peer-global access must be
-/// explicitly granted (either via `security.tool_policies.global_remember.grants.memory`
-/// or per-agent `agents[].grants.global_remember.memory`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MemoryGrant {
-    #[serde(default = "default_true")]
-    pub allow_self: bool,
-    #[serde(default)]
-    pub allow_global: bool,
-}
-
-impl Default for MemoryGrant {
-    fn default() -> Self {
-        Self {
-            allow_self: true,
-            allow_global: false,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// An allowed endpoint pattern for a network grant.

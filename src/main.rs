@@ -197,8 +197,6 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         agent_index_store.clone(),
     ));
-    tool_registry.register(tools::GlobalRemember::new(central_db.clone()));
-    tool_registry.register(tools::GlobalRecall::new(central_db.clone()));
     tool_registry.register(tools::ListMemoryBanks::new(
         registry.clone(),
         agent_index_store.clone(),
