@@ -12,6 +12,7 @@
 - [Tools](user_guide/tools.md)
 - [MCP External Tools](user_guide/mcp.md)
 - [Agents](user_guide/agents.md)
+- [Memory](user_guide/memory.md)
 - [Security](user_guide/security.md)
 - [Logging](user_guide/logging.md)
 

@@ -177,3 +177,165 @@ When an agent calls `spawn_agent`:
 6. The parent reads the response from the child session.
 
 This routes through the same server processing path as user messages, unifying all agent invocation.
+
+## Lifecycle Overview
+
+An agent moves through a small number of states, and the commands that drive those transitions mirror them closely.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Declared: yaml agents: entry
+    Declared --> Hosted: bootstrap creates AgentDb + key
+    [*] --> Hosted: /agent new <name>
+    Hosted --> Attached: /agent add <ref>
+    Attached --> Running: message / Directive arrives
+    Running --> Attached: response written
+    Attached --> Hosted: /agent remove <ref>
+    Hosted --> Shared: /agent share → ticket
+    Shared --> Hosted: /agent import ticket (on peer B)
+    Hosted --> [*]: /agent delete (index row only; DB preserved)
+```
+
+Key invariants:
+
+- **Hosted** means this peer holds the per-agent private key — eidetica authorisation, not a config flag, is what decides. The local `agents` index in `chazdb` tracks which DBs that's true for.
+- **Attached** means the agent's pubkey has `Permission::Write` on a specific session DB. A single agent can be attached to many sessions.
+- Every transition writes to an eidetica DB; there is no in-memory-only agent state that survives a restart.
+
+## End-to-End Walkthrough: Creating and Using an Agent
+
+This walks through the full lifecycle against the TUI. Matrix uses the same commands under `!chaz <cmd>`.
+
+### 1. Create the agent
+
+Either declare it in yaml (bootstrapped once, on first start):
+
+```yaml
+agents:
+  - name: researcher
+    role: researcher
+    max_iterations: 20
+    allowed_tools: [web_fetch, calculate, remember, recall]
+```
+
+…or create one live:
+
+```text
+/agent new researcher role=researcher max_iterations=20 tools=web_fetch,calculate,remember,recall
+```
+
+Either path produces an Agent DB (`agent:researcher`) signed by a fresh per-agent key, plus a row in the local `agents` index.
+
+### 2. Tweak config without restarting
+
+Edits flow through `/agent set`. The server re-reads each agent's `AgentDb::config` per message, so changes take effect on the _next_ message:
+
+```text
+/agent set researcher max_iterations 30
+/agent set researcher role deep-researcher
+```
+
+No yaml reload, no restart.
+
+### 3. Attach the agent to a session
+
+```text
+/agent add researcher
+/agent list
+```
+
+`/agent add` writes the agent's pubkey to the session's `AuthSettings` (authoritative), mirrors an `AgentRef` into `SessionMeta.agents` (readable cache), and appends a row to the agent's own `history` Table.
+
+### 4. Send messages — with or without mentions
+
+If there's only one agent attached, every message goes to it. Attach a second agent and you pick per-message with `@name`:
+
+```text
+/agent add coder
+@researcher summarise the linked paper
+@coder write a minimal repro in Rust
+```
+
+Unmentioned messages fall through: host agent → first attached → default.
+
+### 5. Delegate via `spawn_agent`
+
+Once `coder` lists `researcher` in its `can_spawn`, `coder` can call the `spawn_agent` tool mid-ReAct:
+
+```json
+{ "agent": "researcher", "task": "find the canonical reference", "preset": "deep" }
+```
+
+The parent blocks on completion (sync) or gets a child session ID back (`async: true`) and continues.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as Session DB
+    participant C as coder (ReAct)
+    participant CS as Child session DB
+    participant R as researcher (ReAct)
+
+    U->>S: Message "@coder …"
+    S-->>C: on_local_write → dispatch
+    C->>C: spawn_agent(researcher, task)
+    C->>CS: register_child_session + Directive
+    CS-->>R: on_local_write → dispatch
+    R->>CS: Ack → ToolCall/ToolResult… → response
+    CS-->>C: completion signal
+    C->>S: final response
+    S-->>U: rendered reply
+```
+
+### 6. Schedule heartbeats
+
+```text
+/heartbeat add brief 0 0 9 * * Mon-Fri researcher Summarise overnight activity
+```
+
+Every peer hosting `researcher` polls its sessions every 30s. When a rule fires, it writes a `Directive` — indistinguishable from a user message from the router's perspective.
+
+### 7. Share the agent with another peer
+
+```text
+/agent share researcher
+# → eidetica:?db=sha256:…&pr=http:…
+```
+
+On peer B:
+
+```text
+/agent import eidetica:?db=sha256:…&pr=http:…
+```
+
+If the ticket carries a key, peer B _hosts_ the agent too: both peers can route turns to it, and the fastest to respond wins (the server's per-session serialisation prevents duplicate replies). Without a key it's read-only — peer B sees the agent exist in sync but can't run it.
+
+### 8. Detach or delete
+
+```text
+/agent remove researcher   # session-scoped: revoke AuthSettings, keep DB
+/agent delete researcher   # peer-scoped: unregister from local index (DB preserved for archive)
+```
+
+History is append-only; detach does not erase it.
+
+## Multi-Peer Topology
+
+A single agent DB can be hosted by several peers simultaneously. Each keeps its own copy of the key and the index row; eidetica sync replicates `config`, `memory`, `meta`, `history`, and `memory_banks`.
+
+```mermaid
+graph LR
+    subgraph "Peer A (Matrix bot)"
+        A_agents[agents index]
+        A_db[(agent:researcher DB)]
+    end
+    subgraph "Peer B (laptop TUI)"
+        B_agents[agents index]
+        B_db[(agent:researcher DB)]
+    end
+    A_db <-->|eidetica sync| B_db
+    A_agents -.pubkey→db_id.-> A_db
+    B_agents -.pubkey→db_id.-> B_db
+```
+
+Turn-taking within a session is still per-entry: whichever peer reads the new entry first and has the target agent hosted picks it up.
