@@ -27,6 +27,30 @@ mod heartbeat;
 mod memory;
 mod session;
 
+/// User-visible permission level for co-ownership grants on an Agent DB
+/// (Co-owned Agents Stage 10). Stays separate from eidetica's `Permission`
+/// so the CLI grammar is stable if eidetica's type evolves (e.g. more
+/// Admin tiers). `Admin` grants `Permission::Admin(1)` — the creator's
+/// `Admin(0)` remains exclusive and ungrantable via `/agent invite`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoOwnerPermission {
+    Admin,
+    Write,
+    Read,
+}
+
+/// Parse a CLI permission token (admin | write | read). Empty token =>
+/// `Admin` (the sensible default for `/agent invite`). Shared by TUI and
+/// Matrix parsers so the grammar stays in one place.
+pub fn parse_permission_token(tok: &str) -> Option<CoOwnerPermission> {
+    match tok.to_ascii_lowercase().as_str() {
+        "" | "admin" | "a" => Some(CoOwnerPermission::Admin),
+        "write" | "w" => Some(CoOwnerPermission::Write),
+        "read" | "r" => Some(CoOwnerPermission::Read),
+        _ => None,
+    }
+}
+
 /// Parsed, transport-neutral command intent.
 pub enum Command {
     // --- Session management ---
@@ -90,6 +114,23 @@ pub enum Command {
         agent_ref: String,
         field: String,
         value: String,
+    },
+    /// Print this peer's default pubkey so an agent owner can paste it
+    /// into `/agent invite` on their peer (Co-owned Agents Stage 10).
+    Pubkey,
+    /// Grant a remote peer's pubkey access to an agent DB — admin (default),
+    /// write, or read. Owner stays Admin(0); co-owner becomes Admin(1) and
+    /// below.
+    AgentInvite {
+        agent_ref: String,
+        pubkey: String,
+        permission: CoOwnerPermission,
+    },
+    /// Revoke a previously-invited pubkey on an agent DB. Historical
+    /// entries signed by the key remain verifiable; no new writes.
+    AgentRevokePeer {
+        agent_ref: String,
+        pubkey: String,
     },
 
     // --- Memory banks (Memory Banks Stage 9.D) ---
@@ -220,6 +261,15 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             field,
             value,
         } => agent::agent_set(&agent_ref, &field, &value, ctx).await,
+        Command::Pubkey => agent::pubkey(ctx).await,
+        Command::AgentInvite {
+            agent_ref,
+            pubkey,
+            permission,
+        } => agent::agent_invite(&agent_ref, &pubkey, permission, ctx).await,
+        Command::AgentRevokePeer { agent_ref, pubkey } => {
+            agent::agent_revoke_peer(&agent_ref, &pubkey, ctx).await
+        }
         Command::MemoryNew { name, description } => {
             memory::memory_new(&name, description.as_deref(), ctx).await
         }

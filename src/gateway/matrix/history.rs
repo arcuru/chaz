@@ -16,14 +16,10 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
     'outer: while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
             let raw = message.raw();
-            if let Some((sender, content)) = raw
-                .get_field::<String>("sender")
-                .unwrap_or(None)
-                .zip(
-                    raw.get_field::<RoomMessageEventContent>("content")
-                        .unwrap_or(None),
-                )
-            {
+            if let Some((sender, content)) = raw.get_field::<String>("sender").unwrap_or(None).zip(
+                raw.get_field::<RoomMessageEventContent>("content")
+                    .unwrap_or(None),
+            ) {
                 if let MessageType::Text(text_content) = &content.msgtype {
                     // Stop at !chaz clear
                     if text_content.body.starts_with("!chaz clear") {

@@ -204,6 +204,64 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Authorize a pubkey on an Agent DB (Co-owned Agents Stage 10).
+    /// Used by `/agent invite` to give another peer's pubkey admin/write/
+    /// read permission on the agent DB's AuthSettings. Fails if this peer
+    /// holds no key for the agent — you can't invite someone to an agent
+    /// you don't own.
+    pub async fn grant_on_agent_db(
+        &self,
+        agent_db_id: &eidetica::entry::ID,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+        key_label: &str,
+        permission: Permission,
+    ) -> anyhow::Result<()> {
+        let agent_db = self
+            .open_agent_db(agent_db_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Peer holds no key for agent DB {agent_db_id}"))?;
+        let txn = agent_db.database().new_transaction().await?;
+        let settings = txn.get_settings()?;
+        settings
+            .set_auth_key(pubkey, AuthKey::active(Some(key_label), permission))
+            .await?;
+        txn.commit().await?;
+        info!(
+            agent_db_id = %agent_db_id,
+            key_label,
+            permission = ?permission,
+            "Granted key on agent DB"
+        );
+        Ok(())
+    }
+
+    /// Revoke a pubkey on an Agent DB (Co-owned Agents Stage 10).
+    /// Used by `/agent revoke-peer`. Historical entries signed by the key
+    /// remain verifiable; no new writes.
+    pub async fn revoke_on_agent_db(
+        &self,
+        agent_db_id: &eidetica::entry::ID,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<()> {
+        let agent_db = self
+            .open_agent_db(agent_db_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Peer holds no key for agent DB {agent_db_id}"))?;
+        let txn = agent_db.database().new_transaction().await?;
+        let settings = txn.get_settings()?;
+        settings.revoke_auth_key(pubkey).await?;
+        txn.commit().await?;
+        info!(agent_db_id = %agent_db_id, "Revoked key on agent DB");
+        Ok(())
+    }
+
+    /// Return this peer's default pubkey — used by `/pubkey` so an agent
+    /// owner can paste it into `/agent invite` on another peer.
+    pub async fn default_pubkey(&self) -> anyhow::Result<eidetica::auth::crypto::PublicKey> {
+        let user = self.user.lock().await;
+        Ok(user.get_default_key()?)
+    }
+
     /// Revoke a pubkey on a session. Used by `spawn_task` after the task
     /// completes — historical entries signed by the key remain verifiable,
     /// but no new entries can be written.
@@ -297,6 +355,65 @@ mod tests {
             .await
             .unwrap()
             .get_auth_key(&pubkey)
+            .await
+            .unwrap();
+        assert_ne!(
+            auth_after.status(),
+            &eidetica::auth::types::KeyStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn default_pubkey_returns_users_key() {
+        let (_instance, registry) = make_registry().await;
+        let pk = registry.default_pubkey().await.unwrap();
+        // Round-trip the prefixed representation to prove it's a real key.
+        let as_str = pk.to_prefixed_string();
+        assert!(as_str.starts_with("ed25519:"), "got {as_str}");
+    }
+
+    #[tokio::test]
+    async fn grant_and_revoke_on_agent_db_lifecycle() {
+        let (_instance, registry) = make_registry().await;
+        let cfg = crate::agent_db::AgentDbConfig::default();
+        let meta = crate::agent_db::AgentMeta {
+            display_name: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        let (agent_db, _owner_pk) = registry
+            .create_new_agent_db("alpha", &cfg, &meta)
+            .await
+            .unwrap();
+        let db_id = agent_db.id();
+
+        // Synthesize a second pubkey — the "remote peer" we'd be inviting.
+        let invitee_pk = registry.new_ephemeral_key("invitee:test").await.unwrap();
+
+        registry
+            .grant_on_agent_db(&db_id, &invitee_pk, "co-admin:test", Permission::Admin(1))
+            .await
+            .unwrap();
+        let auth = agent_db
+            .database()
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_key(&invitee_pk)
+            .await
+            .unwrap();
+        assert_eq!(auth.permissions(), &Permission::Admin(1));
+        assert_eq!(auth.status(), &eidetica::auth::types::KeyStatus::Active);
+
+        registry
+            .revoke_on_agent_db(&db_id, &invitee_pk)
+            .await
+            .unwrap();
+        let auth_after = agent_db
+            .database()
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_key(&invitee_pk)
             .await
             .unwrap();
         assert_ne!(

@@ -282,14 +282,10 @@ pub async fn get_context(
     'outer: while let Ok(batch) = room.messages(options).await {
         for message in batch.chunk {
             let raw = message.raw();
-            if let Some((sender, content)) = raw
-                .get_field::<String>("sender")
-                .unwrap_or(None)
-                .zip(
-                    raw.get_field::<RoomMessageEventContent>("content")
-                        .unwrap_or(None),
-                )
-            {
+            if let Some((sender, content)) = raw.get_field::<String>("sender").unwrap_or(None).zip(
+                raw.get_field::<RoomMessageEventContent>("content")
+                    .unwrap_or(None),
+            ) {
                 if let MessageType::Text(text_content) = &content.msgtype {
                     if is_command("!", &text_content.body) {
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {

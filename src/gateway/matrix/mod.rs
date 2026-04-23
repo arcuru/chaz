@@ -507,8 +507,9 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|host|list|hosted|new|delete|share|import|set <arg>".to_string(),
-            "Attach/detach, manage host, list, create/delete/share/import/edit a Living Agent",
+            "add|remove|host|list|hosted|new|delete|share|import|set|invite|revoke-peer <arg>"
+                .to_string(),
+            "Attach/detach, manage host, list, create/delete/share/import/edit/invite/revoke a Living Agent",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -563,9 +564,44 @@ impl Gateway for MatrixGateway {
                             })
                         }
                     }
+                    "invite" if !rest.is_empty() => {
+                        let mut parts = rest.splitn(3, char::is_whitespace);
+                        let agent_ref = parts.next().unwrap_or("").trim();
+                        let pubkey = parts.next().unwrap_or("").trim();
+                        let perm = parts.next().unwrap_or("").trim();
+                        match crate::commands::parse_permission_token(perm) {
+                            Some(permission) if !agent_ref.is_empty() && !pubkey.is_empty() => {
+                                Some(Command::AgentInvite {
+                                    agent_ref: agent_ref.to_string(),
+                                    pubkey: pubkey.to_string(),
+                                    permission,
+                                })
+                            }
+                            _ => None,
+                        }
+                    }
+                    "revoke-peer" if !rest.is_empty() => {
+                        let mut parts = rest.splitn(2, char::is_whitespace);
+                        let agent_ref = parts.next().unwrap_or("").trim();
+                        let pubkey = parts.next().unwrap_or("").trim();
+                        if agent_ref.is_empty() || pubkey.is_empty() {
+                            None
+                        } else {
+                            Some(Command::AgentRevokePeer {
+                                agent_ref: agent_ref.to_string(),
+                                pubkey: pubkey.to_string(),
+                            })
+                        }
+                    }
                     _ => None,
                 }
             }
+        );
+        register_shared!(
+            "pubkey",
+            "".to_string(),
+            "Show this peer's default pubkey (for /agent invite on another peer)",
+            |_t| { Some(Command::Pubkey) }
         );
         register_shared!(
             "memory",

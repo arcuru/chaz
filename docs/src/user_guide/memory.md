@@ -16,9 +16,9 @@ graph LR
 
 ## The Two Kinds
 
-| Kind                   | DB                | Tool call                        | Who can read/write                                                 |
-| ---------------------- | ----------------- | -------------------------------- | ------------------------------------------------------------------ |
-| **Self memory**        | Agent's own DB    | `remember` / `recall` (no `bank`) | Just the agent — it owns the DB key                                |
+| Kind                   | DB                                                | Tool call                                   | Who can read/write                                            |
+| ---------------------- | ------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------- |
+| **Self memory**        | Agent's own DB                                    | `remember` / `recall` (no `bank`)           | Just the agent — it owns the DB key                           |
 | **Shared memory bank** | Standalone `MemoryBankDb` (or another agent's DB) | `remember` / `recall` with `bank: "<name>"` | Anyone granted `Read` or `Write` on the bank's `AuthSettings` |
 
 "Another agent's DB" works here because every Agent DB _is_ a memory bank — it has the same `memory` Table. Granting agent B Read on agent A's DB means B can `recall` from A's notes.
@@ -64,15 +64,15 @@ Lists every bank the agent can see, with the permission level. Always includes `
 
 Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix uses `!chaz memory <sub>`.
 
-| Command                                                 | What                                                                                                  |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `/memory new <name> [description]`                      | Create a new standalone bank DB on this peer. The peer holds the bank's key.                           |
-| `/memory list`                                          | List banks hosted by this peer.                                                                       |
-| `/memory delete <ref>`                                  | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                 |
-| `/memory grant <bank> <agent> <read\|write>`            | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB. |
-| `/memory revoke <bank> <agent>`                         | Reverse a grant. Revokes auth, then best-effort removes the ref.                                      |
-| `/memory share <bank>`                                  | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                     |
-| `/memory import <ticket>`                               | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.      |
+| Command                                      | What                                                                                                  |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `/memory new <name> [description]`           | Create a new standalone bank DB on this peer. The peer holds the bank's key.                          |
+| `/memory list`                               | List banks hosted by this peer.                                                                       |
+| `/memory delete <ref>`                       | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                 |
+| `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB. |
+| `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                      |
+| `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                     |
+| `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.      |
 
 Refs accept either a display name or an eidetica DB ID.
 
@@ -128,7 +128,11 @@ Produces a fresh `MemoryBankDb` signed by a bank-specific key held by this peer.
 Mid-conversation, `alpha` calls:
 
 ```json
-{ "key": "architecture.sessions", "value": "Each conversation gets its own eidetica DB.", "bank": "project-notes" }
+{
+  "key": "architecture.sessions",
+  "value": "Each conversation gets its own eidetica DB.",
+  "bank": "project-notes"
+}
 ```
 
 Later, `beta` (in a totally different session) calls:

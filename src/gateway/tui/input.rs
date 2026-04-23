@@ -2,7 +2,7 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
-use crate::commands::Command;
+use crate::commands::{Command, parse_permission_token};
 use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -117,6 +117,7 @@ fn parse_chat_line(
         "/model" => return Some(ChatAction::Dispatch(Command::Model(None))),
         "/channels" => return Some(ChatAction::Dispatch(Command::ListChannels)),
         "/agents" => return Some(ChatAction::Dispatch(Command::AgentsList)),
+        "/pubkey" => return Some(ChatAction::Dispatch(Command::Pubkey)),
         _ => {}
     }
 
@@ -184,6 +185,51 @@ fn parse_chat_line(
         }
         show_error(app, "Usage: /agent delete <name|db_id>".to_string());
         return None;
+    }
+    if let Some(arg) = text.strip_prefix("/agent invite ") {
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(3, char::is_whitespace);
+        let agent_ref = parts.next().unwrap_or("").trim();
+        let pubkey = parts.next().unwrap_or("").trim();
+        let perm_tok = parts.next().unwrap_or("").trim();
+        if agent_ref.is_empty() || pubkey.is_empty() {
+            show_error(
+                app,
+                "Usage: /agent invite <ref> <pubkey> [admin|write|read]".to_string(),
+            );
+            return None;
+        }
+        let permission = match parse_permission_token(perm_tok) {
+            Some(p) => p,
+            None => {
+                show_error(
+                    app,
+                    format!(
+                        "Unknown permission '{perm_tok}' — use admin, write, or read (default: admin)"
+                    ),
+                );
+                return None;
+            }
+        };
+        return Some(ChatAction::Dispatch(Command::AgentInvite {
+            agent_ref: agent_ref.to_string(),
+            pubkey: pubkey.to_string(),
+            permission,
+        }));
+    }
+    if let Some(arg) = text.strip_prefix("/agent revoke-peer ") {
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let agent_ref = parts.next().unwrap_or("").trim();
+        let pubkey = parts.next().unwrap_or("").trim();
+        if agent_ref.is_empty() || pubkey.is_empty() {
+            show_error(app, "Usage: /agent revoke-peer <ref> <pubkey>".to_string());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::AgentRevokePeer {
+            agent_ref: agent_ref.to_string(),
+            pubkey: pubkey.to_string(),
+        }));
     }
     if let Some(arg) = text.strip_prefix("/agent set ") {
         let trimmed = arg.trim();
@@ -498,6 +544,9 @@ fn help_text(_session_db: &eidetica::Database) -> String {
         "  /agent delete <ref>   — unregister a Living Agent (DB preserved for archive)",
         "  /agent share <ref>    — generate a share ticket for an agent's DB",
         "  /agent import <ticket>— sync + register an agent DB from a ticket",
+        "  /agent invite <ref> <pubkey> [admin|write|read] — grant another peer access (default: admin)",
+        "  /agent revoke-peer <ref> <pubkey> — revoke a co-owner's access",
+        "  /pubkey               — show this peer's default pubkey (for /agent invite)",
         "",
         "Memory banks:",
         "  /memory list          — list memory banks this peer hosts",

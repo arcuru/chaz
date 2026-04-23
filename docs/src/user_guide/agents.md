@@ -76,6 +76,22 @@ Every ref is either an agent's display name or its eidetica DB ID; resolution tr
 | `/agent host <ref>`          | Designate the session's host agent (see turn-taking). Agent must already be attached.                                          |
 | `/agent host` (no arg)       | Clear the host agent.                                                                                                          |
 
+### Lifecycle, sharing, and co-ownership
+
+These aren't session-scoped; they act on the Living Agent itself.
+
+| Command                                             | What                                                                                                                                                                     |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `role`/`model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`. |
+| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                               |
+| `/agent hosted`                                     | List every Living Agent this peer hosts (from the local `agents` index).                                                                                                 |
+| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                         |
+| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                         |
+| `/agent import <ticket>`                            | Sync + register an agent DB from a share ticket. Requires this peer already hold a key on the DB (see `/pubkey` + `/agent invite`).                                      |
+| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                           |
+| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Authorise another peer's pubkey on this agent's DB. Default `admin` (`Admin(1)`); other tiers: `write` (`Write(10)`) / `read` (`Read`). Admin(0) stays with the owner.   |
+| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).  |
+
 ## Turn-taking
 
 When a message arrives on a multi-agent session, routing picks one agent in this precedence:
@@ -191,8 +207,9 @@ stateDiagram-v2
     Attached --> Running: message / Directive arrives
     Running --> Attached: response written
     Attached --> Hosted: /agent remove <ref>
-    Hosted --> Shared: /agent share → ticket
-    Shared --> Hosted: /agent import ticket (on peer B)
+    Hosted --> Invited: /agent invite <peer-pubkey>
+    Invited --> CoHosted: /agent share → /agent import (peer B)
+    CoHosted --> Hosted: /agent revoke-peer (by owner)
     Hosted --> [*]: /agent delete (index row only; DB preserved)
 ```
 
@@ -263,7 +280,11 @@ Unmentioned messages fall through: host agent → first attached → default.
 Once `coder` lists `researcher` in its `can_spawn`, `coder` can call the `spawn_agent` tool mid-ReAct:
 
 ```json
-{ "agent": "researcher", "task": "find the canonical reference", "preset": "deep" }
+{
+  "agent": "researcher",
+  "task": "find the canonical reference",
+  "preset": "deep"
+}
 ```
 
 The parent blocks on completion (sync) or gets a child session ID back (`async: true`) and continues.
@@ -295,20 +316,52 @@ sequenceDiagram
 
 Every peer hosting `researcher` polls its sessions every 30s. When a rule fires, it writes a `Directive` — indistinguishable from a user message from the router's perspective.
 
-### 7. Share the agent with another peer
+### 7. Share the agent with another peer (co-ownership)
+
+Chaz uses a **preseed-pubkey** model for co-ownership: keys stay peer-local, and the owner authorises a second peer by writing that peer's pubkey into the agent DB's `AuthSettings`. The share ticket then only carries the DB reference — no key material ever crosses the wire.
+
+On peer B, get the pubkey to paste:
 
 ```text
+/pubkey
+# → ed25519:AbCd…xyz
+```
+
+On peer A (the agent's current owner), invite that pubkey and share the DB:
+
+```text
+/agent invite researcher ed25519:AbCd…xyz admin
+# → Invited ed25519:AbCd… as Admin on agent 'researcher' (DB sha256:…).
+
 /agent share researcher
 # → eidetica:?db=sha256:…&pr=http:…
 ```
 
-On peer B:
+On peer B, import the ticket:
 
 ```text
 /agent import eidetica:?db=sha256:…&pr=http:…
 ```
 
-If the ticket carries a key, peer B _hosts_ the agent too: both peers can route turns to it, and the fastest to respond wins (the server's per-session serialisation prevents duplicate replies). Without a key it's read-only — peer B sees the agent exist in sync but can't run it.
+Because peer B already holds a key for the DB (it's the one the owner pre-authorised), `/agent import` registers the agent under peer B's own key. Both peers now host the agent: either can attach it to sessions, edit config, run turns — and `/agent share` + `/agent import` can daisy-chain further peers from there. The server's per-session serialisation prevents duplicate replies when two peers race on the same message.
+
+`/agent invite` takes an optional permission — `admin` (default), `write`, or `read`:
+
+| Token   | Eidetica permission | Co-owner can …                                                                                                      |
+| ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `admin` | `Admin(1)`          | Edit config/memory, grant Read/Write to further peers. **Cannot revoke the original owner** (who holds `Admin(0)`). |
+| `write` | `Write(10)`         | Append memory/history entries, attach the agent to their own sessions — but not edit settings or invite others.     |
+| `read`  | `Read`              | Sync + open the DB, read config/memory/history. No writes at all.                                                   |
+
+To revoke a co-owner later:
+
+```text
+/agent revoke-peer researcher ed25519:AbCd…xyz
+```
+
+Historical entries the revoked peer signed remain verifiable — no new writes under that key are accepted. (Revoking **this** peer's own key on an agent is rejected; use `/agent delete` to unregister the agent locally instead.)
+
+**Note**: `Admin(0)` stays with the creating peer — there is no "handover primary ownership" flow today. Multi-tier admin grants (`Admin(2)`, `Admin(3)`, …) aren't exposed yet either.
 
 ### 8. Detach or delete
 
@@ -321,7 +374,9 @@ History is append-only; detach does not erase it.
 
 ## Multi-Peer Topology
 
-A single agent DB can be hosted by several peers simultaneously. Each keeps its own copy of the key and the index row; eidetica sync replicates `config`, `memory`, `meta`, `history`, and `memory_banks`.
+A single agent DB can be hosted by several peers simultaneously. Each peer holds its _own_ keypair — `/pubkey` + `/agent invite` is the handshake that pre-authorises a second peer's pubkey on the DB before the ticket ever moves. The keys never sync; only DB entries do.
+
+Each peer keeps its own row in its local `agents` index; eidetica sync replicates `config`, `memory`, `meta`, `history`, and `memory_banks` between peers. Session `AuthSettings` lists each peer's pubkey separately, so routing treats them as distinct authorised writers — whichever peer picks up the entry first answers.
 
 ```mermaid
 graph LR

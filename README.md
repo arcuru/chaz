@@ -67,6 +67,15 @@ chaz --config config.yaml --tui
 | `/agent add <ref>`                                  | Attach an agent (`<ref>` = display name or DB ID)  |
 | `/agent remove <ref>`                               | Detach an agent                                    |
 | `/agent host [<ref>]`                               | Set (or with no arg, clear) the host agent         |
+| `/agent new <name> [k=v ...]`                       | Create a Living Agent (see `docs/` for fields)     |
+| `/agent set <ref> <field> <value>`                  | Edit one field on a Living Agent's config          |
+| `/agent hosted`                                     | List Living Agents hosted on this peer             |
+| `/agent delete <ref>`                               | Unregister a Living Agent locally (DB preserved)   |
+| `/agent share <ref>`                                | Share an agent DB via ticket                       |
+| `/agent import <ticket>`                            | Sync + register an agent DB from a ticket          |
+| `/pubkey`                                           | Print this peer's pubkey (for `/agent invite`)     |
+| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Authorise another peer to co-own an agent          |
+| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a co-owner's access                         |
 | `/heartbeat list`                                   | List heartbeat rules on this session               |
 | `/heartbeat add <id> <cron(6 fields)> <ref> <task>` | Upsert a cron-driven heartbeat rule                |
 | `/heartbeat remove <id>`                            | Remove a heartbeat rule                            |
@@ -145,6 +154,15 @@ When in a Matrix room, Chaz responds to `!chaz` prefixed commands. In DMs, it re
 !chaz agent add <ref>     — Attach an agent to this session
 !chaz agent remove <ref>  — Detach an agent
 !chaz agent host [<ref>]  — Set or clear the host agent
+!chaz agent new <name> [k=v ...]            — Create a Living Agent
+!chaz agent set <ref> <field> <value>       — Edit one field
+!chaz agent hosted                          — List hosted Living Agents
+!chaz agent delete <ref>                    — Unregister locally (DB preserved)
+!chaz agent share <ref>                     — Share an agent via ticket
+!chaz agent import <ticket>                 — Sync + register an agent DB
+!chaz pubkey                                — Print this peer's pubkey
+!chaz agent invite <ref> <pubkey> [admin|write|read] — Authorise a co-owner
+!chaz agent revoke-peer <ref> <pubkey>      — Revoke a co-owner
 !chaz heartbeat list                                         — List heartbeat rules
 !chaz heartbeat add <id> <cron(6 fields)> <ref> <task...>    — Upsert a heartbeat rule
 !chaz heartbeat remove <id>                                  — Remove a rule

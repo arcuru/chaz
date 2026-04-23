@@ -8,7 +8,7 @@ use crate::session::Session;
 use crate::types::ConversationId;
 
 use super::heartbeat::sweep_heartbeat_rules_for_agent;
-use super::{CommandContext, CommandOutcome};
+use super::{CoOwnerPermission, CommandContext, CommandOutcome};
 
 // -----------------------------------------------------------------------------
 // Shared: agent ref resolution
@@ -504,6 +504,131 @@ pub(super) async fn agent_set(
     ))
 }
 
+// -----------------------------------------------------------------------------
+// Co-owned Agents (Stage 10): /pubkey + /agent invite + /agent revoke-peer
+// -----------------------------------------------------------------------------
+
+pub(super) async fn pubkey(ctx: &CommandContext<'_>) -> CommandOutcome {
+    match ctx.server.registry().default_pubkey().await {
+        Ok(pk) => CommandOutcome::Text(pk.to_prefixed_string()),
+        Err(e) => CommandOutcome::Error(format!("Failed to read default pubkey: {e}")),
+    }
+}
+
+fn map_coowner_permission(p: CoOwnerPermission) -> eidetica::auth::types::Permission {
+    match p {
+        CoOwnerPermission::Admin => eidetica::auth::types::Permission::Admin(1),
+        CoOwnerPermission::Write => eidetica::auth::types::Permission::Write(10),
+        CoOwnerPermission::Read => eidetica::auth::types::Permission::Read,
+    }
+}
+
+pub(super) async fn agent_invite(
+    agent_ref: &str,
+    pubkey_str: &str,
+    permission: CoOwnerPermission,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    let pk = match eidetica::auth::crypto::PublicKey::from_prefixed_string(pubkey_str) {
+        Ok(k) => k,
+        Err(e) => {
+            return CommandOutcome::Error(format!(
+                "Invalid pubkey '{pubkey_str}' — expected ed25519:base64… ({e})"
+            ));
+        }
+    };
+
+    // Inviting your own key is a no-op — the peer already holds a key on this DB.
+    if pk == entry.pubkey {
+        return CommandOutcome::Error(format!(
+            "You already own agent '{}' on this peer — no invite needed",
+            entry.display_name
+        ));
+    }
+
+    let eidetica_perm = map_coowner_permission(permission);
+    // Short-hash label keeps the AuthSettings key-id readable without bloating
+    // the settings doc with the full 44-char base64 pubkey.
+    let short = pubkey_str
+        .strip_prefix("ed25519:")
+        .unwrap_or(pubkey_str)
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let key_label = format!("co-{}:{short}", permission_label(permission));
+
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .grant_on_agent_db(&entry.db_id, &pk, &key_label, eidetica_perm)
+        .await
+    {
+        return CommandOutcome::Error(format!("Failed to invite peer: {e}"));
+    }
+
+    CommandOutcome::Text(format!(
+        "Invited {pubkey_str} as {permission:?} on agent '{}' (DB {}). Share the ticket with /agent share {}.",
+        entry.display_name, entry.db_id, entry.display_name
+    ))
+}
+
+fn permission_label(p: CoOwnerPermission) -> &'static str {
+    match p {
+        CoOwnerPermission::Admin => "admin",
+        CoOwnerPermission::Write => "write",
+        CoOwnerPermission::Read => "read",
+    }
+}
+
+pub(super) async fn agent_revoke_peer(
+    agent_ref: &str,
+    pubkey_str: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    let pk = match eidetica::auth::crypto::PublicKey::from_prefixed_string(pubkey_str) {
+        Ok(k) => k,
+        Err(e) => {
+            return CommandOutcome::Error(format!(
+                "Invalid pubkey '{pubkey_str}' — expected ed25519:base64… ({e})"
+            ));
+        }
+    };
+
+    // Revoking our own key on the agent's DB would orphan the agent locally
+    // (no key → can't open the DB, can't undo). Use /agent delete for the
+    // peer-local cleanup instead.
+    if pk == entry.pubkey {
+        return CommandOutcome::Error(format!(
+            "That's this peer's own key for agent '{}' — use /agent delete to unregister locally",
+            entry.display_name
+        ));
+    }
+
+    if let Err(e) = ctx
+        .server
+        .registry()
+        .revoke_on_agent_db(&entry.db_id, &pk)
+        .await
+    {
+        return CommandOutcome::Error(format!("Failed to revoke peer: {e}"));
+    }
+
+    CommandOutcome::Text(format!(
+        "Revoked {pubkey_str} from agent '{}'. They retain read access to history but cannot write.",
+        entry.display_name
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{Command, CommandContext, CommandOutcome, dispatch};
@@ -943,6 +1068,335 @@ mod tests {
         };
         match dispatch(cmd, &ctx).await {
             CommandOutcome::Error(msg) => assert!(msg.contains("No hosted agent"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Co-owned Agents (Stage 10): /pubkey + /agent invite + /agent revoke-peer
+    // -------------------------------------------------------------------------
+
+    use super::super::CoOwnerPermission;
+
+    #[tokio::test]
+    async fn pubkey_returns_peer_default_key() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(Command::Pubkey, &ctx).await {
+            CommandOutcome::Text(s) => assert!(s.starts_with("ed25519:"), "got {s}"),
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    async fn fresh_invitee_pubkey(
+        registry: &crate::session::SessionRegistry,
+    ) -> eidetica::auth::crypto::PublicKey {
+        // Synthesize a second pubkey via the registry's ephemeral-key helper —
+        // in real use this is a remote peer's pubkey, but for tests any valid
+        // pubkey distinct from our default works.
+        registry.new_ephemeral_key("invitee:test").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_invite_admin_adds_key_to_agent_db_auth() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+
+        let invitee_pk = fresh_invitee_pubkey(&registry).await;
+        let cmd = Command::AgentInvite {
+            agent_ref: "alpha".to_string(),
+            pubkey: invitee_pk.to_prefixed_string(),
+            permission: CoOwnerPermission::Admin,
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Text(msg) => assert!(msg.contains("Invited"), "got {msg}"),
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        let entry = server
+            .agent_index()
+            .find_by_name("alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let auth = agent_db
+            .database()
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_key(&invitee_pk)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.permissions(),
+            &eidetica::auth::types::Permission::Admin(1)
+        );
+        assert_eq!(auth.status(), &eidetica::auth::types::KeyStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn agent_invite_write_permission() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+        let invitee_pk = fresh_invitee_pubkey(&registry).await;
+        let _ = dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee_pk.to_prefixed_string(),
+                permission: CoOwnerPermission::Write,
+            },
+            &ctx,
+        )
+        .await;
+        let entry = server
+            .agent_index()
+            .find_by_name("alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let auth = agent_db
+            .database()
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_key(&invitee_pk)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.permissions(),
+            &eidetica::auth::types::Permission::Write(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_invite_read_permission() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+        let invitee_pk = fresh_invitee_pubkey(&registry).await;
+        let _ = dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee_pk.to_prefixed_string(),
+                permission: CoOwnerPermission::Read,
+            },
+            &ctx,
+        )
+        .await;
+        let entry = server
+            .agent_index()
+            .find_by_name("alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let auth = agent_db
+            .database()
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_key(&invitee_pk)
+            .await
+            .unwrap();
+        assert_eq!(auth.permissions(), &eidetica::auth::types::Permission::Read);
+    }
+
+    #[tokio::test]
+    async fn agent_invite_rejects_own_pubkey() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+        let own_pk = server
+            .agent_index()
+            .find_by_name("alpha")
+            .await
+            .unwrap()
+            .unwrap()
+            .pubkey;
+        match dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: own_pk.to_prefixed_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Error(msg) => assert!(msg.contains("already own"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_invite_rejects_malformed_pubkey() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+        match dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: "not a pubkey".to_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Error(msg) => assert!(msg.contains("Invalid pubkey"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_invite_unknown_agent_errors() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(
+            Command::AgentInvite {
+                agent_ref: "ghost".to_string(),
+                pubkey: "ed25519:AAAA".to_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Error(msg) => assert!(msg.contains("No hosted agent"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_revoke_peer_removes_key() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+        let invitee_pk = fresh_invitee_pubkey(&registry).await;
+        dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee_pk.to_prefixed_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await;
+
+        match dispatch(
+            Command::AgentRevokePeer {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee_pk.to_prefixed_string(),
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => assert!(msg.contains("Revoked"), "got {msg}"),
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        let entry = server
+            .agent_index()
+            .find_by_name("alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let auth_after = agent_db
+            .database()
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_key(&invitee_pk)
+            .await
+            .unwrap();
+        assert_ne!(
+            auth_after.status(),
+            &eidetica::auth::types::KeyStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_revoke_peer_refuses_own_key() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+        let own_pk = server
+            .agent_index()
+            .find_by_name("alpha")
+            .await
+            .unwrap()
+            .unwrap()
+            .pubkey;
+        match dispatch(
+            Command::AgentRevokePeer {
+                agent_ref: "alpha".to_string(),
+                pubkey: own_pk.to_prefixed_string(),
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("/agent delete"), "got {msg}")
+            }
             _ => panic!("expected Error"),
         }
     }
