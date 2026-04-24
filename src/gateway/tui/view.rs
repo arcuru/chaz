@@ -207,9 +207,12 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
     f.render_widget(paragraph, inner);
 }
 
-fn ui_chat(f: &mut ratatui::Frame, app: &App) {
+fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
+    // 4-line approval panel when a tool is waiting on the user; 0 otherwise.
+    let approval_h: u16 = if app.pending_approval.is_some() { 4 } else { 0 };
     let chunks = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(approval_h),
         Constraint::Length(1),
         Constraint::Length(3),
     ])
@@ -331,34 +334,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    if let Some(ref exchange) = app.pending_approval {
-        let info = &exchange.info;
-        lines.push(Line::from(vec![Span::styled(
-            "--- Tool Approval Required ---",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        lines.push(Line::from(format!("  Tool: {}", info.name)));
-        lines.push(Line::from(format!("  Risk: {}", info.risk_level)));
-        for (i, l) in display_lines(&info.arguments_display, None)
-            .into_iter()
-            .enumerate()
-        {
-            let prefix = if i == 0 { "  Args: " } else { "        " };
-            lines.push(Line::from(format!("{prefix}{l}")));
-        }
-        lines.push(Line::from(vec![
-            Span::styled("  [y]", Style::default().fg(Color::Green)),
-            Span::raw("es  "),
-            Span::styled("[n]", Style::default().fg(Color::Red)),
-            Span::raw("o  "),
-            Span::styled("[a]", Style::default().fg(Color::Yellow)),
-            Span::raw("ll"),
-        ]));
-        lines.push(Line::from(""));
-    }
-
     if app.waiting {
         lines.push(Line::from(vec![Span::styled(
             "  thinking...",
@@ -384,6 +359,20 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         .block(Block::bordered().title(" Chaz "));
     f.render_widget(messages, chunks[0]);
 
+    if let Some(exchange) = app.pending_approval.as_ref() {
+        let tool_name = exchange.info.name.clone();
+        let risk = exchange.info.risk_level.to_string();
+        let args = exchange.info.arguments_display.clone();
+        render_approval_panel(
+            f,
+            &mut app.click_regions,
+            chunks[1],
+            &tool_name,
+            &risk,
+            &args,
+        );
+    }
+
     let msg_count = app
         .entries
         .iter()
@@ -400,17 +389,105 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
     );
     let status =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(status, chunks[1]);
+    f.render_widget(status, chunks[2]);
 
     let input = Paragraph::new(app.input.as_str()).block(Block::bordered().title(" > "));
-    f.render_widget(input, chunks[2]);
+    f.render_widget(input, chunks[3]);
 
-    let cursor_x = chunks[2].x + app.cursor as u16 + 1;
-    let cursor_y = chunks[2].y + 1;
+    let cursor_x = chunks[3].x + app.cursor as u16 + 1;
+    let cursor_y = chunks[3].y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn ui_picker(f: &mut ratatui::Frame, app: &App) {
+/// Render the tool-approval panel in the row reserved for it and push
+/// clickable regions for the three buttons.
+fn render_approval_panel(
+    f: &mut ratatui::Frame,
+    click_regions: &mut Vec<ClickRegion>,
+    area: Rect,
+    tool_name: &str,
+    risk: &str,
+    args: &str,
+) {
+    let block = Block::bordered()
+        .title(format!(" Tool approval — {tool_name} ({risk}) "))
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Two rows: args preview, then button row.
+    let args_preview = truncate_chars(args, inner.width as usize * 2);
+    let args_line = Line::from(vec![
+        Span::styled("args: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(args_preview.replace('\n', " ")),
+    ]);
+    let buttons = Line::from(vec![
+        Span::styled(
+            " [y] approve ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            " [n] deny ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            " [a] approve all ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let paragraph =
+        Paragraph::new(vec![args_line, buttons]).style(Style::default().fg(Color::White));
+    f.render_widget(paragraph, inner);
+
+    // Record click regions for the buttons. Widths here must match the label
+    // literals above (including leading/trailing spaces).
+    let row_y = inner.y + 1;
+    let mut x = inner.x;
+    let w_yes: u16 = 13;
+    let w_sep: u16 = 2;
+    let w_no: u16 = 10;
+    let w_all: u16 = 17;
+    click_regions.push(ClickRegion {
+        x,
+        y: row_y,
+        w: w_yes,
+        h: 1,
+        target: ClickTarget::ApprovalApprove,
+    });
+    x += w_yes + w_sep;
+    click_regions.push(ClickRegion {
+        x,
+        y: row_y,
+        w: w_no,
+        h: 1,
+        target: ClickTarget::ApprovalDeny,
+    });
+    x += w_no + w_sep;
+    click_regions.push(ClickRegion {
+        x,
+        y: row_y,
+        w: w_all,
+        h: 1,
+        target: ClickTarget::ApprovalApproveAll,
+    });
+}
+
+fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
     let mut lines: Vec<Line> = Vec::new();

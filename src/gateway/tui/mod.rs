@@ -94,6 +94,13 @@ pub(super) enum ClickTarget {
     OverlayDismiss,
     /// Insert a command template into the input box and dismiss the overlay.
     HelpCommand(&'static str),
+    /// Approve the currently pending tool call once.
+    ApprovalApprove,
+    /// Deny the currently pending tool call.
+    ApprovalDeny,
+    /// Approve the currently pending tool call and auto-approve subsequent
+    /// calls for this tool.
+    ApprovalApproveAll,
 }
 
 #[derive(Clone, Copy, Debug)]

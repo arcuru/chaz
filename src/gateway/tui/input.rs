@@ -79,6 +79,15 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
             app.cursor = app.input.len();
             app.overlay = None;
         }
+        ClickTarget::ApprovalApprove => apply_approval(app, ApprovalDecision::Approve),
+        ClickTarget::ApprovalDeny => apply_approval(app, ApprovalDecision::Deny),
+        ClickTarget::ApprovalApproveAll => apply_approval(app, ApprovalDecision::ApproveAll),
+    }
+}
+
+fn apply_approval(app: &mut App, decision: ApprovalDecision) {
+    if let Some(exchange) = app.pending_approval.take() {
+        let _ = exchange.decision_tx.send(decision);
     }
 }
 
