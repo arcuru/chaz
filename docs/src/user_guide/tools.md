@@ -76,6 +76,7 @@ Runs a search query and returns up to 10 normalized results (`{title, url, snipp
 
 Backends are an **ordered preference list** configured under `web_search.backends` — the tool tries each in turn and falls through to the next on any error, returning the first success. Configuration lives in [Configuration](configuration.md#web-search). Supported backends:
 
+- **kagi** — Kagi Search API (requires `api_key`; invite-only beta)
 - **tavily** — LLM-oriented search API (requires `api_key`)
 - **brave** — Brave Search API (requires `api_key`)
 - **serper** — Google SERP via serper.dev (requires `api_key`)

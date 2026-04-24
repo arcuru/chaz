@@ -93,6 +93,7 @@ pub struct WebSearchBackendEntry {
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSearchBackendKind {
+    Kagi,
     Tavily,
     Brave,
     Serper,

@@ -414,6 +414,7 @@ async fn build_web_search_backends(
             continue;
         }
         match (entry.kind, resolved_key) {
+            (Kind::Kagi, Some(api_key)) => built.push(tools::SearchBackend::Kagi { api_key }),
             (Kind::Tavily, Some(api_key)) => built.push(tools::SearchBackend::Tavily { api_key }),
             (Kind::Brave, Some(api_key)) => built.push(tools::SearchBackend::Brave { api_key }),
             (Kind::Serper, Some(api_key)) => built.push(tools::SearchBackend::Serper { api_key }),
@@ -432,6 +433,7 @@ async fn build_web_search_backends(
     let chain: Vec<&'static str> = built
         .iter()
         .map(|b| match b {
+            tools::SearchBackend::Kagi { .. } => "kagi",
             tools::SearchBackend::Tavily { .. } => "tavily",
             tools::SearchBackend::Brave { .. } => "brave",
             tools::SearchBackend::Serper { .. } => "serper",

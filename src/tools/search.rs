@@ -1,10 +1,10 @@
 //! Web search tool.
 //!
-//! Supports a few API-backed providers (Tavily, Brave, Serper) and falls back
-//! to parsing DuckDuckGo's HTML results page when no API key is configured.
-//! The tool holds an ordered preference list of backends and tries each in
-//! turn, failing over to the next on any error. The last entry is the final
-//! answer — if it also errors, that error is returned.
+//! Supports a few API-backed providers (Kagi, Tavily, Brave, Serper) and
+//! falls back to parsing DuckDuckGo's HTML results page when no API key is
+//! configured. The tool holds an ordered preference list of backends and
+//! tries each in turn, failing over to the next on any error. The last
+//! entry is the final answer — if it also errors, that error is returned.
 
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use regex::Regex;
@@ -27,6 +27,8 @@ struct SearchResult {
 /// Which search provider the tool routes queries through.
 #[derive(Debug, Clone)]
 pub enum SearchBackend {
+    /// Kagi Search API — https://kagi.com/api/v0/search (invite-only beta)
+    Kagi { api_key: String },
     /// Tavily REST — https://api.tavily.com/search
     Tavily { api_key: String },
     /// Brave Search API — https://api.search.brave.com/res/v1/web/search
@@ -41,6 +43,7 @@ impl SearchBackend {
     /// Short name for logs / errors.
     fn name(&self) -> &'static str {
         match self {
+            SearchBackend::Kagi { .. } => "kagi",
             SearchBackend::Tavily { .. } => "tavily",
             SearchBackend::Brave { .. } => "brave",
             SearchBackend::Serper { .. } => "serper",
@@ -153,6 +156,9 @@ async fn try_backends(
 ) -> Result<Vec<SearchResult>, ToolError> {
     try_backends_with(backends, |backend| async move {
         match backend {
+            SearchBackend::Kagi { api_key } => {
+                kagi_search(client, api_key, query, max_results).await
+            }
             SearchBackend::Tavily { api_key } => {
                 tavily_search(client, api_key, query, max_results).await
             }
@@ -206,6 +212,70 @@ where
 // ================================================================
 
 use crate::tool::ToolError;
+
+async fn kagi_search(
+    client: &reqwest::Client,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, ToolError> {
+    // Kagi's Search API is GET /api/v0/search?q=&limit= with
+    // `Authorization: Bot <token>` (literal word "Bot", not "Bearer").
+    // Response `data[]` is a discriminated list; `t: 0` entries are
+    // search results (url/title/snippet), `t: 1` is related searches.
+    let response = client
+        .get("https://kagi.com/api/v0/search")
+        .query(&[("q", query), ("limit", &max_results.to_string())])
+        .header("Authorization", format!("Bot {api_key}"))
+        .send()
+        .await
+        .map_err(|e| ToolError::Network(format!("kagi: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| ToolError::Network(format!("kagi: {e}")))?;
+    if !status.is_success() {
+        return Err(ToolError::Execution(format!(
+            "kagi returned HTTP {status}: {text}"
+        )));
+    }
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|e| ToolError::Execution(format!("kagi: bad JSON: {e}")))?;
+    Ok(parse_kagi_results(&parsed, max_results))
+}
+
+/// Extract search-result (`t: 0`) entries from a Kagi response. Pulled out
+/// so it can be unit-tested against a canned response without HTTP.
+fn parse_kagi_results(parsed: &Value, max_results: usize) -> Vec<SearchResult> {
+    parsed
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|r| r.get("t").and_then(|t| t.as_u64()) == Some(0))
+                .take(max_results)
+                .map(|r| SearchResult {
+                    title: r
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    url: r
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    snippet: r
+                        .get("snippet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 async fn tavily_search(
     client: &reqwest::Client,
@@ -619,6 +689,46 @@ mod tests {
     fn urlencoding_decode_rejects_malformed() {
         assert!(urlencoding_decode("%2").is_err());
         assert!(urlencoding_decode("%XY").is_err());
+    }
+
+    #[test]
+    fn kagi_parser_takes_search_results_and_skips_related() {
+        // t=0 is a search result; t=1 is "related searches" (a list). The
+        // parser must only pick up t=0.
+        let body = serde_json::json!({
+            "meta": {"id": "x", "ms": 123, "api_balance": 99.0},
+            "data": [
+                {"t": 0, "url": "https://a.com", "title": "A", "snippet": "about a"},
+                {"t": 0, "url": "https://b.com", "title": "B", "snippet": "about b"},
+                {"t": 1, "list": ["related 1", "related 2"]},
+            ]
+        });
+        let out = parse_kagi_results(&body, 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].url, "https://a.com");
+        assert_eq!(out[0].title, "A");
+        assert_eq!(out[0].snippet, "about a");
+        assert_eq!(out[1].url, "https://b.com");
+    }
+
+    #[test]
+    fn kagi_parser_respects_max_results() {
+        let body = serde_json::json!({
+            "data": [
+                {"t": 0, "url": "https://a.com", "title": "A", "snippet": ""},
+                {"t": 0, "url": "https://b.com", "title": "B", "snippet": ""},
+                {"t": 0, "url": "https://c.com", "title": "C", "snippet": ""},
+            ]
+        });
+        let out = parse_kagi_results(&body, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].url, "https://b.com");
+    }
+
+    #[test]
+    fn kagi_parser_empty_data_returns_empty() {
+        let body = serde_json::json!({ "data": [] });
+        assert!(parse_kagi_results(&body, 10).is_empty());
     }
 
     #[test]
