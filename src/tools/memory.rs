@@ -17,8 +17,8 @@ use crate::db_registry::DbRegistry;
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use chrono::Utc;
-use eidetica::Database;
 use eidetica::store::Table;
+use eidetica::Database;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -490,13 +490,13 @@ async fn search_memory(
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
     use crate::db_registry::{DbEntry, DbRegistry};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 

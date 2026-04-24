@@ -230,6 +230,10 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         agent_index_store.clone(),
     ));
+    tool_registry.register(tools::HeartbeatAdd::new(agent_index_store.clone()));
+    tool_registry.register(tools::HeartbeatModify::new(agent_index_store.clone()));
+    tool_registry.register(tools::HeartbeatRemove);
+    tool_registry.register(tools::HeartbeatList::new(agent_index_store.clone()));
     tool_registry.register(tools::Compact);
     // SpawnAgent / SpawnTask both route through the server — a single OnceLock
     // is shared; it's set once after Server::new below.

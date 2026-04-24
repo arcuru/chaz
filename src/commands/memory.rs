@@ -338,14 +338,14 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
+    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
     use crate::db_registry::DbRegistry;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -558,14 +558,12 @@ mod tests {
         }
 
         // Index row gone.
-        assert!(
-            server
-                .memory_bank_index()
-                .find_by_name("patrick")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(server
+            .memory_bank_index()
+            .find_by_name("patrick")
+            .await
+            .unwrap()
+            .is_none());
 
         // DB itself is still openable (archive preserved).
         assert!(registry.open_memory_bank(&db_id).await.unwrap().is_some());

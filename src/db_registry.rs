@@ -17,10 +17,10 @@
 #![allow(dead_code)]
 
 use crate::agent_db::BootstrappedAgent;
-use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::entry::ID;
 use eidetica::store::DocStore;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -170,12 +170,12 @@ impl DbRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_db::{AgentDbConfig, AgentMeta, BootstrappedAgent, create_agent_db};
-    use crate::memory_bank_db::{MemoryBankMeta, create_memory_bank};
-    use eidetica::Instance;
+    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta, BootstrappedAgent};
+    use crate::memory_bank_db::{create_memory_bank, MemoryBankMeta};
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::user::User;
+    use eidetica::Instance;
 
     async fn test_peer_user() -> User {
         let backend = InMemory::new();

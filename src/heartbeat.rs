@@ -25,8 +25,8 @@ use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::Database;
 use eidetica::store::{DocStore, Table};
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -217,12 +217,21 @@ impl HeartbeatRunner {
         };
 
         let now = Utc::now();
-        let last = load_last_fired(&self.chazdb, &rule.id).await;
-        let next = match last {
-            Some(lr) => schedule.after(&lr).next(),
-            None => schedule.upcoming(Utc).next(),
+        // First observation of this rule: bootstrap last_fired = now and skip
+        // this tick. `schedule.upcoming(Utc).next()` (and `after(now).next()`)
+        // is always strictly in the future, so comparing `next > now` would
+        // never fire on the first pass. Subsequent ticks take the `Some(lr)`
+        // branch below, which correctly returns the next occurrence after
+        // the last fire; once real time crosses it, we fire.
+        let last = match load_last_fired(&self.chazdb, &rule.id).await {
+            Some(t) => t,
+            None => {
+                save_last_fired(&self.chazdb, &rule.id, now).await?;
+                debug!(rule = %rule.id, "Bootstrapped last_fired for new heartbeat rule");
+                return Ok(());
+            }
         };
-        let Some(next) = next else {
+        let Some(next) = schedule.after(&last).next() else {
             return Ok(());
         };
         if next > now {
@@ -267,10 +276,10 @@ impl HeartbeatRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::user::User;
+    use eidetica::Instance;
 
     async fn test_session_db() -> (Instance, User, Database) {
         let backend = InMemory::new();

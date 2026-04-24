@@ -19,8 +19,8 @@
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::Database;
 use eidetica::store::{DocStore, Table};
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 

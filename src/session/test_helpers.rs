@@ -5,11 +5,11 @@
 
 use super::*;
 use crate::agent::AgentRegistry;
-use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
 use crate::config::{AgentConfig, Config};
 use crate::db_registry::{DbEntry, DbRegistry};
-use eidetica::Instance;
 use eidetica::backend::database::InMemory;
+use eidetica::Instance;
 use std::sync::Arc;
 
 /// Fresh in-memory peer with one database ready for SessionMeta round-trip

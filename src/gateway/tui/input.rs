@@ -2,12 +2,12 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
-use crate::commands::{Command, parse_permission_token};
+use crate::commands::{parse_permission_token, Command};
 use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{App, ChatAction, TuiMode, show_error, show_system_msg};
+use super::{show_error, show_system_msg, App, ChatAction, TuiMode};
 
 pub(super) async fn handle_chat_key(
     app: &mut App,

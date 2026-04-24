@@ -5,14 +5,14 @@
 use crate::agent::AgentRegistry;
 use crate::types::ConversationId;
 
-use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
 use eidetica::store::DocStore;
+use eidetica::Database;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use super::{SessionIndex, find_or_create_db, read_meta_from_db, update_meta_on_db};
+use super::{find_or_create_db, read_meta_from_db, update_meta_on_db, SessionIndex};
 
 /// Notification emitted when a new session is indexed in the registry.
 #[derive(Debug, Clone)]
