@@ -67,7 +67,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         let dim = Style::default().fg(Color::DarkGray);
 
         match entry.entry_type {
-            EntryType::Message | EntryType::Directive => {
+            EntryType::Message => {
                 let is_agent = app.agent_names.contains(&entry.sender);
                 let is_system = entry.sender == "system";
                 let sender_style = if is_system {
@@ -84,12 +84,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
                         .add_modifier(Modifier::BOLD)
                 };
 
-                let type_label = if entry.entry_type == EntryType::Directive {
-                    " (directive)"
-                } else {
-                    ""
-                };
-                let label = format!("{}{}{}:", debug_prefix, entry.sender, type_label);
+                let label = format!("{}{}:", debug_prefix, entry.sender);
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
@@ -97,6 +92,24 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
                     lines.push(Line::from(format!("  {content_line}")));
                 }
                 lines.push(Line::from(""));
+            }
+            // Directives are inputs to the agent (heartbeat, spawn_agent,
+            // spawn_task, explicit user directive) — render with ToolResult
+            // formatting so they group with tool output for future collapse UX.
+            EntryType::Directive => {
+                let max_chars = if app.debug_mode { 500 } else { 120 };
+                let head = format!("{} (directive): ", entry.sender);
+                for (i, l) in display_lines(&entry.content, Some(max_chars))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let text = if i == 0 {
+                        format!("{debug_prefix}  < {head}{l}")
+                    } else {
+                        format!("    {l}")
+                    };
+                    lines.push(Line::from(vec![Span::styled(text, dim)]));
+                }
             }
             EntryType::Ack => {
                 lines.push(Line::from(vec![Span::styled(
