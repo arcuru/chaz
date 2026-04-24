@@ -490,8 +490,17 @@ fn render_approval_panel(
 fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
+    let list_area = chunks[0];
+    // Inner area inside the bordered block is 1 inset on each side.
+    let inner_x = list_area.x + 1;
+    let inner_y = list_area.y + 1;
+    let inner_w = list_area.width.saturating_sub(2);
+    let inner_h = list_area.height.saturating_sub(2);
+
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
+    // y offset inside inner area — starts at 1 because of the leading blank.
+    let mut y_off: u16 = 1;
 
     if app.session_list.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -528,6 +537,24 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 Style::default().fg(Color::Gray)
             };
 
+            // One click region per session spanning its header + optional
+            // preview + trailing blank. Blank line padding at the bottom isn't
+            // captured, but clicking the gap between rows resolves to the
+            // row immediately above, which feels natural.
+            let row_h: u16 = if info.last_message.is_some() { 3 } else { 2 };
+            if y_off < inner_h {
+                let clipped_h = row_h.min(inner_h - y_off);
+                if clipped_h > 0 {
+                    app.click_regions.push(ClickRegion {
+                        x: inner_x,
+                        y: inner_y + y_off,
+                        w: inner_w,
+                        h: clipped_h,
+                        target: ClickTarget::PickerSelect(i),
+                    });
+                }
+            }
+
             lines.push(Line::from(vec![Span::styled(header, style)]));
 
             if let Some(ref preview) = info.last_message {
@@ -538,6 +565,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             }
 
             lines.push(Line::from(""));
+            y_off = y_off.saturating_add(row_h);
         }
     }
 

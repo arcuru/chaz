@@ -101,6 +101,9 @@ pub(super) enum ClickTarget {
     /// Approve the currently pending tool call and auto-approve subsequent
     /// calls for this tool.
     ApprovalApproveAll,
+    /// Select a session picker row. Clicking the already-selected row is
+    /// interpreted as "open" (same as pressing Enter).
+    PickerSelect(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -433,7 +436,46 @@ impl Gateway for TuiGateway {
                     }
                 }
                 Action::Mouse(m) => {
-                    input::handle_mouse(&mut app, m);
+                    if let Some(outcome) = input::handle_mouse(&mut app, m) {
+                        match outcome {
+                            input::MouseOutcome::PickerOpenSelected => {
+                                if let Some(selected) =
+                                    app.session_list.get(app.picker_index).map(|s| {
+                                        s.session_db_id.clone()
+                                    })
+                                {
+                                    let ctx = CommandContext {
+                                        server: &server,
+                                        scheduler: self.scheduler.as_ref(),
+                                        secrets: &self.secrets,
+                                        backend: &backend,
+                                        session_db_id: &app.session_db_id,
+                                        session_db: &session_db,
+                                        current_agent: &app.current_agent,
+                                        session_name: app.session_name.as_deref(),
+                                        config_roles: Some(config_role_names.clone()),
+                                        default_role: default_role.as_deref(),
+                                    };
+                                    let outcome = commands::dispatch(
+                                        Command::SwitchSession(selected),
+                                        &ctx,
+                                    )
+                                    .await;
+                                    render_outcome(
+                                        &mut app,
+                                        outcome,
+                                        &server,
+                                        &backend,
+                                        &approval_tx,
+                                        &notify_tx,
+                                        &mut session_db,
+                                    )
+                                    .await;
+                                    app.mode = TuiMode::Chat;
+                                }
+                            }
+                        }
+                    }
                 }
                 Action::SessionChanged => {
                     if let TuiMode::Chat = app.mode {

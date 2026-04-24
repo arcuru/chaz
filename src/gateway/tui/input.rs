@@ -32,7 +32,16 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
+/// Actions the mouse handler wants the main loop to take that it can't do on
+/// its own because they need cross-module context (command dispatch, session
+/// switching, etc.). None for the common no-op path.
+pub(super) enum MouseOutcome {
+    /// Open the currently selected session picker row — equivalent to
+    /// pressing Enter.
+    PickerOpenSelected,
+}
+
+pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
     // Wheel scrolls the overlay when one is up, otherwise the chat history.
     match m.kind {
         MouseEventKind::ScrollUp => {
@@ -41,7 +50,7 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
             } else {
                 app.scroll_offset = app.scroll_offset.saturating_add(3);
             }
-            return;
+            return None;
         }
         MouseEventKind::ScrollDown => {
             if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
@@ -49,10 +58,10 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
             } else {
                 app.scroll_offset = app.scroll_offset.saturating_sub(3);
             }
-            return;
+            return None;
         }
         MouseEventKind::Down(MouseButton::Left) => {}
-        _ => return,
+        _ => return None,
     }
 
     // Left-click — find the innermost hit region. `click_regions` is pushed in
@@ -65,9 +74,7 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
         .rev()
         .copied()
         .find(|r| r.hit(col, row));
-    let Some(hit) = hit else {
-        return;
-    };
+    let hit = hit?;
     match hit.target {
         ClickTarget::OverlayDismiss => {
             app.overlay = None;
@@ -82,7 +89,18 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
         ClickTarget::ApprovalApprove => apply_approval(app, ApprovalDecision::Approve),
         ClickTarget::ApprovalDeny => apply_approval(app, ApprovalDecision::Deny),
         ClickTarget::ApprovalApproveAll => apply_approval(app, ApprovalDecision::ApproveAll),
+        ClickTarget::PickerSelect(i) => {
+            // First click selects; second click on the same row opens. Keeps
+            // the keyboard flow (Up/Down then Enter) intact.
+            if app.picker_index == i && i < app.session_list.len() {
+                return Some(MouseOutcome::PickerOpenSelected);
+            }
+            if i < app.session_list.len() {
+                app.picker_index = i;
+            }
+        }
     }
+    None
 }
 
 fn apply_approval(app: &mut App, decision: ApprovalDecision) {
