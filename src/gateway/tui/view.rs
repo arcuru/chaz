@@ -149,8 +149,11 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         )]));
     }
 
+    let inner_width = chunks[0].width.saturating_sub(2);
     let messages_height = chunks[0].height.saturating_sub(2);
-    let content_height = lines.len() as u16;
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let content_height = paragraph.line_count(inner_width).min(u16::MAX as usize) as u16;
     let scroll = if content_height > messages_height {
         content_height
             .saturating_sub(messages_height)
@@ -159,8 +162,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         0
     };
 
-    let messages = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
+    let messages = paragraph
         .scroll((scroll, 0))
         .block(Block::bordered().title(" Chaz "));
     f.render_widget(messages, chunks[0]);
