@@ -39,6 +39,10 @@ pub(super) enum MouseOutcome {
     /// Open the currently selected session picker row — equivalent to
     /// pressing Enter.
     PickerOpenSelected,
+    /// Activate tab at the given index.
+    TabActivate(usize),
+    /// Close tab at the given index.
+    TabClose(usize),
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
@@ -48,7 +52,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
                 *scroll = scroll.saturating_sub(3);
             } else {
-                app.scroll_offset = app.scroll_offset.saturating_add(3);
+                let off = &mut app.active_mut().scroll_offset;
+                *off = off.saturating_add(3);
             }
             return None;
         }
@@ -56,7 +61,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
                 *scroll = scroll.saturating_add(3);
             } else {
-                app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                let off = &mut app.active_mut().scroll_offset;
+                *off = off.saturating_sub(3);
             }
             return None;
         }
@@ -99,24 +105,26 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 app.picker_index = i;
             }
         }
+        ClickTarget::TabActivate(i) => return Some(MouseOutcome::TabActivate(i)),
+        ClickTarget::TabClose(i) => return Some(MouseOutcome::TabClose(i)),
     }
     None
 }
 
 fn apply_approval(app: &mut App, decision: ApprovalDecision) {
-    if let Some(exchange) = app.pending_approval.take() {
+    if let Some(exchange) = app.active_mut().pending_approval.take() {
         let _ = exchange.decision_tx.send(decision);
     }
 }
 
 pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
-    if let Some(exchange) = app.pending_approval.take() {
+    if let Some(exchange) = app.active_mut().pending_approval.take() {
         let decision = match key.code {
             KeyCode::Char('y') => Some(ApprovalDecision::Approve),
             KeyCode::Char('n') => Some(ApprovalDecision::Deny),
             KeyCode::Char('a') => Some(ApprovalDecision::ApproveAll),
             _ => {
-                app.pending_approval = Some(exchange);
+                app.active_mut().pending_approval = Some(exchange);
                 return None;
             }
         };
@@ -174,16 +182,20 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
             app.cursor = app.input.len();
         }
         KeyCode::Up => {
-            app.scroll_offset = app.scroll_offset.saturating_add(3);
+            let off = &mut app.active_mut().scroll_offset;
+            *off = off.saturating_add(3);
         }
         KeyCode::Down => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            let off = &mut app.active_mut().scroll_offset;
+            *off = off.saturating_sub(3);
         }
         KeyCode::PageUp => {
-            app.scroll_offset = app.scroll_offset.saturating_add(20);
+            let off = &mut app.active_mut().scroll_offset;
+            *off = off.saturating_add(20);
         }
         KeyCode::PageDown => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(20);
+            let off = &mut app.active_mut().scroll_offset;
+            *off = off.saturating_sub(20);
         }
         KeyCode::Esc => {
             app.should_quit = true;
@@ -569,8 +581,9 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
 
     match text {
         "/clear" => {
-            app.entries.clear();
-            app.scroll_offset = 0;
+            let tab = app.active_mut();
+            tab.entries.clear();
+            tab.scroll_offset = 0;
             return None;
         }
         "/debug" => {
@@ -579,7 +592,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         }
         "/raw" => {
             let mut raw = String::new();
-            for (i, entry) in app.entries.iter().enumerate() {
+            for (i, entry) in app.active().entries.iter().enumerate() {
                 let ts = entry.timestamp.format("%H:%M:%S%.3f");
                 let typ = format!("{:?}", entry.entry_type);
                 let t = crate::util::truncate_chars(&entry.content, 80);

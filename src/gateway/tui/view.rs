@@ -102,25 +102,43 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("/agent remove ", "detach an agent"),
         ("/agent host ", "set (or clear) the session's host agent"),
         ("/agent hosted", "list every Living Agent this peer hosts"),
-        ("/agent new ", "create a Living Agent (see docs for k=v fields)"),
-        ("/agent set ", "edit an agent field; takes effect next message"),
+        (
+            "/agent new ",
+            "create a Living Agent (see docs for k=v fields)",
+        ),
+        (
+            "/agent set ",
+            "edit an agent field; takes effect next message",
+        ),
         ("/agent delete ", "unregister a Living Agent (DB preserved)"),
         ("/agent share ", "generate a share ticket for an agent's DB"),
-        ("/agent import ", "sync + register an agent DB from a ticket"),
-        ("/agent invite ", "grant another peer access (admin|write|read)"),
+        (
+            "/agent import ",
+            "sync + register an agent DB from a ticket",
+        ),
+        (
+            "/agent invite ",
+            "grant another peer access (admin|write|read)",
+        ),
         ("/agent revoke-peer ", "revoke a co-owner's access"),
         ("/pubkey", "show this peer's default pubkey"),
         ("# Memory banks", ""),
         ("/memory list", "list memory banks this peer hosts"),
         ("/memory new ", "create a new bank on this peer"),
         ("/memory delete ", "unregister a bank (DB preserved)"),
-        ("/memory grant ", "grant an agent access to a bank (read|write)"),
+        (
+            "/memory grant ",
+            "grant an agent access to a bank (read|write)",
+        ),
         ("/memory revoke ", "revoke an agent's access"),
         ("/memory share ", "generate a share ticket for a bank's DB"),
         ("/memory import ", "sync + register a bank DB from a ticket"),
         ("# Heartbeat", ""),
         ("/heartbeat list", "list heartbeat rules on this session"),
-        ("/heartbeat add ", "add <id> <cron 6 fields> <agent> <task...>"),
+        (
+            "/heartbeat add ",
+            "add <id> <cron 6 fields> <agent> <task...>",
+        ),
         ("/heartbeat remove ", "remove rule by id"),
         ("# LLM config", ""),
         ("/model ", "show or set the model for this session"),
@@ -169,9 +187,8 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
     let mut lines: Vec<Line> = Vec::new();
     // y cursor relative to `inner`: start at 0, advance per line. We push a
     // click region for each command row, using the post-scroll absolute y.
-    let mut row_idx: i32 = 0;
-    for (cmd, desc) in &entries {
-        let abs_y_i = inner.y as i32 + row_idx - scroll as i32;
+    for (row_idx, (cmd, desc)) in entries.iter().enumerate() {
+        let abs_y_i = inner.y as i32 + row_idx as i32 - scroll as i32;
         if cmd.starts_with('#') {
             let header = cmd.trim_start_matches('#').trim();
             lines.push(Line::from(vec![Span::styled(
@@ -198,7 +215,6 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
                 Span::styled(*desc, Style::default().fg(Color::Gray)),
             ]));
         }
-        row_idx += 1;
     }
 
     let paragraph = Paragraph::new(lines)
@@ -209,8 +225,12 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
 
 fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     // 4-line approval panel when a tool is waiting on the user; 0 otherwise.
-    let approval_h: u16 = if app.pending_approval.is_some() { 4 } else { 0 };
+    let has_approval = app.active().pending_approval.is_some();
+    let approval_h: u16 = if has_approval { 4 } else { 0 };
+    // 1-line tab bar at the top. Always present even with one tab so the user
+    // has a consistent affordance.
     let chunks = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(approval_h),
         Constraint::Length(1),
@@ -218,9 +238,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     ])
     .split(f.area());
 
+    render_tab_bar(f, app, chunks[0]);
+
     let mut lines: Vec<Line> = Vec::new();
 
-    for entry in &app.entries {
+    let tab = app.active();
+    for entry in &tab.entries {
         let debug_prefix = if app.debug_mode {
             let ts = entry.timestamp.format("%H:%M:%S");
             let typ = format!("{:?}", entry.entry_type);
@@ -334,22 +357,45 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    if app.waiting {
+    if tab.waiting {
         lines.push(Line::from(vec![Span::styled(
             "  thinking...",
             Style::default().fg(Color::DarkGray),
         )]));
     }
 
-    let inner_width = chunks[0].width.saturating_sub(2);
-    let messages_height = chunks[0].height.saturating_sub(2);
+    // Snapshot what we need from `tab` before releasing the borrow so the
+    // approval panel can take a &mut borrow of app.click_regions.
+    let scroll_offset = tab.scroll_offset;
+    let session_label = match &tab.session_name {
+        Some(name) => format!("{} ({})", name, tab.session_db_id),
+        None => tab.session_db_id.clone(),
+    };
+    let current_agent = tab.current_agent.clone();
+    let msg_count = tab
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::Message)
+        .count();
+    let approval_info = tab.pending_approval.as_ref().map(|ex| {
+        (
+            ex.info.name.clone(),
+            ex.info.risk_level.to_string(),
+            ex.info.arguments_display.clone(),
+        )
+    });
+    let _ = tab;
+
+    let messages_area = chunks[1];
+    let inner_width = messages_area.width.saturating_sub(2);
+    let messages_height = messages_area.height.saturating_sub(2);
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let content_height = paragraph.line_count(inner_width).min(u16::MAX as usize) as u16;
     let scroll = if content_height > messages_height {
         content_height
             .saturating_sub(messages_height)
-            .saturating_sub(app.scroll_offset)
+            .saturating_sub(scroll_offset)
     } else {
         0
     };
@@ -357,46 +403,114 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     let messages = paragraph
         .scroll((scroll, 0))
         .block(Block::bordered().title(" Chaz "));
-    f.render_widget(messages, chunks[0]);
+    f.render_widget(messages, messages_area);
 
-    if let Some(exchange) = app.pending_approval.as_ref() {
-        let tool_name = exchange.info.name.clone();
-        let risk = exchange.info.risk_level.to_string();
-        let args = exchange.info.arguments_display.clone();
+    if let Some((tool_name, risk, args)) = approval_info {
         render_approval_panel(
             f,
             &mut app.click_regions,
-            chunks[1],
+            chunks[2],
             &tool_name,
             &risk,
             &args,
         );
     }
 
-    let msg_count = app
-        .entries
-        .iter()
-        .filter(|e| e.entry_type == EntryType::Message)
-        .count();
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
-    let session_label = match &app.session_name {
-        Some(name) => format!("{} ({})", name, app.session_db_id),
-        None => app.session_db_id.clone(),
-    };
     let status_text = format!(
         " {} | agent: {} | messages: {}{} | /help",
-        session_label, app.current_agent, msg_count, debug_indicator
+        session_label, current_agent, msg_count, debug_indicator
     );
     let status =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(status, chunks[2]);
+    f.render_widget(status, chunks[3]);
 
     let input = Paragraph::new(app.input.as_str()).block(Block::bordered().title(" > "));
-    f.render_widget(input, chunks[3]);
+    f.render_widget(input, chunks[4]);
 
-    let cursor_x = chunks[3].x + app.cursor as u16 + 1;
-    let cursor_y = chunks[3].y + 1;
+    let cursor_x = chunks[4].x + app.cursor as u16 + 1;
+    let cursor_y = chunks[4].y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
+}
+
+/// Render the tab bar: one line across the top showing each tab's title,
+/// active tab highlighted, with a clickable × close marker on each tab when
+/// there's more than one tab. Also records click regions for tab-activate
+/// and tab-close.
+fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let n = app.tabs.len();
+    let show_close = n > 1;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+    let row_y = area.y;
+    for (i, tab) in app.tabs.iter().enumerate() {
+        let is_active = i == app.active_tab;
+        let title = tab.title();
+        // Visual: " <title> " active inverted, others dim, + optional " × ".
+        let title_label = format!(" {title} ");
+        let close_label = if show_close { " × " } else { "" };
+        let title_style = if is_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::DarkGray)
+        };
+        let close_style = if is_active {
+            Style::default().fg(Color::Red).bg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray).bg(Color::DarkGray)
+        };
+        spans.push(Span::styled(title_label.clone(), title_style));
+        if show_close {
+            spans.push(Span::styled(close_label.to_string(), close_style));
+        }
+        // Record hit regions.
+        let title_w = title_label.chars().count() as u16;
+        if x + title_w <= area.x + area.width {
+            app.click_regions.push(ClickRegion {
+                x,
+                y: row_y,
+                w: title_w,
+                h: 1,
+                target: ClickTarget::TabActivate(i),
+            });
+        }
+        x = x.saturating_add(title_w);
+        if show_close {
+            let close_w = close_label.chars().count() as u16;
+            if x + close_w <= area.x + area.width {
+                app.click_regions.push(ClickRegion {
+                    x,
+                    y: row_y,
+                    w: close_w,
+                    h: 1,
+                    target: ClickTarget::TabClose(i),
+                });
+            }
+            x = x.saturating_add(close_w);
+        }
+        // Small spacer gap between tabs.
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(1);
+    }
+    // Hint text at the right side if space allows.
+    let hint = " Ctrl+PgUp/PgDn · Ctrl+W";
+    let used = x.saturating_sub(area.x);
+    let remaining = area.width.saturating_sub(used);
+    if remaining as usize >= hint.len() {
+        let pad = remaining as usize - hint.len();
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            hint.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let line = Line::from(spans);
+    let paragraph =
+        Paragraph::new(vec![line]).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    f.render_widget(paragraph, area);
 }
 
 /// Render the tool-approval panel in the row reserved for it and push
@@ -508,9 +622,10 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
+        let current_session_db_id = app.active().session_db_id.clone();
         for (i, info) in app.session_list.iter().enumerate() {
             let is_selected = i == app.picker_index;
-            let is_current = info.session_db_id == app.session_db_id;
+            let is_current = info.session_db_id == current_session_db_id;
 
             let marker = if is_selected { "> " } else { "  " };
             let current_marker = if is_current { " *" } else { "" };
