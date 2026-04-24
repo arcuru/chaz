@@ -5,9 +5,24 @@
 use crate::commands::{parse_permission_token, Command};
 use crate::gateway::ApprovalDecision;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 
 use super::{show_error, show_system_msg, App, ChatAction, TuiMode};
+
+/// Mouse events. For now, only scroll wheel is wired — clickable regions for
+/// approvals, picker rows, tabs and overlay items get layered on in follow-ups
+/// via `app.click_regions` (populated during render, consulted here).
+pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
+    match m.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+        }
+        _ => {}
+    }
+}
 
 pub(super) async fn handle_chat_key(
     app: &mut App,

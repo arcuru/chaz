@@ -18,7 +18,10 @@ use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent,
+};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use std::collections::HashSet;
@@ -57,6 +60,7 @@ impl TuiGateway {
 
 enum Action {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     SessionChanged,
     ApprovalRequest(ApprovalExchange),
 }
@@ -115,7 +119,7 @@ impl App {
 fn init_terminal() -> anyhow::Result<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -123,7 +127,7 @@ fn init_terminal() -> anyhow::Result<Terminal<ratatui::backend::CrosstermBackend
 
 fn restore_terminal() {
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 /// Register a session DB for server processing and TUI notifications.
@@ -232,6 +236,7 @@ impl Gateway for TuiGateway {
                 Some(Ok(event)) = events.next() => {
                     match event {
                         Event::Key(key) => Action::Key(key),
+                        Event::Mouse(m) => Action::Mouse(m),
                         _ => continue,
                     }
                 }
@@ -378,6 +383,9 @@ impl Gateway for TuiGateway {
                             }
                         }
                     }
+                }
+                Action::Mouse(m) => {
+                    input::handle_mouse(&mut app, m);
                 }
                 Action::SessionChanged => {
                     if let TuiMode::Chat = app.mode {
