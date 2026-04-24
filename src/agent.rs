@@ -1,7 +1,7 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
 use crate::defaults::DEFAULT_CONFIG;
 use crate::grants::Grants;
-use crate::role::{get_role, RoleDetails};
+use crate::role::{RoleDetails, get_role};
 use std::collections::HashMap;
 use tracing::warn;
 

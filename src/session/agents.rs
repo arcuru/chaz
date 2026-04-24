@@ -11,12 +11,12 @@ use crate::agent_db::{AgentDb, SessionHistoryEntry};
 use crate::db_registry::DbEntry;
 
 use chrono::Utc;
+use eidetica::Database;
 use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::store::Table;
-use eidetica::Database;
 use tracing::{info, warn};
 
-use super::{parse_mentions, read_meta_from_db, update_meta_on_db, AgentRef, SessionRegistry};
+use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
 
 impl SessionRegistry {
     /// Attach an agent to a session. Grants the agent's pubkey Write

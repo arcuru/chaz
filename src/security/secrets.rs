@@ -1,5 +1,5 @@
-use eidetica::store::DocStore;
 use eidetica::Database;
+use eidetica::store::DocStore;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};

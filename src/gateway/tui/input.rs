@@ -2,12 +2,12 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
-use crate::commands::{parse_permission_token, Command};
+use crate::commands::{Command, parse_permission_token};
 use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
-use super::{show_error, show_system_msg, App, ChatAction, ClickTarget, Overlay, TuiMode};
+use super::{App, ChatAction, ClickTarget, Overlay, TuiMode, show_error, show_system_msg};
 
 /// Returns true if an overlay was open and consumed the key. Called from the
 /// top of `handle_chat_key` / picker handling so overlays intercept input

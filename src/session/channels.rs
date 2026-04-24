@@ -3,11 +3,11 @@
 
 use crate::types::ConversationId;
 
-use eidetica::store::DocStore;
 use eidetica::Database;
+use eidetica::store::DocStore;
 use tracing::{info, warn};
 
-use super::registry::{SessionRegistry, STORE_MATRIX_CHANNELS};
+use super::registry::{STORE_MATRIX_CHANNELS, SessionRegistry};
 
 impl SessionRegistry {
     /// Return the session bound to a Matrix room, if any.
