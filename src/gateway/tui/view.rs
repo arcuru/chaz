@@ -4,12 +4,15 @@
 use crate::session::EntryType;
 use crate::util::truncate_chars;
 
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use super::App;
+use super::ClickRegion;
+use super::ClickTarget;
+use super::Overlay;
 use super::TuiMode;
 
 /// Prepare arbitrary content for rendering as ratatui `Line`s. Truncates
@@ -39,11 +42,169 @@ fn display_lines(content: &str, max_chars: Option<usize>) -> Vec<String> {
     }
 }
 
-pub(super) fn ui(f: &mut ratatui::Frame, app: &App) {
+pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
+    // Click regions are rebuilt from scratch each frame so coordinates match
+    // what the user is currently seeing.
+    app.click_regions.clear();
+
     match app.mode {
         TuiMode::Chat => ui_chat(f, app),
         TuiMode::SessionPicker => ui_picker(f, app),
     }
+
+    if app.overlay.is_some() {
+        ui_overlay(f, app);
+    }
+}
+
+/// Centered popup rect: `percent_x%` wide × `percent_y%` tall, at least 20×5.
+fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let w = area.width.saturating_mul(percent_x) / 100;
+    let h = area.height.saturating_mul(percent_y) / 100;
+    let w = w.max(20).min(area.width);
+    let h = h.max(5).min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+fn ui_overlay(f: &mut ratatui::Frame, app: &mut App) {
+    match app.overlay {
+        Some(Overlay::Help { scroll }) => ui_help_overlay(f, app, scroll),
+        None => {}
+    }
+}
+
+/// Grouped help catalog. Each (heading, Option<(command_template, description)>)
+/// — a `None` cmd means a section header, `Some` is a clickable command row
+/// that inserts the template into the input box on click.
+fn help_entries() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("# Session", ""),
+        ("/sessions", "open session picker"),
+        ("/new", "create a new session"),
+        ("/join ", "switch to session by name or DB ID"),
+        ("/name ", "set (or clear) a session alias"),
+        ("/info", "show current session info"),
+        ("/channels", "list Matrix rooms attached to this session"),
+        ("/share", "generate shareable ticket for current session"),
+        ("/sync ", "sync a remote session via ticket"),
+        ("/compact", "summarize and compact conversation history"),
+        ("/print", "dump the transcript"),
+        ("# Living Agents", ""),
+        ("/agents", "list agents attached to this session"),
+        ("/agent add ", "attach an agent (display name or DB ID)"),
+        ("/agent remove ", "detach an agent"),
+        ("/agent host ", "set (or clear) the session's host agent"),
+        ("/agent hosted", "list every Living Agent this peer hosts"),
+        ("/agent new ", "create a Living Agent (see docs for k=v fields)"),
+        ("/agent set ", "edit an agent field; takes effect next message"),
+        ("/agent delete ", "unregister a Living Agent (DB preserved)"),
+        ("/agent share ", "generate a share ticket for an agent's DB"),
+        ("/agent import ", "sync + register an agent DB from a ticket"),
+        ("/agent invite ", "grant another peer access (admin|write|read)"),
+        ("/agent revoke-peer ", "revoke a co-owner's access"),
+        ("/pubkey", "show this peer's default pubkey"),
+        ("# Memory banks", ""),
+        ("/memory list", "list memory banks this peer hosts"),
+        ("/memory new ", "create a new bank on this peer"),
+        ("/memory delete ", "unregister a bank (DB preserved)"),
+        ("/memory grant ", "grant an agent access to a bank (read|write)"),
+        ("/memory revoke ", "revoke an agent's access"),
+        ("/memory share ", "generate a share ticket for a bank's DB"),
+        ("/memory import ", "sync + register a bank DB from a ticket"),
+        ("# Heartbeat", ""),
+        ("/heartbeat list", "list heartbeat rules on this session"),
+        ("/heartbeat add ", "add <id> <cron 6 fields> <agent> <task...>"),
+        ("/heartbeat remove ", "remove rule by id"),
+        ("# LLM config", ""),
+        ("/model ", "show or set the model for this session"),
+        ("/role ", "show, select, or define a role"),
+        ("/backend ", "add a custom backend (<name> <url> <key>)"),
+        ("/backends", "list known backends and models"),
+        ("# Scheduler", ""),
+        ("/schedules", "list configured schedules"),
+        ("/run ", "trigger a schedule immediately"),
+        ("# TUI", ""),
+        ("/clear", "clear display (entries still in DB)"),
+        ("/raw", "dump raw entry data for debugging"),
+        ("/debug", "toggle debug mode (Ctrl+D)"),
+        ("/help", "this help"),
+        ("/quit", "exit"),
+    ]
+}
+
+fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
+    let area = f.area();
+    let popup = centered_rect(area, 80, 80);
+
+    // Dim/disable-click backdrop: clicks here dismiss the overlay.
+    app.click_regions.push(ClickRegion {
+        x: area.x,
+        y: area.y,
+        w: area.width,
+        h: area.height,
+        target: ClickTarget::OverlayDismiss,
+    });
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(" Help — Esc to close · ↑↓/PgUp/PgDn/wheel scroll · click a row to insert ")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let entries = help_entries();
+    let mut lines: Vec<Line> = Vec::new();
+    // y cursor relative to `inner`: start at 0, advance per line. We push a
+    // click region for each command row, using the post-scroll absolute y.
+    let mut row_idx: i32 = 0;
+    for (cmd, desc) in &entries {
+        let abs_y_i = inner.y as i32 + row_idx - scroll as i32;
+        if cmd.starts_with('#') {
+            let header = cmd.trim_start_matches('#').trim();
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {header}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+        } else {
+            // Only register hit-tests for rows that are visible inside the
+            // popup after scrolling — off-screen rows shouldn't capture clicks.
+            if abs_y_i >= inner.y as i32 && abs_y_i < (inner.y as i32 + inner.height as i32) {
+                app.click_regions.push(ClickRegion {
+                    x: inner.x,
+                    y: abs_y_i as u16,
+                    w: inner.width,
+                    h: 1,
+                    target: ClickTarget::HelpCommand(cmd),
+                });
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {cmd}"), Style::default().fg(Color::Green)),
+                Span::raw(" "),
+                Span::styled(*desc, Style::default().fg(Color::Gray)),
+            ]));
+        }
+        row_idx += 1;
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(paragraph, inner);
 }
 
 fn ui_chat(f: &mut ratatui::Frame, app: &App) {

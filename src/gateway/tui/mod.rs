@@ -76,8 +76,45 @@ pub(super) enum ChatAction {
     SendMessage(String),
 }
 
+/// A modal layered over the current mode. `None` = no overlay. Event handling
+/// in mod.rs short-circuits to overlay when `Some(_)`, so overlays intercept
+/// keys/clicks regardless of whether the underlying mode is Chat or
+/// SessionPicker. Dismiss with Esc or by clicking outside the popup rect.
+pub(super) enum Overlay {
+    Help { scroll: u16 },
+}
+
+/// A hit-testable rectangle recorded by the view during render. Each frame
+/// clears `App.click_regions` and re-populates it, so the mouse handler can
+/// resolve a click at (col, row) to a semantic action without the view having
+/// to live beyond the draw call.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ClickTarget {
+    /// Background of the overlay popup — click here dismisses the overlay.
+    OverlayDismiss,
+    /// Insert a command template into the input box and dismiss the overlay.
+    HelpCommand(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ClickRegion {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub target: ClickTarget,
+}
+
+impl ClickRegion {
+    pub fn hit(&self, col: u16, row: u16) -> bool {
+        col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
+    }
+}
+
 pub(super) struct App {
     pub(super) mode: TuiMode,
+    pub(super) overlay: Option<Overlay>,
+    pub(super) click_regions: Vec<ClickRegion>,
     pub(super) input: String,
     pub(super) cursor: usize,
     pub(super) scroll_offset: u16,
@@ -98,6 +135,8 @@ impl App {
     fn new(agent_names: HashSet<String>, session_db_id: String) -> Self {
         Self {
             mode: TuiMode::Chat,
+            overlay: None,
+            click_regions: Vec::new(),
             input: String::new(),
             cursor: 0,
             scroll_offset: 0,
@@ -230,7 +269,7 @@ impl Gateway for TuiGateway {
         let default_role = self.config.role.clone();
 
         loop {
-            terminal.draw(|f| view::ui(f, &app))?;
+            terminal.draw(|f| view::ui(f, &mut app))?;
 
             let action = tokio::select! {
                 Some(Ok(event)) = events.next() => {
@@ -254,11 +293,13 @@ impl Gateway for TuiGateway {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         app.debug_mode = !app.debug_mode;
+                    } else if input::handle_overlay_key(&mut app, key) {
+                        // Overlay consumed the key.
                     } else {
                         match app.mode {
                             TuiMode::Chat => {
                                 if let Some(chat_action) =
-                                    input::handle_chat_key(&mut app, key, &session_db).await
+                                    input::handle_chat_key(&mut app, key).await
                                 {
                                     match chat_action {
                                         ChatAction::SendMessage(text) => {

@@ -5,30 +5,84 @@
 use crate::commands::{parse_permission_token, Command};
 use crate::gateway::ApprovalDecision;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
-use super::{show_error, show_system_msg, App, ChatAction, TuiMode};
+use super::{show_error, show_system_msg, App, ChatAction, ClickTarget, Overlay, TuiMode};
 
-/// Mouse events. For now, only scroll wheel is wired — clickable regions for
-/// approvals, picker rows, tabs and overlay items get layered on in follow-ups
-/// via `app.click_regions` (populated during render, consulted here).
+/// Returns true if an overlay was open and consumed the key. Called from the
+/// top of `handle_chat_key` / picker handling so overlays intercept input
+/// before the underlying mode sees it.
+pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(overlay) = app.overlay.as_mut() else {
+        return false;
+    };
+    match overlay {
+        Overlay::Help { scroll } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                app.overlay = None;
+            }
+            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+            KeyCode::Home => *scroll = 0,
+            _ => {}
+        },
+    }
+    true
+}
+
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) {
+    // Wheel scrolls the overlay when one is up, otherwise the chat history.
     match m.kind {
         MouseEventKind::ScrollUp => {
-            app.scroll_offset = app.scroll_offset.saturating_add(3);
+            if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
+                *scroll = scroll.saturating_sub(3);
+            } else {
+                app.scroll_offset = app.scroll_offset.saturating_add(3);
+            }
+            return;
         }
         MouseEventKind::ScrollDown => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
+                *scroll = scroll.saturating_add(3);
+            } else {
+                app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            }
+            return;
         }
-        _ => {}
+        MouseEventKind::Down(MouseButton::Left) => {}
+        _ => return,
+    }
+
+    // Left-click — find the innermost hit region. `click_regions` is pushed in
+    // outer-to-inner order during render (overlay backdrop first, rows next),
+    // so iterate in reverse to prefer the most specific hit.
+    let (col, row) = (m.column, m.row);
+    let hit = app
+        .click_regions
+        .iter()
+        .rev()
+        .copied()
+        .find(|r| r.hit(col, row));
+    let Some(hit) = hit else {
+        return;
+    };
+    match hit.target {
+        ClickTarget::OverlayDismiss => {
+            app.overlay = None;
+        }
+        ClickTarget::HelpCommand(template) => {
+            // Insert the template into the input box and close the overlay so
+            // the user can edit and submit. Cursor goes to end.
+            app.input = template.to_string();
+            app.cursor = app.input.len();
+            app.overlay = None;
+        }
     }
 }
 
-pub(super) async fn handle_chat_key(
-    app: &mut App,
-    key: KeyEvent,
-    session_db: &eidetica::Database,
-) -> Option<ChatAction> {
+pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
     if let Some(exchange) = app.pending_approval.take() {
         let decision = match key.code {
             KeyCode::Char('y') => Some(ApprovalDecision::Approve),
@@ -50,7 +104,7 @@ pub(super) async fn handle_chat_key(
             if !app.input.is_empty() {
                 let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
-                return parse_chat_line(app, &text, session_db);
+                return parse_chat_line(app, &text);
             }
         }
         KeyCode::Char(c) => {
@@ -107,16 +161,15 @@ pub(super) async fn handle_chat_key(
         KeyCode::Esc => {
             app.should_quit = true;
         }
+        KeyCode::F(1) => {
+            app.overlay = Some(Overlay::Help { scroll: 0 });
+        }
         _ => {}
     }
     None
 }
 
-fn parse_chat_line(
-    app: &mut App,
-    text: &str,
-    session_db: &eidetica::Database,
-) -> Option<ChatAction> {
+fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     match text {
         "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
@@ -517,7 +570,7 @@ fn parse_chat_line(
             return None;
         }
         "/help" | "/?" => {
-            show_system_msg(app, help_text(session_db));
+            app.overlay = Some(Overlay::Help { scroll: 0 });
             return None;
         }
         _ => {}
@@ -532,75 +585,6 @@ fn parse_chat_line(
     }
 
     Some(ChatAction::SendMessage(text.to_string()))
-}
-
-fn help_text(_session_db: &eidetica::Database) -> String {
-    [
-        "Session:",
-        "  /sessions, /s         — open session picker",
-        "  /new                  — create a new session (picker 'n' key)",
-        "  /join <id>            — switch to session by name or DB ID",
-        "  /name [<alias>]       — set (or clear) a session alias",
-        "  /info                 — show current session info",
-        "  /channels             — list Matrix rooms attached to this session",
-        "  /share                — generate shareable ticket for current session",
-        "  /sync <ticket>        — sync a remote session via ticket",
-        "  /compact              — summarize and compact conversation history",
-        "  /print                — dump the transcript",
-        "",
-        "Living Agents:",
-        "  /agents               — list agents attached to this session",
-        "  /agent list           — same as /agents",
-        "  /agent add <ref>      — attach an agent (display name or DB ID)",
-        "  /agent remove <ref>   — detach an agent",
-        "  /agent host [<ref>]   — set (or clear) the session's host agent",
-        "  /agent hosted         — list every Living Agent this peer hosts",
-        "  /agent new <name> [k=v...] — create a Living Agent (role|model|tools|can_spawn|allowed_callers|autonomous|max_iterations|tool_profile|max_context_tokens)",
-        "  /agent set <ref> <field> <value> — edit an agent field (same set as /agent new); takes effect next message",
-        "  /agent delete <ref>   — unregister a Living Agent (DB preserved for archive)",
-        "  /agent share <ref>    — generate a share ticket for an agent's DB",
-        "  /agent import <ticket>— sync + register an agent DB from a ticket",
-        "  /agent invite <ref> <pubkey> [admin|write|read] — grant another peer access (default: admin)",
-        "  /agent revoke-peer <ref> <pubkey> — revoke a co-owner's access",
-        "  /pubkey               — show this peer's default pubkey (for /agent invite)",
-        "",
-        "Memory banks:",
-        "  /memory list          — list memory banks this peer hosts",
-        "  /memory new <name> [description...] — create a new bank on this peer",
-        "  /memory delete <ref>  — unregister a bank (DB preserved)",
-        "  /memory grant <bank> <agent> <read|write> — grant an agent access to a bank",
-        "  /memory revoke <bank> <agent> — revoke an agent's access",
-        "  /memory share <bank>  — generate a share ticket for a bank's DB",
-        "  /memory import <ticket>— sync + register a bank DB from a ticket",
-        "",
-        "Heartbeat:",
-        "  /heartbeat list       — list heartbeat rules on this session",
-        "  /heartbeat add <id> <cron> <agent> <task>",
-        "  /heartbeat remove <id>",
-        "",
-        "LLM config:",
-        "  /model [<model>]      — show or set the model for this session",
-        "  /role [<name> [<prompt>]] — show, select, or define a role",
-        "  /backend <name> <url> <key> — add a custom backend for this session",
-        "  /backends             — list known backends and models",
-        "",
-        "Scheduler:",
-        "  /schedules            — list configured schedules",
-        "  /run <name>           — trigger a schedule immediately",
-        "",
-        "TUI:",
-        "  /clear                — clear display (entries still in DB)",
-        "  /raw                  — dump raw entry data for debugging",
-        "  /debug                — toggle debug mode (Ctrl+D)",
-        "  /help, /?             — this help",
-        "  /quit, /exit, /q      — exit",
-        "",
-        "Keys:",
-        "  Ctrl+D                — toggle debug mode (shows timestamps, types)",
-        "  Ctrl+C                — quit",
-        "  Up/Down, PageUp/Dn    — scroll messages",
-    ]
-    .join("\n")
 }
 
 pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
