@@ -187,14 +187,18 @@ impl LlmError {
         }
     }
 
-    /// Classify an `openai_api_rs` APIError into a structured LlmError.
+    /// Classify an `async_openai` `OpenAIError` into a structured `LlmError`.
     ///
-    /// The SDK's `APIError` has two variants:
-    /// - `ReqwestError(reqwest::Error)` — network/HTTP-level failures
-    /// - `CustomError { message }` — API-level errors, formatted as "{status}: {body}"
-    pub fn from_api_error(err: openai_api_rs::v1::error::APIError) -> Self {
+    /// The SDK's `OpenAIError` surfaces:
+    /// - `Reqwest(_)` — transport errors (timeout, connect refused, TLS, etc.)
+    /// - `ApiError(ApiError)` — the provider returned an error body. The HTTP
+    ///   status code is NOT exposed directly; we classify on the `type`/`code`
+    ///   strings OpenAI-compatible providers use.
+    /// - `JSONDeserialize`/`InvalidArgument` — client-side, non-retryable.
+    pub fn from_openai_error(err: async_openai::error::OpenAIError) -> Self {
+        use async_openai::error::OpenAIError;
         match err {
-            openai_api_rs::v1::error::APIError::ReqwestError(ref reqwest_err) => {
+            OpenAIError::Reqwest(ref reqwest_err) => {
                 if reqwest_err.is_timeout() {
                     return LlmError::Timeout;
                 }
@@ -206,30 +210,141 @@ impl LlmError {
                 if let Some(status) = reqwest_err.status() {
                     return LlmError::from_http_status(status.as_u16(), reqwest_err.to_string());
                 }
-                // Generic network error
                 LlmError::NetworkError {
                     message: reqwest_err.to_string(),
                 }
             }
-            openai_api_rs::v1::error::APIError::CustomError { ref message } => {
-                // The SDK formats errors as "{status_code}: {body}"
-                // Try to extract the status code
-                if let Some((status_str, rest)) = message
-                    .strip_prefix("APIError: ")
-                    .unwrap_or(message)
-                    .split_once(": ")
-                {
-                    if let Ok(status) = status_str.trim().parse::<u16>() {
-                        return LlmError::from_http_status(status, rest.to_string());
+            OpenAIError::ApiError(ref api_err) => {
+                // async-openai doesn't expose the HTTP status on ApiError, so
+                // classify on the provider's `type`/`code` strings. These are
+                // the values used by OpenAI and honored by most compatible
+                // providers (OpenRouter, DeepSeek, Anthropic-via-proxy, …).
+                let kind = api_err.r#type.as_deref().unwrap_or("");
+                let code = api_err.code.as_deref().unwrap_or("");
+                let message = api_err.message.clone();
+                match (kind, code) {
+                    ("server_error", _) | (_, "server_error") => LlmError::ServerError {
+                        status: 500,
+                        message,
+                    },
+                    (_, "rate_limit_exceeded") => LlmError::RateLimited {
+                        retry_after_duration: None,
+                        message,
+                    },
+                    ("insufficient_quota", _) | (_, "insufficient_quota") => {
+                        LlmError::InsufficientCredits { message }
                     }
+                    ("authentication_error" | "permission_error", _)
+                    | (_, "invalid_api_key" | "unauthorized") => LlmError::AuthFailed {
+                        status: 401,
+                        message,
+                    },
+                    _ => LlmError::InvalidRequest { message },
                 }
-                // Couldn't parse status — treat as invalid request
+            }
+            OpenAIError::JSONDeserialize(ref e, ref raw_body) => {
+                // async-openai's ApiError models `code` as `Option<String>`, but
+                // OpenRouter's error bodies use an integer `code` (the HTTP status).
+                // That trips async-openai's strict deserialize and we land here
+                // with the raw body in hand — try a looser parse before giving up.
+                if let Some(classified) = classify_error_body(raw_body) {
+                    return classified;
+                }
                 LlmError::InvalidRequest {
-                    message: message.clone(),
+                    message: format!("Response deserialize error: {e}"),
                 }
+            }
+            OpenAIError::InvalidArgument(ref message) => LlmError::InvalidRequest {
+                message: message.clone(),
+            },
+            OpenAIError::StreamError(ref e) => LlmError::NetworkError {
+                message: e.to_string(),
+            },
+            OpenAIError::FileSaveError(ref m) | OpenAIError::FileReadError(ref m) => {
+                LlmError::InvalidRequest { message: m.clone() }
             }
         }
     }
+}
+
+/// Best-effort classification of a raw error body when the SDK's strict
+/// deserializer couldn't parse it.
+///
+/// Handles two common shapes:
+///
+/// * OpenRouter — `{"error": {"message", "code": <int>, "metadata": {"raw", "provider_name"}, ...}}`
+///   (the `raw` metadata field often wraps the upstream provider's own error body)
+/// * OpenAI-ish — `{"error": {"message", "type", "code": "..."}}`
+///
+/// Returns `None` if the body doesn't match either shape, so the caller can
+/// fall back to a generic InvalidRequest.
+fn classify_error_body(body: &str) -> Option<LlmError> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let err_obj = value.get("error")?;
+
+    // Prefer the innermost upstream message when OpenRouter wraps it.
+    let upstream_message = err_obj
+        .get("metadata")
+        .and_then(|m| m.get("raw"))
+        .and_then(|r| r.as_str())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        });
+
+    let message = upstream_message
+        .or_else(|| {
+            err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| body.to_string());
+
+    // `code` can be an integer (OpenRouter: HTTP status) or a string (OpenAI: symbolic).
+    let status_from_int = err_obj.get("code").and_then(|c| c.as_u64()).and_then(|n| {
+        if (100..=599).contains(&n) {
+            Some(n as u16)
+        } else {
+            None
+        }
+    });
+
+    if let Some(status) = status_from_int {
+        return Some(LlmError::from_http_status(status, message));
+    }
+
+    let code = err_obj
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    let kind = err_obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+
+    Some(match (kind, code) {
+        (_, "rate_limit_exceeded") => LlmError::RateLimited {
+            retry_after_duration: None,
+            message,
+        },
+        ("server_error", _) => LlmError::ServerError {
+            status: 500,
+            message,
+        },
+        ("authentication_error" | "permission_error", _)
+        | (_, "invalid_api_key" | "unauthorized") => LlmError::AuthFailed {
+            status: 401,
+            message,
+        },
+        ("insufficient_quota", _) | (_, "insufficient_quota") => {
+            LlmError::InsufficientCredits { message }
+        }
+        _ => LlmError::InvalidRequest { message },
+    })
 }
 
 #[cfg(test)]
@@ -320,23 +435,88 @@ mod tests {
     }
 
     #[test]
-    fn test_from_api_error_custom_with_status() {
-        // Simulate the SDK's "{status}: {body}" format
-        let api_err = openai_api_rs::v1::error::APIError::CustomError {
-            message: "429: Too Many Requests".into(),
-        };
-        let err = LlmError::from_api_error(api_err);
+    fn test_from_openai_error_rate_limit_code() {
+        let api_err = async_openai::error::OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "Too Many Requests".into(),
+            r#type: None,
+            param: None,
+            code: Some("rate_limit_exceeded".into()),
+        });
+        let err = LlmError::from_openai_error(api_err);
         assert!(err.is_retryable());
         assert!(matches!(err, LlmError::RateLimited { .. }));
     }
 
     #[test]
-    fn test_from_api_error_custom_without_status() {
-        let api_err = openai_api_rs::v1::error::APIError::CustomError {
+    fn test_from_openai_error_server_error_type() {
+        let api_err = async_openai::error::OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "upstream failure".into(),
+            r#type: Some("server_error".into()),
+            param: None,
+            code: None,
+        });
+        let err = LlmError::from_openai_error(api_err);
+        assert!(err.is_retryable());
+        assert!(matches!(err, LlmError::ServerError { .. }));
+    }
+
+    #[test]
+    fn test_from_openai_error_invalid_request_fallback() {
+        let api_err = async_openai::error::OpenAIError::ApiError(async_openai::error::ApiError {
             message: "something went wrong".into(),
-        };
-        let err = LlmError::from_api_error(api_err);
+            r#type: Some("invalid_request_error".into()),
+            param: None,
+            code: None,
+        });
+        let err = LlmError::from_openai_error(api_err);
         assert!(err.is_client_error());
+    }
+
+    #[test]
+    fn test_from_openai_error_invalid_argument() {
+        let api_err = async_openai::error::OpenAIError::InvalidArgument("bad".into());
+        let err = LlmError::from_openai_error(api_err);
+        assert!(err.is_client_error());
+    }
+
+    #[test]
+    fn test_classify_openrouter_error_body_integer_code() {
+        // OpenRouter returns `code` as an integer HTTP status — the SDK's
+        // strict deserializer can't handle that, so we classify from the raw
+        // body. The upstream provider's message is preferred when present.
+        let body = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"The `reasoning_content` in the thinking mode must be passed back to the API.\",\"type\":\"invalid_request_error\"}}","provider_name":"DeepSeek","is_byok":false}},"user_id":"u"}"#;
+        let err = classify_error_body(body).expect("should parse OpenRouter body");
+        assert!(err.is_client_error());
+        assert_eq!(err.status(), Some(400));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reasoning_content"),
+            "expected upstream message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_openrouter_error_body_integer_code_server() {
+        let body = r#"{"error":{"message":"Upstream unavailable","code":502}}"#;
+        let err = classify_error_body(body).expect("should parse");
+        assert!(err.is_retryable());
+        assert_eq!(err.status(), Some(502));
+    }
+
+    #[test]
+    fn test_classify_error_body_rate_limit_code() {
+        let body =
+            r#"{"error":{"message":"slow down","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
+        let err = classify_error_body(body).expect("should parse");
+        assert!(err.is_retryable());
+        assert!(matches!(err, LlmError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_classify_error_body_garbage_returns_none() {
+        assert!(classify_error_body("not json").is_none());
+        // Valid JSON but no `error` key is also None.
+        assert!(classify_error_body(r#"{"foo": "bar"}"#).is_none());
     }
 
     #[test]

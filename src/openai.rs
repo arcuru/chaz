@@ -1,14 +1,13 @@
-/// OpenAI Compatible Backend
-///
-/// Communicates over the OpenAI API as a backend for chaz.
-use openai_api_rs::v1::{
-    api::OpenAIClient,
-    chat_completion::{
-        self, ChatCompletionMessage, ChatCompletionRequest, MessageRole, Tool as OpenAITool,
-        ToolType,
-    },
-    types,
-};
+//! OpenAI-compatible backend for chaz.
+//!
+//! Uses `async-openai`'s **bring-your-own-type** (byot) API: we pass our
+//! own request/response structs to `client.chat().create_byot()` so provider
+//! extensions like DeepSeek's `reasoning_content` round-trip without the
+//! crate's strict types dropping unknown fields.
+
+use async_openai::{Client, config::OpenAIConfig};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::{
     backends::{ChatContext, LLMBackend},
@@ -18,7 +17,6 @@ use crate::{
     security::SecretStore,
     tool::ToolDefinition,
 };
-use std::collections::HashMap;
 
 /// Handle connections to an OpenAI compatible backend
 pub struct OpenAI {
@@ -26,6 +24,83 @@ pub struct OpenAI {
     backend: Backend,
     /// Secret store for host-boundary key injection
     secrets: SecretStore,
+}
+
+// ================================================================
+// BYOT wire types
+// ================================================================
+//
+// The openai chat completions shape, written directly so we control every
+// field on both the request and response side. `#[serde(flatten)] extra`
+// on messages catches unknown provider-specific fields and preserves them
+// across round-trips — critical for providers like DeepSeek where the
+// `reasoning_content` field must be echoed back verbatim on subsequent
+// requests or the API 400s.
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ChatTool>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    /// Catch-all for provider-specific fields on an assistant message:
+    /// DeepSeek's `reasoning_content`, Anthropic's `reasoning_details`,
+    /// OpenRouter's `reasoning`, and whatever else providers add. Preserving
+    /// this across round-trips is essential — DeepSeek thinking mode rejects
+    /// the follow-up with 400 if the reasoning field isn't echoed back.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ChatToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ChatToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatToolFunction {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 impl OpenAI {
@@ -36,7 +111,7 @@ impl OpenAI {
         }
     }
 
-    fn build_client(&self) -> Result<OpenAIClient, LlmError> {
+    fn build_client(&self) -> Result<Client<OpenAIConfig>, LlmError> {
         // Host-boundary injection: resolve API key from SecretStore by reference,
         // falling back to the raw api_key field for backward compatibility.
         let api_key = self
@@ -55,13 +130,10 @@ impl OpenAI {
             .ok_or_else(|| LlmError::Configuration {
                 message: "API base URL not configured".to_string(),
             })?;
-        OpenAIClient::builder()
-            .with_endpoint(api_base)
-            .with_api_key(api_key)
-            .build()
-            .map_err(|e| LlmError::Configuration {
-                message: e.to_string(),
-            })
+        let config = OpenAIConfig::new()
+            .with_api_base(api_base)
+            .with_api_key(api_key);
+        Ok(Client::with_config(config))
     }
 
     /// Execute a single LLM call with tool definitions, returning a structured response.
@@ -79,61 +151,76 @@ impl OpenAI {
         let openai_messages = convert_runtime_messages(messages);
         let openai_tools = convert_tool_definitions(tools);
 
-        let mut request = ChatCompletionRequest::new(model.to_string(), openai_messages);
-        if !openai_tools.is_empty() {
-            request.tools = Some(openai_tools);
-        }
+        let request = ChatRequest {
+            model,
+            messages: openai_messages,
+            tools: if openai_tools.is_empty() {
+                None
+            } else {
+                Some(openai_tools)
+            },
+        };
 
         let timeout = self.backend.request_timeout();
-        let response = tokio::time::timeout(timeout, client.chat_completion(request))
-            .await
-            .map_err(|_| {
-                tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
-                LlmError::Timeout
-            })?
-            .map_err(LlmError::from_api_error)?;
+        let response: ChatResponse = tokio::time::timeout(
+            timeout,
+            client
+                .chat()
+                .create_byot::<ChatRequest, ChatResponse>(request),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
+            LlmError::Timeout
+        })?
+        .map_err(LlmError::from_openai_error)?;
 
-        let choice = response
-            .choices
-            .first()
-            .ok_or_else(|| LlmError::EmptyResponse {
-                message: "No choices in response".to_string(),
-            })?;
+        let choice =
+            response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| LlmError::EmptyResponse {
+                    message: "No choices in response".to_string(),
+                })?;
+
+        let ChatMessage {
+            content,
+            tool_calls,
+            extra,
+            ..
+        } = choice.message;
 
         tracing::debug!(
-            "LLM response: content={:?} tool_calls={:?} finish_reason={:?}",
-            choice
-                .message
-                .content
-                .as_ref()
-                .map(|c| &c[..c.len().min(100)]),
-            choice.message.tool_calls.as_ref().map(|tc| tc.len()),
+            "LLM response: content={:?} tool_calls={:?} extra_fields={:?} finish_reason={:?}",
+            content.as_deref().map(|c| &c[..c.len().min(100)]),
+            tool_calls.as_ref().map(|tc| tc.len()),
+            extra.keys().collect::<Vec<_>>(),
             choice.finish_reason
         );
 
         // Check if the LLM wants to call tools
-        if let Some(tool_calls) = &choice.message.tool_calls {
-            if !tool_calls.is_empty() {
-                let calls = tool_calls
-                    .iter()
+        if let Some(calls) = tool_calls {
+            if !calls.is_empty() {
+                let requests = calls
+                    .into_iter()
                     .map(|tc| ToolCallRequest {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone().unwrap_or_default(),
-                        arguments: tc.function.arguments.clone().unwrap_or_default(),
+                        id: tc.id,
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
                     })
                     .collect();
 
                 return Ok(LLMResponse::ToolCalls {
-                    content: choice.message.content.clone(),
-                    tool_calls: calls,
+                    content,
+                    tool_calls: requests,
+                    provider_extra: extra,
                 });
             }
         }
 
         // Final text response
-        Ok(LLMResponse::Text(
-            choice.message.content.clone().unwrap_or_default(),
-        ))
+        Ok(LLMResponse::Text(content.unwrap_or_default()))
     }
 }
 
@@ -174,184 +261,141 @@ impl LLMBackend for OpenAI {
     async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
         let client = self.build_client()?;
         let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
-        let request =
-            convert_to_chatcompletionrequest(context, &model_prefix, &self.default_model());
+        let (model, messages) = convert_chat_context(context, &model_prefix, &self.default_model());
 
         tracing::debug!(
-            model = %request.model,
-            messages = request.messages.len(),
+            model = %model,
+            messages = messages.len(),
             "LLM request"
         );
 
-        let timeout = self.backend.request_timeout();
-        let response = tokio::time::timeout(timeout, client.chat_completion(request))
-            .await
-            .map_err(|_| {
-                tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
-                LlmError::Timeout
-            })?
-            .map_err(LlmError::from_api_error)?;
+        let request = ChatRequest {
+            model: &model,
+            messages,
+            tools: None,
+        };
 
-        Ok(response.choices[0]
-            .message
-            .content
-            .clone()
-            .unwrap_or("Error retrieving response".to_string()))
+        let timeout = self.backend.request_timeout();
+        let response: ChatResponse = tokio::time::timeout(
+            timeout,
+            client
+                .chat()
+                .create_byot::<ChatRequest, ChatResponse>(request),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
+            LlmError::Timeout
+        })?
+        .map_err(LlmError::from_openai_error)?;
+
+        Ok(response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_else(|| "Error retrieving response".to_string()))
     }
 }
 
-/// Convert RuntimeMessages to OpenAI ChatCompletionMessages
-fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatCompletionMessage> {
+/// Convert RuntimeMessages to our BYOT ChatMessages.
+fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
-        .flat_map(|msg| match msg {
-            RuntimeMessage::System(content) => vec![ChatCompletionMessage {
-                role: MessageRole::system,
-                content: chat_completion::Content::Text(content.clone()),
-                name: None,
+        .map(|msg| match msg {
+            RuntimeMessage::System(content) => ChatMessage {
+                role: "system".to_string(),
+                content: Some(content.clone()),
                 tool_calls: None,
                 tool_call_id: None,
-            }],
-            RuntimeMessage::User(content) => vec![ChatCompletionMessage {
-                role: MessageRole::user,
-                content: chat_completion::Content::Text(content.clone()),
-                name: None,
+                extra: Map::new(),
+            },
+            RuntimeMessage::User(content) => ChatMessage {
+                role: "user".to_string(),
+                content: Some(content.clone()),
                 tool_calls: None,
                 tool_call_id: None,
-            }],
-            RuntimeMessage::Assistant(content) => vec![ChatCompletionMessage {
-                role: MessageRole::assistant,
-                content: chat_completion::Content::Text(content.clone()),
-                name: None,
+                extra: Map::new(),
+            },
+            RuntimeMessage::Assistant(content) => ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(content.clone()),
                 tool_calls: None,
                 tool_call_id: None,
-            }],
+                extra: Map::new(),
+            },
             RuntimeMessage::AssistantToolCalls {
                 content,
                 tool_calls,
-            } => vec![ChatCompletionMessage {
-                role: MessageRole::assistant,
-                content: chat_completion::Content::Text(content.clone().unwrap_or_default()),
-                name: None,
+                provider_extra,
+            } => ChatMessage {
+                role: "assistant".to_string(),
+                content: content.clone(),
                 tool_calls: Some(
                     tool_calls
                         .iter()
-                        .map(|tc| chat_completion::ToolCall {
+                        .map(|tc| ChatToolCall {
                             id: tc.id.clone(),
-                            r#type: "function".to_string(),
-                            function: chat_completion::ToolCallFunction {
-                                name: Some(tc.name.clone()),
-                                arguments: Some(tc.arguments.clone()),
+                            kind: "function".to_string(),
+                            function: ChatToolCallFunction {
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
                             },
                         })
                         .collect(),
                 ),
                 tool_call_id: None,
-            }],
-            RuntimeMessage::ToolResult { call_id, content } => vec![ChatCompletionMessage {
-                role: MessageRole::tool,
-                content: chat_completion::Content::Text(content.clone()),
-                name: None,
+                extra: provider_extra.clone(),
+            },
+            RuntimeMessage::ToolResult { call_id, content } => ChatMessage {
+                role: "tool".to_string(),
+                content: Some(content.clone()),
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
-            }],
+                extra: Map::new(),
+            },
         })
         .collect()
 }
 
-/// Convert ToolDefinitions to OpenAI Tool format
-fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<OpenAITool> {
+/// Convert ToolDefinitions to our BYOT tool shape.
+fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<ChatTool> {
     tools
         .iter()
-        .map(|td| {
-            // Convert serde_json::Value parameters to FunctionParameters
-            let properties = td
-                .parameters
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .map(|props| {
-                    props
-                        .iter()
-                        .map(|(k, v)| (k.clone(), Box::new(json_to_schema_define(v))))
-                        .collect::<HashMap<_, _>>()
-                });
-
-            let required = td
-                .parameters
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
-
-            OpenAITool {
-                r#type: ToolType::Function,
-                function: types::Function {
-                    name: td.name.clone(),
-                    description: Some(td.description.clone()),
-                    parameters: types::FunctionParameters {
-                        schema_type: types::JSONSchemaType::Object,
-                        properties,
-                        required,
-                    },
-                },
-            }
+        .map(|td| ChatTool {
+            kind: "function",
+            function: ChatToolFunction {
+                name: td.name.clone(),
+                description: td.description.clone(),
+                parameters: td.parameters.clone(),
+            },
         })
         .collect()
 }
 
-/// Convert a serde_json::Value to a JSONSchemaDefine
-fn json_to_schema_define(value: &serde_json::Value) -> types::JSONSchemaDefine {
-    types::JSONSchemaDefine {
-        schema_type: value.get("type").and_then(|t| t.as_str()).map(|t| match t {
-            "string" => types::JSONSchemaType::String,
-            "number" => types::JSONSchemaType::Number,
-            "integer" => types::JSONSchemaType::Number,
-            "boolean" => types::JSONSchemaType::Boolean,
-            "array" => types::JSONSchemaType::Array,
-            "object" => types::JSONSchemaType::Object,
-            _ => types::JSONSchemaType::String,
-        }),
-        description: value
-            .get("description")
-            .and_then(|d| d.as_str())
-            .map(String::from),
-        enum_values: value.get("enum").and_then(|e| e.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        }),
-        properties: None,
-        required: None,
-        items: None,
-    }
-}
-
-/// Convert ChatContext to a ChatCompletionRequest (simple, no tools)
-fn convert_to_chatcompletionrequest(
+/// Convert a ChatContext (legacy, no-tools path) to (model, messages) for a request.
+fn convert_chat_context(
     context: &ChatContext,
-    model_prefix: &String,
+    model_prefix: &str,
     default_model: &Option<String>,
-) -> ChatCompletionRequest {
+) -> (String, Vec<ChatMessage>) {
     let mut messages = Vec::new();
     if let Some(role) = &context.role {
-        messages.push(ChatCompletionMessage {
-            role: MessageRole::system,
-            content: chat_completion::Content::Text(role.get_prompt()),
-            name: None,
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(role.get_prompt()),
             tool_calls: None,
             tool_call_id: None,
+            extra: Map::new(),
         });
     }
     for message in &context.messages {
-        messages.push(ChatCompletionMessage {
-            role: message.role.clone(),
-            content: chat_completion::Content::Text(message.content.clone()),
-            name: None,
+        messages.push(ChatMessage {
+            role: message.role.as_str().to_string(),
+            content: Some(message.content.clone()),
             tool_calls: None,
             tool_call_id: None,
+            extra: Map::new(),
         });
     }
     let mut model = context.model.clone().unwrap_or_default();
@@ -361,6 +405,5 @@ fn convert_to_chatcompletionrequest(
     if model.is_empty() {
         model = default_model.clone().unwrap_or_default();
     }
-
-    ChatCompletionRequest::new(model, messages)
+    (model, messages)
 }

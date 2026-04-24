@@ -96,6 +96,12 @@ pub enum RuntimeMessage {
     AssistantToolCalls {
         content: Option<String>,
         tool_calls: Vec<ToolCallRequest>,
+        /// Provider-specific fields from the response that must be echoed
+        /// back verbatim on the follow-up request (DeepSeek's
+        /// `reasoning_content`, Anthropic's `reasoning_details`,
+        /// OpenRouter's `reasoning`, etc.). Opaque to chaz — captured from
+        /// the response's assistant message and re-emitted as-is.
+        provider_extra: serde_json::Map<String, serde_json::Value>,
     },
     ToolResult {
         call_id: String,
@@ -117,6 +123,11 @@ pub enum LLMResponse {
     ToolCalls {
         content: Option<String>,
         tool_calls: Vec<ToolCallRequest>,
+        /// Provider-specific fields captured from the response's assistant
+        /// message. Re-emitted verbatim on the follow-up request so thinking
+        /// modes (DeepSeek `reasoning_content`, Anthropic `reasoning_details`,
+        /// OpenRouter `reasoning`, …) round-trip without per-provider logic.
+        provider_extra: serde_json::Map<String, serde_json::Value>,
     },
 }
 
@@ -329,6 +340,7 @@ pub async fn execute(
             LLMResponse::ToolCalls {
                 content,
                 tool_calls,
+                provider_extra,
             } => {
                 info!(
                     "Tool calls requested: {:?}",
@@ -353,6 +365,7 @@ pub async fn execute(
                 messages.push(RuntimeMessage::AssistantToolCalls {
                     content: content.clone(),
                     tool_calls: tool_calls.clone(),
+                    provider_extra: provider_extra.clone(),
                 });
 
                 // Execute each tool with security checks
@@ -712,8 +725,8 @@ mod tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fake tool whose next error is configurable per call. Counts invocations
     /// so tests can assert how many times the runtime actually ran it.

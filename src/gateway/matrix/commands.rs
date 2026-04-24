@@ -5,23 +5,22 @@
 //! Matrix-specific glue: rate limiting, backend selection for a room, legacy
 //! history reconstruction for `send`/`rename`, and the `rename`/`send` bodies.
 
-use crate::backends::{BackendManager, ChatContext, Message};
+use crate::backends::{BackendManager, ChatContext, Message, MessageRole};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{get_role, RoleDetails};
+use crate::role::{RoleDetails, get_role};
 use crate::security::SecretStore;
 use crate::session::{SessionMeta, SessionRegistry};
 
 use headjack::*;
 use matrix_sdk::{
+    Room, RoomMemberships,
     room::MessagesOptions,
     ruma::{
-        events::room::message::{MessageType, RoomMessageEventContent},
         OwnedUserId,
+        events::room::message::{MessageType, RoomMessageEventContent},
     },
-    Room, RoomMemberships,
 };
-use openai_api_rs::v1::chat_completion::MessageRole;
 use regex::Regex;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -91,7 +90,7 @@ pub async fn send(
 
     let context = get_context(&room, config, secrets, registry).await.unwrap();
     let no_context = ChatContext {
-        messages: vec![Message::new(MessageRole::user, input.to_string())],
+        messages: vec![Message::new(MessageRole::User, input.to_string())],
         model: context.model,
         role: context.role,
     };
@@ -135,7 +134,7 @@ pub async fn rename(
         let mut context = context;
         context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
-            MessageRole::user,
+            MessageRole::User,
             [
                 "Summarize this conversation in less than 20 characters to use as the title of this conversation.",
                 "The output should be a single line of text describing the conversation.",
@@ -170,7 +169,7 @@ pub async fn rename(
 
         context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
-            MessageRole::user,
+            MessageRole::User,
             [
                 "Summarize this conversation in less than 50 characters.",
                 "Do not output anything except for the summary text.",
@@ -324,13 +323,13 @@ pub async fn get_context(
                                 .is_some_and(|uid| sender == uid.as_str())
                             {
                                 context.messages.push(Message::new(
-                                    MessageRole::assistant,
+                                    MessageRole::Assistant,
                                     command.to_string(),
                                 ));
                             } else {
                                 context
                                     .messages
-                                    .push(Message::new(MessageRole::user, command.to_string()));
+                                    .push(Message::new(MessageRole::User, command.to_string()));
                             }
                         }
                     } else if room
@@ -339,13 +338,13 @@ pub async fn get_context(
                         .is_some_and(|uid| sender == uid.as_str())
                     {
                         context.messages.push(Message::new(
-                            MessageRole::assistant,
+                            MessageRole::Assistant,
                             text_content.body.clone(),
                         ));
                     } else {
                         context
                             .messages
-                            .push(Message::new(MessageRole::user, text_content.body.clone()));
+                            .push(Message::new(MessageRole::User, text_content.body.clone()));
                     }
                 }
             }

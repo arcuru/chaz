@@ -4,14 +4,13 @@
 //! switch, info, name, share/sync, compact, print, channel listing,
 //! scheduler pointers, and per-session LLM config (model/role/backend).
 
-use crate::backends::{ChatContext, Message};
+use crate::backends::{ChatContext, Message, MessageRole};
 use crate::defaults::DEFAULT_CONFIG;
 use crate::role::get_role_names;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
 
 use eidetica::store::Table;
-use openai_api_rs::v1::chat_completion::MessageRole;
 
 use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 
@@ -259,9 +258,9 @@ pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
 
     let chat_ctx = ChatContext {
         messages: vec![
-            Message::new(MessageRole::system, system_prompt),
+            Message::new(MessageRole::System, system_prompt),
             Message::new(
-                MessageRole::user,
+                MessageRole::User,
                 format!(
                     "Summarize this conversation:\n\n{transcript}\n\n\
                      Produce a structured summary that captures everything needed to continue the conversation."

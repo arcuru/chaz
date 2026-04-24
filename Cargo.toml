@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 lazy_static = "1"
 regex = "1"
 dirs = "5"
-openai-api-rs = "5"
+async-openai = { version = "0.36", default-features = false, features = ["rustls", "byot", "chat-completion"] }
 eidetica = { git = "https://github.com/arcuru/eidetica", features = ["sqlite"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"

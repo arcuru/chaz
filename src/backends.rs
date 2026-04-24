@@ -1,7 +1,6 @@
 /// Manage all the backends for chaz.
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
-use openai_api_rs::v1::chat_completion::MessageRole;
 use tracing::debug;
 
 use crate::{
@@ -13,6 +12,28 @@ use crate::{
     security::SecretStore,
     tool::ToolDefinition,
 };
+
+/// Role of a message in a legacy `ChatContext`. Mirrors the OpenAI chat
+/// completions roles for System/User/Assistant conversations. The tool and
+/// function roles aren't used by the legacy no-tools path; the ReAct loop
+/// uses `RuntimeMessage` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    /// Wire string used by OpenAI-compatible APIs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        }
+    }
+}
 
 pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;
@@ -55,10 +76,9 @@ pub struct Message {
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let role = match self.role {
-            MessageRole::user => "USER",
-            MessageRole::assistant => "ASSISTANT",
-            MessageRole::system => "SYSTEM",
-            _ => "UNKNOWN",
+            MessageRole::User => "USER",
+            MessageRole::Assistant => "ASSISTANT",
+            MessageRole::System => "SYSTEM",
         };
         write!(f, "{}: {}", role, self.content)
     }
@@ -258,8 +278,8 @@ impl BackendManager {
 mod tests {
     use super::*;
     use crate::config::{Backend, BackendType, Model};
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     async fn empty_secrets() -> SecretStore {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
@@ -292,11 +312,11 @@ mod tests {
 
     #[test]
     fn message_display_formats_role_uppercase() {
-        let m = Message::new(MessageRole::user, "hello");
+        let m = Message::new(MessageRole::User, "hello");
         assert_eq!(m.to_string(), "USER: hello");
-        let m = Message::new(MessageRole::assistant, "hi");
+        let m = Message::new(MessageRole::Assistant, "hi");
         assert_eq!(m.to_string(), "ASSISTANT: hi");
-        let m = Message::new(MessageRole::system, "ok");
+        let m = Message::new(MessageRole::System, "ok");
         assert_eq!(m.to_string(), "SYSTEM: ok");
     }
 
@@ -308,8 +328,8 @@ mod tests {
     fn string_prompt_concatenates_with_trailing_assistant() {
         let ctx = ChatContext {
             messages: vec![
-                Message::new(MessageRole::system, "be helpful"),
-                Message::new(MessageRole::user, "hi"),
+                Message::new(MessageRole::System, "be helpful"),
+                Message::new(MessageRole::User, "hi"),
             ],
             model: None,
             role: None,
@@ -461,7 +481,7 @@ mod tests {
         let secrets = empty_secrets().await;
         let mgr = BackendManager::new(&None, secrets);
         let ctx = ChatContext {
-            messages: vec![Message::new(MessageRole::user, "hi")],
+            messages: vec![Message::new(MessageRole::User, "hi")],
             model: None,
             role: None,
         };
