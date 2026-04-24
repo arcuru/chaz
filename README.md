@@ -28,6 +28,7 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 | `read_file`         | Read file contents                                   |
 | `write_file`        | Write to files                                       |
 | `web_fetch`         | HTTP GET/POST                                        |
+| `web_search`        | Search the web (Tavily/Brave/Serper/DuckDuckGo)      |
 | `shell`             | Execute commands (approval required)                 |
 | `remember`          | Store key-value facts (own memory or a granted bank) |
 | `recall`            | Search stored facts                                  |

@@ -46,6 +46,43 @@ pub struct Config {
     pub mcp_server_dir: Option<String>,
     /// Context window management settings
     pub context: Option<ContextConfig>,
+    /// Web search tool configuration. If omitted, web search defaults to
+    /// DuckDuckGo HTML scraping (no API key required).
+    pub web_search: Option<WebSearchConfig>,
+}
+
+/// Configuration for the `web_search` tool.
+///
+/// Example:
+/// ```yaml
+/// web_search:
+///   backend: tavily
+///   api_key: "${TAVILY_API_KEY}"
+/// ```
+///
+/// Omit the whole section (or set `backend: duckduckgo`) to use the
+/// keyless DuckDuckGo fallback.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WebSearchConfig {
+    /// Search provider. Defaults to DuckDuckGo.
+    #[serde(default)]
+    pub backend: WebSearchBackendKind,
+    /// Raw API key from config (extracted into SecretStore at startup, then cleared).
+    /// Supports `${VAR}`/`$VAR` env references.
+    pub api_key: Option<String>,
+    /// Opaque reference ID into SecretStore (set after api_key is extracted).
+    #[serde(skip)]
+    pub api_key_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchBackendKind {
+    Tavily,
+    Brave,
+    Serper,
+    #[default]
+    DuckDuckGo,
 }
 
 /// Configuration for an agent

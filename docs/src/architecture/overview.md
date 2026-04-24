@@ -123,6 +123,7 @@ src/
     shell.rs       shell execution with allowlist/denylist
     file.rs        read_file, write_file
     web.rs         web_fetch with network policy
+    search.rs      web_search (tavily/brave/serper + DuckDuckGo HTML fallback)
     memory.rs      remember, recall (optional `bank` arg for shared banks), list_memory_banks
     compact.rs     compact — write Summary entry for context compaction
     describe.rs    describe_tool — on-demand tool discovery

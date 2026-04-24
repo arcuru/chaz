@@ -27,7 +27,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.
@@ -622,11 +622,11 @@ impl Server {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::config::Config;
     use crate::db_registry::DbEntry;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     fn blank_config() -> Config {
         Config {
@@ -648,6 +648,7 @@ mod tests {
             tool_profiles: None,
             mcp_server_dir: None,
             context: None,
+            web_search: None,
         }
     }
 

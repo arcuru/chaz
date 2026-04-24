@@ -14,6 +14,7 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 | `list_memory_banks` | Low    | Never              | Lists the memory banks this agent has been granted access to          |
 | `describe_tool`     | Low    | Never              | Returns full description/schema for a tool (discovery)                |
 | `compact`           | Low    | Never              | Summarize and compact conversation context                            |
+| `web_search`        | Low    | Never              | Search the web; returns title/url/snippet per result                  |
 | `write_file`        | Medium | UnlessAutoApproved | Writes content to a file                                              |
 | `web_fetch`         | Medium | UnlessAutoApproved | HTTP GET or POST requests                                             |
 | `spawn_agent`       | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                                       |
@@ -64,6 +65,23 @@ Performs HTTP requests. Subject to network policy (endpoint allowlisting, SSRF p
 {"url": "https://api.example.com/data", "method": "GET"}
 {"url": "https://api.example.com/submit", "method": "POST", "body": "{\"key\": \"value\"}"}
 ```
+
+### web_search
+
+Runs a search query and returns up to 10 normalized results (`{title, url, snippet}`). Typically pairs with `web_fetch` — search for a topic, then fetch the most relevant result.
+
+```json
+{ "query": "CRDT synchronization algorithms", "max_results": 5 }
+```
+
+The backend is selected at startup from the `web_search:` config block — see [Configuration](configuration.md#web-search). Supported backends:
+
+- **tavily** — LLM-oriented search API (requires `api_key`)
+- **brave** — Brave Search API (requires `api_key`)
+- **serper** — Google SERP via serper.dev (requires `api_key`)
+- **duckduckgo** — keyless fallback that scrapes DuckDuckGo's HTML page; used when no `web_search:` section is configured or when a keyed backend is selected without a resolved key
+
+The tool is Low-risk and approval-free because the agent never supplies the destination URL — only a query string — and the HTTP destination is fixed by operator config.
 
 ### shell
 

@@ -181,6 +181,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Resolve the web_search API key (if any) into the secret store, same
+    // `${VAR}` handling as LLM backend keys.
+    let web_search_backend = build_web_search_backend(&mut config, &secret_store).await;
+
     // Build security context from config
     let sec = config.security.clone().unwrap_or_default();
     let leak_policy = match sec.leak_policy.as_deref() {
@@ -218,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::ReadFile);
     tool_registry.register(tools::WriteFile);
     tool_registry.register(tools::WebFetch);
+    tool_registry.register(tools::WebSearch::new(web_search_backend));
     tool_registry.register(tools::Remember::new(
         registry.clone(),
         agent_index_store.clone(),
@@ -361,4 +366,63 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the configured web-search backend: extract its API key (if any)
+/// into the SecretStore, then materialize the `SearchBackend` enum. Falls
+/// back to DuckDuckGo HTML scraping when no config or no key is present.
+/// Missing keys for API-backed providers log a warning and also fall back to
+/// DuckDuckGo rather than failing startup.
+async fn build_web_search_backend(
+    config: &mut Config,
+    secrets: &security::SecretStore,
+) -> tools::SearchBackend {
+    use config::WebSearchBackendKind as Kind;
+    let Some(ws_config) = config.web_search.as_mut() else {
+        info!(backend = "duckduckgo", "web_search backend (default)");
+        return tools::SearchBackend::DuckDuckGo;
+    };
+    // Resolve `${VAR}` in api_key, then stash the secret. Same pattern as
+    // backend API keys above.
+    let resolved_key = ws_config.api_key.take().and_then(|raw| {
+        let resolved = security::SecretStore::resolve_env(&raw).unwrap_or_else(|e| {
+            tracing::warn!("Failed to resolve web_search api_key: {e}");
+            raw
+        });
+        if resolved.is_empty() {
+            None
+        } else {
+            Some(resolved)
+        }
+    });
+    if let Some(ref key) = resolved_key {
+        let ref_id = "secret:web_search.api_key".to_string();
+        secrets.insert(ref_id.clone(), key.clone()).await;
+        ws_config.api_key_ref = Some(ref_id);
+    }
+
+    let needs_key = !matches!(ws_config.backend, Kind::DuckDuckGo);
+    if needs_key && resolved_key.is_none() {
+        tracing::warn!(
+            backend = ?ws_config.backend,
+            "web_search backend requires an api_key — falling back to DuckDuckGo"
+        );
+        return tools::SearchBackend::DuckDuckGo;
+    }
+    let backend = match (ws_config.backend, resolved_key) {
+        (Kind::Tavily, Some(api_key)) => tools::SearchBackend::Tavily { api_key },
+        (Kind::Brave, Some(api_key)) => tools::SearchBackend::Brave { api_key },
+        (Kind::Serper, Some(api_key)) => tools::SearchBackend::Serper { api_key },
+        _ => tools::SearchBackend::DuckDuckGo,
+    };
+    info!(
+        backend = %match backend {
+            tools::SearchBackend::Tavily { .. } => "tavily",
+            tools::SearchBackend::Brave { .. } => "brave",
+            tools::SearchBackend::Serper { .. } => "serper",
+            tools::SearchBackend::DuckDuckGo => "duckduckgo",
+        },
+        "web_search backend"
+    );
+    backend
 }

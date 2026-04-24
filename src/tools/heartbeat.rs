@@ -16,7 +16,7 @@
 //! picks them up on its next tick.
 
 use crate::db_registry::{DbEntry, DbRegistry};
-use crate::heartbeat::{list_rules, remove_rule, upsert_rule, HeartbeatRule};
+use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use cron::Schedule;
 use serde_json::Value;
@@ -395,13 +395,13 @@ impl Tool for HeartbeatList {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::db_registry::{DbEntry, DbRegistry};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -479,6 +479,7 @@ mod tests {
             tool_profiles: None,
             mcp_server_dir: None,
             context: None,
+            web_search: None,
         }
     }
 

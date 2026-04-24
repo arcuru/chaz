@@ -631,15 +631,15 @@ pub(super) async fn agent_revoke_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::agent_db::find_agent_db;
     use crate::backends::BackendManager;
     use crate::db_registry::DbRegistry;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -662,6 +662,7 @@ mod tests {
             tool_profiles: None,
             mcp_server_dir: None,
             context: None,
+            web_search: None,
         }
     }
 
@@ -853,12 +854,14 @@ mod tests {
         // Gone from runtime registry.
         assert!(server.agents().get("alpha").is_none());
         // Gone from agents index.
-        assert!(server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .agent_index()
+                .find_by_name("alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
         // But the DB is still present (preserved for archive).
         let user = registry.user_for_tests().await;
         assert!(find_agent_db(&user, "alpha").await.is_some());

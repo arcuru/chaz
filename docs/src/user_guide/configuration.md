@@ -105,7 +105,25 @@ schedules:
 context:
   max_context_tokens: 128000
   reserved_output_tokens: 4096
+
+# Web search tool
+web_search:
+  backend: tavily # tavily | brave | serper | duckduckgo (default)
+  api_key: "${TAVILY_API_KEY}"
 ```
+
+## Web search
+
+The `web_search` tool is always registered. Omit the `web_search:` section entirely (or set `backend: duckduckgo`) to use the keyless DuckDuckGo HTML scraper.
+
+| Backend      | Endpoint                                      | Auth                   | Notes                             |
+| ------------ | --------------------------------------------- | ---------------------- | --------------------------------- |
+| `tavily`     | `https://api.tavily.com/search`               | API key in JSON body   | Results tuned for LLM consumption |
+| `brave`      | `https://api.search.brave.com/res/v1/web/...` | `X-Subscription-Token` | Brave Search API                  |
+| `serper`     | `https://google.serper.dev/search`            | `X-API-KEY`            | Google SERP as JSON               |
+| `duckduckgo` | `https://html.duckduckgo.com/html/`           | none                   | HTML scrape; default fallback     |
+
+API keys accept the same `${VAR}` / `$VAR` environment substitution as LLM backend keys and are stored in the SecretStore at startup. If a keyed backend is configured but the key doesn't resolve, startup logs a warning and falls back to DuckDuckGo rather than failing.
 
 ## Backends
 
