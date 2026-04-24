@@ -122,13 +122,30 @@ The `web_search` tool is always registered. Backends are an **ordered preference
 
 Omit the `web_search:` section entirely to use DuckDuckGo alone (keyless).
 
-| Backend      | Endpoint                                      | Auth                   | Notes                                              |
-| ------------ | --------------------------------------------- | ---------------------- | -------------------------------------------------- |
-| `kagi`       | `https://kagi.com/api/v0/search`              | `Authorization: Bot …` | Invite-only beta; separate API billing from Search |
-| `tavily`     | `https://api.tavily.com/search`               | API key in JSON body   | Results tuned for LLM consumption                  |
-| `brave`      | `https://api.search.brave.com/res/v1/web/...` | `X-Subscription-Token` | Brave Search API                                   |
-| `serper`     | `https://google.serper.dev/search`            | `X-API-KEY`            | Google SERP as JSON                                |
-| `duckduckgo` | `https://html.duckduckgo.com/html/`           | none                   | HTML scrape; keyless fallback                      |
+| Backend      | Endpoint                                      | Auth                   | Notes                                                             |
+| ------------ | --------------------------------------------- | ---------------------- | ----------------------------------------------------------------- |
+| `kagi`       | `https://kagi.com/api/v0/search`              | `Authorization: Bot …` | Invite-only beta; separate API billing from Search                |
+| `tavily`     | `https://api.tavily.com/search`               | API key in JSON body   | Results tuned for LLM consumption                                 |
+| `brave`      | `https://api.search.brave.com/res/v1/web/...` | `X-Subscription-Token` | Brave Search API                                                  |
+| `serper`     | `https://google.serper.dev/search`            | `X-API-KEY`            | Google SERP as JSON                                               |
+| `searxng`    | `<url>/search?format=json`                    | none                   | Requires `url:` on the entry; JSON output enabled on the instance |
+| `duckduckgo` | `https://html.duckduckgo.com/html/`           | none                   | HTML scrape; keyless fallback                                     |
+
+### SearxNG
+
+`searxng` entries take a `url:` instead of an `api_key:`. The URL is the instance root — `/search?q=<query>&format=json` is appended.
+
+```yaml
+web_search:
+  backends:
+    - type: searxng
+      url: "http://localhost:8888" # self-hosted docker container
+    - type: duckduckgo # safety net if the instance is down
+```
+
+Self-hosting is ~5 minutes with the official docker-compose stack at https://docs.searxng.org/admin/installation-docker.html and doesn't require opening any ports externally.
+
+Public instances at https://searx.space work but come and go, and many rate-limit aggressively or disable the JSON output format. If you see `searxng returned HTTP 403` / `HTTP 429` in the logs, either self-host or pick a different instance. JSON must be enabled server-side in the instance's `settings.yml` (`search.formats: [html, json]`).
 
 API keys accept the same `${VAR}` / `$VAR` environment substitution as LLM backend keys and are stored in the SecretStore at startup. Entries with a missing or unresolvable `api_key` on a keyed backend are skipped at startup with a warning; if the resulting list is empty, a single DuckDuckGo entry is added so the tool always has a fallback.
 

@@ -80,6 +80,7 @@ Backends are an **ordered preference list** configured under `web_search.backend
 - **tavily** — LLM-oriented search API (requires `api_key`)
 - **brave** — Brave Search API (requires `api_key`)
 - **serper** — Google SERP via serper.dev (requires `api_key`)
+- **searxng** — any SearxNG instance (requires `url:`, no key by default). Self-host or point at a public instance.
 - **duckduckgo** — keyless fallback that scrapes DuckDuckGo's HTML page
 
 Empty results are a legitimate answer and do **not** trigger failover — otherwise a bad query would mask itself by running through every backend. Only errors (network, HTTP non-2xx, bad JSON) advance to the next entry.

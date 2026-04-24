@@ -1,7 +1,8 @@
 //! Web search tool.
 //!
-//! Supports a few API-backed providers (Kagi, Tavily, Brave, Serper) and
-//! falls back to parsing DuckDuckGo's HTML results page when no API key is
+//! Supports a few API-backed providers (Kagi, Tavily, Brave, Serper), any
+//! SearxNG instance (self-hosted or public) at a configured URL, and falls
+//! back to parsing DuckDuckGo's HTML results page when no API key is
 //! configured. The tool holds an ordered preference list of backends and
 //! tries each in turn, failing over to the next on any error. The last
 //! entry is the final answer — if it also errors, that error is returned.
@@ -35,6 +36,10 @@ pub enum SearchBackend {
     Brave { api_key: String },
     /// Serper (Google SERP proxy) — https://google.serper.dev/search
     Serper { api_key: String },
+    /// SearxNG meta-search. `base_url` is the instance root (no trailing
+    /// `/search` — we append that). JSON format must be enabled on the
+    /// instance.
+    Searxng { base_url: String },
     /// Keyless fallback — scrapes `html.duckduckgo.com/html/`.
     DuckDuckGo,
 }
@@ -47,6 +52,7 @@ impl SearchBackend {
             SearchBackend::Tavily { .. } => "tavily",
             SearchBackend::Brave { .. } => "brave",
             SearchBackend::Serper { .. } => "serper",
+            SearchBackend::Searxng { .. } => "searxng",
             SearchBackend::DuckDuckGo => "duckduckgo",
         }
     }
@@ -167,6 +173,9 @@ async fn try_backends(
             }
             SearchBackend::Serper { api_key } => {
                 serper_search(client, api_key, query, max_results).await
+            }
+            SearchBackend::Searxng { base_url } => {
+                searxng_search(client, base_url, query, max_results).await
             }
             SearchBackend::DuckDuckGo => duckduckgo_search(client, query, max_results).await,
         }
@@ -442,6 +451,70 @@ async fn serper_search(
                 .collect()
         })
         .unwrap_or_default())
+}
+
+async fn searxng_search(
+    client: &reqwest::Client,
+    base_url: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, ToolError> {
+    // SearxNG exposes both HTML and JSON on the same `/search` endpoint;
+    // `format=json` selects JSON. The instance must have the JSON output
+    // format enabled (default on `searxng` ≥ 2022 but some public instances
+    // disable it — error messages from the server are informative).
+    let trimmed = base_url.trim_end_matches('/');
+    let url = format!("{trimmed}/search");
+    let response = client
+        .get(&url)
+        .query(&[("q", query), ("format", "json")])
+        .send()
+        .await
+        .map_err(|e| ToolError::Network(format!("searxng: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| ToolError::Network(format!("searxng: {e}")))?;
+    if !status.is_success() {
+        return Err(ToolError::Execution(format!(
+            "searxng returned HTTP {status}: {text}"
+        )));
+    }
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|e| ToolError::Execution(format!("searxng: bad JSON: {e}")))?;
+    Ok(parse_searxng_results(&parsed, max_results))
+}
+
+/// Pull result entries out of a SearxNG JSON response. `content` is the
+/// snippet field upstream; we normalize to `snippet`.
+fn parse_searxng_results(parsed: &Value, max_results: usize) -> Vec<SearchResult> {
+    parsed
+        .get("results")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(max_results)
+                .map(|r| SearchResult {
+                    title: r
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    url: r
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    snippet: r
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn duckduckgo_search(
@@ -729,6 +802,45 @@ mod tests {
     fn kagi_parser_empty_data_returns_empty() {
         let body = serde_json::json!({ "data": [] });
         assert!(parse_kagi_results(&body, 10).is_empty());
+    }
+
+    #[test]
+    fn searxng_parser_maps_content_to_snippet() {
+        // SearxNG's result snippet field is `content`; we normalize to `snippet`.
+        let body = serde_json::json!({
+            "query": "rust async",
+            "number_of_results": 123,
+            "results": [
+                {"title": "Tokio", "url": "https://tokio.rs/", "content": "async runtime", "engine": "google"},
+                {"title": "Async book", "url": "https://rust-lang.github.io/async-book/", "content": "the book", "engine": "bing"},
+            ],
+            "suggestions": []
+        });
+        let out = parse_searxng_results(&body, 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].title, "Tokio");
+        assert_eq!(out[0].url, "https://tokio.rs/");
+        assert_eq!(out[0].snippet, "async runtime");
+    }
+
+    #[test]
+    fn searxng_parser_respects_max_results() {
+        let body = serde_json::json!({
+            "results": [
+                {"title": "A", "url": "https://a", "content": ""},
+                {"title": "B", "url": "https://b", "content": ""},
+                {"title": "C", "url": "https://c", "content": ""},
+            ]
+        });
+        let out = parse_searxng_results(&body, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].url, "https://b");
+    }
+
+    #[test]
+    fn searxng_parser_missing_results_returns_empty() {
+        let body = serde_json::json!({"query": "x", "number_of_results": 0});
+        assert!(parse_searxng_results(&body, 10).is_empty());
     }
 
     #[test]

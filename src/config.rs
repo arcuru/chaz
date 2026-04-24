@@ -97,6 +97,9 @@ pub enum WebSearchBackendKind {
     Tavily,
     Brave,
     Serper,
+    /// SearxNG instance — self-hosted or public. Requires `url:` on the entry.
+    #[serde(alias = "searx")]
+    Searxng,
     #[default]
     DuckDuckGo,
 }

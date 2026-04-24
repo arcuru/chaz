@@ -404,7 +404,10 @@ async fn build_web_search_backends(
             entry.api_key_ref = Some(ref_id);
         }
 
-        let needs_key = !matches!(entry.kind, Kind::DuckDuckGo);
+        let needs_key = matches!(
+            entry.kind,
+            Kind::Kagi | Kind::Tavily | Kind::Brave | Kind::Serper
+        );
         if needs_key && resolved_key.is_none() {
             tracing::warn!(
                 index = idx,
@@ -413,13 +416,30 @@ async fn build_web_search_backends(
             );
             continue;
         }
-        match (entry.kind, resolved_key) {
-            (Kind::Kagi, Some(api_key)) => built.push(tools::SearchBackend::Kagi { api_key }),
-            (Kind::Tavily, Some(api_key)) => built.push(tools::SearchBackend::Tavily { api_key }),
-            (Kind::Brave, Some(api_key)) => built.push(tools::SearchBackend::Brave { api_key }),
-            (Kind::Serper, Some(api_key)) => built.push(tools::SearchBackend::Serper { api_key }),
-            (Kind::DuckDuckGo, _) => built.push(tools::SearchBackend::DuckDuckGo),
-            _ => unreachable!("needs_key guard ruled this out"),
+        match entry.kind {
+            Kind::Kagi => built.push(tools::SearchBackend::Kagi {
+                api_key: resolved_key.expect("needs_key guard"),
+            }),
+            Kind::Tavily => built.push(tools::SearchBackend::Tavily {
+                api_key: resolved_key.expect("needs_key guard"),
+            }),
+            Kind::Brave => built.push(tools::SearchBackend::Brave {
+                api_key: resolved_key.expect("needs_key guard"),
+            }),
+            Kind::Serper => built.push(tools::SearchBackend::Serper {
+                api_key: resolved_key.expect("needs_key guard"),
+            }),
+            Kind::Searxng => {
+                let Some(base_url) = entry.url.clone() else {
+                    tracing::warn!(
+                        index = idx,
+                        "web_search searxng entry missing required `url:` — skipping"
+                    );
+                    continue;
+                };
+                built.push(tools::SearchBackend::Searxng { base_url });
+            }
+            Kind::DuckDuckGo => built.push(tools::SearchBackend::DuckDuckGo),
         }
     }
 
@@ -437,6 +457,7 @@ async fn build_web_search_backends(
             tools::SearchBackend::Tavily { .. } => "tavily",
             tools::SearchBackend::Brave { .. } => "brave",
             tools::SearchBackend::Serper { .. } => "serper",
+            tools::SearchBackend::Searxng { .. } => "searxng",
             tools::SearchBackend::DuckDuckGo => "duckduckgo",
         })
         .collect();
