@@ -44,17 +44,13 @@ struct ChazArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
     let args = ChazArgs::parse();
-    info!(config = %args.config.display(), tui = args.tui, "Starting chaz");
 
     let mut file = File::open(&args.config)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
     let mut config: Config = serde_yaml::from_str(&contents)?;
-    info!("Config loaded from {}", args.config.display());
 
     // Resolve state directory for persistence
     let state_dir = config
@@ -65,6 +61,40 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = &state_dir {
         std::fs::create_dir_all(dir)?;
     }
+
+    // Init tracing. Honour RUST_LOG; default to info when unset.
+    // In TUI mode stdout belongs to ratatui, so we route logs to a rolling
+    // file instead (the alt-screen buffer gets corrupted by stray writes).
+    // Daily rotation, keep the last 7 days. Users can tail the file in
+    // another terminal.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _tui_log_guard = if args.tui {
+        let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("chaz-tui")
+            .filename_suffix("log")
+            .max_log_files(7)
+            .build(&log_dir)?;
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .init();
+        eprintln!(
+            "chaz TUI logs: {}/chaz-tui.log (daily, keeps 7 days)",
+            log_dir.display()
+        );
+        Some(guard)
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        None
+    };
+
+    info!(config = %args.config.display(), tui = args.tui, "Starting chaz");
+    info!("Config loaded from {}", args.config.display());
 
     // Initialize eidetica with SQLite backend for persistent storage
     let eidetica_db_path = state_dir
