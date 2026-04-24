@@ -51,28 +51,43 @@ pub struct Config {
     pub web_search: Option<WebSearchConfig>,
 }
 
-/// Configuration for the `web_search` tool.
+/// Configuration for the `web_search` tool. Holds an ordered list of
+/// backends; the tool tries them in order and falls through to the next on
+/// any error. The last entry is the final answer.
 ///
 /// Example:
 /// ```yaml
 /// web_search:
-///   backend: tavily
-///   api_key: "${TAVILY_API_KEY}"
+///   backends:
+///     - type: tavily
+///       api_key: "${TAVILY_API_KEY}"
+///     - type: duckduckgo
 /// ```
 ///
-/// Omit the whole section (or set `backend: duckduckgo`) to use the
-/// keyless DuckDuckGo fallback.
+/// Omit the whole section to use the keyless DuckDuckGo fallback alone.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WebSearchConfig {
-    /// Search provider. Defaults to DuckDuckGo.
+    /// Ordered preference list. Empty or missing → `[duckduckgo]`.
     #[serde(default)]
-    pub backend: WebSearchBackendKind,
+    pub backends: Vec<WebSearchBackendEntry>,
+}
+
+/// One entry in `web_search.backends`. The required `type` selects the
+/// provider; `api_key` / `url` are keyed by the provider's needs (Kagi/
+/// Tavily/Brave/Serper need `api_key`; SearxNG needs `url`; DuckDuckGo
+/// needs neither).
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebSearchBackendEntry {
+    #[serde(rename = "type")]
+    pub kind: WebSearchBackendKind,
     /// Raw API key from config (extracted into SecretStore at startup, then cleared).
     /// Supports `${VAR}`/`$VAR` env references.
     pub api_key: Option<String>,
     /// Opaque reference ID into SecretStore (set after api_key is extracted).
     #[serde(skip)]
     pub api_key_ref: Option<String>,
+    /// Base URL for self-hosted backends (SearxNG). Ignored for other kinds.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]

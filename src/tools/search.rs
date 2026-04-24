@@ -2,8 +2,9 @@
 //!
 //! Supports a few API-backed providers (Tavily, Brave, Serper) and falls back
 //! to parsing DuckDuckGo's HTML results page when no API key is configured.
-//! The provider is chosen at startup from `web_search:` config and held on
-//! the tool instance.
+//! The tool holds an ordered preference list of backends and tries each in
+//! turn, failing over to the next on any error. The last entry is the final
+//! answer — if it also errors, that error is returned.
 
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use regex::Regex;
@@ -49,12 +50,20 @@ impl SearchBackend {
 }
 
 pub struct WebSearch {
-    backend: SearchBackend,
+    /// Non-empty ordered preference list. Tried in sequence on failure.
+    /// An empty `new()` input is coerced to a single DuckDuckGo entry so
+    /// the tool always has a fallback.
+    backends: Vec<SearchBackend>,
 }
 
 impl WebSearch {
-    pub fn new(backend: SearchBackend) -> Self {
-        Self { backend }
+    pub fn new(backends: Vec<SearchBackend>) -> Self {
+        let backends = if backends.is_empty() {
+            vec![SearchBackend::DuckDuckGo]
+        } else {
+            backends
+        };
+        Self { backends }
     }
 
     fn http_client() -> Result<reqwest::Client, String> {
@@ -120,27 +129,76 @@ impl Tool for WebSearch {
                 .unwrap_or(5)
                 .clamp(1, 10) as usize;
 
-            info!(backend = %self.backend.name(), %query, max_results, "Searching web");
+            let chain: Vec<&'static str> = self.backends.iter().map(|b| b.name()).collect();
+            info!(backends = ?chain, %query, max_results, "Searching web");
 
             let client = Self::http_client().map_err(ToolError::Execution)?;
-            let results = match &self.backend {
-                SearchBackend::Tavily { api_key } => {
-                    tavily_search(&client, api_key, query, max_results).await?
-                }
-                SearchBackend::Brave { api_key } => {
-                    brave_search(&client, api_key, query, max_results).await?
-                }
-                SearchBackend::Serper { api_key } => {
-                    serper_search(&client, api_key, query, max_results).await?
-                }
-                SearchBackend::DuckDuckGo => duckduckgo_search(&client, query, max_results).await?,
-            };
+            let results = try_backends(&self.backends, &client, query, max_results).await?;
 
             debug!(count = results.len(), "Search results");
             serde_json::to_string(&results)
                 .map_err(|e| ToolError::Execution(format!("Failed to serialize results: {e}")))
         })
     }
+}
+
+/// Run the query against each backend in order, returning the first `Ok`.
+/// If every backend errors, returns the last error. The chain is assumed
+/// non-empty (`WebSearch::new` guarantees this).
+async fn try_backends(
+    backends: &[SearchBackend],
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, ToolError> {
+    try_backends_with(backends, |backend| async move {
+        match backend {
+            SearchBackend::Tavily { api_key } => {
+                tavily_search(client, api_key, query, max_results).await
+            }
+            SearchBackend::Brave { api_key } => {
+                brave_search(client, api_key, query, max_results).await
+            }
+            SearchBackend::Serper { api_key } => {
+                serper_search(client, api_key, query, max_results).await
+            }
+            SearchBackend::DuckDuckGo => duckduckgo_search(client, query, max_results).await,
+        }
+    })
+    .await
+}
+
+/// Generic failover loop extracted from `try_backends` for unit testing
+/// without HTTP. Iterates `backends`, calling `search(backend)` for each;
+/// returns the first Ok, or the last Err if all fail.
+async fn try_backends_with<'a, F, Fut>(
+    backends: &'a [SearchBackend],
+    mut search: F,
+) -> Result<Vec<SearchResult>, ToolError>
+where
+    F: FnMut(&'a SearchBackend) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<SearchResult>, ToolError>>,
+{
+    let mut last_err: Option<ToolError> = None;
+    for backend in backends {
+        match search(backend).await {
+            Ok(results) => {
+                if last_err.is_some() {
+                    info!(backend = %backend.name(), "Failover succeeded");
+                }
+                return Ok(results);
+            }
+            Err(e) => {
+                warn!(
+                    backend = %backend.name(),
+                    error = %e,
+                    "Search backend failed; trying next"
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| ToolError::Execution("No search backends configured".into())))
 }
 
 // ================================================================
@@ -570,5 +628,99 @@ mod tests {
             SearchBackend::Tavily { api_key: "".into() }.name(),
             "tavily"
         );
+    }
+
+    // ----- Failover loop -----
+    //
+    // These exercise `try_backends_with` against canned per-backend results
+    // — no HTTP. The real `try_backends` is just this loop wrapping a closure
+    // that dispatches to the provider-specific search fns.
+
+    fn sample(url: &str) -> SearchResult {
+        SearchResult {
+            title: format!("t:{url}"),
+            url: url.into(),
+            snippet: "s".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_returns_first_ok() {
+        let backends = vec![
+            SearchBackend::Tavily { api_key: "".into() },
+            SearchBackend::DuckDuckGo,
+        ];
+        let out = try_backends_with(&backends, |b| async move {
+            match b {
+                SearchBackend::Tavily { .. } => Ok(vec![sample("https://a")]),
+                _ => panic!("second backend should not be called"),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url, "https://a");
+    }
+
+    #[tokio::test]
+    async fn failover_falls_through_to_next_on_error() {
+        let backends = vec![
+            SearchBackend::Tavily { api_key: "".into() },
+            SearchBackend::DuckDuckGo,
+        ];
+        let out = try_backends_with(&backends, |b| async move {
+            match b {
+                SearchBackend::Tavily { .. } => Err(ToolError::Network("boom".into())),
+                SearchBackend::DuckDuckGo => Ok(vec![sample("https://b")]),
+                _ => unreachable!(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out[0].url, "https://b");
+    }
+
+    #[tokio::test]
+    async fn failover_returns_last_error_when_all_fail() {
+        let backends = vec![
+            SearchBackend::Tavily { api_key: "".into() },
+            SearchBackend::Brave { api_key: "".into() },
+        ];
+        let err = try_backends_with(&backends, |b| async move {
+            match b {
+                SearchBackend::Tavily { .. } => Err(ToolError::Network("first".into())),
+                SearchBackend::Brave { .. } => Err(ToolError::Execution("last".into())),
+                _ => unreachable!(),
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("last"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn failover_empty_results_do_not_trigger_next_backend() {
+        // An empty list is a legitimate answer (query has no hits). Treating
+        // it as an error would mask bad queries.
+        let backends = vec![
+            SearchBackend::Tavily { api_key: "".into() },
+            SearchBackend::DuckDuckGo,
+        ];
+        let out = try_backends_with(&backends, |b| async move {
+            match b {
+                SearchBackend::Tavily { .. } => Ok(vec![]),
+                _ => panic!("DDG should not be called on empty-Ok"),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn new_empty_list_coerces_to_duckduckgo() {
+        let s = WebSearch::new(vec![]);
+        assert_eq!(s.backends.len(), 1);
+        assert!(matches!(s.backends[0], SearchBackend::DuckDuckGo));
     }
 }

@@ -106,24 +106,32 @@ context:
   max_context_tokens: 128000
   reserved_output_tokens: 4096
 
-# Web search tool
+# Web search tool (ordered failover chain)
 web_search:
-  backend: tavily # tavily | brave | serper | duckduckgo (default)
-  api_key: "${TAVILY_API_KEY}"
+  backends:
+    - type: tavily
+      api_key: "${TAVILY_API_KEY}"
+    - type: brave
+      api_key: "${BRAVE_API_KEY}"
+    - type: duckduckgo
 ```
 
 ## Web search
 
-The `web_search` tool is always registered. Omit the `web_search:` section entirely (or set `backend: duckduckgo`) to use the keyless DuckDuckGo HTML scraper.
+The `web_search` tool is always registered. Backends are an **ordered preference list**: the tool tries each entry in turn and falls through on any error, returning the first success. Empty results are a legitimate answer and do **not** trigger failover.
+
+Omit the `web_search:` section entirely to use DuckDuckGo alone (keyless).
 
 | Backend      | Endpoint                                      | Auth                   | Notes                             |
 | ------------ | --------------------------------------------- | ---------------------- | --------------------------------- |
 | `tavily`     | `https://api.tavily.com/search`               | API key in JSON body   | Results tuned for LLM consumption |
 | `brave`      | `https://api.search.brave.com/res/v1/web/...` | `X-Subscription-Token` | Brave Search API                  |
 | `serper`     | `https://google.serper.dev/search`            | `X-API-KEY`            | Google SERP as JSON               |
-| `duckduckgo` | `https://html.duckduckgo.com/html/`           | none                   | HTML scrape; default fallback     |
+| `duckduckgo` | `https://html.duckduckgo.com/html/`           | none                   | HTML scrape; keyless fallback     |
 
-API keys accept the same `${VAR}` / `$VAR` environment substitution as LLM backend keys and are stored in the SecretStore at startup. If a keyed backend is configured but the key doesn't resolve, startup logs a warning and falls back to DuckDuckGo rather than failing.
+API keys accept the same `${VAR}` / `$VAR` environment substitution as LLM backend keys and are stored in the SecretStore at startup. Entries with a missing or unresolvable `api_key` on a keyed backend are skipped at startup with a warning; if the resulting list is empty, a single DuckDuckGo entry is added so the tool always has a fallback.
+
+**Recommended pattern**: put your highest-quality paid backend first, a cheaper or alternative backend second for rate-limit resilience, and `duckduckgo` last as a keyless safety net.
 
 ## Backends
 

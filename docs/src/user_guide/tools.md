@@ -74,14 +74,16 @@ Runs a search query and returns up to 10 normalized results (`{title, url, snipp
 { "query": "CRDT synchronization algorithms", "max_results": 5 }
 ```
 
-The backend is selected at startup from the `web_search:` config block — see [Configuration](configuration.md#web-search). Supported backends:
+Backends are an **ordered preference list** configured under `web_search.backends` — the tool tries each in turn and falls through to the next on any error, returning the first success. Configuration lives in [Configuration](configuration.md#web-search). Supported backends:
 
 - **tavily** — LLM-oriented search API (requires `api_key`)
 - **brave** — Brave Search API (requires `api_key`)
 - **serper** — Google SERP via serper.dev (requires `api_key`)
-- **duckduckgo** — keyless fallback that scrapes DuckDuckGo's HTML page; used when no `web_search:` section is configured or when a keyed backend is selected without a resolved key
+- **duckduckgo** — keyless fallback that scrapes DuckDuckGo's HTML page
 
-The tool is Low-risk and approval-free because the agent never supplies the destination URL — only a query string — and the HTTP destination is fixed by operator config.
+Empty results are a legitimate answer and do **not** trigger failover — otherwise a bad query would mask itself by running through every backend. Only errors (network, HTTP non-2xx, bad JSON) advance to the next entry.
+
+The tool is Low-risk and approval-free because the agent never supplies the destination URL — only a query string — and every HTTP destination is fixed by operator config.
 
 ### shell
 
