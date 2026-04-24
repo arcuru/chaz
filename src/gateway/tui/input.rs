@@ -487,8 +487,9 @@ fn parse_chat_line(
             for (i, entry) in app.entries.iter().enumerate() {
                 let ts = entry.timestamp.format("%H:%M:%S%.3f");
                 let typ = format!("{:?}", entry.entry_type);
-                let content_preview = if entry.content.len() > 80 {
-                    format!("{}...", &entry.content[..80])
+                let t = crate::util::truncate_chars(&entry.content, 80);
+                let content_preview = if t.len() < entry.content.len() {
+                    format!("{t}...")
                 } else {
                     entry.content.replace('\n', "\\n")
                 };

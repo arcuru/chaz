@@ -2,6 +2,7 @@
 //! Pure view functions — no mutation, no async.
 
 use crate::session::EntryType;
+use crate::util::truncate_chars;
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,6 +11,33 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use super::App;
 use super::TuiMode;
+
+/// Prepare arbitrary content for rendering as ratatui `Line`s. Truncates
+/// char-wise if requested (appending `…`), then splits on `\n`. A `Line`
+/// must not contain embedded newlines — `WordWrapper` treats `\n` as
+/// zero-width whitespace, concatenating adjacent words and corrupting
+/// layout.
+fn display_lines(content: &str, max_chars: Option<usize>) -> Vec<String> {
+    let owned;
+    let src: &str = match max_chars {
+        Some(n) => {
+            let t = truncate_chars(content, n);
+            if t.len() < content.len() {
+                owned = format!("{t}…");
+                &owned
+            } else {
+                content
+            }
+        }
+        None => content,
+    };
+    let out: Vec<String> = src.split('\n').map(str::to_owned).collect();
+    if out.is_empty() {
+        vec![String::new()]
+    } else {
+        out
+    }
+}
 
 pub(super) fn ui(f: &mut ratatui::Frame, app: &App) {
     match app.mode {
@@ -77,28 +105,37 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
                 )]));
             }
             EntryType::ToolCall => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}  > {}", entry.content),
-                    dim,
-                )]));
+                for (i, l) in display_lines(&entry.content, None).into_iter().enumerate() {
+                    let prefix = if i == 0 { "  > " } else { "    " };
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{debug_prefix}{prefix}{l}"),
+                        dim,
+                    )]));
+                }
             }
             EntryType::ToolResult => {
-                let max_len = if app.debug_mode { 500 } else { 120 };
-                let display = if entry.content.len() > max_len {
-                    format!("{}...", &entry.content[..max_len])
-                } else {
-                    entry.content.clone()
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}  < {display}"),
-                    dim,
-                )]));
+                let max_chars = if app.debug_mode { 500 } else { 120 };
+                for (i, l) in display_lines(&entry.content, Some(max_chars))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let prefix = if i == 0 { "  < " } else { "    " };
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{debug_prefix}{prefix}{l}"),
+                        dim,
+                    )]));
+                }
             }
             EntryType::Error => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}  ERROR {}: {}", entry.sender, entry.content),
-                    Style::default().fg(Color::Red),
-                )]));
+                let red = Style::default().fg(Color::Red);
+                for (i, l) in display_lines(&entry.content, None).into_iter().enumerate() {
+                    let text = if i == 0 {
+                        format!("{debug_prefix}  ERROR {}: {l}", entry.sender)
+                    } else {
+                        format!("    {l}")
+                    };
+                    lines.push(Line::from(vec![Span::styled(text, red)]));
+                }
                 lines.push(Line::from(""));
             }
             EntryType::Summary => {
@@ -130,7 +167,13 @@ fn ui_chat(f: &mut ratatui::Frame, app: &App) {
         )]));
         lines.push(Line::from(format!("  Tool: {}", info.name)));
         lines.push(Line::from(format!("  Risk: {}", info.risk_level)));
-        lines.push(Line::from(format!("  Args: {}", info.arguments_display)));
+        for (i, l) in display_lines(&info.arguments_display, None)
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if i == 0 { "  Args: " } else { "        " };
+            lines.push(Line::from(format!("{prefix}{l}")));
+        }
         lines.push(Line::from(vec![
             Span::styled("  [y]", Style::default().fg(Color::Green)),
             Span::raw("es  "),
@@ -256,4 +299,35 @@ fn ui_picker(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new(" [Up/Down] navigate | [Enter] select | [n] new session | [Esc] cancel")
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(help, chunks[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_lines_splits_on_newlines() {
+        let out = display_lines("one\ntwo\nthree", None);
+        assert_eq!(out, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn display_lines_empty_content_yields_single_blank() {
+        // Rendering sites rely on at least one line so the first-line prefix
+        // (e.g. "  < ") always shows, even for empty tool output.
+        assert_eq!(display_lines("", None), vec![String::new()]);
+    }
+
+    #[test]
+    fn display_lines_preserves_trailing_empty_line() {
+        // split('\n') on "a\n" yields ["a", ""]; lines() would drop the
+        // trailing empty. Keep split semantics so the blank shows.
+        assert_eq!(display_lines("a\n", None), vec!["a", ""]);
+    }
+
+    #[test]
+    fn display_lines_truncates_before_splitting() {
+        let out = display_lines("aaaa\nbbbb\ncccc", Some(5));
+        assert_eq!(out, vec!["aaaa".to_string(), "…".to_string()]);
+    }
 }

@@ -44,8 +44,9 @@ impl Tool for ReadFile {
             debug!(path, bytes = content.len(), "File read complete");
 
             // Truncate very long files
-            if content.len() > 50000 {
-                let mut truncated = content[..50000].to_string();
+            let t = crate::util::truncate_chars(&content, 50000);
+            if t.len() < content.len() {
+                let mut truncated = t.to_string();
                 truncated.push_str("\n[truncated]");
                 Ok(truncated)
             } else {

@@ -44,10 +44,11 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
                     .find(|e| e.entry_type == EntryType::Message)
                     .map(|e| {
                         let preview = e.content.lines().next().unwrap_or("");
-                        if preview.len() > 60 {
-                            format!("{}: {}…", e.sender, &preview[..60])
+                        let truncated = crate::util::truncate_chars(preview, 60);
+                        if truncated.len() < preview.len() {
+                            format!("{}: {truncated}…", e.sender)
                         } else {
-                            format!("{}: {}", e.sender, preview)
+                            format!("{}: {preview}", e.sender)
                         }
                     });
                 (count, last, meta.name, meta.agent_name)

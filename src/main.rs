@@ -22,6 +22,7 @@ mod session;
 mod tool;
 mod tools;
 mod types;
+mod util;
 
 use config::Config;
 use gateway::Gateway;

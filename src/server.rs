@@ -547,8 +547,9 @@ impl Server {
                             let content = if is_error {
                                 format!("{name}: ERROR: {output}")
                             } else {
-                                let truncated = if output.len() > 500 {
-                                    format!("{}…", &output[..500])
+                                let t = crate::util::truncate_chars(&output, 500);
+                                let truncated = if t.len() < output.len() {
+                                    format!("{t}…")
                                 } else {
                                     output
                                 };
