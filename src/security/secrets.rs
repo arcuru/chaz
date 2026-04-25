@@ -1,5 +1,5 @@
-use eidetica::Database;
 use eidetica::store::DocStore;
+use eidetica::Database;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
@@ -16,9 +16,12 @@ use tracing::{error, info};
 ///
 /// Architecture:
 /// - In-memory `HashMap` cache for fast sync reads (`get()`)
-/// - Persistent eidetica `DocStore` ("secrets" subtree) for durability
+/// - Persistent eidetica `DocStore` (`credentials` subtree on `chaz_peer`)
 /// - On startup: load from DocStore, reconcile with config, update if changed
 /// - `insert()` writes to both cache and DocStore
+///
+/// Backed by the `chaz_peer` DB (peer-local, never syncs) — these are
+/// third-party API tokens for this binary, not anything that should propagate.
 #[derive(Clone)]
 pub struct SecretStore {
     cache: Arc<RwLock<HashMap<String, String>>>,
@@ -27,7 +30,7 @@ pub struct SecretStore {
 
 impl SecretStore {
     /// Create a new SecretStore backed by the given eidetica database.
-    /// Loads any existing secrets from the "secrets" DocStore into memory.
+    /// Loads any existing secrets from the "credentials" DocStore into memory.
     pub async fn new(database: Database) -> Self {
         let store = Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -43,7 +46,7 @@ impl SecretStore {
             error!("Failed to create transaction for loading secrets");
             return;
         };
-        let Ok(store) = txn.get_store::<DocStore>("secrets").await else {
+        let Ok(store) = txn.get_store::<DocStore>("credentials").await else {
             // First run — no secrets subtree yet, that's fine
             return;
         };
@@ -95,7 +98,7 @@ impl SecretStore {
 
         // Persist to eidetica DocStore
         match self.database.new_transaction().await {
-            Ok(txn) => match txn.get_store::<DocStore>("secrets").await {
+            Ok(txn) => match txn.get_store::<DocStore>("credentials").await {
                 Ok(store) => {
                     if let Err(e) = store.set_string(&id, &value).await {
                         error!("Failed to persist secret '{id}': {e}");

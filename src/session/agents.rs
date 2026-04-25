@@ -8,15 +8,15 @@
 
 use crate::agent::Agent;
 use crate::agent_db::{AgentDb, SessionHistoryEntry};
-use crate::db_registry::DbEntry;
+use crate::hosted_index::DbEntry;
 
 use chrono::Utc;
-use eidetica::Database;
 use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::store::Table;
+use eidetica::Database;
 use tracing::{info, warn};
 
-use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
+use super::{parse_mentions, read_meta_from_db, update_meta_on_db, AgentRef, SessionRegistry};
 
 impl SessionRegistry {
     /// Attach an agent to a session. Grants the agent's pubkey Write
@@ -178,7 +178,7 @@ impl SessionRegistry {
         &self,
         session_db_id: &str,
         override_name: Option<&str>,
-        agent_index: &crate::db_registry::DbRegistry,
+        agent_index: &crate::hosted_index::HostedIndex,
     ) -> Agent {
         if let Some(name) = override_name {
             if let Some(agent) = self.agents.get(name) {
@@ -208,7 +208,7 @@ impl SessionRegistry {
     async fn resolve_from_auth(
         &self,
         session_db: &Database,
-        agent_index: &crate::db_registry::DbRegistry,
+        agent_index: &crate::hosted_index::HostedIndex,
     ) -> Option<Agent> {
         let authorized = self.authorized_agents(session_db, agent_index).await;
         authorized
@@ -222,8 +222,8 @@ impl SessionRegistry {
     async fn authorized_agents(
         &self,
         session_db: &Database,
-        agent_index: &crate::db_registry::DbRegistry,
-    ) -> Vec<crate::db_registry::DbEntry> {
+        agent_index: &crate::hosted_index::HostedIndex,
+    ) -> Vec<crate::hosted_index::DbEntry> {
         use eidetica::auth::crypto::PublicKey;
         use eidetica::auth::types::KeyStatus;
 
@@ -248,7 +248,7 @@ impl SessionRegistry {
             let Ok(pubkey) = PublicKey::from_prefixed_string(&pubkey_str) else {
                 continue;
             };
-            if let Ok(Some(entry)) = agent_index.find_by_pubkey(&pubkey).await {
+            if let Some(entry) = agent_index.find_by_pubkey(&pubkey) {
                 out.push(entry);
             }
         }
@@ -267,7 +267,7 @@ impl SessionRegistry {
         &self,
         session_db_id: &str,
         override_name: Option<&str>,
-        agent_index: &crate::db_registry::DbRegistry,
+        agent_index: &crate::hosted_index::HostedIndex,
         trigger_text: Option<&str>,
     ) -> Agent {
         if let Some(name) = override_name {
@@ -393,7 +393,7 @@ mod tests {
         let session_id = session_db.root_id().to_string();
 
         let agent_entry = make_agent_entry(&registry, "alpha").await;
-        index.register(agent_entry.clone()).await.unwrap();
+        index.register(agent_entry.clone());
         registry
             .attach_agent_to_session(&session_id, &agent_entry)
             .await
@@ -455,8 +455,8 @@ mod tests {
 
         let alpha = make_agent_entry(&registry, "alpha").await;
         let beta = make_agent_entry(&registry, "beta").await;
-        index.register(alpha.clone()).await.unwrap();
-        index.register(beta.clone()).await.unwrap();
+        index.register(alpha.clone());
+        index.register(beta.clone());
         registry
             .attach_agent_to_session(&session_id, &alpha)
             .await
@@ -487,8 +487,8 @@ mod tests {
 
         let alpha = make_agent_entry(&registry, "alpha").await;
         let beta = make_agent_entry(&registry, "beta").await;
-        index.register(alpha.clone()).await.unwrap();
-        index.register(beta.clone()).await.unwrap();
+        index.register(alpha.clone());
+        index.register(beta.clone());
         registry
             .attach_agent_to_session(&session_id, &alpha)
             .await
@@ -521,8 +521,8 @@ mod tests {
 
         let alpha = make_agent_entry(&registry, "alpha").await;
         let beta = make_agent_entry(&registry, "beta").await;
-        index.register(alpha.clone()).await.unwrap();
-        index.register(beta.clone()).await.unwrap();
+        index.register(alpha.clone());
+        index.register(beta.clone());
         registry
             .attach_agent_to_session(&session_id, &alpha)
             .await
@@ -546,7 +546,7 @@ mod tests {
         let session_id = session_db.root_id().to_string();
 
         let alpha = make_agent_entry(&registry, "alpha").await;
-        index.register(alpha.clone()).await.unwrap();
+        index.register(alpha.clone());
         registry
             .attach_agent_to_session(&session_id, &alpha)
             .await

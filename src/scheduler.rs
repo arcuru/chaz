@@ -4,8 +4,9 @@
 //! on a cron schedule. The existing server callback machinery handles agent
 //! execution — the scheduler just provides the trigger.
 //!
-//! Schedule state (last_run) is persisted in the chazdb
-//! so that restarts don't cause duplicate or missed runs.
+//! Schedule state (last_run) is persisted in `chaz_peer.schedule_state` so
+//! that restarts don't cause duplicate or missed runs. Peer-local because
+//! `last_run` is inherently this-binary-on-this-machine state.
 
 use crate::backends::BackendManager;
 use crate::config::ScheduleConfig;
@@ -13,15 +14,15 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::Database;
 use eidetica::store::Table;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-/// Persisted schedule state in eidetica chazdb.
+/// Persisted schedule state in `chaz_peer.schedule_state`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScheduleState {
     name: String,
@@ -44,25 +45,25 @@ pub struct Scheduler {
     records: Arc<Mutex<Vec<ScheduleRecord>>>,
     server: Arc<Server>,
     backend: BackendManager,
-    chazdb: Database,
+    chaz_peer: Database,
 }
 
 impl Scheduler {
     /// Create a new scheduler from config.
     ///
     /// Parses cron expressions, validates configs, and loads persisted last_run
-    /// times from the chazdb. Invalid schedules are logged
+    /// times from the chaz_peer. Invalid schedules are logged
     /// and skipped.
     pub async fn new(
         configs: Vec<ScheduleConfig>,
         server: Arc<Server>,
         backend: BackendManager,
-        chazdb: Database,
+        chaz_peer: Database,
     ) -> Self {
         let mut records = Vec::new();
 
         // Load persisted state
-        let persisted = load_schedule_states(&chazdb).await;
+        let persisted = load_schedule_states(&chaz_peer).await;
 
         for cfg in configs {
             if !cfg.enabled {
@@ -108,7 +109,7 @@ impl Scheduler {
             records: Arc::new(Mutex::new(records)),
             server,
             backend,
-            chazdb,
+            chaz_peer,
         }
     }
 
@@ -231,7 +232,7 @@ impl Scheduler {
         }
 
         // Persist to eidetica
-        if let Err(e) = save_schedule_state(&self.chazdb, name, now).await {
+        if let Err(e) = save_schedule_state(&self.chaz_peer, name, now).await {
             warn!(schedule = %name, "Failed to persist last_run: {e}");
         }
     }
@@ -281,12 +282,15 @@ fn next_run_after(cron: &Schedule, last_run: Option<DateTime<Utc>>) -> Option<Da
     }
 }
 
-/// Load all persisted schedule states from the chazdb.
+/// Load all persisted schedule states from the chaz_peer.
 async fn load_schedule_states(db: &Database) -> Vec<ScheduleState> {
     let Ok(txn) = db.new_transaction().await else {
         return Vec::new();
     };
-    let Ok(store) = txn.get_store::<Table<ScheduleState>>("schedules").await else {
+    let Ok(store) = txn
+        .get_store::<Table<ScheduleState>>("schedule_state")
+        .await
+    else {
         return Vec::new();
     };
     match store.search(|_| true).await {
@@ -295,14 +299,16 @@ async fn load_schedule_states(db: &Database) -> Vec<ScheduleState> {
     }
 }
 
-/// Persist a schedule's last_run to the chazdb.
+/// Persist a schedule's last_run to the chaz_peer.
 async fn save_schedule_state(
     db: &Database,
     name: &str,
     last_run: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let txn = db.new_transaction().await?;
-    let store = txn.get_store::<Table<ScheduleState>>("schedules").await?;
+    let store = txn
+        .get_store::<Table<ScheduleState>>("schedule_state")
+        .await?;
 
     // Update existing or insert new
     let existing = store.search(|s| s.name == name).await?;
@@ -335,8 +341,8 @@ pub struct ScheduleInfo {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
 
     async fn test_db() -> (Instance, Database) {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();

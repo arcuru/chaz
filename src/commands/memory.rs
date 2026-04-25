@@ -10,13 +10,13 @@ use super::{CommandContext, CommandOutcome};
 pub(super) async fn resolve_bank_ref(
     bank_ref: &str,
     ctx: &CommandContext<'_>,
-) -> Result<crate::db_registry::DbEntry, String> {
+) -> Result<crate::hosted_index::DbEntry, String> {
     let index = ctx.server.memory_bank_index();
-    if let Ok(Some(entry)) = index.find_by_name(bank_ref).await {
+    if let Some(entry) = index.find_by_name(bank_ref) {
         return Ok(entry);
     }
     if let Ok(id) = eidetica::entry::ID::parse(bank_ref) {
-        if let Ok(Some(entry)) = index.find_by_id(&id).await {
+        if let Some(entry) = index.find_by_id(&id) {
             return Ok(entry);
         }
     }
@@ -52,20 +52,13 @@ pub(super) async fn memory_new(
         }
     };
 
-    if let Err(e) = ctx
-        .server
+    ctx.server
         .memory_bank_index()
-        .register(crate::db_registry::DbEntry {
+        .register(crate::hosted_index::DbEntry {
             db_id: bank.id(),
             display_name: name.to_string(),
             pubkey,
-        })
-        .await
-    {
-        return CommandOutcome::Error(format!(
-            "Bank DB created but index registration failed: {e}"
-        ));
-    }
+        });
 
     CommandOutcome::Text(format!(
         "Created memory bank '{name}' (DB {}). Grant it to an agent with /memory grant.",
@@ -74,10 +67,7 @@ pub(super) async fn memory_new(
 }
 
 pub(super) async fn memory_list(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let entries = match ctx.server.memory_bank_index().list().await {
-        Ok(e) => e,
-        Err(e) => return CommandOutcome::Error(format!("Failed to list memory banks: {e}")),
-    };
+    let entries = ctx.server.memory_bank_index().list();
     if entries.is_empty() {
         return CommandOutcome::Text(
             "No memory banks on this peer. Create one with /memory new <name>.".to_string(),
@@ -294,18 +284,13 @@ pub(super) async fn memory_import(ticket_str: &str, ctx: &CommandContext<'_>) ->
         }
     };
 
-    if let Err(e) = ctx
-        .server
+    ctx.server
         .memory_bank_index()
-        .register(crate::db_registry::DbEntry {
+        .register(crate::hosted_index::DbEntry {
             db_id: db_id.clone(),
             display_name: display_name.clone(),
             pubkey,
-        })
-        .await
-    {
-        return CommandOutcome::Error(format!("Index registration failed: {e}"));
-    }
+        });
 
     CommandOutcome::Text(format!(
         "Imported memory bank '{display_name}' (DB {db_id}). \
@@ -319,14 +304,7 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
         Err(msg) => return CommandOutcome::Error(msg),
     };
 
-    if let Err(e) = ctx
-        .server
-        .memory_bank_index()
-        .unregister(&entry.db_id)
-        .await
-    {
-        return CommandOutcome::Error(format!("Failed to unregister from index: {e}"));
-    }
+    ctx.server.memory_bank_index().unregister(&entry.db_id);
 
     CommandOutcome::Text(format!(
         "Deleted memory bank '{}' (DB {} preserved for archive). \
@@ -338,14 +316,14 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
+    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
-    use crate::db_registry::DbRegistry;
+    use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -391,9 +369,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let chazdb = registry.chazdb().clone();
-        let index = DbRegistry::agents(chazdb.clone());
-        let bank_index = DbRegistry::memory_banks(chazdb.clone());
+        let chaz_peer = registry.chaz_peer().clone();
+        let index = HostedIndex::empty("agent");
+        let bank_index = HostedIndex::empty("bank");
         let tools = Arc::new(crate::tool::ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = crate::security::SecurityContext {
@@ -414,7 +392,7 @@ mod tests {
             std::collections::HashMap::new(),
             Default::default(),
         );
-        let secrets = SecretStore::new(chazdb).await;
+        let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
@@ -469,7 +447,7 @@ mod tests {
             _ => panic!("expected Text"),
         }
 
-        let banks = server.memory_bank_index().list().await.unwrap();
+        let banks = server.memory_bank_index().list();
         assert_eq!(banks.len(), 1);
         assert_eq!(banks[0].display_name, "patrick");
     }
@@ -548,8 +526,6 @@ mod tests {
         let db_id = server
             .memory_bank_index()
             .find_by_name("patrick")
-            .await
-            .unwrap()
             .unwrap()
             .db_id;
 
@@ -559,14 +535,7 @@ mod tests {
         }
 
         // Index row gone.
-        assert!(
-            server
-                .memory_bank_index()
-                .find_by_name("patrick")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(server.memory_bank_index().find_by_name("patrick").is_none());
 
         // DB itself is still openable (archive preserved).
         assert!(registry.open_memory_bank(&db_id).await.unwrap().is_some());
@@ -612,20 +581,11 @@ mod tests {
             ctx,
         )
         .await;
-        let a_id = ctx
-            .server
-            .agent_index()
-            .find_by_name(agent)
-            .await
-            .unwrap()
-            .unwrap()
-            .db_id;
+        let a_id = ctx.server.agent_index().find_by_name(agent).unwrap().db_id;
         let b_id = ctx
             .server
             .memory_bank_index()
             .find_by_name(bank)
-            .await
-            .unwrap()
             .unwrap()
             .db_id;
         (a_id, b_id)

@@ -5,11 +5,11 @@
 
 use super::*;
 use crate::agent::AgentRegistry;
-use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
 use crate::config::{AgentConfig, Config};
-use crate::db_registry::{DbEntry, DbRegistry};
-use eidetica::Instance;
+use crate::hosted_index::{DbEntry, HostedIndex};
 use eidetica::backend::database::InMemory;
+use eidetica::Instance;
 use std::sync::Arc;
 
 /// Fresh in-memory peer with one database ready for SessionMeta round-trip
@@ -84,7 +84,7 @@ pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
 
 /// Registry with one declared agent `alpha` — routing tests can then resolve
 /// display_name → Agent via AgentRegistry.
-pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, DbRegistry)
+pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, HostedIndex)
 {
     let backend = InMemory::new();
     let instance = Instance::open(Box::new(backend)).await.unwrap();
@@ -99,12 +99,12 @@ pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRe
             .await
             .unwrap(),
     );
-    let index = DbRegistry::agents(registry.chazdb().clone());
+    let index = HostedIndex::empty("agent");
     (instance, registry, index)
 }
 
 /// Registry with two declared agents (alpha, beta).
-pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionRegistry>, DbRegistry)
+pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionRegistry>, HostedIndex)
 {
     let backend = InMemory::new();
     let instance = Instance::open(Box::new(backend)).await.unwrap();
@@ -119,7 +119,7 @@ pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionReg
             .await
             .unwrap(),
     );
-    let index = DbRegistry::agents(registry.chazdb().clone());
+    let index = HostedIndex::empty("agent");
     (instance, registry, index)
 }
 

@@ -56,7 +56,7 @@ Each Agent DB contains five well-known stores:
 | `history`      | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                |
 | `memory_banks` | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission) |
 
-The peer maintains two local indexes in its `chazdb` (the peer-local bookkeeping database): an `agents` DocStore for Living Agents and a `memory_banks` DocStore for standalone Memory Bank DBs. Both map `db_id → (display_name, pubkey)` and share the same `DbRegistry` type. Both exist because eidetica has no inverse "list DBs this key can access" query.
+The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — one for Living Agents and one for standalone Memory Bank DBs — built once at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker (`agent` / `bank` / `session`, written at creation time). Both indices map `db_id ↔ display_name ↔ pubkey`. They exist because eidetica has no inverse "list DBs this key can access" query, and routing reads them on every session entry. Mutations from `/agent new`, `/memory new`, `/agent delete`, etc. update the cache directly. There is no persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 
 ## Session participation
 
@@ -84,7 +84,7 @@ These aren't session-scoped; they act on the Living Agent itself.
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `role`/`model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`. |
 | `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                               |
-| `/agent hosted`                                     | List every Living Agent this peer hosts (from the local `agents` index).                                                                                                 |
+| `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                        |
 | `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                         |
 | `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                         |
 | `/agent import <ticket>`                            | Sync + register an agent DB from a share ticket. Requires this peer already hold a key on the DB (see `/pubkey` + `/agent invite`).                                      |
@@ -109,7 +109,7 @@ Mentions are case-insensitive and match exact display names. No prefix matching.
 
 A heartbeat rule is a cron-scheduled trigger stored inside the session. The `HeartbeatRunner` on every peer polls hosted sessions every 30s; rules targeting agents this peer hosts get fired. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
 
-`last_fired` is tracked peer-locally in the `chazdb`, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
+`last_fired` is tracked peer-locally in the `chaz_peer` DB's `heartbeat_last_fired` store, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
 
 ### `/heartbeat` commands
 
@@ -215,7 +215,7 @@ stateDiagram-v2
 
 Key invariants:
 
-- **Hosted** means this peer holds the per-agent private key — eidetica authorisation, not a config flag, is what decides. The local `agents` index in `chazdb` tracks which DBs that's true for.
+- **Hosted** means this peer holds the per-agent private key — eidetica authorisation, not a config flag, is what decides. The in-memory `agents` index (built from eidetica's tracked-DBs list at startup) reflects which DBs that's true for.
 - **Attached** means the agent's pubkey has `Permission::Write` on a specific session DB. A single agent can be attached to many sessions.
 - Every transition writes to an eidetica DB; there is no in-memory-only agent state that survives a restart.
 

@@ -37,7 +37,8 @@ config.rs            Config, Backend, AgentConfig, SecurityConfig
 types.rs             ConversationId
 agent.rs             Agent + AgentRegistry (runtime view; bridged to Agent DBs by display_name)
 agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memory_banks stores)
-db_registry.rs       Peer-local pubkey→DB index (agents + memory_banks DocStores in chazdb)
+db_kind.rs           meta.kind + display_name markers on entity DBs (agent/bank/session classification)
+hosted_index.rs      In-memory peer-local pubkey/name → DB index, built at startup from user.databases()
 memory_bank_db.rs    Standalone memory bank DBs (parallel to agent_db)
 heartbeat.rs         Per-session HeartbeatRule + HeartbeatRunner (30s poll)
 session.rs           SessionRegistry, Session, EntryType, SessionMeta, attach/detach, resolve_agent
@@ -60,7 +61,8 @@ defaults.rs          Built-in default config and roles
 ## Key Invariants
 
 - **AgentDb is the runtime source of truth.** YAML `agents:` is a first-boot template only; `bootstrap_from_config` does not overwrite existing AgentDb config. Use `/agent set` for live edits.
-- **The `chazdb` is peer-local and never syncs.** It holds indices and bookkeeping (`sessions`, `matrix_channels`, `session_names`, `agents`, `memory_banks`, `heartbeat_last_fired`, `schedules`, `secrets`). Sync-ful state lives in per-entity DBs.
+- **Two peer-local DBs, both never sync.** `chaz_group` holds group-level routing/metadata (`sessions`, `matrix_channels`, `session_names`); `chaz_peer` holds peer-runtime state (`credentials`, `heartbeat_last_fired`, `schedule_state`). Sync-ful state lives in per-entity DBs.
+- **Hosted-agent / hosted-bank lookups are in-memory only.** `hosted_index::HostedIndex` is built at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker. No persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 - **Authorization = key possession.** Session participation is gated by AuthSettings on the session DB; memory bank access is gated by AuthSettings on the bank DB. No capability flags.
 - **Per-session serialization.** Concurrent writes to the same session while an agent is running are skipped (prevents duplicate responses).
 - **Tool capability data flows via `ctx.grants()`** at execute time, not via tool constructor args. New capabilities go in `grants.rs`.

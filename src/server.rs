@@ -17,8 +17,8 @@ use crate::agent::AgentRegistry;
 use crate::backends::BackendManager;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
-use crate::db_registry::DbRegistry;
 use crate::gateway::ApprovalExchange;
+use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
@@ -27,7 +27,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.
@@ -63,8 +63,8 @@ struct SpawnContext {
 pub struct Server {
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
-    agent_index: DbRegistry,
-    memory_bank_index: DbRegistry,
+    agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -86,8 +86,8 @@ impl Server {
     pub fn new(
         registry: Arc<SessionRegistry>,
         agents: Arc<AgentRegistry>,
-        agent_index: DbRegistry,
-        memory_bank_index: DbRegistry,
+        agent_index: HostedIndex,
+        memory_bank_index: HostedIndex,
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
@@ -126,11 +126,11 @@ impl Server {
         server
     }
 
-    pub fn agent_index(&self) -> &DbRegistry {
+    pub fn agent_index(&self) -> &HostedIndex {
         &self.agent_index
     }
 
-    pub fn memory_bank_index(&self) -> &DbRegistry {
+    pub fn memory_bank_index(&self) -> &HostedIndex {
         &self.memory_bank_index
     }
 
@@ -143,7 +143,7 @@ impl Server {
     /// so subsequent `can_spawn` / `default_agent` / legacy lookups see the
     /// refreshed config too.
     pub async fn hydrate_agent_from_db(&self, agent: crate::agent::Agent) -> crate::agent::Agent {
-        let Ok(Some(entry)) = self.agent_index.find_by_name(&agent.name).await else {
+        let Some(entry) = self.agent_index.find_by_name(&agent.name) else {
             return agent;
         };
         let Ok(Some(db)) = self.registry.open_agent_db(&entry.db_id).await else {
@@ -622,11 +622,11 @@ impl Server {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
     use crate::config::Config;
-    use crate::db_registry::DbEntry;
-    use eidetica::Instance;
+    use crate::hosted_index::DbEntry;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
 
     fn blank_config() -> Config {
         Config {
@@ -664,8 +664,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let index = DbRegistry::agents(registry.chazdb().clone());
-        let bank_index = DbRegistry::memory_banks(registry.chazdb().clone());
+        let index = HostedIndex::empty("agent");
+        let bank_index = HostedIndex::empty("bank");
         let tools = Arc::new(ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = SecurityContext {
@@ -712,15 +712,11 @@ mod tests {
             .await
             .unwrap()
         };
-        server
-            .agent_index()
-            .register(DbEntry {
-                db_id: db.id(),
-                display_name: "alpha".to_string(),
-                pubkey,
-            })
-            .await
-            .unwrap();
+        server.agent_index().register(DbEntry {
+            db_id: db.id(),
+            display_name: "alpha".to_string(),
+            pubkey,
+        });
 
         // Seed the in-memory registry with a stale entry (model="opus", iter=999)
         // — exactly what would happen if yaml drifted from DB, or if a prior

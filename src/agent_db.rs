@@ -26,12 +26,12 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
 use crate::grants::Grants;
 use chrono::{DateTime, Utc};
-use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
 use eidetica::user::User;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
@@ -312,6 +312,12 @@ pub async fn create_agent_db(
     agent_db.ensure_stores().await?;
     agent_db.write_config(agent_cfg).await?;
     agent_db.write_meta(meta).await?;
+    crate::db_kind::write_marker(
+        agent_db.database(),
+        crate::db_kind::KIND_AGENT,
+        display_name,
+    )
+    .await?;
     Ok((agent_db, key))
 }
 
@@ -404,8 +410,8 @@ pub async fn bootstrap_from_config(
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config};
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
 
     /// Test-only fixture: build a fresh in-memory `Instance` and return a
     /// logged-in `User` session against it. Each test gets an isolated peer.

@@ -6,7 +6,7 @@
 //! - `entries` (Table<SessionEntry>) — message/directive/tool-call history
 //! - `meta`    (DocStore)            — session configuration (name, agent, model, ...)
 //!
-//! The registry (inside the `chazdb`) holds only indices: `sessions`,
+//! The registry (inside `chaz_group`) holds only indices: `sessions`,
 //! `matrix_channels`, `session_names`. Canonical per-session config lives
 //! in each session's own DB (`SessionMeta`) so it syncs with the session.
 //!
@@ -19,8 +19,8 @@
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::Database;
 use eidetica::store::{DocStore, Table};
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 

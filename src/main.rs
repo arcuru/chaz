@@ -4,12 +4,13 @@ mod backends;
 mod commands;
 mod config;
 mod context;
-mod db_registry;
+mod db_kind;
 mod defaults;
 mod error;
 mod gateway;
 mod grants;
 mod heartbeat;
+mod hosted_index;
 mod mcp;
 mod memory_bank_db;
 mod openai;
@@ -126,44 +127,41 @@ async fn main() -> anyhow::Result<()> {
         "Agent registry initialized"
     );
 
-    // Stage 1 of Living Agents: materialize an eidetica DB per yaml-declared
-    // agent. Idempotent on re-runs. Routing still uses the in-memory
-    // AgentRegistry; Stage 3 switches that to key-possession checks.
-    let mut agent_dbs = agent_db::bootstrap_from_config(&mut user, &config).await?;
-    if !agent_dbs.is_empty() {
+    // Materialize an eidetica DB per yaml-declared agent. Idempotent on
+    // re-runs (yaml is a first-boot template; AgentDb is the source of
+    // truth afterwards).
+    let bootstrapped = agent_db::bootstrap_from_config(&mut user, &config).await?;
+    if !bootstrapped.is_empty() {
         info!(
-            count = agent_dbs.len(),
+            count = bootstrapped.len(),
             "Agent DBs bootstrapped from config"
         );
     }
 
-    // Every AgentRegistry entry needs an AgentDb for Stage 7 per-agent memory
-    // to resolve. The default `chaz` agent (when no yaml `agents:` block) has
-    // no bootstrap entry — fill it in here.
+    // Every AgentRegistry entry needs an AgentDb so per-agent memory tools
+    // resolve. The default `chaz` agent (when no yaml `agents:` block) has
+    // no bootstrap entry — ensure one exists.
     for name in agent_registry.names() {
-        if let std::collections::hash_map::Entry::Vacant(slot) = agent_dbs.entry(name.clone()) {
+        if !bootstrapped.contains_key(&name) {
             let bs = agent_db::ensure_agent_db(&mut user, &name).await?;
             info!(agent = %name, db_id = %bs.db.id(), "Created default Agent DB");
-            slot.insert(bs);
         }
     }
 
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
-    let chazdb = registry.chazdb().clone();
+    let chaz_peer = registry.chaz_peer().clone();
 
-    // Stage 2 of Living Agents: maintain a local index of which Agent DBs
-    // this peer hosts. Needed for O(1) routing in Stage 3 (eidetica has no
-    // inverse "DBs where key K has permission P" query).
-    let agent_index_store = db_registry::DbRegistry::agents(chazdb.clone());
-    agent_index_store.sync_from_bootstrap(&agent_dbs).await?;
+    // Stage 3 of the Database Layout Refactor: build the peer-local Agent
+    // and Memory Bank indices in-memory by walking eidetica's tracked-DBs
+    // list. `meta.kind` (Stage 4) classifies each entry. `/agent new`,
+    // `/memory new`, `/agent delete`, etc. mutate these caches at runtime.
+    let (agent_index_store, memory_bank_index_store) = {
+        let user = registry.user_lock().await;
+        hosted_index::build_from_user(&user).await?
+    };
 
-    // Memory Banks Stage 9.D: peer-local index of bank DBs this peer hosts,
-    // same shape as the agent index. Populated by `/memory new` + `/memory
-    // import` — nothing populates it at startup yet.
-    let memory_bank_index_store = db_registry::DbRegistry::memory_banks(chazdb.clone());
-
-    // Build secret store backed by the chazdb.
-    let secret_store = security::SecretStore::new(chazdb.clone()).await;
+    // Build secret store backed by the chaz_peer DB.
+    let secret_store = security::SecretStore::new(chaz_peer.clone()).await;
     if let Some(backends) = &mut config.backends {
         for backend in backends.iter_mut() {
             if let Some(raw_key) = backend.api_key.take() {
@@ -329,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
                     schedules,
                     server.clone(),
                     backends::BackendManager::new(&config.backends, secret_store.clone()),
-                    chazdb.clone(),
+                    chaz_peer.clone(),
                 )
                 .await,
             );
@@ -344,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the heartbeat runner. Polls every 30s across all hosted sessions
     // for due rules whose target agent this peer hosts.
-    let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chazdb);
+    let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chaz_peer);
     heartbeat_runner.start();
 
     // Run the selected gateway

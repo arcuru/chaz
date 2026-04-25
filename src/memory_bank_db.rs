@@ -19,12 +19,12 @@
 #![allow(dead_code)]
 
 use crate::agent_db::MemoryEntry;
-use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
 use eidetica::user::User;
+use eidetica::Database;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -134,6 +134,7 @@ pub async fn create_memory_bank(
     let bank = MemoryBankDb::from_database(database);
     bank.ensure_stores().await?;
     bank.write_meta(meta).await?;
+    crate::db_kind::write_marker(bank.database(), crate::db_kind::KIND_BANK, display_name).await?;
     Ok((bank, key))
 }
 
@@ -154,8 +155,8 @@ pub async fn find_memory_bank(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
 
     async fn test_user() -> User {
         let backend = InMemory::new();

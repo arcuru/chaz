@@ -123,11 +123,7 @@ impl Tool for SpawnAgent {
             // Resolve the agent ref against the agent index.
             // Try as display name first (most common), then as DB ID.
             let index = server.agent_index();
-            let index_entry = match index
-                .find_by_name(agent_ref)
-                .await
-                .map_err(|e| format!("Agent index lookup failed: {e}"))?
-            {
+            let index_entry = match index.find_by_name(agent_ref) {
                 Some(e) => e,
                 None => {
                     let id = ID::parse(agent_ref).map_err(|_| {
@@ -135,8 +131,6 @@ impl Tool for SpawnAgent {
                     })?;
                     index
                         .find_by_id(&id)
-                        .await
-                        .map_err(|e| format!("Agent index lookup failed: {e}"))?
                         .ok_or_else(|| format!("Unknown agent: '{agent_ref}'"))?
                 }
             };

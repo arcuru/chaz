@@ -15,8 +15,8 @@
 //! remove_rule, list_rules}`), so they sync and survive restarts. `HeartbeatRunner`
 //! picks them up on its next tick.
 
-use crate::db_registry::{DbEntry, DbRegistry};
-use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
+use crate::heartbeat::{list_rules, remove_rule, upsert_rule, HeartbeatRule};
+use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use cron::Schedule;
 use serde_json::Value;
@@ -27,25 +27,17 @@ use std::str::FromStr;
 /// Resolve an agent reference to a `DbEntry`. `None` = the running agent.
 /// Matches the resolution order used by `/agent` commands: display name first,
 /// then DB id.
-async fn resolve_target_agent(
+fn resolve_target_agent(
     ctx: &ToolContext,
-    index: &DbRegistry,
+    index: &HostedIndex,
     agent_ref: Option<&str>,
 ) -> Result<DbEntry, String> {
     let name = agent_ref.unwrap_or(ctx.agent_name.as_str());
-    if let Some(entry) = index
-        .find_by_name(name)
-        .await
-        .map_err(|e| format!("Agent lookup failed: {e}"))?
-    {
+    if let Some(entry) = index.find_by_name(name) {
         return Ok(entry);
     }
     if let Ok(id) = eidetica::entry::ID::parse(name) {
-        if let Some(entry) = index
-            .find_by_id(&id)
-            .await
-            .map_err(|e| format!("Agent lookup failed: {e}"))?
-        {
+        if let Some(entry) = index.find_by_id(&id) {
             return Ok(entry);
         }
     }
@@ -81,11 +73,11 @@ fn validate_cron(expr: &str) -> Result<(), String> {
 
 /// Schedule a recurring directive on the current session.
 pub struct HeartbeatAdd {
-    agent_index: DbRegistry,
+    agent_index: HostedIndex,
 }
 
 impl HeartbeatAdd {
-    pub fn new(agent_index: DbRegistry) -> Self {
+    pub fn new(agent_index: HostedIndex) -> Self {
         Self { agent_index }
     }
 }
@@ -126,7 +118,7 @@ impl Tool for HeartbeatAdd {
             validate_cron(cron)?;
 
             let target =
-                resolve_target_agent(ctx, &self.agent_index, opt_str(&arguments, "agent")).await?;
+                resolve_target_agent(ctx, &self.agent_index, opt_str(&arguments, "agent"))?;
 
             let session = ctx.session.lock().await;
             let db = session.database();
@@ -167,11 +159,11 @@ impl Tool for HeartbeatAdd {
 
 /// Partial update of an existing heartbeat rule.
 pub struct HeartbeatModify {
-    agent_index: DbRegistry,
+    agent_index: HostedIndex,
 }
 
 impl HeartbeatModify {
-    pub fn new(agent_index: DbRegistry) -> Self {
+    pub fn new(agent_index: HostedIndex) -> Self {
         Self { agent_index }
     }
 }
@@ -243,7 +235,7 @@ impl Tool for HeartbeatModify {
                 rule.task = t.to_string();
             }
             let target_display = if let Some(a) = new_agent {
-                let target = resolve_target_agent(ctx, &self.agent_index, Some(a)).await?;
+                let target = resolve_target_agent(ctx, &self.agent_index, Some(a))?;
                 rule.target_agent_db_id = target.db_id.to_string();
                 Some(target.display_name)
             } else {
@@ -328,11 +320,11 @@ impl Tool for HeartbeatRemove {
 /// List heartbeat rules on the current session. Resolves target agent DB ids to
 /// display names where possible.
 pub struct HeartbeatList {
-    agent_index: DbRegistry,
+    agent_index: HostedIndex,
 }
 
 impl HeartbeatList {
-    pub fn new(agent_index: DbRegistry) -> Self {
+    pub fn new(agent_index: HostedIndex) -> Self {
         Self { agent_index }
     }
 }
@@ -373,9 +365,6 @@ impl Tool for HeartbeatList {
                     Ok(id) => self
                         .agent_index
                         .find_by_id(&id)
-                        .await
-                        .ok()
-                        .flatten()
                         .map(|e| e.display_name)
                         .unwrap_or_else(|| r.target_agent_db_id.clone()),
                     Err(_) => r.target_agent_db_id.clone(),
@@ -395,13 +384,13 @@ impl Tool for HeartbeatList {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
-    use crate::db_registry::{DbEntry, DbRegistry};
+    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::hosted_index::{DbEntry, HostedIndex};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -412,7 +401,7 @@ mod tests {
     ) -> (
         Instance,
         Arc<SessionRegistry>,
-        DbRegistry,
+        HostedIndex,
         Arc<TokioMutex<Session>>,
     ) {
         let backend = InMemory::new();
@@ -425,8 +414,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let chazdb = registry.chazdb().clone();
-        let index = DbRegistry::agents(chazdb);
+        let index = HostedIndex::empty("agent");
 
         let (agent_db, pubkey) = {
             let mut user = registry.user_for_tests().await;
@@ -442,14 +430,11 @@ mod tests {
             .await
             .unwrap()
         };
-        index
-            .register(DbEntry {
-                db_id: agent_db.id(),
-                display_name: agent_name.to_string(),
-                pubkey,
-            })
-            .await
-            .unwrap();
+        index.register(DbEntry {
+            db_id: agent_db.id(),
+            display_name: agent_name.to_string(),
+            pubkey,
+        });
 
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session = Arc::new(TokioMutex::new(

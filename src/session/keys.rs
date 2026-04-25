@@ -101,6 +101,15 @@ impl SessionRegistry {
         self.user.lock().await
     }
 
+    /// Lock the internal user mutex and return a guard. Used by
+    /// `hosted_index::build_from_user` at startup to walk
+    /// `User::databases()`. Outside that path, prefer the more focused
+    /// helpers (`open_agent_db`, `find_key_for_db`, etc.) so the lock scope
+    /// stays narrow and well-known.
+    pub async fn user_lock(&self) -> tokio::sync::MutexGuard<'_, eidetica::user::User> {
+        self.user.lock().await
+    }
+
     /// Look up the first pubkey this peer holds for a database. Thin wrapper
     /// around `User::find_key` so callers don't need direct access to the
     /// user mutex.

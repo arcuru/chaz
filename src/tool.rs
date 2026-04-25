@@ -628,11 +628,9 @@ mod tests {
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.description, "Execute a shell command.");
         // Parameter description should be stripped
-        assert!(
-            result.parameters["properties"]["cmd"]
-                .get("description")
-                .is_none()
-        );
+        assert!(result.parameters["properties"]["cmd"]
+            .get("description")
+            .is_none());
         // But type should remain
         assert_eq!(result.parameters["properties"]["cmd"]["type"], "string");
     }
@@ -651,12 +649,10 @@ mod tests {
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.name, "shell");
         assert!(result.description.is_empty());
-        assert!(
-            result.parameters["properties"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(result.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

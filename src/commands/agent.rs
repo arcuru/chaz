@@ -19,13 +19,13 @@ use super::{CoOwnerPermission, CommandContext, CommandOutcome};
 pub(super) async fn resolve_agent_ref(
     agent_ref: &str,
     ctx: &CommandContext<'_>,
-) -> Result<crate::db_registry::DbEntry, String> {
+) -> Result<crate::hosted_index::DbEntry, String> {
     let index = ctx.server.agent_index();
-    if let Ok(Some(entry)) = index.find_by_name(agent_ref).await {
+    if let Some(entry) = index.find_by_name(agent_ref) {
         return Ok(entry);
     }
     if let Ok(id) = eidetica::entry::ID::parse(agent_ref) {
-        if let Ok(Some(entry)) = index.find_by_id(&id).await {
+        if let Some(entry) = index.find_by_id(&id) {
             return Ok(entry);
         }
     }
@@ -251,20 +251,13 @@ pub(super) async fn agent_new(
     let db_id = agent_db.id();
 
     // Register in the peer-local agent index.
-    if let Err(e) = ctx
-        .server
+    ctx.server
         .agent_index()
-        .register(crate::db_registry::DbEntry {
+        .register(crate::hosted_index::DbEntry {
             db_id: db_id.clone(),
             display_name: name.to_string(),
             pubkey: pubkey.clone(),
-        })
-        .await
-    {
-        return CommandOutcome::Error(format!(
-            "Agent DB created but index registration failed: {e}"
-        ));
-    }
+        });
 
     // Build a runtime Agent so the AgentRegistry can resolve it — makes the
     // agent spawnable + attachable by display name for the rest of this session.
@@ -360,18 +353,13 @@ pub(super) async fn agent_import(ticket_str: &str, ctx: &CommandContext<'_>) -> 
             ),
         };
 
-    if let Err(e) = ctx
-        .server
+    ctx.server
         .agent_index()
-        .register(crate::db_registry::DbEntry {
+        .register(crate::hosted_index::DbEntry {
             db_id: db_id.clone(),
             display_name: display_name.clone(),
             pubkey,
-        })
-        .await
-    {
-        return CommandOutcome::Error(format!("Index registration failed: {e}"));
-    }
+        });
 
     // Upsert into the runtime registry so re-importing a previously-seen
     // agent refreshes its config from the synced DB (model/tools/role may
@@ -388,10 +376,7 @@ pub(super) async fn agent_import(ticket_str: &str, ctx: &CommandContext<'_>) -> 
 }
 
 pub(super) async fn agent_hosted(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let entries = match ctx.server.agent_index().list().await {
-        Ok(e) => e,
-        Err(e) => return CommandOutcome::Error(format!("Failed to list hosted agents: {e}")),
-    };
+    let entries = ctx.server.agent_index().list();
     if entries.is_empty() {
         return CommandOutcome::Text("No Living Agents hosted on this peer.".to_string());
     }
@@ -432,9 +417,7 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
         }
     }
 
-    if let Err(e) = ctx.server.agent_index().unregister(&entry.db_id).await {
-        return CommandOutcome::Error(format!("Failed to unregister from index: {e}"));
-    }
+    ctx.server.agent_index().unregister(&entry.db_id);
     ctx.server.agents().unregister(&entry.display_name);
 
     // Also drop peer-local heartbeat rules targeting this agent across every
@@ -631,15 +614,15 @@ pub(super) async fn agent_revoke_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
+    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
     use crate::agent::AgentRegistry;
     use crate::agent_db::find_agent_db;
     use crate::backends::BackendManager;
-    use crate::db_registry::DbRegistry;
+    use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -688,9 +671,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let chazdb = registry.chazdb().clone();
-        let index = DbRegistry::agents(chazdb.clone());
-        let bank_index = DbRegistry::memory_banks(chazdb.clone());
+        let chaz_peer = registry.chaz_peer().clone();
+        let index = HostedIndex::empty("agent");
+        let bank_index = HostedIndex::empty("bank");
         let tools = Arc::new(crate::tool::ToolRegistry::new());
         let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
         let security = crate::security::SecurityContext {
@@ -711,7 +694,7 @@ mod tests {
             std::collections::HashMap::new(),
             Default::default(),
         );
-        let secrets = SecretStore::new(chazdb).await;
+        let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
@@ -854,14 +837,7 @@ mod tests {
         // Gone from runtime registry.
         assert!(server.agents().get("alpha").is_none());
         // Gone from agents index.
-        assert!(
-            server
-                .agent_index()
-                .find_by_name("alpha")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(server.agent_index().find_by_name("alpha").is_none());
         // But the DB is still present (preserved for archive).
         let user = registry.user_for_tests().await;
         assert!(find_agent_db(&user, "alpha").await.is_some());
@@ -1124,12 +1100,7 @@ mod tests {
             _ => panic!("expected Text"),
         }
 
-        let entry = server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .unwrap();
+        let entry = server.agent_index().find_by_name("alpha").unwrap();
         let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
         let auth = agent_db
             .database()
@@ -1168,12 +1139,7 @@ mod tests {
             &ctx,
         )
         .await;
-        let entry = server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .unwrap();
+        let entry = server.agent_index().find_by_name("alpha").unwrap();
         let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
         let auth = agent_db
             .database()
@@ -1211,12 +1177,7 @@ mod tests {
             &ctx,
         )
         .await;
-        let entry = server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .unwrap();
+        let entry = server.agent_index().find_by_name("alpha").unwrap();
         let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
         let auth = agent_db
             .database()
@@ -1241,13 +1202,7 @@ mod tests {
             &ctx,
         )
         .await;
-        let own_pk = server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .unwrap()
-            .pubkey;
+        let own_pk = server.agent_index().find_by_name("alpha").unwrap().pubkey;
         match dispatch(
             Command::AgentInvite {
                 agent_ref: "alpha".to_string(),
@@ -1346,12 +1301,7 @@ mod tests {
             _ => panic!("expected Text"),
         }
 
-        let entry = server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .unwrap();
+        let entry = server.agent_index().find_by_name("alpha").unwrap();
         let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
         let auth_after = agent_db
             .database()
@@ -1379,13 +1329,7 @@ mod tests {
             &ctx,
         )
         .await;
-        let own_pk = server
-            .agent_index()
-            .find_by_name("alpha")
-            .await
-            .unwrap()
-            .unwrap()
-            .pubkey;
+        let own_pk = server.agent_index().find_by_name("alpha").unwrap().pubkey;
         match dispatch(
             Command::AgentRevokePeer {
                 agent_ref: "alpha".to_string(),

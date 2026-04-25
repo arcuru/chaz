@@ -5,14 +5,14 @@
 use crate::agent::AgentRegistry;
 use crate::types::ConversationId;
 
-use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
 use eidetica::store::DocStore;
+use eidetica::Database;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use super::{SessionIndex, find_or_create_db, read_meta_from_db, update_meta_on_db};
+use super::{find_or_create_db, read_meta_from_db, update_meta_on_db, SessionIndex};
 
 /// Notification emitted when a new session is indexed in the registry.
 #[derive(Debug, Clone)]
@@ -21,26 +21,30 @@ pub struct NewSessionEvent {
     pub source: Option<String>,
 }
 
-/// Registry over the `chazdb` — the peer-local bookkeeping database for one
-/// instance of the chaz agent framework. Canonical session config lives in
-/// each session's own DB (see [`super::SessionMeta`]); the chazdb holds only
-/// indices and other peer-local state that never syncs.
+/// Registry over chaz's two peer-local bookkeeping databases. Neither syncs;
+/// canonical sync-ful state lives in per-session, per-agent, and per-bank DBs.
 ///
-/// Stores inside the chazdb:
+/// `chaz_group` — group-level routing/metadata. Stores:
 /// - `sessions`        (DocStore)  — `session_db_id` → `source` (origin tag)
 /// - `matrix_channels` (DocStore)  — `room_id` → `session_db_id`
 /// - `session_names`   (DocStore)  — `name` → `session_db_id`
-/// - `agents`          (DocStore)  — hosted Agent DBs (see `db_registry`)
-/// - `memory_banks`    (DocStore)  — hosted Memory Bank DBs (see `db_registry`)
-/// - `heartbeat_last_fired` (DocStore) — peer-local rule timestamps
-/// - `schedules`       (Table)     — scheduler last_run state
-/// - `secrets`         (DocStore)  — backend API keys, host-injected
+///
+/// Hosted-agent and hosted-bank lookups live in the in-memory
+/// [`crate::hosted_index::HostedIndex`] caches built at startup from
+/// eidetica's `user.databases()` — not in this DB.
+///
+/// `chaz_peer` — peer-runtime state. Tied to this binary on this machine.
+/// - `credentials`         (DocStore)  — backend API keys, host-injected
+/// - `heartbeat_last_fired`(DocStore)  — peer-local rule timestamps
+/// - `schedule_state`      (Table)     — scheduler last_run state
 pub struct SessionRegistry {
     pub(super) instance: eidetica::Instance,
     /// User for creating new session databases (behind Mutex since create_database needs &mut)
     pub(super) user: Arc<Mutex<eidetica::user::User>>,
-    /// The single peer-local bookkeeping database for this chaz instance.
-    pub(super) chazdb: Database,
+    /// Group-level routing/metadata DB for this chaz instance.
+    pub(super) chaz_group: Database,
+    /// Peer-runtime state DB (credentials, cron timestamps, schedule state).
+    pub(super) chaz_peer: Database,
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
@@ -56,14 +60,15 @@ impl SessionRegistry {
         mut user: eidetica::user::User,
         agents: Arc<AgentRegistry>,
     ) -> anyhow::Result<Self> {
-        let chazdb = find_or_create_db(&mut user, "chazdb").await?;
+        let chaz_group = find_or_create_db(&mut user, "chaz_group").await?;
+        let chaz_peer = find_or_create_db(&mut user, "chaz_peer").await?;
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
 
-        // Watch the chazdb for writes (including remote sync).
+        // Watch the chaz_group for writes (including remote sync).
         // On each write, re-scan the sessions index and fire events for each known session.
         // Consumers dedupe via their own `seen` set.
         let sync_tx = new_session_tx.clone();
-        chazdb.on_local_write(move |_entry, db, _instance| {
+        chaz_group.on_local_write(move |_entry, db, _instance| {
             let sync_tx = sync_tx.clone();
             let db = db.clone();
             Box::pin(async move {
@@ -87,7 +92,8 @@ impl SessionRegistry {
         Ok(Self {
             instance,
             user: Arc::new(Mutex::new(user)),
-            chazdb,
+            chaz_group,
+            chaz_peer,
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
@@ -99,11 +105,17 @@ impl SessionRegistry {
         self.new_session_rx.lock().await.take()
     }
 
-    /// The peer-local bookkeeping database for this chaz instance. Holds
-    /// every index, hosted-DB list, schedule state, and secret. Nothing here
-    /// syncs — sync-ful state lives in per-session / per-agent / per-bank DBs.
-    pub fn chazdb(&self) -> &Database {
-        &self.chazdb
+    /// Group-level routing/metadata DB. Holds session/channel/name indices
+    /// and the hosted-Agent / hosted-MemoryBank lists. Never syncs.
+    pub fn chaz_group(&self) -> &Database {
+        &self.chaz_group
+    }
+
+    /// Peer-runtime state DB. Holds credentials, heartbeat last-fired
+    /// timestamps, and scheduler last-run state. Never syncs — this is
+    /// inherently this-binary-on-this-machine state.
+    pub fn chaz_peer(&self) -> &Database {
+        &self.chaz_peer
     }
 
     pub fn instance(&self) -> &eidetica::Instance {
@@ -133,9 +145,12 @@ impl SessionRegistry {
         let session_db_id = db.root_id().to_string();
         let conv_id = ConversationId(session_db_id.clone());
 
+        crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source.unwrap_or("new"))
+            .await?;
+
         // Add to sessions index
         {
-            let txn = self.chazdb.new_transaction().await?;
+            let txn = self.chaz_group.new_transaction().await?;
             let store = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
             store
                 .set_string(&session_db_id, source.unwrap_or(""))
@@ -228,7 +243,7 @@ impl SessionRegistry {
 
     /// List every session known to the registry.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionIndex>> {
-        let txn = self.chazdb.new_transaction().await?;
+        let txn = self.chaz_group.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         let doc = store.get_all().await?;
         Ok(doc
@@ -265,7 +280,7 @@ impl SessionRegistry {
     // -------------------------------------------------------------------------
 
     pub async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
-        let txn = self.chazdb.new_transaction().await?;
+        let txn = self.chaz_group.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
         Ok(store.get_string(name).await.ok())
     }
@@ -274,7 +289,7 @@ impl SessionRegistry {
     /// by a different session.
     pub async fn set_session_name(&self, session_db_id: &str, name: String) -> anyhow::Result<()> {
         {
-            let txn = self.chazdb.new_transaction().await?;
+            let txn = self.chaz_group.new_transaction().await?;
             let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
             if let Ok(existing) = store.get_string(&name).await {
                 if existing != session_db_id {
@@ -297,7 +312,7 @@ impl SessionRegistry {
         let (_conv_id, db) = self.open_session(session_db_id).await?;
         let current = read_meta_from_db(&db).await;
         if let Some(name) = current.name.as_deref() {
-            let txn = self.chazdb.new_transaction().await?;
+            let txn = self.chaz_group.new_transaction().await?;
             let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
             let _ = store.delete(name).await;
             txn.commit().await?;

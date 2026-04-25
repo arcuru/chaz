@@ -25,7 +25,7 @@ graph LR
 
 ## Why It Looks This Way
 
-Earlier iterations had a `MemoryGrant` capability flag and a `global_memory` store in the peer-local `chazdb`. All of that was removed. The current model is **authorisation by key possession**: an agent can read or write a bank iff eidetica's `AuthSettings` on that bank's DB says so. There is no app-level permission flag to forget to check — opening the DB with the wrong key just fails.
+Earlier iterations had a `MemoryGrant` capability flag and a `global_memory` store in the peer-local group DB. All of that was removed. The current model is **authorisation by key possession**: an agent can read or write a bank iff eidetica's `AuthSettings` on that bank's DB says so. There is no app-level permission flag to forget to check — opening the DB with the wrong key just fails.
 
 Two consequences worth noticing:
 
@@ -184,7 +184,7 @@ If you find references in old notes or issues to any of these, they're gone:
 - `MemoryGrant` capability type in `security.tool_policies`
 - `global_remember` / `global_recall` tools
 - `Grants.memory` field on agents
-- `global_memory` store in `chazdb`
+- `global_memory` store in the peer-local group DB
 
 All of it was replaced by key-possession on bank DBs.
 

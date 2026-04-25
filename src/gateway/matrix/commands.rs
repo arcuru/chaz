@@ -8,18 +8,18 @@
 use crate::backends::{BackendManager, ChatContext, Message, MessageRole};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{RoleDetails, get_role};
+use crate::role::{get_role, RoleDetails};
 use crate::security::SecretStore;
 use crate::session::{SessionMeta, SessionRegistry};
 
 use headjack::*;
 use matrix_sdk::{
-    Room, RoomMemberships,
     room::MessagesOptions,
     ruma::{
-        OwnedUserId,
         events::room::message::{MessageType, RoomMessageEventContent},
+        OwnedUserId,
     },
+    Room, RoomMemberships,
 };
 use regex::Regex;
 use std::collections::HashMap;

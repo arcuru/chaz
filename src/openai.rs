@@ -5,7 +5,7 @@
 //! extensions like DeepSeek's `reasoning_content` round-trip without the
 //! crate's strict types dropping unknown fields.
 
-use async_openai::{Client, config::OpenAIConfig};
+use async_openai::{config::OpenAIConfig, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
