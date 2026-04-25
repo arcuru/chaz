@@ -23,11 +23,12 @@ graph TD
     end
 
     subgraph Storage
-        EI[(eidetica<br/>per-session DBs)]
-        REG[(Registry DB<br/>index stores)]
-        CEN[(Central DB<br/>secrets, indexes)]
-        LA[(Living Agent DBs<br/>config, memory, meta)]
+        EI[(Per-session DBs<br/>entries + meta)]
+        LA[(Living Agent DBs<br/>config, memory, meta, history)]
         MB[(Memory Bank DBs<br/>shared memory)]
+        CG[(chaz_group DB<br/>peer-local: sessions,<br/>matrix_channels, session_names)]
+        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>heartbeat_last_fired, schedule_state)]
+        HI[HostedIndex<br/>in-memory cache<br/>built from user.databases]
     end
 
     MG -->|write SessionEntry| EI
@@ -40,9 +41,14 @@ graph TD
     EI -->|callback| MG
     EI -->|callback| TG
     SV --> SR
-    SR --> REG
-    TS --> CEN
+    SR --> CG
+    TS --> CP
+    SV --> HI
+    HI -.->|classify by meta.kind| LA
+    HI -.->|classify by meta.kind| MB
 ```
+
+**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds session/channel/name indices; `chaz_peer` holds credentials and cron/schedule state. Sync-ful state lives in per-session, per-agent, and per-bank DBs.
 
 ## Key Components
 
@@ -103,43 +109,68 @@ See [Tool System](tools.md) for details.
 
 ```text
 src/
-  main.rs          CLI, config, eidetica init, tool registration, gateway dispatch
-  config.rs        Config types (backends, agents, security)
-  types.rs         ConversationId
-  agent.rs         Agent definitions, AgentRegistry, spawn permissions
-  session.rs       SessionEntry, EntryType, Session, SessionRegistry
-  server.rs        Callback-driven server, agent task spawning
-  runtime.rs       ReAct loop, RuntimeEvent, approval gates
-  context.rs       ContextBuilder — token-budgeted context assembly (tiktoken)
-  tool.rs          Tool trait, ToolPolicy, ToolRegistry, ScopedTools, RateLimiter
-  mcp.rs           MCP subprocess server management, auto-restart, tool discovery
-  scheduler.rs     Cron-driven scheduled task execution
-  backends.rs      LLMBackend trait, BackendManager, ChatContext
-  openai.rs        OpenAI-compatible backend implementation
-  role.rs          Role/system prompt management
-  defaults.rs      Built-in default config and roles
-  tools/
-    agent.rs       spawn_agent (routes through server)
-    shell.rs       shell execution with allowlist/denylist
-    file.rs        read_file, write_file
-    web.rs         web_fetch with network policy
-    search.rs      web_search (tavily/brave/serper + DuckDuckGo HTML fallback)
-    memory.rs      remember, recall (optional `bank` arg for shared banks), list_memory_banks
-    compact.rs     compact — write Summary entry for context compaction
-    describe.rs    describe_tool — on-demand tool discovery
-    time.rs        get_time
-    calculate.rs   calculate (meval)
-  security/
-    mod.rs         SecurityContext
-    secrets.rs     SecretStore (eidetica-backed)
-    leak_detector.rs  12-pattern secret scanner
-    network.rs     Endpoint allowlisting, SSRF protection
-    sanitizer.rs   Prompt injection detection
-  gateway/
-    mod.rs         Gateway trait, ApprovalExchange
-    tui.rs         TUI with session picker, debug mode, sync
-    matrix/
-      mod.rs       MatrixGateway lifecycle
-      commands.rs  Matrix-specific commands
-      history.rs   Room history backfill
+  main.rs              CLI, config, eidetica init, tool registration, gateway dispatch
+  config.rs            Config types (backends, agents, security)
+  types.rs             ConversationId
+  agent.rs             Agent definitions, AgentRegistry, spawn permissions
+  agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memory_banks stores)
+  memory_bank_db.rs    Standalone Memory Bank DBs (parallel to agent_db)
+  db_kind.rs           meta.kind + display_name markers on entity DBs
+  hosted_index.rs      In-memory peer-local pubkey/name → DB cache, built from user.databases()
+  heartbeat.rs         HeartbeatRule + HeartbeatRunner (30s poll over hosted sessions)
+  scheduler.rs         Cron-driven scheduled task execution
+  server.rs            Callback-driven server, agent task spawning
+  runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning
+  context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)
+  tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError
+  grants.rs            Typed capability grants (shell/network/fs)
+  error.rs             Error + LlmError (retryable/permanent classification)
+  backends.rs          LLMBackend trait, BackendManager, ChatContext
+  openai.rs            OpenAI-compatible backend (async-openai byot)
+  role.rs              Role/system prompt management
+  defaults.rs          Built-in default config and roles
+  util.rs              Shared utilities
+  session/             SessionRegistry, Session, EntryType, SessionMeta
+    mod.rs             Public types + helpers
+    registry.rs        SessionRegistry struct, chaz_group/chaz_peer accessors, session CRUD
+    channels.rs        Matrix channel attach/detach
+    agents.rs          attach/detach + turn-taking resolve_agent
+    keys.rs            agent DB helpers, ephemeral keys, user_lock accessor
+  commands/            Transport-neutral session commands
+    mod.rs             Command, CommandContext, CommandOutcome, dispatch
+    session.rs         /sessions, /info, /name, /share, /sync, etc.
+    agent.rs           /agent add|remove|list|host|new|set|delete|share|import|invite|revoke-peer
+    memory.rs          /memory new|list|delete|grant|revoke|share|import
+    heartbeat.rs       /heartbeat add|modify|remove|list
+  tools/               Built-in tools
+    agent.rs           spawn_agent (delegate to a Living Agent)
+    task.rs            spawn_task (ephemeral sub-agent with revocable key)
+    shell.rs           shell execution with allowlist/denylist
+    file.rs            read_file, write_file
+    web.rs             web_fetch with network policy
+    search.rs          web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
+    memory.rs          remember, recall (optional `bank` arg), list_memory_banks
+    heartbeat.rs       heartbeat_add, heartbeat_modify, heartbeat_remove, heartbeat_list
+    compact.rs         compact — write Summary entry for context compaction
+    describe.rs        describe_tool — on-demand tool discovery
+    time.rs            get_time
+    calculate.rs       calculate (meval)
+  security/            SecurityContext bundle
+    mod.rs             SecurityContext
+    secrets.rs         SecretStore (chaz_peer.credentials backed)
+    leak_detector.rs   12-pattern secret scanner
+    network.rs         Endpoint allowlisting, SSRF protection
+    sanitizer.rs       Prompt injection detection
+  mcp/                 MCP integration (stdio + Streamable HTTP)
+    mod.rs             MCP server lifecycle
+    parse.rs           JSON-RPC framing
+    transport.rs       Stdio + HTTP transports
+    server.rs          Tool descriptor + invoke
+  gateway/             Gateway trait + transport implementations
+    mod.rs             Gateway trait, ApprovalExchange
+    tui/               TUI with multi-session tabs, mouse + keyboard nav
+    matrix/            Matrix gateway
+      mod.rs           Lifecycle, channel callbacks
+      commands.rs      Matrix-syntax command parsing
+      history.rs       Room history backfill
 ```

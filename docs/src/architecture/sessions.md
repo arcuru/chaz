@@ -12,6 +12,7 @@ enum EntryType {
     ToolResult, // Record of a tool result (audit trail)
     Ack,        // Agent is processing (thinking indicator)
     Error,      // An error occurred
+    Summary,    // Compacted summary of older messages (context-builder boundary)
 }
 ```
 
@@ -19,7 +20,7 @@ Each entry has a sender (participant name), content, timestamp, and type.
 
 ### What Enters the LLM Context
 
-Only `Message` and `Directive` entries are included in the LLM context window. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
+Only `Message`, `Directive`, and `Summary` entries are included in the LLM context window. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
 
 `ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its own in-memory tool call history for the ReAct loop. Session-level tool entries exist for audit trail and TUI display only.
 

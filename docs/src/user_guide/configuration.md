@@ -194,7 +194,7 @@ Token budgeting for the LLM context window. Uses tiktoken (cl100k_base) for accu
 
 Chaz persists all data in the state directory:
 
-- `eidetica.db` — SQLite database containing all sessions, memory, secrets, and registry
+- `eidetica.db` — SQLite database backing every chaz eidetica DB: per-session DBs, per-agent DBs, per-bank DBs, plus the peer-local `chaz_group` (sessions/channels/names) and `chaz_peer` (credentials/heartbeat_last_fired/schedule_state) bookkeeping DBs
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
