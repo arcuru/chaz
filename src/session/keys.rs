@@ -271,6 +271,32 @@ impl SessionRegistry {
         Ok(user.get_default_key()?)
     }
 
+    /// Flip `sync_enabled = true` on the user's `TrackedDatabase` entry for
+    /// `db_id`, so the source peer actually serves the DB to ticket holders
+    /// (and the receiver picks up subsequent writes after import).
+    ///
+    /// `User::create_database` and `sync_with_ticket` both default to
+    /// `SyncSettings::disabled()`. Without this flip, `/share` produces a
+    /// valid-looking ticket but the source peer refuses to serve, and
+    /// imported DBs go stale after the initial fetch.
+    ///
+    /// Errors if this peer holds no key for the DB — you can't track-and-sync
+    /// a database you can't sign for.
+    pub async fn enable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
+        let mut user = self.user.lock().await;
+        let key = user.find_key(db_id)?.ok_or_else(|| {
+            anyhow::anyhow!("Peer holds no key for DB {db_id} — cannot enable sync")
+        })?;
+        user.track_database(
+            db_id.clone(),
+            &key,
+            eidetica::user::SyncSettings::on_commit(),
+        )
+        .await?;
+        info!(db_id = %db_id, "Enabled sync (sync_on_commit) for DB");
+        Ok(())
+    }
+
     /// Revoke a pubkey on a session. Used by `spawn_task` after the task
     /// completes — historical entries signed by the key remain verifiable,
     /// but no new entries can be written.
@@ -428,6 +454,62 @@ mod tests {
         assert_ne!(
             auth_after.status(),
             &eidetica::auth::types::KeyStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_sync_for_flips_tracked_database() {
+        let (_instance, registry) = make_registry().await;
+        let cfg = crate::agent_db::AgentDbConfig::default();
+        let meta = crate::agent_db::AgentMeta {
+            display_name: Some("syncable".to_string()),
+            ..Default::default()
+        };
+        let (agent_db, _pk) = registry
+            .create_new_agent_db("syncable", &cfg, &meta)
+            .await
+            .unwrap();
+        let db_id = agent_db.id();
+
+        // Fresh user.create_database lands sync_enabled = false.
+        {
+            let user = registry.user_lock().await;
+            let tracked = user.database(&db_id).await.unwrap();
+            assert!(
+                !tracked.sync_settings.sync_enabled,
+                "expected new DB to default to sync_enabled = false"
+            );
+        }
+
+        registry.enable_sync_for(&db_id).await.unwrap();
+
+        let user = registry.user_lock().await;
+        let tracked = user.database(&db_id).await.unwrap();
+        assert!(
+            tracked.sync_settings.sync_enabled,
+            "enable_sync_for should flip sync_enabled to true"
+        );
+        assert!(
+            tracked.sync_settings.sync_on_commit,
+            "enable_sync_for should also enable sync_on_commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_sync_for_errors_when_no_key() {
+        let (_instance, registry) = make_registry().await;
+        let fake_id = eidetica::entry::ID::parse(
+            "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm",
+        )
+        .unwrap();
+        let err = registry
+            .enable_sync_for(&fake_id)
+            .await
+            .err()
+            .expect("expected error when peer holds no key");
+        assert!(
+            err.to_string().contains("no key"),
+            "unexpected error: {err}"
         );
     }
 

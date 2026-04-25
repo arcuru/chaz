@@ -284,6 +284,10 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
         return CommandOutcome::Error("Sync not enabled".to_string());
     };
 
+    if let Err(e) = ctx.server.registry().enable_sync_for(&entry.db_id).await {
+        return CommandOutcome::Error(format!("Failed to enable sync for agent DB: {e}"));
+    }
+
     let mut ticket = eidetica::sync::DatabaseTicket::new(entry.db_id.clone());
     if let Ok(addresses) = sync.get_all_server_addresses().await {
         for (transport_type, address) in addresses {
@@ -369,6 +373,12 @@ pub(super) async fn agent_import(ticket_str: &str, ctx: &CommandContext<'_>) -> 
         .agents()
         .build_from_db_config(&display_name, &cfg);
     ctx.server.agents().upsert(runtime_agent);
+
+    if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
+        return CommandOutcome::Error(format!(
+            "Imported agent '{display_name}' (DB {db_id}) but failed to enable ongoing sync: {e}"
+        ));
+    }
 
     CommandOutcome::Text(format!(
         "Imported agent '{display_name}' (DB {db_id}). Attach with /agent add {display_name}."
@@ -614,15 +624,15 @@ pub(super) async fn agent_revoke_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::agent_db::find_agent_db;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {

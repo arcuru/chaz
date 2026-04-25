@@ -188,7 +188,11 @@ pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     let Some(sync) = instance.sync() else {
         return CommandOutcome::Error("Sync not enabled".to_string());
     };
-    let mut ticket = eidetica::sync::DatabaseTicket::new(ctx.session_db.root_id().clone());
+    let db_id = ctx.session_db.root_id().clone();
+    if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
+        return CommandOutcome::Error(format!("Failed to enable sync for session: {e}"));
+    }
+    let mut ticket = eidetica::sync::DatabaseTicket::new(db_id);
     if let Ok(addresses) = sync.get_all_server_addresses().await {
         for (transport_type, address) in addresses {
             ticket.add_address(eidetica::sync::Address::new(transport_type, address));
@@ -209,12 +213,15 @@ pub(super) async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> C
         Err(e) => return CommandOutcome::Error(format!("Invalid ticket: {e}")),
     };
     let db_id = ticket.database_id().clone();
-    match sync.sync_with_ticket(&ticket).await {
-        Ok(()) => {
-            CommandOutcome::Text(format!("Synced database {db_id}. Use sessions to find it."))
-        }
-        Err(e) => CommandOutcome::Error(format!("Sync failed: {e}")),
+    if let Err(e) = sync.sync_with_ticket(&ticket).await {
+        return CommandOutcome::Error(format!("Sync failed: {e}"));
     }
+    if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
+        return CommandOutcome::Error(format!(
+            "Synced {db_id} but failed to enable ongoing sync: {e}"
+        ));
+    }
+    CommandOutcome::Text(format!("Synced database {db_id}. Use sessions to find it."))
 }
 
 pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {

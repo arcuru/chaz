@@ -220,6 +220,10 @@ pub(super) async fn memory_share(bank_ref: &str, ctx: &CommandContext<'_>) -> Co
         return CommandOutcome::Error("Sync not enabled".to_string());
     };
 
+    if let Err(e) = ctx.server.registry().enable_sync_for(&entry.db_id).await {
+        return CommandOutcome::Error(format!("Failed to enable sync for memory bank: {e}"));
+    }
+
     let mut ticket = eidetica::sync::DatabaseTicket::new(entry.db_id.clone());
     if let Ok(addresses) = sync.get_all_server_addresses().await {
         for (transport_type, address) in addresses {
@@ -292,6 +296,12 @@ pub(super) async fn memory_import(ticket_str: &str, ctx: &CommandContext<'_>) ->
             pubkey,
         });
 
+    if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
+        return CommandOutcome::Error(format!(
+            "Imported memory bank '{display_name}' (DB {db_id}) but failed to enable ongoing sync: {e}"
+        ));
+    }
+
     CommandOutcome::Text(format!(
         "Imported memory bank '{display_name}' (DB {db_id}). \
          Grant it to agents with /memory grant {display_name} <agent> <read|write>."
@@ -316,14 +326,14 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
