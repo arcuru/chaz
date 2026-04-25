@@ -240,28 +240,49 @@ pub(super) async fn memory_share(bank_ref: &str, ctx: &CommandContext<'_>) -> Co
 /// locally (Stage 9.D.3). Requires the ticket to include a key for
 /// this peer — read-only imports aren't supported yet (blocked on
 /// eidetica's `Database::open_unauthenticated` being pub(crate)).
-pub(super) async fn memory_import(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let instance = ctx.server.registry().instance();
-    let Some(sync) = instance.sync() else {
-        return CommandOutcome::Error("Sync not enabled".to_string());
-    };
-
+pub(super) async fn memory_import(
+    ticket_str: &str,
+    permission: super::CoOwnerPermission,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
     let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
         Ok(t) => t,
         Err(e) => return CommandOutcome::Error(format!("Invalid ticket: {e}")),
     };
     let db_id = ticket.database_id().clone();
+    let eidetica_perm = match permission {
+        super::CoOwnerPermission::Admin => eidetica::auth::types::Permission::Admin(1),
+        super::CoOwnerPermission::Write => eidetica::auth::types::Permission::Write(10),
+        super::CoOwnerPermission::Read => eidetica::auth::types::Permission::Read,
+    };
 
-    if let Err(e) = sync.sync_with_ticket(&ticket).await {
-        return CommandOutcome::Error(format!("Sync failed: {e}"));
+    // Bootstrap path: preseeded keys → sync succeeds; otherwise a pending
+    // request is queued for the owner's `/sharing approve`.
+    match ctx
+        .server
+        .registry()
+        .request_db_access(&ticket, eidetica_perm)
+        .await
+    {
+        Ok(crate::session::BootstrapOutcome::Approved) => {}
+        Ok(crate::session::BootstrapOutcome::Pending {
+            request_id,
+            message: _,
+        }) => {
+            return CommandOutcome::Text(format!(
+                "Bootstrap request {request_id} pending the owner's approval. \
+                 Re-run `/memory import <ticket>` after they run `/sharing approve {request_id}`."
+            ));
+        }
+        Err(e) => return CommandOutcome::Error(format!("Bootstrap failed: {e}")),
     }
 
     let bank_db = match ctx.server.registry().open_memory_bank(&db_id).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
-                "Synced memory bank DB {db_id} but this peer holds no key for it. \
-                 Read-only bank sharing is not supported yet — ask the owner to share a key-bearing ticket."
+                "Bootstrap reported success on memory bank {db_id} but this peer still holds no key. \
+                 Likely an eidetica state mismatch — re-run the import to retry."
             ));
         }
         Err(e) => return CommandOutcome::Error(format!("Failed to open synced bank: {e}")),
@@ -326,14 +347,14 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
+    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {
@@ -684,7 +705,15 @@ mod tests {
     async fn memory_import_rejects_invalid_ticket() {
         let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
-        match dispatch(Command::MemoryImport("not-a-ticket".to_string()), &ctx).await {
+        match dispatch(
+            Command::MemoryImport {
+                ticket: "not-a-ticket".to_string(),
+                permission: super::super::CoOwnerPermission::Write,
+            },
+            &ctx,
+        )
+        .await
+        {
             CommandOutcome::Error(msg) => {
                 // Could be "Sync not enabled" or "Invalid ticket" depending on fixture;
                 // either surfaces cleanly as an Error, which is what we want.

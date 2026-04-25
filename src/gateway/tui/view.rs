@@ -114,11 +114,11 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("/agent share ", "generate a share ticket for an agent's DB"),
         (
             "/agent import ",
-            "sync + register an agent DB from a ticket",
+            "request access to an agent DB via ticket [admin|write|read]",
         ),
         (
             "/agent invite ",
-            "grant another peer access (admin|write|read)",
+            "preseed another peer's pubkey (admin|write|read)",
         ),
         ("/agent revoke-peer ", "revoke a co-owner's access"),
         ("/pubkey", "show this peer's default pubkey"),
@@ -132,7 +132,14 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
         ),
         ("/memory revoke ", "revoke an agent's access"),
         ("/memory share ", "generate a share ticket for a bank's DB"),
-        ("/memory import ", "sync + register a bank DB from a ticket"),
+        (
+            "/memory import ",
+            "request access to a bank via ticket [admin|write|read]",
+        ),
+        ("# Sharing queue", ""),
+        ("/sharing requests", "list pending bootstrap requests"),
+        ("/sharing approve ", "approve a request by id"),
+        ("/sharing reject ", "reject a request by id"),
         ("# Heartbeat", ""),
         ("/heartbeat list", "list heartbeat rules on this session"),
         (

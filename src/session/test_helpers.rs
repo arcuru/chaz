@@ -82,6 +82,23 @@ pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
     (instance, Arc::new(registry))
 }
 
+/// Same as [`make_registry`] but with eidetica's sync subsystem enabled.
+/// Required for any helper that talks to the bootstrap-request store
+/// (`pending_bootstrap_requests`, `approve_bootstrap_request`, etc.) —
+/// those error out with "Sync not enabled" otherwise.
+pub(crate) async fn make_registry_with_sync() -> (Instance, Arc<SessionRegistry>) {
+    let backend = InMemory::new();
+    let instance = Instance::open(Box::new(backend)).await.unwrap();
+    instance.enable_sync().await.unwrap();
+    let _ = instance.create_user("test", None).await;
+    let user = instance.login_user("test", None).await.unwrap();
+    let agents = Arc::new(AgentRegistry::from_config(&blank_config()));
+    let registry = SessionRegistry::new(instance.clone(), user, agents)
+        .await
+        .unwrap();
+    (instance, Arc::new(registry))
+}
+
 /// Registry with one declared agent `alpha` — routing tests can then resolve
 /// display_name → Agent via AgentRegistry.
 pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, HostedIndex)

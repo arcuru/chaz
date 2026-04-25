@@ -28,6 +28,8 @@ mod agents;
 mod channels;
 mod keys;
 mod registry;
+
+pub use keys::BootstrapOutcome;
 #[cfg(test)]
 mod test_helpers;
 

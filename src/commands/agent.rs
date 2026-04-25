@@ -300,31 +300,47 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
     ))
 }
 
-pub(super) async fn agent_import(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let instance = ctx.server.registry().instance();
-    let Some(sync) = instance.sync() else {
-        return CommandOutcome::Error("Sync not enabled".to_string());
-    };
-
+pub(super) async fn agent_import(
+    ticket_str: &str,
+    permission: CoOwnerPermission,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
     let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
         Ok(t) => t,
         Err(e) => return CommandOutcome::Error(format!("Invalid ticket: {e}")),
     };
     let db_id = ticket.database_id().clone();
+    let eidetica_perm = map_coowner_permission(permission);
 
-    if let Err(e) = sync.sync_with_ticket(&ticket).await {
-        return CommandOutcome::Error(format!("Sync failed: {e}"));
+    // Bootstrap path: if the requester is preseeded (e.g. owner already
+    // ran /agent invite), sync proceeds and we land in `Approved`. Otherwise
+    // eidetica queues a pending request and the owner has to /sharing approve
+    // before this peer can pull entries; we tell the user to re-run.
+    match ctx
+        .server
+        .registry()
+        .request_db_access(&ticket, eidetica_perm)
+        .await
+    {
+        Ok(crate::session::BootstrapOutcome::Approved) => {}
+        Ok(crate::session::BootstrapOutcome::Pending {
+            request_id,
+            message: _,
+        }) => {
+            return CommandOutcome::Text(format!(
+                "Bootstrap request {request_id} pending the owner's approval. \
+                 Re-run `/agent import <ticket>` after they run `/sharing approve {request_id}`."
+            ));
+        }
+        Err(e) => return CommandOutcome::Error(format!("Bootstrap failed: {e}")),
     }
 
-    // After sync, we need a key on this peer for the agent DB to open it and
-    // read its meta/config stores. Without a key, we can't register the agent
-    // locally — the ticket syncs entries but not keys.
     let agent_db = match ctx.server.registry().open_agent_db(&db_id).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
-                "Synced agent DB {db_id} but this peer holds no key for it. \
-                 Read-only agent sharing is not supported yet — ask the owner to share a key-bearing ticket."
+                "Bootstrap reported success on agent DB {db_id} but this peer still holds no key. \
+                 Likely an eidetica state mismatch — re-run the import to retry."
             ));
         }
         Err(e) => return CommandOutcome::Error(format!("Failed to open synced agent DB: {e}")),
@@ -624,15 +640,15 @@ pub(super) async fn agent_revoke_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
+    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
     use crate::agent::AgentRegistry;
     use crate::agent_db::find_agent_db;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::Instance;
     use std::sync::Arc;
 
     fn blank_config() -> crate::config::Config {

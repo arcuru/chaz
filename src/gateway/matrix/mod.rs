@@ -548,7 +548,22 @@ impl Gateway for MatrixGateway {
                         Some(Command::AgentDelete(rest.to_string()))
                     }
                     "share" if !rest.is_empty() => Some(Command::AgentShare(rest.to_string())),
-                    "import" if !rest.is_empty() => Some(Command::AgentImport(rest.to_string())),
+                    "import" if !rest.is_empty() => (|| {
+                        let mut parts = rest.splitn(2, char::is_whitespace);
+                        let ticket = parts.next().unwrap_or("").trim();
+                        let perm_tok = parts.next().unwrap_or("").trim();
+                        if ticket.is_empty() {
+                            return None;
+                        }
+                        let permission = match perm_tok {
+                            "" => crate::commands::CoOwnerPermission::Write,
+                            other => crate::commands::parse_permission_token(other)?,
+                        };
+                        Some(Command::AgentImport {
+                            ticket: ticket.to_string(),
+                            permission,
+                        })
+                    })(),
                     "set" if !rest.is_empty() => {
                         let mut parts = rest.splitn(3, char::is_whitespace);
                         let agent_ref = parts.next().unwrap_or("").trim();
@@ -664,7 +679,43 @@ impl Gateway for MatrixGateway {
                         }
                     }
                     "share" if !rest.is_empty() => Some(Command::MemoryShare(rest.to_string())),
-                    "import" if !rest.is_empty() => Some(Command::MemoryImport(rest.to_string())),
+                    "import" if !rest.is_empty() => (|| {
+                        let mut parts = rest.splitn(2, char::is_whitespace);
+                        let ticket = parts.next().unwrap_or("").trim();
+                        let perm_tok = parts.next().unwrap_or("").trim();
+                        if ticket.is_empty() {
+                            return None;
+                        }
+                        let permission = match perm_tok {
+                            "" => crate::commands::CoOwnerPermission::Write,
+                            other => crate::commands::parse_permission_token(other)?,
+                        };
+                        Some(Command::MemoryImport {
+                            ticket: ticket.to_string(),
+                            permission,
+                        })
+                    })(),
+                    _ => None,
+                }
+            }
+        );
+
+        // --- Bootstrap-queue surface (Co-owned Stage 11) ---
+        register_shared!(
+            "sharing",
+            "requests | approve <id> | reject <id>".to_string(),
+            "Manage bootstrap requests across agent/bank/session DBs",
+            |text| {
+                let arg = matrix_args(&text);
+                let mut parts = arg.trim().splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("").trim();
+                let rest = parts.next().unwrap_or("").trim();
+                match sub {
+                    "" | "requests" | "list" => Some(Command::SharingRequests),
+                    "approve" if !rest.is_empty() => {
+                        Some(Command::SharingApprove(rest.to_string()))
+                    }
+                    "reject" if !rest.is_empty() => Some(Command::SharingReject(rest.to_string())),
                     _ => None,
                 }
             }

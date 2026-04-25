@@ -278,12 +278,38 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         return None;
     }
     if let Some(arg) = text.strip_prefix("/agent import ") {
-        let t = arg.trim().to_string();
-        if !t.is_empty() {
-            return Some(ChatAction::Dispatch(Command::AgentImport(t)));
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let ticket = parts.next().unwrap_or("").trim().to_string();
+        let perm_tok = parts.next().unwrap_or("").trim();
+        if ticket.is_empty() {
+            show_error(
+                app,
+                "Usage: /agent import <ticket> [admin|write|read]".to_string(),
+            );
+            return None;
         }
-        show_error(app, "Usage: /agent import <ticket>".to_string());
-        return None;
+        // Default for /agent import is write — co-ownership with edit
+        // privileges. Admin and Read are explicit opt-ins.
+        let permission = match perm_tok {
+            "" => crate::commands::CoOwnerPermission::Write,
+            other => match parse_permission_token(other) {
+                Some(p) => p,
+                None => {
+                    show_error(
+                        app,
+                        format!(
+                            "Unknown permission '{other}' — use admin, write, or read (default: write)"
+                        ),
+                    );
+                    return None;
+                }
+            },
+        };
+        return Some(ChatAction::Dispatch(Command::AgentImport {
+            ticket,
+            permission,
+        }));
     }
     if let Some(arg) = text.strip_prefix("/agent delete ") {
         let r = arg.trim().to_string();
@@ -461,11 +487,57 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         return None;
     }
     if let Some(arg) = text.strip_prefix("/memory import ") {
-        let t = arg.trim().to_string();
-        if !t.is_empty() {
-            return Some(ChatAction::Dispatch(Command::MemoryImport(t)));
+        let trimmed = arg.trim();
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let ticket = parts.next().unwrap_or("").trim().to_string();
+        let perm_tok = parts.next().unwrap_or("").trim();
+        if ticket.is_empty() {
+            show_error(
+                app,
+                "Usage: /memory import <ticket> [admin|write|read]".to_string(),
+            );
+            return None;
         }
-        show_error(app, "Usage: /memory import <ticket>".to_string());
+        let permission = match perm_tok {
+            "" => crate::commands::CoOwnerPermission::Write,
+            other => match parse_permission_token(other) {
+                Some(p) => p,
+                None => {
+                    show_error(
+                        app,
+                        format!(
+                            "Unknown permission '{other}' — use admin, write, or read (default: write)"
+                        ),
+                    );
+                    return None;
+                }
+            },
+        };
+        return Some(ChatAction::Dispatch(Command::MemoryImport {
+            ticket,
+            permission,
+        }));
+    }
+
+    // Bootstrap-queue surface (Co-owned Stage 11). Single namespace
+    // covering pending requests across every kind of resource.
+    if text == "/sharing requests" || text == "/sharing" {
+        return Some(ChatAction::Dispatch(Command::SharingRequests));
+    }
+    if let Some(arg) = text.strip_prefix("/sharing approve ") {
+        let id = arg.trim().to_string();
+        if !id.is_empty() {
+            return Some(ChatAction::Dispatch(Command::SharingApprove(id)));
+        }
+        show_error(app, "Usage: /sharing approve <request_id>".to_string());
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/sharing reject ") {
+        let id = arg.trim().to_string();
+        if !id.is_empty() {
+            return Some(ChatAction::Dispatch(Command::SharingReject(id)));
+        }
+        show_error(app, "Usage: /sharing reject <request_id>".to_string());
         return None;
     }
 

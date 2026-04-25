@@ -2,9 +2,26 @@
 //! the registry's `User` to manipulate keys or agent DBs.
 
 use eidetica::auth::types::{AuthKey, Permission};
+use eidetica::sync::{BootstrapRequest, DatabaseTicket, SyncError};
 use tracing::info;
 
 use super::SessionRegistry;
+
+/// Outcome of a bootstrap request initiated via `request_db_access`.
+/// Eidetica's `bootstrap_with_ticket` either approves immediately (when the
+/// requester's pubkey is already authorized on the target DB) or queues a
+/// `BootstrapPending` request for an Admin to approve.
+#[derive(Debug, Clone)]
+pub enum BootstrapOutcome {
+    /// Sync proceeded — the requester's pubkey was already preseeded (or the
+    /// DB is open to the requested permission). Caller can immediately open
+    /// the DB and register it locally.
+    Approved,
+    /// Owner must approve via `/sharing approve <request_id>`. Until then the
+    /// requester sees no entries on this DB and cannot open it. The receiver
+    /// must re-run the request after approval to actually pull the entries.
+    Pending { request_id: String, message: String },
+}
 
 impl SessionRegistry {
     /// Create a new Agent DB for the Living Agents lifecycle (Stage 6
@@ -307,6 +324,138 @@ impl SessionRegistry {
         Ok(user.is_sync_enabled(db_id).await?)
     }
 
+    /// Request access to a remote DB via eidetica's bootstrap workflow. The
+    /// receiver's default pubkey is sent to the source peer along with the
+    /// requested permission; the source peer either approves automatically
+    /// (key already authorized) or queues a pending request.
+    ///
+    /// On `Approved`, the caller should open the DB and finish chaz-side
+    /// registration (read meta, populate hosted index, upsert runtime
+    /// agent, enable sync). On `Pending`, instruct the user to re-run the
+    /// request after the owner approves — eidetica doesn't push back to us.
+    pub async fn request_db_access(
+        &self,
+        ticket: &DatabaseTicket,
+        permission: Permission,
+    ) -> anyhow::Result<BootstrapOutcome> {
+        let sync = self
+            .instance
+            .sync()
+            .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+        let user = self.user.lock().await;
+        let key_id = user.get_default_key()?;
+        match user
+            .request_database_access(&sync, ticket, &key_id, permission)
+            .await
+        {
+            Ok(()) => Ok(BootstrapOutcome::Approved),
+            Err(e) => {
+                if let eidetica::Error::Sync(boxed) = &e {
+                    if let SyncError::BootstrapPending {
+                        request_id,
+                        message,
+                    } = boxed.as_ref()
+                    {
+                        return Ok(BootstrapOutcome::Pending {
+                            request_id: request_id.clone(),
+                            message: message.clone(),
+                        });
+                    }
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// List all bootstrap requests on this peer's `_sync` DB that are still
+    /// `Pending`. Each entry carries `tree_id`, requester pubkey, requested
+    /// permission, and timestamp — enough for `/sharing requests` to render
+    /// a queue. Resource names (agent/bank/session) are resolved by the
+    /// caller via the hosted indices since eidetica's request only stores
+    /// the DB id.
+    pub async fn pending_bootstrap_requests(
+        &self,
+    ) -> anyhow::Result<Vec<(String, BootstrapRequest)>> {
+        let sync = self
+            .instance
+            .sync()
+            .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+        let user = self.user.lock().await;
+        Ok(user.pending_bootstrap_requests(&sync).await?)
+    }
+
+    /// Approve a queued bootstrap request. The requested permission is
+    /// granted as-is; if the owner wants a different permission, they must
+    /// reject and use `/agent invite` (preseed) instead. Returns the target
+    /// DB id so the caller can render a confirmation message.
+    ///
+    /// Errors if this peer holds no key with Admin on the target DB —
+    /// only owners (Admin(0)) and co-admins (Admin(1)) can approve.
+    pub async fn approve_bootstrap_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<(eidetica::entry::ID, BootstrapRequest)> {
+        let sync = self
+            .instance
+            .sync()
+            .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+        let req = sync
+            .get_bootstrap_request(request_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No bootstrap request with id '{request_id}'"))?
+            .1;
+        let user = self.user.lock().await;
+        let approving_key = user.find_key(&req.tree_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "This peer holds no key for DB {} — only an admin on that DB can approve",
+                req.tree_id
+            )
+        })?;
+        user.approve_bootstrap_request(&sync, request_id, &approving_key)
+            .await?;
+        info!(
+            request_id,
+            tree_id = %req.tree_id,
+            permission = ?req.requested_permission,
+            "Approved bootstrap request"
+        );
+        Ok((req.tree_id.clone(), req))
+    }
+
+    /// Reject a queued bootstrap request. Same admin-key requirement as
+    /// `approve_bootstrap_request`. The request is marked rejected; the
+    /// requester's bootstrap retry will keep failing until rejected
+    /// requests roll off (no eidetica TTL today — see PLAN.md).
+    pub async fn reject_bootstrap_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<(eidetica::entry::ID, BootstrapRequest)> {
+        let sync = self
+            .instance
+            .sync()
+            .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+        let req = sync
+            .get_bootstrap_request(request_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No bootstrap request with id '{request_id}'"))?
+            .1;
+        let user = self.user.lock().await;
+        let rejecting_key = user.find_key(&req.tree_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "This peer holds no key for DB {} — only an admin on that DB can reject",
+                req.tree_id
+            )
+        })?;
+        user.reject_bootstrap_request(&sync, request_id, &rejecting_key)
+            .await?;
+        info!(
+            request_id,
+            tree_id = %req.tree_id,
+            "Rejected bootstrap request"
+        );
+        Ok((req.tree_id.clone(), req))
+    }
+
     /// Revoke a pubkey on a session. Used by `spawn_task` after the task
     /// completes — historical entries signed by the key remain verifiable,
     /// but no new entries can be written.
@@ -507,6 +656,65 @@ mod tests {
         assert!(
             err.to_string().contains("not tracked")
                 || err.to_string().to_lowercase().contains("not tracked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_bootstrap_requests_empty_on_fresh_peer() {
+        let (_instance, registry) = make_registry_with_sync().await;
+        let pending = registry.pending_bootstrap_requests().await.unwrap();
+        assert!(pending.is_empty(), "fresh peer should have no requests");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_helpers_error_when_sync_not_enabled() {
+        let (_instance, registry) = make_registry().await;
+        let err = registry
+            .pending_bootstrap_requests()
+            .await
+            .err()
+            .expect("expected error without sync");
+        assert!(
+            err.to_string().contains("Sync not enabled"),
+            "unexpected error: {err}"
+        );
+
+        let err = registry
+            .approve_bootstrap_request("does-not-matter")
+            .await
+            .err()
+            .expect("expected error without sync");
+        assert!(
+            err.to_string().contains("Sync not enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_unknown_request_errors() {
+        let (_instance, registry) = make_registry_with_sync().await;
+        let err = registry
+            .approve_bootstrap_request("not-a-real-id")
+            .await
+            .err()
+            .expect("expected error for unknown id");
+        assert!(
+            err.to_string().contains("No bootstrap request"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_unknown_request_errors() {
+        let (_instance, registry) = make_registry_with_sync().await;
+        let err = registry
+            .reject_bootstrap_request("not-a-real-id")
+            .await
+            .err()
+            .expect("expected error for unknown id");
+        assert!(
+            err.to_string().contains("No bootstrap request"),
             "unexpected error: {err}"
         );
     }

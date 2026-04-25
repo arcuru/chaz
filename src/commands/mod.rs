@@ -26,6 +26,7 @@ mod agent;
 mod heartbeat;
 mod memory;
 mod session;
+mod sharing;
 
 /// User-visible permission level for co-ownership grants on an Agent DB
 /// (Co-owned Agents Stage 10). Stays separate from eidetica's `Permission`
@@ -101,8 +102,15 @@ pub enum Command {
     /// Generate a DatabaseTicket URL for an agent DB so another peer can
     /// import it via `/agent import`.
     AgentShare(String),
-    /// Sync an agent DB from a DatabaseTicket URL and register it locally.
-    AgentImport(String),
+    /// Request access to an agent DB via eidetica's bootstrap workflow. If
+    /// the requester's pubkey is already authorized (preseed via
+    /// `/agent invite`) the sync proceeds and the agent is registered
+    /// locally. Otherwise a pending bootstrap request is queued for the
+    /// owner to handle via `/sharing approve`. Default permission: write.
+    AgentImport {
+        ticket: String,
+        permission: CoOwnerPermission,
+    },
     /// List every Living Agent this peer hosts (from the `agents` index).
     AgentHosted,
     /// Unregister a Living Agent locally (index + runtime registry). The
@@ -160,9 +168,30 @@ pub enum Command {
     /// Generate a `DatabaseTicket` URL for a memory bank so another peer
     /// can import it via `/memory import`.
     MemoryShare(String),
-    /// Sync a memory bank from a `DatabaseTicket` URL and register it in
-    /// this peer's memory-banks index.
-    MemoryImport(String),
+    /// Request access to a memory bank via eidetica's bootstrap workflow.
+    /// Same flow as `AgentImport` — preseeded pubkey → sync proceeds;
+    /// otherwise queued for `/sharing approve`. Default permission: write.
+    MemoryImport {
+        ticket: String,
+        permission: CoOwnerPermission,
+    },
+
+    // --- Sharing queue (Co-owned Stage 11) ---
+    /// List bootstrap requests on this peer's `_sync` DB that are still
+    /// pending an admin's approval. Owner-side surface for `/sharing
+    /// requests`. The output lists each request with the resource kind
+    /// (agent/bank/session) and display name when known.
+    SharingRequests,
+    /// Approve a queued bootstrap request. Grants the requester's pubkey
+    /// the permission they asked for on the target DB. Requires this
+    /// peer to hold an Admin key on that DB. After approval, the
+    /// requester must re-run their `/agent import` (or `/memory import`,
+    /// or `/sync`) to actually pull the entries — eidetica doesn't push.
+    SharingApprove(String),
+    /// Reject a queued bootstrap request. Marks it Rejected; the
+    /// requester's bootstrap retries will keep failing for the lifetime
+    /// of the request entry.
+    SharingReject(String),
 
     // --- Heartbeat rules (Stage 4b) ---
     /// Add or upsert a heartbeat rule on the current session.
@@ -253,7 +282,9 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentSetHost(arg) => agent::agent_set_host(arg.as_deref(), ctx).await,
         Command::AgentNew { name, overrides } => agent::agent_new(&name, &overrides, ctx).await,
         Command::AgentShare(r) => agent::agent_share(&r, ctx).await,
-        Command::AgentImport(t) => agent::agent_import(&t, ctx).await,
+        Command::AgentImport { ticket, permission } => {
+            agent::agent_import(&ticket, permission, ctx).await
+        }
         Command::AgentHosted => agent::agent_hosted(ctx).await,
         Command::AgentDelete(r) => agent::agent_delete(&r, ctx).await,
         Command::AgentSet {
@@ -285,7 +316,12 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             agent_ref,
         } => memory::memory_revoke(&bank_ref, &agent_ref, ctx).await,
         Command::MemoryShare(r) => memory::memory_share(&r, ctx).await,
-        Command::MemoryImport(t) => memory::memory_import(&t, ctx).await,
+        Command::MemoryImport { ticket, permission } => {
+            memory::memory_import(&ticket, permission, ctx).await
+        }
+        Command::SharingRequests => sharing::sharing_requests(ctx).await,
+        Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
+        Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
         Command::HeartbeatAdd {
             id,
             cron,

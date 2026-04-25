@@ -204,17 +204,31 @@ pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
 }
 
 pub(super) async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let instance = ctx.server.registry().instance();
-    let Some(sync) = instance.sync() else {
-        return CommandOutcome::Error("Sync not enabled".to_string());
-    };
     let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
         Ok(t) => t,
         Err(e) => return CommandOutcome::Error(format!("Invalid ticket: {e}")),
     };
     let db_id = ticket.database_id().clone();
-    if let Err(e) = sync.sync_with_ticket(&ticket).await {
-        return CommandOutcome::Error(format!("Sync failed: {e}"));
+    // Sessions don't have a Read mode today (no read-only spectator UX), so
+    // /sync always requests Write. If the requester's pubkey is preseeded
+    // the sync proceeds; otherwise eidetica queues a bootstrap request.
+    match ctx
+        .server
+        .registry()
+        .request_db_access(&ticket, eidetica::auth::types::Permission::Write(10))
+        .await
+    {
+        Ok(crate::session::BootstrapOutcome::Approved) => {}
+        Ok(crate::session::BootstrapOutcome::Pending {
+            request_id,
+            message: _,
+        }) => {
+            return CommandOutcome::Text(format!(
+                "Bootstrap request {request_id} pending the owner's approval. \
+                 Re-run `/sync <ticket>` after they run `/sharing approve {request_id}`."
+            ));
+        }
+        Err(e) => return CommandOutcome::Error(format!("Bootstrap failed: {e}")),
     }
     if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
         return CommandOutcome::Error(format!(
