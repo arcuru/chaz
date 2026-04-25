@@ -21,11 +21,11 @@ graph LR
 
 Three things sync as separate database kinds, each with its own commands:
 
-| Kind         | Source command       | Receiver command      | What syncs                              |
-|--------------|----------------------|-----------------------|-----------------------------------------|
-| Session      | `/share`             | `/sync <ticket>`      | Conversation entries + session metadata |
-| Living Agent | `/agent share <ref>` | `/agent import <tkt>` | Agent config + per-agent memory         |
-| Memory Bank  | `/memory share <ref>`| `/memory import <tkt>`| Bank contents + grants                  |
+| Kind         | Source command        | Receiver command       | What syncs                              |
+| ------------ | --------------------- | ---------------------- | --------------------------------------- |
+| Session      | `/share`              | `/sync <ticket>`       | Conversation entries + session metadata |
+| Living Agent | `/agent share <ref>`  | `/agent import <tkt>`  | Agent config + per-agent memory         |
+| Memory Bank  | `/memory share <ref>` | `/memory import <tkt>` | Bank contents + grants                  |
 
 Tickets and the on-the-wire protocol are identical across kinds; the source and receiver commands diverge because each kind has different post-import bookkeeping (registering with the local hosted index, etc.).
 
@@ -55,29 +55,61 @@ After syncing, the session appears in the session list. Use `/sessions` to find 
 
 ## Sharing an Agent or Memory Bank
 
-Sharing an agent or memory bank with another peer is a two-step process: pre-authorize the receiver's pubkey, then hand them the ticket. This is the **preseed-pubkey model** described in [Living Agents](agents.md#lifecycle-sharing-and-co-ownership).
+There are two paths to give another peer access to an agent or memory bank: a **request flow** (the receiver asks; the owner approves) and a **preseed flow** (the owner authorizes the receiver's pubkey out-of-band first). The request flow is the new default — fewer steps and read-only sharing works.
+
+### Request flow (default)
 
 ```text
-# On Receiver (peer B): print B's default pubkey
-/pubkey
-# Output: ed25519:abc123...
-
-# On Source (peer A): authorize B's pubkey on the agent's auth settings
-/agent invite my-agent ed25519:abc123... write
-# (use `admin` for a co-owner, `read` for read-only — read-only support is partial)
-
-# On Source: generate the share ticket
+# On Source (peer A): generate the share ticket
 /agent share my-agent
 # Output: eidetica:?db=<agent_db_id>&pr=http:...
 
-# On Receiver: import
-/agent import eidetica:?db=<agent_db_id>&pr=http:...
-# Receiver now hosts the agent and can attach it to their own sessions.
+# On Receiver (peer B): request access using the ticket
+/agent import eidetica:?db=<agent_db_id>&pr=http:... write
+# Output: Bootstrap request <id> pending the owner's approval.
+#         Re-run `/agent import <ticket>` after they run `/sharing approve <id>`.
+
+# On Source (peer A): see and approve the request
+/sharing requests
+# Output: Pending bootstrap requests (1):
+#           <id> — agent 'my-agent' requested by ed25519:... as write(10) at <ts>
+/sharing approve <id>
+
+# On Receiver: re-run the import — now it succeeds
+/agent import eidetica:?db=<agent_db_id>&pr=http:... write
+# Output: Imported agent 'my-agent' (DB ...). Attach with /agent add my-agent.
 ```
 
-Memory banks follow the same shape with `/memory invite` (coming soon — currently use `/memory grant <bank> <agent>` to give a hosted agent access; cross-peer pubkey grant lands with the bootstrap UX), `/memory share`, and `/memory import`.
+The trailing `[admin|write|read]` token on `/agent import` (and `/memory import`) controls the permission the requester asks for. Default: `write`. `read` works for spectators; `admin` for co-owners.
 
-> **Heads up — bootstrap UX in progress:** the manual `/pubkey` → `/agent invite` → `/agent share` → `/agent import` sequence will be collapsed into a single `/agent request <ticket>` flow once chaz wires up eidetica's bootstrap-request machinery. Until then, the steps above are the supported path.
+### Preseed flow (still supported)
+
+If the source peer authorizes the receiver's pubkey ahead of time via `/agent invite`, the receiver's `/agent import` succeeds immediately — eidetica's handler returns the existing-key fast path without queueing a request.
+
+```text
+# On Receiver: copy your default pubkey
+/pubkey
+# Output: ed25519:abc123...
+
+# On Source: preseed
+/agent invite my-agent ed25519:abc123... write
+/agent share my-agent
+
+# On Receiver: import — no approval needed
+/agent import <ticket>
+```
+
+This is the right shape when the two peers can communicate out-of-band before the import (e.g. you control both, or you've exchanged pubkeys via Matrix). When they can't, use the request flow.
+
+### Memory banks and sessions
+
+Memory banks use the same `/memory share` + `/memory import [perm]` shape. Sessions use `/share` + `/sync <ticket>` — sessions don't have a permission flag because session sharing today implies write access.
+
+The `/sharing` command surface is unified across kinds: `/sharing requests`, `/sharing approve <id>`, `/sharing reject <id>` operate on the single eidetica request queue regardless of whether the request is for an agent, bank, or session DB. The list output names the resource when the target DB is hosted on this peer.
+
+### After approval
+
+Eidetica doesn't push approved requests back to the requester — the request_id lives on the **source** peer's `_sync` DB only. So after `/sharing approve <id>` the receiver has to re-run their original import command. Re-runs are cheap: tickets just carry the DB id and the source peer's sync addresses.
 
 ## Example: Watching a Matrix Bot's Session
 
@@ -109,7 +141,7 @@ Memory banks follow the same shape with `/memory invite` (coming soon — curren
    /sessions
    ```
 
-5. Select the synced session. You'll see the full conversation history. New messages from Matrix should appear in real time — see *Troubleshooting* if they don't.
+5. Select the synced session. You'll see the full conversation history. New messages from Matrix should appear in real time — see _Troubleshooting_ if they don't.
 
 ## Requirements
 
@@ -139,14 +171,18 @@ See the [eidetica documentation](https://github.com/arcuru/eidetica) for details
 
 **The receiver synced but new messages from the source don't appear.**
 This was a real bug fixed in 2026-04 — `/share`/`/agent share`/`/memory share` were generating valid-looking tickets but the source peer wasn't actually advertising the DB. If you see this on a build older than the Database Layout Refactor Stage 1 fix, upgrade. On current builds, also check that:
+
 - Both peers are on the same eidetica protocol version (chaz pins eidetica to a specific revision; mismatched peers won't handshake).
 - The source peer's sync server log shows incoming connections from the receiver's address.
 
 **A co-owner's edits to a synced session don't trigger an agent run on the host.**
 Known limitation: chaz only listens to `on_local_write`, but remote-write callbacks were dead code in eidetica until a recent fix. Until that fix is merged and chaz subscribes to `on_remote_write`, remote pushes land in the database silently — they're visible if you re-render the session, but agents won't react to them. Tracked as the "Remote-write callback subscription" item in the followups.
 
-**`/agent import` or `/memory import` fails with "this peer holds no key for the DB".**
-The ticket synced the DB contents but the receiver wasn't preseeded with a key. The owner must run `/agent invite <receiver_pubkey>` (or `/memory invite`) first; tickets carry no key material themselves. Read-only sharing (no key) is blocked on an upstream eidetica change.
+**`/agent import` reports "Bootstrap request <id> pending" instead of importing.**
+Expected when the receiver's pubkey isn't preseeded. The owner needs to run `/sharing requests` to see the queue, then `/sharing approve <id>` to grant the requested permission. After approval, the receiver re-runs `/agent import <ticket>` and the import completes. See "Request flow" above.
+
+**`/sharing approve` errors with "this peer holds no key for DB ... — only an admin on that DB can approve".**
+You ran `/sharing approve` on a peer that doesn't own the target DB. Only the original creator (Admin(0)) or a co-admin (Admin(1)) can approve. Run it on the peer that hosts the agent/bank/session.
 
 **Tickets stop working after a restart.**
 The sync server picks a random port at each startup, so a ticket minted in one session encodes an address that's stale after the source peer restarts. Workaround: regenerate the ticket after the source restarts. Tracked as "configurable sync server address" in the followups.

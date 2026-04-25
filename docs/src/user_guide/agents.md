@@ -87,10 +87,13 @@ These aren't session-scoped; they act on the Living Agent itself.
 | `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                        |
 | `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                         |
 | `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                         |
-| `/agent import <ticket>`                            | Sync + register an agent DB from a share ticket. Requires this peer already hold a key on the DB (see `/pubkey` + `/agent invite`).                                      |
+| `/agent import <ticket> [admin\|write\|read]`       | Request access to a synced agent DB via the bootstrap workflow. Default `write`. If the receiver's key is preseeded, sync proceeds; otherwise queues a request for the owner's `/sharing approve`. |
 | `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                           |
-| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Authorise another peer's pubkey on this agent's DB. Default `admin` (`Admin(1)`); other tiers: `write` (`Write(10)`) / `read` (`Read`). Admin(0) stays with the owner.   |
+| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                           |
 | `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).  |
+| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                          |
+| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                    |
+| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                        |
 
 ## Turn-taking
 
@@ -207,8 +210,10 @@ stateDiagram-v2
     Attached --> Running: message / Directive arrives
     Running --> Attached: response written
     Attached --> Hosted: /agent remove <ref>
-    Hosted --> Invited: /agent invite <peer-pubkey>
+    Hosted --> Invited: /agent invite <peer-pubkey> (preseed)
     Invited --> CoHosted: /agent share → /agent import (peer B)
+    Hosted --> Requested: /agent share → /agent import (peer B, no preseed)
+    Requested --> CoHosted: /sharing approve (owner) → re-run /agent import (peer B)
     CoHosted --> Hosted: /agent revoke-peer (by owner)
     Hosted --> [*]: /agent delete (index row only; DB preserved)
 ```
