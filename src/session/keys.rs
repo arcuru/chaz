@@ -275,26 +275,36 @@ impl SessionRegistry {
     /// `db_id`, so the source peer actually serves the DB to ticket holders
     /// (and the receiver picks up subsequent writes after import).
     ///
-    /// `User::create_database` and `sync_with_ticket` both default to
-    /// `SyncSettings::disabled()`. Without this flip, `/share` produces a
-    /// valid-looking ticket but the source peer refuses to serve, and
-    /// imported DBs go stale after the initial fetch.
+    /// `User::create_database` and `sync_with_ticket` both default tracked
+    /// DBs to `SyncSettings::disabled()`. Without this flip, `/share`
+    /// produces a valid-looking ticket but the source peer refuses to serve,
+    /// and imported DBs go stale after the initial fetch.
     ///
-    /// Errors if this peer holds no key for the DB — you can't track-and-sync
-    /// a database you can't sign for.
+    /// Idempotent — eidetica's `User::enable_sync` short-circuits if the bit
+    /// is already on, and errors with `DatabaseNotTracked` for DBs this user
+    /// doesn't track (i.e. doesn't hold a key for).
     pub async fn enable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
         let mut user = self.user.lock().await;
-        let key = user.find_key(db_id)?.ok_or_else(|| {
-            anyhow::anyhow!("Peer holds no key for DB {db_id} — cannot enable sync")
-        })?;
-        user.track_database(
-            db_id.clone(),
-            &key,
-            eidetica::user::SyncSettings::on_commit(),
-        )
-        .await?;
-        info!(db_id = %db_id, "Enabled sync (sync_on_commit) for DB");
+        user.enable_sync(db_id).await?;
+        info!(db_id = %db_id, "Enabled sync for DB");
         Ok(())
+    }
+
+    /// Inverse of `enable_sync_for`. Used by future "stop sharing this DB"
+    /// flows. Idempotent — eidetica short-circuits if already off.
+    pub async fn disable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
+        let mut user = self.user.lock().await;
+        user.disable_sync(db_id).await?;
+        info!(db_id = %db_id, "Disabled sync for DB");
+        Ok(())
+    }
+
+    /// Whether this peer's user has sync enabled for `db_id`. Returns
+    /// `Ok(false)` for DBs the user doesn't track. Useful for tests and
+    /// future status commands.
+    pub async fn is_sync_enabled_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<bool> {
+        let user = self.user.lock().await;
+        Ok(user.is_sync_enabled(db_id).await?)
     }
 
     /// Revoke a pubkey on a session. Used by `spawn_task` after the task
@@ -472,31 +482,18 @@ mod tests {
         let db_id = agent_db.id();
 
         // Fresh user.create_database lands sync_enabled = false.
-        {
-            let user = registry.user_lock().await;
-            let tracked = user.database(&db_id).await.unwrap();
-            assert!(
-                !tracked.sync_settings.sync_enabled,
-                "expected new DB to default to sync_enabled = false"
-            );
-        }
+        assert!(!registry.is_sync_enabled_for(&db_id).await.unwrap());
 
         registry.enable_sync_for(&db_id).await.unwrap();
+        assert!(registry.is_sync_enabled_for(&db_id).await.unwrap());
 
-        let user = registry.user_lock().await;
-        let tracked = user.database(&db_id).await.unwrap();
-        assert!(
-            tracked.sync_settings.sync_enabled,
-            "enable_sync_for should flip sync_enabled to true"
-        );
-        assert!(
-            tracked.sync_settings.sync_on_commit,
-            "enable_sync_for should also enable sync_on_commit"
-        );
+        // Idempotent — second call is a no-op.
+        registry.enable_sync_for(&db_id).await.unwrap();
+        assert!(registry.is_sync_enabled_for(&db_id).await.unwrap());
     }
 
     #[tokio::test]
-    async fn enable_sync_for_errors_when_no_key() {
+    async fn enable_sync_for_errors_on_untracked_db() {
         let (_instance, registry) = make_registry().await;
         let fake_id = eidetica::entry::ID::parse(
             "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm",
@@ -506,9 +503,10 @@ mod tests {
             .enable_sync_for(&fake_id)
             .await
             .err()
-            .expect("expected error when peer holds no key");
+            .expect("expected error for untracked DB");
         assert!(
-            err.to_string().contains("no key"),
+            err.to_string().contains("not tracked")
+                || err.to_string().to_lowercase().contains("not tracked"),
             "unexpected error: {err}"
         );
     }
