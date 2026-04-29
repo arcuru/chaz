@@ -651,8 +651,7 @@ mod tests {
         let err = registry
             .enable_sync_for(&fake_id)
             .await
-            .err()
-            .expect("expected error for untracked DB");
+            .expect_err("expected error for untracked DB");
         assert!(
             err.to_string().contains("not tracked")
                 || err.to_string().to_lowercase().contains("not tracked"),
@@ -673,8 +672,7 @@ mod tests {
         let err = registry
             .pending_bootstrap_requests()
             .await
-            .err()
-            .expect("expected error without sync");
+            .expect_err("expected error without sync");
         assert!(
             err.to_string().contains("Sync not enabled"),
             "unexpected error: {err}"
@@ -683,8 +681,7 @@ mod tests {
         let err = registry
             .approve_bootstrap_request("does-not-matter")
             .await
-            .err()
-            .expect("expected error without sync");
+            .expect_err("expected error without sync");
         assert!(
             err.to_string().contains("Sync not enabled"),
             "unexpected error: {err}"
@@ -697,8 +694,7 @@ mod tests {
         let err = registry
             .approve_bootstrap_request("not-a-real-id")
             .await
-            .err()
-            .expect("expected error for unknown id");
+            .expect_err("expected error for unknown id");
         assert!(
             err.to_string().contains("No bootstrap request"),
             "unexpected error: {err}"
@@ -711,8 +707,7 @@ mod tests {
         let err = registry
             .reject_bootstrap_request("not-a-real-id")
             .await
-            .err()
-            .expect("expected error for unknown id");
+            .expect_err("expected error for unknown id");
         assert!(
             err.to_string().contains("No bootstrap request"),
             "unexpected error: {err}"
