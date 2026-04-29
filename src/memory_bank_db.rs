@@ -225,6 +225,7 @@ mod tests {
                 key: "hello".to_string(),
                 value: "world".to_string(),
                 timestamp: Utc::now(),
+                tags: vec![],
             })
             .await
             .unwrap();

@@ -59,37 +59,42 @@ fn str_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing '{name}' argument"))
 }
 
-/// Schema for `remember` (Memory Banks Stage 9.C). Adds an optional
-/// `bank` parameter. When omitted, writes to the agent's own memory.
-/// When present, looks the name up in the agent's `memory_banks`
-/// subtree and writes to that bank's `memory` store — requires Write
-/// permission on the bank.
+/// Schema for `remember`. Optional `bank` routes to a shared bank
+/// instead of self-memory; optional `tags` attach free-form labels for
+/// later recall filtering.
 fn write_schema_banks() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "key":   { "type": "string", "description": "A short descriptive label for this fact (e.g. 'user_name', 'project_deadline')" },
             "value": { "type": "string", "description": "The fact to remember" },
+            "tags":  { "type": "array", "items": { "type": "string" }, "description": "Optional: free-form labels for later filtering with recall (e.g. ['project', 'urgent'])." },
             "bank":  { "type": "string", "description": "Optional: name of a shared memory bank this agent has been granted Write access to. Omit to write to your own memory. Use the list_memory_banks tool to discover accessible banks." }
         },
         "required": ["key", "value"]
     })
 }
 
-/// Schema for `recall` (Memory Banks Stage 9.C). Adds an optional
-/// `bank` parameter — same lookup as `remember`, requires Read permission.
+/// Schema for `recall`. Ranks matches by BM25 over key + value + tags;
+/// optional `tags` AND-filter narrows to entries carrying every listed
+/// tag; optional `limit` caps the result count.
 fn read_schema_banks() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "query": { "type": "string", "description": "Keyword to search for in memory keys and values" },
+            "query": { "type": "string", "description": "Keywords to search for. Tokenized and ranked against entry keys, values, and tags. Pass an empty string to list entries by recency (useful with tags)." },
+            "tags":  { "type": "array", "items": { "type": "string" }, "description": "Optional: only return entries that carry every listed tag." },
+            "limit": { "type": "integer", "description": "Optional: cap the number of returned entries (default 10).", "minimum": 1 },
             "bank":  { "type": "string", "description": "Optional: name of a memory bank this agent has been granted Read access to. Omit to search your own memory. Use the list_memory_banks tool to discover accessible banks." }
         },
         "required": ["query"]
     })
 }
 
-/// Parse `{key, value}`, write the entry to `(db, store)`, return the
+/// Default cap on returned entries when the caller doesn't specify `limit`.
+const DEFAULT_RECALL_LIMIT: usize = 10;
+
+/// Parse `{key, value, tags?}`, write the entry to `(db, store)`, return the
 /// success string. Shared by `Remember`'s self-memory and bank paths.
 async fn do_remember(
     ctx: &ToolContext,
@@ -101,17 +106,19 @@ async fn do_remember(
 ) -> Result<String, String> {
     let key = str_arg(arguments, "key")?;
     let value = str_arg(arguments, "value")?;
+    let tags = string_array_arg(arguments, "tags");
     let entry = MemoryEntry {
         key: key.to_string(),
         value: value.to_string(),
         timestamp: Utc::now(),
+        tags,
     };
     write_memory_entry(db, store, entry).await?;
     debug!(agent = %ctx.agent_name, %key, scope = log_scope, "Stored memory");
     Ok(format!("{success_prefix}: {key} = {value}"))
 }
 
-/// Parse `{query}`, search `(db, store)`, return the formatted result.
+/// Parse `{query, tags?, limit?}`, search `(db, store)`, return the formatted result.
 /// Shared by `Recall`'s self-memory and bank paths.
 async fn do_recall(
     ctx: &ToolContext,
@@ -120,10 +127,31 @@ async fn do_recall(
     store: &str,
     log_scope: &'static str,
 ) -> Result<String, String> {
-    let query = str_arg(arguments, "query")?.to_lowercase();
-    let result = search_memory(db, store, &query).await?;
+    let query = str_arg(arguments, "query")?;
+    let tags_filter = string_array_arg(arguments, "tags");
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_RECALL_LIMIT)
+        .max(1);
+    let result = search_memory(db, store, query, &tags_filter, limit).await?;
     debug!(agent = %ctx.agent_name, %query, scope = log_scope, "Recalled memory");
     Ok(result)
+}
+
+/// Pull `name` as a string array from `arguments`. Missing or malformed
+/// values produce an empty vec — these are advisory, not load-bearing.
+fn string_array_arg(arguments: &Value, name: &str) -> Vec<String> {
+    arguments
+        .get(name)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Store a fact in the running agent's own persistent memory.
@@ -427,12 +455,23 @@ async fn write_memory_entry(
     Ok(())
 }
 
-/// Shared search for both scopes. Matches keys+values case-insensitively
-/// and dedupes by key (keeping the most recent entry).
+/// Search memory entries by BM25 relevance, optionally pre-filtered by
+/// tags, and return the top `limit` formatted as a Markdown list.
+///
+/// Pipeline:
+/// 1. Load every entry from the store and dedupe by `key` (most recent
+///    timestamp wins). The Table is append-only; the same `key` written
+///    twice yields two rows, and the older one is logically stale.
+/// 2. AND-filter by `tags_filter` (case-insensitive exact match per tag).
+/// 3. If `query` tokenizes to nothing, return the surviving entries by
+///    recency. If it does, BM25-score each entry's `key + value + tags`
+///    document against the query, drop zero-score entries, sort, truncate.
 async fn search_memory(
     database: &Database,
     store_name: &str,
     query: &str,
+    tags_filter: &[String],
+    limit: usize,
 ) -> Result<String, String> {
     let txn = database
         .new_transaction()
@@ -444,15 +483,9 @@ async fn search_memory(
         .map_err(|e| format!("Failed to open memory store: {e}"))?;
 
     let records = store
-        .search(|entry: &MemoryEntry| {
-            entry.key.to_lowercase().contains(query) || entry.value.to_lowercase().contains(query)
-        })
+        .search(|_: &MemoryEntry| true)
         .await
         .map_err(|e| format!("Failed to search memory: {e}"))?;
-
-    if records.is_empty() {
-        return Ok(format!("No memories found matching '{query}'."));
-    }
 
     let mut by_key: std::collections::HashMap<String, MemoryEntry> =
         std::collections::HashMap::new();
@@ -466,20 +499,152 @@ async fn search_memory(
             })
             .or_insert(entry);
     }
+    let entries: Vec<MemoryEntry> = by_key
+        .into_values()
+        .filter(|e| entry_has_all_tags(e, tags_filter))
+        .collect();
 
-    let result = by_key
-        .values()
-        .map(|m| {
-            format!(
-                "- **{}**: {} ({})",
-                m.key,
-                m.value,
-                m.timestamp.to_rfc3339()
-            )
-        })
+    if entries.is_empty() {
+        return Ok(no_results_message(query, tags_filter));
+    }
+
+    let query_tokens = tokenize(query);
+    let chosen: Vec<MemoryEntry> = if query_tokens.is_empty() {
+        let mut sorted = entries;
+        sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sorted.truncate(limit);
+        sorted
+    } else {
+        rank_bm25(&entries, &query_tokens, limit)
+    };
+
+    if chosen.is_empty() {
+        return Ok(no_results_message(query, tags_filter));
+    }
+
+    Ok(chosen
+        .iter()
+        .map(format_entry)
         .collect::<Vec<_>>()
-        .join("\n");
-    Ok(result)
+        .join("\n"))
+}
+
+fn entry_has_all_tags(entry: &MemoryEntry, required: &[String]) -> bool {
+    required.iter().all(|want| {
+        entry
+            .tags
+            .iter()
+            .any(|have| have.eq_ignore_ascii_case(want))
+    })
+}
+
+fn format_entry(m: &MemoryEntry) -> String {
+    if m.tags.is_empty() {
+        format!(
+            "- **{}**: {} ({})",
+            m.key,
+            m.value,
+            m.timestamp.to_rfc3339()
+        )
+    } else {
+        format!(
+            "- **{}**: {} [tags: {}] ({})",
+            m.key,
+            m.value,
+            m.tags.join(", "),
+            m.timestamp.to_rfc3339()
+        )
+    }
+}
+
+fn no_results_message(query: &str, tags_filter: &[String]) -> String {
+    match (query.trim().is_empty(), tags_filter.is_empty()) {
+        (true, true) => "No memories stored.".to_string(),
+        (true, false) => format!("No memories found with tags [{}].", tags_filter.join(", ")),
+        (false, true) => format!("No memories found matching '{query}'."),
+        (false, false) => format!(
+            "No memories found matching '{query}' with tags [{}].",
+            tags_filter.join(", ")
+        ),
+    }
+}
+
+/// Lowercase + split-on-non-alphanumeric tokenizer. No stemming or
+/// stopword removal — keep it dep-free; revisit if recall quality
+/// demands it. Tokens shorter than 2 chars are dropped to cut noise.
+fn tokenize(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(String::from)
+        .collect()
+}
+
+/// Standard BM25 ranking. `k1=1.5`, `b=0.75` are textbook defaults; not
+/// worth exposing as knobs at chaz scale (hundreds of entries per DB).
+/// Each entry's "document" is `key + value + tags`. Returns up to
+/// `limit` entries sorted by descending score; entries that don't match
+/// any query term are dropped.
+fn rank_bm25(entries: &[MemoryEntry], query_tokens: &[String], limit: usize) -> Vec<MemoryEntry> {
+    const K1: f64 = 1.5;
+    const B: f64 = 0.75;
+
+    let docs: Vec<Vec<String>> = entries.iter().map(|e| tokenize(&doc_text(e))).collect();
+    let n = docs.len() as f64;
+    if n == 0.0 {
+        return Vec::new();
+    }
+    let total_len: usize = docs.iter().map(|d| d.len()).sum();
+    let avg_dl = (total_len as f64 / n).max(1.0);
+
+    let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for doc in &docs {
+        let unique: std::collections::HashSet<&str> = doc.iter().map(String::as_str).collect();
+        for term in unique {
+            *df.entry(term).or_insert(0) += 1;
+        }
+    }
+
+    let mut scored: Vec<(f64, usize)> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, doc)| {
+            let dl = doc.len() as f64;
+            let mut score = 0.0_f64;
+            for q in query_tokens {
+                let q_str = q.as_str();
+                let tf = doc.iter().filter(|t| t.as_str() == q_str).count() as f64;
+                if tf == 0.0 {
+                    continue;
+                }
+                let df_q = *df.get(q_str).unwrap_or(&0) as f64;
+                let idf = ((n - df_q + 0.5) / (df_q + 0.5) + 1.0).ln();
+                let norm = tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
+                score += idf * norm;
+            }
+            (score, i)
+        })
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+
+    scored.sort_by(|(a, _), (b, _)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored
+        .into_iter()
+        .map(|(_, i)| entries[i].clone())
+        .collect()
+}
+
+fn doc_text(entry: &MemoryEntry) -> String {
+    let mut s = String::with_capacity(entry.key.len() + entry.value.len() + 8);
+    s.push_str(&entry.key);
+    s.push(' ');
+    s.push_str(&entry.value);
+    if !entry.tags.is_empty() {
+        s.push(' ');
+        s.push_str(&entry.tags.join(" "));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -811,5 +976,171 @@ mod tests {
         assert!(out.contains("Write"), "should show Write perm: {out}");
         assert!(out.contains("projects"), "should include projects: {out}");
         assert!(out.contains("Read"), "should show Read perm: {out}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage A — tags + BM25 ranked recall
+    // -------------------------------------------------------------------------
+
+    /// Helper: write a single fact with optional tags.
+    async fn put(remember: &Remember, ctx: &ToolContext, key: &str, value: &str, tags: &[&str]) {
+        let tags_json: Vec<Value> = tags.iter().map(|t| Value::String(t.to_string())).collect();
+        remember
+            .execute(
+                serde_json::json!({ "key": key, "value": value, "tags": tags_json }),
+                ctx,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remember_persists_tags_and_recall_renders_them() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember = Remember::new(registry.clone(), index.clone());
+        let recall = Recall::new(registry, index);
+        let ctx = make_ctx("alpha", session);
+
+        put(
+            &remember,
+            &ctx,
+            "deadline",
+            "ship by friday",
+            &["project", "urgent"],
+        )
+        .await;
+
+        let out = recall
+            .execute(serde_json::json!({ "query": "ship" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("ship by friday"), "missing value: {out}");
+        assert!(out.contains("tags:"), "missing tags marker: {out}");
+        assert!(out.contains("project"), "missing 'project' tag: {out}");
+        assert!(out.contains("urgent"), "missing 'urgent' tag: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_tags_and() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember = Remember::new(registry.clone(), index.clone());
+        let recall = Recall::new(registry, index);
+        let ctx = make_ctx("alpha", session);
+
+        put(&remember, &ctx, "k1", "alpha-fact", &["project"]).await;
+        put(&remember, &ctx, "k2", "beta-fact", &["project", "urgent"]).await;
+        put(&remember, &ctx, "k3", "gamma-fact", &["urgent"]).await;
+
+        // Filter by both tags — only the entry tagged with both should remain.
+        let out = recall
+            .execute(
+                serde_json::json!({
+                    "query": "fact",
+                    "tags": ["project", "urgent"],
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("beta-fact"), "expected k2: {out}");
+        assert!(!out.contains("alpha-fact"), "k1 leaked: {out}");
+        assert!(!out.contains("gamma-fact"), "k3 leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_honors_limit() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember = Remember::new(registry.clone(), index.clone());
+        let recall = Recall::new(registry, index);
+        let ctx = make_ctx("alpha", session);
+
+        for i in 0..5 {
+            put(&remember, &ctx, &format!("k{i}"), "shared keyword", &[]).await;
+        }
+        let out = recall
+            .execute(serde_json::json!({ "query": "shared", "limit": 2 }), &ctx)
+            .await
+            .unwrap();
+        // One entry per line; expect exactly two lines.
+        assert_eq!(out.lines().count(), 2, "expected 2 lines, got: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_empty_query_returns_by_recency() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember = Remember::new(registry.clone(), index.clone());
+        let recall = Recall::new(registry, index);
+        let ctx = make_ctx("alpha", session);
+
+        // Use distinct keys (dedup-by-key would otherwise collapse them)
+        // and tag every entry the same so we can exercise the tags-only
+        // filtering path without keyword scoring.
+        put(&remember, &ctx, "first", "old", &["log"]).await;
+        // Force a measurable timestamp gap.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        put(&remember, &ctx, "second", "new", &["log"]).await;
+
+        let out = recall
+            .execute(
+                serde_json::json!({ "query": "", "tags": ["log"], "limit": 10 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let pos_first = out.find("first").unwrap_or(usize::MAX);
+        let pos_second = out.find("second").unwrap_or(usize::MAX);
+        assert!(pos_first != usize::MAX, "missing first: {out}");
+        assert!(pos_second != usize::MAX, "missing second: {out}");
+        assert!(
+            pos_second < pos_first,
+            "more recent entry should sort first: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_ranks_more_relevant_first() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember = Remember::new(registry.clone(), index.clone());
+        let recall = Recall::new(registry, index);
+        let ctx = make_ctx("alpha", session);
+
+        // Three entries — only one mentions both "deploy" and "friday".
+        // BM25 should put it first.
+        put(&remember, &ctx, "ops_note_a", "deploy on monday", &[]).await;
+        put(&remember, &ctx, "ops_note_b", "deploy on friday", &[]).await;
+        put(&remember, &ctx, "ops_note_c", "weekly status", &[]).await;
+
+        let out = recall
+            .execute(serde_json::json!({ "query": "deploy friday" }), &ctx)
+            .await
+            .unwrap();
+        let pos_b = out.find("ops_note_b").unwrap_or(usize::MAX);
+        let pos_a = out.find("ops_note_a").unwrap_or(usize::MAX);
+        assert!(pos_b != usize::MAX, "missing best match: {out}");
+        assert!(
+            pos_b < pos_a,
+            "more relevant entry should rank first: {out}"
+        );
+        // The weekly status note shares no terms; should not appear.
+        assert!(
+            !out.contains("ops_note_c"),
+            "non-matching entry leaked: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_unknown_token_returns_no_results() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember = Remember::new(registry.clone(), index.clone());
+        let recall = Recall::new(registry, index);
+        let ctx = make_ctx("alpha", session);
+
+        put(&remember, &ctx, "k1", "the quick brown fox", &[]).await;
+
+        let out = recall
+            .execute(serde_json::json!({ "query": "zyxwvut" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("No memories found"), "got: {out}");
     }
 }

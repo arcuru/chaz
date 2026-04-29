@@ -101,6 +101,10 @@ pub struct MemoryEntry {
     pub key: String,
     pub value: String,
     pub timestamp: DateTime<Utc>,
+    /// Free-form labels for filtering recall. Default empty for back-compat
+    /// with entries written before tags existed.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Record that this agent participated in a given session.
