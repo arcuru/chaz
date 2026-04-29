@@ -69,6 +69,10 @@ pub enum Command {
     ClearSessionName,
     /// Generate a shareable ticket URL for the current session.
     Share,
+    /// Stop sharing the current session — disable sync so the source peer
+    /// stops serving it to ticket holders. Does not revoke any keys that
+    /// may already be held by other peers.
+    SessionUnshare,
     /// Sync a remote session via ticket URL.
     Sync(String),
     /// Summarize and compact the current session's context.
@@ -116,6 +120,9 @@ pub enum Command {
     /// Unregister a Living Agent locally (index + runtime registry). The
     /// agent DB is preserved for archive — memory and history stay readable.
     AgentDelete(String),
+    /// Stop sharing an agent DB — disable sync so this peer stops serving
+    /// it. Does not revoke any keys held by peers who already imported it.
+    AgentUnshare(String),
     /// Edit a single field on a Living Agent's DB config. Takes effect on
     /// the next message via Stage 8 hydration — no restart needed.
     AgentSet {
@@ -168,6 +175,9 @@ pub enum Command {
     /// Generate a `DatabaseTicket` URL for a memory bank so another peer
     /// can import it via `/memory import`.
     MemoryShare(String),
+    /// Stop sharing a memory bank DB — disable sync so this peer stops
+    /// serving it. Does not revoke keys.
+    MemoryUnshare(String),
     /// Request access to a memory bank via eidetica's bootstrap workflow.
     /// Same flow as `AgentImport` — preseeded pubkey → sync proceeds;
     /// otherwise queued for `/sharing approve`. Default permission: write.
@@ -192,6 +202,10 @@ pub enum Command {
     /// requester's bootstrap retries will keep failing for the lifetime
     /// of the request entry.
     SharingReject(String),
+    /// List every database this peer is currently sharing (sync enabled),
+    /// grouped by kind (agent / memory bank / session). Shows display
+    /// names when available and root IDs for unambiguous identification.
+    SharingStatus,
 
     // --- Heartbeat rules (Stage 4b) ---
     /// Add or upsert a heartbeat rule on the current session.
@@ -272,6 +286,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::NameSession(name) => session::name_session(&name, ctx).await,
         Command::ClearSessionName => session::clear_session_name(ctx).await,
         Command::Share => session::share(ctx).await,
+        Command::SessionUnshare => session::unshare(ctx).await,
         Command::Sync(ticket) => session::sync_ticket(&ticket, ctx).await,
         Command::Compact => session::compact(ctx).await,
         Command::Print => session::print_transcript(ctx).await,
@@ -282,6 +297,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentSetHost(arg) => agent::agent_set_host(arg.as_deref(), ctx).await,
         Command::AgentNew { name, overrides } => agent::agent_new(&name, &overrides, ctx).await,
         Command::AgentShare(r) => agent::agent_share(&r, ctx).await,
+        Command::AgentUnshare(r) => agent::agent_unshare(&r, ctx).await,
         Command::AgentImport { ticket, permission } => {
             agent::agent_import(&ticket, permission, ctx).await
         }
@@ -316,12 +332,14 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             agent_ref,
         } => memory::memory_revoke(&bank_ref, &agent_ref, ctx).await,
         Command::MemoryShare(r) => memory::memory_share(&r, ctx).await,
+        Command::MemoryUnshare(r) => memory::memory_unshare(&r, ctx).await,
         Command::MemoryImport { ticket, permission } => {
             memory::memory_import(&ticket, permission, ctx).await
         }
         Command::SharingRequests => sharing::sharing_requests(ctx).await,
         Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
         Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
+        Command::SharingStatus => sharing::sharing_status(ctx).await,
         Command::HeartbeatAdd {
             id,
             cron,

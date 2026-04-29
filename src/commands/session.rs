@@ -203,6 +203,17 @@ pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
+/// Disable sync on the current session so this peer stops serving it.
+pub(super) async fn unshare(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let db_id = ctx.session_db.root_id().clone();
+    match ctx.server.registry().disable_sync_for(&db_id).await {
+        Ok(()) => CommandOutcome::Text(
+            "Sync disabled for this session — it is no longer shared.".to_string(),
+        ),
+        Err(e) => CommandOutcome::Error(format!("Failed to disable sync: {e}")),
+    }
+}
+
 pub(super) async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
         Ok(t) => t,

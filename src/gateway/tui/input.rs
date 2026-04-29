@@ -213,6 +213,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
         "/share" => return Some(ChatAction::Dispatch(Command::Share)),
+        "/unshare" => return Some(ChatAction::Dispatch(Command::SessionUnshare)),
         "/compact" => return Some(ChatAction::Dispatch(Command::Compact)),
         "/schedules" => return Some(ChatAction::Dispatch(Command::ListSchedules)),
         "/info" => return Some(ChatAction::Dispatch(Command::Info)),
@@ -275,6 +276,14 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             return Some(ChatAction::Dispatch(Command::AgentShare(r)));
         }
         show_error(app, "Usage: /agent share <name|db_id>".to_string());
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/agent unshare ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::AgentUnshare(r)));
+        }
+        show_error(app, "Usage: /agent unshare <name|db_id>".to_string());
         return None;
     }
     if let Some(arg) = text.strip_prefix("/agent import ") {
@@ -486,6 +495,14 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         show_error(app, "Usage: /memory share <bank>".to_string());
         return None;
     }
+    if let Some(arg) = text.strip_prefix("/memory unshare ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::MemoryUnshare(r)));
+        }
+        show_error(app, "Usage: /memory unshare <bank>".to_string());
+        return None;
+    }
     if let Some(arg) = text.strip_prefix("/memory import ") {
         let trimmed = arg.trim();
         let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -521,7 +538,10 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
 
     // Bootstrap-queue surface (Co-owned Stage 11). Single namespace
     // covering pending requests across every kind of resource.
-    if text == "/sharing requests" || text == "/sharing" {
+    if text == "/sharing" || text == "/sharing status" {
+        return Some(ChatAction::Dispatch(Command::SharingStatus));
+    }
+    if text == "/sharing requests" || text == "/sharing list" {
         return Some(ChatAction::Dispatch(Command::SharingRequests));
     }
     if let Some(arg) = text.strip_prefix("/sharing approve ") {

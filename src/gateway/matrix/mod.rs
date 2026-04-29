@@ -456,6 +456,12 @@ impl Gateway for MatrixGateway {
             |_t| { Some(Command::Share) }
         );
         register_shared!(
+            "unshare",
+            "".to_string(),
+            "Stop sharing the current session",
+            |_t| { Some(Command::SessionUnshare) }
+        );
+        register_shared!(
             "sync",
             "<ticket>".to_string(),
             "Sync a remote session via ticket URL",
@@ -548,6 +554,9 @@ impl Gateway for MatrixGateway {
                         Some(Command::AgentDelete(rest.to_string()))
                     }
                     "share" if !rest.is_empty() => Some(Command::AgentShare(rest.to_string())),
+                    "unshare" if !rest.is_empty() => {
+                        Some(Command::AgentUnshare(rest.to_string()))
+                    }
                     "import" if !rest.is_empty() => (|| {
                         let mut parts = rest.splitn(2, char::is_whitespace);
                         let ticket = parts.next().unwrap_or("").trim();
@@ -679,6 +688,9 @@ impl Gateway for MatrixGateway {
                         }
                     }
                     "share" if !rest.is_empty() => Some(Command::MemoryShare(rest.to_string())),
+                    "unshare" if !rest.is_empty() => {
+                        Some(Command::MemoryUnshare(rest.to_string()))
+                    }
                     "import" if !rest.is_empty() => (|| {
                         let mut parts = rest.splitn(2, char::is_whitespace);
                         let ticket = parts.next().unwrap_or("").trim();
@@ -703,15 +715,16 @@ impl Gateway for MatrixGateway {
         // --- Bootstrap-queue surface (Co-owned Stage 11) ---
         register_shared!(
             "sharing",
-            "requests | approve <id> | reject <id>".to_string(),
-            "Manage bootstrap requests across agent/bank/session DBs",
+            "status | requests | approve <id> | reject <id>".to_string(),
+            "Inspect shared DBs / manage bootstrap requests across agent/bank/session DBs",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
                 let sub = parts.next().unwrap_or("").trim();
                 let rest = parts.next().unwrap_or("").trim();
                 match sub {
-                    "" | "requests" | "list" => Some(Command::SharingRequests),
+                    "" | "status" => Some(Command::SharingStatus),
+                    "requests" | "list" => Some(Command::SharingRequests),
                     "approve" if !rest.is_empty() => {
                         Some(Command::SharingApprove(rest.to_string()))
                     }

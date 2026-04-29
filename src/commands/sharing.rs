@@ -105,6 +105,58 @@ pub(super) async fn sharing_reject(request_id: &str, ctx: &CommandContext<'_>) -
     }
 }
 
+/// List every database this peer is currently sharing (sync enabled).
+/// Walks the user's tracked databases, classifies each by cross-referencing
+/// with the hosted indices, and renders a table showing kind, display name
+/// (when known), and DB root ID.
+pub(super) async fn sharing_status(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let user = ctx.server.registry().user_lock().await;
+    let tracked = match user.databases().await {
+        Ok(dbs) => dbs,
+        Err(e) => return CommandOutcome::Error(format!("Failed to list databases: {e}")),
+    };
+    let agent_index = ctx.server.agent_index();
+    let bank_index = ctx.server.memory_bank_index();
+
+    let shared: Vec<_> = tracked
+        .into_iter()
+        .filter(|tdb| tdb.sync_settings.sync_enabled)
+        .collect();
+
+    if shared.is_empty() {
+        return CommandOutcome::Text("No databases are currently being shared.".to_string());
+    }
+
+    let mut lines: Vec<String> = Vec::with_capacity(shared.len() + 2);
+    lines.push(format!("Sharing {} database(s):", shared.len()));
+    lines.push(String::new());
+
+    for tdb in &shared {
+        let kind = if agent_index.find_by_id(&tdb.database_id).is_some() {
+            "agent     "
+        } else if bank_index.find_by_id(&tdb.database_id).is_some() {
+            "bank      "
+        } else {
+            // Sessions are tracked by eidetica but not in either hosted index.
+            // The registry's `sessions` store is the canonical session list.
+            "session   "
+        };
+        let db_id = tdb.database_id.to_string();
+        let short_id = &db_id[..8.min(db_id.len())];
+        lines.push(format!("  {kind}  {short_id}…  {}", tdb.database_id));
+    }
+
+    // Append the sync server address so users know what address to put in tickets.
+    if let Some(sync) = ctx.server.registry().instance().sync() {
+        if let Ok(addr) = sync.get_server_address().await {
+            lines.push(String::new());
+            lines.push(format!("Sync server address: {addr}"));
+        }
+    }
+
+    CommandOutcome::Text(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{dispatch, Command, CommandContext, CommandOutcome};
@@ -138,6 +190,7 @@ mod tests {
             mcp_server_dir: None,
             context: None,
             web_search: None,
+            sync_listen: None,
         }
     }
 
@@ -294,5 +347,59 @@ mod tests {
             CommandOutcome::SessionSwitched(_) => "SessionSwitched",
             CommandOutcome::Quit => "Quit",
         }
+    }
+
+    #[tokio::test]
+    async fn sharing_status_empty_when_nothing_shared() {
+        let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(Command::SharingStatus, &ctx).await {
+            CommandOutcome::Text(msg) => {
+                assert!(
+                    msg.contains("No databases are currently being shared"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Text, got {:?}", outcome_kind(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn sharing_status_shows_enabled() {
+        let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+        // Enable sync on the session DB — it should appear in the status output.
+        let db_id = sdb.root_id().clone();
+        ctx.server.registry().enable_sync_for(&db_id).await.unwrap();
+
+        match dispatch(Command::SharingStatus, &ctx).await {
+            CommandOutcome::Text(msg) => {
+                assert!(msg.contains("Sharing 1 database"), "got: {msg}");
+                assert!(msg.contains("session"), "got: {msg}");
+                assert!(msg.contains(&sid[..8]), "got: {msg}");
+            }
+            other => panic!("expected Text, got {:?}", outcome_kind(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_unshare_disables_sync() {
+        let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+        // Enable sync so we have something to disable
+        let db_id = sdb.root_id().clone();
+        ctx.server.registry().enable_sync_for(&db_id).await.unwrap();
+        assert!(ctx.server.registry().is_sync_enabled_for(&db_id).await.unwrap());
+
+        match dispatch(Command::SessionUnshare, &ctx).await {
+            CommandOutcome::Text(msg) => {
+                assert!(msg.contains("no longer shared"), "got: {msg}");
+            }
+            other => panic!("expected Text, got {:?}", outcome_kind(&other)),
+        }
+
+        assert!(!ctx.server.registry().is_sync_enabled_for(&db_id).await.unwrap());
     }
 }
