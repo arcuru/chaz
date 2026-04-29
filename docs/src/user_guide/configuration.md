@@ -114,6 +114,11 @@ web_search:
     - type: brave
       api_key: "${BRAVE_API_KEY}"
     - type: duckduckgo
+
+# Optional: expose eidetica sync on an HTTP port alongside the default iroh P2P transport.
+# Useful for debugging or when the remote peer doesn't have iroh connectivity.
+# Omit this field to use iroh P2P only (stable peer identity, no address needed).
+# sync_listen: "0.0.0.0:8765"
 ```
 
 ## Web search

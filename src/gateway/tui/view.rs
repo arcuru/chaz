@@ -137,9 +137,13 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
             "request access to a bank via ticket [admin|write|read]",
         ),
         ("# Sharing queue", ""),
+        ("/sharing", "list databases this peer is sharing"),
         ("/sharing requests", "list pending bootstrap requests"),
         ("/sharing approve ", "approve a request by id"),
         ("/sharing reject ", "reject a request by id"),
+        ("/unshare", "stop sharing the current session"),
+        ("/agent unshare ", "stop sharing an agent DB"),
+        ("/memory unshare ", "stop sharing a memory bank"),
         ("# Heartbeat", ""),
         ("/heartbeat list", "list heartbeat rules on this session"),
         (

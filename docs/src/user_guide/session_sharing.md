@@ -105,7 +105,9 @@ This is the right shape when the two peers can communicate out-of-band before th
 
 Memory banks use the same `/memory share` + `/memory import [perm]` shape. Sessions use `/share` + `/sync <ticket>` — sessions don't have a permission flag because session sharing today implies write access.
 
-The `/sharing` command surface is unified across kinds: `/sharing requests`, `/sharing approve <id>`, `/sharing reject <id>` operate on the single eidetica request queue regardless of whether the request is for an agent, bank, or session DB. The list output names the resource when the target DB is hosted on this peer.
+The `/sharing` command surface is unified across kinds. Bare `/sharing` (or `/sharing status`) lists every database this peer is currently sharing, grouped by kind with DB root IDs. `/sharing requests`, `/sharing approve <id>`, `/sharing reject <id>` operate on the single eidetica request queue regardless of whether the request is for an agent, bank, or session DB. The list output names the resource when the target DB is hosted on this peer.
+
+To stop sharing a database — without revoking keys already held by peers who imported it — use `/unshare` for the current session, `/agent unshare <ref>` for an agent, or `/memory unshare <bank>` for a memory bank.
 
 ### After approval
 
@@ -149,7 +151,7 @@ Eidetica doesn't push approved requests back to the requester — the request_id
 - The sync server binds to a random port by default
 - Firewalls must allow the sync port (check the startup log for the address)
 - Both instances use separate eidetica databases (separate `state_dir` paths)
-- Sharing a database flips its `sync_enabled` flag on the source peer; this persists across restarts. To stop advertising a DB, the source peer can re-create the ticket but a `/unshare` command isn't built yet — track it on the followups list.
+- Sharing a database flips its `sync_enabled` flag on the source peer; this persists across restarts. To stop sharing a DB, use `/unshare` (session), `/agent unshare <ref>`, or `/memory unshare <bank>`.
 
 ## Ticket Format
 
@@ -185,11 +187,11 @@ Expected when the receiver's pubkey isn't preseeded. The owner needs to run `/sh
 You ran `/sharing approve` on a peer that doesn't own the target DB. Only the original creator (Admin(0)) or a co-admin (Admin(1)) can approve. Run it on the peer that hosts the agent/bank/session.
 
 **Tickets stop working after a restart.**
-The sync server picks a random port at each startup, so a ticket minted in one session encodes an address that's stale after the source peer restarts. Workaround: regenerate the ticket after the source restarts. Tracked as "configurable sync server address" in the followups.
+With the default iroh P2P transport, peer identity is stable across restarts — tickets continue to work. If you're using the optional HTTP transport (`sync_listen` config), tickets carry the listen address and will go stale if the address changes. Either use a fixed address or switch to iroh-only (omit `sync_listen`).
 
 ## Limitations
 
-- The sync server address/port is not yet configurable (random port per restart).
+- The sync server address/port is configurable via `sync_listen` for the HTTP transport; the default iroh P2P transport doesn't need one.
 - No authentication on the sync connection beyond the ticket capability and per-DB auth keys (any peer with the ticket can reach the source's sync server; whether they can read/write a specific DB is gated by eidetica's `AuthSettings`).
 - Registry index entries (Matrix channel bindings, name index) are local to each peer — only the database contents (entries + meta) sync.
 - To make a synced session reachable from a specific Matrix room on the receiver, run `!chaz attach <name-or-id>` in that room after syncing.

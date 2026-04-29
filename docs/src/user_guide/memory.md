@@ -72,6 +72,7 @@ Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix us
 | `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB. |
 | `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                      |
 | `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                     |
+| `/memory unshare <bank>`                     | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.                                        |
 | `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.      |
 
 Refs accept either a display name or an eidetica DB ID.
