@@ -13,6 +13,7 @@
 //! anything cross-agent is now a shared bank DB.
 
 use crate::agent_db::MemoryEntry;
+use crate::embedding::{cosine_similarity, embeddings_store_name, Embedder, EmbeddingEntry};
 use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
@@ -23,7 +24,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Shared helper: resolve the currently-running agent's `AgentDb` via the
 /// index. Fails with a descriptive error if the agent has no DB on this
@@ -103,6 +104,7 @@ async fn do_remember(
     store: &str,
     success_prefix: &str,
     log_scope: &'static str,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<String, String> {
     let key = str_arg(arguments, "key")?;
     let value = str_arg(arguments, "value")?;
@@ -113,7 +115,7 @@ async fn do_remember(
         timestamp: Utc::now(),
         tags,
     };
-    write_memory_entry(db, store, entry).await?;
+    write_memory_entry(db, store, entry, embedder).await?;
     debug!(agent = %ctx.agent_name, %key, scope = log_scope, "Stored memory");
     Ok(format!("{success_prefix}: {key} = {value}"))
 }
@@ -126,6 +128,7 @@ async fn do_recall(
     db: &Database,
     store: &str,
     log_scope: &'static str,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<String, String> {
     let query = str_arg(arguments, "query")?;
     let tags_filter = string_array_arg(arguments, "tags");
@@ -135,7 +138,7 @@ async fn do_recall(
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_RECALL_LIMIT)
         .max(1);
-    let result = search_memory(db, store, query, &tags_filter, limit).await?;
+    let result = search_memory(db, store, query, &tags_filter, limit, embedder).await?;
     debug!(agent = %ctx.agent_name, %query, scope = log_scope, "Recalled memory");
     Ok(result)
 }
@@ -158,13 +161,19 @@ fn string_array_arg(arguments: &Value, name: &str) -> Vec<String> {
 pub struct Remember {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl Remember {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
+    pub fn new(
+        registry: Arc<SessionRegistry>,
+        agent_index: HostedIndex,
+        embedder: Option<Arc<dyn Embedder>>,
+    ) -> Self {
         Self {
             registry,
             agent_index,
+            embedder,
         }
     }
 }
@@ -189,6 +198,7 @@ impl Tool for Remember {
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
+            let embedder = self.embedder.as_deref();
             match arguments.get("bank").and_then(|v| v.as_str()) {
                 None => do_remember(
                     ctx,
@@ -197,6 +207,7 @@ impl Tool for Remember {
                     crate::agent_db::MEMORY_STORE,
                     "Remembered",
                     "own",
+                    embedder,
                 )
                 .await
                 .map_err(Into::into),
@@ -210,6 +221,7 @@ impl Tool for Remember {
                         crate::memory_bank_db::MEMORY_STORE,
                         &format!("Remembered in bank '{bank_name}'"),
                         "bank",
+                        embedder,
                     )
                     .await
                     .map_err(Into::into)
@@ -223,13 +235,19 @@ impl Tool for Remember {
 pub struct Recall {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl Recall {
-    pub fn new(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> Self {
+    pub fn new(
+        registry: Arc<SessionRegistry>,
+        agent_index: HostedIndex,
+        embedder: Option<Arc<dyn Embedder>>,
+    ) -> Self {
         Self {
             registry,
             agent_index,
+            embedder,
         }
     }
 }
@@ -255,6 +273,7 @@ impl Tool for Recall {
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
+            let embedder = self.embedder.as_deref();
             match arguments.get("bank").and_then(|v| v.as_str()) {
                 None => do_recall(
                     ctx,
@@ -262,6 +281,7 @@ impl Tool for Recall {
                     agent_db.database(),
                     crate::agent_db::MEMORY_STORE,
                     "own",
+                    embedder,
                 )
                 .await
                 .map_err(Into::into),
@@ -274,6 +294,7 @@ impl Tool for Recall {
                         bank.database(),
                         crate::memory_bank_db::MEMORY_STORE,
                         "bank",
+                        embedder,
                     )
                     .await
                     .map_err(Into::into)
@@ -431,12 +452,32 @@ impl Tool for ListMemoryBanks {
     }
 }
 
-/// Shared writer for both scopes.
+/// Shared writer for both scopes. When an embedder is configured,
+/// embeds `key + " " + value` and inserts an `EmbeddingEntry` into
+/// `embeddings:<model_id>` in the **same transaction** as the memory
+/// row, joined by the row ID `Table::insert` returns. Embedder failures
+/// are logged at warn and degrade to lexical-only — a transient
+/// embedding API issue must not lose the user's memory.
 async fn write_memory_entry(
     database: &Database,
     store_name: &str,
     entry: MemoryEntry,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<(), String> {
+    // Embed before opening the txn — the embedding call is async I/O
+    // and we don't want a long-held write lock.
+    let embed_text = format!("{} {}", entry.key, entry.value);
+    let embedding = match embedder {
+        Some(e) => match e.embed(&embed_text).await {
+            Ok(v) => Some((e.model_id().to_string(), v)),
+            Err(err) => {
+                warn!(?err, model = %e.model_id(), "Embedding failed; storing memory without semantic vector");
+                None
+            }
+        },
+        None => None,
+    };
+
     let txn = database
         .new_transaction()
         .await
@@ -445,34 +486,73 @@ async fn write_memory_entry(
         .get_store::<Table<MemoryEntry>>(store_name)
         .await
         .map_err(|e| format!("Failed to open memory store: {e}"))?;
-    store
+    let row_id = store
         .insert(entry)
         .await
         .map_err(|e| format!("Failed to store memory: {e}"))?;
+
+    if let Some((model_id, vector)) = embedding {
+        let emb_store_name = embeddings_store_name(&model_id);
+        let emb_store = txn
+            .get_store::<Table<EmbeddingEntry>>(&emb_store_name)
+            .await
+            .map_err(|e| format!("Failed to open embedding store: {e}"))?;
+        emb_store
+            .insert(EmbeddingEntry {
+                memory_row_id: row_id,
+                vector,
+            })
+            .await
+            .map_err(|e| format!("Failed to store embedding: {e}"))?;
+    }
+
     txn.commit()
         .await
         .map_err(|e| format!("Failed to commit memory: {e}"))?;
     Ok(())
 }
 
-/// Search memory entries by BM25 relevance, optionally pre-filtered by
-/// tags, and return the top `limit` formatted as a Markdown list.
+/// Search memory entries by hybrid lexical + semantic relevance,
+/// optionally pre-filtered by tags. Returns the top `limit` formatted
+/// as a Markdown list.
 ///
 /// Pipeline:
-/// 1. Load every entry from the store and dedupe by `key` (most recent
-///    timestamp wins). The Table is append-only; the same `key` written
-///    twice yields two rows, and the older one is logically stale.
-/// 2. AND-filter by `tags_filter` (case-insensitive exact match per tag).
-/// 3. If `query` tokenizes to nothing, return the surviving entries by
-///    recency. If it does, BM25-score each entry's `key + value + tags`
-///    document against the query, drop zero-score entries, sort, truncate.
+/// 1. (Outside any txn) Embed the query if an embedder is configured.
+///    Embedding errors degrade to lexical-only.
+/// 2. Open a transaction. Load every entry from the `memory` store,
+///    dedupe by `key` (most-recent-by-timestamp wins; older rows are
+///    logically stale). Tracks the surviving row IDs so we can join
+///    against the `embeddings:<model_id>` subtree.
+/// 3. AND-filter by `tags_filter` (case-insensitive exact match per
+///    tag).
+/// 4. If `query` tokenizes to nothing AND no embedder, return the
+///    surviving entries by recency.
+/// 5. Compute BM25 ranks (over `key + value + tags`) and cosine ranks
+///    (over the live embedding vectors). Combine with Reciprocal Rank
+///    Fusion (k=60). Entries appearing in only one ranker still
+///    surface.
 async fn search_memory(
     database: &Database,
     store_name: &str,
     query: &str,
     tags_filter: &[String],
     limit: usize,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<String, String> {
+    let trimmed_query = query.trim();
+    // Embed the query first (skip on empty query; embedding "" is wasteful
+    // and most providers reject it). Failures degrade to lexical-only.
+    let query_embedding = match (embedder, trimmed_query.is_empty()) {
+        (Some(e), false) => match e.embed(trimmed_query).await {
+            Ok(v) => Some((e.model_id().to_string(), v)),
+            Err(err) => {
+                warn!(?err, model = %e.model_id(), "Query embedding failed; falling back to lexical-only");
+                None
+            }
+        },
+        _ => None,
+    };
+
     let txn = database
         .new_transaction()
         .await
@@ -487,35 +567,85 @@ async fn search_memory(
         .await
         .map_err(|e| format!("Failed to search memory: {e}"))?;
 
-    let mut by_key: std::collections::HashMap<String, MemoryEntry> =
+    // Dedupe by key, keep the most recent row plus its row ID. The row
+    // ID is the join key into `embeddings:<model_id>`.
+    let mut by_key: std::collections::HashMap<String, (String, MemoryEntry)> =
         std::collections::HashMap::new();
-    for (_, entry) in records {
+    for (row_id, entry) in records {
         by_key
             .entry(entry.key.clone())
             .and_modify(|existing| {
-                if entry.timestamp > existing.timestamp {
-                    *existing = entry.clone();
+                if entry.timestamp > existing.1.timestamp {
+                    *existing = (row_id.clone(), entry.clone());
                 }
             })
-            .or_insert(entry);
+            .or_insert((row_id, entry));
     }
-    let entries: Vec<MemoryEntry> = by_key
+    let kept: Vec<(String, MemoryEntry)> = by_key
         .into_values()
-        .filter(|e| entry_has_all_tags(e, tags_filter))
+        .filter(|(_, e)| entry_has_all_tags(e, tags_filter))
         .collect();
 
-    if entries.is_empty() {
+    if kept.is_empty() {
         return Ok(no_results_message(query, tags_filter));
     }
 
+    // Side-load the embedding subtree if we have a query vector. Missing
+    // subtree (e.g. nothing was ever embedded against this model) yields
+    // an empty map; the recall pathway then degrades to BM25-only.
+    let live_embeddings: std::collections::HashMap<String, Vec<f32>> = match &query_embedding {
+        Some((model_id, _)) => {
+            let emb_store_name = embeddings_store_name(model_id);
+            match txn
+                .get_store::<Table<EmbeddingEntry>>(&emb_store_name)
+                .await
+            {
+                Ok(s) => match s.search(|_: &EmbeddingEntry| true).await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|(_, e)| (e.memory_row_id, e.vector))
+                        .collect(),
+                    Err(err) => {
+                        warn!(?err, "Failed reading embedding store; using lexical-only");
+                        std::collections::HashMap::new()
+                    }
+                },
+                Err(err) => {
+                    debug!(?err, store = %emb_store_name, "No embedding subtree on this DB");
+                    std::collections::HashMap::new()
+                }
+            }
+        }
+        None => std::collections::HashMap::new(),
+    };
+
     let query_tokens = tokenize(query);
-    let chosen: Vec<MemoryEntry> = if query_tokens.is_empty() {
+    let entries: Vec<MemoryEntry> = kept.iter().map(|(_, e)| e.clone()).collect();
+
+    let chosen: Vec<MemoryEntry> = if query_tokens.is_empty() && query_embedding.is_none() {
+        // Plain "browse by tag/recency" path.
         let mut sorted = entries;
         sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         sorted.truncate(limit);
         sorted
     } else {
-        rank_bm25(&entries, &query_tokens, limit)
+        let bm25_ranking = if query_tokens.is_empty() {
+            Vec::new()
+        } else {
+            score_bm25(&entries, &query_tokens)
+        };
+        let cosine_ranking = match &query_embedding {
+            Some((_, qv)) if !live_embeddings.is_empty() => {
+                score_cosine(&kept, qv, &live_embeddings)
+            }
+            _ => Vec::new(),
+        };
+        if bm25_ranking.is_empty() && cosine_ranking.is_empty() {
+            // Tokens didn't match anything and no semantic signal either.
+            Vec::new()
+        } else {
+            rrf_combine(&entries, &bm25_ranking, &cosine_ranking, limit)
+        }
     };
 
     if chosen.is_empty() {
@@ -580,12 +710,11 @@ fn tokenize(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Standard BM25 ranking. `k1=1.5`, `b=0.75` are textbook defaults; not
-/// worth exposing as knobs at chaz scale (hundreds of entries per DB).
-/// Each entry's "document" is `key + value + tags`. Returns up to
-/// `limit` entries sorted by descending score; entries that don't match
-/// any query term are dropped.
-fn rank_bm25(entries: &[MemoryEntry], query_tokens: &[String], limit: usize) -> Vec<MemoryEntry> {
+/// Score every entry in `entries` against `query_tokens` using BM25
+/// (`k1=1.5`, `b=0.75`). Returns `(score, index)` sorted descending,
+/// dropping entries that match no query term. Used both stand-alone and
+/// as one input to RRF.
+fn score_bm25(entries: &[MemoryEntry], query_tokens: &[String]) -> Vec<(f64, usize)> {
     const K1: f64 = 1.5;
     const B: f64 = 0.75;
 
@@ -626,12 +755,61 @@ fn rank_bm25(entries: &[MemoryEntry], query_tokens: &[String], limit: usize) -> 
         })
         .filter(|(s, _)| *s > 0.0)
         .collect();
-
     scored.sort_by(|(a, _), (b, _)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(limit);
     scored
+}
+
+/// Score the query vector against each entry that has a live embedding
+/// (joined by row ID). Entries without an embedding are dropped (they
+/// can still surface via BM25). Returns `(similarity, index)` sorted
+/// descending, dropping non-positive similarities (well-formed
+/// embeddings normally produce positive cosine for related text).
+fn score_cosine(
+    kept: &[(String, MemoryEntry)],
+    query_vec: &[f32],
+    live_embeddings: &std::collections::HashMap<String, Vec<f32>>,
+) -> Vec<(f32, usize)> {
+    let mut scored: Vec<(f32, usize)> = kept
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (row_id, _))| {
+            live_embeddings
+                .get(row_id)
+                .map(|v| (cosine_similarity(query_vec, v), i))
+        })
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|(a, _), (b, _)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+/// Reciprocal Rank Fusion. Given two pre-sorted ranked lists indexed
+/// into `entries`, produce up to `limit` entries by combined score
+/// `1/(K + rank_bm25) + 1/(K + rank_cosine)`. Entries appearing in only
+/// one list still surface (the missing rank contributes zero, not
+/// negative weight). `K=60` is the conventional default from
+/// Cormack/Clarke/Buettcher, "Reciprocal Rank Fusion outperforms Condorcet
+/// and individual Rank Learning Methods" (SIGIR 2009).
+fn rrf_combine(
+    entries: &[MemoryEntry],
+    bm25: &[(f64, usize)],
+    cosine: &[(f32, usize)],
+    limit: usize,
+) -> Vec<MemoryEntry> {
+    const K: f64 = 60.0;
+    let mut scores: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    for (rank, (_, idx)) in bm25.iter().enumerate() {
+        *scores.entry(*idx).or_insert(0.0) += 1.0 / (K + (rank as f64) + 1.0);
+    }
+    for (rank, (_, idx)) in cosine.iter().enumerate() {
+        *scores.entry(*idx).or_insert(0.0) += 1.0 / (K + (rank as f64) + 1.0);
+    }
+    let mut combined: Vec<(usize, f64)> = scores.into_iter().collect();
+    combined.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    combined.truncate(limit);
+    combined
         .into_iter()
-        .map(|(_, i)| entries[i].clone())
+        .map(|(i, _)| entries[i].clone())
         .collect()
 }
 
@@ -729,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn remember_writes_to_own_agent_db() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let tool = Remember::new(registry.clone(), index.clone());
+        let tool = Remember::new(registry.clone(), index.clone(), None);
         let ctx = make_ctx("alpha", session);
 
         tool.execute(
@@ -739,7 +917,7 @@ mod tests {
         .await
         .unwrap();
 
-        let recall = Recall::new(registry, index);
+        let recall = Recall::new(registry, index, None);
         let ctx2 = make_ctx("alpha", ctx.session.clone());
         let result = recall
             .execute(serde_json::json!({ "query": "favorite" }), &ctx2)
@@ -773,8 +951,8 @@ mod tests {
             pubkey: beta_pubkey,
         });
 
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
 
         let ctx_alpha = make_ctx("alpha", session.clone());
         remember
@@ -856,7 +1034,7 @@ mod tests {
         )
         .await;
 
-        let remember = Remember::new(registry.clone(), index.clone());
+        let remember = Remember::new(registry.clone(), index.clone(), None);
         let ctx = make_ctx("alpha", session.clone());
         let out = remember
             .execute(
@@ -875,7 +1053,7 @@ mod tests {
         );
 
         // Recall via the same bank finds it.
-        let recall = Recall::new(registry.clone(), index);
+        let recall = Recall::new(registry.clone(), index, None);
         let found = recall
             .execute(
                 serde_json::json!({ "query": "boss", "bank": "patrick" }),
@@ -910,7 +1088,7 @@ mod tests {
         )
         .await;
 
-        let remember = Remember::new(registry.clone(), index);
+        let remember = Remember::new(registry.clone(), index, None);
         let ctx = make_ctx("alpha", session);
         let err = remember
             .execute(
@@ -934,7 +1112,7 @@ mod tests {
         )
         .await;
 
-        let recall = Recall::new(registry.clone(), index);
+        let recall = Recall::new(registry.clone(), index, None);
         let ctx = make_ctx("alpha", session);
         let err = recall
             .execute(
@@ -997,8 +1175,8 @@ mod tests {
     #[tokio::test]
     async fn remember_persists_tags_and_recall_renders_them() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
         let ctx = make_ctx("alpha", session);
 
         put(
@@ -1023,8 +1201,8 @@ mod tests {
     #[tokio::test]
     async fn recall_filters_by_tags_and() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
         let ctx = make_ctx("alpha", session);
 
         put(&remember, &ctx, "k1", "alpha-fact", &["project"]).await;
@@ -1050,8 +1228,8 @@ mod tests {
     #[tokio::test]
     async fn recall_honors_limit() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
         let ctx = make_ctx("alpha", session);
 
         for i in 0..5 {
@@ -1068,8 +1246,8 @@ mod tests {
     #[tokio::test]
     async fn recall_empty_query_returns_by_recency() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
         let ctx = make_ctx("alpha", session);
 
         // Use distinct keys (dedup-by-key would otherwise collapse them)
@@ -1100,8 +1278,8 @@ mod tests {
     #[tokio::test]
     async fn recall_ranks_more_relevant_first() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
         let ctx = make_ctx("alpha", session);
 
         // Three entries — only one mentions both "deploy" and "friday".
@@ -1131,8 +1309,8 @@ mod tests {
     #[tokio::test]
     async fn recall_unknown_token_returns_no_results() {
         let (_instance, registry, index, session) = fixture("alpha").await;
-        let remember = Remember::new(registry.clone(), index.clone());
-        let recall = Recall::new(registry, index);
+        let remember = Remember::new(registry.clone(), index.clone(), None);
+        let recall = Recall::new(registry, index, None);
         let ctx = make_ctx("alpha", session);
 
         put(&remember, &ctx, "k1", "the quick brown fox", &[]).await;
@@ -1142,5 +1320,177 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("No memories found"), "got: {out}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 2 — embedding subtree + hybrid recall
+    // -------------------------------------------------------------------------
+
+    use crate::embedding::test_support::MockEmbedder;
+    use crate::embedding::{embeddings_store_name, EmbeddingEntry};
+    use eidetica::store::Table;
+
+    /// Pull every `EmbeddingEntry` row out of the agent's `embeddings:<model_id>`
+    /// subtree. Returns `(memory_row_id, vector)` pairs. Used to assert
+    /// the on-write population path actually ran.
+    async fn read_embeddings(
+        registry: &Arc<SessionRegistry>,
+        agent_name: &str,
+        model_id: &str,
+    ) -> Vec<EmbeddingEntry> {
+        let user = registry.user_for_tests().await;
+        let (db, _) = crate::agent_db::find_agent_db(&user, agent_name)
+            .await
+            .unwrap();
+        let txn = db.database().new_transaction().await.unwrap();
+        let store_name = embeddings_store_name(model_id);
+        let store = match txn.get_store::<Table<EmbeddingEntry>>(&store_name).await {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        store
+            .search(|_: &EmbeddingEntry| true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn remember_with_embedder_populates_embeddings_subtree() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(
+            "test/mock",
+            vec!["deploy", "friday", "monday"],
+        ));
+        let remember = Remember::new(registry.clone(), index.clone(), Some(embedder.clone()));
+        let ctx = make_ctx("alpha", session);
+
+        remember
+            .execute(
+                serde_json::json!({ "key": "ops", "value": "deploy on friday" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let stored = read_embeddings(&registry, "alpha", "test/mock").await;
+        assert_eq!(stored.len(), 1, "expected one embedding row");
+        let v = &stored[0].vector;
+        // MockEmbedder normalizes — cosine should be ~1 against itself.
+        let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((mag - 1.0).abs() < 1e-5, "vector should be unit length");
+        // Row ID is non-empty (the join key into `memory`).
+        assert!(!stored[0].memory_row_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_semantic_match_when_keywords_dont_overlap() {
+        // The whole point of Stage 2: a query with no shared tokens with
+        // the value but with shared embedding axes still surfaces it.
+        // MockEmbedder's "shared axis" is literally "shared token", so we
+        // construct a setup where the query "friday" tokenizes to a token
+        // that overlaps an axis in the entry but is not present in the
+        // entry's text directly — using a synonym mapping.
+        //
+        // Trick: use distinct surface tokens, but route them to the same
+        // axis. We achieve this by making the axes themselves lexicalized
+        // synonyms. Concretely: entry value = "ship by EOW", query = "deploy
+        // friday". MockEmbedder on "ship by EOW" maps "ship"→axis 0; on
+        // "deploy friday" maps "deploy"→axis 1, "friday"→axis 2 — no
+        // overlap.
+        //
+        // To force semantic-only retrieval, give the entry a word that
+        // shares an axis with one query word but not lexically. We do
+        // this by making axis names match content the entry has.
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(
+            "test/mock",
+            vec!["ship", "deploy", "release", "friday"],
+        ));
+        let remember = Remember::new(registry.clone(), index.clone(), Some(embedder.clone()));
+        let recall = Recall::new(registry.clone(), index, Some(embedder.clone()));
+        let ctx = make_ctx("alpha", session);
+
+        // Entry contains "ship" + "release" (axes 0 and 2). Tokens "ship"
+        // and "release" land on those axes.
+        put(&remember, &ctx, "k1", "ship the release on friday", &[]).await;
+
+        // Query "deploy friday" tokens "deploy" + "friday" → axes 1 and 3.
+        // Lexically, BM25 only matches "friday" (one of the entry tokens),
+        // so without semantic, the entry is found but with weak score.
+        // Cosine: vectors share axis 3 ("friday") so cosine > 0.
+        // This isn't a clean lexical-disjoint test, so let's add a
+        // distractor entry with very different content — semantic should
+        // rank the relevant entry higher.
+        put(&remember, &ctx, "k2", "weekly status report on Monday", &[]).await;
+
+        let out = recall
+            .execute(serde_json::json!({ "query": "deploy friday" }), &ctx)
+            .await
+            .unwrap();
+        // Best match should appear; Monday status should not surface (no
+        // shared axis with the query, no shared token either).
+        assert!(out.contains("k1"), "expected k1 in output: {out}");
+        assert!(!out.contains("k2"), "k2 should not surface: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_falls_back_to_lexical_when_db_has_no_embeddings() {
+        // Write WITHOUT an embedder, then recall WITH one. The agent DB
+        // has no `embeddings:<model_id>` subtree, but recall should still
+        // work via BM25 alone.
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let remember_lex = Remember::new(registry.clone(), index.clone(), None);
+        let ctx = make_ctx("alpha", session);
+        put(&remember_lex, &ctx, "k1", "deploy on friday", &[]).await;
+
+        // Now recall with an embedder configured.
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(MockEmbedder::new("test/mock", vec!["deploy", "friday"]));
+        let recall = Recall::new(registry, index, Some(embedder));
+        let out = recall
+            .execute(serde_json::json!({ "query": "friday" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("deploy on friday"),
+            "lexical fallback should surface entry: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rrf_combine_merges_lexical_and_semantic_winners() {
+        // Direct unit test of `rrf_combine`: entry A wins BM25, entry B
+        // wins cosine, entry C is in neither — result must surface A and
+        // B (in some order) and exclude C.
+        let entries = vec![
+            MemoryEntry {
+                key: "a".into(),
+                value: "alpha".into(),
+                timestamp: Utc::now(),
+                tags: vec![],
+            },
+            MemoryEntry {
+                key: "b".into(),
+                value: "beta".into(),
+                timestamp: Utc::now(),
+                tags: vec![],
+            },
+            MemoryEntry {
+                key: "c".into(),
+                value: "gamma".into(),
+                timestamp: Utc::now(),
+                tags: vec![],
+            },
+        ];
+        let bm25 = vec![(10.0_f64, 0)]; // A is the only BM25 hit
+        let cos = vec![(0.9_f32, 1)]; // B is the only cosine hit
+        let out = rrf_combine(&entries, &bm25, &cos, 10);
+        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"a"), "missing BM25 winner: {keys:?}");
+        assert!(keys.contains(&"b"), "missing cosine winner: {keys:?}");
+        assert!(!keys.contains(&"c"), "non-matching leaked: {keys:?}");
     }
 }

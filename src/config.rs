@@ -55,6 +55,65 @@ pub struct Config {
     /// `0.0.0.0:8765` to also listen on HTTP, which allows remote peers
     /// to reach you via that address even without iroh connectivity.
     pub sync_listen: Option<String>,
+    /// Embedding backend used to populate `embeddings:<model-id>` subtrees
+    /// alongside memory writes (Searchable Memory Stage 2). Omit to run
+    /// lexical-only recall.
+    pub embedding: Option<EmbeddingConfig>,
+}
+
+/// Configuration for the embedding backend that powers semantic recall.
+///
+/// Example:
+/// ```yaml
+/// embedding:
+///   backend: openai
+///   model: text-embedding-3-small
+///   api_base: https://api.openai.com/v1
+///   api_key: "${OPENAI_API_KEY}"
+/// ```
+///
+/// Each memory write embeds `key + " " + value` and stores the vector
+/// under `embeddings:<provider>/<model>` on the same DB, syncing with
+/// the memory data. Multiple model subtrees coexist — switching models
+/// later just leaves the old subtree dormant until reindexed.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmbeddingConfig {
+    /// Provider kind. Currently only `openai` (any OpenAI-compatible
+    /// `/v1/embeddings` endpoint).
+    #[serde(default)]
+    pub backend: EmbeddingBackend,
+    /// Model name as the API expects (e.g. `text-embedding-3-small`).
+    pub model: String,
+    /// Tag used to namespace this model in the subtree name —
+    /// `embeddings:<provider>/<model>`. Defaults to `openai`.
+    pub provider: Option<String>,
+    /// Optional override for the `/v1` base URL.
+    pub api_base: Option<String>,
+    /// Raw API key from config (extracted into SecretStore at startup,
+    /// then cleared). Supports `${VAR}` env references.
+    pub api_key: Option<String>,
+    /// Opaque reference into SecretStore (set after api_key is extracted).
+    #[serde(skip)]
+    pub api_key_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingBackend {
+    #[default]
+    OpenAI,
+}
+
+impl EmbeddingConfig {
+    pub fn secret_key(&self) -> String {
+        format!("embedding:{}/{}", self.provider_or_default(), self.model)
+    }
+
+    pub fn provider_or_default(&self) -> String {
+        self.provider.clone().unwrap_or_else(|| match self.backend {
+            EmbeddingBackend::OpenAI => "openai".to_string(),
+        })
+    }
 }
 
 /// Configuration for the `web_search` tool. Holds an ordered list of
@@ -540,6 +599,42 @@ security:
         assert_eq!(sec.shell_denylist.as_ref().unwrap().len(), 1);
         assert_eq!(sec.leak_policy.as_deref(), Some("block"));
         assert_eq!(sec.auto_approved_tools.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parse_embedding_config_minimal() {
+        // Minimal: backend defaults to openai, provider falls back to
+        // the backend's name.
+        let yaml = r#"
+embedding:
+  model: text-embedding-3-small
+  api_key: "${OPENAI_API_KEY}"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let e = cfg.embedding.unwrap();
+        assert_eq!(e.backend, EmbeddingBackend::OpenAI);
+        assert_eq!(e.model, "text-embedding-3-small");
+        assert!(e.api_base.is_none());
+        assert_eq!(e.provider_or_default(), "openai");
+        assert_eq!(e.secret_key(), "embedding:openai/text-embedding-3-small");
+        assert_eq!(e.api_key.as_deref(), Some("${OPENAI_API_KEY}"));
+    }
+
+    #[test]
+    fn parse_embedding_config_with_provider_and_base() {
+        let yaml = r#"
+embedding:
+  backend: openai
+  model: nomic-embed-text
+  provider: ollama
+  api_base: http://localhost:11434/v1
+  api_key: "ignored-by-ollama"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let e = cfg.embedding.unwrap();
+        assert_eq!(e.provider_or_default(), "ollama");
+        assert_eq!(e.secret_key(), "embedding:ollama/nomic-embed-text");
+        assert_eq!(e.api_base.as_deref(), Some("http://localhost:11434/v1"));
     }
 
     #[test]

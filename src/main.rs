@@ -6,6 +6,7 @@ mod config;
 mod context;
 mod db_kind;
 mod defaults;
+mod embedding;
 mod error;
 mod gateway;
 mod grants;
@@ -195,6 +196,30 @@ async fn main() -> anyhow::Result<()> {
     // `${VAR}` handling as LLM backend keys.
     let web_search_backends = build_web_search_backends(&mut config, &secret_store).await;
 
+    // Same env-resolution dance for the embedding API key, then build the
+    // shared `Arc<dyn Embedder>` (None when no embedding section configured).
+    if let Some(emb) = &mut config.embedding {
+        if let Some(raw_key) = emb.api_key.take() {
+            let resolved = security::SecretStore::resolve_env(&raw_key).unwrap_or_else(|e| {
+                tracing::warn!("Failed to resolve API key for embedding: {e}");
+                raw_key
+            });
+            let ref_id = emb.secret_key();
+            secret_store.insert(ref_id.clone(), resolved).await;
+            emb.api_key_ref = Some(ref_id);
+        }
+    }
+    let embedder = match embedding::build_embedder(config.embedding.as_ref(), &secret_store) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!("Embedding config invalid; falling back to lexical-only: {err}");
+            None
+        }
+    };
+    if let Some(e) = embedder.as_ref() {
+        info!(model_id = %e.model_id(), "Embedder configured");
+    }
+
     // Build security context from config
     let sec = config.security.clone().unwrap_or_default();
     let leak_policy = match sec.leak_policy.as_deref() {
@@ -236,10 +261,12 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::Remember::new(
         registry.clone(),
         agent_index_store.clone(),
+        embedder.clone(),
     ));
     tool_registry.register(tools::Recall::new(
         registry.clone(),
         agent_index_store.clone(),
+        embedder.clone(),
     ));
     tool_registry.register(tools::ListMemoryBanks::new(
         registry.clone(),
