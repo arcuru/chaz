@@ -105,9 +105,10 @@ See [Logging](logging.md) for details on log levels and filtering.
 
 ## Next Steps
 
-- [Configuration](configuration.md) for full config reference
+- [Configuration](configuration.md) for full config reference, including the optional `embedding:` block for semantic memory recall
 - [TUI Mode](tui.md) for TUI commands and features
 - [Tools](tools.md) for the built-in tool set
 - [Agents](agents.md) for multi-agent orchestration
+- [Memory](memory.md) for self-memory, shared banks, and how `recall` ranks results (BM25 + optional embeddings)
 - [Session Sharing](session_sharing.md) for syncing sessions between instances
 - [Logging](logging.md) for observability and debugging

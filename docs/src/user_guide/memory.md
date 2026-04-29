@@ -219,6 +219,25 @@ The `<provider>/<model>` naming means **multiple models coexist on the same DB**
 
 When both rankers produce hits, results are fused with **RRF** (`k=60`, [Cormack et al. 2009](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)): each entry's combined score is `1/(60 + rank_BM25) + 1/(60 + rank_cosine)`, summed over whichever lists it appears in. Entries in only one ranker still surface; entries in both are boosted. The top `limit` are returned.
 
+### Where settings live
+
+The embedding system spans three storage layers, and it's worth knowing which is which because they have very different lifecycle and sync behavior.
+
+| What                                                       | Where                                                              | Peer-local? | Synced?     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------ | ----------- | ----------- |
+| `embedding:` block (`backend`, `model`, `provider`, `api_base`) | chaz config yaml file                                              | yes         | no          |
+| Embedding API key                                          | `chaz_peer.credentials` (peer-local eidetica DB, never syncs)      | yes         | no          |
+| Stored vectors                                             | `embeddings:<provider>/<model>` subtree on each agent DB / bank DB | no          | **yes**     |
+
+The choice of *which* embedder to use is currently peer-config-only — there is **no DB field that declares a preferred model for an agent or bank**. Two peers hosting the same shared bank can each configure a different embedder, and both write to their own model's subtree on the synced DB. Subtrees coexist; nothing collides.
+
+The trade-off:
+
+- **Pro**: peer autonomy. A self-hosted Ollama peer and an OpenAI peer can both write into the same shared bank without coordinating on a model.
+- **Con**: a peer's recall only matches against vectors written under *its own* configured model. Peer A's `openai/text-embedding-3-small` vectors are invisible to peer B's `ollama/nomic-embed-text` recall path until backfilled. Until [`/memory reindex`](#) (Stage 3, planned), the only fallback for peer B on those entries is BM25.
+
+If the design ever moves to a "DB declares its preferred model" model, the field would live in `meta` next to `display_name` / `description` so it syncs with the DB.
+
 ### Fallback semantics
 
 The hybrid path degrades gracefully — none of these scenarios error out:
