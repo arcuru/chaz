@@ -131,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
+    if agent_registry.is_empty() {
+        agent_registry.register_default_chaz(&config)?;
+    }
     info!(
         agents = agent_registry.names().len(),
         "Agent registry initialized"

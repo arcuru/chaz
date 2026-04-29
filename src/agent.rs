@@ -158,7 +158,9 @@ fn intersect_tools(base: &Option<Vec<String>>, override_tools: &[String]) -> Vec
     }
 }
 
-/// Registry of named agents. Always has a default agent.
+/// Registry of named agents. Callers (production: `main.rs`) are
+/// responsible for ensuring at least one agent is registered before the
+/// registry is used for routing — `default_agent()` panics on empty.
 ///
 /// Backed by a `RwLock` so agents can be registered at runtime (via
 /// `/agent new`); yaml-bootstrapped agents land here at startup, and
@@ -174,23 +176,37 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    /// Build the registry from config. If no agents defined, creates a default "chaz" agent.
+    /// Build the registry from config. Maps `config.agents` 1:1 — an
+    /// absent or empty list yields an empty registry. The `chaz`-with-no-
+    /// `agents:`-block UX lives in `main.rs`, which calls
+    /// [`AgentRegistry::register_default_chaz`] when this returns empty.
     pub fn from_config(config: &Config) -> Self {
-        let agents = if let Some(agent_configs) = &config.agents {
-            agent_configs
-                .iter()
-                .map(|ac| Agent::from_agent_config(ac, config))
-                .collect()
-        } else {
-            // Legacy: no agents section — create default from top-level role field
-            let default_role = get_role(
-                config.role.clone(),
-                config.roles.clone(),
-                DEFAULT_CONFIG.roles.clone(),
-            );
-            vec![Agent {
-                name: "chaz".to_string(),
-                default_role,
+        let agents = config
+            .agents
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|ac| Agent::from_agent_config(ac, config))
+            .collect();
+
+        let registry = Self {
+            agents: std::sync::RwLock::new(agents),
+            config_roles: config.roles.clone(),
+        };
+        registry.validate_references();
+        registry
+    }
+
+    /// Build a registry containing a single bare-bones agent named
+    /// `"default"`. Test-only seam: anywhere production code expects a
+    /// non-empty registry to satisfy a type, this is the cheapest way to
+    /// produce one without dragging a [`Config`] through.
+    #[cfg(test)]
+    pub fn with_default_agent() -> Self {
+        Self {
+            agents: std::sync::RwLock::new(vec![Agent {
+                name: "default".to_string(),
+                default_role: None,
                 default_model: None,
                 allowed_tools: None,
                 can_spawn: Vec::new(),
@@ -201,15 +217,43 @@ impl AgentRegistry {
                 tool_profile: None,
                 max_context_tokens: None,
                 grants: HashMap::new(),
-            }]
-        };
+            }]),
+            config_roles: None,
+        }
+    }
 
-        let registry = Self {
-            agents: std::sync::RwLock::new(agents),
-            config_roles: config.roles.clone(),
-        };
-        registry.validate_references();
-        registry
+    /// Synthesize and register a `"chaz"` agent built from the top-level
+    /// `role`/`roles` config — the legacy "user provided no `agents:`
+    /// block" fallback. Called by `main.rs` when [`from_config`] yielded
+    /// an empty registry; tests don't need this (they use
+    /// [`with_default_agent`]).
+    pub fn register_default_chaz(&self, config: &Config) -> anyhow::Result<()> {
+        let default_role = get_role(
+            config.role.clone(),
+            config.roles.clone(),
+            DEFAULT_CONFIG.roles.clone(),
+        );
+        self.register(Agent {
+            name: "chaz".to_string(),
+            default_role,
+            default_model: None,
+            allowed_tools: None,
+            can_spawn: Vec::new(),
+            allowed_callers: Vec::new(),
+            max_iterations: 10,
+            autonomous: false,
+            presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: HashMap::new(),
+        })
+    }
+
+    /// Whether the registry has zero agents. Production uses this at
+    /// startup to decide whether to synthesize the legacy default
+    /// `"chaz"` agent.
+    pub fn is_empty(&self) -> bool {
+        self.agents.read().unwrap().is_empty()
     }
 
     /// Access the user-config roles stashed at registry-build time. Used by

@@ -27,10 +27,6 @@ pub(crate) async fn test_session_db() -> (Instance, eidetica::user::User, eideti
     (instance, user, db)
 }
 
-pub(crate) fn blank_config() -> Config {
-    Config::default()
-}
-
 pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
     AgentConfig {
         name: name.to_string(),
@@ -48,14 +44,15 @@ pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
     }
 }
 
-/// Plain registry with no declared agents — useful for attach/detach tests
-/// that don't care about AgentRegistry resolution.
+/// Registry containing only the bare-bones `"default"` agent — useful
+/// for attach/detach tests that don't care about AgentRegistry
+/// resolution but still need `default_agent()` to succeed if hit.
 pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
     let backend = InMemory::new();
     let instance = Instance::open(Box::new(backend)).await.unwrap();
     let _ = instance.create_user("test", None).await;
     let user = instance.login_user("test", None).await.unwrap();
-    let agents = Arc::new(AgentRegistry::from_config(&blank_config()));
+    let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = SessionRegistry::new(instance.clone(), user, agents)
         .await
         .unwrap();
@@ -72,7 +69,7 @@ pub(crate) async fn make_registry_with_sync() -> (Instance, Arc<SessionRegistry>
     instance.enable_sync().await.unwrap();
     let _ = instance.create_user("test", None).await;
     let user = instance.login_user("test", None).await.unwrap();
-    let agents = Arc::new(AgentRegistry::from_config(&blank_config()));
+    let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = SessionRegistry::new(instance.clone(), user, agents)
         .await
         .unwrap();
@@ -88,8 +85,10 @@ pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRe
     let _ = instance.create_user("test", None).await;
     let user = instance.login_user("test", None).await.unwrap();
 
-    let mut cfg = blank_config();
-    cfg.agents = Some(vec![agent_cfg("alpha")]);
+    let cfg = Config {
+        agents: Some(vec![agent_cfg("alpha")]),
+        ..Config::default()
+    };
     let agents = Arc::new(AgentRegistry::from_config(&cfg));
     let registry = Arc::new(
         SessionRegistry::new(instance.clone(), user, agents)
@@ -108,8 +107,10 @@ pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionReg
     let _ = instance.create_user("test", None).await;
     let user = instance.login_user("test", None).await.unwrap();
 
-    let mut cfg = blank_config();
-    cfg.agents = Some(vec![agent_cfg("alpha"), agent_cfg("beta")]);
+    let cfg = Config {
+        agents: Some(vec![agent_cfg("alpha"), agent_cfg("beta")]),
+        ..Config::default()
+    };
     let agents = Arc::new(AgentRegistry::from_config(&cfg));
     let registry = Arc::new(
         SessionRegistry::new(instance.clone(), user, agents)

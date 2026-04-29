@@ -623,14 +623,9 @@ mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
     use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
-    use crate::config::Config;
     use crate::hosted_index::DbEntry;
     use eidetica::backend::database::InMemory;
     use eidetica::Instance;
-
-    fn blank_config() -> Config {
-        Config::default()
-    }
 
     /// Build a Server with the minimum wiring needed to exercise hydration.
     async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
@@ -638,7 +633,7 @@ mod tests {
         let instance = Instance::open(Box::new(backend)).await.unwrap();
         let _ = instance.create_user("test", None).await;
         let user = instance.login_user("test", None).await.unwrap();
-        let agents = Arc::new(AgentRegistry::from_config(&blank_config()));
+        let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             crate::session::SessionRegistry::new(instance.clone(), user, agents.clone())
                 .await
