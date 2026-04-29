@@ -245,11 +245,40 @@ pub fn build_embedder(
 
 #[cfg(test)]
 pub mod test_support {
-    //! Test-only embedder helpers. A `MockEmbedder` returns a deterministic
-    //! token-bag vector so tests can control which strings are "near."
+    //! Test-only embedder helpers. `MockEmbedder` returns a deterministic
+    //! token-bag vector so tests can control which strings are "near";
+    //! `FailingEmbedder` always errors so tests can exercise the
+    //! lexical-fallback path.
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// Embedder that always returns a configured `EmbedError`. Used to
+    /// verify that write/recall paths degrade gracefully when the
+    /// embedding service is down.
+    pub struct FailingEmbedder {
+        pub model_id: String,
+    }
+
+    impl FailingEmbedder {
+        pub fn new(model_id: impl Into<String>) -> Self {
+            Self {
+                model_id: model_id.into(),
+            }
+        }
+    }
+
+    impl Embedder for FailingEmbedder {
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+        fn embed<'a>(
+            &'a self,
+            _text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, EmbedError>> + Send + 'a>> {
+            Box::pin(async move { Err(EmbedError::Network("simulated failure".into())) })
+        }
+    }
 
     /// Hand-tuned embedder: every test text gets a fixed length-N vector
     /// computed from a `HashMap<token, axis>` lookup. Two texts share an
@@ -363,5 +392,134 @@ mod tests {
         assert!(cosine_similarity(&v_b, &v_a) > 0.0);
         // No shared tokens → zero similarity.
         assert!(cosine_similarity(&v_b, &v_c) < 1e-6);
+    }
+
+    /// Tiny one-shot HTTP/1.1 server: accepts one connection, captures
+    /// the raw request, replies with a canned 200 + body, then exits.
+    /// Returns the bound address and a join handle yielding the captured
+    /// request bytes. Lets us exercise `OpenAiEmbedder` against a real
+    /// socket without dragging in `wiremock`.
+    async fn one_shot_http_server(
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let captured = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Drain any continuation if Content-Length-bounded body
+            // wasn't fully read in the first chunk; not strictly needed
+            // for this small test but keeps things robust.
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            captured
+        });
+        (addr, handle)
+    }
+
+    /// Build a SecretStore over an isolated in-memory eidetica DB —
+    /// same pattern as `backends::tests::empty_secrets`.
+    async fn empty_secret_store() -> SecretStore {
+        use eidetica::backend::database::InMemory;
+        use eidetica::Instance;
+        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
+        let _ = instance.create_user("t", None).await;
+        let mut user = instance.login_user("t", None).await.unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut s = eidetica::crdt::Doc::new();
+        s.set("name", "central");
+        let db = user.create_database(s, &key).await.unwrap();
+        SecretStore::new(db).await
+    }
+
+    #[tokio::test]
+    async fn openai_embedder_calls_v1_embeddings_with_bearer() {
+        // Stuff the API key in the SecretStore so the embedder can pull
+        // it out at request time, mirroring production wiring.
+        let secrets = empty_secret_store().await;
+        secrets
+            .insert("embedding:openai/test-model".into(), "sk-canary".into())
+            .await;
+
+        let canned = r#"{"data":[{"embedding":[3.0,4.0]}]}"#;
+        let (addr, server_handle) = one_shot_http_server(canned).await;
+
+        let cfg = OpenAiEmbedderConfig {
+            api_base: format!("http://{addr}/v1"),
+            model: "test-model".into(),
+            provider: "openai".into(),
+            api_key_ref: "embedding:openai/test-model".into(),
+        };
+        let embedder = OpenAiEmbedder::new(cfg, secrets).unwrap();
+        let v = embedder.embed("hello world").await.unwrap();
+
+        // Vector came back unit-normalized: |(3,4)| = 5 → (0.6, 0.8).
+        assert!((v[0] - 0.6).abs() < 1e-6, "got {v:?}");
+        assert!((v[1] - 0.8).abs() < 1e-6, "got {v:?}");
+
+        // Inspect the raw request the server received.
+        let captured = server_handle.await.unwrap();
+        assert!(
+            captured.starts_with("POST /v1/embeddings"),
+            "wrong path: {}",
+            captured.lines().next().unwrap_or("")
+        );
+        assert!(
+            captured
+                .to_lowercase()
+                .contains("authorization: bearer sk-canary"),
+            "missing bearer header"
+        );
+        assert!(
+            captured.contains(r#""model":"test-model""#),
+            "missing model in body: {captured}"
+        );
+        assert!(
+            captured.contains(r#""input":"hello world""#),
+            "missing input in body: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_embedder_propagates_http_error() {
+        let secrets = empty_secret_store().await;
+        secrets
+            .insert("embedding:openai/m".into(), "sk-x".into())
+            .await;
+        // Server replies with a 500.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let body = "boom";
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let cfg = OpenAiEmbedderConfig {
+            api_base: format!("http://{addr}/v1"),
+            model: "m".into(),
+            provider: "openai".into(),
+            api_key_ref: "embedding:openai/m".into(),
+        };
+        let embedder = OpenAiEmbedder::new(cfg, secrets).unwrap();
+        let err = embedder.embed("x").await.expect_err("expected API error");
+        let _ = handle.await;
+        assert!(matches!(err, EmbedError::Api(_)), "got: {err:?}");
     }
 }

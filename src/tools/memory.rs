@@ -1493,4 +1493,240 @@ mod tests {
         assert!(keys.contains(&"b"), "missing cosine winner: {keys:?}");
         assert!(!keys.contains(&"c"), "non-matching leaked: {keys:?}");
     }
+
+    #[tokio::test]
+    async fn rrf_combine_boosts_when_both_rankers_agree() {
+        // Direct unit test: an entry that wins both lists should outrank
+        // entries winning only one — that's the whole point of RRF.
+        let mk = |k: &str| MemoryEntry {
+            key: k.into(),
+            value: "v".into(),
+            timestamp: Utc::now(),
+            tags: vec![],
+        };
+        let entries = vec![mk("both"), mk("bm25_only"), mk("cos_only")];
+        // BM25: idx 0 first, idx 1 second
+        let bm25 = vec![(10.0_f64, 0), (5.0, 1)];
+        // Cosine: idx 0 first, idx 2 second
+        let cos = vec![(0.9_f32, 0), (0.5, 2)];
+        let out = rrf_combine(&entries, &bm25, &cos, 10);
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out[0].key,
+            "both",
+            "agreement should rank first: {:?}",
+            out.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_with_failing_embedder_still_stores_memory() {
+        // Critical fallback: a network-down embedding API must not lose
+        // the user's memory. The memory row gets written; the
+        // `embeddings:<model_id>` subtree stays empty.
+        use crate::embedding::test_support::FailingEmbedder;
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder::new("test/down"));
+        let remember = Remember::new(registry.clone(), index.clone(), Some(embedder.clone()));
+        let recall = Recall::new(registry.clone(), index, None);
+        let ctx = make_ctx("alpha", session);
+
+        remember
+            .execute(
+                serde_json::json!({ "key": "k1", "value": "ship by friday" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // Memory persisted: BM25 recall surfaces it.
+        let out = recall
+            .execute(serde_json::json!({ "query": "ship" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("ship by friday"),
+            "memory should persist despite embedder failure: {out}"
+        );
+        // Embedding subtree stayed empty.
+        let stored = read_embeddings(&registry, "alpha", "test/down").await;
+        assert!(
+            stored.is_empty(),
+            "no embedding row should be written when embedder errors: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_with_failing_query_embedder_falls_back_to_bm25() {
+        // Write with a working embedder so embeddings exist on disk;
+        // recall with a failing one — the query-embedding error path
+        // must degrade to BM25-only, not error out.
+        use crate::embedding::test_support::FailingEmbedder;
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let writer: Arc<dyn Embedder> =
+            Arc::new(MockEmbedder::new("test/mock", vec!["ship", "friday"]));
+        let failing: Arc<dyn Embedder> = Arc::new(FailingEmbedder::new("test/down"));
+        let remember = Remember::new(registry.clone(), index.clone(), Some(writer));
+        let recall = Recall::new(registry, index, Some(failing));
+        let ctx = make_ctx("alpha", session);
+
+        put(&remember, &ctx, "k1", "ship by friday", &[]).await;
+
+        let out = recall
+            .execute(serde_json::json!({ "query": "ship" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("ship by friday"),
+            "BM25 fallback should still surface entry: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bank_remember_with_embedder_populates_embedding_subtree() {
+        // The bank path uses `do_remember(..., embedder=Some(...))`
+        // exactly like self memory; verify by writing into a bank and
+        // reading the bank's `embeddings:<model_id>` subtree directly.
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let bank_db_id = provision_bank(
+            &registry,
+            "alpha",
+            "shared",
+            crate::agent_db::BankPermission::Write,
+        )
+        .await;
+
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(MockEmbedder::new("test/mock", vec!["deploy", "friday"]));
+        let remember = Remember::new(registry.clone(), index.clone(), Some(embedder.clone()));
+        let ctx = make_ctx("alpha", session);
+        remember
+            .execute(
+                serde_json::json!({
+                    "key": "ops",
+                    "value": "deploy friday",
+                    "bank": "shared",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // Pull the embeddings subtree off the bank DB itself. Scoped so
+        // the user lock drops before we consume `registry` into Recall.
+        {
+            let user = registry.user_for_tests().await;
+            let id = eidetica::entry::ID::parse(&bank_db_id).unwrap();
+            let database = user.open_database(&id).await.unwrap();
+            let txn = database.new_transaction().await.unwrap();
+            let store = txn
+                .get_store::<Table<EmbeddingEntry>>(&embeddings_store_name("test/mock"))
+                .await
+                .unwrap();
+            let rows = store.search(|_: &EmbeddingEntry| true).await.unwrap();
+            assert_eq!(rows.len(), 1, "bank should have one embedding");
+        }
+
+        // And recall via the bank still works (hybrid path).
+        let recall = Recall::new(registry, index, Some(embedder));
+        let ctx2 = make_ctx("alpha", ctx.session.clone());
+        let out = recall
+            .execute(
+                serde_json::json!({ "query": "friday", "bank": "shared" }),
+                &ctx2,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("deploy friday"), "bank recall: {out}");
+    }
+
+    #[tokio::test]
+    async fn multiple_model_subtrees_coexist_on_one_db() {
+        // Switching models should leave the old subtree dormant, not
+        // overwrite or remove it. Write one entry under model A, then
+        // another under model B on the same DB; both subtrees populate
+        // independently.
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let ctx = make_ctx("alpha", session);
+
+        let emb_a: Arc<dyn Embedder> = Arc::new(MockEmbedder::new("test/model-a", vec!["alpha"]));
+        let remember_a = Remember::new(registry.clone(), index.clone(), Some(emb_a));
+        remember_a
+            .execute(
+                serde_json::json!({ "key": "k1", "value": "alpha-fact" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let emb_b: Arc<dyn Embedder> = Arc::new(MockEmbedder::new("test/model-b", vec!["beta"]));
+        let remember_b = Remember::new(registry.clone(), index, Some(emb_b));
+        remember_b
+            .execute(
+                serde_json::json!({ "key": "k2", "value": "beta-fact" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // Direct subtree inspection: each model has exactly one row,
+        // and they reference distinct memory rows.
+        let user = registry.user_for_tests().await;
+        let (agent_db, _) = crate::agent_db::find_agent_db(&user, "alpha")
+            .await
+            .unwrap();
+        let txn = agent_db.database().new_transaction().await.unwrap();
+        let a_rows = txn
+            .get_store::<Table<EmbeddingEntry>>(&embeddings_store_name("test/model-a"))
+            .await
+            .unwrap()
+            .search(|_: &EmbeddingEntry| true)
+            .await
+            .unwrap();
+        let b_rows = txn
+            .get_store::<Table<EmbeddingEntry>>(&embeddings_store_name("test/model-b"))
+            .await
+            .unwrap()
+            .search(|_: &EmbeddingEntry| true)
+            .await
+            .unwrap();
+        assert_eq!(a_rows.len(), 1, "model-a subtree");
+        assert_eq!(b_rows.len(), 1, "model-b subtree");
+        assert_ne!(
+            a_rows[0].1.memory_row_id, b_rows[0].1.memory_row_id,
+            "rows reference different memory entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_remember_same_key_does_not_leak_old_value() {
+        // Dedup-by-key keeps the most-recent row; recall must surface
+        // the new value and not the old. The old embedding row stays
+        // dormant in `embeddings:<model>` (its memory_row_id no longer
+        // joins to anything visible) — that's expected and harmless.
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(MockEmbedder::new("test/mock", vec!["alpha", "beta"]));
+        let remember = Remember::new(registry.clone(), index.clone(), Some(embedder.clone()));
+        let recall = Recall::new(registry, index, Some(embedder));
+        let ctx = make_ctx("alpha", session);
+
+        put(&remember, &ctx, "role", "alpha-version", &[]).await;
+        // Force a measurable timestamp gap so dedup picks the new one.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        put(&remember, &ctx, "role", "beta-version", &[]).await;
+
+        let out = recall
+            .execute(serde_json::json!({ "query": "role" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("beta-version"),
+            "newer value should surface: {out}"
+        );
+        assert!(
+            !out.contains("alpha-version"),
+            "older value should not leak: {out}"
+        );
+    }
 }
