@@ -629,28 +629,7 @@ mod tests {
     use eidetica::Instance;
 
     fn blank_config() -> Config {
-        Config {
-            homeserver_url: String::new(),
-            username: String::new(),
-            password: None,
-            allow_list: None,
-            message_limit: None,
-            room_size_limit: None,
-            state_dir: None,
-            chat_summary_model: None,
-            role: None,
-            roles: None,
-            backends: None,
-            agents: None,
-            security: None,
-            schedules: None,
-            mcp_servers: None,
-            tool_profiles: None,
-            mcp_server_dir: None,
-            context: None,
-            web_search: None,
-            sync_listen: None,
-        }
+        Config::default()
     }
 
     /// Build a Server with the minimum wiring needed to exercise hydration.

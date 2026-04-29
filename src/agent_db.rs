@@ -424,26 +424,8 @@ mod tests {
 
     fn empty_config_with_agents(agents: Vec<AgentConfig>) -> Config {
         Config {
-            homeserver_url: String::new(),
-            username: String::new(),
-            password: None,
-            allow_list: None,
-            message_limit: None,
-            room_size_limit: None,
-            state_dir: None,
-            chat_summary_model: None,
-            role: None,
-            roles: None,
-            backends: None,
             agents: Some(agents),
-            security: None,
-            schedules: None,
-            mcp_servers: None,
-            tool_profiles: None,
-            mcp_server_dir: None,
-            context: None,
-            web_search: None,
-            sync_listen: None,
+            ..Config::default()
         }
     }
 
