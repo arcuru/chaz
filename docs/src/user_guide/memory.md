@@ -39,18 +39,30 @@ Agents interact with memory through three tools. All three need to be in `allowe
 ### `remember`
 
 ```json
-{ "key": "project.chaz.deadline", "value": "2026-06-01" }
+{
+  "key": "project.chaz.deadline",
+  "value": "2026-06-01",
+  "tags": ["project", "chaz"]
+}
 ```
 
-Writes to the agent's own memory. Add `"bank": "<name>"` to write to a shared bank where the agent has Write.
+Writes to the agent's own memory. Optional `tags: [string]` attach free-form labels for later filtering. Add `"bank": "<name>"` to write to a shared bank where the agent has Write.
+
+If an [embedding backend](configuration.md#embeddings) is configured, every write also embeds `key + " " + value` and stores the vector in the same DB under `embeddings:<provider>/<model>` — joined to the memory row by the row ID. This happens in one transaction. If the embedding API fails, the memory is still stored; only the vector is missing.
 
 ### `recall`
 
 ```json
-{ "query": "deadline" }
+{ "query": "deadline", "tags": ["project"], "limit": 5 }
 ```
 
-Searches the agent's own memory. Add `"bank": "<name>"` to search a bank. Returns matching entries with timestamps.
+Searches the agent's own memory. Add `"bank": "<name>"` to search a bank. All three extra fields are optional:
+
+- `tags: [string]` — AND-filter; only entries carrying every listed tag are considered.
+- `limit: integer` — cap on returned entries (default 10).
+- `query: ""` — empty string returns by recency (handy with a `tags` filter).
+
+See [Searching memory](#searching-memory) below for how ranking works.
 
 ### `list_memory_banks`
 
@@ -64,16 +76,16 @@ Lists every bank the agent can see, with the permission level. Always includes `
 
 Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix uses `!chaz memory <sub>`.
 
-| Command                                      | What                                                                                                  |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `/memory new <name> [description]`           | Create a new standalone bank DB on this peer. The peer holds the bank's key.                          |
-| `/memory list`                               | List banks hosted by this peer.                                                                       |
-| `/memory delete <ref>`                       | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                 |
-| `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB. |
-| `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                      |
-| `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                     |
-| `/memory unshare <bank>`                     | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.                                        |
-| `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.      |
+| Command                                      | What                                                                                                                            |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `/memory new <name> [description]`           | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                    |
+| `/memory list`                               | List banks hosted by this peer.                                                                                                 |
+| `/memory delete <ref>`                       | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                           |
+| `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                           |
+| `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                |
+| `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                               |
+| `/memory unshare <bank>`                     | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it. |
+| `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.                                |
 
 Refs accept either a display name or an eidetica DB ID.
 
@@ -177,6 +189,50 @@ Because an Agent DB has the same `memory` Table a bank does, you can grant one a
 ```
 
 This only works if alpha is a hosted agent on this peer (its DB ID is in the `agents` index). The command resolves the bank ref against both `memory_banks` and `agents` indices, and treats the agent DB as a bank for the purposes of the grant.
+
+## Searching memory
+
+`recall` ranks results, it doesn't just substring-match. There are two rankers, and they're combined.
+
+### Lexical ranking — always on
+
+Every memory entry is treated as a "document": `key + " " + value + " " + tags`. The query is tokenized (lowercase, split on non-alphanumeric, drop tokens shorter than 2 chars — no stemming, no stopwords) and scored against each document with **BM25** (`k1=1.5`, `b=0.75`). Entries that match no query token are dropped from the BM25 list.
+
+This works without any external service or configuration. It's the only ranker on by default.
+
+### Semantic ranking — opt-in via `embedding:`
+
+Configure an [embedding backend](configuration.md#embeddings) and chaz also stores a vector for every memory write under `embeddings:<provider>/<model>` on the same DB:
+
+```mermaid
+graph TD
+    M[(memory subtree<br/>row_id → MemoryEntry)]
+    E["embeddings:openai/text-embedding-3-small<br/>memory_row_id → vector"]
+    M -- joined by row_id --> E
+```
+
+At recall time, the query is embedded the same way, and **cosine similarity** ranks every entry that has a stored vector for the active model. Entries with non-positive similarity are dropped.
+
+The `<provider>/<model>` naming means **multiple models coexist on the same DB**. Switching models leaves the old subtree dormant; entries written under the old model stop contributing to semantic recall until [`/memory reindex`](#) (Stage 3, planned) backfills them.
+
+### Hybrid ranking — Reciprocal Rank Fusion
+
+When both rankers produce hits, results are fused with **RRF** (`k=60`, [Cormack et al. 2009](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)): each entry's combined score is `1/(60 + rank_BM25) + 1/(60 + rank_cosine)`, summed over whichever lists it appears in. Entries in only one ranker still surface; entries in both are boosted. The top `limit` are returned.
+
+### Fallback semantics
+
+The hybrid path degrades gracefully — none of these scenarios error out:
+
+| Scenario                                                     | Behavior                                                  |
+| ------------------------------------------------------------ | --------------------------------------------------------- |
+| No `embedding:` configured                                   | BM25-only.                                                |
+| Embedder configured, but the active DB has no `embeddings:M` | BM25-only (subtree just doesn't exist yet).               |
+| Embedding API call fails on **write**                        | Memory still stored; no vector written. Logged at `warn`. |
+| Embedding API call fails on **read**                         | BM25-only for this query. Logged at `warn`.               |
+| Empty `query` string                                         | Recency sort over the surviving entries.                  |
+| Query matches no BM25 token AND no semantic match            | Returns "No memories found …"                             |
+
+The guarantee: configuring an embedder never makes recall worse, and a flaky embedding service never costs you a memory write.
 
 ## What Doesn't Exist (Any More)
 

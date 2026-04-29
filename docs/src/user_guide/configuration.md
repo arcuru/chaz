@@ -119,6 +119,13 @@ web_search:
 # Useful for debugging or when the remote peer doesn't have iroh connectivity.
 # Omit this field to use iroh P2P only (stable peer identity, no address needed).
 # sync_listen: "0.0.0.0:8765"
+
+# Optional: embedding backend for semantic memory recall.
+# Without this section, recall uses BM25 lexical ranking only.
+embedding:
+  backend: openai
+  model: text-embedding-3-small
+  api_key: "${OPENAI_API_KEY}"
 ```
 
 ## Web search
@@ -155,6 +162,50 @@ Public instances at https://searx.space work but come and go, and many rate-limi
 API keys accept the same `${VAR}` / `$VAR` environment substitution as LLM backend keys and are stored in the SecretStore at startup. Entries with a missing or unresolvable `api_key` on a keyed backend are skipped at startup with a warning; if the resulting list is empty, a single DuckDuckGo entry is added so the tool always has a fallback.
 
 **Recommended pattern**: put your highest-quality paid backend first, a cheaper or alternative backend second for rate-limit resilience, and `duckduckgo` last as a keyless safety net.
+
+## Embeddings
+
+The `embedding:` block configures semantic recall for the [memory tools](memory.md). Omit it to keep recall lexical-only (BM25); add it to enable hybrid lexical + semantic ranking via Reciprocal Rank Fusion. See [Searching memory](memory.md#searching-memory) for ranking details.
+
+```yaml
+embedding:
+  backend: openai
+  model: text-embedding-3-small
+  api_key: "${OPENAI_API_KEY}"
+```
+
+| Field      | Required | Default                           | Notes                                                                                                                                                                                             |
+| ---------- | -------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend`  | no       | `openai`                          | Provider kind. Currently only `openai` (any OpenAI-compatible `/v1/embeddings` endpoint).                                                                                                         |
+| `model`    | yes      | —                                 | Model name as the API expects (e.g. `text-embedding-3-small`, `nomic-embed-text`).                                                                                                                |
+| `provider` | no       | matches `backend` (e.g. `openai`) | Tag used to namespace the model in the storage subtree name (`embeddings:<provider>/<model>`). Override when pointing at a self-hosted endpoint so the subtree distinguishes it from real OpenAI. |
+| `api_base` | no       | `https://api.openai.com/v1`       | Override for OpenAI-compatible endpoints (Ollama, LM Studio, Together, etc.).                                                                                                                     |
+| `api_key`  | yes      | —                                 | API key. Same `${VAR}` / `$VAR` env substitution as LLM backend keys; stored in the SecretStore at startup.                                                                                       |
+
+### Self-hosted (e.g. Ollama)
+
+```yaml
+embedding:
+  backend: openai
+  provider: ollama # so the subtree is "embeddings:ollama/nomic-embed-text", not "openai/..."
+  model: nomic-embed-text
+  api_base: http://localhost:11434/v1
+  api_key: "ignored" # Ollama doesn't check the key but reqwest needs something
+```
+
+### Switching models
+
+Each model writes to its own subtree (`embeddings:<provider>/<model>`); subtrees coexist on the same DB and sync together. Switching models leaves the old subtree dormant — entries written under the old model stop contributing to recall until they're reindexed (planned: `/memory reindex`). Until then, recall against the new model uses semantic only on the entries written since the switch, plus BM25 on everything.
+
+### Failure handling
+
+The embedder is best-effort:
+
+- API down on **write** → memory is still stored, the vector is skipped, a `warn` is logged.
+- API down on **recall** → query falls back to BM25 only.
+- DB has no rows under the active model's subtree → BM25 only.
+
+Configuring an embedder never makes recall worse than the lexical baseline.
 
 ## Backends
 
