@@ -443,6 +443,7 @@ mod tests {
             mcp_server_dir: None,
             context: None,
             web_search: None,
+            sync_listen: None,
         }
     }
 

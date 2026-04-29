@@ -236,6 +236,21 @@ pub(super) async fn memory_share(bank_ref: &str, ctx: &CommandContext<'_>) -> Co
     ))
 }
 
+/// Disable sync on a memory bank DB so this peer stops serving it.
+pub(super) async fn memory_unshare(bank_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let entry = match resolve_bank_ref(bank_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    match ctx.server.registry().disable_sync_for(&entry.db_id).await {
+        Ok(()) => CommandOutcome::Text(format!(
+            "Sync disabled for memory bank '{}' — it is no longer shared.",
+            entry.display_name
+        )),
+        Err(e) => CommandOutcome::Error(format!("Failed to disable sync: {e}")),
+    }
+}
+
 /// Sync a memory bank from a DatabaseTicket URL and register it
 /// locally (Stage 9.D.3). Requires the ticket to include a key for
 /// this peer — read-only imports aren't supported yet (blocked on

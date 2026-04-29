@@ -11,6 +11,7 @@
 //!   permission they asked for. Owner can override only by rejecting and
 //!   pre-seeding a different permission via `/agent invite`.
 //! - `/sharing reject <id>` — marks the request rejected.
+//! - `/sharing` — list every database this peer is currently sharing.
 
 use eidetica::auth::types::Permission;
 

@@ -108,16 +108,25 @@ async fn main() -> anyhow::Result<()> {
     let _ = instance.create_user("chaz", None).await; // OK if already exists
     let mut user = instance.login_user("chaz", None).await?;
 
-    // Enable eidetica sync with HTTP transport for session sharing
+    // Enable eidetica sync for session sharing. Register iroh P2P transport
+    // by default (stable peer identity, no address config needed). If
+    // sync_listen is configured, also bind HTTP for traditional access.
     instance.enable_sync().await?;
     if let Some(sync) = instance.sync() {
-        use eidetica::sync::transports::http::HttpTransport;
-        sync.register_transport("http", HttpTransport::builder())
+        use eidetica::sync::transports::iroh::IrohTransport;
+        sync.register_transport("iroh", IrohTransport::builder())
             .await?;
+
+        if let Some(ref addr) = config.sync_listen {
+            use eidetica::sync::transports::http::HttpTransport;
+            sync.register_transport("http", HttpTransport::builder().bind(addr))
+                .await?;
+            info!("Sync HTTP transport listening on {addr}");
+        }
+
         sync.accept_connections().await?;
-        match sync.get_server_address().await {
-            Ok(addr) => info!("Eidetica sync listening on {addr}"),
-            Err(e) => tracing::warn!("Could not get sync server address: {e}"),
+        if let Ok(addr) = sync.get_server_address().await {
+            info!("Eidetica sync address: {addr}");
         }
     }
 

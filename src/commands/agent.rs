@@ -300,6 +300,21 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
     ))
 }
 
+/// Disable sync on an agent DB so this peer stops serving it.
+pub(super) async fn agent_unshare(agent_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    match ctx.server.registry().disable_sync_for(&entry.db_id).await {
+        Ok(()) => CommandOutcome::Text(format!(
+            "Sync disabled for agent '{}' — it is no longer shared.",
+            entry.display_name
+        )),
+        Err(e) => CommandOutcome::Error(format!("Failed to disable sync: {e}")),
+    }
+}
+
 pub(super) async fn agent_import(
     ticket_str: &str,
     permission: CoOwnerPermission,

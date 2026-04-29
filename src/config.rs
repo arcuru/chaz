@@ -49,6 +49,12 @@ pub struct Config {
     /// Web search tool configuration. If omitted, web search defaults to
     /// DuckDuckGo HTML scraping (no API key required).
     pub web_search: Option<WebSearchConfig>,
+    /// Optional address:port for the eidetica sync HTTP server to bind to.
+    /// When omitted (default), sync uses iroh P2P transport only (stable
+    /// peer identity, no address management needed). Set to e.g.
+    /// `0.0.0.0:8765` to also listen on HTTP, which allows remote peers
+    /// to reach you via that address even without iroh connectivity.
+    pub sync_listen: Option<String>,
 }
 
 /// Configuration for the `web_search` tool. Holds an ordered list of
