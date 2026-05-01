@@ -214,7 +214,12 @@ async fn exec_shell(
 
 /// Check a shell command against allowlist/denylist from a `ShellGrant`.
 /// An empty `allow` list means allow-all. Denylist entries always apply.
-fn check_shell_command(command: &str, grant: Option<&ShellGrant>) -> Result<(), String> {
+/// Check a shell command against allowlist/denylist from a `ShellGrant`.
+/// An empty `allow` list means allow-all. Denylist entries always apply.
+///
+/// Public so other host implementations (e.g., bubblewrap) can enforce
+/// the same grant checks before executing via their own mechanism.
+pub fn check_shell_command(command: &str, grant: Option<&ShellGrant>) -> Result<(), String> {
     let binaries = extract_command_binaries(command);
     let grant = match grant {
         Some(g) => g,

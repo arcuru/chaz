@@ -1,6 +1,7 @@
 mod agent;
 mod agent_db;
 mod backends;
+mod bubblewrap_host;
 mod commands;
 mod config;
 mod context;
@@ -26,6 +27,7 @@ mod tool_host;
 mod tools;
 mod types;
 mod util;
+mod wasm_host;
 
 use config::Config;
 use gateway::Gateway;
