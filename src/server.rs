@@ -23,6 +23,7 @@ use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolProfile, ToolRegistry};
+use crate::tool_host::ToolHost;
 use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -71,6 +72,8 @@ pub struct Server {
     semaphore: Arc<Semaphore>,
     tool_profiles: HashMap<String, ToolProfile>,
     context_config: ContextConfig,
+    /// Execution host for sandboxed capability requests (Native, future WASM, bwrap)
+    host: Arc<dyn ToolHost>,
     /// Per-session runtime state keyed by session_db_id
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     /// Track which session DBs have server callbacks registered
@@ -93,6 +96,7 @@ impl Server {
         security: SecurityContext,
         tool_profiles: HashMap<String, ToolProfile>,
         context_config: ContextConfig,
+        host: Arc<dyn ToolHost>,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
@@ -107,6 +111,7 @@ impl Server {
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LLM_CALLS)),
             tool_profiles,
             context_config,
+            host,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -464,6 +469,7 @@ impl Server {
         let security = self.security.clone();
         let semaphore = self.semaphore.clone();
         let context_config = self.context_config.clone();
+        let host = self.host.clone();
         let max_context_tokens = agent.max_context_tokens;
 
         tokio::spawn(async move {
@@ -501,6 +507,7 @@ impl Server {
                 session: session.clone(),
                 grants: Default::default(),
                 agent_grants,
+                host: host.clone(),
             };
 
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
@@ -660,6 +667,7 @@ mod tests {
             security,
             HashMap::new(),
             Default::default(),
+            Arc::new(crate::tool_host::NativeToolHost::new()),
         );
         (instance, server, registry)
     }

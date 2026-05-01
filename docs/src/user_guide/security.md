@@ -34,42 +34,76 @@ Approval levels:
 
 In the TUI, approval is an inline y/n/a prompt. In Matrix, unapproved tools time out (Matrix approval UX is planned).
 
-## Shell Sandboxing
+## Capability Grants
 
-The `shell` tool filters commands against allowlist and denylist patterns:
+Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure *what* each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.
 
-```yaml
-security:
-  shell_allowlist:
-    - ls
-    - cat
-    - grep
-    - find
-    - wc
-  shell_denylist:
-    - rm
-    - sudo
-    - chmod
-    - chown
-    - dd
-```
+### Shell grants
 
-If an allowlist is defined, only commands starting with an allowed prefix are permitted. The denylist blocks commands regardless of the allowlist.
-
-## Network Controls
-
-The `web_fetch` tool enforces endpoint allowlisting and SSRF protection:
+The `shell` tool's commands are filtered by `allow`/`deny` lists in its grant:
 
 ```yaml
 security:
-  allowed_endpoints:
-    - host: "api.example.com"
-      path_prefix: "/v1"
-      methods: ["GET", "POST"]
-    - host: "httpbin.org"
+  tool_policies:
+    shell:
+      grants:
+        shell:
+          allow:
+            - ls
+            - cat
+            - grep
+            - find
+            - wc
+          deny:
+            - rm
+            - sudo
+            - chmod
+            - chown
+            - dd
 ```
 
-Private IP addresses (RFC 1918, loopback, link-local) are always blocked to prevent SSRF attacks.
+If `allow` is non-empty, only commands starting with an allowed prefix are permitted. The `deny` list blocks commands regardless of the allowlist.
+
+> **Deprecated**: `security.shell_allowlist` and `security.shell_denylist` are legacy fields. They still work but are converted to shell grants at startup with a deprecation warning. Use `tool_policies.shell.grants.shell` for new configs.
+
+### Network grants
+
+The `web_fetch` tool's HTTP requests are filtered by endpoint patterns:
+
+```yaml
+security:
+  tool_policies:
+    web_fetch:
+      grants:
+        network:
+          endpoints:
+            - host: "api.example.com"
+              path_prefix: "/v1"
+              methods: ["GET", "POST"]
+            - host: "httpbin.org"
+          allow_private: false
+```
+
+Private IP addresses (RFC 1918, loopback, link-local) are always blocked unless `allow_private: true`. Wildcard hosts (`"*.example.com"`) are supported.
+
+> **Deprecated**: `security.allowed_endpoints` is a legacy field. It still works but is converted to a network grant at startup with a deprecation warning. Use `tool_policies.web_fetch.grants.network.endpoints` for new configs.
+
+### Filesystem grants
+
+File read/write path restrictions are configured but enforcement is a stub (not yet active):
+
+```yaml
+security:
+  tool_policies:
+    read_file:
+      grants:
+        fs:
+          allow_read: ["/tmp", "/home/user/projects"]
+    write_file:
+      grants:
+        fs:
+          allow_write: ["/tmp", "/home/user/projects"]
+```
 
 ## Leak Detection
 

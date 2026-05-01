@@ -818,6 +818,7 @@ mod tests {
             session,
             grants: Default::default(),
             agent_grants: Default::default(),
+            host: Arc::new(crate::tool_host::NativeToolHost::new()),
         }
     }
 

@@ -22,6 +22,7 @@ mod security;
 pub mod server;
 mod session;
 mod tool;
+mod tool_host;
 mod tools;
 mod types;
 mod util;
@@ -342,6 +343,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Create the callback-driven server
     let context_config = config.context.clone().unwrap_or_default();
+    let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
+        as std::sync::Arc<dyn tool_host::ToolHost>;
+
     let server = server::Server::new(
         registry,
         agent_registry,
@@ -352,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
         security_ctx,
         tool_profiles,
         context_config,
+        tool_host,
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),

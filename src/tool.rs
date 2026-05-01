@@ -1,4 +1,5 @@
 use crate::grants::Grants;
+use crate::tool_host::ToolHost;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -263,12 +264,21 @@ pub struct ToolContext {
     /// The runtime merges the grants for the currently-executing tool over
     /// the tool's resolved policy grants when building each call's `grants`.
     pub agent_grants: HashMap<String, Grants>,
+    /// The execution host for sandboxed capability requests.
+    /// Tools go through the host for system access (shell, HTTP, filesystem)
+    /// rather than calling OS APIs directly. Defaults to [`NativeToolHost`].
+    pub host: Arc<dyn ToolHost>,
 }
 
 impl ToolContext {
     /// Read the resolved capability grants for the currently-executing tool.
     pub fn grants(&self) -> &Grants {
         &self.grants
+    }
+
+    /// Access the execution host for sandboxed capability requests.
+    pub fn host(&self) -> &dyn ToolHost {
+        self.host.as_ref()
     }
 }
 

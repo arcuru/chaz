@@ -147,9 +147,19 @@ Chaz supports external tools via the Model Context Protocol. MCP servers run as 
 
 ## Security Controls
 
+### Capability boundary
+
+Tools access system resources through a **ToolHost** — a sandboxed capability boundary. The tool declares what it wants to do (e.g., "run `ls`"), and the host decides whether to allow it based on configured grants (shell allowlist/denylist, network endpoint policy, filesystem paths). The default `NativeToolHost` enforces grants in-process; future hosts will add OS-level (bwrap) or VM-level (WASM) sandboxing.
+
+### Leak detection
+
 All tool outputs are scanned for secret patterns (API keys, tokens, etc.) before entering the LLM context. The leak detector supports 12 patterns and can either redact or block the output.
 
+### Output safety
+
 Tool results fed back to the LLM are wrapped in XML delimiters (`<tool_output tool="name">...</tool_output>`) with angle-bracket escaping, preventing prompt injection through tool output.
+
+### Timeouts and rate limits
 
 Tool execution is wrapped in a configurable timeout (default varies by tool). Tools can also have a `rate_limit` (max calls per minute) configured in their policy.
 

@@ -901,6 +901,7 @@ mod tests {
             session,
             grants: crate::grants::Grants::default(),
             agent_grants: std::collections::HashMap::new(),
+            host: Arc::new(crate::tool_host::NativeToolHost::new()),
         }
     }
 

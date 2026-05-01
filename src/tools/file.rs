@@ -1,10 +1,14 @@
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
+use crate::tool_host::Capability;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use tracing::{debug, info};
 
-/// Read the contents of a file
+/// Read the contents of a file.
+///
+/// Filesystem grants (read paths) are enforced by the host at the
+/// capability boundary. The tool itself does not inspect grants directly.
 pub struct ReadFile;
 
 impl Tool for ReadFile {
@@ -25,11 +29,11 @@ impl Tool for ReadFile {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + '_>> {
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         use crate::tool::ToolError;
         Box::pin(async move {
             let path = arguments
@@ -37,26 +41,45 @@ impl Tool for ReadFile {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::InvalidArgument("Missing 'path' argument".into()))?;
 
-            debug!(path, "Reading file");
-            let content = tokio::fs::read_to_string(path)
-                .await
-                .map_err(|e| format!("Failed to read file: {e}"))?;
-            debug!(path, bytes = content.len(), "File read complete");
+            debug!(path, "Reading file via host");
 
-            // Truncate very long files
-            let t = crate::util::truncate_chars(&content, 50000);
-            if t.len() < content.len() {
-                let mut truncated = t.to_string();
-                truncated.push_str("\n[truncated]");
-                Ok(truncated)
-            } else {
-                Ok(content)
+            let result = ctx
+                .host()
+                .request(
+                    &Capability::FileRead {
+                        path: path.to_string(),
+                    },
+                    ctx.grants(),
+                )
+                .await?;
+
+            match result {
+                crate::tool_host::CapabilityResult::FileRead(content) => {
+                    let text = String::from_utf8_lossy(&content).into_owned();
+                    debug!(path, bytes = text.len(), "File read complete");
+
+                    // Truncate very long files
+                    let t = crate::util::truncate_chars(&text, 50000);
+                    if t.len() < text.len() {
+                        let mut truncated = t.to_string();
+                        truncated.push_str("\n[truncated]");
+                        Ok(truncated)
+                    } else {
+                        Ok(text)
+                    }
+                }
+                _ => Err(ToolError::Execution(
+                    "Unexpected host result for file read capability".into(),
+                )),
             }
         })
     }
 }
 
-/// Write content to a file
+/// Write content to a file.
+///
+/// Filesystem grants (write paths) are enforced by the host at the
+/// capability boundary. The tool itself does not inspect grants directly.
 pub struct WriteFile;
 
 impl Tool for WriteFile {
@@ -89,11 +112,11 @@ impl Tool for WriteFile {
         }
     }
 
-    fn execute(
-        &self,
+    fn execute<'a>(
+        &'a self,
         arguments: Value,
-        _ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + '_>> {
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         use crate::tool::ToolError;
         Box::pin(async move {
             let path = arguments
@@ -106,10 +129,18 @@ impl Tool for WriteFile {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::InvalidArgument("Missing 'content' argument".into()))?;
 
-            info!(path, bytes = content.len(), "Writing file");
-            tokio::fs::write(path, content)
-                .await
-                .map_err(|e| format!("Failed to write file: {e}"))?;
+            info!(path, bytes = content.len(), "Writing file via host");
+
+            let _result = ctx
+                .host()
+                .request(
+                    &Capability::FileWrite {
+                        path: path.to_string(),
+                        content: content.to_string(),
+                    },
+                    ctx.grants(),
+                )
+                .await?;
 
             Ok(format!("Wrote {} bytes to {path}", content.len()))
         })

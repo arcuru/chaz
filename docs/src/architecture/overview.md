@@ -103,6 +103,8 @@ See [Session Model](sessions.md) for details.
 
 Tools implement the `Tool` trait (descriptor + execute). `ToolPolicy` controls risk level, approval requirements, and timeouts. `ScopedTools` provides per-agent tool visibility with transitive narrowing.
 
+Tools access system resources through the `ToolHost` trait — a sandboxed capability boundary. The default `NativeToolHost` executes capabilities in-process with grant enforcement; future WASM and bubblewrap hosts provide VM-level and OS-level sandboxing without changing any tool code.
+
 See [Tool System](tools.md) for details.
 
 ## Source Layout
@@ -123,6 +125,7 @@ src/
   runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning
   context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)
   tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError
+  tool_host.rs         ToolHost trait — sandboxed capability boundary (Native, future WASM/bwrap)
   grants.rs            Typed capability grants (shell/network/fs)
   error.rs             Error + LlmError (retryable/permanent classification)
   backends.rs          LLMBackend trait, BackendManager, ChatContext

@@ -43,7 +43,8 @@ memory_bank_db.rs    Standalone memory bank DBs (parallel to agent_db)
 heartbeat.rs         Per-session HeartbeatRule + HeartbeatRunner (30s poll)
 session.rs           SessionRegistry, Session, EntryType, SessionMeta, attach/detach, resolve_agent
 context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)
-tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile
+tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError
+tool_host.rs         ToolHost trait — sandboxed capability boundary (native, future WASM/bwrap)
 grants.rs            Typed capability grants (shell/network/fs)
 mcp/                 MCP integration (parse, transport, server) — stdio + Streamable HTTP
 tools/               Built-in tools: agent, task, compact, describe, time, calculate, shell, file, web, search, memory
@@ -65,7 +66,7 @@ defaults.rs          Built-in default config and roles
 - **Hosted-agent / hosted-bank lookups are in-memory only.** `hosted_index::HostedIndex` is built at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker. No persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 - **Authorization = key possession.** Session participation is gated by AuthSettings on the session DB; memory bank access is gated by AuthSettings on the bank DB. No capability flags.
 - **Per-session serialization.** Concurrent writes to the same session while an agent is running are skipped (prevents duplicate responses).
-- **Tool capability data flows via `ctx.grants()`** at execute time, not via tool constructor args. New capabilities go in `grants.rs`.
+- **Tools access system resources through `ToolHost`.** The host (`ctx.host()`) enforces grants at the capability boundary. Tools request capabilities (Shell, FileRead, FileWrite, HttpRequest) rather than calling OS APIs directly. New capability types go in `tool_host.rs`.
 - **Context entries**: only `Message`, `Directive`, and `Summary` enter the LLM context window. `ToolCall`/`ToolResult`/`Ack`/`Error` are audit-only.
 
 ## Test Instance

@@ -86,11 +86,38 @@ impl ScopedTools {
 
 Allowlist entries support glob patterns: `"filesystem.*"` matches all tools with that namespace prefix (requires a dot after the prefix). This is useful for MCP tool namespaces. Glob patterns work across all ScopedTools operations: `definitions()`, `get()`, `is_empty()`, and `narrow()`.
 
+## ToolHost
+
+The `ToolHost` trait is the sandboxed capability boundary between tools and the operating system. Tools request capabilities (shell commands, file I/O, HTTP requests) through the host rather than calling OS APIs directly:
+
+```rust,ignore
+trait ToolHost: Send + Sync {
+    fn request(&self, capability: &Capability, grants: &Grants)
+        -> Pin<Box<dyn Future<Output = Result<CapabilityResult, ToolError>>>>;
+    fn name(&self) -> &str;
+}
+
+enum Capability {
+    Shell { command: String, working_dir: Option<String> },
+    FileRead { path: String },
+    FileWrite { path: String, content: String },
+    HttpRequest { url: String, method: String, headers: HashMap<String, String>, body: Option<String> },
+}
+```
+
+The host enforces grants at the capability boundary — the tool says what it wants to do, the host decides whether to allow it and how to execute it. Different host implementations provide different trust tiers:
+
+| Host | Tier | Isolation |
+|------|------|-----------|
+| `NativeToolHost` | Native | In-process, grant enforcement only |
+| (future) | WASM | VM-enforced sandbox, capability tokens |
+| (future) | Bubblewrap | OS-level sandboxing via `bwrap` |
+
+The `Tool` implementations (shell, web, file) are identical across all tiers — they call `ctx.host().request()` regardless of which host sits behind the trait.
+
 ## ToolContext
 
 The `ToolContext` is passed to every tool execution:
-
-<!-- Code block ignored: struct definition for illustration -->
 
 ```rust,ignore
 struct ToolContext {
@@ -98,10 +125,12 @@ struct ToolContext {
     call_depth: usize,        // spawn nesting level
     max_call_depth: usize,    // from agent config
     tools: ScopedTools,       // narrowed tool set
+    grants: Grants,           // resolved per-call grants
+    host: Arc<dyn ToolHost>,  // sandboxed capability boundary
 }
 ```
 
-Tools like `spawn_agent` use the context to enforce depth limits and propagate tool narrowing.
+Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants()` only for introspection (e.g., `describe_tool` listing available capabilities).
 
 ## Adding a New Tool
 
