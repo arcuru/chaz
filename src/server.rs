@@ -232,17 +232,6 @@ impl Server {
             })
         })?;
 
-        let tx = self.notify_tx.clone();
-        let sid = session_db_id.clone();
-        session_db.on_remote_write(move |_event, _db, _instance| {
-            let tx = tx.clone();
-            let sid = sid.clone();
-            Box::pin(async move {
-                let _ = tx.send(sid).await;
-                Ok(())
-            })
-        })?;
-
         info!(session_db_id = %session_db_id, "Server watching session");
         Ok(())
     }
