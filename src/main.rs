@@ -46,11 +46,23 @@ struct ChazArgs {
     /// Run in TUI mode (stdin/stdout) instead of Matrix
     #[arg(long)]
     tui: bool,
+
+    /// Run a single CLI prompt and exit. Reuses a session named "cli".
+    #[arg(long)]
+    cli: bool,
+
+    /// The prompt to send when --cli is used.
+    #[arg(required_if_eq("cli", "true"))]
+    prompt: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = ChazArgs::parse();
+
+    if args.tui && args.cli {
+        anyhow::bail!("--tui and --cli are mutually exclusive");
+    }
 
     let mut file = File::open(&args.config)?;
     let mut contents = String::new();
@@ -392,11 +404,19 @@ async fn main() -> anyhow::Result<()> {
     heartbeat_runner.start();
 
     // Run the selected gateway
-    info!(
-        mode = if args.tui { "tui" } else { "matrix" },
-        "Starting gateway"
-    );
-    let result = if args.tui {
+    let mode = if args.cli {
+        "cli"
+    } else if args.tui {
+        "tui"
+    } else {
+        "matrix"
+    };
+    info!(mode, "Starting gateway");
+    let result = if args.cli {
+        let prompt = args.prompt.clone().expect("--cli requires PROMPT");
+        let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt);
+        gateway.run(server).await
+    } else if args.tui {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
         gateway.run(server).await
     } else {
