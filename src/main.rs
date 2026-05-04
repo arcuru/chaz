@@ -242,12 +242,23 @@ async fn main() -> anyhow::Result<()> {
         _ => security::LeakPolicy::Redact,
     };
     let leak_detector = security::LeakDetector::new(leak_policy);
-    let auto_approved: std::collections::HashSet<String> = sec
+    let mut auto_approved: std::collections::HashSet<String> = sec
         .auto_approved_tools
         .clone()
         .unwrap_or_default()
         .into_iter()
         .collect();
+
+    // In CLI mode there is no interactive approval; add the configured
+    // (or default) CLI auto-approved tools so shell/write_file work.
+    if args.cli {
+        let cli_tools = config
+            .cli
+            .as_ref()
+            .map(|c| c.auto_approved_tools.clone())
+            .unwrap_or_else(config::default_cli_auto_approved);
+        auto_approved.extend(cli_tools);
+    }
 
     let security_ctx = security::SecurityContext {
         leak_detector,

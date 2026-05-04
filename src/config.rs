@@ -59,6 +59,21 @@ pub struct Config {
     /// alongside memory writes (Searchable Memory Stage 2). Omit to run
     /// lexical-only recall.
     pub embedding: Option<EmbeddingConfig>,
+    /// CLI-specific configuration (single-shot --cli mode)
+    pub cli: Option<CliConfig>,
+}
+
+/// CLI-specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CliConfig {
+    /// Tools to auto-approve in CLI mode (no interactive approval possible).
+    /// Default: shell, write_file
+    #[serde(default = "default_cli_auto_approved")]
+    pub auto_approved_tools: Vec<String>,
+}
+
+pub(crate) fn default_cli_auto_approved() -> Vec<String> {
+    vec!["shell".into(), "write_file".into()]
 }
 
 /// Configuration for the embedding backend that powers semantic recall.
@@ -658,5 +673,43 @@ embedding:
         assert!(preset.model.is_none());
         assert!(preset.max_iterations.is_none());
         assert!(preset.tools.is_none());
+    }
+
+    #[test]
+    fn parse_cli_config_defaults() {
+        // When no cli section is present, Config.cli is None.
+        let cfg: Config = serde_yaml::from_str("").unwrap();
+        assert!(cfg.cli.is_none());
+    }
+
+    #[test]
+    fn parse_cli_config_empty_section() {
+        // An empty `cli:` section uses the serde default (shell + write_file).
+        let yaml = "cli: {}";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cli = cfg.cli.unwrap();
+        assert_eq!(cli.auto_approved_tools, vec!["shell", "write_file"]);
+    }
+
+    #[test]
+    fn parse_cli_config_custom_tools() {
+        let yaml = r#"
+cli:
+  auto_approved_tools: [shell, write_file, web_fetch]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cli = cfg.cli.unwrap();
+        assert_eq!(
+            cli.auto_approved_tools,
+            vec!["shell", "write_file", "web_fetch"]
+        );
+    }
+
+    #[test]
+    fn default_cli_auto_approved_returns_shell_and_write_file() {
+        let defaults = default_cli_auto_approved();
+        assert!(defaults.contains(&"shell".to_string()));
+        assert!(defaults.contains(&"write_file".to_string()));
+        assert_eq!(defaults.len(), 2);
     }
 }
