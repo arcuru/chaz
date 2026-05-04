@@ -78,8 +78,8 @@ impl WebSearch {
     fn http_client() -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
-            // DuckDuckGo blocks empty/unknown UAs; set one for all backends to be safe.
-            .user_agent("Mozilla/5.0 (compatible; chaz-bot/0.3; +https://github.com/arcuru/chaz)")
+            // DuckDuckGo blocks bot UAs; use a generic browser UA for all backends.
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {e}"))
     }
@@ -522,9 +522,10 @@ async fn duckduckgo_search(
     query: &str,
     max_results: usize,
 ) -> Result<Vec<SearchResult>, ToolError> {
+    // DDG blocks GET requests with non-browser UAs; POST with form data works reliably.
     let response = client
-        .get("https://html.duckduckgo.com/html/")
-        .query(&[("q", query)])
+        .post("https://html.duckduckgo.com/html/")
+        .form(&[("q", query)])
         .send()
         .await
         .map_err(|e| ToolError::Network(format!("duckduckgo: {e}")))?;
@@ -533,7 +534,9 @@ async fn duckduckgo_search(
         .text()
         .await
         .map_err(|e| ToolError::Network(format!("duckduckgo: {e}")))?;
-    if !status.is_success() {
+    // DDG returns 202 when rate-limiting or blocking the request; treat it as
+    // an error so the failover chain can try the next backend.
+    if status.as_u16() != 200 {
         return Err(ToolError::Execution(format!(
             "duckduckgo returned HTTP {status}"
         )));
@@ -542,6 +545,9 @@ async fn duckduckgo_search(
     let results = parse_duckduckgo_html(&body, max_results);
     if results.is_empty() {
         warn!("duckduckgo returned no parseable results (HTML may have changed)");
+        return Err(ToolError::Execution(
+            "duckduckgo returned no results (may be rate-limited or HTML changed)".into(),
+        ));
     }
     Ok(results)
 }
@@ -944,5 +950,35 @@ mod tests {
         let s = WebSearch::new(vec![]);
         assert_eq!(s.backends.len(), 1);
         assert!(matches!(s.backends[0], SearchBackend::DuckDuckGo));
+    }
+
+    #[test]
+    fn ddg_parses_direct_url_format() {
+        // DDG now emits direct URLs rather than /l/?uddg= redirects.
+        let html = r#"
+            <div class="result results_links results_links_deep web-result ">
+              <div class="links_main links_deep result__body">
+                <h2 class="result__title">
+                  <a rel="nofollow" class="result__a" href="https://tokio.rs/">Tokio async runtime</a>
+                </h2>
+                <a class="result__snippet" href="https://tokio.rs/">A reliable, async runtime for Rust.</a>
+              </div>
+            </div>
+            <div class="result results_links results_links_deep web-result ">
+              <div class="links_main links_deep result__body">
+                <h2 class="result__title">
+                  <a rel="nofollow" class="result__a" href="https://async.rs/">async-std</a>
+                </h2>
+                <a class="result__snippet" href="https://async.rs/">Async version of the Rust standard library.</a>
+              </div>
+            </div>
+        "#;
+        let r = parse_duckduckgo_html(html, 10);
+        assert_eq!(r.len(), 2, "expected 2 results, got {r:?}");
+        assert_eq!(r[0].url, "https://tokio.rs/");
+        assert_eq!(r[0].title, "Tokio async runtime");
+        assert!(r[0].snippet.contains("async runtime"));
+        assert_eq!(r[1].url, "https://async.rs/");
+        assert_eq!(r[1].title, "async-std");
     }
 }
