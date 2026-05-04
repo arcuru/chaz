@@ -282,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(tools::ShellExec);
     tool_registry.register(tools::ReadFile);
     tool_registry.register(tools::WriteFile);
+    tool_registry.register(tools::EditFile);
     tool_registry.register(tools::WebFetch);
     tool_registry.register(tools::WebSearch::new(web_search_backends));
     tool_registry.register(tools::Remember::new(
