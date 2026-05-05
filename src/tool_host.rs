@@ -383,7 +383,7 @@ fn build_network_policy(grant: Option<&NetworkGrant>) -> crate::security::Networ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grants::{EndpointPattern, FsGrant, ShellGrant};
+    use crate::grants::{EndpointPattern, ShellGrant};
 
     // ── Shell grant checks ──
 

@@ -237,7 +237,7 @@ mod tests {
             let count = content.matches(old_text.as_str()).count();
             match count {
                 0 => return Err(if edits.len() == 1 {
-                    format!("old_text not found")
+                    "old_text not found".to_string()
                 } else {
                     format!("edits[{i}] old_text not found")
                 }),
