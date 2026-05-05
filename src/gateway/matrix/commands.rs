@@ -8,18 +8,18 @@
 use crate::backends::{BackendManager, ChatContext, Message, MessageRole};
 use crate::config::*;
 use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{get_role, RoleDetails};
+use crate::role::{RoleDetails, get_role};
 use crate::security::SecretStore;
 use crate::session::{SessionMeta, SessionRegistry};
 
 use headjack::*;
 use matrix_sdk::{
+    Room, RoomMemberships,
     room::MessagesOptions,
     ruma::{
-        events::room::message::{MessageType, RoomMessageEventContent},
         OwnedUserId,
+        events::room::message::{MessageType, RoomMessageEventContent},
     },
-    Room, RoomMemberships,
 };
 use regex::Regex;
 use std::collections::HashMap;
@@ -223,12 +223,12 @@ pub async fn get_backend(
 ) -> BackendManager {
     let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
-    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await {
-        if let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await {
-            let meta = crate::session::read_meta_from_db(&db).await;
-            if let Some(backend) = meta_backend(&meta) {
-                backends.push(backend);
-            }
+    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await
+        && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
+    {
+        let meta = crate::session::read_meta_from_db(&db).await;
+        if let Some(backend) = meta_backend(&meta) {
+            backends.push(backend);
         }
     }
     if let Some(config_backends) = &config.backends {
@@ -295,14 +295,13 @@ pub async fn get_context(
                     if is_command("!", &text_content.body) {
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {
                             let model = text_content.body.split_whitespace().nth(2);
-                            if let Some(model) = model {
-                                if get_backend(room, config, secrets, registry)
+                            if let Some(model) = model
+                                && get_backend(room, config, secrets, registry)
                                     .await
                                     .validate_model(model)
                                     .is_ok()
-                                {
-                                    context.model = Some(model.to_string());
-                                }
+                            {
+                                context.model = Some(model.to_string());
                             }
                         }
                         if text_content.body.starts_with("!chaz clear") {
@@ -313,15 +312,14 @@ pub async fn get_context(
                             if command.is_empty() {
                                 continue;
                             }
-                            if let Some(command) = command.split_whitespace().next() {
-                                if [
+                            if let Some(command) = command.split_whitespace().next()
+                                && [
                                     "help", "party", "send", "list", "rename", "print", "model",
                                     "clear",
                                 ]
                                 .contains(&command.to_lowercase().as_str())
-                                {
-                                    continue;
-                                }
+                            {
+                                continue;
                             }
                             if room
                                 .client()
@@ -363,27 +361,27 @@ pub async fn get_context(
     }
     // Apply session meta overrides from the session DB
     let room_id = room.room_id().to_string();
-    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await {
-        if let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await {
-            let meta = crate::session::read_meta_from_db(&db).await;
-            if let Some(model) = &meta.model {
-                context.model = Some(model.clone());
-            }
-            if let Some(role_name) = &meta.role_name {
-                if let Some(prompt) = &meta.role_prompt {
-                    context.role = Some(RoleDetails::new(
-                        role_name,
-                        None,
-                        Some(prompt.clone()),
-                        None,
-                    ));
-                } else {
-                    context.role = get_role(
-                        Some(role_name.clone()),
-                        config.roles.clone(),
-                        DEFAULT_CONFIG.roles.clone(),
-                    );
-                }
+    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await
+        && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
+    {
+        let meta = crate::session::read_meta_from_db(&db).await;
+        if let Some(model) = &meta.model {
+            context.model = Some(model.clone());
+        }
+        if let Some(role_name) = &meta.role_name {
+            if let Some(prompt) = &meta.role_prompt {
+                context.role = Some(RoleDetails::new(
+                    role_name,
+                    None,
+                    Some(prompt.clone()),
+                    None,
+                ));
+            } else {
+                context.role = get_role(
+                    Some(role_name.clone()),
+                    config.roles.clone(),
+                    DEFAULT_CONFIG.roles.clone(),
+                );
             }
         }
     }

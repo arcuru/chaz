@@ -462,12 +462,11 @@ impl Gateway for TuiGateway {
                         )
                         .await;
                         tab.entries = session.entries().to_vec();
-                        if let Some(latest) = tab.entries.last() {
-                            if app.agent_names.contains(&latest.sender)
-                                && latest.entry_type == EntryType::Message
-                            {
-                                tab.waiting = false;
-                            }
+                        if let Some(latest) = tab.entries.last()
+                            && app.agent_names.contains(&latest.sender)
+                            && latest.entry_type == EntryType::Message
+                        {
+                            tab.waiting = false;
                         }
                     }
                 }

@@ -51,35 +51,34 @@ impl Tool for DescribeTool {
                 .parameters
                 .get("properties")
                 .and_then(|p| p.as_object())
+                && !props.is_empty()
             {
-                if !props.is_empty() {
-                    let required: Vec<&str> = desc
-                        .parameters
-                        .get("required")
-                        .and_then(|r| r.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
+                let required: Vec<&str> = desc
+                    .parameters
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
 
-                    output.push_str("\n\nParameters:\n");
-                    for (param_name, schema) in props {
-                        let type_str = schema.get("type").and_then(|t| t.as_str()).unwrap_or("any");
-                        let req = if required.contains(&param_name.as_str()) {
-                            "required"
-                        } else {
-                            "optional"
-                        };
-                        let param_desc = schema
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
+                output.push_str("\n\nParameters:\n");
+                for (param_name, schema) in props {
+                    let type_str = schema.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+                    let req = if required.contains(&param_name.as_str()) {
+                        "required"
+                    } else {
+                        "optional"
+                    };
+                    let param_desc = schema
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
 
-                        if param_desc.is_empty() {
-                            output.push_str(&format!("  - {param_name} ({type_str}, {req})\n"));
-                        } else {
-                            output.push_str(&format!(
-                                "  - {param_name} ({type_str}, {req}): {param_desc}\n"
-                            ));
-                        }
+                    if param_desc.is_empty() {
+                        output.push_str(&format!("  - {param_name} ({type_str}, {req})\n"));
+                    } else {
+                        output.push_str(&format!(
+                            "  - {param_name} ({type_str}, {req}): {param_desc}\n"
+                        ));
                     }
                 }
             }

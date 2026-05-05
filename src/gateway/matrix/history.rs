@@ -2,9 +2,9 @@ use crate::session::{EntryType, SessionEntry};
 
 use chrono::Utc;
 use matrix_sdk::{
+    Room,
     room::MessagesOptions,
     ruma::events::room::message::{MessageType, RoomMessageEventContent},
-    Room,
 };
 
 /// Read room message history as SessionEntries for backfilling.
@@ -34,15 +34,14 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
                         if command.is_empty() {
                             continue;
                         }
-                        if let Some(cmd) = command.split_whitespace().next() {
-                            if [
+                        if let Some(cmd) = command.split_whitespace().next()
+                            && [
                                 "help", "party", "send", "list", "rename", "print", "model",
                                 "clear", "backend", "role",
                             ]
                             .contains(&cmd.to_lowercase().as_str())
-                            {
-                                continue;
-                            }
+                        {
+                            continue;
                         }
                     }
 

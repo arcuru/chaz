@@ -41,14 +41,9 @@ pub enum Capability {
         working_dir: Option<String>,
     },
     /// Read a file's contents as UTF-8 text.
-    FileRead {
-        path: String,
-    },
+    FileRead { path: String },
     /// Write UTF-8 content to a file (creates or overwrites).
-    FileWrite {
-        path: String,
-        content: String,
-    },
+    FileWrite { path: String, content: String },
     /// Make an HTTP request.
     HttpRequest {
         url: String,
@@ -170,8 +165,16 @@ impl ToolHost for NativeToolHost {
                     method,
                     headers,
                     body,
-                } => exec_http(url, method, headers, body.as_deref(), grants.network.as_ref())
-                    .await,
+                } => {
+                    exec_http(
+                        url,
+                        method,
+                        headers,
+                        body.as_deref(),
+                        grants.network.as_ref(),
+                    )
+                    .await
+                }
             }
         })
     }
@@ -230,9 +233,7 @@ pub fn check_shell_command(command: &str, grant: Option<&ShellGrant>) -> Result<
         // Denylist first
         for denied in &grant.deny {
             if binary.starts_with(denied) {
-                return Err(format!(
-                    "Command '{binary}' is denied by security policy"
-                ));
+                return Err(format!("Command '{binary}' is denied by security policy"));
             }
         }
 
@@ -257,9 +258,7 @@ fn extract_command_binaries(command: &str) -> Vec<String> {
             continue;
         }
         if let Some(first_word) = trimmed.split_whitespace().next() {
-            let clean = first_word
-                .trim_start_matches("$(")
-                .trim_start_matches('(');
+            let clean = first_word.trim_start_matches("$(").trim_start_matches('(');
             if !clean.is_empty() {
                 binaries.push(clean.to_string());
             }
@@ -269,10 +268,7 @@ fn extract_command_binaries(command: &str) -> Vec<String> {
 }
 
 /// Read a file with optional filesystem grant enforcement.
-async fn exec_file_read(
-    path: &str,
-    _grants: &Grants,
-) -> Result<CapabilityResult, ToolError> {
+async fn exec_file_read(path: &str, _grants: &Grants) -> Result<CapabilityResult, ToolError> {
     // FsGrant enforcement is a stub — not yet wired in config. The host
     // boundary is here so we can add it without changing tool code.
     let content = tokio::fs::read(path)
@@ -304,9 +300,7 @@ async fn exec_http(
 ) -> Result<CapabilityResult, ToolError> {
     // Build a NetworkPolicy from the grant and check the URL+method
     let policy = build_network_policy(grant);
-    policy
-        .check(url, method)
-        .map_err(ToolError::Execution)?;
+    policy.check(url, method).map_err(ToolError::Execution)?;
 
     tracing::info!(%method, %url, "HTTP request via NativeToolHost");
 

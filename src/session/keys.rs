@@ -350,17 +350,16 @@ impl SessionRegistry {
         {
             Ok(()) => Ok(BootstrapOutcome::Approved),
             Err(e) => {
-                if let eidetica::Error::Sync(boxed) = &e {
-                    if let SyncError::BootstrapPending {
+                if let eidetica::Error::Sync(boxed) = &e
+                    && let SyncError::BootstrapPending {
                         request_id,
                         message,
                     } = boxed.as_ref()
-                    {
-                        return Ok(BootstrapOutcome::Pending {
-                            request_id: request_id.clone(),
-                            message: message.clone(),
-                        });
-                    }
+                {
+                    return Ok(BootstrapOutcome::Pending {
+                        request_id: request_id.clone(),
+                        message: message.clone(),
+                    });
                 }
                 Err(e.into())
             }

@@ -25,8 +25,8 @@ use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::store::{DocStore, Table};
 use eidetica::Database;
+use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -276,10 +276,10 @@ impl HeartbeatRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::user::User;
-    use eidetica::Instance;
 
     async fn test_session_db() -> (Instance, User, Database) {
         let backend = InMemory::new();

@@ -15,10 +15,10 @@ pub(super) async fn resolve_bank_ref(
     if let Some(entry) = index.find_by_name(bank_ref) {
         return Ok(entry);
     }
-    if let Ok(id) = eidetica::entry::ID::parse(bank_ref) {
-        if let Some(entry) = index.find_by_id(&id) {
-            return Ok(entry);
-        }
+    if let Ok(id) = eidetica::entry::ID::parse(bank_ref)
+        && let Some(entry) = index.find_by_id(&id)
+    {
+        return Ok(entry);
     }
     Err(format!(
         "No hosted memory bank matches '{bank_ref}' (try a display name from /memory list or a bank DB ID)"
@@ -362,14 +362,14 @@ pub(super) async fn memory_delete(bank_ref: &str, ctx: &CommandContext<'_>) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     async fn fixture() -> (

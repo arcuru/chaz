@@ -73,30 +73,47 @@ impl Tool for EditFile {
                 .ok_or_else(|| ToolError::InvalidArgument("Missing 'path' argument".into()))?;
 
             // Build the list of (old_text, new_text) pairs
-            let edits: Vec<(String, String)> = if let Some(arr) = arguments.get("edits").and_then(|v| v.as_array()) {
-                arr.iter()
-                    .enumerate()
-                    .map(|(i, item)| {
-                        let old = item.get("old_text").and_then(|v| v.as_str())
-                            .ok_or_else(|| ToolError::InvalidArgument(
-                                format!("edits[{i}] missing 'old_text'")
-                            ))?;
-                        let new = item.get("new_text").and_then(|v| v.as_str())
-                            .ok_or_else(|| ToolError::InvalidArgument(
-                                format!("edits[{i}] missing 'new_text'")
-                            ))?;
-                        Ok((old.to_string(), new.to_string()))
-                    })
-                    .collect::<Result<Vec<_>, ToolError>>()?
-            } else {
-                let old = arguments.get("old_text").and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::InvalidArgument(
-                        "Must provide either 'old_text'/'new_text' or 'edits' array".into()
-                    ))?;
-                let new = arguments.get("new_text").and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::InvalidArgument("Missing 'new_text' argument".into()))?;
-                vec![(old.to_string(), new.to_string())]
-            };
+            let edits: Vec<(String, String)> =
+                if let Some(arr) = arguments.get("edits").and_then(|v| v.as_array()) {
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let old =
+                                item.get("old_text")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        ToolError::InvalidArgument(format!(
+                                            "edits[{i}] missing 'old_text'"
+                                        ))
+                                    })?;
+                            let new =
+                                item.get("new_text")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        ToolError::InvalidArgument(format!(
+                                            "edits[{i}] missing 'new_text'"
+                                        ))
+                                    })?;
+                            Ok((old.to_string(), new.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, ToolError>>()?
+                } else {
+                    let old = arguments
+                        .get("old_text")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ToolError::InvalidArgument(
+                                "Must provide either 'old_text'/'new_text' or 'edits' array".into(),
+                            )
+                        })?;
+                    let new = arguments
+                        .get("new_text")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ToolError::InvalidArgument("Missing 'new_text' argument".into())
+                        })?;
+                    vec![(old.to_string(), new.to_string())]
+                };
 
             if edits.is_empty() {
                 return Err(ToolError::InvalidArgument("No edits provided".into()));
@@ -106,14 +123,20 @@ impl Tool for EditFile {
             let result = ctx
                 .host()
                 .request(
-                    &Capability::FileRead { path: path.to_string() },
+                    &Capability::FileRead {
+                        path: path.to_string(),
+                    },
                     ctx.grants(),
                 )
                 .await?;
 
             let original = match result {
                 CapabilityResult::FileRead(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                _ => return Err(ToolError::Execution("Unexpected host result for file read".into())),
+                _ => {
+                    return Err(ToolError::Execution(
+                        "Unexpected host result for file read".into(),
+                    ));
+                }
             };
 
             let original_lines = original.lines().count();
@@ -122,21 +145,23 @@ impl Tool for EditFile {
             for (i, (old_text, _)) in edits.iter().enumerate() {
                 let count = original.matches(old_text.as_str()).count();
                 match count {
-                    0 => return Err(ToolError::InvalidArgument(
-                        if edits.len() == 1 {
+                    0 => {
+                        return Err(ToolError::InvalidArgument(if edits.len() == 1 {
                             format!("old_text not found in {path}")
                         } else {
                             format!("edits[{i}] old_text not found in {path}")
-                        }
-                    )),
+                        }));
+                    }
                     1 => {}
-                    n => return Err(ToolError::InvalidArgument(
-                        if edits.len() == 1 {
+                    n => {
+                        return Err(ToolError::InvalidArgument(if edits.len() == 1 {
                             format!("old_text appears {n} times in {path} (must be unique)")
                         } else {
-                            format!("edits[{i}] old_text appears {n} times in {path} (must be unique)")
-                        }
-                    )),
+                            format!(
+                                "edits[{i}] old_text appears {n} times in {path} (must be unique)"
+                            )
+                        }));
+                    }
                 }
             }
 
@@ -149,7 +174,12 @@ impl Tool for EditFile {
             let new_lines = content.lines().count();
             let line_delta: i64 = new_lines as i64 - original_lines as i64;
 
-            info!(path, edits = edits.len(), line_delta, "Editing file via host");
+            info!(
+                path,
+                edits = edits.len(),
+                line_delta,
+                "Editing file via host"
+            );
 
             ctx.host()
                 .request(
@@ -178,9 +208,9 @@ impl Tool for EditFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grants::Grants;
     use crate::tool::ToolError;
     use crate::tool_host::{Capability, CapabilityResult, ToolHost};
-    use crate::grants::Grants;
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -194,7 +224,9 @@ mod tests {
         fn new(path: &str, content: &str) -> Self {
             let mut m = HashMap::new();
             m.insert(path.to_string(), content.to_string());
-            Self { files: Mutex::new(m) }
+            Self {
+                files: Mutex::new(m),
+            }
         }
 
         fn read(&self, path: &str) -> Option<String> {
@@ -207,7 +239,8 @@ mod tests {
             &'a self,
             capability: &'a Capability,
             _grants: &'a Grants,
-        ) -> Pin<Box<dyn Future<Output = Result<CapabilityResult, ToolError>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<CapabilityResult, ToolError>> + Send + 'a>>
+        {
             let result = match capability {
                 Capability::FileRead { path } => {
                     match self.files.lock().unwrap().get(path).cloned() {
@@ -216,10 +249,15 @@ mod tests {
                     }
                 }
                 Capability::FileWrite { path, content } => {
-                    self.files.lock().unwrap().insert(path.clone(), content.clone());
+                    self.files
+                        .lock()
+                        .unwrap()
+                        .insert(path.clone(), content.clone());
                     Ok(CapabilityResult::FileWrite)
                 }
-                _ => Err(ToolError::Execution("Unsupported capability in mock".into())),
+                _ => Err(ToolError::Execution(
+                    "Unsupported capability in mock".into(),
+                )),
             };
             Box::pin(std::future::ready(result))
         }
@@ -229,24 +267,25 @@ mod tests {
         }
     }
 
-    fn apply_edits(
-        content: &str,
-        edits: &[(String, String)],
-    ) -> Result<String, String> {
+    fn apply_edits(content: &str, edits: &[(String, String)]) -> Result<String, String> {
         for (i, (old_text, _)) in edits.iter().enumerate() {
             let count = content.matches(old_text.as_str()).count();
             match count {
-                0 => return Err(if edits.len() == 1 {
-                    "old_text not found".to_string()
-                } else {
-                    format!("edits[{i}] old_text not found")
-                }),
+                0 => {
+                    return Err(if edits.len() == 1 {
+                        "old_text not found".to_string()
+                    } else {
+                        format!("edits[{i}] old_text not found")
+                    });
+                }
                 1 => {}
-                n => return Err(if edits.len() == 1 {
-                    format!("old_text appears {n} times (must be unique)")
-                } else {
-                    format!("edits[{i}] old_text appears {n} times (must be unique)")
-                }),
+                n => {
+                    return Err(if edits.len() == 1 {
+                        format!("old_text appears {n} times (must be unique)")
+                    } else {
+                        format!("edits[{i}] old_text appears {n} times (must be unique)")
+                    });
+                }
             }
         }
         let mut result = content.to_string();
@@ -323,7 +362,9 @@ mod tests {
         // Verify via MockHost directly
         let cap_result = host
             .request(
-                &Capability::FileRead { path: path.to_string() },
+                &Capability::FileRead {
+                    path: path.to_string(),
+                },
                 &Grants::default(),
             )
             .await
@@ -342,16 +383,16 @@ mod tests {
 
         // Write back via host
         host.request(
-            &Capability::FileWrite { path: path.to_string(), content: new_content },
+            &Capability::FileWrite {
+                path: path.to_string(),
+                content: new_content,
+            },
             &Grants::default(),
         )
         .await
         .unwrap();
 
-        assert_eq!(
-            host.read(path).unwrap(),
-            "line one\nLINE TWO\nline three\n"
-        );
+        assert_eq!(host.read(path).unwrap(), "line one\nLINE TWO\nline three\n");
     }
 
     #[test]
@@ -362,6 +403,9 @@ mod tests {
             ("only once".to_string(), "y".to_string()),
         ];
         let err = apply_edits(content, &edits).unwrap_err();
-        assert!(err.contains("edits[0]") && err.contains("not found"), "got: {err}");
+        assert!(
+            err.contains("edits[0]") && err.contains("not found"),
+            "got: {err}"
+        );
     }
 }

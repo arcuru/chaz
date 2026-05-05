@@ -325,10 +325,10 @@ impl HttpTransport {
         }
 
         // Track session ID from response headers
-        if let Some(sid) = resp.headers().get("mcp-session-id") {
-            if let Ok(sid_str) = sid.to_str() {
-                *self.session_id.lock().await = Some(sid_str.to_string());
-            }
+        if let Some(sid) = resp.headers().get("mcp-session-id")
+            && let Ok(sid_str) = sid.to_str()
+        {
+            *self.session_id.lock().await = Some(sid_str.to_string());
         }
 
         let content_type = resp

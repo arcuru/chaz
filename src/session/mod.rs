@@ -19,8 +19,8 @@
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::store::{DocStore, Table};
 use eidetica::Database;
+use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -193,13 +193,11 @@ impl Session {
                 existing.timestamp == entry.timestamp && existing.content == entry.content
             });
             if !already_exists {
-                if let Ok(txn) = self.database.new_transaction().await {
-                    if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await
-                    {
-                        if store.insert(entry.clone()).await.is_ok() {
-                            let _ = txn.commit().await;
-                        }
-                    }
+                if let Ok(txn) = self.database.new_transaction().await
+                    && let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await
+                    && store.insert(entry.clone()).await.is_ok()
+                {
+                    let _ = txn.commit().await;
                 }
                 self.entries.push(entry);
                 new_count += 1;

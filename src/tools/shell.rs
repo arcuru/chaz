@@ -16,8 +16,8 @@ impl Tool for ShellExec {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "shell".to_string(),
-            description:
-                "Execute a shell command and return its stdout, stderr, and exit code".to_string(),
+            description: "Execute a shell command and return its stdout, stderr, and exit code"
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

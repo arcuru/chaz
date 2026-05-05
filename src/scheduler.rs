@@ -14,8 +14,8 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use eidetica::store::Table;
 use eidetica::Database;
+use eidetica::store::Table;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -341,8 +341,8 @@ pub struct ScheduleInfo {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     async fn test_db() -> (Instance, Database) {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();

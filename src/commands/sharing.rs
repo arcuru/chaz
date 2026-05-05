@@ -147,11 +147,11 @@ pub(super) async fn sharing_status(ctx: &CommandContext<'_>) -> CommandOutcome {
     }
 
     // Append the sync server address so users know what address to put in tickets.
-    if let Some(sync) = ctx.server.registry().instance().sync() {
-        if let Ok(addr) = sync.get_server_address().await {
-            lines.push(String::new());
-            lines.push(format!("Sync server address: {addr}"));
-        }
+    if let Some(sync) = ctx.server.registry().instance().sync()
+        && let Ok(addr) = sync.get_server_address().await
+    {
+        lines.push(String::new());
+        lines.push(format!("Sync server address: {addr}"));
     }
 
     CommandOutcome::Text(lines.join("\n"))
@@ -159,14 +159,14 @@ pub(super) async fn sharing_status(ctx: &CommandContext<'_>) -> CommandOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     /// Fixture matches `commands/agent.rs::tests::fixture` but takes a
@@ -367,7 +367,13 @@ mod tests {
         // Enable sync so we have something to disable
         let db_id = sdb.root_id().clone();
         ctx.server.registry().enable_sync_for(&db_id).await.unwrap();
-        assert!(ctx.server.registry().is_sync_enabled_for(&db_id).await.unwrap());
+        assert!(
+            ctx.server
+                .registry()
+                .is_sync_enabled_for(&db_id)
+                .await
+                .unwrap()
+        );
 
         match dispatch(Command::SessionUnshare, &ctx).await {
             CommandOutcome::Text(msg) => {
@@ -376,6 +382,12 @@ mod tests {
             other => panic!("expected Text, got {:?}", outcome_kind(&other)),
         }
 
-        assert!(!ctx.server.registry().is_sync_enabled_for(&db_id).await.unwrap());
+        assert!(
+            !ctx.server
+                .registry()
+                .is_sync_enabled_for(&db_id)
+                .await
+                .unwrap()
+        );
     }
 }

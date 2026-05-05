@@ -5,7 +5,7 @@
 //! extensions like DeepSeek's `reasoning_content` round-trip without the
 //! crate's strict types dropping unknown fields.
 
-use async_openai::{config::OpenAIConfig, Client};
+use async_openai::{Client, config::OpenAIConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -200,23 +200,23 @@ impl OpenAI {
         );
 
         // Check if the LLM wants to call tools
-        if let Some(calls) = tool_calls {
-            if !calls.is_empty() {
-                let requests = calls
-                    .into_iter()
-                    .map(|tc| ToolCallRequest {
-                        id: tc.id,
-                        name: tc.function.name,
-                        arguments: tc.function.arguments,
-                    })
-                    .collect();
+        if let Some(calls) = tool_calls
+            && !calls.is_empty()
+        {
+            let requests = calls
+                .into_iter()
+                .map(|tc| ToolCallRequest {
+                    id: tc.id,
+                    name: tc.function.name,
+                    arguments: tc.function.arguments,
+                })
+                .collect();
 
-                return Ok(LLMResponse::ToolCalls {
-                    content,
-                    tool_calls: requests,
-                    provider_extra: extra,
-                });
-            }
+            return Ok(LLMResponse::ToolCalls {
+                content,
+                tool_calls: requests,
+                provider_extra: extra,
+            });
         }
 
         // Final text response
@@ -236,10 +236,10 @@ impl LLMBackend for OpenAI {
 
     /// Get the default model for this backend
     fn default_model(&self) -> Option<String> {
-        if let Some(models) = &self.backend.models {
-            if !models.is_empty() {
-                return Some(models[0].name.clone());
-            }
+        if let Some(models) = &self.backend.models
+            && !models.is_empty()
+        {
+            return Some(models[0].name.clone());
         }
         None
     }

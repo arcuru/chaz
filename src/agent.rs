@@ -1,7 +1,7 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
 use crate::defaults::DEFAULT_CONFIG;
 use crate::grants::Grants;
-use crate::role::{get_role, RoleDetails};
+use crate::role::{RoleDetails, get_role};
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -103,22 +103,22 @@ impl Agent {
         let mut tool_profile = self.tool_profile.clone();
 
         // Apply preset if specified
-        if let Some(preset_name) = preset {
-            if let Some(p) = self.presets.get(preset_name) {
-                if let Some(ref m) = p.model {
-                    model = Some(m.clone());
-                }
-                if let Some(mi) = p.max_iterations {
-                    max_iterations = mi;
-                }
-                if let Some(ref t) = p.tools {
-                    // Preset tools must be subset of definition's allowed tools
-                    allowed_tools = Some(intersect_tools(&allowed_tools, t));
-                }
-                role_suffix = p.role_suffix.clone();
-                if let Some(ref tp) = p.tool_profile {
-                    tool_profile = Some(tp.clone());
-                }
+        if let Some(preset_name) = preset
+            && let Some(p) = self.presets.get(preset_name)
+        {
+            if let Some(ref m) = p.model {
+                model = Some(m.clone());
+            }
+            if let Some(mi) = p.max_iterations {
+                max_iterations = mi;
+            }
+            if let Some(ref t) = p.tools {
+                // Preset tools must be subset of definition's allowed tools
+                allowed_tools = Some(intersect_tools(&allowed_tools, t));
+            }
+            role_suffix = p.role_suffix.clone();
+            if let Some(ref tp) = p.tool_profile {
+                tool_profile = Some(tp.clone());
             }
         }
 

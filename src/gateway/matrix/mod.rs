@@ -11,13 +11,13 @@ use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 
 use headjack::*;
+use matrix_sdk::Room;
+use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::ruma::OwnedEventId;
-use matrix_sdk::Room;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{error, info};
 
 use commands::{get_backend, rate_limit};
@@ -91,17 +91,18 @@ fn attach_response_callback(
         let sid = session_db_id.clone();
         Box::pin(async move {
             let session = Session::new(crate::types::ConversationId(sid), db).await;
-            if let Some(latest) = session.latest_entry() {
-                if latest.entry_type == EntryType::Message && agents.get(&latest.sender).is_some() {
-                    info!(
-                        "→ Matrix({}): {}",
-                        room.room_id(),
-                        latest.content.replace('\n', " ")
-                    );
-                    let content = RoomMessageEventContent::text_markdown(&latest.content);
-                    if let Err(e) = room.send(content).await {
-                        tracing::error!("Failed to send to Matrix: {e}");
-                    }
+            if let Some(latest) = session.latest_entry()
+                && latest.entry_type == EntryType::Message
+                && agents.get(&latest.sender).is_some()
+            {
+                info!(
+                    "→ Matrix({}): {}",
+                    room.room_id(),
+                    latest.content.replace('\n', " ")
+                );
+                let content = RoomMessageEventContent::text_markdown(&latest.content);
+                if let Err(e) = room.send(content).await {
+                    tracing::error!("Failed to send to Matrix: {e}");
                 }
             }
             Ok(())
@@ -554,9 +555,7 @@ impl Gateway for MatrixGateway {
                         Some(Command::AgentDelete(rest.to_string()))
                     }
                     "share" if !rest.is_empty() => Some(Command::AgentShare(rest.to_string())),
-                    "unshare" if !rest.is_empty() => {
-                        Some(Command::AgentUnshare(rest.to_string()))
-                    }
+                    "unshare" if !rest.is_empty() => Some(Command::AgentUnshare(rest.to_string())),
                     "import" if !rest.is_empty() => (|| {
                         let mut parts = rest.splitn(2, char::is_whitespace);
                         let ticket = parts.next().unwrap_or("").trim();
@@ -688,9 +687,7 @@ impl Gateway for MatrixGateway {
                         }
                     }
                     "share" if !rest.is_empty() => Some(Command::MemoryShare(rest.to_string())),
-                    "unshare" if !rest.is_empty() => {
-                        Some(Command::MemoryUnshare(rest.to_string()))
-                    }
+                    "unshare" if !rest.is_empty() => Some(Command::MemoryUnshare(rest.to_string())),
                     "import" if !rest.is_empty() => (|| {
                         let mut parts = rest.splitn(2, char::is_whitespace);
                         let ticket = parts.next().unwrap_or("").trim();

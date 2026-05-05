@@ -1,9 +1,9 @@
+use serde::Deserialize;
 /// Roles
 /// Roles are the same as defining the system prompt.
 /// Some models, especially the chat models, take a specific system prompt, and others you can just inject it as the first message.
 /// Prompting the models with an example message can also be useful.
 use serde::de::{self, Deserializer, Unexpected, Visitor};
-use serde::Deserialize;
 use std::fmt;
 
 #[derive(Debug, Deserialize, Clone)]

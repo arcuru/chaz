@@ -15,7 +15,7 @@
 //! remove_rule, list_rules}`), so they sync and survive restarts. `HeartbeatRunner`
 //! picks them up on its next tick.
 
-use crate::heartbeat::{list_rules, remove_rule, upsert_rule, HeartbeatRule};
+use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
 use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use cron::Schedule;
@@ -36,10 +36,10 @@ fn resolve_target_agent(
     if let Some(entry) = index.find_by_name(name) {
         return Ok(entry);
     }
-    if let Ok(id) = eidetica::entry::ID::parse(name) {
-        if let Some(entry) = index.find_by_id(&id) {
-            return Ok(entry);
-        }
+    if let Ok(id) = eidetica::entry::ID::parse(name)
+        && let Some(entry) = index.find_by_id(&id)
+    {
+        return Ok(entry);
     }
     Err(format!(
         "No hosted agent matches '{name}' — pass a display name or DB id, or omit to target yourself"
@@ -384,13 +384,13 @@ impl Tool for HeartbeatList {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::{DbEntry, HostedIndex};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 

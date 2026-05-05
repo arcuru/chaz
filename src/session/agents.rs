@@ -11,12 +11,12 @@ use crate::agent_db::{AgentDb, SessionHistoryEntry};
 use crate::hosted_index::DbEntry;
 
 use chrono::Utc;
+use eidetica::Database;
 use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::store::Table;
-use eidetica::Database;
 use tracing::{info, warn};
 
-use super::{parse_mentions, read_meta_from_db, update_meta_on_db, AgentRef, SessionRegistry};
+use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
 
 impl SessionRegistry {
     /// Attach an agent to a session. Grants the agent's pubkey Write
@@ -180,10 +180,10 @@ impl SessionRegistry {
         override_name: Option<&str>,
         agent_index: &crate::hosted_index::HostedIndex,
     ) -> Agent {
-        if let Some(name) = override_name {
-            if let Some(agent) = self.agents.get(name) {
-                return agent.clone();
-            }
+        if let Some(name) = override_name
+            && let Some(agent) = self.agents.get(name)
+        {
+            return agent.clone();
         }
 
         let Ok((_conv_id, db)) = self.open_session(session_db_id).await else {
@@ -195,10 +195,10 @@ impl SessionRegistry {
         }
 
         let meta = read_meta_from_db(&db).await;
-        if let Some(agent_name) = meta.agent_name.as_deref() {
-            if let Some(agent) = self.agents.get(agent_name) {
-                return agent.clone();
-            }
+        if let Some(agent_name) = meta.agent_name.as_deref()
+            && let Some(agent) = self.agents.get(agent_name)
+        {
+            return agent.clone();
         }
 
         self.agents.default_agent().clone()
@@ -270,10 +270,10 @@ impl SessionRegistry {
         agent_index: &crate::hosted_index::HostedIndex,
         trigger_text: Option<&str>,
     ) -> Agent {
-        if let Some(name) = override_name {
-            if let Some(agent) = self.agents.get(name) {
-                return agent.clone();
-            }
+        if let Some(name) = override_name
+            && let Some(agent) = self.agents.get(name)
+        {
+            return agent.clone();
         }
 
         let Ok((_conv_id, db)) = self.open_session(session_db_id).await else {
@@ -288,10 +288,9 @@ impl SessionRegistry {
                 if let Some(entry) = authorized
                     .iter()
                     .find(|e| e.display_name.eq_ignore_ascii_case(&mention))
+                    && let Some(agent) = self.agents.get(&entry.display_name)
                 {
-                    if let Some(agent) = self.agents.get(&entry.display_name) {
-                        return agent.clone();
-                    }
+                    return agent.clone();
                 }
             }
         }
@@ -299,26 +298,25 @@ impl SessionRegistry {
         let meta = read_meta_from_db(&db).await;
 
         // (3) designated host agent.
-        if let Some(host_id) = meta.host_agent_db_id.as_deref() {
-            if let Some(entry) = authorized.iter().find(|e| e.db_id.to_string() == host_id) {
-                if let Some(agent) = self.agents.get(&entry.display_name) {
-                    return agent.clone();
-                }
-            }
+        if let Some(host_id) = meta.host_agent_db_id.as_deref()
+            && let Some(entry) = authorized.iter().find(|e| e.db_id.to_string() == host_id)
+            && let Some(agent) = self.agents.get(&entry.display_name)
+        {
+            return agent.clone();
         }
 
         // (4) first authorized agent.
-        if let Some(entry) = authorized.first() {
-            if let Some(agent) = self.agents.get(&entry.display_name) {
-                return agent.clone();
-            }
+        if let Some(entry) = authorized.first()
+            && let Some(agent) = self.agents.get(&entry.display_name)
+        {
+            return agent.clone();
         }
 
         // (5) legacy agent_name.
-        if let Some(name) = meta.agent_name.as_deref() {
-            if let Some(agent) = self.agents.get(name) {
-                return agent.clone();
-            }
+        if let Some(name) = meta.agent_name.as_deref()
+            && let Some(agent) = self.agents.get(name)
+        {
+            return agent.clone();
         }
 
         self.agents.default_agent().clone()

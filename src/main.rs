@@ -213,16 +213,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Same env-resolution dance for the embedding API key, then build the
     // shared `Arc<dyn Embedder>` (None when no embedding section configured).
-    if let Some(emb) = &mut config.embedding {
-        if let Some(raw_key) = emb.api_key.take() {
-            let resolved = security::SecretStore::resolve_env(&raw_key).unwrap_or_else(|e| {
-                tracing::warn!("Failed to resolve API key for embedding: {e}");
-                raw_key
-            });
-            let ref_id = emb.secret_key();
-            secret_store.insert(ref_id.clone(), resolved).await;
-            emb.api_key_ref = Some(ref_id);
-        }
+    if let Some(emb) = &mut config.embedding
+        && let Some(raw_key) = emb.api_key.take()
+    {
+        let resolved = security::SecretStore::resolve_env(&raw_key).unwrap_or_else(|e| {
+            tracing::warn!("Failed to resolve API key for embedding: {e}");
+            raw_key
+        });
+        let ref_id = emb.secret_key();
+        secret_store.insert(ref_id.clone(), resolved).await;
+        emb.api_key_ref = Some(ref_id);
     }
     let embedder = match embedding::build_embedder(config.embedding.as_ref(), &secret_store) {
         Ok(e) => e,

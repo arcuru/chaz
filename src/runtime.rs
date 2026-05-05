@@ -388,15 +388,15 @@ pub async fn execute(
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
 
                             // --- Security: rate limit check ---
-                            if let Some(limit) = policy.rate_limit {
-                                if let Err(msg) = rate_limiter.check(&call.name, limit) {
-                                    warn!(tool = %call.name, "Rate limited");
-                                    messages.push(RuntimeMessage::ToolResult {
-                                        call_id: call.id.clone(),
-                                        content: wrap_tool_output(&call.name, &msg),
-                                    });
-                                    continue;
-                                }
+                            if let Some(limit) = policy.rate_limit
+                                && let Err(msg) = rate_limiter.check(&call.name, limit)
+                            {
+                                warn!(tool = %call.name, "Rate limited");
+                                messages.push(RuntimeMessage::ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: wrap_tool_output(&call.name, &msg),
+                                });
+                                continue;
                             }
 
                             // --- Security: approval gate ---
@@ -725,8 +725,8 @@ mod tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fake tool whose next error is configurable per call. Counts invocations
     /// so tests can assert how many times the runtime actually ran it.

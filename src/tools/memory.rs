@@ -13,13 +13,13 @@
 //! anything cross-agent is now a shared bank DB.
 
 use crate::agent_db::MemoryEntry;
-use crate::embedding::{cosine_similarity, embeddings_store_name, Embedder, EmbeddingEntry};
+use crate::embedding::{Embedder, EmbeddingEntry, cosine_similarity, embeddings_store_name};
 use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use chrono::Utc;
-use eidetica::store::Table;
 use eidetica::Database;
+use eidetica::store::Table;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -829,13 +829,13 @@ fn doc_text(entry: &MemoryEntry) -> String {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::{DbEntry, HostedIndex};
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -1328,7 +1328,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     use crate::embedding::test_support::MockEmbedder;
-    use crate::embedding::{embeddings_store_name, EmbeddingEntry};
+    use crate::embedding::{EmbeddingEntry, embeddings_store_name};
     use eidetica::store::Table;
 
     /// Pull every `EmbeddingEntry` row out of the agent's `embeddings:<model_id>`

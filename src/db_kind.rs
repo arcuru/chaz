@@ -12,8 +12,8 @@
 //! JSON-blob `value` key the rest of `meta` uses, so adding them doesn't
 //! force a schema change on `AgentMeta` / `MemoryBankMeta` / `SessionMeta`.
 
-use eidetica::store::DocStore;
 use eidetica::Database;
+use eidetica::store::DocStore;
 
 pub const META_STORE: &str = "meta";
 pub const KIND_KEY: &str = "kind";
@@ -52,8 +52,8 @@ pub async fn read_marker(database: &Database) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     async fn fresh_db() -> (Instance, eidetica::user::User, Database) {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();

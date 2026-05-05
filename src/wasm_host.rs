@@ -50,7 +50,10 @@ fn pack_result(ptr: u32, len: u32) -> i64 {
 }
 
 fn unpack_result(packed: i64) -> (u32, u32) {
-    ((packed & 0xFFFF_FFFF) as u32, ((packed >> 32) & 0xFFFF_FFFF) as u32)
+    (
+        (packed & 0xFFFF_FFFF) as u32,
+        ((packed >> 32) & 0xFFFF_FFFF) as u32,
+    )
 }
 
 // ── WasmEngine ───────────────────────────────────────────────────
@@ -86,9 +89,9 @@ impl WasmEngine {
 
         // Validate required exports
         for exp in &["alloc", "descriptor", "execute"] {
-            module.get_export(exp).ok_or_else(|| {
-                format!("Module '{name}' missing required export '{exp}'")
-            })?;
+            module
+                .get_export(exp)
+                .ok_or_else(|| format!("Module '{name}' missing required export '{exp}'"))?;
         }
 
         self.modules.insert(name.to_string(), Arc::new(module));
@@ -262,8 +265,7 @@ impl Tool for WasmTool {
                 .read(&store, result_ptr as usize, &mut result_buf)
                 .map_err(|e| ToolError::Execution(format!("result read: {e}")))?;
 
-            String::from_utf8(result_buf)
-                .map_err(|e| ToolError::Execution(format!("UTF-8: {e}")))
+            String::from_utf8(result_buf).map_err(|e| ToolError::Execution(format!("UTF-8: {e}")))
         })
     }
 }
@@ -276,9 +278,7 @@ struct WasmHostState {
 }
 
 #[allow(dead_code)]
-fn add_host_functions(
-    linker: &mut wasmtime::Linker<WasmHostState>,
-) -> Result<(), ToolError> {
+fn add_host_functions(linker: &mut wasmtime::Linker<WasmHostState>) -> Result<(), ToolError> {
     // host_shell(cmd_ptr: i32, cmd_len: i32) -> i64
     linker
         .func_wrap_async(
@@ -359,11 +359,10 @@ fn add_host_functions(
                         Some(s) => s,
                         None => return -1,
                     };
-                    let content =
-                        match host_read_str(&caller, &memory, content_ptr, content_len) {
-                            Some(s) => s,
-                            None => return -1,
-                        };
+                    let content = match host_read_str(&caller, &memory, content_ptr, content_len) {
+                        Some(s) => s,
+                        None => return -1,
+                    };
                     let result = ctx
                         .host()
                         .request(
@@ -404,11 +403,10 @@ fn add_host_functions(
                         Some(s) => s,
                         None => return -1,
                     };
-                    let method =
-                        match host_read_str(&caller, &memory, method_ptr, method_len) {
-                            Some(s) => s,
-                            None => return -1,
-                        };
+                    let method = match host_read_str(&caller, &memory, method_ptr, method_len) {
+                        Some(s) => s,
+                        None => return -1,
+                    };
                     let body = if body_ptr == 0 || body_len == 0 {
                         None
                     } else {
@@ -519,10 +517,7 @@ fn host_write_result(
         return -1;
     }
 
-    let memory = match caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
-    {
+    let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
         Some(m) => m,
         None => return -1,
     };
@@ -665,10 +660,7 @@ mod tests {
         let err = engine
             .load_module("bad_tool", &wasm_bytes)
             .expect_err("Should reject");
-        assert!(
-            err.contains("missing required export"),
-            "Error: {err}"
-        );
+        assert!(err.contains("missing required export"), "Error: {err}");
     }
 
     #[test]

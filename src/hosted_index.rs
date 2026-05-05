@@ -190,10 +190,10 @@ pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, Hosted
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
-    use crate::memory_bank_db::{create_memory_bank, MemoryBankMeta};
-    use eidetica::backend::database::InMemory;
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+    use crate::memory_bank_db::{MemoryBankMeta, create_memory_bank};
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     async fn fresh_user() -> (Instance, eidetica::user::User) {
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();

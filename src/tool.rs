@@ -189,10 +189,11 @@ impl ToolProfile {
         }
         // Glob prefix match: "namespace.*" matches "namespace.anything"
         for (pattern, mode) in &self.tool_modes {
-            if let Some(prefix) = pattern.strip_suffix(".*") {
-                if tool_name.starts_with(prefix) && tool_name[prefix.len()..].starts_with('.') {
-                    return mode;
-                }
+            if let Some(prefix) = pattern.strip_suffix(".*")
+                && tool_name.starts_with(prefix)
+                && tool_name[prefix.len()..].starts_with('.')
+            {
+                return mode;
             }
         }
         &self.default_mode
@@ -569,10 +570,10 @@ impl ScopedTools {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        if let Some(allowed) = &self.allowed {
-            if !is_allowed_by(allowed, name) {
-                return None;
-            }
+        if let Some(allowed) = &self.allowed
+            && !is_allowed_by(allowed, name)
+        {
+            return None;
         }
         self.registry.get(name)
     }
@@ -638,9 +639,11 @@ mod tests {
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.description, "Execute a shell command.");
         // Parameter description should be stripped
-        assert!(result.parameters["properties"]["cmd"]
-            .get("description")
-            .is_none());
+        assert!(
+            result.parameters["properties"]["cmd"]
+                .get("description")
+                .is_none()
+        );
         // But type should remain
         assert_eq!(result.parameters["properties"]["cmd"]["type"], "string");
     }
@@ -659,10 +662,12 @@ mod tests {
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.name, "shell");
         assert!(result.description.is_empty());
-        assert!(result.parameters["properties"]
-            .as_object()
-            .unwrap()
-            .is_empty());
+        assert!(
+            result.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -64,7 +64,9 @@ impl BubblewrapToolHost {
         if available {
             tracing::info!("BubblewrapToolHost: bwrap found, shell sandboxing active");
         } else {
-            warn!("BubblewrapToolHost: bwrap not found — falling back to native execution for all capabilities. Install bubblewrap for OS-level shell sandboxing.");
+            warn!(
+                "BubblewrapToolHost: bwrap not found — falling back to native execution for all capabilities. Install bubblewrap for OS-level shell sandboxing."
+            );
         }
 
         Self {
@@ -176,11 +178,10 @@ async fn exec_shell_bwrap(
     grants: &Grants,
 ) -> Result<CapabilityResult, ToolError> {
     // Grant check — shared with native host
-    crate::tool_host::check_shell_command(command, grants.shell.as_ref())
-        .map_err(|msg| {
-            warn!(command = %command, "Bwrap shell command denied: {msg}");
-            ToolError::Execution(msg)
-        })?;
+    crate::tool_host::check_shell_command(command, grants.shell.as_ref()).map_err(|msg| {
+        warn!(command = %command, "Bwrap shell command denied: {msg}");
+        ToolError::Execution(msg)
+    })?;
 
     let mut cmd = build_bwrap_command("bwrap", command, working_dir);
 
@@ -232,10 +233,7 @@ mod tests {
         let cmd = host.build_shell_command("ls", Some("/tmp"));
 
         let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("--chdir"),
-            "Should have chdir: {debug}"
-        );
+        assert!(debug.contains("--chdir"), "Should have chdir: {debug}");
     }
 
     #[test]

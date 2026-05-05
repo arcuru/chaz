@@ -24,10 +24,10 @@ pub(super) async fn resolve_agent_ref(
     if let Some(entry) = index.find_by_name(agent_ref) {
         return Ok(entry);
     }
-    if let Ok(id) = eidetica::entry::ID::parse(agent_ref) {
-        if let Some(entry) = index.find_by_id(&id) {
-            return Ok(entry);
-        }
+    if let Ok(id) = eidetica::entry::ID::parse(agent_ref)
+        && let Some(entry) = index.find_by_id(&id)
+    {
+        return Ok(entry);
     }
     Err(format!(
         "No hosted agent matches '{agent_ref}' (try a display name from /agents or an agent DB ID)"
@@ -655,15 +655,15 @@ pub(super) async fn agent_revoke_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, Command, CommandContext, CommandOutcome};
+    use super::super::{Command, CommandContext, CommandOutcome, dispatch};
     use crate::agent::AgentRegistry;
     use crate::agent_db::find_agent_db;
     use crate::backends::BackendManager;
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
     use std::sync::Arc;
 
     /// End-to-end fixture: Server + SessionRegistry + one open session +

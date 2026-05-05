@@ -5,7 +5,7 @@
 use crate::config::McpServerConfig;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -201,10 +201,10 @@ impl McpServer {
     /// Call a tool on the MCP server, with auto-restart on process death.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, String> {
         // Lazy refresh: if the server signaled tools/list_changed, re-discover before calling
-        if self.tools_changed.load(Ordering::Relaxed) {
-            if let Err(e) = self.refresh_tools().await {
-                warn!(server = %self.name, error = %e, "Failed to refresh tools after list_changed");
-            }
+        if self.tools_changed.load(Ordering::Relaxed)
+            && let Err(e) = self.refresh_tools().await
+        {
+            warn!(server = %self.name, error = %e, "Failed to refresh tools after list_changed");
         }
 
         let params = json!({

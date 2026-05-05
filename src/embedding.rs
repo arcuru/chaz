@@ -428,8 +428,8 @@ mod tests {
     /// Build a SecretStore over an isolated in-memory eidetica DB —
     /// same pattern as `backends::tests::empty_secrets`.
     async fn empty_secret_store() -> SecretStore {
-        use eidetica::backend::database::InMemory;
         use eidetica::Instance;
+        use eidetica::backend::database::InMemory;
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
         let _ = instance.create_user("t", None).await;
         let mut user = instance.login_user("t", None).await.unwrap();
@@ -505,7 +505,8 @@ mod tests {
             let body = "boom";
             let response = format!(
                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(), body
+                body.len(),
+                body
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             let _ = socket.shutdown().await;

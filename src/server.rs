@@ -28,7 +28,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.
@@ -629,10 +629,10 @@ impl Server {
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
-    use crate::agent_db::{create_agent_db, AgentDbConfig, AgentMeta};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::DbEntry;
-    use eidetica::backend::database::InMemory;
     use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
 
     /// Build a Server with the minimum wiring needed to exercise hydration.
     async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {

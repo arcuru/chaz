@@ -5,14 +5,14 @@
 use crate::agent::AgentRegistry;
 use crate::types::ConversationId;
 
+use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
 use eidetica::store::DocStore;
-use eidetica::Database;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
-use super::{find_or_create_db, read_meta_from_db, update_meta_on_db, SessionIndex};
+use super::{SessionIndex, find_or_create_db, read_meta_from_db, update_meta_on_db};
 
 /// Notification emitted when a new session is indexed in the registry.
 #[derive(Debug, Clone)]
@@ -72,17 +72,16 @@ impl SessionRegistry {
             let sync_tx = sync_tx.clone();
             let db = db.clone();
             Box::pin(async move {
-                if let Ok(txn) = db.new_transaction().await {
-                    if let Ok(store) = txn.get_store::<DocStore>(STORE_SESSIONS).await {
-                        if let Ok(doc) = store.get_all().await {
-                            for (key, value) in doc.iter() {
-                                let source: Option<String> = value.try_into().ok();
-                                let _ = sync_tx.try_send(NewSessionEvent {
-                                    session_db_id: key.clone(),
-                                    source,
-                                });
-                            }
-                        }
+                if let Ok(txn) = db.new_transaction().await
+                    && let Ok(store) = txn.get_store::<DocStore>(STORE_SESSIONS).await
+                    && let Ok(doc) = store.get_all().await
+                {
+                    for (key, value) in doc.iter() {
+                        let source: Option<String> = value.try_into().ok();
+                        let _ = sync_tx.try_send(NewSessionEvent {
+                            session_db_id: key.clone(),
+                            source,
+                        });
                     }
                 }
                 Ok(())
@@ -291,10 +290,10 @@ impl SessionRegistry {
         {
             let txn = self.chaz_group.new_transaction().await?;
             let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
-            if let Ok(existing) = store.get_string(&name).await {
-                if existing != session_db_id {
-                    anyhow::bail!("Name '{name}' is already used by another session");
-                }
+            if let Ok(existing) = store.get_string(&name).await
+                && existing != session_db_id
+            {
+                anyhow::bail!("Name '{name}' is already used by another session");
             }
             store.set_string(&name, session_db_id).await?;
             txn.commit().await?;

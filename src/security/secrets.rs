@@ -1,5 +1,5 @@
-use eidetica::store::DocStore;
 use eidetica::Database;
+use eidetica::store::DocStore;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
@@ -155,22 +155,26 @@ mod tests {
 
     #[test]
     fn test_resolve_env_dollar_brace() {
-        std::env::set_var("CHAZ_TEST_SECRET_1", "from-env");
+        // SAFETY: tests are single-threaded per #[test]; the var name is
+        // CHAZ_TEST_SECRET_1, scoped to this test only.
+        unsafe { std::env::set_var("CHAZ_TEST_SECRET_1", "from-env") };
         assert_eq!(
             SecretStore::resolve_env("${CHAZ_TEST_SECRET_1}").unwrap(),
             "from-env"
         );
-        std::env::remove_var("CHAZ_TEST_SECRET_1");
+        unsafe { std::env::remove_var("CHAZ_TEST_SECRET_1") };
     }
 
     #[test]
     fn test_resolve_env_dollar() {
-        std::env::set_var("CHAZ_TEST_SECRET_2", "also-from-env");
+        // SAFETY: tests are single-threaded per #[test]; the var name is
+        // CHAZ_TEST_SECRET_2, scoped to this test only.
+        unsafe { std::env::set_var("CHAZ_TEST_SECRET_2", "also-from-env") };
         assert_eq!(
             SecretStore::resolve_env("$CHAZ_TEST_SECRET_2").unwrap(),
             "also-from-env"
         );
-        std::env::remove_var("CHAZ_TEST_SECRET_2");
+        unsafe { std::env::remove_var("CHAZ_TEST_SECRET_2") };
     }
 
     #[test]
