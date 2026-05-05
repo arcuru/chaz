@@ -285,6 +285,12 @@ pub async fn get_context(
                 raw.get_field::<RoomMessageEventContent>("content")
                     .unwrap_or(None),
             ) {
+                // TODO(multimodal): only text messages are ingested. Image/file
+                // attachments (`MessageType::Image`, etc.) were supported on 0.3.0
+                // via MediaRequest → LLM context but were dropped in the rewrite.
+                // Restoring requires plumbing image bytes through RuntimeMessage
+                // and emitting multi-part chat-completion content. See
+                // docs/src/user_guide/matrix.md "Limitations".
                 if let MessageType::Text(text_content) = &content.msgtype {
                     if is_command("!", &text_content.body) {
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {

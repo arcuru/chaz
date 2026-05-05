@@ -74,3 +74,7 @@ If the Matrix connection drops, the bot retries with a 5-second backoff. The ret
 ## Tool Approval
 
 The bot surfaces approval requests as markdown notices in the room. Respond either via reactions (✅ approve · ❌ deny · ⏭ approve all) or by sending `!chaz approve` / `!chaz deny`. To skip approval altogether for specific low-risk tools, add them to `security.auto_approved_tools`.
+
+## Limitations
+
+- **Text only.** The Matrix gateway currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `src/gateway/matrix/commands.rs` and `src/gateway/matrix/history.rs`.
