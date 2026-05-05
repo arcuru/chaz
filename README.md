@@ -1,6 +1,8 @@
 # chaz
 
-Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects to LLM providers via OpenAI-compatible APIs and features a ReAct tool-calling loop, multi-agent orchestration, persistent sessions via [eidetica](https://github.com/arcuru/eidetica), and session sharing between instances.
+Chaz is an experimental AI agent framework built on [eidetica](https://github.com/arcuru/eidetica). It features a ReAct tool-calling loop, multi-agent orchestration, and persistent + syncable per-session state. The primary gateway is a [Matrix](https://matrix.org) bot connecting to any OpenAI-compatible LLM provider; a TUI is also included.
+
+> ⚠️ **Experimental.** APIs, config, and on-disk state may change without notice. Don't run against data you can't afford to lose.
 
 For a more mature Matrix chatbot focused on day-to-day use, see [baibot](https://github.com/etkecc/baibot).
 
