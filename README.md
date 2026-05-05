@@ -267,6 +267,12 @@ services:
     volumes:
       - ./config.yaml:/config.yaml
       - chaz-state:/state
+    # Cap log size — chaz can be chatty under tracing=debug
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
 
 volumes:
   chaz-state:
