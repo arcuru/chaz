@@ -13,7 +13,7 @@ homepage = "https://github.com/arcuru/chaz"
 name = "chaz"
 
 [dependencies]
-headjack = { git = "https://github.com/arcuru/headjack", branch = "vibe" }
+headjack = { git = "https://github.com/arcuru/headjack", rev = "0715bf369de97fdb02b915fef682c396f34f24b9" }
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util"] }
