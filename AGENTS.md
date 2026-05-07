@@ -55,8 +55,9 @@ gateway/             matrix/ + tui/ — translate platform events ↔ session DB
 error.rs             Error + LlmError (retryable/permanent classification)
 backends.rs          BackendManager, LLMBackend trait, ChatContext, Message
 openai.rs            OpenAI-compatible backend
-role.rs              Role/system prompt management
-defaults.rs          Built-in default config and roles
+persona.rs           Persona + ResolvedPersona + PersonaSnapshotPayload — file-include + inline system prompts
+role.rs              Deprecated role lookup (one-release migration window for legacy `roles:` configs)
+defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
 ```
 
 ## Key Invariants
@@ -68,6 +69,7 @@ defaults.rs          Built-in default config and roles
 - **Per-session serialization.** Concurrent writes to the same session while an agent is running are skipped (prevents duplicate responses).
 - **Tools access system resources through `ToolHost`.** The host (`ctx.host()`) enforces grants at the capability boundary. Tools request capabilities (Shell, FileRead, FileWrite, HttpRequest) rather than calling OS APIs directly. New capability types go in `tool_host.rs`.
 - **Context entries**: only `Message`, `Directive`, and `Summary` enter the LLM context window. `ToolCall`/`ToolResult`/`Ack`/`Error` are audit-only.
+- **PersonaSnapshot is the system-prompt source of truth.** Once written (at agent attach, on `/agent persona bump`, or on `/agent set <ref> persona.*`), the snapshot's `text` is what ContextBuilder injects as the LLM system message — disk edits to a persona's source files do **not** silently mutate ongoing sessions. The legacy `default_role`/`role:` flow only applies to sessions that predate any snapshot.
 
 ## Test Instance
 

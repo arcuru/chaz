@@ -587,6 +587,21 @@ impl Gateway for MatrixGateway {
                             })
                         }
                     }
+                    "persona" if !rest.is_empty() => {
+                        // `!chaz agent persona show <ref>` / `!chaz agent persona bump <ref>`
+                        let mut parts = rest.splitn(2, char::is_whitespace);
+                        let sub = parts.next().unwrap_or("").trim();
+                        let target = parts.next().unwrap_or("").trim();
+                        if target.is_empty() {
+                            None
+                        } else {
+                            match sub {
+                                "show" => Some(Command::AgentPersonaShow(target.to_string())),
+                                "bump" => Some(Command::AgentPersonaBump(target.to_string())),
+                                _ => None,
+                            }
+                        }
+                    }
                     "invite" if !rest.is_empty() => {
                         let mut parts = rest.splitn(3, char::is_whitespace);
                         let agent_ref = parts.next().unwrap_or("").trim();

@@ -23,121 +23,124 @@ username: ""
 # Optional. This is a separate model to use for summarization
 #chat_summary_model: ""
 
-# Optional. Set a role, A.K.A. system prompt, to use by default
-#role: ""
-
 # Optional. Set a per-account message limit.
 #message_limit: 0
 
 # Optional. Set a room size limit to respond in.
 #room_size_limit: 0
 
-# Predefined roles here to use above
-# These roles are builtin and can be set by any user
-roles:
+# Built-in agents. Each agent has an embedded `persona:` (file includes
+# + inline prompt) — there is no longer a separate `roles:` section.
+# Users can reference these agent names from their own configs (e.g.
+# clone the chaz prompt by referring to it) or replace them entirely.
+agents:
   - name: chaz
-    description: Chaz is Chaz
-    prompt: "Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person."
-    example: # Include some example responses, which can help the model understand the role
-      - user: User
-        message: "Are you ready?"
-      - user: Assistant
-        message: "Chaz is ready."
+    persona:
+      description: Chaz is Chaz
+      prompt: "Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person."
   - name: chazmina
-    description: Chaz is Chazmina
-    prompt: "Your name is Chazmina, you are an AI assistant, and you refer to yourself in the third person."
-    example:
-      - user: User
-        message: "Are you ready?"
-      - user: Assistant
-        message: "Chazmina is ready."
+    persona:
+      description: Chaz is Chazmina
+      prompt: "Your name is Chazmina, you are an AI assistant, and you refer to yourself in the third person."
   - name: cave-chaz
-    description: Chaz is Cave Man Chaz
-    prompt: "Your name is Chaz, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
-    example:
-      - user: User
-        message: "Are you ready?"
-      - user: Assistant
-        message: "Chaz is ready."
+    persona:
+      description: Chaz is Cave Man Chaz
+      prompt: "Your name is Chaz, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
   - name: cave-chazmina
-    description: Chaz is Cave Man Chazmina
-    prompt: "Your name is Chazmina, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
-    example:
-      - user: User
-        message: "Are you ready?"
-      - user: Assistant
-        message: "Chazmina is ready."
+    persona:
+      description: Chaz is Cave Man Chazmina
+      prompt: "Your name is Chazmina, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
   - name: bash
-    description: Get a bash shell command
-    prompt: >
-      Based on the following user description, generate a corresponding Bash shell command.
-      Focus solely on interpreting the requirements and translating them into a single, executable Bash command.
-      Ensure accuracy and relevance to the user's description.
-      The output should be a valid Bash command that directly aligns with the user's intent, ready for execution in a command-line environment.
-      Do not output anything except for the command.
-      No code block, no English explanation, no newlines, and no start/end tags.
+    persona:
+      description: Get a bash shell command
+      prompt: >
+        Based on the following user description, generate a corresponding Bash shell command.
+        Focus solely on interpreting the requirements and translating them into a single, executable Bash command.
+        Ensure accuracy and relevance to the user's description.
+        The output should be a valid Bash command that directly aligns with the user's intent, ready for execution in a command-line environment.
+        Do not output anything except for the command.
+        No code block, no English explanation, no newlines, and no start/end tags.
   - name: fish
-    description: Get a fish shell command
-    prompt: >
-      Based on the following user description, generate a corresponding Fish shell command.
-      Focus solely on interpreting the requirements and translating them into a single, executable Fish command.
-      Ensure accuracy and relevance to the user's description.
-      The output should be a valid Fish command that directly aligns with the user's intent, ready for execution in a command-line environment.
-      Do not output anything except for the command.
-      No code block, no English explanation, no newlines, and no start/end tags.
+    persona:
+      description: Get a fish shell command
+      prompt: >
+        Based on the following user description, generate a corresponding Fish shell command.
+        Focus solely on interpreting the requirements and translating them into a single, executable Fish command.
+        Ensure accuracy and relevance to the user's description.
+        The output should be a valid Fish command that directly aligns with the user's intent, ready for execution in a command-line environment.
+        Do not output anything except for the command.
+        No code block, no English explanation, no newlines, and no start/end tags.
   - name: zsh
-    description: Get a zsh shell command
-    prompt: >
-      Based on the following user description, generate a corresponding Zsh shell command.
-      Focus solely on interpreting the requirements and translating them into a single, executable Zsh command.
-      Ensure accuracy and relevance to the user's description.
-      The output should be a valid Zsh command that directly aligns with the user's intent, ready for execution in a command-line environment.
-      Do not output anything except for the command.
-      No code block, no English explanation, no newlines, and no start/end tags.
+    persona:
+      description: Get a zsh shell command
+      prompt: >
+        Based on the following user description, generate a corresponding Zsh shell command.
+        Focus solely on interpreting the requirements and translating them into a single, executable Zsh command.
+        Ensure accuracy and relevance to the user's description.
+        The output should be a valid Zsh command that directly aligns with the user's intent, ready for execution in a command-line environment.
+        Do not output anything except for the command.
+        No code block, no English explanation, no newlines, and no start/end tags.
   - name: nu
-    description: Get a nushell command
-    prompt: >
-      Based on the following user description, generate a corresponding Nushell shell command.
-      Focus solely on interpreting the requirements and translating them into a single, executable Nushell command.
-      Ensure accuracy and relevance to the user's description.
-      The output should be a valid Nushell command that directly aligns with the user's intent, ready for execution in a command-line environment.
-      Do not output anything except for the command.
-      No code block, no English explanation, no newlines, and no start/end tags.
+    persona:
+      description: Get a nushell command
+      prompt: >
+        Based on the following user description, generate a corresponding Nushell shell command.
+        Focus solely on interpreting the requirements and translating them into a single, executable Nushell command.
+        Ensure accuracy and relevance to the user's description.
+        The output should be a valid Nushell command that directly aligns with the user's intent, ready for execution in a command-line environment.
+        Do not output anything except for the command.
+        No code block, no English explanation, no newlines, and no start/end tags.
 "#).unwrap();
+}
+
+/// Look up a built-in agent by name in `DEFAULT_CONFIG.agents`. Returns
+/// the first match — names are unique by construction.
+pub fn default_agent(name: &str) -> Option<crate::config::AgentConfig> {
+    DEFAULT_CONFIG
+        .agents
+        .as_ref()?
+        .iter()
+        .find(|a| a.name == name)
+        .cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::role::get_role_names;
 
     /// Force the lazy_static to parse. If the embedded YAML is malformed,
     /// `unwrap()` inside DEFAULT_CONFIG's initializer would panic here.
-    /// This is the regression guard against someone adding a role/agent to
-    /// the default config with invalid YAML.
+    /// This is the regression guard against someone adding an agent with
+    /// invalid YAML.
     #[test]
     fn default_config_parses() {
         let _ = DEFAULT_CONFIG.homeserver_url.as_str();
     }
 
     #[test]
-    fn default_config_has_expected_required_roles() {
-        let names = get_role_names(DEFAULT_CONFIG.roles.clone());
-        // These five roles are documented in the user guide as the built-ins.
+    fn default_config_has_expected_built_in_agents() {
+        let agents = DEFAULT_CONFIG
+            .agents
+            .as_ref()
+            .expect("DEFAULT_CONFIG must declare built-in agents");
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        // These are documented in the user guide as the built-ins. The
+        // shell variants (bash/fish/zsh/nu) are stateless agents whose
+        // persona is fully defined by their inline prompt.
         for expected in ["chaz", "chazmina", "bash", "fish", "zsh"] {
             assert!(
-                names.iter().any(|n| n == expected),
-                "default role '{expected}' missing; have {names:?}"
+                names.contains(&expected),
+                "default agent '{expected}' missing; have {names:?}"
             );
         }
     }
 
     #[test]
-    fn default_config_has_no_declared_agents() {
-        // Default config is expected to not declare any agents — users add
-        // theirs via yaml. If this changes, update the assertion rather than
-        // silently grow the default agent set.
-        assert!(DEFAULT_CONFIG.agents.is_none());
+    fn default_config_drops_legacy_roles_section() {
+        // `roles:` is dropped in favor of embedded `persona:` on agents.
+        // Legacy field is still on the schema as Option<...> so existing
+        // user configs keep parsing — we just don't ship default roles.
+        assert!(DEFAULT_CONFIG.roles.is_none());
     }
 
     #[test]
@@ -148,17 +151,25 @@ mod tests {
     }
 
     #[test]
-    fn default_roles_all_have_prompts() {
-        // Every role in defaults should have a non-empty prompt — otherwise
-        // the role is useless and it's a config bug.
-        let roles = DEFAULT_CONFIG.roles.as_ref().unwrap();
-        for role in roles {
-            let prompt = role.get_prompt();
+    fn default_agents_all_have_personas_with_prompts() {
+        let agents = DEFAULT_CONFIG.agents.as_ref().unwrap();
+        for agent in agents {
+            let persona = agent
+                .persona
+                .as_ref()
+                .unwrap_or_else(|| panic!("default agent '{}' has no persona", agent.name));
+            let prompt = persona.prompt.as_deref().unwrap_or("");
             assert!(
                 !prompt.trim().is_empty(),
-                "role '{}' has empty prompt",
-                role.name
+                "default agent '{}' has empty persona prompt",
+                agent.name
             );
         }
+    }
+
+    #[test]
+    fn default_agent_lookup_works() {
+        assert!(default_agent("chaz").is_some());
+        assert!(default_agent("nonexistent").is_none());
     }
 }

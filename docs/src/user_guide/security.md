@@ -36,7 +36,7 @@ In the TUI, approval is an inline y/n/a prompt. In Matrix, unapproved tools time
 
 ## Capability Grants
 
-Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure *what* each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.
+Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure _what_ each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.
 
 ### Shell grants
 

@@ -43,6 +43,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-stream = "0.1"
 tiktoken-rs = "0.11"
 wasmtime = "43"
+blake3 = "1"
 
 [dev-dependencies]
 wat = "1"
+tempfile = "3"

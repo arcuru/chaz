@@ -325,10 +325,7 @@ impl SessionRegistry {
     /// Used by `/agent share`, `/memory share`, and `/session share` to
     /// produce a ticket the holder can paste into the corresponding import
     /// command on another peer.
-    pub async fn share_for(
-        &self,
-        db_id: &eidetica::entry::ID,
-    ) -> anyhow::Result<DatabaseTicket> {
+    pub async fn share_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<DatabaseTicket> {
         let mut user = self.user.lock().await;
         let ticket = user.share(db_id).await?;
         info!(db_id = %db_id, "Shared DB (sync enabled, ticket built)");

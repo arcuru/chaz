@@ -107,11 +107,11 @@ enum Capability {
 
 The host enforces grants at the capability boundary — the tool says what it wants to do, the host decides whether to allow it and how to execute it. Different host implementations provide different trust tiers:
 
-| Host | Tier | Isolation |
-|------|------|-----------|
-| `NativeToolHost` | Native | In-process, grant enforcement only |
-| (future) | WASM | VM-enforced sandbox, capability tokens |
-| (future) | Bubblewrap | OS-level sandboxing via `bwrap` |
+| Host             | Tier       | Isolation                              |
+| ---------------- | ---------- | -------------------------------------- |
+| `NativeToolHost` | Native     | In-process, grant enforcement only     |
+| (future)         | WASM       | VM-enforced sandbox, capability tokens |
+| (future)         | Bubblewrap | OS-level sandboxing via `bwrap`        |
 
 The `Tool` implementations (shell, web, file) are identical across all tiers — they call `ctx.host().request()` regardless of which host sits behind the trait.
 

@@ -32,33 +32,31 @@ backends:
     models:
       - name: llama3
 
-# Agent definitions
+# Agent definitions. Each agent embeds its persona (system prompt)
+# directly. The legacy top-level `roles:` block is deprecated — see
+# `user_guide/agents.md` for the migration path.
 agents:
   - name: default
-    role: chaz
+    persona:
+      description: "Default assistant"
+      prompt: "You are Chaz, a helpful AI assistant."
     max_iterations: 10
     allowed_tools: null # null = all tools
     can_spawn: ["researcher", "coder"]
   - name: researcher
-    role: researcher
+    persona:
+      description: "Research agent"
+      prompt: "You are a research assistant. Use web_fetch to find information."
     max_iterations: 20
     allowed_tools: ["web_fetch", "calculate", "get_time", "remember", "recall"]
   - name: coder
-    role: coder
+    persona:
+      description: "Coding agent"
+      # Pull repo-level instructions from a file; layer inline guidance on top.
+      files: ["~/code/myproject/AGENTS.md"]
+      prompt: "Edit files in-place; never rewrite from scratch."
     max_iterations: 15
     allowed_tools: ["shell", "read_file", "write_file", "calculate"]
-
-# Roles (system prompts)
-roles:
-  - name: chaz
-    description: Default assistant
-    prompt: "You are Chaz, a helpful AI assistant."
-  - name: researcher
-    description: Research agent
-    prompt: "You are a research assistant. Use web_fetch to find information."
-  - name: coder
-    description: Coding agent
-    prompt: "You are a coding assistant. Read and write files, run shell commands."
 
 # Security
 security:

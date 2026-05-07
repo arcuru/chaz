@@ -16,7 +16,11 @@ use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::store::Table;
 use tracing::{info, warn};
 
-use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
+use super::{
+    AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db,
+    write_persona_snapshot_to_db,
+};
+use crate::persona::{Persona, PersonaSnapshotPayload, SnapshotReason};
 
 impl SessionRegistry {
     /// Attach an agent to a session. Grants the agent's pubkey Write
@@ -72,6 +76,28 @@ impl SessionRegistry {
             );
         }
 
+        // 4. PersonaSnapshot: freeze the agent's resolved system prompt
+        //    into the session entries so this conversation has a durable
+        //    record of what instructions the agent ran with. Failures
+        //    are warn-only — the attach has already taken effect; on the
+        //    next message ContextBuilder will fall back to the legacy
+        //    `default_role` until a later bump succeeds.
+        if let Some(persona) = self.persona_for_agent(&agent.display_name)
+            && let Err(e) = write_persona_snapshot(
+                &session_db,
+                &agent.display_name,
+                &persona,
+                SnapshotReason::Attach,
+            )
+            .await
+        {
+            warn!(
+                agent = %agent.display_name,
+                session_db_id,
+                "Failed to write initial PersonaSnapshot: {e}"
+            );
+        }
+
         info!(
             agent = %agent.display_name,
             agent_db_id = %agent.db_id,
@@ -79,6 +105,14 @@ impl SessionRegistry {
             "Attached agent to session"
         );
         Ok(())
+    }
+
+    /// Look up the persona definition for an agent registered in this
+    /// peer's `AgentRegistry`. Returns `None` for unknown agents or
+    /// agents whose persona is not set (in which case no snapshot is
+    /// written and ContextBuilder falls back to `default_role`).
+    fn persona_for_agent(&self, display_name: &str) -> Option<Persona> {
+        self.agents.get(display_name).and_then(|a| a.persona)
     }
 
     /// Detach an agent from a session. Revokes the agent's pubkey on the
@@ -321,6 +355,37 @@ impl SessionRegistry {
 
         self.agents.default_agent().clone()
     }
+}
+
+/// Resolve a persona's file includes, hash sources, and write a
+/// `PersonaSnapshot` entry to the session DB. The base directory for
+/// relative paths is the chaz process's CWD (absolute paths and `~`
+/// expansion are unaffected).
+///
+/// Used by attach (initial snapshot), `/agent persona bump`, and
+/// `/agent set <ref> persona.*`.
+pub async fn write_persona_snapshot(
+    session_db: &Database,
+    agent_name: &str,
+    persona: &Persona,
+    reason: SnapshotReason,
+) -> anyhow::Result<()> {
+    let base_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let resolved = persona.resolve(&base_dir)?;
+    let payload = PersonaSnapshotPayload {
+        agent: agent_name.to_string(),
+        resolved,
+        reason,
+        written_at: Utc::now(),
+    };
+    write_persona_snapshot_to_db(session_db, agent_name, &payload).await?;
+    info!(
+        agent = agent_name,
+        files = persona.files.len(),
+        reason = ?reason,
+        "Wrote PersonaSnapshot"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

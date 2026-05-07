@@ -771,6 +771,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-openai",
+ "blake3",
  "chrono",
  "clap",
  "cron",
@@ -787,6 +788,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",

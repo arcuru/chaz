@@ -13,6 +13,7 @@
 //! - Always includes the system prompt and at least the most recent message
 
 use crate::config::ContextConfig;
+use crate::persona::PersonaSnapshotPayload;
 use crate::role::RoleDetails;
 use crate::runtime::RuntimeMessage;
 use crate::session::{EntryType, SessionEntry};
@@ -55,6 +56,33 @@ fn estimate_tool_tokens(def: &ToolDefinition) -> usize {
 
 /// Per-message framing overhead in tokens (role label, JSON structure).
 const MESSAGE_OVERHEAD_TOKENS: usize = 8;
+
+/// Find the most recent `PersonaSnapshot` entry whose `sender` matches
+/// `agent_name`, deserialize its payload, and return it. Returns `None`
+/// when no snapshot exists yet (legacy sessions) or the payload is
+/// malformed (logged + ignored to keep one corrupt entry from
+/// neutering the agent).
+pub fn latest_persona_snapshot(
+    entries: &[SessionEntry],
+    agent_name: &str,
+) -> Option<PersonaSnapshotPayload> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.entry_type == EntryType::PersonaSnapshot && e.sender == agent_name)
+        .and_then(
+            |e| match serde_json::from_str::<PersonaSnapshotPayload>(&e.content) {
+                Ok(p) => Some(p),
+                Err(err) => {
+                    tracing::warn!(
+                        agent = agent_name,
+                        "Skipping malformed PersonaSnapshot entry: {err}"
+                    );
+                    None
+                }
+            },
+        )
+}
 
 /// Assembled context ready for the runtime/backend.
 pub struct AssembledContext {
@@ -118,8 +146,15 @@ impl<'a> ContextBuilder<'a> {
 
         let mut used_tokens: usize = 0;
 
-        // 1. System prompt (always included)
-        let system_prompt = self.role.map(|r| r.get_prompt()).unwrap_or_default();
+        // 1. System prompt (always included). Source priority:
+        //    a. Latest `PersonaSnapshot` entry for `agent_name` on this
+        //       session — written at attach / `/agent persona bump` /
+        //       `/agent set <ref> persona.*`. Authoritative once present.
+        //    b. Legacy `role:` lookup, kept for transitional sessions
+        //       where no snapshot has been written yet.
+        let system_prompt = latest_persona_snapshot(self.entries, self.agent_name)
+            .map(|p| p.resolved.text)
+            .unwrap_or_else(|| self.role.map(|r| r.get_prompt()).unwrap_or_default());
         let system_tokens = if !system_prompt.is_empty() {
             estimate_tokens(&system_prompt) + MESSAGE_OVERHEAD_TOKENS
         } else {

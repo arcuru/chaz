@@ -13,6 +13,7 @@ enum EntryType {
     Ack,        // Agent is processing (thinking indicator)
     Error,      // An error occurred
     Summary,    // Compacted summary of older messages (context-builder boundary)
+    PersonaSnapshot, // Frozen system prompt for an agent at a point in time
 }
 ```
 
@@ -20,7 +21,9 @@ Each entry has a sender (participant name), content, timestamp, and type.
 
 ### What Enters the LLM Context
 
-Only `Message`, `Directive`, and `Summary` entries are included in the LLM context window. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
+Only `Message`, `Directive`, and `Summary` entries enter the conversation portion of the LLM context. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
+
+`PersonaSnapshot` entries don't enter the conversation — they're the **source** of the system message. ContextBuilder finds the most recent `PersonaSnapshot` whose `sender` matches the active agent and injects its `text` as the system prompt. See [Personas in `agents.md`](../user_guide/agents.md#personas-system-prompts) for the lifecycle (write at attach, refresh via `/agent persona bump`).
 
 `ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its own in-memory tool call history for the ReAct loop. Session-level tool entries exist for audit trail and TUI display only.
 

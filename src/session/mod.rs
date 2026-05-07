@@ -29,6 +29,7 @@ mod channels;
 mod keys;
 mod registry;
 
+pub use agents::write_persona_snapshot;
 pub use keys::BootstrapOutcome;
 #[cfg(test)]
 mod test_helpers;
@@ -55,6 +56,13 @@ pub enum EntryType {
     /// A compacted summary of older messages, written by /compact or the compact tool.
     /// Context builder treats the most recent Summary as the start boundary.
     Summary,
+    /// Audit-only record of an agent's resolved persona at a point in time.
+    /// `sender` is the agent's display name; `content` is a JSON-serialized
+    /// [`crate::persona::PersonaSnapshotPayload`]. ContextBuilder reads the
+    /// most recent snapshot for the active agent as the system prompt.
+    /// Excluded from LLM context — the snapshot's `text` is injected
+    /// separately as the system message.
+    PersonaSnapshot,
 }
 
 /// An entry in a session. Participants (human users and AI agents) are
@@ -273,6 +281,31 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         backend_url: store.get_string("backend_url").await.ok(),
         backend_key_ref: store.get_string("backend_key_ref").await.ok(),
     }
+}
+
+/// Append a `PersonaSnapshot` entry to the session DB's `entries` store.
+/// `sender` is the agent's display name; `payload` carries the resolved
+/// prompt + source manifest. The entry's timestamp is taken from
+/// `payload.written_at` so all reads agree.
+///
+/// Used at attach (initial), `/agent persona bump`, and on every
+/// persona edit. Append-only — historical snapshots stay readable.
+pub async fn write_persona_snapshot_to_db(
+    database: &Database,
+    sender: &str,
+    payload: &crate::persona::PersonaSnapshotPayload,
+) -> anyhow::Result<()> {
+    let entry = SessionEntry {
+        sender: sender.to_string(),
+        content: serde_json::to_string(payload)?,
+        timestamp: payload.written_at,
+        entry_type: EntryType::PersonaSnapshot,
+    };
+    let txn = database.new_transaction().await?;
+    let store = txn.get_store::<Table<SessionEntry>>("entries").await?;
+    store.insert(entry).await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 /// Apply a mutator to the meta DocStore of a session DB and commit.

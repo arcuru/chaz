@@ -58,6 +58,17 @@ pub struct AgentMeta {
 /// downgraded to bootstrap sugar (Stage 6).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentDbConfig {
+    /// Persona definition: file includes + optional inline text. The
+    /// resolved string is what becomes the LLM's system message; live
+    /// snapshots written into each session DB freeze the resolved text
+    /// at attach/bump time so disk edits don't silently mutate ongoing
+    /// sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<crate::persona::Persona>,
+    /// Deprecated: name of a config-level `roles:` entry. Migrated into
+    /// `persona` at runtime when `persona` is unset (Stage transition).
+    /// Kept on the schema so older AgentDbs continue to deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
@@ -79,6 +90,7 @@ pub struct AgentDbConfig {
 impl AgentDbConfig {
     pub fn from_agent_config(cfg: &AgentConfig) -> Self {
         Self {
+            persona: cfg.persona.clone(),
             role: cfg.role.clone(),
             model: cfg.model.clone(),
             tools: cfg.tools.clone(),
@@ -436,6 +448,7 @@ mod tests {
     fn agent_cfg(name: &str) -> AgentConfig {
         AgentConfig {
             name: name.to_string(),
+            persona: None,
             role: Some("default".to_string()),
             model: Some("sonnet".to_string()),
             tools: Some(vec!["get_time".into(), "calculate".into()]),
@@ -454,6 +467,7 @@ mod tests {
     async fn config_round_trip() {
         let mut user = test_peer_user().await;
         let cfg = AgentDbConfig {
+            persona: None,
             role: Some("researcher".to_string()),
             model: Some("opus".to_string()),
             tools: Some(vec!["web_fetch".into()]),

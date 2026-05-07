@@ -149,7 +149,11 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
 /// Supported `/agent new` and `/agent set` keys. Nested-structure fields
 /// (`grants`, `presets`) intentionally omitted — edit yaml template or add
 /// a dedicated command.
-const SUPPORTED_AGENT_FIELDS: &str = "role, model, tools, can_spawn, allowed_callers, autonomous, max_iterations, tool_profile, max_context_tokens";
+///
+/// Persona sub-fields use dotted keys: `persona.files` (comma-sep paths),
+/// `persona.prompt` (inline text), `persona.description` (label),
+/// `persona.clear` (any value — drops the persona).
+const SUPPORTED_AGENT_FIELDS: &str = "role, model, tools, can_spawn, allowed_callers, autonomous, max_iterations, tool_profile, max_context_tokens, persona.files, persona.prompt, persona.description, persona.clear";
 
 /// Apply a single `key=value` override to an `AgentDbConfig`. Used by
 /// `/agent new` (on a fresh config) and `/agent set` (on a DB-loaded one).
@@ -194,6 +198,33 @@ pub(super) fn apply_agent_field(
                     .parse::<usize>()
                     .map_err(|e| format!("Invalid max_context_tokens '{value}': {e}"))?,
             );
+        }
+        "persona.files" => {
+            let files = comma_split(value);
+            let mut p = cfg.persona.clone().unwrap_or_default();
+            p.files = files;
+            cfg.persona = Some(p);
+        }
+        "persona.prompt" => {
+            let mut p = cfg.persona.clone().unwrap_or_default();
+            p.prompt = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+            cfg.persona = Some(p);
+        }
+        "persona.description" => {
+            let mut p = cfg.persona.clone().unwrap_or_default();
+            p.description = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+            cfg.persona = Some(p);
+        }
+        "persona.clear" => {
+            cfg.persona = None;
         }
         other => {
             return Err(format!(
@@ -507,6 +538,7 @@ pub(super) async fn agent_set(
         Err(e) => return CommandOutcome::Error(format!("Failed to read agent config: {e}")),
     };
 
+    let was_persona_edit = field.starts_with("persona.");
     if let Err(msg) = apply_agent_field(&mut cfg, field, value) {
         return CommandOutcome::Error(msg);
     }
@@ -519,10 +551,190 @@ pub(super) async fn agent_set(
         .server
         .agents()
         .build_from_db_config(&entry.display_name, &cfg);
-    ctx.server.agents().upsert(runtime_agent);
+    ctx.server.agents().upsert(runtime_agent.clone());
+
+    // If the operator edited the persona, immediately freeze the new
+    // resolved prompt into this session as a snapshot. Other sessions
+    // hosting this agent need an explicit `/agent persona bump` to pick
+    // it up — same deterministic posture as file edits.
+    let mut suffix = String::new();
+    if was_persona_edit {
+        match runtime_agent.persona {
+            Some(persona) => match crate::session::write_persona_snapshot(
+                ctx.session_db,
+                &entry.display_name,
+                &persona,
+                crate::persona::SnapshotReason::Edit,
+            )
+            .await
+            {
+                Ok(_) => suffix.push_str(" + new PersonaSnapshot written"),
+                Err(e) => {
+                    suffix.push_str(&format!(
+                        " (warning: snapshot write failed: {e}; bump manually)"
+                    ));
+                }
+            },
+            None => {
+                // persona.clear left the persona empty — no snapshot to write.
+            }
+        }
+    }
 
     CommandOutcome::Text(format!(
-        "Set {field}={value} on agent '{}' (takes effect next message)",
+        "Set {field}={value} on agent '{}' (takes effect next message{suffix})",
+        entry.display_name
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// Persona inspection / refresh
+// -----------------------------------------------------------------------------
+
+/// `/agent persona show <ref>` — print the agent's current persona
+/// definition (files + inline prompt) plus a summary of the most recent
+/// `PersonaSnapshot` written into the active session.
+pub(super) async fn agent_persona_show(
+    agent_ref: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    let agent_db = match ctx
+        .server
+        .registry()
+        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+        .await
+    {
+        Ok(Some(db)) => db,
+        Ok(None) => {
+            return CommandOutcome::Error(format!(
+                "This peer holds no key for agent '{}'",
+                entry.display_name
+            ));
+        }
+        Err(e) => return CommandOutcome::Error(format!("Failed to open agent DB: {e}")),
+    };
+
+    let cfg = match agent_db.read_config().await {
+        Ok(c) => c,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read agent config: {e}")),
+    };
+
+    let mut out = format!("Persona for agent '{}':\n", entry.display_name);
+    match &cfg.persona {
+        None => {
+            out.push_str("  (no persona set)\n");
+            if let Some(role) = &cfg.role {
+                out.push_str(&format!("  legacy role: {role}\n"));
+            }
+        }
+        Some(p) => {
+            if let Some(d) = &p.description {
+                out.push_str(&format!("  description: {d}\n"));
+            }
+            if !p.files.is_empty() {
+                out.push_str("  files:\n");
+                for f in &p.files {
+                    out.push_str(&format!("    - {f}\n"));
+                }
+            }
+            if let Some(prompt) = &p.prompt {
+                out.push_str(&format!(
+                    "  inline prompt: ({} chars)\n    {}\n",
+                    prompt.len(),
+                    prompt.lines().take(3).collect::<Vec<_>>().join("\n    ")
+                ));
+            }
+        }
+    }
+
+    // Latest snapshot summary on the active session.
+    let session = crate::session::Session::new(
+        crate::types::ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
+    let entries = session.entries();
+    match crate::context::latest_persona_snapshot(entries, &entry.display_name) {
+        None => out.push_str("\nNo PersonaSnapshot yet on this session.\n"),
+        Some(snap) => {
+            out.push_str(&format!(
+                "\nLatest snapshot ({}):\n  written_at: {}\n  reason: {:?}\n  sources: {}\n  text length: {} chars\n",
+                entry.display_name,
+                snap.written_at.to_rfc3339(),
+                snap.reason,
+                snap.resolved.sources.len(),
+                snap.resolved.text.len(),
+            ));
+            for s in &snap.resolved.sources {
+                out.push_str(&format!(
+                    "    - {} ({} bytes, blake3:{})\n",
+                    s.path,
+                    s.bytes,
+                    &s.hash_blake3[..16.min(s.hash_blake3.len())]
+                ));
+            }
+        }
+    }
+
+    CommandOutcome::Text(out)
+}
+
+/// `/agent persona bump <ref>` — re-resolve the agent's persona files and
+/// write a fresh `PersonaSnapshot` to the active session. Use after
+/// editing source files (e.g. ~/AGENTS.md) so existing sessions pick up
+/// the change. Without a bump, an in-flight session keeps the snapshot
+/// from its last attach/edit indefinitely (deterministic by design).
+pub(super) async fn agent_persona_bump(
+    agent_ref: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    // Pull persona from the runtime registry — it's already hydrated
+    // from the AgentDb at message-time, and falls back to the legacy
+    // `role:` migration when persona is unset.
+    let agent = match ctx.server.agents().get(&entry.display_name) {
+        Some(a) => a,
+        None => {
+            return CommandOutcome::Error(format!(
+                "Agent '{}' is not in the runtime registry",
+                entry.display_name
+            ));
+        }
+    };
+    let persona = match agent.persona {
+        Some(p) => p,
+        None => {
+            return CommandOutcome::Error(format!(
+                "Agent '{}' has no persona set. Use `/agent set {} persona.files <paths>` or `persona.prompt <text>`.",
+                entry.display_name, entry.display_name
+            ));
+        }
+    };
+
+    if let Err(e) = crate::session::write_persona_snapshot(
+        ctx.session_db,
+        &entry.display_name,
+        &persona,
+        crate::persona::SnapshotReason::Bump,
+    )
+    .await
+    {
+        return CommandOutcome::Error(format!(
+            "Failed to bump persona snapshot: {e}. Source files may have moved or be unreadable."
+        ));
+    }
+
+    CommandOutcome::Text(format!(
+        "Bumped persona snapshot for agent '{}' on this session.",
         entry.display_name
     ))
 }

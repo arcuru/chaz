@@ -16,6 +16,7 @@ mod hosted_index;
 mod mcp;
 mod memory_bank_db;
 mod openai;
+mod persona;
 mod role;
 mod runtime;
 mod scheduler;
@@ -145,6 +146,10 @@ async fn main() -> anyhow::Result<()> {
             info!("Eidetica sync address: {addr}");
         }
     }
+
+    // Surface deprecation warnings for legacy role-based config so users
+    // get a single, explicit nudge per startup.
+    warn_on_legacy_role_config(&config);
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
     if agent_registry.is_empty() {
@@ -442,6 +447,33 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// One-shot deprecation banner at startup. Logs a single warning per
+/// legacy concept (`role:` and `roles:`) so users know to migrate to
+/// `agents: [{persona: ...}]`. Silent when neither legacy key is set.
+fn warn_on_legacy_role_config(config: &Config) {
+    if config.role.is_some() {
+        tracing::warn!(
+            "config.role is deprecated; declare an `agents:` block with a default agent and an embedded `persona:` instead. See docs/src/user_guide/agents.md."
+        );
+    }
+    if config.roles.is_some() {
+        tracing::warn!(
+            "config.roles is deprecated; built-in personas now live on agents. Migrate user-defined roles into `agents[].persona.prompt` (or `persona.files` for file-backed prompts)."
+        );
+    }
+    if let Some(agents) = config.agents.as_ref() {
+        for a in agents {
+            if a.persona.is_none() && a.role.is_some() {
+                tracing::warn!(
+                    agent = %a.name,
+                    role = ?a.role,
+                    "agent.role is deprecated; the role's prompt is auto-migrated into a persona at runtime, but new configs should use `persona:` directly."
+                );
+            }
+        }
+    }
 }
 
 /// Resolve the configured web-search backend: extract its API key (if any)

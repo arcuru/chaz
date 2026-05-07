@@ -392,6 +392,22 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             value: value.to_string(),
         }));
     }
+    if let Some(arg) = text.strip_prefix("/agent persona show ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::AgentPersonaShow(r)));
+        }
+        show_error(app, "Usage: /agent persona show <name|db_id>".to_string());
+        return None;
+    }
+    if let Some(arg) = text.strip_prefix("/agent persona bump ") {
+        let r = arg.trim().to_string();
+        if !r.is_empty() {
+            return Some(ChatAction::Dispatch(Command::AgentPersonaBump(r)));
+        }
+        show_error(app, "Usage: /agent persona bump <name|db_id>".to_string());
+        return None;
+    }
     if text == "/agent hosted" {
         return Some(ChatAction::Dispatch(Command::AgentHosted));
     }

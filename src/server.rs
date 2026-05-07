@@ -710,6 +710,7 @@ mod tests {
         // hydration happened before a DB edit.
         let mut stale = crate::agent::Agent {
             name: "alpha".to_string(),
+            persona: None,
             default_role: None,
             default_model: Some("opus".to_string()),
             allowed_tools: None,
@@ -771,6 +772,7 @@ mod tests {
         // No DB for "phantom"; hydration should return the input unchanged.
         let input = crate::agent::Agent {
             name: "phantom".to_string(),
+            persona: None,
             default_role: None,
             default_model: Some("ghost".to_string()),
             allowed_tools: None,

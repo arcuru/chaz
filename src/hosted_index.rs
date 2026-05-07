@@ -153,7 +153,10 @@ pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, Hosted
 
     let tracked = user.databases().await?;
     for td in tracked {
-        let database = match user.open_database_with_key(&td.database_id, &td.key_id).await {
+        let database = match user
+            .open_database_with_key(&td.database_id, &td.key_id)
+            .await
+        {
             Ok(db) => db,
             Err(e) => {
                 warn!(db_id = %td.database_id, "Skipping tracked DB: open failed: {e}");

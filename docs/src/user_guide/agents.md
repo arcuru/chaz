@@ -9,7 +9,12 @@ YAML `agents:` config is the bootstrap path: at startup, chaz materializes one A
 ```yaml
 agents:
   - name: default
-    role: chaz # System prompt (from roles section)
+    persona: # System prompt (file includes + inline text)
+      description: "the default chaz agent"
+      files:
+        - ~/AGENTS.md # Tilde expands to $HOME
+      prompt: |
+        Stay terse on Matrix.
     max_iterations: 10 # Max ReAct loop iterations before forced summary
     allowed_tools: null # null = all tools, or list specific tools
     can_spawn: # Which agents this one can delegate to
@@ -17,7 +22,9 @@ agents:
       - coder
 
   - name: researcher
-    role: researcher
+    persona:
+      description: "tracks down sources and synthesizes"
+      prompt: "You are a researcher. Cite primary sources."
     max_iterations: 20
     allowed_tools:
       - web_fetch
@@ -27,7 +34,8 @@ agents:
       - recall
 
   - name: coder
-    role: coder
+    persona:
+      prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
     max_iterations: 15
     allowed_tools:
       - shell
@@ -43,6 +51,54 @@ agents:
 ```
 
 At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. On subsequent boots, existing DBs are reused without overwriting their `config` — yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
+
+## Personas (system prompts)
+
+A persona is what shapes the LLM's behavior — what older systems called the "system prompt." It has three pieces, all optional:
+
+| Field         | Type          | Notes                                                         |
+| ------------- | ------------- | ------------------------------------------------------------- |
+| `description` | `String`      | Surfaced in `/agent persona show`. Doesn't enter the prompt.  |
+| `files`       | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. |
+| `prompt`      | `String`      | Inline text appended after file content.                      |
+
+### Snapshots: deterministic prompts per session
+
+When an agent is attached to a session, chaz reads each `files:` path, hashes the content with blake3, and writes a single audit-only `PersonaSnapshot` entry to the session's eidetica DB. That snapshot is what ContextBuilder injects as the system message — **disk edits to the source files do not silently mutate ongoing sessions**. To pick up file changes, run:
+
+```text
+/agent persona bump <ref>
+```
+
+This re-resolves the persona and writes a fresh snapshot. Each snapshot records the source files, their byte counts, and their hashes, so months later you can audit "what instructions was the agent running with on 2026-05-07?"
+
+### Editing a persona
+
+Persona fields are edited through `/agent set` with dotted keys; the change writes to the AgentDb and triggers a fresh snapshot on the active session.
+
+| Command                                          | Effect                                                                                 |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `/agent set <ref> persona.files <path1>,<path2>` | Replace the file list (comma-separated, supports `~`).                                 |
+| `/agent set <ref> persona.prompt "<text>"`       | Set the inline prompt text (empty string clears it).                                   |
+| `/agent set <ref> persona.description "<text>"`  | Update the description label.                                                          |
+| `/agent set <ref> persona.clear x`               | Drop the persona entirely. The agent falls back to the migrated `role:` lookup if any. |
+| `/agent persona show <ref>`                      | Print current persona definition + latest snapshot summary.                            |
+| `/agent persona bump <ref>`                      | Re-resolve files and write a new snapshot.                                             |
+
+### Migrating from `role:`
+
+Older configs used a top-level `roles:` block plus an `agent.role:` reference:
+
+```yaml
+roles:
+  - name: chaz
+    prompt: "..."
+agents:
+  - name: default
+    role: chaz
+```
+
+Both still parse for one release, with a deprecation warning at startup. At runtime, an agent with `role:` set and `persona:` unset gets a synthetic persona built from the role's prompt — same behavior, different shape. New configs should drop `roles:` and put the prompt directly under the agent's `persona:`.
 
 ## Agent DB schema
 
@@ -80,22 +136,22 @@ Every ref is either an agent's display name or its eidetica DB ID; resolution tr
 
 These aren't session-scoped; they act on the Living Agent itself.
 
-| Command                                             | What                                                                                                                                                                     |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `role`/`model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`. |
-| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                               |
-| `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                        |
-| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                         |
-| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                         |
-| `/agent unshare <ref>`                              | Stop sharing the agent's DB — disable sync so this peer stops serving it. Does not revoke keys already held by peers who imported it.                                    |
+| Command                                             | What                                                                                                                                                                                               |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `role`/`model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`.                           |
+| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                         |
+| `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                                                  |
+| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                   |
+| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                   |
+| `/agent unshare <ref>`                              | Stop sharing the agent's DB — disable sync so this peer stops serving it. Does not revoke keys already held by peers who imported it.                                                              |
 | `/agent import <ticket> [admin\|write\|read]`       | Request access to a synced agent DB via the bootstrap workflow. Default `write`. If the receiver's key is preseeded, sync proceeds; otherwise queues a request for the owner's `/sharing approve`. |
-| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                           |
-| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                           |
-| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).  |
-| `/sharing` or `/sharing status`                     | List every database this peer is currently sharing, grouped by kind (agent / bank / session) with DB root IDs.                                                           |
-| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                          |
-| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                    |
-| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                        |
+| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                                                     |
+| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                                                   |
+| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).                            |
+| `/sharing` or `/sharing status`                     | List every database this peer is currently sharing, grouped by kind (agent / bank / session) with DB root IDs.                                                                                     |
+| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                                                   |
+| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                                             |
+| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                                                 |
 
 ## Turn-taking
 

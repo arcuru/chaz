@@ -1,6 +1,7 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
 use crate::defaults::DEFAULT_CONFIG;
 use crate::grants::Grants;
+use crate::persona::Persona;
 use crate::role::{RoleDetails, get_role};
 use std::collections::HashMap;
 use tracing::warn;
@@ -9,6 +10,13 @@ use tracing::warn;
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,
+    /// Persona definition. When set, this is the source of truth for the
+    /// agent's system prompt: ContextBuilder either reads the latest
+    /// `PersonaSnapshot` for the agent on the active session, or
+    /// resolves this persona live and writes a snapshot.
+    /// Coexists with `default_role` for the duration of the deprecation
+    /// window — `default_role` only applies when `persona` is `None`.
+    pub persona: Option<Persona>,
     pub default_role: Option<RoleDetails>,
     pub default_model: Option<String>,
     /// Tool names this agent can use. None = all tools (no filtering).
@@ -49,8 +57,20 @@ impl Agent {
             config.roles.clone(),
             DEFAULT_CONFIG.roles.clone(),
         );
+        // Persona resolution priority:
+        //   1. Explicit persona on this agent's config.
+        //   2. Migrated from the agent's `role:` reference (legacy).
+        //   3. Built-in agent of the same name (e.g. `chaz`,
+        //      `chazmina`, `bash`) — lets users declare an agent by
+        //      name alone and inherit the canonical persona.
+        let persona = agent_config
+            .persona
+            .clone()
+            .or_else(|| migrate_role_to_persona(agent_config.role.as_deref(), config))
+            .or_else(|| crate::defaults::default_agent(&agent_config.name).and_then(|a| a.persona));
         Agent {
             name: agent_config.name.clone(),
+            persona,
             default_role,
             default_model: agent_config.model.clone(),
             allowed_tools: agent_config.tools.clone(),
@@ -71,8 +91,14 @@ impl Agent {
     /// in ReAct even without a named role.
     pub fn from_db_config(name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Self {
         let default_role = get_role(cfg.role.clone(), None, DEFAULT_CONFIG.roles.clone());
+        let persona = cfg
+            .persona
+            .clone()
+            .or_else(|| migrate_role_name_to_persona(cfg.role.as_deref(), None))
+            .or_else(|| crate::defaults::default_agent(name).and_then(|a| a.persona));
         Agent {
             name: name.to_string(),
+            persona,
             default_role,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
@@ -144,6 +170,52 @@ impl Agent {
     }
 }
 
+/// Build a `Persona` from a deprecated `role:` name, looking it up in
+/// the user's `roles:` list and falling back to `DEFAULT_CONFIG.roles`.
+/// Returns `None` if the name doesn't resolve — caller is responsible
+/// for deciding whether that's an error or just an empty system prompt.
+fn migrate_role_to_persona(role_name: Option<&str>, config: &Config) -> Option<Persona> {
+    let name = role_name?;
+    let role = get_role(
+        Some(name.to_string()),
+        config.roles.clone(),
+        DEFAULT_CONFIG.roles.clone(),
+    )?;
+    let prompt = role.get_prompt();
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    Some(Persona {
+        description: Some(format!("(migrated from role:{name})")),
+        prompt: Some(prompt),
+        ..Default::default()
+    })
+}
+
+/// Same as [`migrate_role_to_persona`] but used when only the built-in
+/// defaults are available (e.g. live hydration from an AgentDb that has
+/// neither `persona` nor a referenceable user-defined role list).
+fn migrate_role_name_to_persona(
+    role_name: Option<&str>,
+    extra_roles: Option<&[RoleDetails]>,
+) -> Option<Persona> {
+    let name = role_name?;
+    let role = get_role(
+        Some(name.to_string()),
+        extra_roles.map(|r| r.to_vec()),
+        DEFAULT_CONFIG.roles.clone(),
+    )?;
+    let prompt = role.get_prompt();
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    Some(Persona {
+        description: Some(format!("(migrated from role:{name})")),
+        prompt: Some(prompt),
+        ..Default::default()
+    })
+}
+
 /// Intersect a tool override list with an existing allowlist.
 /// If base is None (all tools), the override becomes the allowlist.
 /// If both are set, only tools in both lists are kept.
@@ -206,6 +278,7 @@ impl AgentRegistry {
         Self {
             agents: std::sync::RwLock::new(vec![Agent {
                 name: "default".to_string(),
+                persona: None,
                 default_role: None,
                 default_model: None,
                 allowed_tools: None,
@@ -233,8 +306,18 @@ impl AgentRegistry {
             config.roles.clone(),
             DEFAULT_CONFIG.roles.clone(),
         );
+        // Persona lookup priority:
+        //   1. Migrate the legacy top-level `role: <name>` (if set) by
+        //      looking up that role's prompt in user `roles:` /
+        //      DEFAULT_CONFIG.roles (the latter is empty post-rename).
+        //   2. Fall back to the built-in `chaz` agent's persona from
+        //      DEFAULT_CONFIG.agents — the canonical "Chaz refers to
+        //      himself in the third person" prompt.
+        let persona = migrate_role_to_persona(config.role.as_deref(), config)
+            .or_else(|| crate::defaults::default_agent("chaz").and_then(|a| a.persona));
         self.register(Agent {
             name: "chaz".to_string(),
+            persona,
             default_role,
             default_model: None,
             allowed_tools: None,
@@ -356,8 +439,16 @@ impl AgentRegistry {
             self.config_roles.clone(),
             DEFAULT_CONFIG.roles.clone(),
         );
+        let persona = cfg
+            .persona
+            .clone()
+            .or_else(|| {
+                migrate_role_name_to_persona(cfg.role.as_deref(), self.config_roles.as_deref())
+            })
+            .or_else(|| crate::defaults::default_agent(name).and_then(|a| a.persona));
         Agent {
             name: name.to_string(),
+            persona,
             default_role,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
@@ -404,6 +495,7 @@ mod tests {
     fn make_agent(name: &str, can_spawn: Vec<&str>, allowed_callers: Vec<&str>) -> Agent {
         Agent {
             name: name.to_string(),
+            persona: None,
             default_role: None,
             default_model: None,
             allowed_tools: None,

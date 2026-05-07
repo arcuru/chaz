@@ -189,7 +189,14 @@ pub enum WebSearchBackendKind {
 pub struct AgentConfig {
     /// Name of the agent
     pub name: String,
-    /// Default role (system prompt) for this agent
+    /// System-prompt definition: file includes + optional inline text. The
+    /// resolved string is what becomes the LLM's system message. If unset,
+    /// the legacy `role:` lookup is used as a deprecated fallback.
+    pub persona: Option<crate::persona::Persona>,
+    /// Deprecated: name of a top-level `roles:` entry whose `prompt:` is
+    /// used as the system prompt. Kept for one release so existing configs
+    /// still parse; new configs should use `persona:` directly. When both
+    /// are set, `persona:` wins.
     pub role: Option<String>,
     /// Default model for this agent
     pub model: Option<String>,
