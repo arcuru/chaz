@@ -280,20 +280,14 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
     };
 
     let instance = ctx.server.registry().instance();
-    let Some(sync) = instance.sync() else {
+    if instance.sync().is_none() {
         return CommandOutcome::Error("Sync not enabled".to_string());
+    }
+
+    let ticket = match ctx.server.registry().share_for(&entry.db_id).await {
+        Ok(t) => t,
+        Err(e) => return CommandOutcome::Error(format!("Failed to share agent DB: {e}")),
     };
-
-    if let Err(e) = ctx.server.registry().enable_sync_for(&entry.db_id).await {
-        return CommandOutcome::Error(format!("Failed to enable sync for agent DB: {e}"));
-    }
-
-    let mut ticket = eidetica::sync::DatabaseTicket::new(entry.db_id.clone());
-    if let Ok(addresses) = sync.get_all_server_addresses().await {
-        for (transport_type, address) in addresses {
-            ticket.add_address(eidetica::sync::Address::new(transport_type, address));
-        }
-    }
     CommandOutcome::Text(format!(
         "Share this ticket to sync agent '{}' (DB {}):\n\n{ticket}",
         entry.display_name, entry.db_id
@@ -350,7 +344,7 @@ pub(super) async fn agent_import(
         Err(e) => return CommandOutcome::Error(format!("Bootstrap failed: {e}")),
     }
 
-    let agent_db = match ctx.server.registry().open_agent_db(&db_id).await {
+    let agent_db = match ctx.server.registry().open_agent_db(&db_id, None).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
@@ -492,7 +486,12 @@ pub(super) async fn agent_set(
         Err(msg) => return CommandOutcome::Error(msg),
     };
 
-    let agent_db = match ctx.server.registry().open_agent_db(&entry.db_id).await {
+    let agent_db = match ctx
+        .server
+        .registry()
+        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+        .await
+    {
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
@@ -1119,7 +1118,11 @@ mod tests {
         }
 
         let entry = server.agent_index().find_by_name("alpha").unwrap();
-        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
         let auth = agent_db
             .database()
             .get_settings()
@@ -1158,7 +1161,11 @@ mod tests {
         )
         .await;
         let entry = server.agent_index().find_by_name("alpha").unwrap();
-        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
         let auth = agent_db
             .database()
             .get_settings()
@@ -1196,7 +1203,11 @@ mod tests {
         )
         .await;
         let entry = server.agent_index().find_by_name("alpha").unwrap();
-        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
         let auth = agent_db
             .database()
             .get_settings()
@@ -1320,7 +1331,11 @@ mod tests {
         }
 
         let entry = server.agent_index().find_by_name("alpha").unwrap();
-        let agent_db = registry.open_agent_db(&entry.db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
         let auth_after = agent_db
             .database()
             .get_settings()

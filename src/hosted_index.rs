@@ -153,15 +153,25 @@ pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, Hosted
 
     let tracked = user.databases().await?;
     for td in tracked {
-        let database = match user.open_database(&td.database_id).await {
+        let database = match user.open_database_with_key(&td.database_id, &td.key_id).await {
             Ok(db) => db,
             Err(e) => {
                 warn!(db_id = %td.database_id, "Skipping tracked DB: open failed: {e}");
                 continue;
             }
         };
-        let Some((kind, display_name)) = crate::db_kind::read_marker(&database).await else {
+        let Some((kind, marker_name)) = crate::db_kind::read_marker(&database).await else {
             continue;
+        };
+        // Prefer the in-DB meta marker (clean name like "alpha"); fall
+        // back to key_display_name (may have "agent:" / "memory:" prefix)
+        // for DBs created without a marker but with a labelled key.
+        let display_name = if marker_name.is_empty() {
+            user.key_display_name(&td.key_id)
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        } else {
+            marker_name
         };
         let entry = DbEntry {
             db_id: td.database_id.clone(),

@@ -185,19 +185,14 @@ pub(super) async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutco
 
 pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     let instance = ctx.server.registry().instance();
-    let Some(sync) = instance.sync() else {
+    if instance.sync().is_none() {
         return CommandOutcome::Error("Sync not enabled".to_string());
-    };
+    }
     let db_id = ctx.session_db.root_id().clone();
-    if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
-        return CommandOutcome::Error(format!("Failed to enable sync for session: {e}"));
-    }
-    let mut ticket = eidetica::sync::DatabaseTicket::new(db_id);
-    if let Ok(addresses) = sync.get_all_server_addresses().await {
-        for (transport_type, address) in addresses {
-            ticket.add_address(eidetica::sync::Address::new(transport_type, address));
-        }
-    }
+    let ticket = match ctx.server.registry().share_for(&db_id).await {
+        Ok(t) => t,
+        Err(e) => return CommandOutcome::Error(format!("Failed to share session: {e}")),
+    };
     CommandOutcome::Text(format!(
         "Share this ticket to sync the current session:\n\n{ticket}"
     ))

@@ -114,7 +114,12 @@ pub(super) async fn memory_grant(
 
     // Now mirror the ref into the agent's view. On failure, roll back the auth
     // so the two sides stay consistent.
-    let agent_db = match ctx.server.registry().open_agent_db(&agent.db_id).await {
+    let agent_db = match ctx
+        .server
+        .registry()
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+    {
         Ok(Some(db)) => db,
         Ok(None) => {
             // Rollback — the agent is in index but we can't open its DB. Shouldn't
@@ -191,7 +196,12 @@ pub(super) async fn memory_revoke(
     }
 
     // Best-effort ref cleanup.
-    let ref_removed = match ctx.server.registry().open_agent_db(&agent.db_id).await {
+    let ref_removed = match ctx
+        .server
+        .registry()
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+    {
         Ok(Some(db)) => db.detach_memory_bank(&bank.display_name).await.ok(),
         _ => None,
     };
@@ -216,20 +226,14 @@ pub(super) async fn memory_share(bank_ref: &str, ctx: &CommandContext<'_>) -> Co
     };
 
     let instance = ctx.server.registry().instance();
-    let Some(sync) = instance.sync() else {
+    if instance.sync().is_none() {
         return CommandOutcome::Error("Sync not enabled".to_string());
+    }
+
+    let ticket = match ctx.server.registry().share_for(&entry.db_id).await {
+        Ok(t) => t,
+        Err(e) => return CommandOutcome::Error(format!("Failed to share memory bank: {e}")),
     };
-
-    if let Err(e) = ctx.server.registry().enable_sync_for(&entry.db_id).await {
-        return CommandOutcome::Error(format!("Failed to enable sync for memory bank: {e}"));
-    }
-
-    let mut ticket = eidetica::sync::DatabaseTicket::new(entry.db_id.clone());
-    if let Ok(addresses) = sync.get_all_server_addresses().await {
-        for (transport_type, address) in addresses {
-            ticket.add_address(eidetica::sync::Address::new(transport_type, address));
-        }
-    }
     CommandOutcome::Text(format!(
         "Share this ticket to sync memory bank '{}' (DB {}):\n\n{ticket}",
         entry.display_name, entry.db_id
@@ -292,7 +296,7 @@ pub(super) async fn memory_import(
         Err(e) => return CommandOutcome::Error(format!("Bootstrap failed: {e}")),
     }
 
-    let bank_db = match ctx.server.registry().open_memory_bank(&db_id).await {
+    let bank_db = match ctx.server.registry().open_memory_bank(&db_id, None).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
@@ -561,7 +565,13 @@ mod tests {
         assert!(server.memory_bank_index().find_by_name("patrick").is_none());
 
         // DB itself is still openable (archive preserved).
-        assert!(registry.open_memory_bank(&db_id).await.unwrap().is_some());
+        assert!(
+            registry
+                .open_memory_bank(&db_id, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -635,7 +645,11 @@ mod tests {
         }
 
         // Ref mirrored into agent's memory_banks subtree.
-        let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&agent_db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
         let banks = agent_db.list_memory_banks().await.unwrap();
         assert_eq!(banks.len(), 1);
         assert_eq!(banks[0].name, "patrick");
@@ -659,7 +673,11 @@ mod tests {
         )
         .await;
         // Sanity: ref present before revoke.
-        let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&agent_db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(agent_db.list_memory_banks().await.unwrap().len(), 1);
 
         match dispatch(
@@ -677,7 +695,11 @@ mod tests {
         }
 
         // Ref removed from agent's memory_banks.
-        let agent_db = registry.open_agent_db(&agent_db_id).await.unwrap().unwrap();
+        let agent_db = registry
+            .open_agent_db(&agent_db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(agent_db.list_memory_banks().await.unwrap().is_empty());
     }
 

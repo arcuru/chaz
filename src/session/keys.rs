@@ -47,18 +47,26 @@ impl SessionRegistry {
     /// Open an Agent DB via this peer's user. Succeeds only if this peer
     /// holds a key for the DB (e.g. an agent it created, or one synced and
     /// then key-shared). Returns `None` if the user doesn't hold a key.
+    ///
+    /// `pubkey` selects which user-held key signs subsequent writes; pass
+    /// `Some` when the caller knows the pubkey (e.g. from `HostedIndex`)
+    /// to avoid `find_key`'s arbitrary first-match. Pass `None` to fall
+    /// back to `find_key` for callers without a specific key in mind.
     pub async fn open_agent_db(
         &self,
         agent_db_id: &eidetica::entry::ID,
+        pubkey: Option<&eidetica::auth::crypto::PublicKey>,
     ) -> anyhow::Result<Option<crate::agent_db::AgentDb>> {
         let user = self.user.lock().await;
-        match user.find_key(agent_db_id)? {
-            Some(_) => {
-                let db = user.open_database(agent_db_id).await?;
-                Ok(Some(crate::agent_db::AgentDb::from_database(db)))
-            }
-            None => Ok(None),
-        }
+        let key = match pubkey {
+            Some(pk) => pk.clone(),
+            None => match user.find_key(agent_db_id)? {
+                Some(k) => k,
+                None => return Ok(None),
+            },
+        };
+        let db = user.open_database_with_key(agent_db_id, &key).await?;
+        Ok(Some(crate::agent_db::AgentDb::from_database(db)))
     }
 
     /// Open a Memory Bank DB via this peer's user (Memory Banks Stage
@@ -66,23 +74,25 @@ impl SessionRegistry {
     /// expected for bank references an agent's key was revoked from, or
     /// for references we haven't synced yet.
     ///
-    /// Known gap: `User::open_database` picks the first key `find_key`
-    /// returns rather than the agent's specific key. When the DB is
-    /// write-granted to multiple keys on this peer, writes may be signed
-    /// by the wrong one. Tracked as the `open_database_with_key` gap in
-    /// Eidetica Feedback.
+    /// `pubkey` selects which user-held key signs subsequent writes; pass
+    /// `Some` when the caller knows the pubkey (e.g. an agent writing to
+    /// a bank it has been granted access to). Pass `None` to fall back to
+    /// `find_key` for ambient lookups.
     pub async fn open_memory_bank(
         &self,
         bank_db_id: &eidetica::entry::ID,
+        pubkey: Option<&eidetica::auth::crypto::PublicKey>,
     ) -> anyhow::Result<Option<crate::memory_bank_db::MemoryBankDb>> {
         let user = self.user.lock().await;
-        match user.find_key(bank_db_id)? {
-            Some(_) => {
-                let db = user.open_database(bank_db_id).await?;
-                Ok(Some(crate::memory_bank_db::MemoryBankDb::from_database(db)))
-            }
-            None => Ok(None),
-        }
+        let key = match pubkey {
+            Some(pk) => pk.clone(),
+            None => match user.find_key(bank_db_id)? {
+                Some(k) => k,
+                None => return Ok(None),
+            },
+        };
+        let db = user.open_database_with_key(bank_db_id, &key).await?;
+        Ok(Some(crate::memory_bank_db::MemoryBankDb::from_database(db)))
     }
 
     /// Create a Memory Bank DB for the `/memory new` command (Stage
@@ -188,7 +198,7 @@ impl SessionRegistry {
         permission: crate::agent_db::BankPermission,
     ) -> anyhow::Result<()> {
         let bank = self
-            .open_memory_bank(bank_db_id)
+            .open_memory_bank(bank_db_id, None)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Peer holds no key for memory bank {bank_db_id}"))?;
         let eidetica_perm = match permission {
@@ -219,7 +229,7 @@ impl SessionRegistry {
         pubkey: &eidetica::auth::crypto::PublicKey,
     ) -> anyhow::Result<()> {
         let bank = self
-            .open_memory_bank(bank_db_id)
+            .open_memory_bank(bank_db_id, None)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Peer holds no key for memory bank {bank_db_id}"))?;
         let txn = bank.database().new_transaction().await?;
@@ -243,7 +253,7 @@ impl SessionRegistry {
         permission: Permission,
     ) -> anyhow::Result<()> {
         let agent_db = self
-            .open_agent_db(agent_db_id)
+            .open_agent_db(agent_db_id, None)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Peer holds no key for agent DB {agent_db_id}"))?;
         let txn = agent_db.database().new_transaction().await?;
@@ -270,7 +280,7 @@ impl SessionRegistry {
         pubkey: &eidetica::auth::crypto::PublicKey,
     ) -> anyhow::Result<()> {
         let agent_db = self
-            .open_agent_db(agent_db_id)
+            .open_agent_db(agent_db_id, None)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Peer holds no key for agent DB {agent_db_id}"))?;
         let txn = agent_db.database().new_transaction().await?;
@@ -305,6 +315,24 @@ impl SessionRegistry {
         user.enable_sync(db_id).await?;
         info!(db_id = %db_id, "Enabled sync for DB");
         Ok(())
+    }
+
+    /// Atomically enable sync for `db_id` and build a `DatabaseTicket` with
+    /// this peer's transport addresses populated. Wraps eidetica's
+    /// `User::share`, which combines `enable_sync` + `Sync::create_ticket`
+    /// so the track → enable → ticket-build sequence stays in one place.
+    ///
+    /// Used by `/agent share`, `/memory share`, and `/session share` to
+    /// produce a ticket the holder can paste into the corresponding import
+    /// command on another peer.
+    pub async fn share_for(
+        &self,
+        db_id: &eidetica::entry::ID,
+    ) -> anyhow::Result<DatabaseTicket> {
+        let mut user = self.user.lock().await;
+        let ticket = user.share(db_id).await?;
+        info!(db_id = %db_id, "Shared DB (sync enabled, ticket built)");
+        Ok(ticket)
     }
 
     /// Inverse of `enable_sync_for`. Used by future "stop sharing this DB"
@@ -516,7 +544,7 @@ mod tests {
             "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm",
         )
         .unwrap();
-        let opened = registry.open_agent_db(&fake_id).await.unwrap();
+        let opened = registry.open_agent_db(&fake_id, None).await.unwrap();
         assert!(opened.is_none());
     }
 

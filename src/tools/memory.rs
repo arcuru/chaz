@@ -41,7 +41,7 @@ async fn open_own_agent_db(
         )
     })?;
     registry
-        .open_agent_db(&entry.db_id)
+        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
         .await
         .map_err(|e| format!("Failed to open agent DB: {e}"))?
         .ok_or_else(|| {
@@ -360,7 +360,7 @@ async fn open_bank_by_ref(
     let db_id = eidetica::entry::ID::parse(&bank_ref.db_id)
         .map_err(|e| format!("Bank ref '{}' has invalid db_id: {e}", bank_ref.name))?;
     registry
-        .open_memory_bank(&db_id)
+        .open_memory_bank(&db_id, None)
         .await
         .map_err(|e| format!("Failed to open bank '{}': {e}", bank_ref.name))?
         .ok_or_else(|| {

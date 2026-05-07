@@ -151,7 +151,11 @@ impl Server {
         let Some(entry) = self.agent_index.find_by_name(&agent.name) else {
             return agent;
         };
-        let Ok(Some(db)) = self.registry.open_agent_db(&entry.db_id).await else {
+        let Ok(Some(db)) = self
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+        else {
             return agent;
         };
         let Ok(cfg) = db.read_config().await else {
