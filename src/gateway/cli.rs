@@ -69,7 +69,7 @@ impl Gateway for CliGateway {
             .register_session(&session_db, backend, None, None)
             .await?;
 
-        // Watch for the agent's response via on_local_write. The server already
+        // Watch for the agent's response via on_write. The server already
         // installed its own callback during register_session; this is an additional
         // listener for response detection.
         let (notify_tx, mut notify_rx) = mpsc::channel::<()>(8);

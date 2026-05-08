@@ -1,7 +1,7 @@
 //! Callback-driven agent server.
 //!
 //! The server watches session databases for new entries via eidetica's
-//! `on_local_write` callbacks. When a new message from a non-agent sender
+//! `on_write` callbacks. When a new message from a non-agent sender
 //! is detected, it spawns an agent task that runs the ReAct loop and writes
 //! the response back to the session database.
 //!

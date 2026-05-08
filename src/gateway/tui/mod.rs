@@ -67,7 +67,7 @@ pub(super) type TaggedApproval = (String, ApprovalExchange);
 enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    /// A session DB fired an on_local_write callback — payload is the
+    /// A session DB fired an on_write callback — payload is the
     /// session_db_id so we can refresh the right tab.
     SessionChanged(String),
     ApprovalRequest(TaggedApproval),
