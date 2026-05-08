@@ -68,7 +68,7 @@ impl SessionRegistry {
         // On each write, re-scan the sessions index and fire events for each known session.
         // Consumers dedupe via their own `seen` set.
         let sync_tx = new_session_tx.clone();
-        chaz_group.on_local_write(move |_entry, db, _instance| {
+        chaz_group.on_write(move |_event, db| {
             let sync_tx = sync_tx.clone();
             let db = db.clone();
             Box::pin(async move {
@@ -86,7 +86,7 @@ impl SessionRegistry {
                 }
                 Ok(())
             })
-        })?;
+        })?.detach();
 
         Ok(Self {
             instance,

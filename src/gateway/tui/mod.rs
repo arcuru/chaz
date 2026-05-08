@@ -238,14 +238,14 @@ async fn setup_session(
         .await?;
 
     let notify_id = session_db_id;
-    session_db.on_local_write(move |_entry, _db, _instance| {
+    session_db.on_write(move |_event, _db| {
         let tx = notify_tx.clone();
         let id = notify_id.clone();
         Box::pin(async move {
             let _ = tx.send(id).await;
             Ok(())
         })
-    })?;
+    })?.detach();
 
     Ok(())
 }

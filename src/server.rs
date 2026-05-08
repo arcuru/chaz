@@ -184,9 +184,9 @@ impl Server {
 
     /// Register a session for callback-driven agent processing.
     ///
-    /// Installs an `on_local_write` callback on the session DB (if not already
-    /// present) that triggers agent processing when new non-agent messages or
-    /// directives appear. Stores per-session runtime state (backend, agent
+    /// Installs an `on_write` callback on the session DB (if not already
+    /// present) that triggers agent processing when new entries appear,
+    /// whether written locally or via remote sync. Stores per-session runtime state (backend, agent
     /// override, approval channel) keyed by the session DB ID.
     ///
     /// Gateways should register their own callbacks on the session DB to handle
@@ -227,14 +227,14 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
-        session_db.on_local_write(move |_entry, _db, _instance| {
+        session_db.on_write(move |_event, _db| {
             let tx = tx.clone();
             let sid = sid.clone();
             Box::pin(async move {
                 let _ = tx.send(sid).await;
                 Ok(())
             })
-        })?;
+        })?.detach();
 
         info!(session_db_id = %session_db_id, "Server watching session");
         Ok(())
@@ -298,14 +298,14 @@ impl Server {
 
             let tx = self.notify_tx.clone();
             let sid = session_db_id.clone();
-            session_db.on_local_write(move |_entry, _db, _instance| {
+            session_db.on_write(move |_event, _db| {
                 let tx = tx.clone();
                 let sid = sid.clone();
                 Box::pin(async move {
                     let _ = tx.send(sid).await;
                     Ok(())
                 })
-            })?;
+            })?.detach();
 
             info!(
                 session_db_id = %session_db_id,

@@ -84,7 +84,7 @@ fn attach_response_callback(
     agents: Arc<crate::agent::AgentRegistry>,
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
-    session_db.on_local_write(move |_entry, db, _instance| {
+    session_db.on_write(move |_event, db| {
         let room = room.clone();
         let agents = agents.clone();
         let db = db.clone();
@@ -107,7 +107,7 @@ fn attach_response_callback(
             }
             Ok(())
         })
-    })?;
+    })?.detach();
     Ok(())
 }
 
