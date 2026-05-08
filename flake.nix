@@ -1,6 +1,11 @@
 {
   description = "chaz - AI agent orchestrator for Matrix.";
 
+  nixConfig = {
+    extra-substituters = ["https://cache.eidetica.dev"];
+    extra-trusted-public-keys = ["cache.eidetica.dev-1:eND5gRJlbnool3ZLCWT2H8kkygWS8JcsU76HYXbWPBI="];
+  };
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 

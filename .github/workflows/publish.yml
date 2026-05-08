@@ -1,0 +1,56 @@
+# Publish workflow — pushes built artifacts to the eidetica Nix cache.
+#
+# Triggers after every successful CI run on main. Builds clean from
+# cache.nixos.org (bypassing our own cache to prevent poisoning), signs
+# the results, and pushes them to s3://cache-eidetica-dev. Subsequent
+# CI runs and local builds then download instead of recompiling.
+
+name: Publish
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  push-cache:
+    name: Push to cache
+    environment: publish
+    runs-on: ubicloud-standard-8
+    if: |
+      github.repository_owner == 'arcuru' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    permissions:
+      contents: read
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+        id: nix
+        with:
+          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+
+      # Build the binary clean from source, bypassing our own cache to
+      # prevent cache poisoning from affecting published artifacts.
+      - name: Build and push artifacts
+        run: |
+          nix-fast-build --skip-cached --no-nom --no-link \
+            ${{ steps.nix.outputs.push-args }} \
+            --option substituters 'https://cache.nixos.org' \
+            -f '.#packages.x86_64-linux.default'
+
+      # Warm the cache with all check outputs (lint, test, doc, build) so
+      # subsequent CI runs and dev shells download instead of recompiling.
+      - name: Warm CI cache
+        run: |
+          nix-fast-build --skip-cached --no-nom --no-link \
+            ${{ steps.nix.outputs.push-args }}
