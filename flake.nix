@@ -96,8 +96,8 @@
         # Args with cached artifacts
         buildArgs = commonArgs // {inherit cargoArtifacts;};
 
-        # Build the binary
-        chaz-unwrapped = craneLib.buildPackage buildArgs;
+        # Build the binary. Tests run separately via the `test` check.
+        chaz-unwrapped = craneLib.buildPackage (buildArgs // {doCheck = false;});
 
         # Wrap chaz to include aichat in PATH
         chaz =
