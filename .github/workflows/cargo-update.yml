@@ -18,7 +18,7 @@ concurrency:
 jobs:
   cargo-update:
     name: Cargo Update
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     environment: automation
     if: github.repository_owner == 'arcuru'
     permissions:
