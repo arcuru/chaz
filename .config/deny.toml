@@ -1,18 +1,21 @@
 [advisories]
-# Upstream transitive dependency issues (via eidetica → iroh)
+# Upstream transitive dependency issues. Each entry must currently be
+# detected — `cargo deny` warns on `[advisory-not-detected]` for stale
+# entries. When a dep is updated and an advisory no longer applies,
+# remove the entry rather than leaving it as silent debt.
 ignore = [
     # Transitive via eidetica → iroh
     "RUSTSEC-2023-0089", # atomic-polyfill unmaintained
-    "RUSTSEC-2025-0012", # rustls vulnerability
+    "RUSTSEC-2025-0012", # backoff unmaintained (use backon)
     "RUSTSEC-2026-0098", # rustls-webpki URI name constraints
     "RUSTSEC-2026-0099", # rustls-webpki wildcard name constraints
-    # Transitive via headjack → matrix-sdk 0.7
-    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
+    "RUSTSEC-2026-0104", # rustls-webpki CRL parsing panic
+    "RUSTSEC-2026-0105", # core2 unmaintained + all versions yanked (via cid → eidetica)
+    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser unbounded loop
+    "RUSTSEC-2026-0119", # hickory-proto O(n²) name-compression CPU exhaustion
+    # Transitive via headjack → matrix-sdk
     "RUSTSEC-2024-0384", # instant unmaintained
     "RUSTSEC-2024-0436", # paste-impl unmaintained
-    "RUSTSEC-2025-0065", # matrix-sdk-base power level panic
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
-    "RUSTSEC-2025-0135", # matrix-sdk-base join_rules DoS
 ]
 
 [bans]
@@ -22,8 +25,10 @@ multiple-versions = "allow"
 allow = [
     "AGPL-3.0-or-later",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # cranelift family (via wasmtime)
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0", # xxhash-rust (transitive)
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
