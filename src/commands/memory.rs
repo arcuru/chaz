@@ -256,9 +256,9 @@ pub(super) async fn memory_unshare(bank_ref: &str, ctx: &CommandContext<'_>) -> 
 }
 
 /// Sync a memory bank from a DatabaseTicket URL and register it
-/// locally (Stage 9.D.3). Requires the ticket to include a key for
-/// this peer — read-only imports aren't supported yet (blocked on
-/// eidetica's `Database::open_unauthenticated` being pub(crate)).
+/// locally (Stage 9.D.3). Read/Write/Admin all work via the
+/// bootstrap-approve flow: the requester ends up with a key in their
+/// User keyring, and the normal key-bearing open path takes over.
 pub(super) async fn memory_import(
     ticket_str: &str,
     permission: super::CoOwnerPermission,

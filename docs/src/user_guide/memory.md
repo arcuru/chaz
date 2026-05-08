@@ -266,6 +266,5 @@ All of it was replaced by key-possession on bank DBs.
 
 ## Limitations
 
-- **Bank writes are signed by the agent's own key, not a bank-scoped key.** Same limitation as Stage 5 session attachment. Blocked on eidetica exposing `open_database_with_key` so that writes can be signed under a specific delegated key. Doesn't affect authorisation correctness — eidetica still enforces which keys are allowed to write.
-- **Read-only bank imports are not supported.** `/memory import` requires the ticket to include a key for the importing peer. The underlying eidetica `Database::open_unauthenticated` is `pub(crate)` for now.
+- **Bank writes are signed by the agent's own key, not a bank-scoped key.** Same limitation as Stage 5 session attachment. eidetica's `open_database_with_key` is now available; chaz hasn't adopted it yet. Doesn't affect authorisation correctness — eidetica still enforces which keys are allowed to write.
 - **No per-entry ACLs.** Permissions are at the bank-DB level: Read or Write on the whole thing.

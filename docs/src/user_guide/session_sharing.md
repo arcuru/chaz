@@ -195,4 +195,3 @@ With the default iroh P2P transport, peer identity is stable across restarts —
 - No authentication on the sync connection beyond the ticket capability and per-DB auth keys (any peer with the ticket can reach the source's sync server; whether they can read/write a specific DB is gated by eidetica's `AuthSettings`).
 - Registry index entries (Matrix channel bindings, name index) are local to each peer — only the database contents (entries + meta) sync.
 - To make a synced session reachable from a specific Matrix room on the receiver, run `!chaz attach <name-or-id>` in that room after syncing.
-- Read-only import (no preseeded key) is blocked on `Database::open_unauthenticated` becoming public in eidetica.
