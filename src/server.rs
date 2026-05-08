@@ -227,14 +227,16 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
-        session_db.on_write(move |_event, _db| {
-            let tx = tx.clone();
-            let sid = sid.clone();
-            Box::pin(async move {
-                let _ = tx.send(sid).await;
-                Ok(())
-            })
-        })?.detach();
+        session_db
+            .on_write(move |_event, _db| {
+                let tx = tx.clone();
+                let sid = sid.clone();
+                Box::pin(async move {
+                    let _ = tx.send(sid).await;
+                    Ok(())
+                })
+            })?
+            .detach();
 
         info!(session_db_id = %session_db_id, "Server watching session");
         Ok(())
@@ -298,14 +300,16 @@ impl Server {
 
             let tx = self.notify_tx.clone();
             let sid = session_db_id.clone();
-            session_db.on_write(move |_event, _db| {
-                let tx = tx.clone();
-                let sid = sid.clone();
-                Box::pin(async move {
-                    let _ = tx.send(sid).await;
-                    Ok(())
-                })
-            })?.detach();
+            session_db
+                .on_write(move |_event, _db| {
+                    let tx = tx.clone();
+                    let sid = sid.clone();
+                    Box::pin(async move {
+                        let _ = tx.send(sid).await;
+                        Ok(())
+                    })
+                })?
+                .detach();
 
             info!(
                 session_db_id = %session_db_id,

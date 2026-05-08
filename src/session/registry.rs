@@ -68,25 +68,27 @@ impl SessionRegistry {
         // On each write, re-scan the sessions index and fire events for each known session.
         // Consumers dedupe via their own `seen` set.
         let sync_tx = new_session_tx.clone();
-        chaz_group.on_write(move |_event, db| {
-            let sync_tx = sync_tx.clone();
-            let db = db.clone();
-            Box::pin(async move {
-                if let Ok(txn) = db.new_transaction().await
-                    && let Ok(store) = txn.get_store::<DocStore>(STORE_SESSIONS).await
-                    && let Ok(doc) = store.get_all().await
-                {
-                    for (key, value) in doc.iter() {
-                        let source: Option<String> = value.try_into().ok();
-                        let _ = sync_tx.try_send(NewSessionEvent {
-                            session_db_id: key.clone(),
-                            source,
-                        });
+        chaz_group
+            .on_write(move |_event, db| {
+                let sync_tx = sync_tx.clone();
+                let db = db.clone();
+                Box::pin(async move {
+                    if let Ok(txn) = db.new_transaction().await
+                        && let Ok(store) = txn.get_store::<DocStore>(STORE_SESSIONS).await
+                        && let Ok(doc) = store.get_all().await
+                    {
+                        for (key, value) in doc.iter() {
+                            let source: Option<String> = value.try_into().ok();
+                            let _ = sync_tx.try_send(NewSessionEvent {
+                                session_db_id: key.clone(),
+                                source,
+                            });
+                        }
                     }
-                }
-                Ok(())
-            })
-        })?.detach();
+                    Ok(())
+                })
+            })?
+            .detach();
 
         Ok(Self {
             instance,

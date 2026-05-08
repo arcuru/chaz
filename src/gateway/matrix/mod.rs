@@ -84,30 +84,32 @@ fn attach_response_callback(
     agents: Arc<crate::agent::AgentRegistry>,
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
-    session_db.on_write(move |_event, db| {
-        let room = room.clone();
-        let agents = agents.clone();
-        let db = db.clone();
-        let sid = session_db_id.clone();
-        Box::pin(async move {
-            let session = Session::new(crate::types::ConversationId(sid), db).await;
-            if let Some(latest) = session.latest_entry()
-                && latest.entry_type == EntryType::Message
-                && agents.get(&latest.sender).is_some()
-            {
-                info!(
-                    "→ Matrix({}): {}",
-                    room.room_id(),
-                    latest.content.replace('\n', " ")
-                );
-                let content = RoomMessageEventContent::text_markdown(&latest.content);
-                if let Err(e) = room.send(content).await {
-                    tracing::error!("Failed to send to Matrix: {e}");
+    session_db
+        .on_write(move |_event, db| {
+            let room = room.clone();
+            let agents = agents.clone();
+            let db = db.clone();
+            let sid = session_db_id.clone();
+            Box::pin(async move {
+                let session = Session::new(crate::types::ConversationId(sid), db).await;
+                if let Some(latest) = session.latest_entry()
+                    && latest.entry_type == EntryType::Message
+                    && agents.get(&latest.sender).is_some()
+                {
+                    info!(
+                        "→ Matrix({}): {}",
+                        room.room_id(),
+                        latest.content.replace('\n', " ")
+                    );
+                    let content = RoomMessageEventContent::text_markdown(&latest.content);
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send to Matrix: {e}");
+                    }
                 }
-            }
-            Ok(())
-        })
-    })?.detach();
+                Ok(())
+            })
+        })?
+        .detach();
     Ok(())
 }
 

@@ -73,13 +73,15 @@ impl Gateway for CliGateway {
         // installed its own callback during register_session; this is an additional
         // listener for response detection.
         let (notify_tx, mut notify_rx) = mpsc::channel::<()>(8);
-        session_db.on_write(move |_event, _db| {
-            let tx = notify_tx.clone();
-            Box::pin(async move {
-                let _ = tx.send(()).await;
-                Ok(())
-            })
-        })?.detach();
+        session_db
+            .on_write(move |_event, _db| {
+                let tx = notify_tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(())
+                })
+            })?
+            .detach();
 
         let agent_names: HashSet<String> = server
             .agents()
