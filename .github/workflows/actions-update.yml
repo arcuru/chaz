@@ -102,7 +102,7 @@ jobs:
             fi
           }
 
-          for FILE in .github/workflows/*.yml; do
+          for FILE in .github/workflows/*.yml .github/actions/*/action.yml .github/actions/*/action.yaml; do
             [ -f "$FILE" ] || continue
 
             FILE_CONTENT=$(cat "$FILE")
