@@ -66,6 +66,7 @@
         # Common arguments
         commonArgs = {
           inherit src;
+          strictDeps = true;
           nativeBuildInputs = with pkgs; [
             pkg-config
           ];
@@ -73,7 +74,21 @@
             openssl
             sqlite
           ];
+          # Test binaries link openssl dynamically; checkPhase runs them in the
+          # build sandbox where they need libssl on LD_LIBRARY_PATH at runtime.
+          LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
         };
+
+        # Test-only extras: subprocess tests spawn python3, and tests that
+        # touch $HOME need it to point at a writable path inside the sandbox.
+        testArgs =
+          buildArgs
+          // {
+            nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.python3];
+            preCheck = ''
+              export HOME=$TMPDIR
+            '';
+          };
 
         # Build only cargo dependencies for caching
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -142,7 +157,7 @@
 
           # Test group
           test = {
-            default = craneLib.cargoTest buildArgs;
+            default = craneLib.cargoTest testArgs;
           };
 
           # Doc group
@@ -167,7 +182,7 @@
         # CI checks — run during `nix flake check`
         checks = {
           build = chaz-unwrapped;
-          test = craneLib.cargoTest buildArgs;
+          test = craneLib.cargoTest testArgs;
           lint = mkAggregate "lint" lintDefaults;
           doc = chaz-doc;
         };
