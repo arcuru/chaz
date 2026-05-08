@@ -131,15 +131,16 @@ pub struct PersonaSnapshotPayload {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotReason {
-    /// First snapshot for this agent on this session — written at attach.
-    Attach,
+    /// First snapshot for this agent on this session. Written lazily
+    /// the first time the session needs a system prompt and finds no
+    /// snapshot — covers fresh sessions, sessions attached without an
+    /// explicit `/agent add`, and legacy sessions that predate the
+    /// persona feature.
+    Initial,
     /// Operator ran `/agent persona bump <ref>` after editing source files.
     Bump,
     /// `/agent set <ref> persona.*` rewrote the persona definition.
     Edit,
-    /// ContextBuilder found no snapshot for an attached agent and wrote
-    /// one from the live config (recovery path for legacy sessions).
-    Migrate,
 }
 
 /// Expand `~`, `~/...`, and resolve relative paths against `base_dir`.
@@ -306,7 +307,7 @@ mod tests {
                     hash_blake3: "deadbeef".repeat(8),
                 }],
             },
-            reason: SnapshotReason::Attach,
+            reason: SnapshotReason::Initial,
             written_at: Utc::now(),
         };
         let json = serde_json::to_string(&payload).unwrap();

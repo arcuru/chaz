@@ -377,10 +377,9 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                         "--- persona snapshot ({}, {}, {} src, {} chars) ---",
                         p.agent,
                         match p.reason {
-                            crate::persona::SnapshotReason::Attach => "attach",
+                            crate::persona::SnapshotReason::Initial => "initial",
                             crate::persona::SnapshotReason::Bump => "bump",
                             crate::persona::SnapshotReason::Edit => "edit",
-                            crate::persona::SnapshotReason::Migrate => "migrate",
                         },
                         p.resolved.sources.len(),
                         p.resolved.text.len(),

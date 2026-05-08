@@ -452,6 +452,7 @@ impl Server {
     ) {
         let agent_name = agent.name.clone();
         let default_role = agent.default_role.clone();
+        let agent_persona = agent.persona.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
         let agent_grants = agent.grants.clone();
@@ -489,6 +490,50 @@ impl Server {
                     entry_type: EntryType::Ack,
                 })
                 .await;
+            }
+
+            // Lazy PersonaSnapshot: if this agent has a persona but no
+            // snapshot has been written for it on this session, resolve
+            // and write one now (reason = Initial). Covers fresh
+            // sessions, CLI mode, sessions where `/agent add` happened
+            // before the persona feature, and sessions synced from a
+            // peer that hadn't run the agent yet. Failures are logged
+            // and the call proceeds — ContextBuilder falls back to the
+            // legacy `default_role` and the operator sees an empty or
+            // partial system prompt rather than a crash.
+            if let Some(persona) = agent_persona.as_ref() {
+                let needs_snapshot = {
+                    let s = session.lock().await;
+                    crate::context::latest_persona_snapshot(s.entries(), &agent_name).is_none()
+                };
+                if needs_snapshot {
+                    let session_db = {
+                        let s = session.lock().await;
+                        s.database().clone()
+                    };
+                    match crate::session::write_persona_snapshot(
+                        &session_db,
+                        &agent_name,
+                        persona,
+                        crate::persona::SnapshotReason::Initial,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            // Re-read the session so the freshly-written
+                            // snapshot enters the in-memory entries
+                            // before ContextBuilder runs.
+                            let mut s = session.lock().await;
+                            *s = Session::new(s.conversation_id.clone(), session_db).await;
+                        }
+                        Err(e) => {
+                            error!(
+                                agent = %agent_name,
+                                "Failed to write Initial PersonaSnapshot: {e}"
+                            );
+                        }
+                    }
+                }
             }
 
             let request_security = SecurityContext {
