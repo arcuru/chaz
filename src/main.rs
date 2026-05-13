@@ -416,9 +416,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start the heartbeat runner. Polls every 30s across all hosted sessions
-    // for due rules whose target agent this peer hosts.
-    let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chaz_peer);
-    heartbeat_runner.start();
+    // for due rules whose target agent this peer hosts. Skipped in --cli mode:
+    // the process exits after a single ReAct loop, so the runner never gets a
+    // chance to fire — its setup is pure overhead.
+    if !args.cli {
+        let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chaz_peer);
+        heartbeat_runner.start();
+    }
 
     // Run the selected gateway
     let mode = if args.cli {
