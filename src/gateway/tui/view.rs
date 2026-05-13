@@ -76,8 +76,12 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 }
 
 fn ui_overlay(f: &mut ratatui::Frame, app: &mut App) {
-    match app.overlay {
-        Some(Overlay::Help { scroll }) => ui_help_overlay(f, app, scroll),
+    match &app.overlay {
+        Some(Overlay::Help { scroll }) => {
+            let scroll = *scroll;
+            ui_help_overlay(f, app, scroll);
+        }
+        Some(Overlay::RenamePrompt { .. }) => ui_rename_overlay(f, app),
         None => {}
     }
 }
@@ -235,6 +239,71 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(paragraph, inner);
+}
+
+/// Modal text input for renaming the highlighted session from the picker.
+/// Empty submission clears the alias. Esc cancels. Clicks outside the popup
+/// dismiss.
+fn ui_rename_overlay(f: &mut ratatui::Frame, app: &mut App) {
+    // Pull the overlay fields out by clone so we don't hold an immutable
+    // borrow of `app` while pushing click regions below.
+    let (title, input, cursor) = match &app.overlay {
+        Some(Overlay::RenamePrompt {
+            title,
+            input,
+            cursor,
+            ..
+        }) => (title.clone(), input.clone(), *cursor),
+        _ => return,
+    };
+
+    let area = f.area();
+    // Compact popup — one line for the title bar, one for the input, one for
+    // the help footer, plus borders.
+    let w = area.width.saturating_mul(60) / 100;
+    let w = w.max(30).min(area.width);
+    let h: u16 = 5;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    // Click anywhere outside the popup → dismiss. Inside the popup we don't
+    // register fine-grained regions; keyboard owns the editing UX.
+    app.click_regions.push(ClickRegion {
+        x: area.x,
+        y: area.y,
+        w: area.width,
+        h: area.height,
+        target: ClickTarget::OverlayDismiss,
+    });
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::bordered().title(format!(" {title} ")).title_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+
+    let input_widget = Paragraph::new(input.as_str());
+    f.render_widget(input_widget, chunks[0]);
+
+    let help = Paragraph::new(" [Enter] save · empty = clear · [Esc] cancel")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(help, chunks[1]);
+
+    let cursor_x = chunks[0].x + cursor as u16;
+    let cursor_y = chunks[0].y;
+    f.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
@@ -773,7 +842,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(list, chunks[0]);
 
     let help = Paragraph::new(
-        " [Up/Down] navigate | [Enter] select | [n] new session | [Esc/Ctrl+P] cancel",
+        " [Up/Down] navigate | [Enter] select | [n] new | [r] rename | [Esc/Ctrl+P] cancel",
     )
     .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(help, chunks[1]);

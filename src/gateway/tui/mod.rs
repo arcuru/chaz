@@ -85,7 +85,17 @@ pub(super) enum ChatAction {
 }
 
 pub(super) enum Overlay {
-    Help { scroll: u16 },
+    Help {
+        scroll: u16,
+    },
+    /// Modal input for renaming a session. Submitting an empty string clears
+    /// the alias (matches `/name` with no arg).
+    RenamePrompt {
+        session_db_id: String,
+        title: String,
+        input: String,
+        cursor: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -402,9 +412,29 @@ impl Gateway for TuiGateway {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         cycle_tab(&mut app, 1);
-                    } else if input::handle_overlay_key(&mut app, key) {
-                        // Overlay consumed the key.
                     } else {
+                        match input::handle_overlay_key(&mut app, key) {
+                            input::OverlayKey::Consumed => continue,
+                            input::OverlayKey::RenameSubmit {
+                                session_db_id,
+                                name,
+                            } => {
+                                apply_picker_rename(
+                                    &mut app,
+                                    &server,
+                                    &backend,
+                                    &self.secrets,
+                                    self.scheduler.as_ref(),
+                                    &config_role_names,
+                                    default_role.as_deref(),
+                                    session_db_id,
+                                    name,
+                                )
+                                .await;
+                                continue;
+                            }
+                            input::OverlayKey::NotConsumed => {}
+                        }
                         match app.mode {
                             TuiMode::Chat => {
                                 if let Some(chat_action) =
@@ -630,6 +660,74 @@ async fn handle_chat_action(
             let outcome = commands::dispatch(cmd, &ctx).await;
             render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
         }
+    }
+}
+
+/// Persist a rename initiated from the session picker's [r] keybinding, then
+/// refresh the picker list so the new alias is visible immediately. The
+/// rename targets `session_db_id` directly, which may or may not be the
+/// active tab — that's why it bypasses the `/name` Command path (which keys
+/// off the active session).
+#[allow(clippy::too_many_arguments)]
+async fn apply_picker_rename(
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    secrets: &SecretStore,
+    scheduler: Option<&Arc<Scheduler>>,
+    config_role_names: &[String],
+    default_role: Option<&str>,
+    session_db_id: String,
+    name: Option<String>,
+) {
+    let result = match &name {
+        Some(n) => {
+            server
+                .registry()
+                .set_session_name(&session_db_id, n.clone())
+                .await
+        }
+        None => server.registry().clear_session_name(&session_db_id).await,
+    };
+
+    if let Err(e) = result {
+        show_error(app, format!("Rename failed: {e}"));
+        // Stay in the picker so the user can try again.
+        return;
+    }
+
+    // Keep the active tab's cached name in sync so its title and status bar
+    // update without waiting for a session reopen.
+    if let Some(idx) = app.tab_index_for(&session_db_id) {
+        app.tabs[idx].session_name = name.clone();
+    }
+
+    // Refresh the picker list so the row reflects the new alias and the
+    // selection stays anchored on the renamed session.
+    let tab = app.active();
+    let active_db_id = tab.session_db_id.clone();
+    let active_db = tab.session_db.clone();
+    let current_agent = tab.current_agent.clone();
+    let active_name = tab.session_name.clone();
+    let ctx = CommandContext {
+        server,
+        scheduler,
+        secrets,
+        backend,
+        session_db_id: &active_db_id,
+        session_db: &active_db,
+        current_agent: &current_agent,
+        session_name: active_name.as_deref(),
+        config_roles: Some(config_role_names.to_vec()),
+        default_role,
+    };
+    if let CommandOutcome::SessionsList(list) = commands::dispatch(Command::ListSessions, &ctx).await
+    {
+        app.picker_index = list
+            .iter()
+            .position(|s| s.session_db_id == session_db_id)
+            .unwrap_or(app.picker_index.min(list.len().saturating_sub(1)));
+        app.session_list = list;
     }
 }
 

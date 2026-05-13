@@ -9,12 +9,26 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 
 use super::{App, ChatAction, ClickTarget, Overlay, TuiMode, show_error, show_system_msg};
 
-/// Returns true if an overlay was open and consumed the key. Called from the
-/// top of `handle_chat_key` / picker handling so overlays intercept input
-/// before the underlying mode sees it.
-pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
+/// Outcome of routing a key through the active overlay.
+pub(super) enum OverlayKey {
+    /// No overlay is open — let the mode handler see this key.
+    NotConsumed,
+    /// Overlay handled the key; nothing further to do.
+    Consumed,
+    /// The rename overlay was submitted. The main loop persists the change
+    /// (passing `None` clears the alias) and refreshes the picker list.
+    RenameSubmit {
+        session_db_id: String,
+        name: Option<String>,
+    },
+}
+
+/// Routes a key through the active overlay. Called from the top of
+/// `handle_chat_key` / picker handling so overlays intercept input before the
+/// underlying mode sees it.
+pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
     let Some(overlay) = app.overlay.as_mut() else {
-        return false;
+        return OverlayKey::NotConsumed;
     };
     match overlay {
         Overlay::Help { scroll } => match key.code {
@@ -28,8 +42,68 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Home => *scroll = 0,
             _ => {}
         },
+        Overlay::RenamePrompt {
+            session_db_id,
+            input,
+            cursor,
+            ..
+        } => match key.code {
+            KeyCode::Esc => {
+                app.overlay = None;
+            }
+            KeyCode::Enter => {
+                let trimmed = input.trim();
+                let name = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                let session_db_id = std::mem::take(session_db_id);
+                app.overlay = None;
+                return OverlayKey::RenameSubmit {
+                    session_db_id,
+                    name,
+                };
+            }
+            KeyCode::Char(c) => {
+                input.insert(*cursor, c);
+                *cursor += c.len_utf8();
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    let prev = input[..*cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    input.drain(prev..*cursor);
+                    *cursor = prev;
+                }
+            }
+            KeyCode::Left => {
+                if *cursor > 0 {
+                    *cursor = input[..*cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+            }
+            KeyCode::Right => {
+                if *cursor < input.len() {
+                    *cursor = input[*cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| *cursor + i)
+                        .unwrap_or(input.len());
+                }
+            }
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = input.len(),
+            _ => {}
+        },
     }
-    true
+    OverlayKey::Consumed
 }
 
 /// Actions the mouse handler wants the main loop to take that it can't do on
@@ -757,6 +831,32 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
             .get(app.picker_index)
             .map(|info| info.session_db_id.clone()),
         KeyCode::Char('n') => Some("__new__".to_string()),
+        KeyCode::Char('r') => {
+            if let Some(info) = app.session_list.get(app.picker_index) {
+                let initial = info.name.clone().unwrap_or_default();
+                let cursor = initial.len();
+                let title = match &info.name {
+                    Some(n) => format!("Rename \"{n}\""),
+                    None => format!(
+                        "Name session {}",
+                        info.session_db_id
+                            .rsplit(':')
+                            .next()
+                            .unwrap_or(&info.session_db_id)
+                            .chars()
+                            .take(8)
+                            .collect::<String>()
+                    ),
+                };
+                app.overlay = Some(Overlay::RenamePrompt {
+                    session_db_id: info.session_db_id.clone(),
+                    title,
+                    input: initial,
+                    cursor,
+                });
+            }
+            None
+        }
         KeyCode::Esc => {
             app.mode = TuiMode::Chat;
             None
