@@ -167,6 +167,15 @@ pub(super) struct App {
     pub(super) should_quit: bool,
     pub(super) debug_mode: bool,
     pub(super) session_list: Vec<SessionInfo>,
+    /// Lazy cache of `session_list`. The cold-list walk
+    /// (`Command::ListSessions`) opens every session DB and folds entries —
+    /// fine on a session with 7 catalogs, less so at scale. Set to `true`
+    /// after a fresh fetch and patched-in-place when a watched session
+    /// fires `on_write`; invalidated wholesale when a session is created.
+    /// Sessions not in tabs are assumed stable from this process's
+    /// perspective; remote sync writes won't invalidate the cache and the
+    /// user can re-open the picker to refresh.
+    pub(super) session_list_fresh: bool,
     pub(super) picker_index: usize,
 }
 
@@ -184,6 +193,7 @@ impl App {
             should_quit: false,
             debug_mode: false,
             session_list: Vec::new(),
+            session_list_fresh: false,
             picker_index: 0,
         }
     }
@@ -512,18 +522,47 @@ impl Gateway for TuiGateway {
                 }
                 Action::SessionChanged(id) => {
                     if let Some(idx) = app.tab_index_for(&id) {
+                        let (db_id, db) = {
+                            let tab = &app.tabs[idx];
+                            (tab.session_db_id.clone(), tab.session_db.clone())
+                        };
+                        let session =
+                            Session::new(crate::types::ConversationId(db_id.clone()), db).await;
+                        let entries = session.entries().to_vec();
+                        let meta = session.read_meta().await;
+
+                        // Decide waiting state from the fresh entries before
+                        // moving them into the tab.
+                        let clear_waiting = entries.last().is_some_and(|latest| {
+                            app.agent_names.contains(&latest.sender)
+                                && latest.entry_type == EntryType::Message
+                        });
+
                         let tab = &mut app.tabs[idx];
-                        let session = Session::new(
-                            crate::types::ConversationId(tab.session_db_id.clone()),
-                            tab.session_db.clone(),
-                        )
-                        .await;
-                        tab.entries = session.entries().to_vec();
-                        if let Some(latest) = tab.entries.last()
-                            && app.agent_names.contains(&latest.sender)
-                            && latest.entry_type == EntryType::Message
-                        {
+                        tab.entries = entries;
+                        tab.session_name = meta.name.clone();
+                        if clear_waiting {
                             tab.waiting = false;
+                        }
+
+                        // Keep the picker cache in lock-step with this tab's
+                        // entries so the next picker open doesn't show stale
+                        // counts / cost / name.
+                        if let Some(row) = app
+                            .session_list
+                            .iter_mut()
+                            .find(|s| s.session_db_id == db_id)
+                        {
+                            let entries_ref = &app.tabs[idx].entries;
+                            row.entry_count = entries_ref.len();
+                            row.name = meta.name.clone();
+                            row.agent_name = meta.agent_name.clone();
+                            row.last_message = crate::session::summarize_last_message(entries_ref);
+                            let (cost, reported, calls) =
+                                crate::session::sum_session_cost(entries_ref);
+                            row.total_cost_usd = cost;
+                            row.cost_reported = reported;
+                            row.llm_call_count = calls;
                         }
                     }
                 }
@@ -611,6 +650,21 @@ async fn handle_chat_action(
         ChatAction::OpenPicker => {
             let tab = app.active();
             let session_db_id = tab.session_db_id.clone();
+            // Warm cache short-circuit: skip the full walk when the cached
+            // list is still valid. Action::SessionChanged patches in-tab
+            // rows in place, and Command::NewSession invalidates wholesale,
+            // so a fresh-flagged cache mirrors what a cold fetch would
+            // produce. The cost rollup on each row was computed during the
+            // prior cold fetch.
+            if app.session_list_fresh && !app.session_list.is_empty() {
+                app.picker_index = app
+                    .session_list
+                    .iter()
+                    .position(|s| s.session_db_id == session_db_id)
+                    .unwrap_or(0);
+                app.mode = TuiMode::SessionPicker;
+                return;
+            }
             let session_db = tab.session_db.clone();
             let current_agent = tab.current_agent.clone();
             let session_name = tab.session_name.clone();
@@ -632,6 +686,7 @@ async fn handle_chat_action(
                         .iter()
                         .position(|s| s.session_db_id == session_db_id)
                         .unwrap_or(0);
+                    app.session_list_fresh = true;
                     app.session_list = list;
                     app.mode = TuiMode::SessionPicker;
                 }
@@ -641,6 +696,14 @@ async fn handle_chat_action(
             }
         }
         ChatAction::Dispatch(cmd) => {
+            // Commands that mutate the catalog membership invalidate the
+            // picker cache. NameSession / ClearSessionName change a row's
+            // name but Action::SessionChanged patches it in place from the
+            // session DB's on_write fire, so no wholesale invalidation
+            // needed there.
+            if matches!(cmd, Command::NewSession) {
+                app.session_list_fresh = false;
+            }
             let tab = app.active();
             let session_db_id = tab.session_db_id.clone();
             let session_db = tab.session_db.clone();
@@ -730,6 +793,7 @@ async fn apply_picker_rename(
             .position(|s| s.session_db_id == session_db_id)
             .unwrap_or(app.picker_index.min(list.len().saturating_sub(1)));
         app.session_list = list;
+        app.session_list_fresh = true;
     }
 }
 
@@ -808,8 +872,13 @@ async fn render_outcome(
                         .created_at
                         .map(|t| t.format("%Y-%m-%d").to_string())
                         .unwrap_or_else(|| "—".to_string());
+                    let cost = if info.cost_reported {
+                        format!(", ${:.4}", info.total_cost_usd)
+                    } else {
+                        String::new()
+                    };
                     msg.push_str(&format!(
-                        "\n  {}{} [{}] ({}, {} entries, {})",
+                        "\n  {}{} [{}] ({}, {} entries, {}{cost})",
                         info.session_db_id,
                         name,
                         info.gateway.as_str(),

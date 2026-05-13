@@ -451,6 +451,50 @@ async fn write_field(store: &DocStore, key: &str, value: Option<&str>) -> anyhow
     Ok(())
 }
 
+/// Find the most recent `Message` entry and produce a short single-line
+/// preview ("sender: first line of content…") suitable for session listings.
+/// Returns `None` if no `Message` entry exists. Shared between the
+/// `list_sessions()` cold path and the TUI picker's row-patch warm path so
+/// both code paths produce identical previews.
+pub fn summarize_last_message(entries: &[SessionEntry]) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.entry_type == EntryType::Message)
+        .map(|e| {
+            let preview = e.content.lines().next().unwrap_or("");
+            let truncated = crate::util::truncate_chars(preview, 60);
+            if truncated.len() < preview.len() {
+                format!("{}: {truncated}…", e.sender)
+            } else {
+                format!("{}: {preview}", e.sender)
+            }
+        })
+}
+
+/// Sum `ResponseMetadata.usage.cost_usd` across an in-memory entry slice.
+/// Returns `(total_cost_usd, cost_reported, llm_call_count)`.
+///
+/// Shared between `list_sessions()` (which walks every session's entries on
+/// catalog open) and the TUI's per-row cache-patch path (which recomputes
+/// just one row's totals when a watched session DB fires `on_write`). Both
+/// see the same in-memory entries, so the cache stays in lock-step with
+/// what `list_sessions()` would have produced from a cold read.
+pub fn sum_session_cost(entries: &[SessionEntry]) -> (f64, bool, u32) {
+    let mut total = 0.0_f64;
+    let mut reported = false;
+    let mut calls = 0u32;
+    for entry in entries {
+        let Some(m) = &entry.metadata else { continue };
+        calls += 1;
+        if let Some(c) = m.usage.cost_usd {
+            total += c;
+            reported = true;
+        }
+    }
+    (total, reported, calls)
+}
+
 /// Extract `@<token>` mentions from free-form text. Returns the tokens
 /// without the leading `@`, in appearance order. Tokens are split on
 /// whitespace; punctuation directly adjacent to a mention is trimmed

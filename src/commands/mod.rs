@@ -259,6 +259,14 @@ pub struct SessionInfo {
     /// catalog (legacy rows in the routing index).
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub status: crate::session::SessionStatus,
+    /// Sum of `cost_usd` across every assistant entry with `ResponseMetadata`.
+    /// `cost_reported` distinguishes "$0.00 because no calls had cost data"
+    /// from "$0.00 because every call was free".
+    pub total_cost_usd: f64,
+    pub cost_reported: bool,
+    /// Number of assistant messages with recorded metadata. Useful for
+    /// distinguishing "no LLM activity" from "LLM activity but uncosted".
+    pub llm_call_count: u32,
 }
 
 /// Everything a command handler needs. Borrowed from the gateway.

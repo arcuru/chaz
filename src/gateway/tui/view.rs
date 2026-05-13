@@ -787,8 +787,16 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 crate::session::SessionStatus::Active => "",
             };
 
+            // Show cost only when the backend reported one. Sessions whose
+            // entries predate the metadata commit (or backends that don't
+            // surface cost) just omit the suffix rather than printing $0.00.
+            let cost_suffix = if info.cost_reported {
+                format!(" • ${:.4}", info.total_cost_usd)
+            } else {
+                String::new()
+            };
             let header = format!(
-                "{marker}{title}{current_marker} [{gateway}] {agent_str} • {} entries • {age}{closed_suffix}",
+                "{marker}{title}{current_marker} [{gateway}] {agent_str} • {} entries • {age}{cost_suffix}{closed_suffix}",
                 info.entry_count
             );
 

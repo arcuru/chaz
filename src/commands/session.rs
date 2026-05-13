@@ -26,34 +26,33 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
 
     let mut sessions = Vec::new();
     for index in indices {
-        let (entry_count, last_message, meta_name, meta_agent) = match ctx
-            .server
-            .registry()
-            .open_session(&index.session_db_id)
-            .await
-        {
-            Ok((conv_id, db)) => {
-                let session = Session::new(conv_id, db).await;
-                let meta = session.read_meta().await;
-                let count = session.entries().len();
-                let last = session
-                    .entries()
-                    .iter()
-                    .rev()
-                    .find(|e| e.entry_type == EntryType::Message)
-                    .map(|e| {
-                        let preview = e.content.lines().next().unwrap_or("");
-                        let truncated = crate::util::truncate_chars(preview, 60);
-                        if truncated.len() < preview.len() {
-                            format!("{}: {truncated}…", e.sender)
-                        } else {
-                            format!("{}: {preview}", e.sender)
-                        }
-                    });
-                (count, last, meta.name, meta.agent_name)
-            }
-            Err(_) => (0, None, None, None),
-        };
+        let (entry_count, last_message, meta_name, meta_agent, cost_total, cost_reported, calls) =
+            match ctx
+                .server
+                .registry()
+                .open_session(&index.session_db_id)
+                .await
+            {
+                Ok((conv_id, db)) => {
+                    let session = Session::new(conv_id, db).await;
+                    let meta = session.read_meta().await;
+                    let entries = session.entries();
+                    let count = entries.len();
+                    let last = crate::session::summarize_last_message(entries);
+                    let (cost_total, cost_reported, calls) =
+                        crate::session::sum_session_cost(entries);
+                    (
+                        count,
+                        last,
+                        meta.name,
+                        meta.agent_name,
+                        cost_total,
+                        cost_reported,
+                        calls,
+                    )
+                }
+                Err(_) => (0, None, None, None, 0.0, false, 0),
+            };
         sessions.push(SessionInfo {
             session_db_id: index.session_db_id,
             agent_name: meta_agent,
@@ -63,6 +62,9 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
             gateway: index.gateway,
             created_at: index.created_at,
             status: index.status,
+            total_cost_usd: cost_total,
+            cost_reported,
+            llm_call_count: calls,
         });
     }
 
