@@ -82,17 +82,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
-    // In TUI mode stdout belongs to ratatui, so we route logs to a rolling
-    // file instead (the alt-screen buffer gets corrupted by stray writes).
-    // Daily rotation, keep the last 7 days. Users can tail the file in
-    // another terminal.
+    //
+    // - TUI: stdout belongs to ratatui, so logs go to a rolling file
+    //   (the alt-screen buffer gets corrupted by stray writes).
+    // - CLI: stdout is reserved for the model's reply so it can be piped /
+    //   captured cleanly. Logs go to a rolling file mirroring the TUI path.
+    // - Matrix (default): logs go to stdout, where systemd / docker / etc.
+    //   collect them via their usual mechanisms.
+    //
+    // File-mode rotations: daily, keep the last 7 days. Tail the file in
+    // another terminal to follow live.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _tui_log_guard = if args.tui {
+    let _file_log_guard = if args.tui || args.cli {
         let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let prefix = if args.tui { "chaz-tui" } else { "chaz-cli" };
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("chaz-tui")
+            .filename_prefix(prefix)
             .filename_suffix("log")
             .max_log_files(7)
             .build(&log_dir)?;
@@ -103,8 +110,10 @@ async fn main() -> anyhow::Result<()> {
             .with_ansi(false)
             .init();
         eprintln!(
-            "chaz TUI logs: {}/chaz-tui.log (daily, keeps 7 days)",
-            log_dir.display()
+            "chaz {} logs: {}/{}.log (daily, keeps 7 days)",
+            if args.tui { "TUI" } else { "CLI" },
+            log_dir.display(),
+            prefix,
         );
         Some(guard)
     } else {
