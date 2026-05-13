@@ -1,5 +1,12 @@
-//! Single-shot CLI gateway. Sends one prompt to a reused "cli" session
-//! and prints the agent's reply on stdout.
+//! Single-shot CLI gateway. Sends one prompt and prints the agent's reply
+//! on stdout.
+//!
+//! Session behavior:
+//! - Default: each invocation creates a fresh ephemeral session. Suited to
+//!   one-shot batch and timer use where context accumulation would be
+//!   harmful.
+//! - `--session NAME`: find-or-create a named session and reuse it across
+//!   invocations. Suited to scripted multi-turn workflows.
 //!
 //! No interactive approval — tools requiring approval are auto-denied
 //! (see [`SecurityContext::request_approval`] when `approval_callback` is None).
@@ -16,51 +23,67 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-/// Name used for the CLI's reused session. Created on first invocation,
-/// reopened on subsequent ones.
-const CLI_DEFAULT_NAME: &str = "cli";
-
 pub struct CliGateway {
     config: Config,
     secrets: SecretStore,
     prompt: String,
+    /// Optional named session to reuse. When `None`, a fresh ephemeral
+    /// session is created per invocation.
+    session_name: Option<String>,
 }
 
 impl CliGateway {
-    pub fn new(config: Config, secrets: SecretStore, prompt: String) -> Self {
+    pub fn new(
+        config: Config,
+        secrets: SecretStore,
+        prompt: String,
+        session_name: Option<String>,
+    ) -> Self {
         Self {
             config,
             secrets,
             prompt,
+            session_name,
         }
     }
 }
 
-/// Find the session named "cli", or create one and name it.
-async fn default_cli_session(
+/// Resolve the session to run against:
+/// - `Some(name)` → find-or-create a session with that name (reused across runs).
+/// - `None`       → create a fresh ephemeral session (no name, no reuse).
+async fn resolve_cli_session(
     server: &Server,
+    session_name: Option<&str>,
 ) -> anyhow::Result<(crate::types::ConversationId, eidetica::Database)> {
-    if let Some(id) = server.registry().find_by_name(CLI_DEFAULT_NAME).await? {
-        match server.registry().open_session(&id).await {
-            Ok(r) => return Ok(r),
-            Err(e) => warn!(id, "Default CLI session unreadable, recreating: {e}"),
+    if let Some(name) = session_name {
+        if let Some(id) = server.registry().find_by_name(name).await? {
+            match server.registry().open_session(&id).await {
+                Ok(r) => return Ok(r),
+                Err(e) => warn!(id, "Named CLI session '{name}' unreadable, recreating: {e}"),
+            }
         }
+        let (conv_id, db) = server.registry().create_session(Some(name)).await?;
+        let session_db_id = db.root_id().to_string();
+        if let Err(e) = server
+            .registry()
+            .set_session_name(&session_db_id, name.to_string())
+            .await
+        {
+            warn!("Failed to name CLI session '{name}': {e}");
+        }
+        Ok((conv_id, db))
+    } else {
+        // Ephemeral: create a fresh session every invocation, leave it
+        // unnamed. Tagged with source "cli" for debug visibility in session
+        // listings.
+        server.registry().create_session(Some("cli")).await
     }
-    let (conv_id, db) = server.registry().create_session(Some("cli")).await?;
-    let session_db_id = db.root_id().to_string();
-    if let Err(e) = server
-        .registry()
-        .set_session_name(&session_db_id, CLI_DEFAULT_NAME.to_string())
-        .await
-    {
-        warn!("Failed to name default CLI session: {e}");
-    }
-    Ok((conv_id, db))
 }
 
 impl Gateway for CliGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
-        let (conv_id, session_db) = default_cli_session(&server).await?;
+        let (conv_id, session_db) =
+            resolve_cli_session(&server, self.session_name.as_deref()).await?;
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 

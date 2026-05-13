@@ -48,9 +48,15 @@ struct ChazArgs {
     #[arg(long)]
     tui: bool,
 
-    /// Run a single CLI prompt and exit. Reuses a session named "cli".
+    /// Run a single CLI prompt and exit. By default each invocation creates
+    /// a fresh ephemeral session; pass --session NAME to reuse one.
     #[arg(long)]
     cli: bool,
+
+    /// Named session to reuse with --cli (find-or-create). When omitted,
+    /// --cli creates a fresh session per invocation.
+    #[arg(long, requires = "cli", value_name = "NAME")]
+    session: Option<String>,
 
     /// The prompt to send when --cli is used.
     #[arg(required_if_eq("cli", "true"))]
@@ -444,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
     info!(mode, "Starting gateway");
     let result = if args.cli {
         let prompt = args.prompt.clone().expect("--cli requires PROMPT");
-        let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt);
+        let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt, args.session);
         gateway.run(server).await
     } else if args.tui {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
