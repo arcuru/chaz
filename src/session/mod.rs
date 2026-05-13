@@ -118,11 +118,78 @@ pub struct SessionMeta {
 }
 
 /// Registry index entry — exists for every session known to this instance.
+///
+/// Combines the lightweight routing index (`sessions` DocStore: id→source)
+/// with the richer catalog metadata (`session_catalog` DocStore: gateway,
+/// created_at, status). Legacy sessions registered before the catalog
+/// existed surface here with `gateway = Other` and `created_at = None`.
 #[derive(Debug, Clone)]
 pub struct SessionIndex {
     pub session_db_id: String,
     /// Free-form origin tag for debugging ("matrix:!room", "tui", "spawn:uuid").
     pub source: Option<String>,
+    pub gateway: GatewayKind,
+    pub created_at: Option<DateTime<Utc>>,
+    pub status: SessionStatus,
+}
+
+/// Normalized gateway-of-origin derived from the session's `source` tag.
+/// Stored alongside the raw source so consumers can filter without parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GatewayKind {
+    Cli,
+    Tui,
+    Matrix,
+    Spawn,
+    #[default]
+    Other,
+}
+
+impl GatewayKind {
+    /// Map a free-form `source` tag to a normalized gateway kind.
+    pub fn from_source(source: Option<&str>) -> Self {
+        match source {
+            Some("cli") => Self::Cli,
+            Some("tui") => Self::Tui,
+            Some(s) if s.starts_with("matrix:") => Self::Matrix,
+            Some(s) if s.starts_with("spawn:") => Self::Spawn,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Tui => "tui",
+            Self::Matrix => "matrix",
+            Self::Spawn => "spawn",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SessionStatus {
+    #[default]
+    Active,
+    Closed,
+}
+
+/// A row in the user-central session catalog.
+///
+/// Stored in `chaz_group`'s `session_catalog` DocStore (one entry per session
+/// ever created on this peer). Caches only fields that don't drift after
+/// creation — `name` and `agent_name` are intentionally NOT cached here, since
+/// they live canonically in `SessionMeta` inside each session's own DB and
+/// would require an update hook at every meta-write site.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCatalogEntry {
+    pub session_db_id: String,
+    pub source: Option<String>,
+    pub gateway: GatewayKind,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub status: SessionStatus,
 }
 
 /// Per-conversation state backed by its own eidetica Database.

@@ -251,6 +251,12 @@ pub struct SessionInfo {
     pub name: Option<String>,
     pub entry_count: usize,
     pub last_message: Option<String>,
+    /// Normalized gateway-of-origin from the session catalog.
+    pub gateway: crate::session::GatewayKind,
+    /// Catalog creation timestamp. `None` for sessions that predate the
+    /// catalog (legacy rows in the routing index).
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub status: crate::session::SessionStatus,
 }
 
 /// Everything a command handler needs. Borrowed from the gateway.

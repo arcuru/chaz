@@ -10,9 +10,12 @@ use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, Tree
 use eidetica::store::DocStore;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::info;
+use tracing::{info, warn};
 
-use super::{SessionIndex, find_or_create_db, read_meta_from_db, update_meta_on_db};
+use super::{
+    GatewayKind, SessionCatalogEntry, SessionIndex, SessionStatus, find_or_create_db,
+    read_meta_from_db, update_meta_on_db,
+};
 
 /// Notification emitted when a new session is indexed in the registry.
 #[derive(Debug, Clone)]
@@ -53,6 +56,10 @@ pub struct SessionRegistry {
 pub(super) const STORE_SESSIONS: &str = "sessions";
 pub(super) const STORE_MATRIX_CHANNELS: &str = "matrix_channels";
 pub(super) const STORE_SESSION_NAMES: &str = "session_names";
+/// User-central session catalog. Companion to `STORE_SESSIONS`; the routing
+/// index there stays a cheap id→source map, while this store holds rich
+/// per-session metadata (gateway, created_at, status) as JSON.
+pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 
 impl SessionRegistry {
     pub async fn new(
@@ -149,13 +156,24 @@ impl SessionRegistry {
         crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source.unwrap_or("new"))
             .await?;
 
-        // Add to sessions index
+        // Add to sessions index + session catalog in one transaction so the
+        // pair stays consistent even if the second write would fail.
+        let catalog_entry = SessionCatalogEntry {
+            session_db_id: session_db_id.clone(),
+            source: source.map(|s| s.to_string()),
+            gateway: GatewayKind::from_source(source),
+            created_at: chrono::Utc::now(),
+            status: SessionStatus::Active,
+        };
         {
             let txn = self.chaz_group.new_transaction().await?;
-            let store = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
-            store
+            let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
+            sessions
                 .set_string(&session_db_id, source.unwrap_or(""))
                 .await?;
+            let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+            let catalog_json = serde_json::to_string(&catalog_entry)?;
+            catalog.set_string(&session_db_id, catalog_json).await?;
             txn.commit().await?;
         }
 
@@ -243,21 +261,77 @@ impl SessionRegistry {
     // -------------------------------------------------------------------------
 
     /// List every session known to the registry.
+    ///
+    /// Joins the routing index (`sessions`) with the catalog
+    /// (`session_catalog`). Sessions created before the catalog existed
+    /// surface here with `created_at = None` and gateway derived from their
+    /// routing-index source string.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionIndex>> {
         let txn = self.chaz_group.new_transaction().await?;
-        let store = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
-        let doc = store.get_all().await?;
-        Ok(doc
-            .iter()
-            .map(|(key, value)| {
-                let source: Option<String> =
-                    value.try_into().ok().filter(|s: &String| !s.is_empty());
-                SessionIndex {
-                    session_db_id: key.clone(),
-                    source,
+        let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
+        let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let routing_doc = sessions.get_all().await?;
+        let catalog_doc = catalog.get_all().await?;
+
+        let mut out: Vec<SessionIndex> = Vec::with_capacity(routing_doc.iter().count());
+        for (key, value) in routing_doc.iter() {
+            let routing_source: Option<String> =
+                value.try_into().ok().filter(|s: &String| !s.is_empty());
+            let entry = match catalog_doc.get(key) {
+                Some(v) => {
+                    let json: Option<String> = v.try_into().ok();
+                    json.as_deref().and_then(|s| {
+                        serde_json::from_str::<SessionCatalogEntry>(s)
+                            .map_err(|e| {
+                                warn!(session_db_id = %key, "Malformed catalog entry: {e}");
+                                e
+                            })
+                            .ok()
+                    })
                 }
-            })
-            .collect())
+                None => None,
+            };
+            let (source, gateway, created_at, status) = match entry {
+                Some(e) => (e.source, e.gateway, Some(e.created_at), e.status),
+                None => {
+                    // Legacy: synthesize from routing-index source only.
+                    let g = GatewayKind::from_source(routing_source.as_deref());
+                    (routing_source, g, None, SessionStatus::Active)
+                }
+            };
+            out.push(SessionIndex {
+                session_db_id: key.clone(),
+                source,
+                gateway,
+                created_at,
+                status,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Mark a session as closed in the catalog (no row removal — Patrick's
+    /// "find all sessions" design treats history as append-only).
+    ///
+    /// Stub for the future session-deletion pathway. No-op for sessions that
+    /// have no catalog row yet (legacy entries); call after `create_session`
+    /// or rely on backfill if needed.
+    pub async fn mark_session_closed(&self, session_db_id: &str) -> anyhow::Result<()> {
+        let txn = self.chaz_group.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let Ok(json) = store.get_string(session_db_id).await else {
+            return Ok(());
+        };
+        let mut entry: SessionCatalogEntry = serde_json::from_str(&json)?;
+        if entry.status == SessionStatus::Closed {
+            return Ok(());
+        }
+        entry.status = SessionStatus::Closed;
+        store
+            .set_string(session_db_id, serde_json::to_string(&entry)?)
+            .await?;
+        txn.commit().await?;
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -346,6 +420,82 @@ mod tests {
             Some(eidetica::crdt::doc::Value::Doc(d)) => DelegatedTreeRef::try_from(d).ok(),
             _ => None,
         }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_populates_catalog_metadata() {
+        let (_instance, registry) = make_registry().await;
+
+        let before = chrono::Utc::now();
+        let (_conv_cli, db_cli) = registry.create_session(Some("cli")).await.unwrap();
+        let (_conv_matrix, db_matrix) = registry
+            .create_session(Some("matrix:!room1:example.com"))
+            .await
+            .unwrap();
+        let (_conv_bare, db_bare) = registry.create_session(None).await.unwrap();
+        let after = chrono::Utc::now();
+
+        let mut list = registry.list_sessions().await.unwrap();
+        list.sort_by(|a, b| a.session_db_id.cmp(&b.session_db_id));
+        assert_eq!(list.len(), 3, "expected three sessions in the catalog");
+
+        let by_id: std::collections::HashMap<&str, &SessionIndex> = list
+            .iter()
+            .map(|s| (s.session_db_id.as_str(), s))
+            .collect();
+
+        let cli = by_id[db_cli.root_id().to_string().as_str()];
+        assert_eq!(cli.gateway, GatewayKind::Cli);
+        assert_eq!(cli.source.as_deref(), Some("cli"));
+        assert_eq!(cli.status, SessionStatus::Active);
+        let cli_created = cli.created_at.expect("cli session should have created_at");
+        assert!(cli_created >= before && cli_created <= after);
+
+        let matrix = by_id[db_matrix.root_id().to_string().as_str()];
+        assert_eq!(matrix.gateway, GatewayKind::Matrix);
+        assert!(matrix.source.as_deref().unwrap().starts_with("matrix:"));
+
+        let bare = by_id[db_bare.root_id().to_string().as_str()];
+        assert_eq!(bare.gateway, GatewayKind::Other);
+        assert_eq!(bare.source, None);
+        assert!(bare.created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn mark_session_closed_flips_catalog_status() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let id = db.root_id().to_string();
+
+        registry.mark_session_closed(&id).await.unwrap();
+        let list = registry.list_sessions().await.unwrap();
+        let entry = list
+            .iter()
+            .find(|s| s.session_db_id == id)
+            .expect("session must still be listed after close");
+        assert_eq!(entry.status, SessionStatus::Closed);
+
+        // Idempotent: second call is a no-op, still Closed.
+        registry.mark_session_closed(&id).await.unwrap();
+        let list = registry.list_sessions().await.unwrap();
+        assert_eq!(
+            list.iter()
+                .find(|s| s.session_db_id == id)
+                .unwrap()
+                .status,
+            SessionStatus::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_session_closed_is_noop_for_unknown_id() {
+        let (_instance, registry) = make_registry().await;
+        // Use a syntactically-valid but never-registered id. The fn should
+        // silently succeed (no catalog row to update).
+        registry
+            .mark_session_closed("sha256:deadbeefcafe")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

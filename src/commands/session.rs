@@ -60,8 +60,20 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
             name: meta_name,
             entry_count,
             last_message,
+            gateway: index.gateway,
+            created_at: index.created_at,
+            status: index.status,
         });
     }
+
+    // Most-recently created first, with legacy (created_at = None) sessions
+    // sorted to the end so fresh sessions are always near the top.
+    sessions.sort_by(|a, b| match (a.created_at, b.created_at) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.session_db_id.cmp(&b.session_db_id),
+    });
 
     CommandOutcome::SessionsList(sessions)
 }
