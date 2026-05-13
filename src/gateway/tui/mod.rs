@@ -369,6 +369,31 @@ impl Gateway for TuiGateway {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         close_active_tab(&mut app);
+                    } else if key.code == KeyCode::Char('p')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        // Ctrl+P toggles the session picker. In chat mode it
+                        // opens it; in picker mode it dismisses back to chat.
+                        match app.mode {
+                            TuiMode::Chat => {
+                                handle_chat_action(
+                                    ChatAction::OpenPicker,
+                                    &mut app,
+                                    &server,
+                                    &backend,
+                                    &self.secrets,
+                                    self.scheduler.as_ref(),
+                                    &approval_tx,
+                                    &notify_tx,
+                                    &config_role_names,
+                                    default_role.as_deref(),
+                                )
+                                .await;
+                            }
+                            TuiMode::SessionPicker => {
+                                app.mode = TuiMode::Chat;
+                            }
+                        }
                     } else if key.code == KeyCode::PageUp
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -679,9 +704,18 @@ async fn render_outcome(
                         .as_deref()
                         .map(|n| format!(" \"{n}\""))
                         .unwrap_or_default();
+                    let age = info
+                        .created_at
+                        .map(|t| t.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "—".to_string());
                     msg.push_str(&format!(
-                        "\n  {}{} ({}, {} entries)",
-                        info.session_db_id, name, agent, info.entry_count
+                        "\n  {}{} [{}] ({}, {} entries, {})",
+                        info.session_db_id,
+                        name,
+                        info.gateway.as_str(),
+                        agent,
+                        info.entry_count,
+                        age
                     ));
                     if let Some(preview) = &info.last_message {
                         msg.push_str(&format!("\n    {preview}"));

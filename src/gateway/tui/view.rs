@@ -4,6 +4,8 @@
 use crate::session::EntryType;
 use crate::util::truncate_chars;
 
+use chrono::{DateTime, Utc};
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -639,6 +641,39 @@ fn render_approval_panel(
     });
 }
 
+/// Last 8 chars of a session DB id (after stripping any `multihash:` prefix),
+/// used as a short identifier in pickers and tab titles.
+fn short_session_id(s: &str) -> String {
+    let tail = s.rsplit(':').next().unwrap_or(s);
+    tail.chars().take(8).collect()
+}
+
+/// "5m ago", "3h ago", "2d ago", "5w ago" — coarse age for the picker.
+/// Returns `"—"` for legacy sessions that predate the catalog.
+fn humanize_age(created_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(t) = created_at else {
+        return "—".to_string();
+    };
+    let secs = (now - t).num_seconds().max(0);
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 48 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    if days < 14 {
+        return format!("{days}d ago");
+    }
+    let weeks = days / 7;
+    format!("{weeks}w ago")
+}
+
 fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
@@ -661,6 +696,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         )]));
     } else {
         let current_session_db_id = app.active().session_db_id.clone();
+        let now = Utc::now();
         for (i, info) in app.session_list.iter().enumerate() {
             let is_selected = i == app.picker_index;
             let is_current = info.session_db_id == current_session_db_id;
@@ -669,21 +705,29 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             let current_marker = if is_current { " *" } else { "" };
 
             let agent_str = info.agent_name.as_deref().unwrap_or("default");
-            let name_str = info
-                .name
-                .as_ref()
-                .map(|n| format!(" \"{n}\""))
-                .unwrap_or_default();
+            let title = match &info.name {
+                Some(n) => format!("\"{n}\""),
+                None => short_session_id(&info.session_db_id),
+            };
+            let gateway = info.gateway.as_str();
+            let age = humanize_age(info.created_at, now);
+            let closed_suffix = match info.status {
+                crate::session::SessionStatus::Closed => " (closed)",
+                crate::session::SessionStatus::Active => "",
+            };
 
             let header = format!(
-                "{}{}{}{} ({}, {} entries)",
-                marker, info.session_db_id, name_str, current_marker, agent_str, info.entry_count
+                "{marker}{title}{current_marker} [{gateway}] {agent_str} • {} entries • {age}{closed_suffix}",
+                info.entry_count
             );
 
+            let is_closed = matches!(info.status, crate::session::SessionStatus::Closed);
             let style = if is_selected {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            } else if is_closed {
+                Style::default().fg(Color::DarkGray)
             } else if is_current {
                 Style::default().fg(Color::Green)
             } else {
@@ -727,9 +771,10 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         .block(Block::bordered().title(" Sessions "));
     f.render_widget(list, chunks[0]);
 
-    let help =
-        Paragraph::new(" [Up/Down] navigate | [Enter] select | [n] new session | [Esc] cancel")
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let help = Paragraph::new(
+        " [Up/Down] navigate | [Enter] select | [n] new session | [Esc/Ctrl+P] cancel",
+    )
+    .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(help, chunks[1]);
 }
 
