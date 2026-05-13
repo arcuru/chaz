@@ -13,7 +13,7 @@ use crate::{
     backends::{ChatContext, LLMBackend},
     config::Backend,
     error::LlmError,
-    runtime::{LLMResponse, RuntimeMessage, ToolCallRequest},
+    runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
     security::SecretStore,
     tool::ToolDefinition,
 };
@@ -43,6 +43,15 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ChatTool>>,
+    /// Opt into OpenRouter's extended usage accounting (`cost`, cache details,
+    /// reasoning tokens). Unknown to vanilla OpenAI/DeepSeek but ignored
+    /// silently per the spec, so we always set it.
+    usage: UsageOpts,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct UsageOpts {
+    include: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +103,23 @@ struct ChatToolFunction {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    /// Response id (e.g. OR's `gen-…`). Useful for correlating with the
+    /// backend's request logs. Absent on some compatible providers.
+    #[serde(default)]
+    id: Option<String>,
+    /// The model that actually answered. May differ from the requested model
+    /// when the backend (OR) falls back or routes elsewhere.
+    #[serde(default)]
+    model: Option<String>,
+    /// Upstream inference provider when reported (OpenRouter-specific).
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    usage: Option<Usage>,
+    /// Catch-all for provider extensions we don't normalize but want to
+    /// preserve (e.g. OR's `cost_details`, `is_byok`).
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +127,92 @@ struct ChatChoice {
     message: ChatMessage,
     #[serde(default)]
     finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    /// Backend-reported cost in USD. Populated when the request opts into
+    /// extended usage accounting (OR with `usage.include = true`).
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Anthropic-style prompt cache breakdown when the backend surfaces it.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Project the wire-format Usage onto the normalized `TokenUsage` shape.
+    /// Picks the first populated source for each cache/reasoning field so we
+    /// transparently handle both OpenAI-style nested details and
+    /// Anthropic-style flat fields.
+    fn into_token_usage(self) -> TokenUsage {
+        let cached_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .or(self.cache_read_input_tokens);
+        let reasoning_tokens = self
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens);
+        TokenUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            cached_tokens,
+            cache_creation_tokens: self.cache_creation_input_tokens,
+            reasoning_tokens,
+            cost_usd: self.cost,
+        }
+    }
+}
+
+/// Build `ResponseMetadata` from the parsed response. Falls back to the
+/// requested model name if the backend didn't echo it.
+fn build_metadata(
+    response_id: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    usage: Option<Usage>,
+    extra: Map<String, Value>,
+    requested_model: &str,
+) -> Option<ResponseMetadata> {
+    // If absolutely nothing useful came back, surface None so callers know
+    // this call wasn't accounted for.
+    if response_id.is_none() && model.is_none() && provider.is_none() && usage.is_none() {
+        return None;
+    }
+    Some(ResponseMetadata {
+        model: model.unwrap_or_else(|| requested_model.to_string()),
+        provider,
+        response_id,
+        usage: usage.map(Usage::into_token_usage).unwrap_or_default(),
+        extra,
+    })
 }
 
 impl OpenAI {
@@ -159,6 +271,7 @@ impl OpenAI {
             } else {
                 Some(openai_tools)
             },
+            usage: UsageOpts { include: true },
         };
 
         let timeout = self.backend.request_timeout();
@@ -175,14 +288,23 @@ impl OpenAI {
         })?
         .map_err(LlmError::from_openai_error)?;
 
-        let choice =
-            response
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| LlmError::EmptyResponse {
-                    message: "No choices in response".to_string(),
-                })?;
+        let ChatResponse {
+            choices,
+            id,
+            model: response_model,
+            provider,
+            usage,
+            extra: response_extra,
+        } = response;
+
+        let metadata = build_metadata(id, response_model, provider, usage, response_extra, model);
+
+        let choice = choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| LlmError::EmptyResponse {
+                message: "No choices in response".to_string(),
+            })?;
 
         let ChatMessage {
             content,
@@ -192,11 +314,12 @@ impl OpenAI {
         } = choice.message;
 
         tracing::debug!(
-            "LLM response: content={:?} tool_calls={:?} extra_fields={:?} finish_reason={:?}",
+            "LLM response: content={:?} tool_calls={:?} extra_fields={:?} finish_reason={:?} usage={:?}",
             content.as_deref().map(|c| &c[..c.len().min(100)]),
             tool_calls.as_ref().map(|tc| tc.len()),
             extra.keys().collect::<Vec<_>>(),
-            choice.finish_reason
+            choice.finish_reason,
+            metadata.as_ref().map(|m| &m.usage),
         );
 
         // Check if the LLM wants to call tools
@@ -216,11 +339,15 @@ impl OpenAI {
                 content,
                 tool_calls: requests,
                 provider_extra: extra,
+                metadata,
             });
         }
 
         // Final text response
-        Ok(LLMResponse::Text(content.unwrap_or_default()))
+        Ok(LLMResponse::Text {
+            content: content.unwrap_or_default(),
+            metadata,
+        })
     }
 }
 
@@ -273,6 +400,7 @@ impl LLMBackend for OpenAI {
             model: &model,
             messages,
             tools: None,
+            usage: UsageOpts { include: true },
         };
 
         let timeout = self.backend.request_timeout();
@@ -406,4 +534,100 @@ fn convert_chat_context(
         model = default_model.clone().unwrap_or_default();
     }
     (model, messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_normalizes_openai_style_cached_tokens() {
+        let u = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cost: Some(0.0123),
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(40),
+            }),
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(20),
+            }),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        let t = u.into_token_usage();
+        assert_eq!(t.prompt_tokens, 100);
+        assert_eq!(t.cached_tokens, Some(40));
+        assert_eq!(t.reasoning_tokens, Some(20));
+        assert_eq!(t.cost_usd, Some(0.0123));
+        assert_eq!(t.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn usage_normalizes_anthropic_style_cache_fields() {
+        // Anthropic uses flat cache_read_input_tokens / cache_creation_input_tokens
+        // instead of nested prompt_tokens_details.cached_tokens.
+        let u = Usage {
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            total_tokens: 300,
+            cost: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+            cache_read_input_tokens: Some(50),
+            cache_creation_input_tokens: Some(10),
+        };
+        let t = u.into_token_usage();
+        assert_eq!(t.cached_tokens, Some(50));
+        assert_eq!(t.cache_creation_tokens, Some(10));
+        assert_eq!(t.cost_usd, None);
+    }
+
+    #[test]
+    fn usage_prefers_nested_over_flat_when_both_present() {
+        // If a backend somehow returns both shapes, the nested OpenAI-style
+        // field wins. Arbitrary but consistent.
+        let u = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost: None,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(7),
+            }),
+            completion_tokens_details: None,
+            cache_read_input_tokens: Some(99),
+            cache_creation_input_tokens: None,
+        };
+        assert_eq!(u.into_token_usage().cached_tokens, Some(7));
+    }
+
+    #[test]
+    fn build_metadata_returns_none_when_response_has_nothing() {
+        let m = build_metadata(
+            None,
+            None,
+            None,
+            None,
+            Map::new(),
+            "anthropic/claude-haiku-4-5",
+        );
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn build_metadata_falls_back_to_requested_model() {
+        let m = build_metadata(
+            Some("gen-abc".into()),
+            None, // backend didn't echo model
+            None,
+            None,
+            Map::new(),
+            "openai/gpt-5",
+        )
+        .expect("response_id alone is enough to surface metadata");
+        assert_eq!(m.model, "openai/gpt-5");
+        assert_eq!(m.response_id.as_deref(), Some("gen-abc"));
+    }
 }

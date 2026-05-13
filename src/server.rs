@@ -492,6 +492,7 @@ impl Server {
                     content: String::new(),
                     timestamp: Utc::now(),
                     entry_type: EntryType::Ack,
+                    metadata: None,
                 })
                 .await;
             }
@@ -595,6 +596,7 @@ impl Server {
                                 content: format!("{name}({arguments})"),
                                 timestamp: Utc::now(),
                                 entry_type: EntryType::ToolCall,
+                                metadata: None,
                             })
                             .await;
                         }
@@ -620,6 +622,7 @@ impl Server {
                                 content,
                                 timestamp: Utc::now(),
                                 entry_type: EntryType::ToolResult,
+                                metadata: None,
                             })
                             .await;
                         }
@@ -644,12 +647,13 @@ impl Server {
 
             let mut s = session.lock().await;
             match result {
-                Ok(body) => {
+                Ok(outcome) => {
                     s.add_entry(SessionEntry {
                         sender: agent_name,
-                        content: body,
+                        content: outcome.body,
                         timestamp: Utc::now(),
                         entry_type: EntryType::Message,
+                        metadata: outcome.metadata,
                     })
                     .await;
                 }
@@ -660,6 +664,7 @@ impl Server {
                         content: format!("Error: {err}"),
                         timestamp: Utc::now(),
                         entry_type: EntryType::Error,
+                        metadata: None,
                     })
                     .await;
                 }

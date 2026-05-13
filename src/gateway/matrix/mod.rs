@@ -1198,6 +1198,7 @@ impl Gateway for MatrixGateway {
                             content: body,
                             timestamp: chrono::Utc::now(),
                             entry_type: EntryType::Message,
+                            metadata: None,
                         })
                         .await;
 

@@ -320,6 +320,7 @@ pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
         content: summary.clone(),
         timestamp: chrono::Utc::now(),
         entry_type: EntryType::Summary,
+        metadata: None,
     };
 
     let write = async {

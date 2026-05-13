@@ -262,6 +262,7 @@ impl HeartbeatRunner {
                 content,
                 timestamp: now,
                 entry_type: EntryType::Directive,
+                metadata: None,
             })
             .await;
 

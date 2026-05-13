@@ -266,6 +266,7 @@ impl Scheduler {
                 content: directive_content,
                 timestamp: Utc::now(),
                 entry_type: EntryType::Directive,
+                metadata: None,
             })
             .await;
 

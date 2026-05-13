@@ -67,6 +67,7 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
                         content: body,
                         timestamp,
                         entry_type: EntryType::Message,
+                        metadata: None,
                     });
                 }
             }

@@ -187,6 +187,7 @@ impl Tool for SpawnTask {
                     content: directive,
                     timestamp: chrono::Utc::now(),
                     entry_type: EntryType::Directive,
+                    metadata: None,
                 })
                 .await;
 

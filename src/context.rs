@@ -253,6 +253,7 @@ mod tests {
             content: content.to_string(),
             timestamp: Utc::now(),
             entry_type,
+            metadata: None,
         }
     }
 

@@ -69,12 +69,19 @@ pub enum EntryType {
 /// treated identically — both write SessionEntries with their name as sender.
 /// The agent determines assistant vs user roles at context-building time by
 /// comparing the sender to its own name.
+///
+/// `metadata` carries token/cost provenance for assistant `Message` entries
+/// (aggregated across the turn's ReAct loop). It is `None` for human
+/// messages, tool calls, tool results, errors, and persona snapshots.
+/// Stored alongside the entry so cost attribution survives session sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub sender: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
     pub entry_type: EntryType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::runtime::ResponseMetadata>,
 }
 
 /// A reference to an agent authorized to participate in a session.
@@ -367,6 +374,7 @@ pub async fn write_persona_snapshot_to_db(
         content: serde_json::to_string(payload)?,
         timestamp: payload.written_at,
         entry_type: EntryType::PersonaSnapshot,
+        metadata: None,
     };
     let txn = database.new_transaction().await?;
     let store = txn.get_store::<Table<SessionEntry>>("entries").await?;

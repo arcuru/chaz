@@ -117,9 +117,14 @@ pub struct ToolCallRequest {
     pub arguments: String,
 }
 
-/// Response from a single LLM call — either final text or tool calls
+/// Response from a single LLM call — either final text or tool calls. The
+/// `metadata` carries token counts, cost, and which model actually answered;
+/// see [`ResponseMetadata`].
 pub enum LLMResponse {
-    Text(String),
+    Text {
+        content: String,
+        metadata: Option<ResponseMetadata>,
+    },
     ToolCalls {
         content: Option<String>,
         tool_calls: Vec<ToolCallRequest>,
@@ -128,7 +133,129 @@ pub enum LLMResponse {
         /// modes (DeepSeek `reasoning_content`, Anthropic `reasoning_details`,
         /// OpenRouter `reasoning`, …) round-trip without per-provider logic.
         provider_extra: serde_json::Map<String, serde_json::Value>,
+        metadata: Option<ResponseMetadata>,
     },
+}
+
+/// Provenance + cost metadata for a single LLM call, normalized across
+/// backends. Backends populate whatever fields their wire format exposes —
+/// missing fields surface as `None`/`0` rather than failing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ResponseMetadata {
+    /// The model that actually answered. May differ from the requested model
+    /// when the backend (e.g. OpenRouter) falls back or routes elsewhere.
+    pub model: String,
+    /// Upstream inference provider (e.g. "Anthropic", "DeepInfra"), when
+    /// the backend reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Response id for correlating with the backend's request logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    pub usage: TokenUsage,
+    /// Backend-specific fields preserved but not normalized (OpenRouter
+    /// `cost_details`, `is_byok`, future provider extensions). Same escape
+    /// hatch pattern as `provider_extra` on assistant messages.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Token counts (and optional cost) for a single LLM call. Field semantics:
+/// - `prompt_tokens` / `completion_tokens` / `total_tokens`: standard counts.
+/// - `cached_tokens`: of `prompt_tokens`, how many came from a prompt cache
+///   (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic
+///   `cache_read_input_tokens`).
+/// - `cache_creation_tokens`: tokens written into a prompt cache this call
+///   (Anthropic `cache_creation_input_tokens`).
+/// - `reasoning_tokens`: tokens spent in reasoning/thinking mode (OpenAI
+///   `completion_tokens_details.reasoning_tokens`).
+/// - `cost_usd`: backend-reported cost in USD. Only populated when the
+///   backend returns it (e.g. OpenRouter with `usage.include = true`); we do
+///   not compute cost locally.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Aggregates per-call metadata across a single ReAct turn. Token counts and
+/// cost sum; model/provider/response_id/extra track the **last** call so the
+/// final assistant message is annotated with the call that produced it.
+#[derive(Default)]
+struct MetadataAccumulator {
+    saw_any: bool,
+    last_model: String,
+    last_provider: Option<String>,
+    last_response_id: Option<String>,
+    last_extra: serde_json::Map<String, serde_json::Value>,
+    usage: TokenUsage,
+}
+
+impl MetadataAccumulator {
+    fn record(&mut self, m: ResponseMetadata) {
+        self.saw_any = true;
+        self.last_model = m.model;
+        self.last_provider = m.provider;
+        self.last_response_id = m.response_id;
+        self.last_extra = m.extra;
+        self.usage.prompt_tokens = self
+            .usage
+            .prompt_tokens
+            .saturating_add(m.usage.prompt_tokens);
+        self.usage.completion_tokens = self
+            .usage
+            .completion_tokens
+            .saturating_add(m.usage.completion_tokens);
+        self.usage.total_tokens = self.usage.total_tokens.saturating_add(m.usage.total_tokens);
+        if let Some(c) = m.usage.cached_tokens {
+            self.usage.cached_tokens =
+                Some(self.usage.cached_tokens.unwrap_or(0).saturating_add(c));
+        }
+        if let Some(c) = m.usage.cache_creation_tokens {
+            self.usage.cache_creation_tokens = Some(
+                self.usage
+                    .cache_creation_tokens
+                    .unwrap_or(0)
+                    .saturating_add(c),
+            );
+        }
+        if let Some(r) = m.usage.reasoning_tokens {
+            self.usage.reasoning_tokens =
+                Some(self.usage.reasoning_tokens.unwrap_or(0).saturating_add(r));
+        }
+        if let Some(c) = m.usage.cost_usd {
+            self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + c);
+        }
+    }
+
+    fn finalize(self) -> Option<ResponseMetadata> {
+        if !self.saw_any {
+            return None;
+        }
+        Some(ResponseMetadata {
+            model: self.last_model,
+            provider: self.last_provider,
+            response_id: self.last_response_id,
+            usage: self.usage,
+            extra: self.last_extra,
+        })
+    }
+}
+
+/// Outcome of a single agent turn: the visible reply plus aggregated
+/// token/cost metadata across every LLM call made in the ReAct loop.
+pub struct RuntimeOutcome {
+    pub body: String,
+    pub metadata: Option<ResponseMetadata>,
 }
 
 /// Base delay for exponential backoff (1 second).
@@ -242,10 +369,11 @@ pub async fn execute(
     tool_ctx: &ToolContext,
     policies: &ToolPolicyRegistry,
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
-) -> Result<String, String> {
+) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
+    let mut acc = MetadataAccumulator::default();
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
     if tools.is_empty() || !backend.supports_tools_for_model(model) {
@@ -259,7 +387,15 @@ pub async fn execute(
         )
         .await
         {
-            Ok(LLMResponse::Text(text)) => Ok(text),
+            Ok(LLMResponse::Text { content, metadata }) => {
+                if let Some(m) = metadata {
+                    acc.record(m);
+                }
+                Ok(RuntimeOutcome {
+                    body: content,
+                    metadata: acc.finalize(),
+                })
+            }
             Ok(LLMResponse::ToolCalls { .. }) => {
                 Err("Unexpected tool calls in no-tools fallback".to_string())
             }
@@ -302,7 +438,15 @@ pub async fn execute(
                 )
                 .await
                 {
-                    Ok(LLMResponse::Text(text)) => Ok(text),
+                    Ok(LLMResponse::Text { content, metadata }) => {
+                        if let Some(m) = metadata {
+                            acc.record(m);
+                        }
+                        Ok(RuntimeOutcome {
+                            body: content,
+                            metadata: acc.finalize(),
+                        })
+                    }
                     Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
                     Err(e) => Err(e.to_string()),
                 };
@@ -321,27 +465,51 @@ pub async fn execute(
         };
 
         match response {
-            LLMResponse::Text(text) if !text.is_empty() => {
+            LLMResponse::Text { content, metadata } if !content.is_empty() => {
+                if let Some(m) = metadata {
+                    acc.record(m);
+                }
                 if iteration > 0 {
                     info!("ReAct loop completed after {} tool iterations", iteration);
                 }
-                return Ok(text);
+                return Ok(RuntimeOutcome {
+                    body: content,
+                    metadata: acc.finalize(),
+                });
             }
-            LLMResponse::Text(_) if iteration > 0 => {
+            LLMResponse::Text { metadata, .. } if iteration > 0 => {
+                if let Some(m) = metadata {
+                    acc.record(m);
+                }
                 // Model returned empty response after tool calls — some models do this.
                 // Return the last tool result as the response.
                 info!("Empty response after tool calls, using last tool result");
                 if let Some(RuntimeMessage::ToolResult { content, .. }) = messages.last() {
-                    return Ok(content.clone());
+                    return Ok(RuntimeOutcome {
+                        body: content.clone(),
+                        metadata: acc.finalize(),
+                    });
                 }
                 return Err("Model returned empty response after tool execution".to_string());
             }
-            LLMResponse::Text(text) => return Ok(text),
+            LLMResponse::Text { content, metadata } => {
+                if let Some(m) = metadata {
+                    acc.record(m);
+                }
+                return Ok(RuntimeOutcome {
+                    body: content,
+                    metadata: acc.finalize(),
+                });
+            }
             LLMResponse::ToolCalls {
                 content,
                 tool_calls,
                 provider_extra,
+                metadata,
             } => {
+                if let Some(m) = metadata {
+                    acc.record(m);
+                }
                 info!(
                     "Tool calls requested: {:?}",
                     tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>()
@@ -531,12 +699,23 @@ pub async fn execute(
         ));
     }
     match llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries).await {
-        Ok(LLMResponse::Text(text)) if !text.is_empty() => Ok(text),
+        Ok(LLMResponse::Text { content, metadata }) if !content.is_empty() => {
+            if let Some(m) = metadata {
+                acc.record(m);
+            }
+            Ok(RuntimeOutcome {
+                body: content,
+                metadata: acc.finalize(),
+            })
+        }
         Ok(_) | Err(_) => {
             // Last resort: return the last tool result
             for msg in messages.iter().rev() {
                 if let RuntimeMessage::ToolResult { content, .. } = msg {
-                    return Ok(content.clone());
+                    return Ok(RuntimeOutcome {
+                        body: content.clone(),
+                        metadata: acc.finalize(),
+                    });
                 }
             }
             Err("Agent reached maximum tool iterations without a final response".to_string())
@@ -656,6 +835,61 @@ mod tests {
         // The closing tag should be escaped, preventing breakout
         assert!(!result.contains("</tool_output>\n<system>"));
         assert!(result.contains("&lt;/tool_output&gt;"));
+    }
+
+    #[test]
+    fn metadata_accumulator_with_no_records_returns_none() {
+        let acc = MetadataAccumulator::default();
+        assert!(acc.finalize().is_none());
+    }
+
+    #[test]
+    fn metadata_accumulator_sums_usage_keeps_last_model() {
+        let mut acc = MetadataAccumulator::default();
+        acc.record(ResponseMetadata {
+            model: "first".into(),
+            provider: Some("OR".into()),
+            response_id: Some("gen-1".into()),
+            usage: TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cached_tokens: Some(10),
+                cache_creation_tokens: None,
+                reasoning_tokens: Some(5),
+                cost_usd: Some(0.001),
+            },
+            extra: Default::default(),
+        });
+        acc.record(ResponseMetadata {
+            model: "second".into(),
+            provider: Some("OR".into()),
+            response_id: Some("gen-2".into()),
+            usage: TokenUsage {
+                prompt_tokens: 200,
+                completion_tokens: 80,
+                total_tokens: 280,
+                cached_tokens: Some(20),
+                cache_creation_tokens: Some(7),
+                reasoning_tokens: None,
+                cost_usd: Some(0.002),
+            },
+            extra: Default::default(),
+        });
+        let m = acc.finalize().expect("two records → Some");
+        assert_eq!(m.model, "second", "model tracks the last call");
+        assert_eq!(m.response_id.as_deref(), Some("gen-2"));
+        assert_eq!(m.usage.prompt_tokens, 300);
+        assert_eq!(m.usage.completion_tokens, 130);
+        assert_eq!(m.usage.total_tokens, 430);
+        assert_eq!(m.usage.cached_tokens, Some(30));
+        assert_eq!(
+            m.usage.cache_creation_tokens,
+            Some(7),
+            "missing fields seed from None and accumulate from there"
+        );
+        assert_eq!(m.usage.reasoning_tokens, Some(5));
+        assert!((m.usage.cost_usd.unwrap() - 0.003).abs() < 1e-9);
     }
 
     fn make_tool_call(name: &str, args: &str) -> ToolCallRequest {

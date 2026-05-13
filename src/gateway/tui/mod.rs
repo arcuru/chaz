@@ -603,6 +603,7 @@ async fn handle_chat_action(
                     content: text,
                     timestamp: chrono::Utc::now(),
                     entry_type: EntryType::Message,
+                    metadata: None,
                 })
                 .await;
             tab.waiting = true;
@@ -721,7 +722,8 @@ async fn apply_picker_rename(
         config_roles: Some(config_role_names.to_vec()),
         default_role,
     };
-    if let CommandOutcome::SessionsList(list) = commands::dispatch(Command::ListSessions, &ctx).await
+    if let CommandOutcome::SessionsList(list) =
+        commands::dispatch(Command::ListSessions, &ctx).await
     {
         app.picker_index = list
             .iter()
@@ -873,6 +875,7 @@ pub(super) fn show_system_msg(app: &mut App, content: String) {
         content,
         timestamp: chrono::Utc::now(),
         entry_type: EntryType::Message,
+        metadata: None,
     });
 }
 
@@ -882,5 +885,6 @@ pub(super) fn show_error(app: &mut App, content: String) {
         content,
         timestamp: chrono::Utc::now(),
         entry_type: EntryType::Error,
+        metadata: None,
     });
 }

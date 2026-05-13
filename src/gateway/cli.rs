@@ -121,6 +121,7 @@ impl Gateway for CliGateway {
                 content: self.prompt.clone(),
                 timestamp: chrono::Utc::now(),
                 entry_type: EntryType::Message,
+                metadata: None,
             })
             .await;
 

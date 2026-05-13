@@ -439,10 +439,8 @@ mod tests {
         list.sort_by(|a, b| a.session_db_id.cmp(&b.session_db_id));
         assert_eq!(list.len(), 3, "expected three sessions in the catalog");
 
-        let by_id: std::collections::HashMap<&str, &SessionIndex> = list
-            .iter()
-            .map(|s| (s.session_db_id.as_str(), s))
-            .collect();
+        let by_id: std::collections::HashMap<&str, &SessionIndex> =
+            list.iter().map(|s| (s.session_db_id.as_str(), s)).collect();
 
         let cli = by_id[db_cli.root_id().to_string().as_str()];
         assert_eq!(cli.gateway, GatewayKind::Cli);
@@ -479,10 +477,7 @@ mod tests {
         registry.mark_session_closed(&id).await.unwrap();
         let list = registry.list_sessions().await.unwrap();
         assert_eq!(
-            list.iter()
-                .find(|s| s.session_db_id == id)
-                .unwrap()
-                .status,
+            list.iter().find(|s| s.session_db_id == id).unwrap().status,
             SessionStatus::Closed
         );
     }
