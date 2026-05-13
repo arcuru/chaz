@@ -220,7 +220,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         "/print" => return Some(ChatAction::Dispatch(Command::Print)),
         "/backends" => return Some(ChatAction::Dispatch(Command::ListBackends)),
         "/new" => return Some(ChatAction::Dispatch(Command::NewSession)),
-        "/name" => return Some(ChatAction::Dispatch(Command::ClearSessionName)),
+        "/name" | "/rename" => return Some(ChatAction::Dispatch(Command::ClearSessionName)),
         "/role" => return Some(ChatAction::Dispatch(Command::Role(None))),
         "/model" => return Some(ChatAction::Dispatch(Command::Model(None))),
         "/channels" => return Some(ChatAction::Dispatch(Command::ListChannels)),
@@ -633,7 +633,10 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         }
         return None;
     }
-    if let Some(arg) = text.strip_prefix("/name ") {
+    if let Some(arg) = text
+        .strip_prefix("/name ")
+        .or_else(|| text.strip_prefix("/rename "))
+    {
         let name = arg.trim().to_string();
         if !name.is_empty() {
             return Some(ChatAction::Dispatch(Command::NameSession(name)));

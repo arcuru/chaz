@@ -92,6 +92,7 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("/new", "create a new session"),
         ("/join ", "switch to session by name or DB ID"),
         ("/name ", "set (or clear) a session alias"),
+        ("/rename ", "alias for /name"),
         ("/info", "show current session info"),
         ("/channels", "list Matrix rooms attached to this session"),
         ("/share", "generate shareable ticket for current session"),
