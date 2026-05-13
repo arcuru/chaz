@@ -79,6 +79,8 @@ pub enum Command {
     Compact,
     /// Dump the transcript of the current session.
     Print,
+    /// Aggregate LLM usage and cost across all sessions.
+    ListCosts,
 
     // --- Matrix channel management ---
     /// List Matrix rooms currently attached to the current session.
@@ -296,6 +298,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::NewSession => session::new_session(ctx).await,
         Command::SwitchSession(id) => session::switch_session(&id, ctx).await,
         Command::Info => session::info(ctx).await,
+        Command::ListCosts => session::list_costs(ctx).await,
         Command::NameSession(name) => session::name_session(&name, ctx).await,
         Command::ClearSessionName => session::clear_session_name(ctx).await,
         Command::Share => session::share(ctx).await,

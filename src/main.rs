@@ -61,6 +61,32 @@ struct ChazArgs {
     /// The prompt to send when --cli is used.
     #[arg(required_if_eq("cli", "true"))]
     prompt: Option<String>,
+
+    #[command(subcommand)]
+    subcommand: Option<Subcommand>,
+}
+
+#[derive(clap::Subcommand)]
+enum Subcommand {
+    /// Aggregate LLM usage and cost across all sessions, then exit.
+    /// Reads the user-central session catalog; no gateway is started.
+    Usage(UsageArgs),
+}
+
+#[derive(clap::Args)]
+struct UsageArgs {
+    /// Emit the rollup as JSON for machine consumption.
+    #[arg(long)]
+    json: bool,
+
+    /// Only include sessions originating from this gateway (cli, tui,
+    /// matrix, spawn, other).
+    #[arg(long, value_name = "KIND")]
+    gateway: Option<String>,
+
+    /// Skip sessions marked closed.
+    #[arg(long)]
+    active_only: bool,
 }
 
 #[tokio::main]
@@ -85,6 +111,24 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| dirs::state_dir().map(|d| d.join("chaz")));
     if let Some(dir) = &state_dir {
         std::fs::create_dir_all(dir)?;
+    }
+
+    // Subcommand short-circuit: read-only utilities open the DB, do their
+    // work, and exit — no gateway, scheduler, MCP, or sync setup.
+    if let Some(sub) = args.subcommand {
+        // Bare stderr logging — stdout is reserved for the subcommand's
+        // own output (text or JSON) so it stays pipe-friendly.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+        return match sub {
+            Subcommand::Usage(usage_args) => {
+                run_usage_subcommand(usage_args, &config, state_dir.as_deref()).await
+            }
+        };
     }
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
@@ -598,4 +642,51 @@ async fn build_web_search_backends(
         .collect();
     info!(chain = ?chain, "web_search backends");
     built
+}
+
+/// `chaz usage` — open the eidetica DB read-only, walk the user-central
+/// session catalog, aggregate per-message `ResponseMetadata`, print either
+/// human-readable text or JSON, then exit. Skips all gateway/sync/scheduler
+/// setup since we never serve a session here.
+async fn run_usage_subcommand(
+    args: UsageArgs,
+    config: &Config,
+    state_dir: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let gateway_filter = match args.gateway.as_deref() {
+        Some(s) => Some(session::GatewayKind::from_filter_str(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown --gateway value '{s}' (expected: cli, tui, matrix, spawn, other)"
+            )
+        })?),
+        None => None,
+    };
+
+    let eidetica_db_path = state_dir
+        .map(|d| d.join("eidetica.db"))
+        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
+    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
+    let instance = eidetica::Instance::open(Box::new(backend)).await?;
+    let _ = instance.create_user("chaz", None).await;
+    let user = instance.login_user("chaz", None).await?;
+
+    let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
+    if agent_registry.is_empty() {
+        agent_registry.register_default_chaz(config)?;
+    }
+    let registry = session::SessionRegistry::new(instance, user, agent_registry).await?;
+
+    let filter = session::usage::UsageFilter {
+        since: None,
+        gateway: gateway_filter,
+        active_only: args.active_only,
+    };
+    let rollup = session::usage::collect_usage(&registry, &filter).await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rollup)?);
+    } else {
+        print!("{}", session::usage::render_text(&rollup));
+    }
+    Ok(())
 }

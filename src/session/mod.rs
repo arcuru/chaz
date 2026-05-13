@@ -28,6 +28,7 @@ mod agents;
 mod channels;
 mod keys;
 mod registry;
+pub mod usage;
 
 pub use agents::write_persona_snapshot;
 pub use keys::BootstrapOutcome;
@@ -171,6 +172,19 @@ impl GatewayKind {
             Self::Matrix => "matrix",
             Self::Spawn => "spawn",
             Self::Other => "other",
+        }
+    }
+
+    /// Parse the case-insensitive short name produced by `as_str`. Used by
+    /// CLI filters (`chaz usage --gateway tui`).
+    pub fn from_filter_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "cli" => Some(Self::Cli),
+            "tui" => Some(Self::Tui),
+            "matrix" => Some(Self::Matrix),
+            "spawn" => Some(Self::Spawn),
+            "other" => Some(Self::Other),
+            _ => None,
         }
     }
 }

@@ -291,6 +291,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         "/compact" => return Some(ChatAction::Dispatch(Command::Compact)),
         "/schedules" => return Some(ChatAction::Dispatch(Command::ListSchedules)),
         "/info" => return Some(ChatAction::Dispatch(Command::Info)),
+        "/costs" => return Some(ChatAction::Dispatch(Command::ListCosts)),
         "/print" => return Some(ChatAction::Dispatch(Command::Print)),
         "/backends" => return Some(ChatAction::Dispatch(Command::ListBackends)),
         "/new" => return Some(ChatAction::Dispatch(Command::NewSession)),

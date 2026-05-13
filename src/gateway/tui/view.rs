@@ -98,6 +98,7 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("/name ", "set (or clear) a session alias"),
         ("/rename ", "alias for /name"),
         ("/info", "show current session info"),
+        ("/costs", "aggregate LLM usage + cost across all sessions"),
         ("/channels", "list Matrix rooms attached to this session"),
         ("/share", "generate shareable ticket for current session"),
         ("/sync ", "sync a remote session via ticket"),

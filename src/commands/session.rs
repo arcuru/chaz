@@ -224,6 +224,14 @@ fn format_usage_summary(entries: &[crate::session::SessionEntry]) -> String {
     out
 }
 
+pub(super) async fn list_costs(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let registry = ctx.server.registry();
+    match crate::session::usage::collect_usage(registry, &Default::default()).await {
+        Ok(rollup) => CommandOutcome::Text(crate::session::usage::render_text(&rollup)),
+        Err(e) => CommandOutcome::Error(format!("Failed to collect usage: {e}")),
+    }
+}
+
 pub(super) async fn name_session(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     if name.is_empty() {
         return CommandOutcome::Error("Usage: name <alias>".to_string());
