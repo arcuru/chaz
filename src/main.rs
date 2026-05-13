@@ -143,22 +143,30 @@ async fn main() -> anyhow::Result<()> {
     // Enable eidetica sync for session sharing. Register iroh P2P transport
     // by default (stable peer identity, no address config needed). If
     // sync_listen is configured, also bind HTTP for traditional access.
-    instance.enable_sync().await?;
-    if let Some(sync) = instance.sync() {
-        use eidetica::sync::transports::iroh::IrohTransport;
-        sync.register_transport("iroh", IrohTransport::builder())
-            .await?;
-
-        if let Some(ref addr) = config.sync_listen {
-            use eidetica::sync::transports::http::HttpTransport;
-            sync.register_transport("http", HttpTransport::builder().bind(addr))
+    //
+    // Skipped in --cli mode: starting iroh, registering with the n0 relay,
+    // and spinning up the 300s periodic-sync engine all run *after* exit
+    // for one-shot CLI invocations. The setup is pure overhead and exposes
+    // a public sync endpoint that lives for the lifetime of the process —
+    // a few seconds. Long-lived TUI/Matrix modes still get full sync.
+    if !args.cli {
+        instance.enable_sync().await?;
+        if let Some(sync) = instance.sync() {
+            use eidetica::sync::transports::iroh::IrohTransport;
+            sync.register_transport("iroh", IrohTransport::builder())
                 .await?;
-            info!("Sync HTTP transport listening on {addr}");
-        }
 
-        sync.accept_connections().await?;
-        if let Ok(addr) = sync.get_server_address().await {
-            info!("Eidetica sync address: {addr}");
+            if let Some(ref addr) = config.sync_listen {
+                use eidetica::sync::transports::http::HttpTransport;
+                sync.register_transport("http", HttpTransport::builder().bind(addr))
+                    .await?;
+                info!("Sync HTTP transport listening on {addr}");
+            }
+
+            sync.accept_connections().await?;
+            if let Ok(addr) = sync.get_server_address().await {
+                info!("Eidetica sync address: {addr}");
+            }
         }
     }
 
