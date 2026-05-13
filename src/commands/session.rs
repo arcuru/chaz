@@ -160,12 +160,68 @@ pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
     } else {
         format!("\nMatrix rooms: {}", channels.join(", "))
     };
+    let usage_line = format_usage_summary(entries);
     CommandOutcome::Text(format!(
-        "Session: {}{name_line}\nAgent: {}{channels_line}\nTotal entries: {}\nMessages: {msg_count} | Directives: {directive_count} | Tool calls: {tool_count} | Errors: {error_count}",
+        "Session: {}{name_line}\nAgent: {}{channels_line}\nTotal entries: {}\nMessages: {msg_count} | Directives: {directive_count} | Tool calls: {tool_count} | Errors: {error_count}{usage_line}",
         ctx.session_db_id,
         ctx.current_agent,
         entries.len(),
     ))
+}
+
+/// Roll up `ResponseMetadata` across every entry in the session and render
+/// it as one or two extra lines for `/info`. Returns the empty string when
+/// no entries carry metadata (legacy sessions or sessions whose backend
+/// didn't surface usage), so the output stays clean for those cases.
+fn format_usage_summary(entries: &[crate::session::SessionEntry]) -> String {
+    let mut calls = 0u32;
+    let mut prompt = 0u64;
+    let mut completion = 0u64;
+    let mut cached = 0u64;
+    let mut cost: f64 = 0.0;
+    let mut saw_cost = false;
+    let mut models: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for entry in entries {
+        let Some(m) = &entry.metadata else { continue };
+        calls += 1;
+        prompt += m.usage.prompt_tokens as u64;
+        completion += m.usage.completion_tokens as u64;
+        cached += m.usage.cached_tokens.unwrap_or(0) as u64;
+        if let Some(c) = m.usage.cost_usd {
+            cost += c;
+            saw_cost = true;
+        }
+        if !m.model.is_empty() {
+            *models.entry(m.model.clone()).or_insert(0) += 1;
+        }
+    }
+    if calls == 0 {
+        return String::new();
+    }
+    let cached_part = if cached > 0 {
+        format!(" ({cached} cached)")
+    } else {
+        String::new()
+    };
+    let cost_part = if saw_cost {
+        format!(" | ${cost:.4}")
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "\nLLM usage: {calls} call{} | {prompt} prompt + {completion} completion{cached_part}{cost_part}",
+        if calls == 1 { "" } else { "s" }
+    );
+    if !models.is_empty() {
+        let mut pairs: Vec<(String, u32)> = models.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let rendered: Vec<String> = pairs
+            .into_iter()
+            .map(|(name, n)| format!("{name} ({n})"))
+            .collect();
+        out.push_str(&format!("\nModels: {}", rendered.join(", ")));
+    }
+    out
 }
 
 pub(super) async fn name_session(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
