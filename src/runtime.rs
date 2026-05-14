@@ -396,6 +396,7 @@ pub async fn execute(
         model: model.map(|s| s.to_string()),
         call_depth: tool_ctx.call_depth,
         session: tool_ctx.session.clone(),
+        active_extensions: tool_ctx.active_extensions.clone(),
     });
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
@@ -1154,6 +1155,7 @@ mod tests {
             grants: Default::default(),
             agent_grants: Default::default(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
+            active_extensions: std::collections::HashSet::new(),
         }
     }
 

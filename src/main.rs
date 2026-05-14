@@ -385,8 +385,8 @@ async fn main() -> anyhow::Result<()> {
     // so they continue to live directly in the registry — they're just
     // un-attributed for now.
     let mut tool_registry = tool::ToolRegistry::new();
-    for (_name, tool) in extension_hub.tools_for_registry() {
-        tool_registry.register_arc(tool);
+    for (owner, _name, tool) in extension_hub.tools_for_registry() {
+        tool_registry.register_arc_owned(tool, Some(owner));
     }
 
     // Collect MCP server configs from inline config + directory scanning

@@ -425,6 +425,21 @@ async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) ->
         ));
     }
 
+    let active_extensions = ctx.server.active_extensions_for(ctx.session_db_id).await;
+
+    // Surface a clearer error when the command exists but its owner
+    // extension is inactive on this session — otherwise the dispatch
+    // would just return None and the user sees a misleading "unknown
+    // command" message.
+    if let Some(owner) = hub.command_owner(name)
+        && !active_extensions.contains(owner)
+    {
+        return CommandOutcome::Error(format!(
+            "/{name} is provided by the '{owner}' extension, which is not \
+             active on this session. Use `/extensions add {owner}` to enable it."
+        ));
+    }
+
     let conv_id = crate::types::ConversationId(ctx.session_db_id.to_string());
     let session = Session::new(conv_id, ctx.session_db.clone()).await;
     let hook_ctx = HookContext {
@@ -432,6 +447,7 @@ async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) ->
         model: None,
         call_depth: 0,
         session: Arc::new(Mutex::new(session)),
+        active_extensions,
     };
 
     match hub.try_dispatch_command(name, args, &hook_ctx).await {

@@ -83,6 +83,10 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-session active-extension set, folded from each session's
+    /// `extensions` event log and cached in memory. Refreshed at
+    /// `register_session` and on `/extensions add|remove`.
+    active_extensions: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
     /// Internal notification channel — callbacks send session_db_id here
     notify_tx: mpsc::Sender<String>,
 }
@@ -120,6 +124,7 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
         });
 
@@ -192,6 +197,56 @@ impl Server {
     /// commands.
     pub fn extensions(&self) -> &Arc<ExtensionHub> {
         &self.extensions
+    }
+
+    /// Per-session active-extension set, lazily computed from the
+    /// session's `extensions` event log and cached. Returned cloned so
+    /// the caller can hand it into a [`crate::extension::HookContext`].
+    /// Falls back to an empty set if the session DB can't be opened —
+    /// in that case no hook fires, which is the conservative choice.
+    pub async fn active_extensions_for(
+        &self,
+        session_db_id: &str,
+    ) -> std::collections::HashSet<String> {
+        {
+            let cache = self.active_extensions.lock().await;
+            if let Some(s) = cache.get(session_db_id) {
+                return s.clone();
+            }
+        }
+        let active = self.compute_active_extensions(session_db_id).await;
+        let mut cache = self.active_extensions.lock().await;
+        cache.insert(session_db_id.to_string(), active.clone());
+        active
+    }
+
+    /// Recompute the per-session active set from the session DB (without
+    /// using the in-memory cache) and refresh the cache. Called after
+    /// `/extensions add|remove` writes an event.
+    pub async fn refresh_active_extensions(
+        &self,
+        session_db_id: &str,
+    ) -> std::collections::HashSet<String> {
+        let active = self.compute_active_extensions(session_db_id).await;
+        let mut cache = self.active_extensions.lock().await;
+        cache.insert(session_db_id.to_string(), active.clone());
+        active
+    }
+
+    async fn compute_active_extensions(
+        &self,
+        session_db_id: &str,
+    ) -> std::collections::HashSet<String> {
+        let Ok((_conv, db)) = self.registry.open_session(session_db_id).await else {
+            return std::collections::HashSet::new();
+        };
+        match crate::extension::read_active(&db).await {
+            Ok(refs) => refs.into_iter().map(|r| r.name().to_string()).collect(),
+            Err(e) => {
+                tracing::warn!(session = %session_db_id, "Failed to read active extensions: {e}");
+                std::collections::HashSet::new()
+            }
+        }
     }
 
     /// Register a session for callback-driven agent processing.
@@ -357,9 +412,10 @@ impl Server {
     ) {
         // Framework-level: record activation events for the current extension
         // set onto the session DB. Idempotent on repeat calls; only writes
-        // when the set or a version differs from the latest stored event.
-        // Failure is non-fatal — we'd rather lose provenance for one
-        // session-start than block the agent turn.
+        // when the set or a version differs from the latest stored event,
+        // and respects `Deactivated` (so a `/extensions remove` survives
+        // restart). Failure is non-fatal — we'd rather lose provenance for
+        // one session-start than block the agent turn.
         if let Err(e) = self.extensions.record_active(&session_db).await {
             tracing::warn!(
                 conv = %session_db.root_id(),
@@ -367,13 +423,17 @@ impl Server {
             );
         }
 
-        let conv_id = ConversationId(session_db.root_id().to_string());
+        let session_db_id = session_db.root_id().to_string();
+        let active_extensions = self.refresh_active_extensions(&session_db_id).await;
+
+        let conv_id = ConversationId(session_db_id);
         let session = Session::new(conv_id, session_db).await;
         let ctx = HookContext {
             agent_name,
             model: None,
             call_depth,
             session: Arc::new(Mutex::new(session)),
+            active_extensions,
         };
         self.extensions.fire_session_start(&ctx).await;
     }
@@ -392,6 +452,8 @@ impl Server {
                 .unwrap_or_else(|| "agent".to_string())
         };
 
+        let active_extensions = self.active_extensions_for(session_db_id).await;
+
         if let Ok((_, db)) = self.registry.open_session(session_db_id).await {
             let conv_id = ConversationId(session_db_id.to_string());
             let session = Session::new(conv_id, db).await;
@@ -400,9 +462,14 @@ impl Server {
                 model: None,
                 call_depth: 0,
                 session: Arc::new(Mutex::new(session)),
+                active_extensions,
             };
             self.extensions.fire_session_shutdown(&ctx).await;
         }
+
+        // Drop the cached active set so a future re-register starts fresh.
+        let mut cache = self.active_extensions.lock().await;
+        cache.remove(session_db_id);
 
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_db_id);
@@ -566,6 +633,7 @@ impl Server {
         let host = self.host.clone();
         let spawn_extensions = self.extensions.clone();
         let max_context_tokens = agent.max_context_tokens;
+        let active_extensions = self.active_extensions_for(&session_db_id).await;
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
@@ -633,10 +701,16 @@ impl Server {
                 approval_callback: approval_tx,
             };
 
+            // Layer the per-session active-extension filter on top of the
+            // parent (or root) scope. `narrow` already propagates the set
+            // when spawning a child, but `with_active_extensions` here
+            // re-asserts the current session's set in case the parent was
+            // built from a different lineage.
             let scoped_tools = match spawn.parent_tools {
                 Some(parent) => parent.narrow(allowed_tools.as_deref()),
                 None => ScopedTools::new(tools, allowed_tools),
-            };
+            }
+            .with_active_extensions(Some(active_extensions.clone()));
 
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
@@ -648,6 +722,7 @@ impl Server {
                 grants: Default::default(),
                 agent_grants,
                 host: host.clone(),
+                active_extensions: active_extensions.clone(),
             };
 
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);

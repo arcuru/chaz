@@ -257,6 +257,11 @@ pub struct ToolContext {
     pub profile: ToolProfile,
     /// Handle to the current session (for tools that need to write entries, e.g. compact)
     pub session: std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
+    /// Per-session active-extension set, used by `HookContext` to filter
+    /// hook firing and by `ScopedTools` to hide tools owned by inactive
+    /// extensions. Built by `Server::active_extensions_for` and threaded
+    /// through `runtime::execute` from the calling agent worker.
+    pub active_extensions: std::collections::HashSet<String>,
     /// Resolved capability grants for the tool currently executing.
     /// Populated by the runtime before each call with config grants merged
     /// with per-agent overlays (see `Grants::merge_over`).
@@ -411,11 +416,26 @@ impl ToolPolicyRegistry {
     }
 }
 
+/// One row in the ToolRegistry: the tool itself plus the extension that
+/// contributed it (`None` for MCP-loaded tools, which don't yet flow
+/// through the extension hub).
+pub struct RegistryEntry {
+    pub tool: std::sync::Arc<dyn Tool>,
+    pub owner: Option<&'static str>,
+}
+
+impl RegistryEntry {
+    pub fn descriptor(&self) -> ToolDescriptor {
+        self.tool.descriptor()
+    }
+}
+
 /// Registry of available tools. Holds `Arc<dyn Tool>` so the extension hub
 /// can share ownership of each tool with the registry — built from the hub
-/// at startup in `main.rs`.
+/// at startup in `main.rs`. Owner attribution lets `ScopedTools` filter by
+/// per-session active-extension set.
 pub struct ToolRegistry {
-    tools: Vec<std::sync::Arc<dyn Tool>>,
+    tools: Vec<RegistryEntry>,
 }
 
 impl ToolRegistry {
@@ -424,17 +444,28 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.push(std::sync::Arc::new(tool));
+        self.tools.push(RegistryEntry {
+            tool: std::sync::Arc::new(tool),
+            owner: None,
+        });
     }
 
     pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(std::sync::Arc::from(tool));
+        self.tools.push(RegistryEntry {
+            tool: std::sync::Arc::from(tool),
+            owner: None,
+        });
     }
 
     /// Add a tool already wrapped in an `Arc` (e.g. one held by the
-    /// extension hub).
-    pub fn register_arc(&mut self, tool: std::sync::Arc<dyn Tool>) {
-        self.tools.push(tool);
+    /// extension hub) attributed to its owner extension. `None` owner
+    /// means "always available regardless of per-session active set".
+    pub fn register_arc_owned(
+        &mut self,
+        tool: std::sync::Arc<dyn Tool>,
+        owner: Option<&'static str>,
+    ) {
+        self.tools.push(RegistryEntry { tool, owner });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -446,8 +477,8 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .map(|t| {
-                let desc = t.descriptor();
+            .map(|e| {
+                let desc = e.tool.descriptor();
                 ToolDefinition {
                     name: desc.name,
                     description: desc.description,
@@ -461,8 +492,16 @@ impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
-            .find(|t| t.descriptor().name == name)
-            .map(|t| t.as_ref())
+            .find(|e| e.tool.descriptor().name == name)
+            .map(|e| e.tool.as_ref())
+    }
+
+    /// Owner extension of a tool, if any. `None` for MCP/un-attributed.
+    pub fn owner_of(&self, name: &str) -> Option<&'static str> {
+        self.tools
+            .iter()
+            .find(|e| e.tool.descriptor().name == name)
+            .and_then(|e| e.owner)
     }
 }
 
@@ -489,15 +528,45 @@ fn is_allowed_by(allowed: &[String], tool_name: &str) -> bool {
 /// Allowlist entries can be exact names or glob patterns (`"filesystem.*"`).
 /// Narrowing via `narrow()` produces a new ScopedTools with a tighter allowlist,
 /// enabling transitive tool restriction down the agent spawn tree.
+///
+/// `active_extensions` adds a per-session filter layered on top: a tool
+/// whose `owner` extension isn't in the active set is hidden, *unless*
+/// the tool has no owner (MCP / direct registration) — those are always
+/// available because they're not subject to the extension lifecycle.
 #[derive(Clone)]
 pub struct ScopedTools {
     registry: Arc<ToolRegistry>,
     allowed: Option<Vec<String>>,
+    active_extensions: Option<std::collections::HashSet<String>>,
 }
 
 impl ScopedTools {
     pub fn new(registry: Arc<ToolRegistry>, allowed: Option<Vec<String>>) -> Self {
-        Self { registry, allowed }
+        Self {
+            registry,
+            allowed,
+            active_extensions: None,
+        }
+    }
+
+    /// Apply a per-session active-extension filter. Tools owned by an
+    /// extension not in `active` are hidden from `definitions` / `get`.
+    /// Tools without an owner (MCP, etc.) pass regardless. Passing
+    /// `None` clears the filter.
+    pub fn with_active_extensions(
+        mut self,
+        active: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.active_extensions = active;
+        self
+    }
+
+    fn passes_extension_filter(&self, owner: Option<&'static str>) -> bool {
+        match (&self.active_extensions, owner) {
+            (None, _) => true,
+            (Some(_), None) => true, // un-attributed (MCP / direct) — always allowed
+            (Some(active), Some(o)) => active.contains(o),
+        }
     }
 
     /// Narrow this scope further for a child agent.
@@ -521,8 +590,8 @@ impl ScopedTools {
                 for child_pattern in child {
                     if child_pattern.ends_with(".*") {
                         // Child glob: expand to matching registry tools, keep if parent allows
-                        for tool in &self.registry.tools {
-                            let name = tool.descriptor().name;
+                        for entry in &self.registry.tools {
+                            let name = entry.descriptor().name;
                             if pattern_matches(child_pattern, &name)
                                 && is_allowed_by(parent, &name)
                                 && !result.contains(&name)
@@ -543,30 +612,34 @@ impl ScopedTools {
         Self {
             registry: self.registry.clone(),
             allowed: narrowed,
+            active_extensions: self.active_extensions.clone(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        match &self.allowed {
-            None => self.registry.is_empty(),
-            Some(allowed) => !self
-                .registry
-                .tools
-                .iter()
-                .any(|t| is_allowed_by(allowed, &t.descriptor().name)),
-        }
+        self.registry
+            .tools
+            .iter()
+            .filter(|e| match &self.allowed {
+                None => true,
+                Some(allowed) => is_allowed_by(allowed, &e.tool.descriptor().name),
+            })
+            .filter(|e| self.passes_extension_filter(e.owner))
+            .count()
+            == 0
     }
 
     pub fn definitions(&self, profile: &ToolProfile) -> Vec<ToolDefinition> {
         self.registry
             .tools
             .iter()
-            .filter(|t| match &self.allowed {
+            .filter(|e| match &self.allowed {
                 None => true,
-                Some(allowed) => is_allowed_by(allowed, &t.descriptor().name),
+                Some(allowed) => is_allowed_by(allowed, &e.tool.descriptor().name),
             })
-            .filter_map(|t| {
-                let desc = t.descriptor();
+            .filter(|e| self.passes_extension_filter(e.owner))
+            .filter_map(|e| {
+                let desc = e.tool.descriptor();
                 let def = ToolDefinition {
                     name: desc.name,
                     description: desc.description,
@@ -581,6 +654,9 @@ impl ScopedTools {
         if let Some(allowed) = &self.allowed
             && !is_allowed_by(allowed, name)
         {
+            return None;
+        }
+        if !self.passes_extension_filter(self.registry.owner_of(name)) {
             return None;
         }
         self.registry.get(name)

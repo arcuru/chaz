@@ -245,6 +245,7 @@ mod tests {
             model: None,
             call_depth: 0,
             session: Arc::new(Mutex::new(session)),
+            active_extensions: std::collections::HashSet::new(),
         };
         (instance, index, ctx)
     }

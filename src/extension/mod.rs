@@ -266,11 +266,17 @@ pub enum ToolCallDecision {
 /// mutating tool scopes, grants, or hosts. Session access is exposed so
 /// extensions can read history or append entries via the existing
 /// `Session` API.
+///
+/// `active_extensions` carries the per-session active-extension set. The
+/// hub's `fire_<kind>` methods use it to skip handlers whose owner isn't
+/// active for this session, so a `/extensions remove memory` immediately
+/// stops the memory extension's hooks from firing on subsequent turns.
 pub struct HookContext {
     pub agent_name: String,
     pub model: Option<String>,
     pub call_depth: usize,
     pub session: Arc<Mutex<Session>>,
+    pub active_extensions: HashSet<String>,
 }
 
 /// Outcome of an extension-registered slash command.
@@ -514,13 +520,14 @@ impl ExtensionHub {
             .unwrap_or_default()
     }
 
-    /// Iterate every registered tool as `(name, Arc<dyn Tool>)`. Used by
-    /// `main.rs` to populate the legacy [`ToolRegistry`] from the hub's
-    /// hook-registered tools.
-    pub fn tools_for_registry(&self) -> Vec<(String, Arc<dyn Tool>)> {
+    /// Iterate every registered tool as `(owner, name, Arc<dyn Tool>)`.
+    /// Used by `main.rs` to populate the legacy [`crate::tool::ToolRegistry`]
+    /// from the hub's hook-registered tools, attributed for per-session
+    /// active-set filtering.
+    pub fn tools_for_registry(&self) -> Vec<(&'static str, String, Arc<dyn Tool>)> {
         self.tools
             .iter()
-            .map(|(name, reg)| (name.clone(), reg.tool.clone()))
+            .map(|(name, reg)| (reg.owner, name.clone(), reg.tool.clone()))
             .collect()
     }
 
@@ -574,7 +581,13 @@ impl ExtensionHub {
                 let name = r.name().to_string();
                 let needs_write = match latest_by_name.get(&name) {
                     Some(ExtensionEvent::Activated { extension_ref, .. }) => extension_ref != &r,
-                    Some(ExtensionEvent::Deactivated { .. }) => true,
+                    // Respect explicit removal: `/extensions remove X`
+                    // wrote a Deactivated and that decision persists across
+                    // restarts. Re-activation is a deliberate user action,
+                    // not something `record_active` should synthesize.
+                    Some(ExtensionEvent::Deactivated { .. }) => false,
+                    // No prior event for this name — extension is new (or
+                    // this is a brand-new session). Default-include.
                     None => true,
                 };
                 if needs_write {
@@ -735,19 +748,27 @@ impl ExtensionHub {
     }
 
     // --- hook dispatch ---
+    //
+    // Every fire_* method filters by `ctx.active_extensions` — a handler
+    // whose owner extension isn't in the session's active set is skipped.
+    // The active set is computed from the session's `extensions` event log
+    // and cached on `Server`; see `Server::active_extensions`.
 
-    /// Fire `before_agent_start` for every registered handler. Each
-    /// handler may append messages, which are flattened into a single
-    /// vector preserving registration order.
+    /// Fire `before_agent_start` for every active handler. Each handler
+    /// may append messages, which are flattened into a single vector
+    /// preserving registration order.
     pub async fn fire_before_agent_start(&self, ctx: &HookContext) -> Vec<RuntimeMessage> {
         let mut out = Vec::new();
         for reg in &self.before_agent_start {
+            if !ctx.active_extensions.contains(reg.owner) {
+                continue;
+            }
             out.extend(reg.hook.on_before_agent_start(ctx).await);
         }
         out
     }
 
-    /// Fire `tool_call` for every registered handler. Args are mutated in
+    /// Fire `tool_call` for every active handler. Args are mutated in
     /// place. First `Block` short-circuits the rest.
     pub async fn fire_tool_call(
         &self,
@@ -756,6 +777,9 @@ impl ExtensionHub {
         args: &mut serde_json::Value,
     ) -> ToolCallDecision {
         for reg in &self.tool_call {
+            if !ctx.active_extensions.contains(reg.owner) {
+                continue;
+            }
             match reg.hook.on_tool_call(ctx, tool_name, args).await {
                 ToolCallDecision::Continue => {}
                 ToolCallDecision::Block { reason } => return ToolCallDecision::Block { reason },
@@ -764,8 +788,8 @@ impl ExtensionHub {
         ToolCallDecision::Continue
     }
 
-    /// Fire `tool_result`. Handlers are run in registration order; each
-    /// receives the (possibly transformed) result from the previous.
+    /// Fire `tool_result`. Active handlers run in registration order;
+    /// each receives the (possibly transformed) result from the previous.
     pub async fn fire_tool_result(
         &self,
         ctx: &HookContext,
@@ -774,6 +798,9 @@ impl ExtensionHub {
     ) -> String {
         let mut acc = result;
         for reg in &self.tool_result {
+            if !ctx.active_extensions.contains(reg.owner) {
+                continue;
+            }
             acc = reg.hook.on_tool_result(ctx, tool_name, acc).await;
         }
         acc
@@ -781,24 +808,34 @@ impl ExtensionHub {
 
     pub async fn fire_agent_end(&self, ctx: &HookContext) {
         for reg in &self.agent_end {
+            if !ctx.active_extensions.contains(reg.owner) {
+                continue;
+            }
             reg.hook.on_agent_end(ctx).await;
         }
     }
 
     pub async fn fire_session_start(&self, ctx: &HookContext) {
         for reg in &self.session_start {
+            if !ctx.active_extensions.contains(reg.owner) {
+                continue;
+            }
             reg.hook.on_session_start(ctx).await;
         }
     }
 
     pub async fn fire_session_shutdown(&self, ctx: &HookContext) {
         for reg in &self.session_shutdown {
+            if !ctx.active_extensions.contains(reg.owner) {
+                continue;
+            }
             reg.hook.on_session_shutdown(ctx).await;
         }
     }
 
     /// Look up and invoke an extension command by name. Returns `None`
-    /// if no extension registered this name.
+    /// if no extension registered this name OR if the owner extension is
+    /// not in the calling context's active set (per-session enforcement).
     pub async fn try_dispatch_command(
         &self,
         name: &str,
@@ -806,6 +843,9 @@ impl ExtensionHub {
         ctx: &HookContext,
     ) -> Option<ExtensionCommandOutcome> {
         let reg = self.commands.get(name)?;
+        if !ctx.active_extensions.contains(reg.owner) {
+            return None;
+        }
         Some(reg.handler.invoke(args, ctx).await)
     }
 }
@@ -957,14 +997,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_active_after_deactivation_reactivates() {
+    async fn record_active_respects_deactivation_across_restarts() {
+        // `record_active` is the session_start reconciler. The old behavior
+        // re-activated anything currently in the hub regardless of prior
+        // Deactivated events — which would have undone every
+        // `/extensions remove X` on the next session_start. The new
+        // contract: respect explicit removal across restarts.
         let (_inst, db) = make_session_db().await;
         let mut hub = ExtensionHub::new();
         hub.register_extension(Arc::new(NamedExt("alpha")));
 
-        // Initial activation.
         hub.record_active(&db).await.unwrap();
-        // Directly write a Deactivated to simulate a future remove API call.
         append_event(
             &db,
             ExtensionEvent::Deactivated {
@@ -976,12 +1019,14 @@ mod tests {
         .unwrap();
         assert!(read_active(&db).await.unwrap().is_empty());
 
-        // Recording while alpha is in the hub but Deactivated in the log
-        // re-activates it.
+        // A subsequent record_active does NOT reactivate — the Deactivated
+        // event stands. Only an explicit `/extensions add X` (which writes
+        // a fresh Activated) can bring it back.
         hub.record_active(&db).await.unwrap();
-        let active = read_active(&db).await.unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].name(), "alpha");
+        assert!(
+            read_active(&db).await.unwrap().is_empty(),
+            "record_active should respect prior Deactivated"
+        );
     }
 
     #[tokio::test]
@@ -1202,6 +1247,20 @@ mod tests {
         }
     }
 
+    /// Test-only ctx that pretends *every* extension name is active so
+    /// fire_* tests can exercise handler dispatch without manually
+    /// listing owners. Production code always builds a real per-session
+    /// set via `Server::active_extensions_for`.
+    fn all_active(names: &[&'static str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn fixture_ctx_with_active(active: HashSet<String>) -> HookContext {
+        let mut ctx = fixture_ctx().await;
+        ctx.active_extensions = active;
+        ctx
+    }
+
     async fn fixture_ctx() -> HookContext {
         let backend = InMemory::new();
         let instance = Instance::open(Box::new(backend)).await.unwrap();
@@ -1217,6 +1276,7 @@ mod tests {
             model: None,
             call_depth: 0,
             session: Arc::new(Mutex::new(session)),
+            active_extensions: HashSet::new(),
         }
     }
 
@@ -1266,10 +1326,28 @@ mod tests {
             name_: "b",
             calls: calls.clone(),
         }));
-        let ctx = fixture_ctx().await;
+        let ctx = fixture_ctx_with_active(all_active(&["a", "b"])).await;
         let injected = hub.fire_before_agent_start(&ctx).await;
         assert_eq!(injected.len(), 2);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn inactive_extension_does_not_fire_hooks() {
+        // Only "a" is active; "b" must be skipped despite being registered.
+        let mut hub = ExtensionHub::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        hub.register_extension(Arc::new(CountingExt {
+            name_: "a",
+            calls: calls.clone(),
+        }));
+        hub.register_extension(Arc::new(CountingExt {
+            name_: "b",
+            calls: calls.clone(),
+        }));
+        let ctx = fixture_ctx_with_active(all_active(&["a"])).await;
+        hub.fire_before_agent_start(&ctx).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     struct BlockingHook;
@@ -1339,7 +1417,7 @@ mod tests {
         let mut hub = ExtensionHub::new();
         hub.register_extension(Arc::new(MutatingExt));
         hub.register_extension(Arc::new(BlockingExt));
-        let ctx = fixture_ctx().await;
+        let ctx = fixture_ctx_with_active(all_active(&["mutating", "blocking"])).await;
 
         let mut args = serde_json::json!({});
         let decision = hub.fire_tool_call(&ctx, "read_file", &mut args).await;
@@ -1422,7 +1500,9 @@ mod tests {
             }
         }
         hub.register_extension(Arc::new(OtherCmdExt));
-        let ctx = fixture_ctx().await;
+        // "first" wins the collision and owns the command; needs to be
+        // in the active set or dispatch will return None.
+        let ctx = fixture_ctx_with_active(all_active(&["first"])).await;
         let out = hub
             .try_dispatch_command("greet", "x", &ctx)
             .await
