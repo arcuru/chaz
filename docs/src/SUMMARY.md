@@ -13,6 +13,7 @@
 - [MCP External Tools](user_guide/mcp.md)
 - [Agents](user_guide/agents.md)
 - [Memory](user_guide/memory.md)
+- [Extensions](user_guide/extensions.md)
 - [Security](user_guide/security.md)
 - [Logging](user_guide/logging.md)
 
@@ -22,6 +23,7 @@
 - [Session Model](architecture/sessions.md)
 - [ReAct Runtime](architecture/react.md)
 - [Tool System](architecture/tools.md)
+- [Extension Framework](architecture/extensions.md)
 
 # Design Documents
 

@@ -15,6 +15,7 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 ## Features
 
 - **ReAct tool-calling loop** — agents reason, act, and observe in a loop with 9 built-in tools
+- **Extension framework** — tools, slash commands, and lifecycle hooks all flow through declared extensions with per-session activation, settings, and an event-log audit trail (see [`docs/`](docs/src/user_guide/extensions.md))
 - **Multi-agent orchestration** — agents can spawn sub-agents with depth limiting and transitive tool narrowing
 - **TUI mode** — local terminal interface for testing and debugging without Matrix
 - **Session sharing** — share sessions between chaz instances via eidetica sync
@@ -82,6 +83,11 @@ chaz --config config.yaml --tui
 | `/heartbeat list`                                   | List heartbeat rules on this session               |
 | `/heartbeat add <id> <cron(6 fields)> <ref> <task>` | Upsert a cron-driven heartbeat rule                |
 | `/heartbeat remove <id>`                            | Remove a heartbeat rule                            |
+| `/extensions [list]`                                | List extensions on this peer + active status       |
+| `/extensions add <name>`                            | Activate an extension on this session              |
+| `/extensions remove <name>`                         | Deactivate an extension on this session            |
+| `/extensions settings <name>`                       | Show per-session settings JSON for an extension    |
+| `/extensions set <name> <key> <value>`              | Merge a key into an extension's per-session config |
 | `/clear`                                            | Clear display (entries remain in DB)               |
 | `/raw`                                              | Dump raw entry data for debugging                  |
 | `/debug`                                            | Toggle debug mode (also Ctrl+D)                    |
