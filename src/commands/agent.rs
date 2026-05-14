@@ -1120,6 +1120,7 @@ mod tests {
                 id: "rule1".to_string(),
                 name: "rule1".to_string(),
                 cron: "0 0 * * * *".to_string(),
+                fire_at: None,
                 task: "ping".to_string(),
                 target_agent_db_id: alpha_entry.db_id.to_string(),
                 enabled: true,

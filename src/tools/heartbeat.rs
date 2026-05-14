@@ -137,6 +137,7 @@ impl Tool for HeartbeatAdd {
                 id: id.to_string(),
                 name: id.to_string(),
                 cron: cron.to_string(),
+                fire_at: None,
                 task: task.to_string(),
                 target_agent_db_id: target.db_id.to_string(),
                 enabled: true,
@@ -370,12 +371,130 @@ impl Tool for HeartbeatList {
                     Err(_) => r.target_agent_db_id.clone(),
                 };
                 let state = if r.enabled { "" } else { " (disabled)" };
+                let schedule = match r.fire_at {
+                    Some(fire_at) => format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ")),
+                    None => r.cron.clone(),
+                };
                 lines.push(format!(
-                    "- **{}** [{}]{state} → {} — {}",
-                    r.id, r.cron, target_display, r.task
+                    "- **{}** [{schedule}]{state} → {} — {}",
+                    r.id, target_display, r.task
                 ));
             }
             Ok(lines.join("\n"))
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// wake_me_up
+// -----------------------------------------------------------------------------
+
+/// Minimum delay. Anything shorter is shorter than the runner's poll interval,
+/// so the wakeup would fire at unpredictable times relative to the request.
+const WAKE_MIN_SECONDS: u64 = 30;
+/// Upper bound — 30 days. Far enough out that the agent should be using a
+/// proper cron rule instead, but not so restrictive that "remind me next week"
+/// is impossible.
+const WAKE_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// Schedule a one-shot wakeup that fires a Directive into this session after a
+/// delay, then deletes itself. The wakeup targets the calling agent so the
+/// resulting directive is routed back to *you*.
+pub struct WakeMeUp {
+    agent_index: HostedIndex,
+}
+
+impl WakeMeUp {
+    pub fn new(agent_index: HostedIndex) -> Self {
+        Self { agent_index }
+    }
+}
+
+impl Tool for WakeMeUp {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "wake_me_up".to_string(),
+            description: format!(
+                "Schedule a one-shot wakeup that fires `task` into this session after `after_seconds`. \
+                 The directive is routed to you (the calling agent); the rule deletes itself once it fires. \
+                 Use this when you need to come back to a session later — e.g. 'check the build in 10 minutes'. \
+                 Range: {WAKE_MIN_SECONDS}–{WAKE_MAX_SECONDS} seconds. For recurring work, use heartbeat_add instead."
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "after_seconds": {
+                        "type": "integer",
+                        "minimum": WAKE_MIN_SECONDS,
+                        "maximum": WAKE_MAX_SECONDS,
+                        "description": "Seconds from now until the wakeup fires.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The instruction you'll receive when the wakeup fires.",
+                    }
+                },
+                "required": ["after_seconds", "task"]
+            }),
+        }
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy::default()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: Value,
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let after = arguments
+                .get("after_seconds")
+                .and_then(|v| v.as_u64())
+                .ok_or("Missing or non-integer 'after_seconds' argument".to_string())?;
+            if !(WAKE_MIN_SECONDS..=WAKE_MAX_SECONDS).contains(&after) {
+                return Err(format!(
+                    "after_seconds must be between {WAKE_MIN_SECONDS} and {WAKE_MAX_SECONDS}"
+                )
+                .into());
+            }
+            let task = str_arg(&arguments, "task")?;
+            if task.trim().is_empty() {
+                return Err("'task' must not be empty".into());
+            }
+
+            // Target is always self — agents wake themselves, not each other.
+            // Cross-agent scheduling stays in `heartbeat_add`.
+            let target = resolve_target_agent(ctx, &self.agent_index, None)?;
+
+            let now = chrono::Utc::now();
+            let fire_at = now + chrono::Duration::seconds(after as i64);
+            // Epoch-ms id keeps it unique and sortable for /heartbeat list and
+            // heartbeat_list output; no need for randomness in single-process use.
+            let id = format!("wakeup-{}", now.timestamp_millis());
+
+            let session = ctx.session.lock().await;
+            let db = session.database();
+            let rule = HeartbeatRule {
+                id: id.clone(),
+                name: id.clone(),
+                cron: String::new(),
+                fire_at: Some(fire_at),
+                task: task.to_string(),
+                target_agent_db_id: target.db_id.to_string(),
+                enabled: true,
+            };
+            upsert_rule(db, rule)
+                .await
+                .map_err(|e| format!("Failed to save wakeup: {e}"))?;
+
+            Ok(format!(
+                "Wakeup '{id}' scheduled for {} ({}s from now) → {}",
+                fire_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                after,
+                target.display_name
+            ))
         })
     }
 }
@@ -684,5 +803,88 @@ mod tests {
 
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(out.contains("No heartbeat rules"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn wake_me_up_writes_one_shot_rule_targeting_self() {
+        let (_i, _r, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(index);
+        let ctx = make_ctx("alpha", session.clone());
+
+        let before = chrono::Utc::now();
+        let out = wake
+            .execute(
+                serde_json::json!({ "after_seconds": 60, "task": "check on build" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Wakeup"), "unexpected msg: {out}");
+        assert!(out.contains("alpha"), "should target self: {out}");
+
+        let db = session.lock().await.database().clone();
+        let rules = list_rules(&db).await.unwrap();
+        assert_eq!(rules.len(), 1);
+        let r = &rules[0];
+        assert!(r.is_one_shot());
+        assert!(r.cron.is_empty());
+        let fire_at = r.fire_at.unwrap();
+        let delta = fire_at - before;
+        // We asked for 60s; allow some slack for clock motion.
+        assert!(
+            delta.num_seconds() >= 59 && delta.num_seconds() <= 65,
+            "fire_at off: {delta}"
+        );
+        assert_eq!(r.task, "check on build");
+    }
+
+    #[tokio::test]
+    async fn wake_me_up_rejects_too_short() {
+        let (_i, _r, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(index);
+        let ctx = make_ctx("alpha", session);
+
+        let err = wake
+            .execute(serde_json::json!({ "after_seconds": 5, "task": "t" }), &ctx)
+            .await
+            .expect_err("under-min should fail");
+        assert!(format!("{err:?}").contains("after_seconds must be between"));
+    }
+
+    #[tokio::test]
+    async fn wake_me_up_rejects_empty_task() {
+        let (_i, _r, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(index);
+        let ctx = make_ctx("alpha", session);
+
+        let err = wake
+            .execute(
+                serde_json::json!({ "after_seconds": 60, "task": "   " }),
+                &ctx,
+            )
+            .await
+            .expect_err("empty task should fail");
+        assert!(format!("{err:?}").contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn list_renders_one_shot_rule_with_fire_at() {
+        let (_i, _r, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(index.clone());
+        let list = HeartbeatList::new(index);
+        let ctx = make_ctx("alpha", session);
+
+        wake.execute(
+            serde_json::json!({ "after_seconds": 120, "task": "later thing" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.contains("wakeup-"), "id missing: {out}");
+        // Format prefix "@YYYY-MM-DD ..." distinguishes one-shot from cron.
+        assert!(out.contains("[@"), "fire_at marker missing: {out}");
+        assert!(out.contains("later thing"), "task missing: {out}");
     }
 }

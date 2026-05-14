@@ -18,7 +18,7 @@ pub use compact::Compact;
 pub use describe::DescribeTool;
 pub use edit::EditFile;
 pub use file::{ReadFile, WriteFile};
-pub use heartbeat::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove};
+pub use heartbeat::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp};
 pub use memory::{ListMemoryBanks, Recall, Remember};
 pub use search::{SearchBackend, WebSearch};
 pub use shell::ShellExec;

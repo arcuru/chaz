@@ -11,7 +11,7 @@ use crate::extension::{
 };
 use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
 use crate::hosted_index::HostedIndex;
-use crate::tools::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove};
+use crate::tools::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp};
 use cron::Schedule;
 use std::future::Future;
 use std::pin::Pin;
@@ -42,6 +42,7 @@ impl Extension for HeartbeatExtension {
         hub.register_tool(Arc::new(HeartbeatModify::new(self.agent_index.clone())));
         hub.register_tool(Arc::new(HeartbeatRemove));
         hub.register_tool(Arc::new(HeartbeatList::new(self.agent_index.clone())));
+        hub.register_tool(Arc::new(WakeMeUp::new(self.agent_index.clone())));
         hub.register_command(
             "heartbeat",
             Box::new(HeartbeatCommand {
@@ -101,9 +102,13 @@ async fn list_cmd(ctx: &HookContext) -> ExtensionCommandOutcome {
                 .iter()
                 .map(|r| {
                     let state = if r.enabled { "" } else { " (disabled)" };
+                    let schedule = match r.fire_at {
+                        Some(fire_at) => format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ")),
+                        None => r.cron.clone(),
+                    };
                     format!(
-                        "  {} [{}]{state} → {} — {}",
-                        r.id, r.cron, r.target_agent_db_id, r.task
+                        "  {} [{schedule}]{state} → {} — {}",
+                        r.id, r.target_agent_db_id, r.task
                     )
                 })
                 .collect();
@@ -177,6 +182,7 @@ async fn add_cmd(
         id: id.to_string(),
         name: id.to_string(),
         cron: cron.clone(),
+        fire_at: None,
         task: task.clone(),
         target_agent_db_id: entry.db_id.to_string(),
         enabled: true,

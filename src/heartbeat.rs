@@ -1,10 +1,16 @@
 //! Heartbeat rules — Living Agents Stage 4b.
 //!
-//! A heartbeat rule is a cron-driven trigger stored *inside* a session's DB.
+//! A heartbeat rule is a time-driven trigger stored *inside* a session's DB.
+//! Two shapes share one table:
+//!   - **Cron rules** fire on a recurring schedule (`cron: "0 */5 * * * *"`).
+//!   - **One-shot rules** fire once at an absolute time (`fire_at:
+//!     DateTime<Utc>`), then delete themselves. These back the `wake_me_up`
+//!     tool — agent-initiated "ping me in 30 minutes" wakeups.
+//!
 //! Each peer periodically scans every session it knows about, looks at the
-//! rules in that session, and fires any that are both (a) due under their
-//! cron and (b) targeted at an agent this peer hosts (i.e. whose pubkey
-//! appears in the local `agent_index`).
+//! rules in that session, and fires any that are both (a) due and (b)
+//! targeted at an agent this peer hosts (i.e. whose pubkey appears in the
+//! local `agent_index`).
 //!
 //! Firing a rule writes a Directive entry to the session — the same
 //! mechanism `spawn_agent` and the config scheduler already use. The
@@ -15,7 +21,8 @@
 //! `last_fired` is peer-local (`chaz_peer.heartbeat_last_fired`) rather than
 //! a rule-DB field because multiple peers may host the same rule's target
 //! agent, and each peer fires independently. Keeping `last_fired` out of the
-//! synced DB avoids cross-peer fire-coordination churn.
+//! synced DB avoids cross-peer fire-coordination churn. One-shot rules don't
+//! use `last_fired` — they're deleted on fire instead.
 
 #![allow(dead_code)]
 
@@ -37,16 +44,29 @@ use tracing::{debug, error, info, warn};
 pub const RULES_STORE: &str = "rules";
 const LAST_FIRED_STORE: &str = "heartbeat_last_fired";
 
-/// A cron rule living inside a session's `rules` table.
+/// A scheduled rule living inside a session's `rules` table.
+///
+/// `fire_at == Some(_)` marks the rule as one-shot: it fires once when wall
+/// time reaches `fire_at` and is then deleted. `cron` is ignored in that case.
+/// `fire_at == None` is a recurring cron rule driven by `cron`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeartbeatRule {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub cron: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_at: Option<DateTime<Utc>>,
     pub task: String,
     pub target_agent_db_id: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+impl HeartbeatRule {
+    pub fn is_one_shot(&self) -> bool {
+        self.fire_at.is_some()
+    }
 }
 
 fn default_enabled() -> bool {
@@ -208,33 +228,39 @@ impl HeartbeatRunner {
             return Ok(()); // Not our agent; silently skip.
         };
 
-        let schedule = match Schedule::from_str(&rule.cron) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(rule = %rule.id, cron = %rule.cron, "Invalid cron: {e}");
+        let now = Utc::now();
+        let due = if let Some(fire_at) = rule.fire_at {
+            // One-shot: due once wall time reaches `fire_at`. No bootstrap, no
+            // last_fired bookkeeping — fired rules are deleted below.
+            now >= fire_at
+        } else {
+            // Cron: bootstrap on first observation, then fire when the next
+            // scheduled occurrence after `last_fired` is in the past.
+            let schedule = match Schedule::from_str(&rule.cron) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(rule = %rule.id, cron = %rule.cron, "Invalid cron: {e}");
+                    return Ok(());
+                }
+            };
+            let last = match load_last_fired(&self.chaz_peer, &rule.id).await {
+                Some(t) => t,
+                None => {
+                    // `schedule.after(now).next()` is always strictly in the
+                    // future, so the first observation would never fire under
+                    // a `next > now` check. Seed last_fired and skip this tick.
+                    save_last_fired(&self.chaz_peer, &rule.id, now).await?;
+                    debug!(rule = %rule.id, "Bootstrapped last_fired for new heartbeat rule");
+                    return Ok(());
+                }
+            };
+            let Some(next) = schedule.after(&last).next() else {
                 return Ok(());
-            }
+            };
+            next <= now
         };
 
-        let now = Utc::now();
-        // First observation of this rule: bootstrap last_fired = now and skip
-        // this tick. `schedule.upcoming(Utc).next()` (and `after(now).next()`)
-        // is always strictly in the future, so comparing `next > now` would
-        // never fire on the first pass. Subsequent ticks take the `Some(lr)`
-        // branch below, which correctly returns the next occurrence after
-        // the last fire; once real time crosses it, we fire.
-        let last = match load_last_fired(&self.chaz_peer, &rule.id).await {
-            Some(t) => t,
-            None => {
-                save_last_fired(&self.chaz_peer, &rule.id, now).await?;
-                debug!(rule = %rule.id, "Bootstrapped last_fired for new heartbeat rule");
-                return Ok(());
-            }
-        };
-        let Some(next) = schedule.after(&last).next() else {
-            return Ok(());
-        };
-        if next > now {
+        if !due {
             return Ok(());
         }
 
@@ -242,6 +268,7 @@ impl HeartbeatRunner {
             rule = %rule.id,
             session = %session_db_id,
             target_agent = %rule.target_agent_db_id,
+            kind = if rule.is_one_shot() { "one-shot" } else { "cron" },
             "Firing heartbeat rule"
         );
 
@@ -250,12 +277,21 @@ impl HeartbeatRunner {
             session_db.clone(),
         )
         .await;
-        let content = format!(
-            "Heartbeat '{}' at {}.\n\n{}",
-            rule.name,
-            now.format("%Y-%m-%d %H:%M:%S UTC"),
-            rule.task
-        );
+        let content = if rule.is_one_shot() {
+            format!(
+                "Wakeup '{}' at {}.\n\n{}",
+                rule.name,
+                now.format("%Y-%m-%d %H:%M:%S UTC"),
+                rule.task
+            )
+        } else {
+            format!(
+                "Heartbeat '{}' at {}.\n\n{}",
+                rule.name,
+                now.format("%Y-%m-%d %H:%M:%S UTC"),
+                rule.task
+            )
+        };
         session
             .add_entry(SessionEntry {
                 sender: "heartbeat".to_string(),
@@ -266,7 +302,13 @@ impl HeartbeatRunner {
             })
             .await;
 
-        if let Err(e) = save_last_fired(&self.chaz_peer, &rule.id, now).await {
+        if rule.is_one_shot() {
+            // Delete the rule so it can't fire twice. Errors here are logged
+            // but non-fatal — worst case the next tick fires it again.
+            if let Err(e) = remove_rule(session_db, &rule.id).await {
+                error!(rule = %rule.id, "Failed to delete one-shot rule after firing: {e}");
+            }
+        } else if let Err(e) = save_last_fired(&self.chaz_peer, &rule.id, now).await {
             error!(rule = %rule.id, "Failed to persist last_fired: {e}");
         }
 
@@ -331,7 +373,20 @@ mod tests {
             id: id.to_string(),
             name: format!("rule-{id}"),
             cron: cron.to_string(),
+            fire_at: None,
             task: "do a thing".to_string(),
+            target_agent_db_id: target.to_string(),
+            enabled: true,
+        }
+    }
+
+    fn one_shot_rule(id: &str, fire_at: DateTime<Utc>, target: &str) -> HeartbeatRule {
+        HeartbeatRule {
+            id: id.to_string(),
+            name: format!("wake-{id}"),
+            cron: String::new(),
+            fire_at: Some(fire_at),
+            task: "wake-up task".to_string(),
             target_agent_db_id: target.to_string(),
             enabled: true,
         }
@@ -371,5 +426,35 @@ mod tests {
         let read = load_last_fired(&db, "r1").await.unwrap();
         // Truncated to RFC3339 (ns precision), compare to within a second.
         assert!((now - read).num_milliseconds().abs() < 1000);
+    }
+
+    #[tokio::test]
+    async fn one_shot_rule_round_trips_through_table() {
+        let (_i, _u, db) = test_session_db().await;
+        let when = Utc::now() + chrono::Duration::seconds(60);
+        let r = one_shot_rule("wake-1", when, "sha256:aaa");
+        upsert_rule(&db, r.clone()).await.unwrap();
+        let listed = list_rules(&db).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let got = &listed[0];
+        assert!(got.is_one_shot());
+        assert_eq!(got.fire_at, Some(when));
+        assert!(got.cron.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cron_rule_serializes_without_fire_at_field() {
+        // Deserializing an old-shape rule (no fire_at on disk) yields None.
+        let json = r#"{
+            "id": "old",
+            "name": "old",
+            "cron": "0 */5 * * * *",
+            "task": "do thing",
+            "target_agent_db_id": "sha256:zzz",
+            "enabled": true
+        }"#;
+        let parsed: HeartbeatRule = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.fire_at, None);
+        assert!(!parsed.is_one_shot());
     }
 }
