@@ -15,6 +15,7 @@
 //! through the agent turn. (TODO: add `catch_unwind` isolation once the
 //! `futures` crate is in the tree.)
 
+pub mod caps;
 pub mod hooks;
 
 use crate::runtime::RuntimeMessage;
