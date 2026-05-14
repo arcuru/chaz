@@ -15,7 +15,7 @@ use crate::backends::BackendManager;
 use crate::error::LlmError;
 use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::gateway::ApprovalDecision;
-use crate::security::{Sanitizer, SecurityContext};
+use crate::security::SecurityContext;
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -708,7 +708,10 @@ pub async fn execute(
                                         &output[..output.len().min(200)]
                                     );
 
-                                    // --- Extension hook: tool_result (may transform output) ---
+                                    // --- Extension hook: tool_result ---
+                                    // Extensions may transform the output and/or perform
+                                    // warning-only checks (e.g. the `security_warnings`
+                                    // built-in scans for prompt-injection patterns).
                                     let output = if let (Some(hub_ref), Some(ctx)) =
                                         (hub, hook_ctx.as_ref())
                                     {
@@ -716,16 +719,6 @@ pub async fn execute(
                                     } else {
                                         output
                                     };
-
-                                    // --- Security: scan for injection patterns (warning-only) ---
-                                    let warnings = Sanitizer::scan(&output);
-                                    if !warnings.is_empty() {
-                                        warn!(
-                                            tool = %call.name,
-                                            count = warnings.len(),
-                                            "Prompt injection patterns detected in tool output"
-                                        );
-                                    }
 
                                     // --- Security: leak detection ---
                                     match security.leak_detector.scan(&output) {
