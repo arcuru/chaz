@@ -20,6 +20,9 @@ pub mod hooks;
 use crate::runtime::RuntimeMessage;
 use crate::session::Session;
 use crate::tool::ToolRegistry;
+use chrono::{DateTime, Utc};
+use eidetica::Database;
+use eidetica::store::Table;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -27,6 +30,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::warn;
+
+/// Eidetica store name where per-session extension activation/deactivation
+/// events are recorded. Lives on the session DB (not the peer DB) so the
+/// provenance travels with the session via sync.
+pub const EXTENSIONS_STORE: &str = "extensions";
 
 pub use hooks::{
     HookAgentEnd, HookBeforeAgentStart, HookSessionShutdown, HookSessionStart, HookToolCall,
@@ -106,6 +114,102 @@ impl ExtensionRef {
             ExtensionRef::Git { sha, .. } => sha,
         }
     }
+}
+
+/// One activation or deactivation of an extension on a session.
+///
+/// Stored as rows in the session's `extensions` table (see [`EXTENSIONS_STORE`]).
+/// Each row is a discrete event keyed only implicitly — eidetica's CRDT
+/// merges rows from different peers without coordination. Current state is
+/// derived by folding events: per `name`, the latest event by `timestamp`
+/// wins (Activated → in the active set; Deactivated → not).
+///
+/// Provenance (which peer wrote this event) is carried by eidetica's entry
+/// signing metadata, not duplicated in the row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtensionEvent {
+    Activated {
+        name: String,
+        extension_ref: ExtensionRef,
+        timestamp: DateTime<Utc>,
+    },
+    Deactivated {
+        name: String,
+        timestamp: DateTime<Utc>,
+    },
+}
+
+impl ExtensionEvent {
+    pub fn name(&self) -> &str {
+        match self {
+            ExtensionEvent::Activated { name, .. } | ExtensionEvent::Deactivated { name, .. } => {
+                name
+            }
+        }
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            ExtensionEvent::Activated { timestamp, .. }
+            | ExtensionEvent::Deactivated { timestamp, .. } => *timestamp,
+        }
+    }
+}
+
+/// Read every event in the session's extension log. Order is *not*
+/// guaranteed by storage — callers that care about ordering must sort by
+/// [`ExtensionEvent::timestamp`].
+pub async fn list_events(session_db: &Database) -> anyhow::Result<Vec<ExtensionEvent>> {
+    let txn = session_db.new_transaction().await?;
+    let store = txn
+        .get_store::<Table<ExtensionEvent>>(EXTENSIONS_STORE)
+        .await?;
+    let rows = store.search(|_| true).await?;
+    Ok(rows.into_iter().map(|(_, e)| e).collect())
+}
+
+/// Fold the event log into the current active-extension set.
+///
+/// Per extension `name`, the latest event by timestamp determines membership:
+/// `Activated` keeps it in; `Deactivated` drops it. The result is sorted by
+/// name for stable callers.
+///
+/// Public for the upcoming `/extensions` reader and replay path; tests
+/// exercise it directly.
+#[allow(dead_code)]
+pub async fn read_active(session_db: &Database) -> anyhow::Result<Vec<ExtensionRef>> {
+    let mut events = list_events(session_db).await?;
+    events.sort_by_key(|e| e.timestamp());
+    let mut latest: HashMap<String, ExtensionEvent> = HashMap::new();
+    for e in events {
+        latest.insert(e.name().to_string(), e);
+    }
+    let mut active: Vec<ExtensionRef> = latest
+        .into_values()
+        .filter_map(|e| match e {
+            ExtensionEvent::Activated { extension_ref, .. } => Some(extension_ref),
+            ExtensionEvent::Deactivated { .. } => None,
+        })
+        .collect();
+    active.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(active)
+}
+
+/// Append a single event to the session's extension log.
+///
+/// Public for the upcoming runtime remove API (writes a `Deactivated`)
+/// and for tests; the activation path goes through
+/// [`ExtensionHub::record_active`] which batches writes.
+#[allow(dead_code)]
+pub async fn append_event(session_db: &Database, event: ExtensionEvent) -> anyhow::Result<()> {
+    let txn = session_db.new_transaction().await?;
+    let store = txn
+        .get_store::<Table<ExtensionEvent>>(EXTENSIONS_STORE)
+        .await?;
+    store.insert(event).await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 /// Decision returned from a `tool_call` hook.
@@ -246,6 +350,73 @@ impl ExtensionHub {
     /// active-extension set can be reproduced later.
     pub fn extension_refs(&self) -> Vec<ExtensionRef> {
         self.extensions.iter().map(|e| e.extension_ref()).collect()
+    }
+
+    /// Write `Activated` events for the current extension set into the
+    /// session DB's `extensions` table, skipping any whose latest event
+    /// already records the same [`ExtensionRef`] as Activated. Idempotent
+    /// across session re-starts when the extension set is unchanged;
+    /// captures genuine adds (no prior event, or previously Deactivated)
+    /// and version bumps (different `version()` on the same name).
+    ///
+    /// Deactivations are not synthesized here — those come from a future
+    /// runtime remove API, which writes a `Deactivated` event directly.
+    pub async fn record_active(&self, session_db: &Database) -> anyhow::Result<()> {
+        let current = self.extension_refs();
+        let existing = list_events(session_db).await?;
+
+        let mut latest_by_name: HashMap<String, ExtensionEvent> = HashMap::new();
+        let mut sorted = existing;
+        sorted.sort_by_key(|e| e.timestamp());
+        for e in sorted {
+            latest_by_name.insert(e.name().to_string(), e);
+        }
+
+        // Force monotonicity over the observed log so a newly written event
+        // strictly post-dates anything already in the table. Without this,
+        // an event synced in from a peer with a skewed clock (or a test
+        // that wrote a future-dated event) could end up "older" than what
+        // we just appended, and the fold would silently discard our write.
+        let max_seen = latest_by_name
+            .values()
+            .map(|e| e.timestamp())
+            .max()
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let timestamp = std::cmp::max(Utc::now(), max_seen + chrono::Duration::milliseconds(1));
+
+        let to_write: Vec<ExtensionEvent> = current
+            .into_iter()
+            .filter_map(|r| {
+                let name = r.name().to_string();
+                let needs_write = match latest_by_name.get(&name) {
+                    Some(ExtensionEvent::Activated { extension_ref, .. }) => extension_ref != &r,
+                    Some(ExtensionEvent::Deactivated { .. }) => true,
+                    None => true,
+                };
+                if needs_write {
+                    Some(ExtensionEvent::Activated {
+                        name,
+                        extension_ref: r,
+                        timestamp,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if to_write.is_empty() {
+            return Ok(());
+        }
+        let txn = session_db.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<ExtensionEvent>>(EXTENSIONS_STORE)
+            .await?;
+        for event in to_write {
+            store.insert(event).await?;
+        }
+        txn.commit().await?;
+        Ok(())
     }
 
     // --- registration API used inside Extension::register ---
@@ -476,6 +647,165 @@ mod tests {
             self.0
         }
         fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+    }
+
+    async fn make_session_db() -> (Instance, Database) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let mut user = instance.login_user("test", None).await.unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut s = Doc::new();
+        s.set("name", "session");
+        let db = user.create_database(s, &key).await.unwrap();
+        (instance, db)
+    }
+
+    #[tokio::test]
+    async fn read_active_on_empty_db_returns_empty() {
+        let (_inst, db) = make_session_db().await;
+        let active = read_active(&db).await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_active_writes_events_for_each_extension() {
+        let (_inst, db) = make_session_db().await;
+        let mut hub = ExtensionHub::new();
+        hub.register_extension(Arc::new(NamedExt("alpha")));
+        hub.register_extension(Arc::new(NamedExt("beta")));
+
+        hub.record_active(&db).await.unwrap();
+
+        let events = list_events(&db).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let names: std::collections::HashSet<_> = events.iter().map(|e| e.name()).collect();
+        assert!(names.contains("alpha"));
+        assert!(names.contains("beta"));
+        for e in &events {
+            assert!(matches!(e, ExtensionEvent::Activated { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_active_is_idempotent_when_set_unchanged() {
+        let (_inst, db) = make_session_db().await;
+        let mut hub = ExtensionHub::new();
+        hub.register_extension(Arc::new(NamedExt("alpha")));
+
+        hub.record_active(&db).await.unwrap();
+        let after_first = list_events(&db).await.unwrap().len();
+        assert_eq!(after_first, 1);
+
+        // Second call with no changes must not append a duplicate.
+        hub.record_active(&db).await.unwrap();
+        let after_second = list_events(&db).await.unwrap().len();
+        assert_eq!(after_second, 1);
+    }
+
+    #[tokio::test]
+    async fn record_active_after_deactivation_reactivates() {
+        let (_inst, db) = make_session_db().await;
+        let mut hub = ExtensionHub::new();
+        hub.register_extension(Arc::new(NamedExt("alpha")));
+
+        // Initial activation.
+        hub.record_active(&db).await.unwrap();
+        // Directly write a Deactivated to simulate a future remove API call.
+        append_event(
+            &db,
+            ExtensionEvent::Deactivated {
+                name: "alpha".into(),
+                timestamp: Utc::now() + chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(read_active(&db).await.unwrap().is_empty());
+
+        // Recording while alpha is in the hub but Deactivated in the log
+        // re-activates it.
+        hub.record_active(&db).await.unwrap();
+        let active = read_active(&db).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn read_active_folds_to_latest_event_per_name() {
+        let (_inst, db) = make_session_db().await;
+        let t0 = Utc::now();
+        // alpha: Activated at t0, then Deactivated at t1 — should not be active.
+        append_event(
+            &db,
+            ExtensionEvent::Activated {
+                name: "alpha".into(),
+                extension_ref: ExtensionRef::builtin("alpha"),
+                timestamp: t0,
+            },
+        )
+        .await
+        .unwrap();
+        append_event(
+            &db,
+            ExtensionEvent::Deactivated {
+                name: "alpha".into(),
+                timestamp: t0 + chrono::Duration::seconds(10),
+            },
+        )
+        .await
+        .unwrap();
+        // beta: Activated at t0 only — should be active.
+        append_event(
+            &db,
+            ExtensionEvent::Activated {
+                name: "beta".into(),
+                extension_ref: ExtensionRef::builtin("beta"),
+                timestamp: t0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let active = read_active(&db).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name(), "beta");
+    }
+
+    struct VersionedExt(&'static str, &'static str);
+    impl Extension for VersionedExt {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn extension_ref(&self) -> ExtensionRef {
+            ExtensionRef::Git {
+                name: self.0.to_string(),
+                repo: "repo".to_string(),
+                sha: self.1.to_string(),
+            }
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+    }
+
+    #[tokio::test]
+    async fn record_active_writes_new_event_when_version_bumps() {
+        let (_inst, db) = make_session_db().await;
+
+        let mut hub_v1 = ExtensionHub::new();
+        hub_v1.register_extension(Arc::new(VersionedExt("loop", "sha1")));
+        hub_v1.record_active(&db).await.unwrap();
+        assert_eq!(list_events(&db).await.unwrap().len(), 1);
+
+        // Fresh hub with the same name but different SHA: must write a new
+        // event so the upgrade is captured in the log.
+        let mut hub_v2 = ExtensionHub::new();
+        hub_v2.register_extension(Arc::new(VersionedExt("loop", "sha2")));
+        hub_v2.record_active(&db).await.unwrap();
+        let events = list_events(&db).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let active = read_active(&db).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].version(), "sha2");
     }
 
     #[test]

@@ -355,6 +355,18 @@ impl Server {
         agent_name: String,
         call_depth: usize,
     ) {
+        // Framework-level: record activation events for the current extension
+        // set onto the session DB. Idempotent on repeat calls; only writes
+        // when the set or a version differs from the latest stored event.
+        // Failure is non-fatal — we'd rather lose provenance for one
+        // session-start than block the agent turn.
+        if let Err(e) = self.extensions.record_active(&session_db).await {
+            tracing::warn!(
+                conv = %session_db.root_id(),
+                "Failed to record extension activation events: {e}"
+            );
+        }
+
         let conv_id = ConversationId(session_db.root_id().to_string());
         let session = Session::new(conv_id, session_db).await;
         let ctx = HookContext {
