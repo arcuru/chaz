@@ -16,6 +16,7 @@
 //! `futures` crate is in the tree.)
 
 pub mod caps;
+pub mod caps_inproc;
 pub mod hooks;
 pub mod manifest;
 pub mod registry;
