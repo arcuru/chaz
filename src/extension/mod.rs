@@ -20,6 +20,7 @@ pub mod hooks;
 use crate::runtime::RuntimeMessage;
 use crate::session::Session;
 use crate::tool::ToolRegistry;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -31,6 +32,81 @@ pub use hooks::{
     HookAgentEnd, HookBeforeAgentStart, HookSessionShutdown, HookSessionStart, HookToolCall,
     HookToolResult,
 };
+
+/// Persistent identifier for an extension instance.
+///
+/// Designed to be written into a session's eidetica DB so the active
+/// extension set can be reconstructed when the session is re-opened on
+/// another peer or replayed later. Each variant chooses the addressing
+/// scheme that fits where the extension's code actually lives:
+///
+/// - `Builtin` — compiled into the chaz binary; `chaz_version` carries the
+///   `CARGO_PKG_VERSION` of the binary that registered it.
+/// - `Eidetica` — loaded out of an eidetica DB (think Memory-Bank for
+///   extensions). `db_id` is the root entry id; `version` is a content
+///   hash or eidetica-supplied identifier.
+/// - `Ipld` — content-addressed via IPLD/IPFS. The CID *is* the version.
+/// - `Git` — pinned to a git commit on a remote source repo. The SHA *is*
+///   the version. Useful for out-of-tree extensions.
+///
+/// Only `Builtin` is produced today; the other variants are placeholders
+/// for the loader paths that will land alongside dynamic extension support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtensionRef {
+    Builtin {
+        name: String,
+        chaz_version: String,
+    },
+    Eidetica {
+        name: String,
+        db_id: String,
+        version: String,
+    },
+    Ipld {
+        name: String,
+        cid: String,
+    },
+    Git {
+        name: String,
+        repo: String,
+        sha: String,
+    },
+}
+
+impl ExtensionRef {
+    /// Construct a `Builtin` ref tagged with the current chaz binary
+    /// version. This is the default for every extension compiled into the
+    /// chaz binary.
+    pub fn builtin(name: &str) -> Self {
+        ExtensionRef::Builtin {
+            name: name.to_string(),
+            chaz_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Extension name, regardless of variant.
+    pub fn name(&self) -> &str {
+        match self {
+            ExtensionRef::Builtin { name, .. }
+            | ExtensionRef::Eidetica { name, .. }
+            | ExtensionRef::Ipld { name, .. }
+            | ExtensionRef::Git { name, .. } => name,
+        }
+    }
+
+    /// Content-addressing token (binary version / DB content hash / CID /
+    /// git SHA). Combined with `name`, uniquely identifies the code the
+    /// session was running.
+    pub fn version(&self) -> &str {
+        match self {
+            ExtensionRef::Builtin { chaz_version, .. } => chaz_version,
+            ExtensionRef::Eidetica { version, .. } => version,
+            ExtensionRef::Ipld { cid, .. } => cid,
+            ExtensionRef::Git { sha, .. } => sha,
+        }
+    }
+}
 
 /// Decision returned from a `tool_call` hook.
 #[derive(Debug)]
@@ -82,6 +158,15 @@ pub trait ExtensionCommand: Send + Sync {
 pub trait Extension: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Persistent identifier for this extension instance, serialized into
+    /// the session DB so the active-extension set can be reconstructed
+    /// later. Defaults to a `Builtin` ref carrying the chaz binary version
+    /// — override for extensions loaded from non-binary sources (eidetica
+    /// DB, IPLD, git repo).
+    fn extension_ref(&self) -> ExtensionRef {
+        ExtensionRef::builtin(self.name())
+    }
+
     /// Wire hooks and commands. Called once at startup.
     fn register(self: Arc<Self>, hub: &mut ExtensionHub);
 
@@ -90,7 +175,10 @@ pub trait Extension: Send + Sync {
     /// filtering automatically.
     fn contribute_tools(&self, _registry: &mut ToolRegistry) {}
 
-    /// Reserved for a future hot-reload / WASM-loaded surface.
+    /// Hook ABI version. Bumped when the hook interface changes shape in
+    /// a backwards-incompatible way. Orthogonal to [`extension_ref`] —
+    /// `extension_ref` identifies *which* extension is loaded;
+    /// `extension_api_version` identifies *which hook contract* it expects.
     fn extension_api_version(&self) -> u32 {
         1
     }
@@ -151,6 +239,13 @@ impl ExtensionHub {
 
     pub fn extension_names(&self) -> Vec<&'static str> {
         self.extensions.iter().map(|e| e.name()).collect()
+    }
+
+    /// Snapshot the persistent identifier of every registered extension.
+    /// Intended for writing into a session's DB at `session_start` so the
+    /// active-extension set can be reproduced later.
+    pub fn extension_refs(&self) -> Vec<ExtensionRef> {
+        self.extensions.iter().map(|e| e.extension_ref()).collect()
     }
 
     // --- registration API used inside Extension::register ---
@@ -302,6 +397,100 @@ mod tests {
     use eidetica::Instance;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
+
+    #[test]
+    fn builtin_ref_carries_binary_version() {
+        let r = ExtensionRef::builtin("heartbeat");
+        match &r {
+            ExtensionRef::Builtin { name, chaz_version } => {
+                assert_eq!(name, "heartbeat");
+                assert_eq!(chaz_version, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected Builtin, got {other:?}"),
+        }
+        assert_eq!(r.name(), "heartbeat");
+        assert_eq!(r.version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn name_and_version_accessors_cover_every_variant() {
+        let cases = [
+            (
+                ExtensionRef::Builtin {
+                    name: "a".into(),
+                    chaz_version: "0.1.0".into(),
+                },
+                "a",
+                "0.1.0",
+            ),
+            (
+                ExtensionRef::Eidetica {
+                    name: "b".into(),
+                    db_id: "db".into(),
+                    version: "v1".into(),
+                },
+                "b",
+                "v1",
+            ),
+            (
+                ExtensionRef::Ipld {
+                    name: "c".into(),
+                    cid: "bafy...".into(),
+                },
+                "c",
+                "bafy...",
+            ),
+            (
+                ExtensionRef::Git {
+                    name: "d".into(),
+                    repo: "https://example.com/r".into(),
+                    sha: "deadbeef".into(),
+                },
+                "d",
+                "deadbeef",
+            ),
+        ];
+        for (r, expected_name, expected_version) in &cases {
+            assert_eq!(r.name(), *expected_name);
+            assert_eq!(r.version(), *expected_version);
+        }
+    }
+
+    #[test]
+    fn extension_ref_serde_round_trips_with_tag() {
+        let original = ExtensionRef::Git {
+            name: "loop_detector".into(),
+            repo: "https://github.com/x/y".into(),
+            sha: "abc123".into(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        // `#[serde(tag = "kind")]` produces a flat, discoverable shape.
+        assert!(json.contains("\"kind\":\"git\""), "got: {json}");
+        let parsed: ExtensionRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    struct NamedExt(&'static str);
+    impl Extension for NamedExt {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+    }
+
+    #[test]
+    fn hub_extension_refs_returns_one_per_extension_in_order() {
+        let mut hub = ExtensionHub::new();
+        hub.register_extension(Arc::new(NamedExt("alpha")));
+        hub.register_extension(Arc::new(NamedExt("beta")));
+        let refs = hub.extension_refs();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].name(), "alpha");
+        assert_eq!(refs[1].name(), "beta");
+        for r in &refs {
+            assert!(matches!(r, ExtensionRef::Builtin { .. }));
+        }
+    }
 
     async fn fixture_ctx() -> HookContext {
         let backend = InMemory::new();
