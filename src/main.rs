@@ -353,31 +353,12 @@ async fn main() -> anyhow::Result<()> {
     let mut extension_hub = extension::ExtensionHub::new();
     extension_hub.reserve_builtin_commands(commands::BUILTIN_COMMAND_NAMES.iter().copied());
 
-    // Register built-in tools
+    // Register built-in tools. Anything that can sensibly live behind an
+    // extension surface (fs / system / web / memory / heartbeat) is wired
+    // up by `extensions::register_builtins` below; this section keeps only
+    // the core tools that are too tightly coupled to the server to move.
     let mut tool_registry = tool::ToolRegistry::new();
-    tool_registry.register(tools::GetTime);
-    tool_registry.register(tools::Calculate);
-    tool_registry.register(tools::DescribeTool);
     tool_registry.register(tools::ShellExec);
-    tool_registry.register(tools::ReadFile);
-    tool_registry.register(tools::WriteFile);
-    tool_registry.register(tools::EditFile);
-    tool_registry.register(tools::WebFetch);
-    tool_registry.register(tools::WebSearch::new(web_search_backends));
-    tool_registry.register(tools::Remember::new(
-        registry.clone(),
-        agent_index_store.clone(),
-        embedder.clone(),
-    ));
-    tool_registry.register(tools::Recall::new(
-        registry.clone(),
-        agent_index_store.clone(),
-        embedder.clone(),
-    ));
-    tool_registry.register(tools::ListMemoryBanks::new(
-        registry.clone(),
-        agent_index_store.clone(),
-    ));
     tool_registry.register(tools::Compact);
     // SpawnAgent / SpawnTask both route through the server — a single OnceLock
     // is shared; it's set once after Server::new below.
@@ -428,7 +409,12 @@ async fn main() -> anyhow::Result<()> {
     extensions::register_builtins(
         &mut extension_hub,
         &mut tool_registry,
-        agent_index_store.clone(),
+        extensions::BuiltinDeps {
+            agent_index: agent_index_store.clone(),
+            session_registry: registry.clone(),
+            embedder: embedder.clone(),
+            web_search_backends,
+        },
     );
     let extension_names = extension_hub.extension_names();
     if !extension_names.is_empty() {
