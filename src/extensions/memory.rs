@@ -8,7 +8,6 @@ use crate::embedding::Embedder;
 use crate::extension::{Extension, ExtensionHub, HookKind};
 use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
-use crate::tool::ToolRegistry;
 use crate::tools::{ListMemoryBanks, Recall, Remember};
 use std::sync::Arc;
 
@@ -38,25 +37,23 @@ impl Extension for MemoryExtension {
     }
 
     fn supported_hooks(&self) -> &[HookKind] {
-        &[]
+        &[HookKind::Tool]
     }
 
-    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
-
-    fn contribute_tools(&self, registry: &mut ToolRegistry) {
-        registry.register(Remember::new(
+    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
+        hub.register_tool(Arc::new(Remember::new(
             self.registry.clone(),
             self.agent_index.clone(),
             self.embedder.clone(),
-        ));
-        registry.register(Recall::new(
+        )));
+        hub.register_tool(Arc::new(Recall::new(
             self.registry.clone(),
             self.agent_index.clone(),
             self.embedder.clone(),
-        ));
-        registry.register(ListMemoryBanks::new(
+        )));
+        hub.register_tool(Arc::new(ListMemoryBanks::new(
             self.registry.clone(),
             self.agent_index.clone(),
-        ));
+        )));
     }
 }

@@ -4,7 +4,6 @@
 //! to know about them individually.
 
 use crate::extension::{Extension, ExtensionHub, HookKind};
-use crate::tool::ToolRegistry;
 use crate::tools::{Calculate, DescribeTool, GetTime};
 use std::sync::Arc;
 
@@ -16,14 +15,12 @@ impl Extension for SystemExtension {
     }
 
     fn supported_hooks(&self) -> &[HookKind] {
-        &[]
+        &[HookKind::Tool]
     }
 
-    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
-
-    fn contribute_tools(&self, registry: &mut ToolRegistry) {
-        registry.register(GetTime);
-        registry.register(Calculate);
-        registry.register(DescribeTool);
+    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
+        hub.register_tool(Arc::new(GetTime));
+        hub.register_tool(Arc::new(Calculate));
+        hub.register_tool(Arc::new(DescribeTool));
     }
 }

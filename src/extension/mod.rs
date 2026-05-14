@@ -19,7 +19,7 @@ pub mod hooks;
 
 use crate::runtime::RuntimeMessage;
 use crate::session::Session;
-use crate::tool::ToolRegistry;
+use crate::tool::Tool;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
 use eidetica::store::Table;
@@ -59,6 +59,12 @@ pub enum HookKind {
     AgentEnd,
     SessionStart,
     SessionShutdown,
+    /// Extension provides one or more named tools (via
+    /// [`ExtensionHub::register_tool`]).
+    Tool,
+    /// Extension provides one or more slash commands (via
+    /// [`ExtensionHub::register_command`]).
+    Command,
     /// Reserved — scheduled-event hook. Extensions may declare it, but
     /// the framework does not yet have a firing path.
     Cron,
@@ -289,8 +295,10 @@ pub trait ExtensionCommand: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ExtensionCommandOutcome> + Send + 'a>>;
 }
 
-/// An extension is a compile-time Rust type that wires hooks, tools, and
-/// commands into the agent runtime. Implementations are registered in
+/// An extension is a compile-time Rust type that hooks into the agent
+/// runtime. Its entire API surface is hook registration: tools, slash
+/// commands, and lifecycle hooks all flow through [`ExtensionHub`].
+/// Implementations are registered in
 /// `src/extensions/mod.rs::register_builtins`.
 pub trait Extension: Send + Sync {
     fn name(&self) -> &'static str;
@@ -305,22 +313,19 @@ pub trait Extension: Send + Sync {
     }
 
     /// Declare every hook kind this extension intends to register. Used
-    /// at startup to validate that `on_<kind>` calls inside [`register`]
+    /// at startup to validate that `register_*` calls inside [`register`]
     /// match the declaration, and at runtime for inspection / future
     /// sandboxing surfaces.
     ///
-    /// Return `&[]` for extensions that only register slash commands or
-    /// contribute tools (those surfaces are not yet HookKind variants;
-    /// they collapse into hooks in a later refactor).
+    /// Tools and commands count: an extension that registers any tool
+    /// must include [`HookKind::Tool`]; any command requires
+    /// [`HookKind::Command`].
     fn supported_hooks(&self) -> &[HookKind];
 
-    /// Wire hooks and commands. Called once at startup.
+    /// Register hooks, tools, and commands. Called once at startup with
+    /// the hub in "registering-as-this-extension" mode so every
+    /// `register_*` call captures ownership.
     fn register(self: Arc<Self>, hub: &mut ExtensionHub);
-
-    /// Contribute tools to the registry. Called before the registry is
-    /// wrapped in `Arc`, so tools land in `ScopedTools`/`ToolProfile`
-    /// filtering automatically.
-    fn contribute_tools(&self, _registry: &mut ToolRegistry) {}
 
     /// Hook ABI version. Bumped when the hook interface changes shape in
     /// a backwards-incompatible way. Orthogonal to [`extension_ref`] —
@@ -348,6 +353,12 @@ struct RegisteredCommand {
     handler: Box<dyn ExtensionCommand>,
 }
 
+/// Internal wrapper that tags a registered tool with its owner.
+struct RegisteredTool {
+    owner: &'static str,
+    tool: Arc<dyn Tool>,
+}
+
 /// Central registry for hook handlers, extension commands, and the
 /// extensions themselves. Held on `Server` as `Arc<ExtensionHub>`.
 pub struct ExtensionHub {
@@ -359,6 +370,8 @@ pub struct ExtensionHub {
     session_start: Vec<RegisteredHook<dyn HookSessionStart>>,
     session_shutdown: Vec<RegisteredHook<dyn HookSessionShutdown>>,
     commands: HashMap<String, RegisteredCommand>,
+    /// Tools registered by extensions, indexed by descriptor name.
+    tools: HashMap<String, RegisteredTool>,
     /// Names reserved by built-in slash commands; extensions cannot register
     /// these. Populated by [`ExtensionHub::reserve_builtin_commands`] during
     /// hub construction.
@@ -373,6 +386,8 @@ pub struct ExtensionHub {
     /// Reverse index: which slash commands did each extension register?
     /// Built alongside the per-name command map for inspection.
     commands_by_extension: HashMap<&'static str, HashSet<String>>,
+    /// Reverse index: which tools did each extension register?
+    tools_by_extension: HashMap<&'static str, HashSet<String>>,
     /// Set to `Some(name)` for the duration of one extension's
     /// `Extension::register` call so `on_<kind>` and `register_command`
     /// know who's currently registering. None outside that window —
@@ -398,9 +413,11 @@ impl ExtensionHub {
             session_start: Vec::new(),
             session_shutdown: Vec::new(),
             commands: HashMap::new(),
+            tools: HashMap::new(),
             reserved_command_names: HashSet::new(),
             hooks_by_extension: HashMap::new(),
             commands_by_extension: HashMap::new(),
+            tools_by_extension: HashMap::new(),
             current_registering: None,
         }
     }
@@ -429,6 +446,7 @@ impl ExtensionHub {
         self.current_registering = Some(name);
         self.hooks_by_extension.entry(name).or_default();
         self.commands_by_extension.entry(name).or_default();
+        self.tools_by_extension.entry(name).or_default();
         ext.clone().register(self);
         self.current_registering = None;
 
@@ -486,6 +504,29 @@ impl ExtensionHub {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Tools registered by each extension. Empty for unknown names.
+    pub fn tools_for(&self, name: &str) -> HashSet<String> {
+        self.tools_by_extension
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Iterate every registered tool as `(name, Arc<dyn Tool>)`. Used by
+    /// `main.rs` to populate the legacy [`ToolRegistry`] from the hub's
+    /// hook-registered tools.
+    pub fn tools_for_registry(&self) -> Vec<(String, Arc<dyn Tool>)> {
+        self.tools
+            .iter()
+            .map(|(name, reg)| (name.clone(), reg.tool.clone()))
+            .collect()
+    }
+
+    /// Owner extension of a given tool, or `None` for unknown names.
+    pub fn tool_owner(&self, name: &str) -> Option<&'static str> {
+        self.tools.get(name).map(|r| r.owner)
     }
 
     /// Snapshot the persistent identifier of every registered extension.
@@ -644,12 +685,36 @@ impl ExtensionHub {
             );
             return;
         }
+        self.note_hook(owner, HookKind::Command);
         self.commands_by_extension
             .entry(owner)
             .or_default()
             .insert(name.clone());
         self.commands
             .insert(name, RegisteredCommand { owner, handler });
+    }
+
+    /// Register a tool provided by the currently-registering extension.
+    /// The tool is indexed by its descriptor name; collisions log a
+    /// warning and keep the first registration (mirrors the command
+    /// collision policy).
+    pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
+        let owner = self.current_owner("register_tool");
+        let name = tool.descriptor().name;
+        if self.tools.contains_key(&name) {
+            warn!(
+                tool = %name,
+                extension = %owner,
+                "Duplicate tool registration; keeping first registration"
+            );
+            return;
+        }
+        self.note_hook(owner, HookKind::Tool);
+        self.tools_by_extension
+            .entry(owner)
+            .or_default()
+            .insert(name.clone());
+        self.tools.insert(name, RegisteredTool { owner, tool });
     }
 
     pub fn has_command(&self, name: &str) -> bool {
@@ -1089,7 +1154,7 @@ mod tests {
                 "with_command"
             }
             fn supported_hooks(&self) -> &[HookKind] {
-                &[]
+                &[HookKind::Command]
             }
             fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
                 hub.register_command("dance", Box::new(DummyCmd));
@@ -1309,7 +1374,7 @@ mod tests {
             self.0
         }
         fn supported_hooks(&self) -> &[HookKind] {
-            &[]
+            &[HookKind::Command]
         }
         fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
             hub.register_command(self.1, Box::new(DummyCmd));
@@ -1347,7 +1412,10 @@ mod tests {
                 "second"
             }
             fn supported_hooks(&self) -> &[HookKind] {
-                &[]
+                // Declares Command even though the actual registration
+                // will be rejected as a duplicate — keeps the declaration
+                // honest about intent.
+                &[HookKind::Command]
             }
             fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
                 hub.register_command("greet", Box::new(OtherCmd));

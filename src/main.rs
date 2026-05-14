@@ -353,26 +353,41 @@ async fn main() -> anyhow::Result<()> {
     let mut extension_hub = extension::ExtensionHub::new();
     extension_hub.reserve_builtin_commands(commands::BUILTIN_COMMAND_NAMES.iter().copied());
 
-    // Register built-in tools. Anything that can sensibly live behind an
-    // extension surface (fs / system / web / memory / heartbeat) is wired
-    // up by `extensions::register_builtins` below; this section keeps only
-    // the core tools that are too tightly coupled to the server to move.
-    let mut tool_registry = tool::ToolRegistry::new();
-    tool_registry.register(tools::ShellExec);
-    tool_registry.register(tools::Compact);
-    // SpawnAgent / SpawnTask both route through the server — a single OnceLock
-    // is shared; it's set once after Server::new below.
+    // SpawnAgent / SpawnTask route through the server — a single OnceLock
+    // is shared; it's set once after Server::new below. The core extension
+    // takes ownership of the cell and constructs the spawn tools.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
-    tool_registry.register(tools::SpawnAgent {
-        server: spawn_server_cell.clone(),
-        backend: backends::BackendManager::new(&config.backends, secret_store.clone()),
-        security: security_ctx.clone(),
-    });
-    tool_registry.register(tools::SpawnTask {
-        server: spawn_server_cell.clone(),
-        backend: backends::BackendManager::new(&config.backends, secret_store.clone()),
-        security: security_ctx.clone(),
-    });
+
+    // Register every built-in extension on the hub. Tools and commands
+    // land inside the hub via `register_tool` / `register_command`; once
+    // this returns we drain them out into the legacy ToolRegistry that
+    // the runtime/agent loop currently expects.
+    extensions::register_builtins(
+        &mut extension_hub,
+        extensions::BuiltinDeps {
+            agent_index: agent_index_store.clone(),
+            session_registry: registry.clone(),
+            embedder: embedder.clone(),
+            web_search_backends,
+            spawn_server_cell: spawn_server_cell.clone(),
+            backend_manager: backends::BackendManager::new(&config.backends, secret_store.clone()),
+            security: security_ctx.clone(),
+        },
+    );
+    let extension_names = extension_hub.extension_names();
+    if !extension_names.is_empty() {
+        info!(?extension_names, "Extensions registered");
+    }
+
+    // Build the legacy ToolRegistry from extension-contributed tools plus
+    // any MCP-provided tools. MCP tools don't fit the extension model yet
+    // (they're config-driven at startup and may grow/shrink at reload time)
+    // so they continue to live directly in the registry — they're just
+    // un-attributed for now.
+    let mut tool_registry = tool::ToolRegistry::new();
+    for (_name, tool) in extension_hub.tools_for_registry() {
+        tool_registry.register_arc(tool);
+    }
 
     // Collect MCP server configs from inline config + directory scanning
     let mut mcp_configs: Vec<config::McpServerConfig> =
@@ -402,24 +417,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Register built-in extensions. Each extension may contribute tools
-    // (added to `tool_registry`) and wire hooks into `extension_hub`.
-    // Must run before `tool_registry` is wrapped in `Arc` so contributed
-    // tools land in `ScopedTools`/`ToolProfile` filtering automatically.
-    extensions::register_builtins(
-        &mut extension_hub,
-        &mut tool_registry,
-        extensions::BuiltinDeps {
-            agent_index: agent_index_store.clone(),
-            session_registry: registry.clone(),
-            embedder: embedder.clone(),
-            web_search_backends,
-        },
-    );
-    let extension_names = extension_hub.extension_names();
-    if !extension_names.is_empty() {
-        info!(?extension_names, "Extensions registered");
-    }
     let extension_hub = std::sync::Arc::new(extension_hub);
 
     info!("Tool registry initialized");

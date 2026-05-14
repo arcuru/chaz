@@ -11,7 +11,6 @@ use crate::extension::{
 };
 use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
 use crate::hosted_index::HostedIndex;
-use crate::tool::ToolRegistry;
 use crate::tools::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove};
 use cron::Schedule;
 use std::future::Future;
@@ -35,24 +34,20 @@ impl Extension for HeartbeatExtension {
     }
 
     fn supported_hooks(&self) -> &[HookKind] {
-        // Tools + slash command only; no per-event hooks today.
-        &[]
+        &[HookKind::Tool, HookKind::Command]
     }
 
     fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
+        hub.register_tool(Arc::new(HeartbeatAdd::new(self.agent_index.clone())));
+        hub.register_tool(Arc::new(HeartbeatModify::new(self.agent_index.clone())));
+        hub.register_tool(Arc::new(HeartbeatRemove));
+        hub.register_tool(Arc::new(HeartbeatList::new(self.agent_index.clone())));
         hub.register_command(
             "heartbeat",
             Box::new(HeartbeatCommand {
                 agent_index: self.agent_index.clone(),
             }),
         );
-    }
-
-    fn contribute_tools(&self, registry: &mut ToolRegistry) {
-        registry.register(HeartbeatAdd::new(self.agent_index.clone()));
-        registry.register(HeartbeatModify::new(self.agent_index.clone()));
-        registry.register(HeartbeatRemove);
-        registry.register(HeartbeatList::new(self.agent_index.clone()));
     }
 }
 

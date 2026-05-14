@@ -5,7 +5,6 @@
 //! re-resolving it from config (which lives outside the extension surface).
 
 use crate::extension::{Extension, ExtensionHub, HookKind};
-use crate::tool::ToolRegistry;
 use crate::tools::{SearchBackend, WebFetch, WebSearch};
 use std::sync::Arc;
 
@@ -25,13 +24,11 @@ impl Extension for WebExtension {
     }
 
     fn supported_hooks(&self) -> &[HookKind] {
-        &[]
+        &[HookKind::Tool]
     }
 
-    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
-
-    fn contribute_tools(&self, registry: &mut ToolRegistry) {
-        registry.register(WebFetch);
-        registry.register(WebSearch::new(self.search_backends.clone()));
+    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
+        hub.register_tool(Arc::new(WebFetch));
+        hub.register_tool(Arc::new(WebSearch::new(self.search_backends.clone())));
     }
 }

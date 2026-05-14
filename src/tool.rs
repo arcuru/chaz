@@ -411,9 +411,11 @@ impl ToolPolicyRegistry {
     }
 }
 
-/// Registry of available tools
+/// Registry of available tools. Holds `Arc<dyn Tool>` so the extension hub
+/// can share ownership of each tool with the registry — built from the hub
+/// at startup in `main.rs`.
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<std::sync::Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -422,10 +424,16 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.push(Box::new(tool));
+        self.tools.push(std::sync::Arc::new(tool));
     }
 
     pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(std::sync::Arc::from(tool));
+    }
+
+    /// Add a tool already wrapped in an `Arc` (e.g. one held by the
+    /// extension hub).
+    pub fn register_arc(&mut self, tool: std::sync::Arc<dyn Tool>) {
         self.tools.push(tool);
     }
 
