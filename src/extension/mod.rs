@@ -18,6 +18,7 @@
 pub mod caps;
 pub mod hooks;
 pub mod manifest;
+pub mod registry;
 
 use crate::runtime::RuntimeMessage;
 use crate::session::Session;

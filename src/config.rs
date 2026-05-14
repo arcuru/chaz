@@ -1,3 +1,4 @@
+use crate::extension::caps::CapabilityKind;
 use crate::role::RoleDetails;
 use crate::tool::PresentationMode;
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,16 @@ pub struct Config {
     pub embedding: Option<EmbeddingConfig>,
     /// CLI-specific configuration (single-shot --cli mode)
     pub cli: Option<CliConfig>,
+    /// Per-capability-kind operator default-provider picks for
+    /// extension-providable caps (e.g. `messenger`, `memory`). When
+    /// multiple extensions register impls for the same cap kind, this
+    /// map chooses which one bare consumer requests
+    /// (`Messenger { provider: None }`) resolve to. Single-provider
+    /// kinds auto-default without needing an entry here; kinds with
+    /// multiple providers and no entry stay unresolved. Host-only
+    /// kinds (e.g. `session_write`) are rejected.
+    #[serde(default)]
+    pub capability_defaults: HashMap<CapabilityKind, String>,
 }
 
 /// CLI-specific configuration
