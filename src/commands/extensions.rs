@@ -194,6 +194,411 @@ async fn monotonic_timestamp_after(session_db: &eidetica::Database) -> DateTime<
     std::cmp::max(Utc::now(), max_seen + chrono::Duration::milliseconds(1))
 }
 
-// Lower-level event-log and settings round-trips already have unit
-// tests in src/extension/mod.rs; the dispatch glue here is exercised
-// via the gateway parsers + integration paths.
+#[cfg(test)]
+mod tests {
+    //! Integration tests for the `/extensions` command + per-session
+    //! filtering. Each test builds a real `Arc<Server>` with the full
+    //! built-in extension set registered so the assertions exercise the
+    //! same code path the TUI/Matrix gateways take. No LLM backend is
+    //! involved — tests don't run agent turns, they verify state
+    //! observable through `Server::active_extensions_for`,
+    //! `dispatch_extension`, and `ScopedTools::definitions`.
+
+    use super::*;
+    use crate::agent::AgentRegistry;
+    use crate::backends::BackendManager;
+    use crate::commands::{Command, dispatch};
+    use crate::extension::ExtensionHub;
+    use crate::extensions::{BuiltinDeps, register_builtins};
+    use crate::hosted_index::HostedIndex;
+    use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
+    use crate::server::Server;
+    use crate::session::SessionRegistry;
+    use crate::tool::{ScopedTools, ToolPolicyRegistry, ToolProfile, ToolRegistry};
+    use crate::tool_host::NativeToolHost;
+    use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
+    use std::sync::{Arc, OnceLock};
+
+    /// Full-fat fixture: Server with every built-in extension registered,
+    /// a fresh session, and the dependencies needed to drive
+    /// `commands::dispatch`. `_instance` and `_registry` are kept alive
+    /// by the caller for the duration of the test.
+    struct Fixture {
+        _instance: Instance,
+        _registry: Arc<SessionRegistry>,
+        server: Arc<Server>,
+        secrets: SecretStore,
+        backend: BackendManager,
+        tool_registry: Arc<ToolRegistry>,
+        session_db_id: String,
+        session_db: eidetica::Database,
+    }
+
+    async fn fixture() -> Fixture {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+        let agents = Arc::new(AgentRegistry::with_default_agent());
+        let registry = Arc::new(
+            SessionRegistry::new(instance.clone(), user, agents.clone())
+                .await
+                .unwrap(),
+        );
+        let chaz_peer = registry.chaz_peer().clone();
+        let agent_index = HostedIndex::empty("agent");
+        let bank_index = HostedIndex::empty("bank");
+        let policies = Arc::new(ToolPolicyRegistry::empty());
+        let security = SecurityContext {
+            leak_detector: LeakDetector::new(LeakPolicy::default()),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        };
+
+        // Register every built-in extension on the hub, then drain the
+        // hub's tool list into a ToolRegistry (mirroring main.rs).
+        let mut hub = ExtensionHub::new();
+        hub.reserve_builtin_commands(crate::commands::BUILTIN_COMMAND_NAMES.iter().copied());
+        let secrets = SecretStore::new(chaz_peer).await;
+        let backend_mgr = BackendManager::new(&None, secrets.clone());
+        let spawn_cell = Arc::new(OnceLock::new());
+        register_builtins(
+            &mut hub,
+            BuiltinDeps {
+                agent_index: agent_index.clone(),
+                session_registry: registry.clone(),
+                embedder: None,
+                web_search_backends: Vec::new(),
+                spawn_server_cell: spawn_cell.clone(),
+                backend_manager: backend_mgr.clone(),
+                security: security.clone(),
+            },
+        );
+        let mut tool_registry = ToolRegistry::new();
+        for (owner, _name, tool) in hub.tools_for_registry() {
+            tool_registry.register_arc_owned(tool, Some(owner));
+        }
+        let tool_registry = Arc::new(tool_registry);
+        let hub = Arc::new(hub);
+
+        let server = Server::new(
+            registry.clone(),
+            agents,
+            agent_index,
+            bank_index,
+            tool_registry.clone(),
+            policies,
+            security,
+            Default::default(),
+            Default::default(),
+            Arc::new(NativeToolHost::new()),
+            hub,
+        );
+        let _ = spawn_cell.set(server.clone());
+
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_db_id = session_db.root_id().to_string();
+
+        // Seed the session the way `Server::fire_session_start_hook`
+        // would in production — record_active writes default-include
+        // Activated events, then we refresh the cache. Skipping this
+        // would leave the active set empty (no log to fold from), and
+        // every test assertion against "what's active by default"
+        // would fail in a misleading way.
+        server
+            .extensions()
+            .record_active(&session_db)
+            .await
+            .unwrap();
+        server.refresh_active_extensions(&session_db_id).await;
+
+        Fixture {
+            _instance: instance,
+            _registry: registry,
+            server,
+            secrets,
+            backend: backend_mgr,
+            tool_registry,
+            session_db_id,
+            session_db,
+        }
+    }
+
+    fn ctx<'a>(f: &'a Fixture) -> CommandContext<'a> {
+        CommandContext {
+            server: &f.server,
+            scheduler: None,
+            secrets: &f.secrets,
+            backend: &f.backend,
+            session_db_id: &f.session_db_id,
+            session_db: &f.session_db,
+            current_agent: "chaz",
+            session_name: None,
+            config_roles: None,
+            default_role: None,
+        }
+    }
+
+    /// Build a `ScopedTools` view that mirrors what the runtime would
+    /// hand the agent for this session — full registry, no allowlist,
+    /// per-session active-extension filter.
+    async fn scoped_for(f: &Fixture) -> ScopedTools {
+        let active = f.server.active_extensions_for(&f.session_db_id).await;
+        ScopedTools::new(f.tool_registry.clone(), None).with_active_extensions(Some(active))
+    }
+
+    /// Visible tool names according to `ScopedTools::definitions`.
+    fn visible_tool_names(scoped: &ScopedTools) -> std::collections::HashSet<String> {
+        scoped
+            .definitions(&ToolProfile::default())
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // listing
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_shows_every_builtin_active_on_a_fresh_session() {
+        let f = fixture().await;
+        // Touch the active set so session_start fires record_active
+        // and seeds the default-include events.
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+
+        let out = dispatch(Command::Extensions(ExtensionsAction::List), &ctx(&f)).await;
+        let text = match out {
+            CommandOutcome::Text(s) => s,
+            _ => panic!("expected CommandOutcome::Text"),
+        };
+        for name in [
+            "core",
+            "fs",
+            "system",
+            "web",
+            "memory",
+            "heartbeat",
+            "path_normalizer",
+            "security_warnings",
+        ] {
+            assert!(text.contains(name), "list missing {name}:\n{text}");
+        }
+        // Default-everything-active: every line is marked ✓.
+        assert!(
+            !text.lines().skip(1).any(|l| l.starts_with("   ")),
+            "every extension should be active on a fresh session, but a row was un-marked:\n{text}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // add / remove flow
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn remove_hides_owned_tools_from_scoped_tools_definitions() {
+        let f = fixture().await;
+        // Seed the default-active set.
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+        let before = visible_tool_names(&scoped_for(&f).await);
+        assert!(before.contains("remember"));
+        assert!(before.contains("recall"));
+        assert!(before.contains("list_memory_banks"));
+
+        let out = dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            &ctx(&f),
+        )
+        .await;
+        assert!(matches!(out, CommandOutcome::Text(_)));
+
+        let after = visible_tool_names(&scoped_for(&f).await);
+        assert!(!after.contains("remember"), "remember should be hidden");
+        assert!(!after.contains("recall"), "recall should be hidden");
+        assert!(
+            !after.contains("list_memory_banks"),
+            "list_memory_banks should be hidden"
+        );
+        // Tools from other still-active extensions must remain visible.
+        assert!(after.contains("read_file"), "fs tools unaffected");
+        assert!(after.contains("shell"), "core tools unaffected");
+    }
+
+    #[tokio::test]
+    async fn add_after_remove_restores_tools_to_the_scope() {
+        let f = fixture().await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            &ctx(&f),
+        )
+        .await;
+        assert!(!visible_tool_names(&scoped_for(&f).await).contains("remember"));
+
+        dispatch(
+            Command::Extensions(ExtensionsAction::Add("memory".into())),
+            &ctx(&f),
+        )
+        .await;
+        assert!(visible_tool_names(&scoped_for(&f).await).contains("remember"));
+    }
+
+    #[tokio::test]
+    async fn remove_survives_simulated_session_restart() {
+        // After a remove + a fresh record_active (mimicking the
+        // session_start reconciler on next startup), the deactivation
+        // should stand — `record_active`'s respect-Deactivated rule.
+        let f = fixture().await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            &ctx(&f),
+        )
+        .await;
+
+        f.server
+            .extensions()
+            .record_active(&f.session_db)
+            .await
+            .unwrap();
+        f.server.refresh_active_extensions(&f.session_db_id).await;
+
+        let active = f.server.active_extensions_for(&f.session_db_id).await;
+        assert!(
+            !active.contains("memory"),
+            "memory should stay removed after a record_active reconcile, got: {active:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // command dispatch under inactive extensions
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn inactive_extension_command_returns_helpful_error() {
+        let f = fixture().await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Remove("heartbeat".into())),
+            &ctx(&f),
+        )
+        .await;
+
+        let out = super::super::dispatch_extension("heartbeat", "list", &ctx(&f)).await;
+        match out {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("heartbeat"), "msg: {msg}");
+                assert!(
+                    msg.contains("not active") && msg.contains("/extensions add"),
+                    "msg should point user at /extensions add: {msg}"
+                );
+            }
+            _ => panic!("expected CommandOutcome::Error with the helpful pointer"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // multi-session isolation
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn two_sessions_have_independent_active_sets() {
+        let f = fixture().await;
+        // Create a second session on the same server. We need to
+        // bypass the Fixture struct (it only carries one session DB).
+        let (_, session_b) = f._registry.create_session(Some("other")).await.unwrap();
+        let session_b_id = session_b.root_id().to_string();
+        // Seed session B the same way the fixture seeds session A.
+        f.server
+            .extensions()
+            .record_active(&session_b)
+            .await
+            .unwrap();
+        f.server.refresh_active_extensions(&session_b_id).await;
+
+        // Remove memory from session A only.
+        dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            &ctx(&f),
+        )
+        .await;
+
+        let active_a = f.server.active_extensions_for(&f.session_db_id).await;
+        let active_b = f.server.active_extensions_for(&session_b_id).await;
+        assert!(!active_a.contains("memory"), "session A should drop memory");
+        assert!(active_b.contains("memory"), "session B unaffected");
+    }
+
+    // -------------------------------------------------------------------------
+    // settings round-trip
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn settings_round_trip_via_set_and_settings_subcommands() {
+        let f = fixture().await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Set {
+                name: "memory".into(),
+                key: "custom_limit".into(),
+                value: "8".into(),
+            }),
+            &ctx(&f),
+        )
+        .await;
+
+        let out = dispatch(
+            Command::Extensions(ExtensionsAction::Settings("memory".into())),
+            &ctx(&f),
+        )
+        .await;
+        let text = match out {
+            CommandOutcome::Text(s) => s,
+            _ => panic!("expected CommandOutcome::Text"),
+        };
+        assert!(
+            text.contains("custom_limit"),
+            "settings missing key: {text}"
+        );
+        // JSON-parse of "8" should land an integer, not the string "8".
+        assert!(
+            text.contains("8") && !text.contains("\"8\""),
+            "value should be the integer 8, not the string: {text}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // validation
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn add_unknown_extension_errors() {
+        let f = fixture().await;
+        let out = dispatch(
+            Command::Extensions(ExtensionsAction::Add("doesnotexist".into())),
+            &ctx(&f),
+        )
+        .await;
+        match out {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("doesnotexist"), "msg: {msg}");
+                assert!(msg.contains("Unknown extension"), "msg: {msg}");
+            }
+            _ => panic!("expected CommandOutcome::Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_extension_errors() {
+        let f = fixture().await;
+        let out = dispatch(
+            Command::Extensions(ExtensionsAction::Remove("doesnotexist".into())),
+            &ctx(&f),
+        )
+        .await;
+        match out {
+            CommandOutcome::Error(msg) => assert!(msg.contains("Unknown extension"), "msg: {msg}"),
+            _ => panic!("expected CommandOutcome::Error"),
+        }
+    }
+}
