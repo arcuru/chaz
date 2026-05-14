@@ -17,6 +17,7 @@ use crate::agent::AgentRegistry;
 use crate::backends::BackendManager;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
+use crate::extension::{ExtensionHub, HookContext};
 use crate::gateway::ApprovalExchange;
 use crate::hosted_index::HostedIndex;
 use crate::runtime;
@@ -74,6 +75,8 @@ pub struct Server {
     context_config: ContextConfig,
     /// Execution host for sandboxed capability requests (Native, future WASM, bwrap)
     host: Arc<dyn ToolHost>,
+    /// Compile-time extension hub: hook handlers, extension commands.
+    extensions: Arc<ExtensionHub>,
     /// Per-session runtime state keyed by session_db_id
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     /// Track which session DBs have server callbacks registered
@@ -97,6 +100,7 @@ impl Server {
         tool_profiles: HashMap<String, ToolProfile>,
         context_config: ContextConfig,
         host: Arc<dyn ToolHost>,
+        extensions: Arc<ExtensionHub>,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
@@ -112,6 +116,7 @@ impl Server {
             tool_profiles,
             context_config,
             host,
+            extensions,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -182,6 +187,13 @@ impl Server {
         self.agents.clone()
     }
 
+    /// Access the compile-time extension hub. Held by `Server` so that
+    /// runtime and command dispatch can fire hooks and look up extension
+    /// commands.
+    pub fn extensions(&self) -> &Arc<ExtensionHub> {
+        &self.extensions
+    }
+
     /// Register a session for callback-driven agent processing.
     ///
     /// Installs an `on_write` callback on the session DB (if not already
@@ -201,6 +213,9 @@ impl Server {
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
         let session_db_id = session_db.root_id().to_string();
+        let agent_name_for_hook = agent_override
+            .clone()
+            .unwrap_or_else(|| "agent".to_string());
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -239,6 +254,11 @@ impl Server {
             .detach();
 
         info!(session_db_id = %session_db_id, "Server watching session");
+
+        // Extension hook: session_start
+        self.fire_session_start_hook(session_db.clone(), agent_name_for_hook, 0)
+            .await;
+
         Ok(())
     }
 
@@ -320,7 +340,60 @@ impl Server {
             drop(watched);
         }
 
+        // Extension hook: session_start (for child session)
+        self.fire_session_start_hook(session_db.clone(), agent_name.to_string(), call_depth)
+            .await;
+
         Ok((conversation_id, session_db, completion_rx))
+    }
+
+    /// Build a `HookContext` for the given session and fire `session_start`.
+    /// Internal helper shared by `register_session` / `register_child_session`.
+    async fn fire_session_start_hook(
+        &self,
+        session_db: eidetica::Database,
+        agent_name: String,
+        call_depth: usize,
+    ) {
+        let conv_id = ConversationId(session_db.root_id().to_string());
+        let session = Session::new(conv_id, session_db).await;
+        let ctx = HookContext {
+            agent_name,
+            model: None,
+            call_depth,
+            session: Arc::new(Mutex::new(session)),
+        };
+        self.extensions.fire_session_start(&ctx).await;
+    }
+
+    /// Fire `session_shutdown` for the given session and remove its runtime
+    /// state. Best-effort: process exit / abnormal termination skips this
+    /// hook. Idempotent — calling on an unknown session is a no-op.
+    pub async fn deregister_session(&self, session_db_id: &str) {
+        // Build a hook context from whatever runtime state we still have.
+        // If the session is unknown we still let the caller fire-and-forget.
+        let agent_name = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_db_id)
+                .and_then(|s| s.agent_override.clone())
+                .unwrap_or_else(|| "agent".to_string())
+        };
+
+        if let Ok((_, db)) = self.registry.open_session(session_db_id).await {
+            let conv_id = ConversationId(session_db_id.to_string());
+            let session = Session::new(conv_id, db).await;
+            let ctx = HookContext {
+                agent_name,
+                model: None,
+                call_depth: 0,
+                session: Arc::new(Mutex::new(session)),
+            };
+            self.extensions.fire_session_shutdown(&ctx).await;
+        }
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.remove(session_db_id);
     }
 
     async fn processing_loop(&self, mut notify_rx: mpsc::Receiver<String>) {
@@ -479,6 +552,7 @@ impl Server {
         let semaphore = self.semaphore.clone();
         let context_config = self.context_config.clone();
         let host = self.host.clone();
+        let spawn_extensions = self.extensions.clone();
         let max_context_tokens = agent.max_context_tokens;
 
         tokio::spawn(async move {
@@ -638,6 +712,7 @@ impl Server {
                 &tool_ctx,
                 &policies,
                 Some(event_tx),
+                Some(spawn_extensions.as_ref()),
             )
             .await;
 
@@ -726,6 +801,7 @@ mod tests {
             HashMap::new(),
             Default::default(),
             Arc::new(crate::tool_host::NativeToolHost::new()),
+            Arc::new(crate::extension::ExtensionHub::new()),
         );
         (instance, server, registry)
     }

@@ -13,6 +13,7 @@
 
 use crate::backends::BackendManager;
 use crate::error::LlmError;
+use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::gateway::ApprovalDecision;
 use crate::security::{Sanitizer, SecurityContext};
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
@@ -354,6 +355,19 @@ async fn llm_call_with_retry(
     }))
 }
 
+/// Fire `agent_end` for all registered hooks and return the outcome unchanged.
+/// Centralizes the hook fire across every exit site of `execute`.
+async fn finalize_outcome(
+    hub: Option<&ExtensionHub>,
+    ctx: Option<&HookContext>,
+    outcome: RuntimeOutcome,
+) -> RuntimeOutcome {
+    if let (Some(hub), Some(ctx)) = (hub, ctx) {
+        hub.fire_agent_end(ctx).await;
+    }
+    outcome
+}
+
 /// Run the agent runtime for a single turn.
 ///
 /// If tools are registered and the backend supports tool calling,
@@ -361,6 +375,7 @@ async fn llm_call_with_retry(
 ///
 /// Accepts pre-built `RuntimeMessage`s from the `ContextBuilder` and
 /// an optional model name for backend routing.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     model: Option<&str>,
     initial_messages: Vec<RuntimeMessage>,
@@ -369,11 +384,19 @@ pub async fn execute(
     tool_ctx: &ToolContext,
     policies: &ToolPolicyRegistry,
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
+    hub: Option<&ExtensionHub>,
 ) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
+
+    let hook_ctx = hub.map(|_| HookContext {
+        agent_name: tool_ctx.agent_name.clone(),
+        model: model.map(|s| s.to_string()),
+        call_depth: tool_ctx.call_depth,
+        session: tool_ctx.session.clone(),
+    });
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
     if tools.is_empty() || !backend.supports_tools_for_model(model) {
@@ -391,10 +414,15 @@ pub async fn execute(
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
-                Ok(RuntimeOutcome {
-                    body: content,
-                    metadata: acc.finalize(),
-                })
+                Ok(finalize_outcome(
+                    hub,
+                    hook_ctx.as_ref(),
+                    RuntimeOutcome {
+                        body: content,
+                        metadata: acc.finalize(),
+                    },
+                )
+                .await)
             }
             Ok(LLMResponse::ToolCalls { .. }) => {
                 Err("Unexpected tool calls in no-tools fallback".to_string())
@@ -405,6 +433,19 @@ pub async fn execute(
 
     let tool_defs = tools.definitions(&tool_ctx.profile);
     let mut messages = initial_messages;
+
+    // Hook: before_agent_start — append extension-injected messages.
+    if let (Some(hub), Some(ctx)) = (hub, hook_ctx.as_ref()) {
+        let injected = hub.fire_before_agent_start(ctx).await;
+        if !injected.is_empty() {
+            debug!(
+                count = injected.len(),
+                "Extensions injected pre-turn messages"
+            );
+            messages.extend(injected);
+        }
+    }
+
     let mut approve_all = false; // tracks if user chose "approve all" this turn
     let mut rate_limiter = RateLimiter::new();
     let mut loop_detector = LoopDetector::new();
@@ -442,10 +483,15 @@ pub async fn execute(
                         if let Some(m) = metadata {
                             acc.record(m);
                         }
-                        Ok(RuntimeOutcome {
-                            body: content,
-                            metadata: acc.finalize(),
-                        })
+                        Ok(finalize_outcome(
+                            hub,
+                            hook_ctx.as_ref(),
+                            RuntimeOutcome {
+                                body: content,
+                                metadata: acc.finalize(),
+                            },
+                        )
+                        .await)
                     }
                     Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
                     Err(e) => Err(e.to_string()),
@@ -472,10 +518,15 @@ pub async fn execute(
                 if iteration > 0 {
                     info!("ReAct loop completed after {} tool iterations", iteration);
                 }
-                return Ok(RuntimeOutcome {
-                    body: content,
-                    metadata: acc.finalize(),
-                });
+                return Ok(finalize_outcome(
+                    hub,
+                    hook_ctx.as_ref(),
+                    RuntimeOutcome {
+                        body: content,
+                        metadata: acc.finalize(),
+                    },
+                )
+                .await);
             }
             LLMResponse::Text { metadata, .. } if iteration > 0 => {
                 if let Some(m) = metadata {
@@ -485,10 +536,15 @@ pub async fn execute(
                 // Return the last tool result as the response.
                 info!("Empty response after tool calls, using last tool result");
                 if let Some(RuntimeMessage::ToolResult { content, .. }) = messages.last() {
-                    return Ok(RuntimeOutcome {
-                        body: content.clone(),
-                        metadata: acc.finalize(),
-                    });
+                    return Ok(finalize_outcome(
+                        hub,
+                        hook_ctx.as_ref(),
+                        RuntimeOutcome {
+                            body: content.clone(),
+                            metadata: acc.finalize(),
+                        },
+                    )
+                    .await);
                 }
                 return Err("Model returned empty response after tool execution".to_string());
             }
@@ -496,10 +552,15 @@ pub async fn execute(
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
-                return Ok(RuntimeOutcome {
-                    body: content,
-                    metadata: acc.finalize(),
-                });
+                return Ok(finalize_outcome(
+                    hub,
+                    hook_ctx.as_ref(),
+                    RuntimeOutcome {
+                        body: content,
+                        metadata: acc.finalize(),
+                    },
+                )
+                .await);
             }
             LLMResponse::ToolCalls {
                 content,
@@ -552,7 +613,7 @@ pub async fn execute(
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
                             let policy = policies.resolve(tool);
-                            let args: serde_json::Value =
+                            let mut args: serde_json::Value =
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
 
                             // --- Security: rate limit check ---
@@ -597,6 +658,34 @@ pub async fn execute(
                                 }
                             }
 
+                            // --- Extension hook: tool_call (may mutate args or block) ---
+                            if let (Some(hub_ref), Some(ctx)) = (hub, hook_ctx.as_ref())
+                                && let ToolCallDecision::Block { reason } =
+                                    hub_ref.fire_tool_call(ctx, &call.name, &mut args).await
+                            {
+                                warn!(
+                                    tool = %call.name,
+                                    reason = %reason,
+                                    "Tool call blocked by extension"
+                                );
+                                let blocked_msg = format!("Tool blocked by extension: {reason}");
+                                if let Some(ref sink) = event_sink {
+                                    let _ = sink
+                                        .send(RuntimeEvent::ToolResult {
+                                            id: call.id.clone(),
+                                            name: call.name.clone(),
+                                            output: blocked_msg.clone(),
+                                            is_error: true,
+                                        })
+                                        .await;
+                                }
+                                messages.push(RuntimeMessage::ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: wrap_tool_output(&call.name, &blocked_msg),
+                                });
+                                continue;
+                            }
+
                             // --- Security: execute with timeout ---
                             let timeout = policy.timeout_duration();
                             // Build per-call grants: config-level policy grants, with
@@ -618,6 +707,15 @@ pub async fn execute(
                                         "Tool returned: {}",
                                         &output[..output.len().min(200)]
                                     );
+
+                                    // --- Extension hook: tool_result (may transform output) ---
+                                    let output = if let (Some(hub_ref), Some(ctx)) =
+                                        (hub, hook_ctx.as_ref())
+                                    {
+                                        hub_ref.fire_tool_result(ctx, &call.name, output).await
+                                    } else {
+                                        output
+                                    };
 
                                     // --- Security: scan for injection patterns (warning-only) ---
                                     let warnings = Sanitizer::scan(&output);
@@ -703,19 +801,29 @@ pub async fn execute(
             if let Some(m) = metadata {
                 acc.record(m);
             }
-            Ok(RuntimeOutcome {
-                body: content,
-                metadata: acc.finalize(),
-            })
+            Ok(finalize_outcome(
+                hub,
+                hook_ctx.as_ref(),
+                RuntimeOutcome {
+                    body: content,
+                    metadata: acc.finalize(),
+                },
+            )
+            .await)
         }
         Ok(_) | Err(_) => {
             // Last resort: return the last tool result
             for msg in messages.iter().rev() {
                 if let RuntimeMessage::ToolResult { content, .. } = msg {
-                    return Ok(RuntimeOutcome {
-                        body: content.clone(),
-                        metadata: acc.finalize(),
-                    });
+                    return Ok(finalize_outcome(
+                        hub,
+                        hook_ctx.as_ref(),
+                        RuntimeOutcome {
+                            body: content.clone(),
+                            metadata: acc.finalize(),
+                        },
+                    )
+                    .await);
                 }
             }
             Err("Agent reached maximum tool iterations without a final response".to_string())

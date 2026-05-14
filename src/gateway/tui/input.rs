@@ -802,12 +802,19 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         _ => {}
     }
 
-    if text.starts_with('/') {
-        show_error(
-            app,
-            format!("Unknown command: {text}. Type /help for available commands."),
-        );
-        return None;
+    if let Some(stripped) = text.strip_prefix('/') {
+        // Unknown built-in — route to extension command dispatch.
+        // `dispatch` will produce a `CommandOutcome::Error` if no
+        // extension registered this name.
+        let (name, args) = match stripped.split_once(char::is_whitespace) {
+            Some((n, a)) => (n.to_string(), a.trim().to_string()),
+            None => (stripped.to_string(), String::new()),
+        };
+        if name.is_empty() {
+            show_error(app, "Empty command".to_string());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::Extension { name, args }));
     }
 
     Some(ChatAction::SendMessage(text.to_string()))

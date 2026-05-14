@@ -244,7 +244,52 @@ pub enum Command {
     ListBackends,
 
     Quit,
+
+    /// Slash command registered by a chaz extension (see `crate::extension`).
+    /// Gateways produce this variant when a `/foo` doesn't match any
+    /// built-in. `dispatch` looks `name` up in `Server::extensions().commands`
+    /// and routes there; an unregistered name yields an "Unknown command"
+    /// error.
+    Extension {
+        name: String,
+        args: String,
+    },
 }
+
+/// Built-in slash command names (without leading `/`). Used at hub
+/// construction time to reserve names that extensions cannot shadow.
+pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
+    "quit",
+    "exit",
+    "q",
+    "sessions",
+    "s",
+    "share",
+    "unshare",
+    "compact",
+    "schedules",
+    "info",
+    "costs",
+    "print",
+    "backends",
+    "new",
+    "name",
+    "rename",
+    "role",
+    "model",
+    "channels",
+    "agents",
+    "pubkey",
+    "help",
+    "?",
+    "agent",
+    "heartbeat",
+    "memory",
+    "sharing",
+    "sync",
+    "use",
+    "switch",
+];
 
 /// Data about a session, used to render a picker (TUI) or a listing (Matrix).
 pub struct SessionInfo {
@@ -383,5 +428,35 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         }
         Command::ListBackends => session::list_backends(ctx).await,
         Command::Quit => CommandOutcome::Quit,
+        Command::Extension { name, args } => dispatch_extension(&name, &args, ctx).await,
+    }
+}
+
+async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    use crate::extension::{ExtensionCommandOutcome, HookContext};
+    use crate::session::Session;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let hub = ctx.server.extensions();
+    if !hub.has_command(name) {
+        return CommandOutcome::Error(format!(
+            "Unknown command: /{name}. Type /help for available commands."
+        ));
+    }
+
+    let conv_id = crate::types::ConversationId(ctx.session_db_id.to_string());
+    let session = Session::new(conv_id, ctx.session_db.clone()).await;
+    let hook_ctx = HookContext {
+        agent_name: ctx.current_agent.to_string(),
+        model: None,
+        call_depth: 0,
+        session: Arc::new(Mutex::new(session)),
+    };
+
+    match hub.try_dispatch_command(name, args, &hook_ctx).await {
+        Some(ExtensionCommandOutcome::Text(s)) => CommandOutcome::Text(s),
+        Some(ExtensionCommandOutcome::Error(s)) => CommandOutcome::Error(s),
+        None => CommandOutcome::Error(format!("Unknown command: /{name}")),
     }
 }

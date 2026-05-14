@@ -418,6 +418,7 @@ mod tests {
             std::collections::HashMap::new(),
             Default::default(),
             std::sync::Arc::new(crate::tool_host::NativeToolHost::new()),
+            std::sync::Arc::new(crate::extension::ExtensionHub::new()),
         );
         let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());

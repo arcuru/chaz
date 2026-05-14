@@ -9,6 +9,8 @@ mod db_kind;
 mod defaults;
 mod embedding;
 mod error;
+mod extension;
+mod extensions;
 mod gateway;
 mod grants;
 mod heartbeat;
@@ -346,6 +348,11 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = std::sync::Arc::new(registry);
 
+    // Build the extension hub and reserve built-in slash command names so
+    // extensions can't shadow them.
+    let mut extension_hub = extension::ExtensionHub::new();
+    extension_hub.reserve_builtin_commands(commands::BUILTIN_COMMAND_NAMES.iter().copied());
+
     // Register built-in tools
     let mut tool_registry = tool::ToolRegistry::new();
     tool_registry.register(tools::GetTime);
@@ -418,6 +425,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Register built-in extensions. Each extension may contribute tools
+    // (added to `tool_registry`) and wire hooks into `extension_hub`.
+    // Must run before `tool_registry` is wrapped in `Arc` so contributed
+    // tools land in `ScopedTools`/`ToolProfile` filtering automatically.
+    extensions::register_builtins(&mut extension_hub, &mut tool_registry);
+    let extension_names = extension_hub.extension_names();
+    if !extension_names.is_empty() {
+        info!(?extension_names, "Extensions registered");
+    }
+    let extension_hub = std::sync::Arc::new(extension_hub);
+
     info!("Tool registry initialized");
     let tool_registry = std::sync::Arc::new(tool_registry);
 
@@ -455,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
         tool_profiles,
         context_config,
         tool_host,
+        extension_hub,
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),
