@@ -150,7 +150,7 @@ impl fmt::Display for CapabilityKind {
 ///
 /// Stored in manifests as either `required_capabilities` (load fails if
 /// absent) or `requested_capabilities` (degrades gracefully if absent).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CapabilityRequest {
     SessionRead,
@@ -464,6 +464,85 @@ impl fmt::Debug for CapProvider {
 }
 
 // =========================================================================
+// ExtensionCaps — per-extension consumer bundle
+// =========================================================================
+
+/// The fully-resolved bundle of capabilities a consumer extension
+/// receives at `install` time.
+///
+/// One field per host-only kind (each holds at most one impl — the
+/// host's), plus a [`CapSet`] per extension-providable kind so the
+/// consumer can either grab the operator default (bare request) or
+/// look up a specific provider by name.
+///
+/// Slots are `Option` / empty `CapSet` whenever the extension's
+/// manifest didn't grant the corresponding cap. Attempting to use a
+/// missing slot is a logic error on the extension's part — the manifest
+/// contract said it wouldn't.
+///
+/// Built by the hub during phase 2 of `install_all` (added in step 5)
+/// from the operator config, the cap registry, and the requesting
+/// extension's manifest.
+pub struct ExtensionCaps {
+    pub session_read: Option<Arc<dyn SessionRead>>,
+    pub session_write: Option<Arc<dyn SessionWrite>>,
+    pub settings: Option<Arc<dyn Settings>>,
+    pub tool_registration: Option<Arc<dyn ToolRegistration>>,
+    pub command_registration: Option<Arc<dyn CommandRegistration>>,
+    pub messengers: CapSet<dyn Messenger>,
+    pub memory: CapSet<dyn MemoryAccess>,
+}
+
+impl ExtensionCaps {
+    /// Bundle with no caps granted. Convenient for tests and for
+    /// extensions whose manifests grant nothing (e.g., pure hook
+    /// observers that don't consume any cap).
+    pub fn empty() -> Self {
+        Self {
+            session_read: None,
+            session_write: None,
+            settings: None,
+            tool_registration: None,
+            command_registration: None,
+            messengers: CapSet::new(),
+            memory: CapSet::new(),
+        }
+    }
+
+    /// `true` when no host-only slot is filled and both `CapSet`s are
+    /// empty. Useful in tests and as a manifest sanity check.
+    pub fn is_empty(&self) -> bool {
+        self.session_read.is_none()
+            && self.session_write.is_none()
+            && self.settings.is_none()
+            && self.tool_registration.is_none()
+            && self.command_registration.is_none()
+            && self.messengers.is_empty()
+            && self.memory.is_empty()
+    }
+}
+
+impl Default for ExtensionCaps {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl fmt::Debug for ExtensionCaps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtensionCaps")
+            .field("session_read", &self.session_read.is_some())
+            .field("session_write", &self.session_write.is_some())
+            .field("settings", &self.settings.is_some())
+            .field("tool_registration", &self.tool_registration.is_some())
+            .field("command_registration", &self.command_registration.is_some())
+            .field("messengers", &self.messengers.provider_names())
+            .field("memory", &self.memory.provider_names())
+            .finish()
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
@@ -753,6 +832,47 @@ mod tests {
         let s = serde_json::to_string(&view).unwrap();
         let round: SessionEntryView = serde_json::from_str(&s).unwrap();
         assert_eq!(round, view);
+    }
+
+    // --- ExtensionCaps ----------------------------------------------------
+
+    #[test]
+    fn empty_extension_caps_grants_nothing() {
+        let caps = ExtensionCaps::empty();
+        assert!(caps.is_empty());
+        assert!(caps.session_read.is_none());
+        assert!(caps.session_write.is_none());
+        assert!(caps.settings.is_none());
+        assert!(caps.tool_registration.is_none());
+        assert!(caps.command_registration.is_none());
+        assert!(caps.messengers.is_empty());
+        assert!(caps.memory.is_empty());
+    }
+
+    #[test]
+    fn extension_caps_is_empty_flips_when_any_slot_filled() {
+        let mut caps = ExtensionCaps::empty();
+        caps.messengers.default = Some(Arc::new(NoopMessenger));
+        assert!(!caps.is_empty(), "messenger default should count");
+
+        let mut caps = ExtensionCaps::empty();
+        caps.memory
+            .named
+            .insert("local".into(), Arc::new(NoopMemory));
+        assert!(!caps.is_empty(), "named memory should count");
+    }
+
+    #[test]
+    fn extension_caps_debug_summarizes_without_arc_payload() {
+        let mut caps = ExtensionCaps::empty();
+        caps.messengers
+            .named
+            .insert("matrix".into(), Arc::new(NoopMessenger));
+        let s = format!("{caps:?}");
+        // Slot booleans + provider names are present; raw Arc<dyn _>
+        // pointers are not (they're not Debug-printable anyway).
+        assert!(s.contains("session_read: false"), "got: {s}");
+        assert!(s.contains("messengers: [\"matrix\"]"), "got: {s}");
     }
 
     #[test]
