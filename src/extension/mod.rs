@@ -22,7 +22,7 @@ use crate::session::Session;
 use crate::tool::Tool;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
-use eidetica::store::Table;
+use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -74,6 +74,42 @@ pub enum HookKind {
 /// events are recorded. Lives on the session DB (not the peer DB) so the
 /// provenance travels with the session via sync.
 pub const EXTENSIONS_STORE: &str = "extensions";
+
+/// Eidetica `DocStore` name where per-session per-extension settings are
+/// stored. Keys are extension names; values are JSON-serialized settings
+/// blobs. Lives on the session DB so settings travel with the session.
+pub const EXTENSION_SETTINGS_STORE: &str = "extension_settings";
+
+/// Read the settings JSON for one extension on this session's DB.
+/// Missing key (or any read error) yields `json!({})` rather than
+/// propagating — settings absence is the normal "no overrides" state.
+pub async fn read_settings(session_db: &Database, ext_name: &str) -> serde_json::Value {
+    let Ok(txn) = session_db.new_transaction().await else {
+        return serde_json::json!({});
+    };
+    let Ok(store) = txn.get_store::<DocStore>(EXTENSION_SETTINGS_STORE).await else {
+        return serde_json::json!({});
+    };
+    match store.get_string(ext_name).await {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    }
+}
+
+/// Persist settings JSON for one extension on this session's DB.
+/// Overwrites any prior value.
+pub async fn write_settings(
+    session_db: &Database,
+    ext_name: &str,
+    value: serde_json::Value,
+) -> anyhow::Result<()> {
+    let serialized = serde_json::to_string(&value)?;
+    let txn = session_db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(EXTENSION_SETTINGS_STORE).await?;
+    store.set_string(ext_name, serialized).await?;
+    txn.commit().await?;
+    Ok(())
+}
 
 pub use hooks::{
     HookAgentEnd, HookBeforeAgentStart, HookSessionShutdown, HookSessionStart, HookToolCall,
@@ -279,6 +315,28 @@ pub struct HookContext {
     pub active_extensions: HashSet<String>,
 }
 
+impl HookContext {
+    /// Read the settings JSON for the named extension off the current
+    /// session's DB. Returns `json!({})` if no override is stored —
+    /// callers typically fall back to the extension's own
+    /// [`Extension::default_settings`] when keys are missing.
+    pub async fn get_settings(&self, ext_name: &str) -> serde_json::Value {
+        let session = self.session.lock().await;
+        read_settings(session.database(), ext_name).await
+    }
+
+    /// Persist a new settings blob for the named extension on this
+    /// session's DB. Overwrites any prior value.
+    pub async fn set_settings(
+        &self,
+        ext_name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let session = self.session.lock().await;
+        write_settings(session.database(), ext_name, value).await
+    }
+}
+
 /// Outcome of an extension-registered slash command.
 ///
 /// Mirrors `commands::CommandOutcome::Text`/`Error` — extensions can't
@@ -339,6 +397,15 @@ pub trait Extension: Send + Sync {
     /// `extension_api_version` identifies *which hook contract* it expects.
     fn extension_api_version(&self) -> u32 {
         1
+    }
+
+    /// Schema defaults for this extension's settings. Returned to callers
+    /// of [`HookContext::get_settings`] when no per-session override has
+    /// been written. Extensions with no configurable settings can leave
+    /// the default `json!({})` — the framework will still hand it back
+    /// uniformly.
+    fn default_settings(&self) -> serde_json::Value {
+        serde_json::json!({})
     }
 }
 
@@ -952,6 +1019,78 @@ mod tests {
         s.set("name", "session");
         let db = user.create_database(s, &key).await.unwrap();
         (instance, db)
+    }
+
+    #[tokio::test]
+    async fn settings_missing_key_returns_empty_object() {
+        let (_inst, db) = make_session_db().await;
+        let got = read_settings(&db, "memory").await;
+        assert_eq!(got, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_via_helpers() {
+        let (_inst, db) = make_session_db().await;
+        let value = serde_json::json!({
+            "max_results": 8,
+            "embedder": "nomic"
+        });
+        write_settings(&db, "memory", value.clone()).await.unwrap();
+        let got = read_settings(&db, "memory").await;
+        assert_eq!(got, value);
+    }
+
+    #[tokio::test]
+    async fn settings_for_two_extensions_dont_collide() {
+        let (_inst, db) = make_session_db().await;
+        write_settings(&db, "memory", serde_json::json!({"k": 1}))
+            .await
+            .unwrap();
+        write_settings(&db, "heartbeat", serde_json::json!({"k": 2}))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_settings(&db, "memory").await,
+            serde_json::json!({"k": 1})
+        );
+        assert_eq!(
+            read_settings(&db, "heartbeat").await,
+            serde_json::json!({"k": 2})
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_overwrite_replaces_prior_value() {
+        let (_inst, db) = make_session_db().await;
+        write_settings(&db, "x", serde_json::json!({"a": 1}))
+            .await
+            .unwrap();
+        write_settings(&db, "x", serde_json::json!({"b": 2}))
+            .await
+            .unwrap();
+        assert_eq!(read_settings(&db, "x").await, serde_json::json!({"b": 2}));
+    }
+
+    #[tokio::test]
+    async fn hook_context_settings_round_trip() {
+        // Build the ctx inline so the `Instance` stays alive for the
+        // duration of the read/write calls — `fixture_ctx` drops it
+        // before returning, which is fine for fire_* tests that don't
+        // touch the DB but not for settings ops.
+        let (_inst, db) = make_session_db().await;
+        let session = Session::new(ConversationId("conv".into()), db).await;
+        let ctx = HookContext {
+            agent_name: "test_agent".into(),
+            model: None,
+            call_depth: 0,
+            session: Arc::new(Mutex::new(session)),
+            active_extensions: HashSet::new(),
+        };
+        ctx.set_settings("heartbeat", serde_json::json!({"poll_secs": 60}))
+            .await
+            .unwrap();
+        let got = ctx.get_settings("heartbeat").await;
+        assert_eq!(got, serde_json::json!({"poll_secs": 60}));
     }
 
     #[tokio::test]
