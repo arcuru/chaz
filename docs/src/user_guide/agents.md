@@ -168,19 +168,26 @@ Mentions are case-insensitive and match exact display names. No prefix matching.
 
 ## Heartbeat rules
 
-A heartbeat rule is a cron-scheduled trigger stored inside the session. The `HeartbeatRunner` on every peer polls hosted sessions every 30s; rules targeting agents this peer hosts get fired. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
+A heartbeat rule is a time-driven trigger stored inside the session. The `HeartbeatRunner` on every peer polls hosted sessions every 30s; rules targeting agents this peer hosts get fired. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
 
-`last_fired` is tracked peer-locally in the `chaz_peer` DB's `heartbeat_last_fired` store, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
+Two rule shapes share one table:
+
+- **Cron rules** fire on a recurring schedule (`cron: "0 */5 * * * *"`). `last_fired` is tracked peer-locally in the `chaz_peer` DB's `heartbeat_last_fired` store, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
+- **One-shot rules** fire once at an absolute `fire_at` time, then delete themselves. These back the `wake_me_up` tool described in [Tools](./tools.md). They don't use `last_fired` — deletion replaces it.
+
+Both shapes are subject to up to 30 s of jitter past the scheduled time, since that's the runner's poll interval.
 
 ### `/heartbeat` commands
 
 Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
 
-| Command                                                                        | What                                                         |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------ |
-| `/heartbeat list` (or bare `/heartbeat`)                                       | List rules on the current session.                           |
-| `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a rule keyed by `<id>`. Task may contain `@mentions`. |
-| `/heartbeat remove <id>`                                                       | Remove a rule by id.                                         |
+| Command                                                                        | What                                                                                                                       |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `/heartbeat list` (or bare `/heartbeat`)                                       | List rules on the current session. One-shot rules are rendered with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of the cron. |
+| `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                          |
+| `/heartbeat remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                    |
+
+To create a one-shot rule from the TUI, agents call the `wake_me_up` tool. There's no slash-command form yet.
 
 Example — make `researcher` post a morning briefing to the current session weekdays at 09:00:
 

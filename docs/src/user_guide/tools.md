@@ -18,6 +18,11 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 | `write_file`        | Medium | UnlessAutoApproved | Writes content to a file                                              |
 | `web_fetch`         | Medium | UnlessAutoApproved | HTTP GET or POST requests                                             |
 | `spawn_agent`       | Medium | UnlessAutoApproved | Delegates a task to a sub-agent                                       |
+| `heartbeat_add`     | Low    | Never              | Schedule a recurring directive on this session                        |
+| `heartbeat_modify`  | Low    | Never              | Partial update of an existing heartbeat rule                          |
+| `heartbeat_remove`  | Low    | Never              | Delete a heartbeat rule by id                                         |
+| `heartbeat_list`    | Low    | Never              | List heartbeat rules on this session                                  |
+| `wake_me_up`        | Low    | Never              | Schedule a one-shot wakeup directive after N seconds                  |
 | `shell`             | High   | Always             | Executes a shell command                                              |
 
 ## Risk Levels
@@ -140,6 +145,35 @@ Delegates a task to another agent in a child session. See [Agents](agents.md).
   "async": false
 }
 ```
+
+### heartbeat_add / heartbeat_modify / heartbeat_remove / heartbeat_list
+
+Agent-facing CRUD over the session's heartbeat rules, mirroring the `/heartbeat` slash commands described in [Agents — Heartbeat rules](agents.md#heartbeat-rules). Rules persist in the session DB and the `HeartbeatRunner` polls them every 30 s. Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+
+```json
+{
+  "id": "morning-brief",
+  "cron": "0 0 9 * * Mon-Fri",
+  "task": "Summarize overnight activity"
+}
+```
+
+The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
+
+### wake_me_up
+
+One-shot wakeup that fires a directive into this session after a delay, then deletes itself. The directive is routed back to the calling agent — cross-agent scheduling stays in `heartbeat_add`. Use it for "come back to this in N seconds" cases; for recurring work, use `heartbeat_add` instead.
+
+```json
+{
+  "after_seconds": 1800,
+  "task": "Check whether the build finished and report status."
+}
+```
+
+- `after_seconds` is bounded to `[30, 2_592_000]` (30 seconds to 30 days).
+- The wakeup time has up to 30 s of jitter past the requested delay (poll interval).
+- Generated rule id has the form `wakeup-<epoch_ms>`; it surfaces in `/heartbeat list` and `heartbeat_list` with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of a cron expression.
 
 ## External Tools (MCP)
 
