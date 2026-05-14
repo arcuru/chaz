@@ -378,10 +378,6 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         agent_index_store.clone(),
     ));
-    tool_registry.register(tools::HeartbeatAdd::new(agent_index_store.clone()));
-    tool_registry.register(tools::HeartbeatModify::new(agent_index_store.clone()));
-    tool_registry.register(tools::HeartbeatRemove);
-    tool_registry.register(tools::HeartbeatList::new(agent_index_store.clone()));
     tool_registry.register(tools::Compact);
     // SpawnAgent / SpawnTask both route through the server — a single OnceLock
     // is shared; it's set once after Server::new below.
@@ -429,7 +425,11 @@ async fn main() -> anyhow::Result<()> {
     // (added to `tool_registry`) and wire hooks into `extension_hub`.
     // Must run before `tool_registry` is wrapped in `Arc` so contributed
     // tools land in `ScopedTools`/`ToolProfile` filtering automatically.
-    extensions::register_builtins(&mut extension_hub, &mut tool_registry);
+    extensions::register_builtins(
+        &mut extension_hub,
+        &mut tool_registry,
+        agent_index_store.clone(),
+    );
     let extension_names = extension_hub.extension_names();
     if !extension_names.is_empty() {
         info!(?extension_names, "Extensions registered");

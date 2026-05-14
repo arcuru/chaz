@@ -10,9 +10,12 @@
 //! that make sense across transports.
 //!
 //! Submodules group handlers by family:
-//! - `session`   — session CRUD, channels, compact/print, schedules, LLM config
-//! - `agent`     — Living Agents participation + lifecycle (attach/detach/new/delete/import/share/...)
-//! - `heartbeat` — per-session heartbeat rules
+//! - `session` — session CRUD, channels, compact/print, schedules, LLM config
+//! - `agent`   — Living Agents participation + lifecycle (attach/detach/new/delete/import/share/...)
+//!
+//! Heartbeat rules used to live here; they now live in
+//! [`crate::extensions::heartbeat`] as a chaz extension. The cross-session
+//! sweep helper used by `agent_delete` is in [`crate::heartbeat::sweep_for_agent`].
 
 use crate::backends::BackendManager;
 use crate::scheduler::Scheduler;
@@ -23,7 +26,6 @@ use crate::types::ConversationId;
 use std::sync::Arc;
 
 mod agent;
-mod heartbeat;
 mod memory;
 mod session;
 mod sharing;
@@ -216,19 +218,6 @@ pub enum Command {
     /// names when available and root IDs for unambiguous identification.
     SharingStatus,
 
-    // --- Heartbeat rules (Stage 4b) ---
-    /// Add or upsert a heartbeat rule on the current session.
-    HeartbeatAdd {
-        id: String,
-        cron: String,
-        agent_ref: String,
-        task: String,
-    },
-    /// Remove a heartbeat rule by id.
-    HeartbeatRemove(String),
-    /// List heartbeat rules on the current session.
-    HeartbeatList,
-
     // --- Scheduler ---
     ListSchedules,
     TriggerSchedule(String),
@@ -283,7 +272,6 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "help",
     "?",
     "agent",
-    "heartbeat",
     "memory",
     "sharing",
     "sync",
@@ -411,14 +399,6 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
         Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
         Command::SharingStatus => sharing::sharing_status(ctx).await,
-        Command::HeartbeatAdd {
-            id,
-            cron,
-            agent_ref,
-            task,
-        } => heartbeat::heartbeat_add(&id, &cron, &agent_ref, &task, ctx).await,
-        Command::HeartbeatRemove(id) => heartbeat::heartbeat_remove(&id, ctx).await,
-        Command::HeartbeatList => heartbeat::heartbeat_list(ctx).await,
         Command::ListSchedules => session::list_schedules(ctx).await,
         Command::TriggerSchedule(name) => session::trigger_schedule(&name, ctx).await,
         Command::Model(arg) => session::model(arg, ctx).await,

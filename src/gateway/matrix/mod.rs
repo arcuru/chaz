@@ -202,31 +202,6 @@ fn matrix_args(text: &str) -> String {
         .join(" ")
 }
 
-/// Parse the positional form of `!chaz heartbeat add` (mirrors TUI syntax):
-/// `<id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>`.
-/// Returns `None` if any field is missing — the caller renders a usage hint.
-fn parse_heartbeat_add(rest: &str) -> Option<Command> {
-    let mut tokens = rest.split_whitespace();
-    let id = tokens.next()?;
-    let c1 = tokens.next()?;
-    let c2 = tokens.next()?;
-    let c3 = tokens.next()?;
-    let c4 = tokens.next()?;
-    let c5 = tokens.next()?;
-    let c6 = tokens.next()?;
-    let agent_ref = tokens.next()?;
-    let task = tokens.collect::<Vec<_>>().join(" ");
-    if task.is_empty() {
-        return None;
-    }
-    Some(Command::HeartbeatAdd {
-        id: id.to_string(),
-        cron: format!("{c1} {c2} {c3} {c4} {c5} {c6}"),
-        agent_ref: agent_ref.to_string(),
-        task,
-    })
-}
-
 impl Gateway for MatrixGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let config = Arc::new(self.config);
@@ -493,26 +468,6 @@ impl Gateway for MatrixGateway {
             "".to_string(),
             "List agents attached to this session",
             |_t| { Some(Command::AgentsList) }
-        );
-        register_shared!(
-            "heartbeat",
-            "add|remove|list [args]".to_string(),
-            "Manage heartbeat rules on this session",
-            |text| {
-                let arg = matrix_args(&text);
-                let trimmed = arg.trim();
-                let mut parts = trimmed.splitn(2, char::is_whitespace);
-                let sub = parts.next().unwrap_or("").trim();
-                let rest = parts.next().unwrap_or("").trim();
-                match sub {
-                    "list" | "" => Some(Command::HeartbeatList),
-                    "remove" | "rm" if !rest.is_empty() => {
-                        Some(Command::HeartbeatRemove(rest.to_string()))
-                    }
-                    "add" => parse_heartbeat_add(rest),
-                    _ => None,
-                }
-            }
         );
         register_shared!(
             "agent",
@@ -957,6 +912,45 @@ impl Gateway for MatrixGateway {
             "List available models (alias of backends)",
             |_t| { Some(Command::ListBackends) }
         );
+
+        // --- Extension-registered slash commands ---
+        //
+        // Mirror every `ExtensionHub::register_command` registration into a
+        // headjack text command so `!chaz <name> <args…>` reaches the
+        // extension via `Command::Extension`. Built-in name reservations
+        // (see `commands::BUILTIN_COMMAND_NAMES`) keep extensions from
+        // shadowing the per-command `register_shared!` blocks above.
+        for (ext_name, ext_desc) in server.extensions().list_commands() {
+            let name_owned = ext_name.to_string();
+            let desc_owned = ext_desc.to_string();
+            let server_c = server.clone();
+            let scheduler_c = scheduler.clone();
+            let config_c = config.clone();
+            let secrets_c = self.secrets.clone();
+            bot.register_text_command(
+                &name_owned.clone(),
+                "[args...]".to_string(),
+                desc_owned,
+                move |_, text, room| {
+                    let name = name_owned.clone();
+                    let server = server_c.clone();
+                    let scheduler = scheduler_c.clone();
+                    let config = config_c.clone();
+                    let secrets = secrets_c.clone();
+                    async move {
+                        let args = matrix_args(&text);
+                        let cmd = Command::Extension { name, args };
+                        if let Err(e) =
+                            dispatch_in_room(cmd, room, server, scheduler, config, secrets).await
+                        {
+                            tracing::error!("Extension command dispatch failed: {e}");
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }
 
         // --- Matrix-only commands ---
         bot.register_text_command(

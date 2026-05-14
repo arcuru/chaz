@@ -274,6 +274,38 @@ impl HeartbeatRunner {
     }
 }
 
+/// Walk every known session and remove heartbeat rules whose target matches
+/// `target_db_id`. Returns the number of rules removed. Best-effort per
+/// session — errors are logged and skipped.
+///
+/// Used by `agent_delete` to clean up rules left orphaned when their target
+/// agent is unregistered.
+pub async fn sweep_for_agent(server: &Arc<Server>, target_db_id: &str) -> usize {
+    let sessions = match server.registry().list_sessions().await {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut removed = 0usize;
+    for idx in &sessions {
+        let Ok((_conv, sdb)) = server.registry().open_session(&idx.session_db_id).await else {
+            continue;
+        };
+        let rules = match list_rules(&sdb).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for rule in rules
+            .iter()
+            .filter(|r| r.target_agent_db_id == target_db_id)
+        {
+            if let Ok(true) = remove_rule(&sdb, &rule.id).await {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

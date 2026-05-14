@@ -652,55 +652,6 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         return None;
     }
 
-    if text == "/heartbeat" || text == "/heartbeat list" {
-        return Some(ChatAction::Dispatch(Command::HeartbeatList));
-    }
-    if let Some(arg) = text.strip_prefix("/heartbeat remove ") {
-        let id = arg.trim().to_string();
-        if !id.is_empty() {
-            return Some(ChatAction::Dispatch(Command::HeartbeatRemove(id)));
-        }
-        show_error(app, "Usage: /heartbeat remove <id>".to_string());
-        return None;
-    }
-    if let Some(arg) = text.strip_prefix("/heartbeat add ") {
-        // Syntax: /heartbeat add <id> <cron_6_fields> <agent_ref> <task...>
-        // Cron is 6 whitespace tokens (sec min hour dom mon dow) because that's
-        // what the `cron` crate expects. Splitting on whitespace keeps parsing
-        // simple; callers that want spaces in the task just type them.
-        let mut parts = arg.split_whitespace();
-        let id = parts.next();
-        let c1 = parts.next();
-        let c2 = parts.next();
-        let c3 = parts.next();
-        let c4 = parts.next();
-        let c5 = parts.next();
-        let c6 = parts.next();
-        let agent_ref = parts.next();
-        let task: String = parts.collect::<Vec<_>>().join(" ");
-        match (id, c1, c2, c3, c4, c5, c6, agent_ref) {
-            (Some(id), Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(ar))
-                if !task.is_empty() =>
-            {
-                let cron = format!("{a} {b} {c} {d} {e} {f}");
-                return Some(ChatAction::Dispatch(Command::HeartbeatAdd {
-                    id: id.to_string(),
-                    cron,
-                    agent_ref: ar.to_string(),
-                    task,
-                }));
-            }
-            _ => {
-                show_error(
-                    app,
-                    "Usage: /heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent> <task...>"
-                        .to_string(),
-                );
-                return None;
-            }
-        }
-    }
-
     if let Some(arg) = text.strip_prefix("/join ") {
         let id = arg.trim().to_string();
         if !id.is_empty() {

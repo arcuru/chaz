@@ -1,13 +1,9 @@
 //! Living Agents handlers: session participation (attach/detach/list/host)
 //! and lifecycle (new/share/import/hosted/delete).
-//!
-//! `resolve_agent_ref` is `pub(super)` because `heartbeat::heartbeat_add`
-//! also needs to resolve an agent ref to a DB id.
 
 use crate::session::Session;
 use crate::types::ConversationId;
 
-use super::heartbeat::sweep_heartbeat_rules_for_agent;
 use super::{CoOwnerPermission, CommandContext, CommandOutcome};
 
 // -----------------------------------------------------------------------------
@@ -489,7 +485,7 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
     // Also drop peer-local heartbeat rules targeting this agent across every
     // session on this peer. Rules that fire into a missing agent are silent
     // dead weight; this keeps the state clean.
-    let sweep = sweep_heartbeat_rules_for_agent(ctx, &db_id_str).await;
+    let sweep = crate::heartbeat::sweep_for_agent(ctx.server, &db_id_str).await;
 
     let mut msg = format!(
         "Deleted Living Agent '{}' (DB {} preserved for archive).",
@@ -1111,13 +1107,26 @@ mod tests {
         )
         .await;
         dispatch(Command::AgentAdd("alpha".to_string()), &ctx).await;
-        let cmd = Command::HeartbeatAdd {
-            id: "rule1".to_string(),
-            cron: "0 0 * * * *".to_string(),
-            agent_ref: "alpha".to_string(),
-            task: "ping".to_string(),
-        };
-        dispatch(cmd, &ctx).await;
+        // Seed the rule directly via the storage primitive — the dispatch
+        // surface lives in the heartbeat *extension* now and isn't wired
+        // into this fixture's hub.
+        let alpha_entry = server
+            .agent_index()
+            .find_by_name("alpha")
+            .expect("alpha registered");
+        crate::heartbeat::upsert_rule(
+            &sdb,
+            crate::heartbeat::HeartbeatRule {
+                id: "rule1".to_string(),
+                name: "rule1".to_string(),
+                cron: "0 0 * * * *".to_string(),
+                task: "ping".to_string(),
+                target_agent_db_id: alpha_entry.db_id.to_string(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
 
         // Rule exists before delete.
         let before = crate::heartbeat::list_rules(&sdb).await.unwrap();
