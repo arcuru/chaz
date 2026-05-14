@@ -2,7 +2,7 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
-use crate::commands::{Command, parse_permission_token};
+use crate::commands::{Command, ExtensionsAction, parse_permission_token};
 use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -650,6 +650,60 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         }
         show_error(app, "Usage: /sharing reject <request_id>".to_string());
         return None;
+    }
+
+    // --- /extensions: per-session framework control ---
+    if text == "/extensions" || text == "/extensions list" {
+        return Some(ChatAction::Dispatch(Command::Extensions(
+            ExtensionsAction::List,
+        )));
+    }
+    if let Some(arg) = text.strip_prefix("/extensions add ") {
+        let name = arg.trim().to_string();
+        if name.is_empty() {
+            show_error(app, "Usage: /extensions add <name>".into());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::Extensions(
+            ExtensionsAction::Add(name),
+        )));
+    }
+    if let Some(arg) = text.strip_prefix("/extensions remove ") {
+        let name = arg.trim().to_string();
+        if name.is_empty() {
+            show_error(app, "Usage: /extensions remove <name>".into());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::Extensions(
+            ExtensionsAction::Remove(name),
+        )));
+    }
+    if let Some(arg) = text.strip_prefix("/extensions settings ") {
+        let name = arg.trim().to_string();
+        if name.is_empty() {
+            show_error(app, "Usage: /extensions settings <name>".into());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::Extensions(
+            ExtensionsAction::Settings(name),
+        )));
+    }
+    if let Some(arg) = text.strip_prefix("/extensions set ") {
+        let mut parts = arg.trim().splitn(3, char::is_whitespace);
+        let name = parts.next().unwrap_or("").trim();
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        if name.is_empty() || key.is_empty() || value.is_empty() {
+            show_error(app, "Usage: /extensions set <name> <key> <value>".into());
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::Extensions(
+            ExtensionsAction::Set {
+                name: name.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+        )));
     }
 
     if let Some(arg) = text.strip_prefix("/join ") {

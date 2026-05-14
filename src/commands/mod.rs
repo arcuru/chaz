@@ -26,9 +26,12 @@ use crate::types::ConversationId;
 use std::sync::Arc;
 
 mod agent;
+mod extensions;
 mod memory;
 mod session;
 mod sharing;
+
+pub use extensions::ExtensionsAction;
 
 /// User-visible permission level for co-ownership grants on an Agent DB
 /// (Co-owned Agents Stage 10). Stays separate from eidetica's `Permission`
@@ -218,6 +221,13 @@ pub enum Command {
     /// names when available and root IDs for unambiguous identification.
     SharingStatus,
 
+    // --- Extension framework control ---
+    /// Built-in `/extensions` command. Controls per-session activation
+    /// and settings for the compile-time extensions registered on the
+    /// hub. Not an extension command — removing the framework's own
+    /// control surface would be a footgun.
+    Extensions(ExtensionsAction),
+
     // --- Scheduler ---
     ListSchedules,
     TriggerSchedule(String),
@@ -272,6 +282,7 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "help",
     "?",
     "agent",
+    "extensions",
     "memory",
     "sharing",
     "sync",
@@ -399,6 +410,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
         Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
         Command::SharingStatus => sharing::sharing_status(ctx).await,
+        Command::Extensions(action) => extensions::dispatch(action, ctx).await,
         Command::ListSchedules => session::list_schedules(ctx).await,
         Command::TriggerSchedule(name) => session::trigger_schedule(&name, ctx).await,
         Command::Model(arg) => session::model(arg, ctx).await,

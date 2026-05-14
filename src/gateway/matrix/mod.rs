@@ -1,7 +1,9 @@
 mod commands;
 mod history;
 
-use crate::commands::{self as shared_commands, Command, CommandContext, CommandOutcome};
+use crate::commands::{
+    self as shared_commands, Command, CommandContext, CommandOutcome, ExtensionsAction,
+};
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use crate::role::get_role_names;
@@ -911,6 +913,47 @@ impl Gateway for MatrixGateway {
             "".to_string(),
             "List available models (alias of backends)",
             |_t| { Some(Command::ListBackends) }
+        );
+
+        register_shared!(
+            "extensions",
+            "list|add|remove|settings|set [args]".to_string(),
+            "Per-session extension control",
+            |text| {
+                let arg = matrix_args(&text);
+                let trimmed = arg.trim();
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("").trim();
+                let rest = parts.next().unwrap_or("").trim();
+                match sub {
+                    "" | "list" => Some(Command::Extensions(ExtensionsAction::List)),
+                    "add" if !rest.is_empty() => {
+                        Some(Command::Extensions(ExtensionsAction::Add(rest.to_string())))
+                    }
+                    "remove" | "rm" if !rest.is_empty() => Some(Command::Extensions(
+                        ExtensionsAction::Remove(rest.to_string()),
+                    )),
+                    "settings" if !rest.is_empty() => Some(Command::Extensions(
+                        ExtensionsAction::Settings(rest.to_string()),
+                    )),
+                    "set" => {
+                        let mut p = rest.splitn(3, char::is_whitespace);
+                        let name = p.next().unwrap_or("").trim();
+                        let key = p.next().unwrap_or("").trim();
+                        let value = p.next().unwrap_or("").trim();
+                        if name.is_empty() || key.is_empty() || value.is_empty() {
+                            None
+                        } else {
+                            Some(Command::Extensions(ExtensionsAction::Set {
+                                name: name.to_string(),
+                                key: key.to_string(),
+                                value: value.to_string(),
+                            }))
+                        }
+                    }
+                    _ => None,
+                }
+            }
         );
 
         // --- Extension-registered slash commands ---
