@@ -9,7 +9,7 @@
 //! `runtime::execute`. Demonstrates a pure observability `tool_result`
 //! hook: read the output, log if something looks suspicious, hand it back.
 
-use crate::extension::{Extension, ExtensionHub, HookContext, HookToolResult};
+use crate::extension::{Extension, ExtensionHub, HookContext, HookKind, HookToolResult};
 use crate::security::Sanitizer;
 use std::future::Future;
 use std::pin::Pin;
@@ -21,6 +21,10 @@ pub struct SecurityWarnings;
 impl Extension for SecurityWarnings {
     fn name(&self) -> &'static str {
         "security_warnings"
+    }
+
+    fn supported_hooks(&self) -> &[HookKind] {
+        &[HookKind::ToolResult]
     }
 
     fn register(self: Arc<Self>, hub: &mut ExtensionHub) {

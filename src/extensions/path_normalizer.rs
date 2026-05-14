@@ -5,7 +5,9 @@
 //! treats as a directory and rejects. Canonicalizing the arg before
 //! execution avoids the round-trip through an error message.
 
-use crate::extension::{Extension, ExtensionHub, HookContext, HookToolCall, ToolCallDecision};
+use crate::extension::{
+    Extension, ExtensionHub, HookContext, HookKind, HookToolCall, ToolCallDecision,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,6 +17,10 @@ pub struct PathNormalizer;
 impl Extension for PathNormalizer {
     fn name(&self) -> &'static str {
         "path_normalizer"
+    }
+
+    fn supported_hooks(&self) -> &[HookKind] {
+        &[HookKind::ToolCall]
     }
 
     fn register(self: Arc<Self>, hub: &mut ExtensionHub) {

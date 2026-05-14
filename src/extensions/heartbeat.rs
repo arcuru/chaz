@@ -7,7 +7,7 @@
 //! The extension owns the *user-facing* layer only.
 
 use crate::extension::{
-    Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionHub, HookContext,
+    Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionHub, HookContext, HookKind,
 };
 use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
 use crate::hosted_index::HostedIndex;
@@ -32,6 +32,11 @@ impl HeartbeatExtension {
 impl Extension for HeartbeatExtension {
     fn name(&self) -> &'static str {
         "heartbeat"
+    }
+
+    fn supported_hooks(&self) -> &[HookKind] {
+        // Tools + slash command only; no per-event hooks today.
+        &[]
     }
 
     fn register(self: Arc<Self>, hub: &mut ExtensionHub) {

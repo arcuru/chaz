@@ -4,7 +4,7 @@
 //! extension takes the resolved list at construction time rather than
 //! re-resolving it from config (which lives outside the extension surface).
 
-use crate::extension::{Extension, ExtensionHub};
+use crate::extension::{Extension, ExtensionHub, HookKind};
 use crate::tool::ToolRegistry;
 use crate::tools::{SearchBackend, WebFetch, WebSearch};
 use std::sync::Arc;
@@ -22,6 +22,10 @@ impl WebExtension {
 impl Extension for WebExtension {
     fn name(&self) -> &'static str {
         "web"
+    }
+
+    fn supported_hooks(&self) -> &[HookKind] {
+        &[]
     }
 
     fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}

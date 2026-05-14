@@ -5,7 +5,7 @@
 //! three separate times in main.rs.
 
 use crate::embedding::Embedder;
-use crate::extension::{Extension, ExtensionHub};
+use crate::extension::{Extension, ExtensionHub, HookKind};
 use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
 use crate::tool::ToolRegistry;
@@ -35,6 +35,10 @@ impl MemoryExtension {
 impl Extension for MemoryExtension {
     fn name(&self) -> &'static str {
         "memory"
+    }
+
+    fn supported_hooks(&self) -> &[HookKind] {
+        &[]
     }
 
     fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
