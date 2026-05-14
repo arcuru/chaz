@@ -17,6 +17,7 @@
 
 pub mod caps;
 pub mod caps_inproc;
+pub mod handler;
 pub mod hooks;
 pub mod manifest;
 pub mod registry;
@@ -411,6 +412,47 @@ pub trait Extension: Send + Sync {
     fn default_settings(&self) -> serde_json::Value {
         serde_json::json!({})
     }
+
+    // ---- Cap refactor — new install path (step 5) -----------------------
+    //
+    // These methods drive the cap-based install flow added in step 5.
+    // Existing extensions get sensible defaults (manifest derived from
+    // legacy methods, no providers, empty install) so they keep working
+    // through the legacy `register` path until step 6 migrates them.
+
+    /// Static contract the extension publishes. The default derives
+    /// from [`Self::name`] + [`Self::extension_ref`] + [`Self::supported_hooks`]
+    /// and declares no caps in any direction. Extensions migrating to
+    /// the cap surface override this to declare their required /
+    /// requested / provided capabilities.
+    fn manifest(&self) -> manifest::ExtensionManifest {
+        manifest::ExtensionManifest {
+            name: self.name().to_string(),
+            extension_ref: self.extension_ref(),
+            supported_hooks: self.supported_hooks().to_vec(),
+            required_capabilities: Vec::new(),
+            requested_capabilities: Vec::new(),
+            provides_capabilities: Vec::new(),
+        }
+    }
+
+    /// Phase 1 of `install_all`: produce the cap impls this extension
+    /// publishes for others to consume. Default: no providers.
+    fn build_providers(&self) -> anyhow::Result<HashMap<caps::CapabilityKind, caps::CapProvider>> {
+        Ok(HashMap::new())
+    }
+
+    /// Phase 2 of `install_all`: receive the fully-resolved consumer
+    /// bundle and produce the per-hook + routine handlers. Default:
+    /// no handlers — extensions still using `register` keep installing
+    /// hooks the legacy way.
+    fn install<'a>(
+        &'a self,
+        _caps: caps::ExtensionCaps,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(handler::InstalledExtension::empty()) })
+    }
 }
 
 /// Internal wrapper that tags a hook handler with the extension that
@@ -471,6 +513,25 @@ pub struct ExtensionHub {
     /// callers that hit `None` are calling from the wrong place and the
     /// hub panics rather than producing un-owned handlers.
     current_registering: Option<&'static str>,
+
+    // ---- Cap refactor — step 5 -----------------------------------------
+    /// Capability registry — host-only impls plus per-kind extension
+    /// providers. Built up across `install_all`. Empty until `install_all`
+    /// runs; extensions still using the legacy `register` path leave it
+    /// empty for now.
+    cap_registry: registry::CapRegistry,
+    /// Operator-configured default-provider picks per extension-providable
+    /// kind, captured from `Config::capability_defaults` at hub construction.
+    capability_defaults: HashMap<caps::CapabilityKind, String>,
+    /// Per-extension `InstalledExtension` returned from `install`.
+    /// Populated by `install_all`; the legacy `register` path doesn't
+    /// touch this map.
+    installed: HashMap<String, handler::InstalledExtension>,
+    /// Bump on every extension-name-keyed string the hub needs to
+    /// pass to legacy methods that demand `&'static str`. Lookup-only
+    /// during the migration window; can be dropped once legacy
+    /// registration is gone.
+    name_intern: HashSet<&'static str>,
 }
 
 impl Default for ExtensionHub {
@@ -496,7 +557,32 @@ impl ExtensionHub {
             commands_by_extension: HashMap::new(),
             tools_by_extension: HashMap::new(),
             current_registering: None,
+            cap_registry: registry::CapRegistry::new(),
+            capability_defaults: HashMap::new(),
+            installed: HashMap::new(),
+            name_intern: HashSet::new(),
         }
+    }
+
+    /// Replace the hub's operator-default-provider map. Called once at
+    /// startup from chaz's main, sourcing the map from
+    /// `Config::capability_defaults`. The map is consulted from inside
+    /// [`Self::install_all`] when applying defaults to the cap registry.
+    pub fn set_capability_defaults(&mut self, defaults: HashMap<caps::CapabilityKind, String>) {
+        self.capability_defaults = defaults;
+    }
+
+    /// Snapshot of `InstalledExtension` for a registered extension.
+    /// Returns `None` for extensions still using the legacy `register`
+    /// path (their slot in `installed` is unset).
+    pub fn installed_for(&self, name: &str) -> Option<&handler::InstalledExtension> {
+        self.installed.get(name)
+    }
+
+    /// Snapshot of the cap registry. Useful for `/extensions list -v`
+    /// and similar surfaces that want to introspect provider routing.
+    pub fn cap_registry(&self) -> &registry::CapRegistry {
+        &self.cap_registry
     }
 
     /// Reserve built-in slash command names so extensions can't shadow them.
@@ -918,6 +1004,278 @@ impl ExtensionHub {
             return None;
         }
         Some(reg.handler.invoke(args, ctx).await)
+    }
+
+    // -----------------------------------------------------------------
+    // Cap refactor — install_all (step 5)
+    // -----------------------------------------------------------------
+
+    /// Drive the two-phase cap-based install for `extensions`:
+    ///
+    /// 1. Collect manifests, run per-manifest validation.
+    /// 2. Phase 1 — `build_providers()` on every extension; register
+    ///    each impl in the cap registry.
+    /// 3. Apply operator default-provider picks.
+    /// 4. Phase 2 — for each extension, build its install-time
+    ///    `ExtensionCaps` bundle, call `install(caps)`, store the
+    ///    returned `InstalledExtension`. Tool / command registrations
+    ///    buffered into pending queues during install are drained
+    ///    through the existing owner-attribution helpers so the legacy
+    ///    fire paths still see them.
+    ///
+    /// This runs alongside `register_extension`: extensions still using
+    /// the legacy `register` path leave `installed[name]` empty and
+    /// register hooks the old way. Step 6 migrates each built-in.
+    ///
+    /// Idempotent across calls: an extension already present is
+    /// skipped (its first install wins). Tools / commands collected
+    /// here flow through the legacy collision policy (first
+    /// registration wins) at drain time.
+    pub async fn install_all(&mut self, extensions: Vec<Arc<dyn Extension>>) -> anyhow::Result<()> {
+        let manifests: Vec<manifest::ExtensionManifest> =
+            extensions.iter().map(|e| e.manifest()).collect();
+        for m in &manifests {
+            m.validate()?;
+        }
+
+        // Phase 1 — every extension's providers register before any
+        // consumer install runs.
+        for (ext, m) in extensions.iter().zip(&manifests) {
+            let providers = ext.build_providers()?;
+            for (kind, provider) in providers {
+                self.cap_registry
+                    .register_provider(m.name.clone(), kind, provider)?;
+            }
+        }
+
+        // Apply operator picks + auto-default any single-provider kinds.
+        self.cap_registry
+            .apply_operator_defaults(&self.capability_defaults)?;
+
+        // Phase 2 — build a per-extension install bundle, call install,
+        // capture the returned InstalledExtension.
+        let tool_pending: Arc<Mutex<Vec<caps_inproc::PendingTool>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let command_pending: Arc<Mutex<Vec<caps_inproc::PendingCommand>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        for (ext, m) in extensions.iter().zip(&manifests) {
+            if self.installed.contains_key(&m.name) {
+                // Already installed in a prior `install_all` call; skip
+                // to keep the operation idempotent.
+                continue;
+            }
+            let caps = self.build_install_caps(m, &tool_pending, &command_pending);
+            let installed = ext.install(caps).await?;
+            self.installed.insert(m.name.clone(), installed);
+        }
+
+        // Drain pending tool / command registrations through the legacy
+        // owner-attributed registration. Same collision policy
+        // (first-write-wins) and same reverse-index bookkeeping.
+        let pending_tools = std::mem::take(&mut *tool_pending.lock().await);
+        for p in pending_tools {
+            self.register_tool_attributed(&p.owner, p.tool);
+        }
+        let pending_commands = std::mem::take(&mut *command_pending.lock().await);
+        for p in pending_commands {
+            self.register_command_attributed(&p.owner, p.descriptor.name, p.command);
+        }
+
+        Ok(())
+    }
+
+    /// Assemble the install-time consumer bundle for `manifest`.
+    ///
+    /// Install-time scope: session-scoped slots stay `None`
+    /// (session_read/write/settings — no session yet), tool and
+    /// command registration are populated with buffered impls, and
+    /// extension-providable caps resolve through the registry.
+    fn build_install_caps(
+        &self,
+        m: &manifest::ExtensionManifest,
+        tool_pending: &Arc<Mutex<Vec<caps_inproc::PendingTool>>>,
+        command_pending: &Arc<Mutex<Vec<caps_inproc::PendingCommand>>>,
+    ) -> caps::ExtensionCaps {
+        let mut bundle = caps::ExtensionCaps::empty();
+
+        // Walk required + requested; populate the slot if any matches.
+        // Required-vs-requested distinction only matters for what the
+        // extension does on missing caps (it gets `None` and decides);
+        // bundle building treats them uniformly here, since step-5
+        // hub-side enforcement of required-absence cascade lives with
+        // step-6 migration of consumers.
+        let requests = m
+            .required_capabilities
+            .iter()
+            .chain(m.requested_capabilities.iter());
+        for req in requests {
+            use caps::CapabilityKind as K;
+            match req.kind() {
+                K::SessionRead | K::SessionWrite | K::Settings => {
+                    // Session-scoped — populated at handler-fire time,
+                    // not install time.
+                }
+                K::ToolRegistration => {
+                    bundle.tool_registration =
+                        Some(Arc::new(caps_inproc::InProcToolRegistration::new(
+                            m.name.clone(),
+                            tool_pending.clone(),
+                        )));
+                }
+                K::CommandRegistration => {
+                    bundle.command_registration =
+                        Some(Arc::new(caps_inproc::InProcCommandRegistration::new(
+                            m.name.clone(),
+                            command_pending.clone(),
+                        )));
+                }
+                K::Messenger => {
+                    populate_capset(
+                        &mut bundle.messengers,
+                        &self.cap_registry,
+                        K::Messenger,
+                        req.provider(),
+                        |p| match p {
+                            caps::CapProvider::Messenger(m) => Some(m.clone()),
+                            _ => None,
+                        },
+                    );
+                }
+                K::Memory => {
+                    populate_capset(
+                        &mut bundle.memory,
+                        &self.cap_registry,
+                        K::Memory,
+                        req.provider(),
+                        |p| match p {
+                            caps::CapProvider::Memory(m) => Some(m.clone()),
+                            _ => None,
+                        },
+                    );
+                }
+            }
+        }
+        bundle
+    }
+
+    /// Intern a `String` extension name into a `&'static str`. Required
+    /// for the legacy `RegisteredHook<...>::owner: &'static str` field
+    /// the existing fire paths consult. Box-leaks once per unique name;
+    /// safe under the chaz invariant that the hub lives for the whole
+    /// process and extension names are bounded (<< 100).
+    fn intern_name(&mut self, name: &str) -> &'static str {
+        if let Some(existing) = self.name_intern.iter().find(|n| **n == name) {
+            return existing;
+        }
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        self.name_intern.insert(leaked);
+        leaked
+    }
+
+    /// Internal: register a tool against an explicit owner name without
+    /// going through `current_registering`. Used to drain the install_all
+    /// pending queues. Same first-write-wins + reverse-index policy as
+    /// the legacy `register_tool`.
+    fn register_tool_attributed(&mut self, owner: &str, tool: Arc<dyn Tool>) {
+        let owner_static = self.intern_name(owner);
+        let name = tool.descriptor().name;
+        if self.tools.contains_key(&name) {
+            warn!(
+                tool = %name,
+                extension = %owner_static,
+                "Duplicate tool registration; keeping first registration"
+            );
+            return;
+        }
+        self.note_hook(owner_static, HookKind::Tool);
+        self.tools_by_extension
+            .entry(owner_static)
+            .or_default()
+            .insert(name.clone());
+        self.tools.insert(
+            name,
+            RegisteredTool {
+                owner: owner_static,
+                tool,
+            },
+        );
+    }
+
+    /// Internal: register a slash command against an explicit owner.
+    /// Same first-write-wins + reservation policy as the legacy
+    /// `register_command`.
+    fn register_command_attributed(
+        &mut self,
+        owner: &str,
+        name: String,
+        handler: Box<dyn ExtensionCommand>,
+    ) {
+        let owner_static = self.intern_name(owner);
+        if self.reserved_command_names.contains(&name) {
+            warn!(
+                command = %name,
+                extension = %owner_static,
+                "Extension command shadows a built-in; ignoring registration"
+            );
+            return;
+        }
+        if self.commands.contains_key(&name) {
+            warn!(
+                command = %name,
+                extension = %owner_static,
+                "Duplicate extension command registration; keeping first registration"
+            );
+            return;
+        }
+        self.note_hook(owner_static, HookKind::Command);
+        self.commands_by_extension
+            .entry(owner_static)
+            .or_default()
+            .insert(name.clone());
+        self.commands.insert(
+            name,
+            RegisteredCommand {
+                owner: owner_static,
+                handler,
+            },
+        );
+    }
+}
+
+/// Resolve one extension-providable cap request into a `CapSet` slot.
+///
+/// `extractor` peels the right `Arc<dyn T>` out of `CapProvider`.
+/// Mirrors the consumer-side resolution rules: bare requests fill the
+/// `default` slot from the registry's resolved default; named
+/// requests fill the corresponding `named` entry. Misses pass through
+/// silently (consumer code checks `Option`).
+fn populate_capset<T: ?Sized>(
+    set: &mut caps::CapSet<T>,
+    reg: &registry::CapRegistry,
+    kind: caps::CapabilityKind,
+    requested_provider: Option<&str>,
+    extractor: impl Fn(&caps::CapProvider) -> Option<Arc<T>>,
+) {
+    let Some(map) = reg.by_kind.get(&kind) else {
+        return;
+    };
+    match requested_provider {
+        Some(name) => {
+            if let Some(p) = map.providers.get(name)
+                && let Some(arc) = extractor(p)
+            {
+                set.named.insert(name.into(), arc);
+            }
+        }
+        None => {
+            if let Some(default_name) = map.default.as_deref()
+                && let Some(p) = map.providers.get(default_name)
+                && let Some(arc) = extractor(p)
+            {
+                set.default = Some(arc);
+            }
+        }
     }
 }
 
@@ -1654,5 +2012,237 @@ mod tests {
             ExtensionCommandOutcome::Text(s) => assert_eq!(s, "got: x"),
             _ => panic!("expected text outcome"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // install_all coverage (cap refactor — step 5)
+    // -----------------------------------------------------------------
+
+    /// Extension that exists for the cap-install tests. Declares no
+    /// hooks, no caps; install returns the default empty
+    /// `InstalledExtension`.
+    struct MinimalCapExt(&'static str);
+    impl Extension for MinimalCapExt {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+    }
+
+    /// Extension that declares it provides a `Messenger`. Returns a
+    /// no-op impl from `build_providers`.
+    struct ProvidingExt(&'static str);
+    impl ProvidingExt {
+        fn provider() -> caps::CapProvider {
+            struct NoopMessenger;
+            impl caps::Messenger for NoopMessenger {
+                fn send<'a>(
+                    &'a self,
+                    _target: String,
+                    _body: caps::MessageBody,
+                ) -> caps::CapFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+            }
+            caps::CapProvider::Messenger(Arc::new(NoopMessenger))
+        }
+    }
+    impl Extension for ProvidingExt {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+        fn manifest(&self) -> manifest::ExtensionManifest {
+            manifest::ExtensionManifest {
+                name: self.0.to_string(),
+                extension_ref: ExtensionRef::builtin(self.0),
+                supported_hooks: Vec::new(),
+                required_capabilities: Vec::new(),
+                requested_capabilities: Vec::new(),
+                provides_capabilities: vec![caps::CapabilityKind::Messenger],
+            }
+        }
+        fn build_providers(
+            &self,
+        ) -> anyhow::Result<HashMap<caps::CapabilityKind, caps::CapProvider>> {
+            Ok([(caps::CapabilityKind::Messenger, Self::provider())]
+                .into_iter()
+                .collect())
+        }
+    }
+
+    /// Extension that requires a `Messenger` (bare — default provider).
+    /// `install` reaches into the bundle, asserts the messenger slot
+    /// is filled, and returns an empty `InstalledExtension`.
+    struct ConsumingExt(&'static str);
+    impl Extension for ConsumingExt {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+        fn manifest(&self) -> manifest::ExtensionManifest {
+            manifest::ExtensionManifest {
+                name: self.0.to_string(),
+                extension_ref: ExtensionRef::builtin(self.0),
+                supported_hooks: Vec::new(),
+                required_capabilities: vec![caps::CapabilityRequest::Messenger { provider: None }],
+                requested_capabilities: Vec::new(),
+                provides_capabilities: Vec::new(),
+            }
+        }
+        fn install<'a>(
+            &'a self,
+            caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if caps.messengers.default.is_none() {
+                    return Err(anyhow::anyhow!("expected default messenger"));
+                }
+                Ok(handler::InstalledExtension::empty())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn install_all_minimal_extension_is_a_noop() {
+        let mut hub = ExtensionHub::new();
+        hub.install_all(vec![Arc::new(MinimalCapExt("solo"))])
+            .await
+            .unwrap();
+        // No providers registered, no tools / commands drained.
+        assert!(hub.installed_for("solo").is_some());
+        assert!(hub.installed_for("solo").unwrap().is_empty());
+        assert!(
+            hub.cap_registry()
+                .providers_for(caps::CapabilityKind::Messenger)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn install_all_wires_provider_into_consumer_via_auto_default() {
+        // Single Messenger provider → auto-default → bare consumer
+        // request resolves to it.
+        let mut hub = ExtensionHub::new();
+        hub.install_all(vec![
+            Arc::new(ProvidingExt("matrix")),
+            Arc::new(ConsumingExt("notifier")),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hub.cap_registry()
+                .default_provider_for(caps::CapabilityKind::Messenger),
+            Some("matrix")
+        );
+        assert!(hub.installed_for("notifier").is_some());
+        assert!(hub.installed_for("matrix").is_some());
+    }
+
+    #[tokio::test]
+    async fn install_all_with_operator_default_overrides_auto() {
+        // Two providers, no auto-default → operator must pick.
+        let mut hub = ExtensionHub::new();
+        hub.set_capability_defaults(
+            [(caps::CapabilityKind::Messenger, "email".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        hub.install_all(vec![
+            Arc::new(ProvidingExt("matrix")),
+            Arc::new(ProvidingExt("email")),
+            Arc::new(ConsumingExt("notifier")),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hub.cap_registry()
+                .default_provider_for(caps::CapabilityKind::Messenger),
+            Some("email")
+        );
+    }
+
+    #[tokio::test]
+    async fn install_all_unknown_operator_default_errors() {
+        let mut hub = ExtensionHub::new();
+        hub.set_capability_defaults(
+            [(caps::CapabilityKind::Messenger, "ghost".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let err = hub
+            .install_all(vec![Arc::new(ProvidingExt("matrix"))])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ghost"),
+            "error should mention bad provider: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_all_missing_required_provider_does_not_silently_pass() {
+        // ConsumingExt requires a default Messenger; with no provider,
+        // its `install` returns an error which install_all propagates.
+        let mut hub = ExtensionHub::new();
+        let err = hub
+            .install_all(vec![Arc::new(ConsumingExt("notifier"))])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("messenger"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn install_all_is_idempotent() {
+        let mut hub = ExtensionHub::new();
+        let ext: Arc<dyn Extension> = Arc::new(MinimalCapExt("solo"));
+        hub.install_all(vec![ext.clone()]).await.unwrap();
+        hub.install_all(vec![ext]).await.unwrap();
+        // Same `installed` slot; provider registry untouched.
+        assert!(hub.installed_for("solo").is_some());
+    }
+
+    #[tokio::test]
+    async fn install_all_validates_manifests_before_phase_1() {
+        // Manifest with empty name — should reject before any
+        // provider registration runs.
+        struct BadManifestExt;
+        impl Extension for BadManifestExt {
+            fn name(&self) -> &'static str {
+                "named-in-trait-but-not-in-manifest"
+            }
+            fn supported_hooks(&self) -> &[HookKind] {
+                &[]
+            }
+            fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+            fn manifest(&self) -> manifest::ExtensionManifest {
+                manifest::ExtensionManifest {
+                    name: String::new(), // <-- triggers EmptyName
+                    extension_ref: ExtensionRef::builtin("x"),
+                    supported_hooks: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    requested_capabilities: Vec::new(),
+                    provides_capabilities: Vec::new(),
+                }
+            }
+        }
+        let mut hub = ExtensionHub::new();
+        let err = hub
+            .install_all(vec![Arc::new(BadManifestExt)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("name"), "got: {err}");
     }
 }
