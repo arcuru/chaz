@@ -30,7 +30,7 @@ lazy_static = "1"
 regex = "1"
 dirs = "5"
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "byot", "chat-completion"] }
-eidetica = { git = "https://github.com/arcuru/eidetica", rev = "17b85c069491d4225811e2ff1b526134e89dc766", features = ["sqlite"] }
+eidetica = { git = "https://github.com/arcuru/eidetica", rev = "d0cc682a1a8c605385ddc60acc01754801514127", features = ["sqlite"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
 meval = "0.2"

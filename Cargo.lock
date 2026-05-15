@@ -1824,7 +1824,7 @@ dependencies = [
 [[package]]
 name = "eidetica"
 version = "0.2.0"
-source = "git+https://github.com/arcuru/eidetica?rev=17b85c069491d4225811e2ff1b526134e89dc766#17b85c069491d4225811e2ff1b526134e89dc766"
+source = "git+https://github.com/arcuru/eidetica?rev=d0cc682a1a8c605385ddc60acc01754801514127#d0cc682a1a8c605385ddc60acc01754801514127"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1845,6 +1845,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest 0.12.28",
  "serde",
+ "serde_bytes",
  "serde_ipld_dagcbor",
  "serde_json",
  "sqlx",
