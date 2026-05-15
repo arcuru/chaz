@@ -585,6 +585,59 @@ impl ExtensionHub {
         &self.cap_registry
     }
 
+    /// Dispatch one routine fire to the named extension's routine
+    /// handler (added in step 8 of the cap refactor).
+    ///
+    /// Returns `Ok(())` if dispatch succeeded (the handler returned
+    /// `Ok`); `Err(...)` if the handler errored, the extension isn't
+    /// installed, or the installed extension didn't register a
+    /// routine handler. The engine's failure-handling pass uses the
+    /// `Err` path to drive `consecutive_failures` / auto-disable.
+    pub async fn dispatch_routine(
+        &self,
+        extension: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let installed = self.installed.get(extension).ok_or_else(|| {
+            anyhow::anyhow!("no installed extension named '{extension}' to dispatch routine to")
+        })?;
+        let handler = installed.routine_handler.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "extension '{extension}' has no routine_handler — declare it in install()"
+            )
+        })?;
+        // Engine fires are global today — no calling session. Build a
+        // routine-time bundle: extension-providable caps from the
+        // registry's per-kind defaults, host-only slots stay `None`
+        // (handlers using SessionWrite must be invoked with a
+        // per-session bundle that step 9 wires through the heartbeat
+        // path).
+        let caps = self.build_routine_caps();
+        handler.on_fire(&caps, payload).await
+    }
+
+    /// Assemble the routine-fire caps bundle for engine dispatch.
+    /// Today: extension-providable caps' default providers only.
+    fn build_routine_caps(&self) -> caps::ExtensionCaps {
+        let mut bundle = caps::ExtensionCaps::empty();
+        if let Some(map) = self
+            .cap_registry
+            .by_kind
+            .get(&caps::CapabilityKind::Messenger)
+            && let Some(default_name) = map.default.as_deref()
+            && let Some(caps::CapProvider::Messenger(m)) = map.providers.get(default_name)
+        {
+            bundle.messengers.default = Some(m.clone());
+        }
+        if let Some(map) = self.cap_registry.by_kind.get(&caps::CapabilityKind::Memory)
+            && let Some(default_name) = map.default.as_deref()
+            && let Some(caps::CapProvider::Memory(m)) = map.providers.get(default_name)
+        {
+            bundle.memory.default = Some(m.clone());
+        }
+        bundle
+    }
+
     /// Reserve built-in slash command names so extensions can't shadow them.
     pub fn reserve_builtin_commands<I, S>(&mut self, names: I)
     where
@@ -2212,6 +2265,145 @@ mod tests {
         hub.install_all(vec![ext]).await.unwrap();
         // Same `installed` slot; provider registry untouched.
         assert!(hub.installed_for("solo").is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // dispatch_routine coverage (cap refactor — step 8)
+    // -----------------------------------------------------------------
+
+    /// Extension whose `install` registers a routine handler that
+    /// records every payload it receives.
+    struct RoutineRecorderExt {
+        name: &'static str,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl Extension for RoutineRecorderExt {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+        fn install<'a>(
+            &'a self,
+            _caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                struct Recorder {
+                    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+                }
+                impl handler::RoutineHandler for Recorder {
+                    fn on_fire<'a>(
+                        &'a self,
+                        _caps: &'a caps::ExtensionCaps,
+                        payload: serde_json::Value,
+                    ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
+                        let seen = self.seen.clone();
+                        Box::pin(async move {
+                            seen.lock().unwrap().push(payload);
+                            Ok(())
+                        })
+                    }
+                }
+                let mut installed = handler::InstalledExtension::empty();
+                installed.routine_handler = Some(Box::new(Recorder { seen }));
+                Ok(installed)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_invokes_registered_handler() {
+        let mut hub = ExtensionHub::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        hub.install_all(vec![Arc::new(RoutineRecorderExt {
+            name: "heartbeat",
+            seen: seen.clone(),
+        })])
+        .await
+        .unwrap();
+
+        hub.dispatch_routine("heartbeat", serde_json::json!({"task": "ping"}))
+            .await
+            .unwrap();
+
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], serde_json::json!({"task": "ping"}));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_unknown_extension_errors() {
+        let hub = ExtensionHub::new();
+        let err = hub
+            .dispatch_routine("ghost", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ghost"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_extension_without_handler_errors() {
+        // Install an extension that doesn't override `install` — its
+        // default returns an empty `InstalledExtension` with no
+        // routine handler.
+        let mut hub = ExtensionHub::new();
+        hub.install_all(vec![Arc::new(MinimalCapExt("solo"))])
+            .await
+            .unwrap();
+        let err = hub
+            .dispatch_routine("solo", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("routine_handler"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_handler_error_propagates() {
+        struct ErroringExt;
+        impl Extension for ErroringExt {
+            fn name(&self) -> &'static str {
+                "broken"
+            }
+            fn supported_hooks(&self) -> &[HookKind] {
+                &[]
+            }
+            fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+            fn install<'a>(
+                &'a self,
+                _caps: caps::ExtensionCaps,
+            ) -> Pin<
+                Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>,
+            > {
+                Box::pin(async {
+                    struct AlwaysFails;
+                    impl handler::RoutineHandler for AlwaysFails {
+                        fn on_fire<'a>(
+                            &'a self,
+                            _caps: &'a caps::ExtensionCaps,
+                            _payload: serde_json::Value,
+                        ) -> handler::HandlerFuture<'a, anyhow::Result<()>>
+                        {
+                            Box::pin(async { Err(anyhow::anyhow!("simulated failure")) })
+                        }
+                    }
+                    let mut installed = handler::InstalledExtension::empty();
+                    installed.routine_handler = Some(Box::new(AlwaysFails));
+                    Ok(installed)
+                })
+            }
+        }
+        let mut hub = ExtensionHub::new();
+        hub.install_all(vec![Arc::new(ErroringExt)]).await.unwrap();
+        let err = hub
+            .dispatch_routine("broken", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated"), "got: {err}");
     }
 
     #[tokio::test]

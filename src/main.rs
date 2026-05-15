@@ -20,6 +20,7 @@ mod memory_bank_db;
 mod openai;
 mod persona;
 mod role;
+mod routine;
 mod runtime;
 mod scheduler;
 mod security;
