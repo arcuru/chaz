@@ -1107,39 +1107,44 @@ mod tests {
         )
         .await;
         dispatch(Command::AgentAdd("alpha".to_string()), &ctx).await;
-        // Seed the rule directly via the storage primitive — the dispatch
-        // surface lives in the heartbeat *extension* now and isn't wired
-        // into this fixture's hub.
+        // Seed the routine directly via the storage primitive — the
+        // dispatch surface lives in the heartbeat *extension* now and
+        // isn't wired into this fixture's hub.
         let alpha_entry = server
             .agent_index()
             .find_by_name("alpha")
             .expect("alpha registered");
-        crate::heartbeat::upsert_rule(
-            &sdb,
-            crate::heartbeat::HeartbeatRule {
-                id: "rule1".to_string(),
-                name: "rule1".to_string(),
-                cron: "0 0 * * * *".to_string(),
-                fire_at: None,
-                task: "ping".to_string(),
-                target_agent_db_id: alpha_entry.db_id.to_string(),
-                enabled: true,
-            },
-        )
-        .await
+        let payload = serde_json::to_value(crate::extensions::heartbeat::HeartbeatPayload {
+            rule_name: "rule1".into(),
+            target_agent_db_id: alpha_entry.db_id.to_string(),
+            task: "ping".into(),
+            is_one_shot: false,
+        })
         .unwrap();
+        let routine = crate::routine::Routine::cron(
+            crate::routine::RoutineId::new("rule1"),
+            "rule1",
+            "0 0 * * * *",
+            crate::routine::RoutineTarget {
+                extension: "heartbeat".into(),
+                payload,
+            },
+        );
+        crate::routine::upsert_session_routine(&sdb, &routine)
+            .await
+            .unwrap();
 
-        // Rule exists before delete.
-        let before = crate::heartbeat::list_rules(&sdb).await.unwrap();
+        // Routine exists before delete.
+        let before = crate::routine::list_session_routines(&sdb).await.unwrap();
         assert_eq!(before.len(), 1);
 
         // Detach first (delete refuses while attached), then delete.
         dispatch(Command::AgentRemove("alpha".to_string()), &ctx).await;
-        // Detach-side cleanup should already have removed the rule.
-        let after_detach = crate::heartbeat::list_rules(&sdb).await.unwrap();
+        // Detach-side cleanup should already have removed the routine.
+        let after_detach = crate::routine::list_session_routines(&sdb).await.unwrap();
         assert!(
             after_detach.is_empty(),
-            "detach should sweep heartbeat rules, got {after_detach:?}"
+            "detach should sweep heartbeat routines, got {after_detach:?}"
         );
     }
 

@@ -1,327 +1,52 @@
-//! Heartbeat rules — Living Agents Stage 4b.
+//! Heartbeat support helpers.
 //!
-//! A heartbeat rule is a time-driven trigger stored *inside* a session's DB.
-//! Two shapes share one table:
-//!   - **Cron rules** fire on a recurring schedule (`cron: "0 */5 * * * *"`).
-//!   - **One-shot rules** fire once at an absolute time (`fire_at:
-//!     DateTime<Utc>`), then delete themselves. These back the `wake_me_up`
-//!     tool — agent-initiated "ping me in 30 minutes" wakeups.
+//! Per-session heartbeat rules now live as [`crate::routine::Routine`]
+//! rows under the session DB's `routines` table; firing goes through
+//! [`crate::routine::RoutineEngine`] once it's spawned (commit E).
 //!
-//! Each peer periodically scans every session it knows about, looks at the
-//! rules in that session, and fires any that are both (a) due and (b)
-//! targeted at an agent this peer hosts (i.e. whose pubkey appears in the
-//! local `agent_index`).
+//! This module retains two narrow surfaces during the migration:
 //!
-//! Firing a rule writes a Directive entry to the session — the same
-//! mechanism `spawn_agent` and the config scheduler already use. The
-//! server callback path then hands the directive to the target agent via
-//! the Stage 4a mention-aware router (rules can say `@agent ...` in the
-//! `task` text to pin the turn).
-//!
-//! `last_fired` is peer-local (`chaz_peer.heartbeat_last_fired`) rather than
-//! a rule-DB field because multiple peers may host the same rule's target
-//! agent, and each peer fires independently. Keeping `last_fired` out of the
-//! synced DB avoids cross-peer fire-coordination churn. One-shot rules don't
-//! use `last_fired` — they're deleted on fire instead.
+//! * [`sweep_for_agent`] — used by `agent_delete` to drop routines left
+//!   orphaned when their target agent is unregistered. Now operates on
+//!   Routine rows whose payload deserializes to [`HeartbeatPayload`].
+//! * [`HeartbeatRunner`] — a no-op stub whose `start()` survives only
+//!   to keep `main.rs`'s call site compiling until commit F deletes it.
 
 #![allow(dead_code)]
 
-use crate::hosted_index::HostedIndex;
+use crate::extensions::heartbeat::HeartbeatPayload;
+use crate::routine::{list_session_routines, remove_session_routine};
 use crate::server::Server;
-use crate::session::{EntryType, Session, SessionEntry};
-use crate::types::ConversationId;
-use chrono::{DateTime, Utc};
-use cron::Schedule;
 use eidetica::Database;
-use eidetica::store::{DocStore, Table};
-use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
 
-pub const RULES_STORE: &str = "rules";
-const LAST_FIRED_STORE: &str = "heartbeat_last_fired";
-
-/// A scheduled rule living inside a session's `rules` table.
-///
-/// `fire_at == Some(_)` marks the rule as one-shot: it fires once when wall
-/// time reaches `fire_at` and is then deleted. `cron` is ignored in that case.
-/// `fire_at == None` is a recurring cron rule driven by `cron`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HeartbeatRule {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub cron: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fire_at: Option<DateTime<Utc>>,
-    pub task: String,
-    pub target_agent_db_id: String,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-}
-
-impl HeartbeatRule {
-    pub fn is_one_shot(&self) -> bool {
-        self.fire_at.is_some()
-    }
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-/// Upsert a rule by `id` into the session's rules table.
-pub async fn upsert_rule(session_db: &Database, rule: HeartbeatRule) -> anyhow::Result<()> {
-    let txn = session_db.new_transaction().await?;
-    let store = txn.get_store::<Table<HeartbeatRule>>(RULES_STORE).await?;
-    // Upsert keyed by rule.id — search for existing, then set or insert.
-    let existing = store.search(|r| r.id == rule.id).await?;
-    if let Some((key, _)) = existing.into_iter().next() {
-        store.set(&key, rule).await?;
-    } else {
-        store.insert(rule).await?;
-    }
-    txn.commit().await?;
-    Ok(())
-}
-
-/// Remove a rule by id. Returns true if one was removed.
-pub async fn remove_rule(session_db: &Database, rule_id: &str) -> anyhow::Result<bool> {
-    let txn = session_db.new_transaction().await?;
-    let store = txn.get_store::<Table<HeartbeatRule>>(RULES_STORE).await?;
-    let existing = store.search(|r| r.id == rule_id).await?;
-    let mut removed = false;
-    for (key, _) in existing {
-        if store.delete(&key).await? {
-            removed = true;
-        }
-    }
-    txn.commit().await?;
-    Ok(removed)
-}
-
-/// List all rules on a session.
-pub async fn list_rules(session_db: &Database) -> anyhow::Result<Vec<HeartbeatRule>> {
-    let txn = session_db.new_transaction().await?;
-    let store = txn.get_store::<Table<HeartbeatRule>>(RULES_STORE).await?;
-    let rows = store.search(|_| true).await?;
-    Ok(rows.into_iter().map(|(_, r)| r).collect())
-}
-
-/// Peer-local timestamp of the last successful fire for a given rule.
-async fn load_last_fired(chaz_peer: &Database, rule_id: &str) -> Option<DateTime<Utc>> {
-    let txn = chaz_peer.new_transaction().await.ok()?;
-    let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await.ok()?;
-    let iso = store.get_string(rule_id).await.ok()?;
-    DateTime::parse_from_rfc3339(&iso)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
-async fn save_last_fired(
-    chaz_peer: &Database,
-    rule_id: &str,
-    when: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    let txn = chaz_peer.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await?;
-    store.set_string(rule_id, when.to_rfc3339()).await?;
-    txn.commit().await?;
-    Ok(())
-}
-
-/// Background runner: polls every `poll_interval`, fires due rules targeting
-/// agents this peer hosts.
-pub struct HeartbeatRunner {
-    server: Arc<Server>,
-    chaz_peer: Database,
-    poll_interval: Duration,
-    stopped: Arc<Mutex<bool>>,
-}
+/// Per-session heartbeat runner — gutted for the cap-refactor migration
+/// window. Routine firing moves to [`crate::routine::RoutineEngine`]
+/// once chaz's `main` spawns it (commit E). The struct + its `start()`
+/// method survive this commit only so `main.rs`'s call site keeps
+/// compiling. Commit F deletes them.
+pub struct HeartbeatRunner;
 
 impl HeartbeatRunner {
-    pub fn new(server: Arc<Server>, chaz_peer: Database) -> Arc<Self> {
-        Arc::new(Self {
-            server,
-            chaz_peer,
-            poll_interval: Duration::from_secs(30),
-            stopped: Arc::new(Mutex::new(false)),
-        })
+    pub fn new(_server: Arc<Server>, _chaz_peer: Database) -> Arc<Self> {
+        Arc::new(Self)
     }
 
     pub fn start(self: &Arc<Self>) {
-        let runner = self.clone();
-        tokio::spawn(async move {
-            runner.run_loop().await;
-        });
-    }
-
-    async fn run_loop(&self) {
-        info!(
-            poll_interval_secs = self.poll_interval.as_secs(),
-            "Heartbeat runner started"
-        );
-        loop {
-            if *self.stopped.lock().await {
-                return;
-            }
-            if let Err(e) = self.tick().await {
-                warn!("Heartbeat tick failed: {e}");
-            }
-            tokio::time::sleep(self.poll_interval).await;
-        }
-    }
-
-    /// Single pass: enumerate sessions, check their rules, fire due ones.
-    pub async fn tick(&self) -> anyhow::Result<()> {
-        let sessions = self.server.registry().list_sessions().await?;
-        for index in sessions {
-            let session_db_id = index.session_db_id.clone();
-            let Ok((_conv, session_db)) = self.server.registry().open_session(&session_db_id).await
-            else {
-                continue;
-            };
-            let rules = match list_rules(&session_db).await {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!(session = %session_db_id, "No rules or read failed: {e}");
-                    continue;
-                }
-            };
-            for rule in rules {
-                if let Err(e) = self
-                    .maybe_fire(
-                        &session_db_id,
-                        &session_db,
-                        &rule,
-                        self.server.agent_index(),
-                    )
-                    .await
-                {
-                    warn!(rule = %rule.id, "Fire check failed: {e}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn maybe_fire(
-        &self,
-        session_db_id: &str,
-        session_db: &Database,
-        rule: &HeartbeatRule,
-        agent_index: &HostedIndex,
-    ) -> anyhow::Result<()> {
-        if !rule.enabled {
-            return Ok(());
-        }
-
-        // Do we host the target agent on this peer?
-        let Ok(id) = eidetica::entry::ID::parse(&rule.target_agent_db_id) else {
-            debug!(rule = %rule.id, "Rule target_agent_db_id unparseable");
-            return Ok(());
-        };
-        let Some(_entry) = agent_index.find_by_id(&id) else {
-            return Ok(()); // Not our agent; silently skip.
-        };
-
-        let now = Utc::now();
-        let due = if let Some(fire_at) = rule.fire_at {
-            // One-shot: due once wall time reaches `fire_at`. No bootstrap, no
-            // last_fired bookkeeping — fired rules are deleted below.
-            now >= fire_at
-        } else {
-            // Cron: bootstrap on first observation, then fire when the next
-            // scheduled occurrence after `last_fired` is in the past.
-            let schedule = match Schedule::from_str(&rule.cron) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(rule = %rule.id, cron = %rule.cron, "Invalid cron: {e}");
-                    return Ok(());
-                }
-            };
-            let last = match load_last_fired(&self.chaz_peer, &rule.id).await {
-                Some(t) => t,
-                None => {
-                    // `schedule.after(now).next()` is always strictly in the
-                    // future, so the first observation would never fire under
-                    // a `next > now` check. Seed last_fired and skip this tick.
-                    save_last_fired(&self.chaz_peer, &rule.id, now).await?;
-                    debug!(rule = %rule.id, "Bootstrapped last_fired for new heartbeat rule");
-                    return Ok(());
-                }
-            };
-            let Some(next) = schedule.after(&last).next() else {
-                return Ok(());
-            };
-            next <= now
-        };
-
-        if !due {
-            return Ok(());
-        }
-
-        info!(
-            rule = %rule.id,
-            session = %session_db_id,
-            target_agent = %rule.target_agent_db_id,
-            kind = if rule.is_one_shot() { "one-shot" } else { "cron" },
-            "Firing heartbeat rule"
-        );
-
-        let mut session = Session::new(
-            ConversationId(session_db_id.to_string()),
-            session_db.clone(),
-        )
-        .await;
-        let content = if rule.is_one_shot() {
-            format!(
-                "Wakeup '{}' at {}.\n\n{}",
-                rule.name,
-                now.format("%Y-%m-%d %H:%M:%S UTC"),
-                rule.task
-            )
-        } else {
-            format!(
-                "Heartbeat '{}' at {}.\n\n{}",
-                rule.name,
-                now.format("%Y-%m-%d %H:%M:%S UTC"),
-                rule.task
-            )
-        };
-        session
-            .add_entry(SessionEntry {
-                sender: "heartbeat".to_string(),
-                content,
-                timestamp: now,
-                entry_type: EntryType::Directive,
-                metadata: None,
-            })
-            .await;
-
-        if rule.is_one_shot() {
-            // Delete the rule so it can't fire twice. Errors here are logged
-            // but non-fatal — worst case the next tick fires it again.
-            if let Err(e) = remove_rule(session_db, &rule.id).await {
-                error!(rule = %rule.id, "Failed to delete one-shot rule after firing: {e}");
-            }
-        } else if let Err(e) = save_last_fired(&self.chaz_peer, &rule.id, now).await {
-            error!(rule = %rule.id, "Failed to persist last_fired: {e}");
-        }
-
-        Ok(())
+        // Intentionally no-op: per-session heartbeats fire through the
+        // routine engine once it's spawned. Rules added between this
+        // commit and commit E sit in the routines table until the
+        // engine picks them up.
     }
 }
 
-/// Walk every known session and remove heartbeat rules whose target matches
-/// `target_db_id`. Returns the number of rules removed. Best-effort per
-/// session — errors are logged and skipped.
+/// Walk every known session and remove heartbeat routine rows whose
+/// payload targets `target_db_id`. Returns the number removed.
 ///
-/// Used by `agent_delete` to clean up rules left orphaned when their target
-/// agent is unregistered.
+/// Used by `agent_delete` to clean up routines left orphaned when their
+/// target agent is unregistered. Rows whose payload doesn't deserialize
+/// as a heartbeat payload (e.g. some other extension wrote into the
+/// session's `routines` table) are skipped, not removed.
 pub async fn sweep_for_agent(server: &Arc<Server>, target_db_id: &str) -> usize {
     let sessions = match server.registry().list_sessions().await {
         Ok(s) => s,
@@ -332,129 +57,23 @@ pub async fn sweep_for_agent(server: &Arc<Server>, target_db_id: &str) -> usize 
         let Ok((_conv, sdb)) = server.registry().open_session(&idx.session_db_id).await else {
             continue;
         };
-        let rules = match list_rules(&sdb).await {
+        let routines = match list_session_routines(&sdb).await {
             Ok(r) => r,
             Err(_) => continue,
         };
-        for rule in rules
-            .iter()
-            .filter(|r| r.target_agent_db_id == target_db_id)
-        {
-            if let Ok(true) = remove_rule(&sdb, &rule.id).await {
+        for r in routines {
+            let Ok(payload): Result<HeartbeatPayload, _> =
+                serde_json::from_value(r.target.payload.clone())
+            else {
+                continue;
+            };
+            if payload.target_agent_db_id != target_db_id {
+                continue;
+            }
+            if let Ok(true) = remove_session_routine(&sdb, &r.id).await {
                 removed += 1;
             }
         }
     }
     removed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eidetica::Instance;
-    use eidetica::backend::database::InMemory;
-    use eidetica::crdt::Doc;
-    use eidetica::user::User;
-
-    async fn test_session_db() -> (Instance, User, Database) {
-        let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let mut user = instance.login_user("test", None).await.unwrap();
-        let key = user.get_default_key().unwrap();
-        let mut s = Doc::new();
-        s.set("name", "session");
-        let db = user.create_database(s, &key).await.unwrap();
-        (instance, user, db)
-    }
-
-    fn rule(id: &str, cron: &str, target: &str) -> HeartbeatRule {
-        HeartbeatRule {
-            id: id.to_string(),
-            name: format!("rule-{id}"),
-            cron: cron.to_string(),
-            fire_at: None,
-            task: "do a thing".to_string(),
-            target_agent_db_id: target.to_string(),
-            enabled: true,
-        }
-    }
-
-    fn one_shot_rule(id: &str, fire_at: DateTime<Utc>, target: &str) -> HeartbeatRule {
-        HeartbeatRule {
-            id: id.to_string(),
-            name: format!("wake-{id}"),
-            cron: String::new(),
-            fire_at: Some(fire_at),
-            task: "wake-up task".to_string(),
-            target_agent_db_id: target.to_string(),
-            enabled: true,
-        }
-    }
-
-    #[tokio::test]
-    async fn rule_upsert_list_remove() {
-        let (_i, _u, db) = test_session_db().await;
-        upsert_rule(&db, rule("r1", "0 0 * * * *", "sha256:aaa"))
-            .await
-            .unwrap();
-        upsert_rule(&db, rule("r2", "0 0 * * * *", "sha256:bbb"))
-            .await
-            .unwrap();
-        assert_eq!(list_rules(&db).await.unwrap().len(), 2);
-
-        // Upsert r1 (modify task).
-        let mut updated = rule("r1", "0 0 * * * *", "sha256:aaa");
-        updated.task = "updated".into();
-        upsert_rule(&db, updated.clone()).await.unwrap();
-        let all = list_rules(&db).await.unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all.iter().find(|r| r.id == "r1").unwrap().task, "updated");
-
-        assert!(remove_rule(&db, "r1").await.unwrap());
-        assert_eq!(list_rules(&db).await.unwrap().len(), 1);
-        // Removing again is a no-op.
-        assert!(!remove_rule(&db, "r1").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn last_fired_round_trip() {
-        let (_i, _u, db) = test_session_db().await;
-        assert!(load_last_fired(&db, "r1").await.is_none());
-        let now = Utc::now();
-        save_last_fired(&db, "r1", now).await.unwrap();
-        let read = load_last_fired(&db, "r1").await.unwrap();
-        // Truncated to RFC3339 (ns precision), compare to within a second.
-        assert!((now - read).num_milliseconds().abs() < 1000);
-    }
-
-    #[tokio::test]
-    async fn one_shot_rule_round_trips_through_table() {
-        let (_i, _u, db) = test_session_db().await;
-        let when = Utc::now() + chrono::Duration::seconds(60);
-        let r = one_shot_rule("wake-1", when, "sha256:aaa");
-        upsert_rule(&db, r.clone()).await.unwrap();
-        let listed = list_rules(&db).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        let got = &listed[0];
-        assert!(got.is_one_shot());
-        assert_eq!(got.fire_at, Some(when));
-        assert!(got.cron.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cron_rule_serializes_without_fire_at_field() {
-        // Deserializing an old-shape rule (no fire_at on disk) yields None.
-        let json = r#"{
-            "id": "old",
-            "name": "old",
-            "cron": "0 */5 * * * *",
-            "task": "do thing",
-            "target_agent_db_id": "sha256:zzz",
-            "enabled": true
-        }"#;
-        let parsed: HeartbeatRule = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.fire_at, None);
-        assert!(!parsed.is_one_shot());
-    }
 }

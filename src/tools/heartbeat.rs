@@ -11,18 +11,54 @@
 //!   - `heartbeat_remove` — delete by id
 //!   - `heartbeat_list`   — list rules on this session
 //!
-//! Rules live in the session DB (via `crate::heartbeat::{upsert_rule,
-//! remove_rule, list_rules}`), so they sync and survive restarts. `HeartbeatRunner`
-//! picks them up on its next tick.
+//! Rules live in the session DB as [`Routine`] rows whose `target.payload`
+//! deserializes to [`HeartbeatPayload`]. The routine engine picks them up
+//! and dispatches them through the heartbeat extension's `RoutineHandler`.
 
-use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
+use crate::extensions::heartbeat::HeartbeatPayload;
 use crate::hosted_index::{DbEntry, HostedIndex};
+use crate::routine::{
+    Routine, RoutineId, RoutineTarget, Trigger, list_session_routines, remove_session_routine,
+    upsert_session_routine,
+};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use cron::Schedule;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+
+const HEARTBEAT_EXTENSION: &str = "heartbeat";
+
+/// Pull the heartbeat-shaped payload off a routine, falling back to a
+/// debug-only placeholder when the payload didn't deserialize (e.g.
+/// a row written by some other extension into the same store).
+fn payload_for(routine: &Routine) -> HeartbeatPayload {
+    serde_json::from_value(routine.target.payload.clone()).unwrap_or(HeartbeatPayload {
+        rule_name: routine.name.clone(),
+        target_agent_db_id: String::new(),
+        task: String::new(),
+        is_one_shot: matches!(routine.trigger, Trigger::OneShot { .. }),
+    })
+}
+
+fn build_routine(
+    id: &str,
+    trigger: Trigger,
+    payload: HeartbeatPayload,
+    enabled: bool,
+) -> anyhow::Result<Routine> {
+    let target = RoutineTarget {
+        extension: HEARTBEAT_EXTENSION.into(),
+        payload: serde_json::to_value(&payload)?,
+    };
+    let mut r = match trigger {
+        Trigger::Cron { expr } => Routine::cron(RoutineId::new(id), id, expr, target),
+        Trigger::OneShot { fire_at } => Routine::one_shot(RoutineId::new(id), id, fire_at, target),
+    };
+    r.enabled = enabled;
+    Ok(r)
+}
 
 /// Resolve an agent reference to a `DbEntry`. `None` = the running agent.
 /// Matches the resolution order used by `/agent` commands: display name first,
@@ -123,26 +159,29 @@ impl Tool for HeartbeatAdd {
             let session = ctx.session.lock().await;
             let db = session.database();
 
-            let existing = list_rules(db)
+            let existing = list_session_routines(db)
                 .await
-                .map_err(|e| format!("Failed to read rules: {e}"))?;
-            if existing.iter().any(|r| r.id == id) {
+                .map_err(|e| format!("Failed to read routines: {e}"))?;
+            if existing.iter().any(|r| r.id.as_str() == id) {
                 return Err(format!(
                     "Heartbeat rule '{id}' already exists; use heartbeat_modify to edit or heartbeat_remove first"
                 )
                 .into());
             }
 
-            let rule = HeartbeatRule {
-                id: id.to_string(),
-                name: id.to_string(),
-                cron: cron.to_string(),
-                fire_at: None,
-                task: task.to_string(),
-                target_agent_db_id: target.db_id.to_string(),
-                enabled: true,
-            };
-            upsert_rule(db, rule)
+            let routine = build_routine(
+                id,
+                Trigger::Cron { expr: cron.into() },
+                HeartbeatPayload {
+                    rule_name: id.to_string(),
+                    target_agent_db_id: target.db_id.to_string(),
+                    task: task.to_string(),
+                    is_one_shot: false,
+                },
+                true,
+            )
+            .map_err(|e| format!("Failed to encode routine payload: {e}"))?;
+            upsert_session_routine(db, &routine)
                 .await
                 .map_err(|e| format!("Failed to save rule: {e}"))?;
 
@@ -222,31 +261,34 @@ impl Tool for HeartbeatModify {
             let session = ctx.session.lock().await;
             let db = session.database();
 
-            let mut rule = list_rules(db)
+            let mut routine = list_session_routines(db)
                 .await
-                .map_err(|e| format!("Failed to read rules: {e}"))?
+                .map_err(|e| format!("Failed to read routines: {e}"))?
                 .into_iter()
-                .find(|r| r.id == id)
+                .find(|r| r.id.as_str() == id)
                 .ok_or_else(|| format!("No heartbeat rule with id '{id}' on this session"))?;
+            let mut payload = payload_for(&routine);
 
             if let Some(c) = new_cron {
-                rule.cron = c.to_string();
+                routine.trigger = Trigger::Cron { expr: c.into() };
             }
             if let Some(t) = new_task {
-                rule.task = t.to_string();
+                payload.task = t.to_string();
             }
             let target_display = if let Some(a) = new_agent {
                 let target = resolve_target_agent(ctx, &self.agent_index, Some(a))?;
-                rule.target_agent_db_id = target.db_id.to_string();
+                payload.target_agent_db_id = target.db_id.to_string();
                 Some(target.display_name)
             } else {
                 None
             };
             if let Some(e) = new_enabled {
-                rule.enabled = e;
+                routine.enabled = e;
             }
+            routine.target.payload = serde_json::to_value(&payload)
+                .map_err(|e| format!("Failed to encode payload: {e}"))?;
 
-            upsert_rule(db, rule.clone())
+            upsert_session_routine(db, &routine)
                 .await
                 .map_err(|e| format!("Failed to save rule: {e}"))?;
 
@@ -303,7 +345,7 @@ impl Tool for HeartbeatRemove {
             let id = str_arg(&arguments, "id")?;
             let session = ctx.session.lock().await;
             let db = session.database();
-            match remove_rule(db, id).await {
+            match remove_session_routine(db, &RoutineId::new(id)).await {
                 Ok(true) => Ok(format!("Removed heartbeat '{id}'")),
                 Ok(false) => {
                     Err(format!("No heartbeat rule with id '{id}' on this session").into())
@@ -353,31 +395,34 @@ impl Tool for HeartbeatList {
         Box::pin(async move {
             let session = ctx.session.lock().await;
             let db = session.database();
-            let rules = list_rules(db)
+            let routines = list_session_routines(db)
                 .await
                 .map_err(|e| format!("Failed to list rules: {e}"))?;
-            if rules.is_empty() {
+            if routines.is_empty() {
                 return Ok("No heartbeat rules on this session.".to_string());
             }
-            let mut lines = Vec::with_capacity(rules.len() + 1);
+            let mut lines = Vec::with_capacity(routines.len() + 1);
             lines.push("Heartbeat rules:".to_string());
-            for r in &rules {
-                let target_display = match eidetica::entry::ID::parse(&r.target_agent_db_id) {
+            for r in &routines {
+                let p = payload_for(r);
+                let target_display = match eidetica::entry::ID::parse(&p.target_agent_db_id) {
                     Ok(id) => self
                         .agent_index
                         .find_by_id(&id)
                         .map(|e| e.display_name)
-                        .unwrap_or_else(|| r.target_agent_db_id.clone()),
-                    Err(_) => r.target_agent_db_id.clone(),
+                        .unwrap_or_else(|| p.target_agent_db_id.clone()),
+                    Err(_) => p.target_agent_db_id.clone(),
                 };
                 let state = if r.enabled { "" } else { " (disabled)" };
-                let schedule = match r.fire_at {
-                    Some(fire_at) => format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ")),
-                    None => r.cron.clone(),
+                let schedule = match &r.trigger {
+                    Trigger::Cron { expr } => expr.clone(),
+                    Trigger::OneShot { fire_at } => {
+                        format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ"))
+                    }
                 };
                 lines.push(format!(
                     "- **{}** [{schedule}]{state} → {} — {}",
-                    r.id, target_display, r.task
+                    r.id, target_display, p.task
                 ));
             }
             Ok(lines.join("\n"))
@@ -476,16 +521,19 @@ impl Tool for WakeMeUp {
 
             let session = ctx.session.lock().await;
             let db = session.database();
-            let rule = HeartbeatRule {
-                id: id.clone(),
-                name: id.clone(),
-                cron: String::new(),
-                fire_at: Some(fire_at),
-                task: task.to_string(),
-                target_agent_db_id: target.db_id.to_string(),
-                enabled: true,
-            };
-            upsert_rule(db, rule)
+            let routine = build_routine(
+                &id,
+                Trigger::OneShot { fire_at },
+                HeartbeatPayload {
+                    rule_name: id.clone(),
+                    target_agent_db_id: target.db_id.to_string(),
+                    task: task.to_string(),
+                    is_one_shot: true,
+                },
+                true,
+            )
+            .map_err(|e| format!("Failed to encode wakeup payload: {e}"))?;
+            upsert_session_routine(db, &routine)
                 .await
                 .map_err(|e| format!("Failed to save wakeup: {e}"))?;
 
@@ -823,19 +871,22 @@ mod tests {
         assert!(out.contains("alpha"), "should target self: {out}");
 
         let db = session.lock().await.database().clone();
-        let rules = list_rules(&db).await.unwrap();
-        assert_eq!(rules.len(), 1);
-        let r = &rules[0];
-        assert!(r.is_one_shot());
-        assert!(r.cron.is_empty());
-        let fire_at = r.fire_at.unwrap();
+        let routines = list_session_routines(&db).await.unwrap();
+        assert_eq!(routines.len(), 1);
+        let r = &routines[0];
+        let fire_at = match r.trigger {
+            Trigger::OneShot { fire_at } => fire_at,
+            ref other => panic!("expected OneShot, got {other:?}"),
+        };
         let delta = fire_at - before;
         // We asked for 60s; allow some slack for clock motion.
         assert!(
             delta.num_seconds() >= 59 && delta.num_seconds() <= 65,
             "fire_at off: {delta}"
         );
-        assert_eq!(r.task, "check on build");
+        let payload = payload_for(r);
+        assert!(payload.is_one_shot);
+        assert_eq!(payload.task, "check on build");
     }
 
     #[tokio::test]

@@ -121,18 +121,26 @@ impl SessionRegistry {
         })
         .await?;
 
-        // Clean up heartbeat rules on this session that target the detached
-        // agent — otherwise they'd sit silently forever (the runner skips
-        // rules whose target isn't in `agent_index`, but the rule records
-        // still accumulate).
+        // Clean up heartbeat routines on this session that target the
+        // detached agent — otherwise they'd sit silently forever (the
+        // handler skips fires whose target isn't in `agent_index`, but
+        // the rows still accumulate).
         let db_id_str = agent.db_id.to_string();
-        if let Ok(rules) = crate::heartbeat::list_rules(&session_db).await {
-            for rule in rules.iter().filter(|r| r.target_agent_db_id == db_id_str) {
-                if let Err(e) = crate::heartbeat::remove_rule(&session_db, &rule.id).await {
+        if let Ok(routines) = crate::routine::list_session_routines(&session_db).await {
+            for r in &routines {
+                let Ok(p): Result<crate::extensions::heartbeat::HeartbeatPayload, _> =
+                    serde_json::from_value(r.target.payload.clone())
+                else {
+                    continue;
+                };
+                if p.target_agent_db_id != db_id_str {
+                    continue;
+                }
+                if let Err(e) = crate::routine::remove_session_routine(&session_db, &r.id).await {
                     warn!(
                         agent = %agent.display_name,
-                        rule_id = %rule.id,
-                        "Failed to remove heartbeat rule on detach: {e}"
+                        rule_id = %r.id,
+                        "Failed to remove heartbeat routine on detach: {e}"
                     );
                 }
             }

@@ -15,8 +15,11 @@ use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionHub, ExtensionRef, HookContext,
     HookKind,
 };
-use crate::heartbeat::{HeartbeatRule, list_rules, remove_rule, upsert_rule};
 use crate::hosted_index::HostedIndex;
+use crate::routine::{
+    Routine, RoutineId, RoutineTarget, Trigger, list_session_routines, remove_session_routine,
+    upsert_session_routine,
+};
 use crate::tools::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp};
 use chrono::Utc;
 use cron::Schedule;
@@ -252,22 +255,31 @@ impl ExtensionCommand for HeartbeatCommand {
 async fn list_cmd(ctx: &HookContext) -> ExtensionCommandOutcome {
     let session = ctx.session.lock().await;
     let db = session.database();
-    match list_rules(db).await {
-        Ok(rules) if rules.is_empty() => {
+    match list_session_routines(db).await {
+        Ok(rs) if rs.is_empty() => {
             ExtensionCommandOutcome::Text("No heartbeat rules on this session".into())
         }
-        Ok(rules) => {
-            let lines: Vec<String> = rules
+        Ok(routines) => {
+            let lines: Vec<String> = routines
                 .iter()
                 .map(|r| {
+                    let p: HeartbeatPayload = serde_json::from_value(r.target.payload.clone())
+                        .unwrap_or(HeartbeatPayload {
+                            rule_name: r.name.clone(),
+                            target_agent_db_id: String::new(),
+                            task: String::new(),
+                            is_one_shot: matches!(r.trigger, Trigger::OneShot { .. }),
+                        });
                     let state = if r.enabled { "" } else { " (disabled)" };
-                    let schedule = match r.fire_at {
-                        Some(fire_at) => format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ")),
-                        None => r.cron.clone(),
+                    let schedule = match &r.trigger {
+                        Trigger::Cron { expr } => expr.clone(),
+                        Trigger::OneShot { fire_at } => {
+                            format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ"))
+                        }
                     };
                     format!(
                         "  {} [{schedule}]{state} → {} — {}",
-                        r.id, r.target_agent_db_id, r.task
+                        r.id, p.target_agent_db_id, p.task
                     )
                 })
                 .collect();
@@ -280,7 +292,7 @@ async fn list_cmd(ctx: &HookContext) -> ExtensionCommandOutcome {
 async fn remove_cmd(id: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
     let session = ctx.session.lock().await;
     let db = session.database();
-    match remove_rule(db, id).await {
+    match remove_session_routine(db, &RoutineId::new(id)).await {
         Ok(true) => ExtensionCommandOutcome::Text(format!("Removed heartbeat rule '{id}'")),
         Ok(false) => ExtensionCommandOutcome::Error(format!("No heartbeat rule with id '{id}'")),
         Err(e) => ExtensionCommandOutcome::Error(format!("Failed to remove rule: {e}")),
@@ -337,18 +349,30 @@ async fn add_cmd(
     } else {
         return ExtensionCommandOutcome::Error(format!("No hosted agent matches '{agent_ref}'"));
     };
-    let rule = HeartbeatRule {
-        id: id.to_string(),
-        name: id.to_string(),
-        cron: cron.clone(),
-        fire_at: None,
-        task: task.clone(),
+    let payload = HeartbeatPayload {
+        rule_name: id.to_string(),
         target_agent_db_id: entry.db_id.to_string(),
-        enabled: true,
+        task: task.clone(),
+        is_one_shot: false,
     };
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            return ExtensionCommandOutcome::Error(format!("Failed to encode payload: {e}"));
+        }
+    };
+    let routine = Routine::cron(
+        RoutineId::new(id),
+        id,
+        cron.clone(),
+        RoutineTarget {
+            extension: "heartbeat".into(),
+            payload: payload_value,
+        },
+    );
     let session = ctx.session.lock().await;
     let db = session.database();
-    match upsert_rule(db, rule).await {
+    match upsert_session_routine(db, &routine).await {
         Ok(()) => ExtensionCommandOutcome::Text(format!(
             "Heartbeat rule '{id}' set: cron='{cron}' → {} — {task}",
             entry.display_name
