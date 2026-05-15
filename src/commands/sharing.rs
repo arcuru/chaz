@@ -244,7 +244,6 @@ mod tests {
     ) -> CommandContext<'a> {
         CommandContext {
             server,
-            scheduler: None,
             secrets,
             backend,
             session_db_id,

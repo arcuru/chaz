@@ -7,7 +7,6 @@ use crate::commands::{
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use crate::role::get_role_names;
-use crate::scheduler::Scheduler;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
@@ -53,7 +52,6 @@ fn make_room_approval_tx(
 pub struct MatrixGateway {
     config: Config,
     secrets: SecretStore,
-    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl MatrixGateway {
@@ -64,16 +62,7 @@ impl MatrixGateway {
         if config.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
-        Ok(Self {
-            config,
-            secrets,
-            scheduler: None,
-        })
-    }
-
-    pub fn with_scheduler(mut self, scheduler: Option<Arc<Scheduler>>) -> Self {
-        self.scheduler = scheduler;
-        self
+        Ok(Self { config, secrets })
     }
 }
 
@@ -120,7 +109,6 @@ async fn dispatch_in_room(
     cmd: Command,
     room: Room,
     server: Arc<Server>,
-    scheduler: Option<Arc<Scheduler>>,
     config: Arc<Config>,
     secrets: SecretStore,
 ) -> anyhow::Result<()> {
@@ -141,7 +129,6 @@ async fn dispatch_in_room(
 
     let ctx = CommandContext {
         server: &server,
-        scheduler: scheduler.as_ref(),
         secrets: &secrets,
         backend: &backend,
         session_db_id: &session_db_id,
@@ -365,7 +352,6 @@ impl Gateway for MatrixGateway {
             .await;
         }
 
-        let scheduler = self.scheduler.clone();
         let message_counts: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Track which session DBs have the Matrix response callback installed.
@@ -376,7 +362,6 @@ impl Gateway for MatrixGateway {
         macro_rules! register_shared {
             ($name:expr, $usage:expr, $desc:expr, |$text_ident:ident| $cmd_expr:expr) => {{
                 let server = server.clone();
-                let scheduler = scheduler.clone();
                 let config = config.clone();
                 let secrets = self.secrets.clone();
                 bot.register_text_command(
@@ -385,15 +370,13 @@ impl Gateway for MatrixGateway {
                     $desc.to_string(),
                     move |_, $text_ident, room| {
                         let server = server.clone();
-                        let scheduler = scheduler.clone();
                         let config = config.clone();
                         let secrets = secrets.clone();
                         let cmd: Option<Command> = $cmd_expr;
                         async move {
                             if let Some(cmd) = cmd {
                                 if let Err(e) =
-                                    dispatch_in_room(cmd, room, server, scheduler, config, secrets)
-                                        .await
+                                    dispatch_in_room(cmd, room, server, config, secrets).await
                                 {
                                     tracing::error!("Command dispatch failed: {e}");
                                 }
@@ -967,7 +950,6 @@ impl Gateway for MatrixGateway {
             let name_owned = ext_name.to_string();
             let desc_owned = ext_desc.to_string();
             let server_c = server.clone();
-            let scheduler_c = scheduler.clone();
             let config_c = config.clone();
             let secrets_c = self.secrets.clone();
             bot.register_text_command(
@@ -977,15 +959,12 @@ impl Gateway for MatrixGateway {
                 move |_, text, room| {
                     let name = name_owned.clone();
                     let server = server_c.clone();
-                    let scheduler = scheduler_c.clone();
                     let config = config_c.clone();
                     let secrets = secrets_c.clone();
                     async move {
                         let args = matrix_args(&text);
                         let cmd = Command::Extension { name, args };
-                        if let Err(e) =
-                            dispatch_in_room(cmd, room, server, scheduler, config, secrets).await
-                        {
+                        if let Err(e) = dispatch_in_room(cmd, room, server, config, secrets).await {
                             tracing::error!("Extension command dispatch failed: {e}");
                         }
                         Ok(())

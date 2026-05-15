@@ -465,41 +465,22 @@ pub(super) async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
 // Scheduler
 // -----------------------------------------------------------------------------
 
-pub(super) async fn list_schedules(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let Some(sched) = ctx.scheduler else {
-        return CommandOutcome::Text("No scheduler configured.".to_string());
-    };
-    let schedules = sched.list().await;
-    if schedules.is_empty() {
-        return CommandOutcome::Text("No schedules configured.".to_string());
-    }
-    let mut msg = String::from("Schedules:\n");
-    for s in &schedules {
-        let status = if s.enabled { "enabled" } else { "disabled" };
-        let last = s
-            .last_run
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "never".to_string());
-        let next = s
-            .next_run
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "n/a".to_string());
-        msg.push_str(&format!(
-            "\n  {} [{}]\n    session: {}\n    task: {}\n    last: {} | next: {}\n",
-            s.name, status, s.session, s.task, last, next
-        ));
-    }
-    CommandOutcome::Text(msg)
+pub(super) async fn list_schedules(_ctx: &CommandContext<'_>) -> CommandOutcome {
+    // YAML schedules now ride on per-session Routine rows fired by
+    // `RoutineEngine`. Browsing them is `heartbeat_list` on the
+    // schedule's target session, or `/heartbeat list` from inside it.
+    CommandOutcome::Text(
+        "Scheduler retired — YAML schedules fire through the routine engine. \
+         List them with `/heartbeat list` inside the target session."
+            .into(),
+    )
 }
 
-pub(super) async fn trigger_schedule(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let Some(sched) = ctx.scheduler else {
-        return CommandOutcome::Error("No scheduler configured.".to_string());
-    };
-    match sched.trigger(name).await {
-        Ok(()) => CommandOutcome::Text(format!("Triggered schedule '{name}'.")),
-        Err(e) => CommandOutcome::Error(format!("Failed to trigger '{name}': {e}")),
-    }
+pub(super) async fn trigger_schedule(name: &str, _ctx: &CommandContext<'_>) -> CommandOutcome {
+    CommandOutcome::Error(format!(
+        "Manual scheduler triggers are not supported after the routine-engine \
+         refactor. Routine '{name}' will fire on its next cron tick."
+    ))
 }
 
 // -----------------------------------------------------------------------------

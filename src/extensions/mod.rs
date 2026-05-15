@@ -11,6 +11,7 @@ pub mod fs;
 pub mod heartbeat;
 pub mod memory;
 pub mod path_normalizer;
+pub mod scheduler;
 pub mod security_warnings;
 pub mod system;
 pub mod web;
@@ -77,5 +78,6 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             deps.embedder,
         )),
         Arc::new(heartbeat::HeartbeatExtension::new(deps.agent_index)),
+        Arc::new(scheduler::ScheduleExtension),
     ]
 }

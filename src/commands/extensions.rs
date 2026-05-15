@@ -329,7 +329,6 @@ mod tests {
     fn ctx<'a>(f: &'a Fixture) -> CommandContext<'a> {
         CommandContext {
             server: &f.server,
-            scheduler: None,
             secrets: &f.secrets,
             backend: &f.backend,
             session_db_id: &f.session_db_id,

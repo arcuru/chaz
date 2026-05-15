@@ -15,7 +15,6 @@ use crate::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo
 use crate::config::Config;
 use crate::gateway::{ApprovalExchange, Gateway};
 use crate::role::get_role_names;
-use crate::scheduler::Scheduler;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
@@ -42,21 +41,11 @@ const TUI_DEFAULT_NAME: &str = "tui";
 pub struct TuiGateway {
     config: Config,
     secrets: SecretStore,
-    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl TuiGateway {
     pub fn new(config: Config, secrets: SecretStore) -> Self {
-        Self {
-            config,
-            secrets,
-            scheduler: None,
-        }
-    }
-
-    pub fn with_scheduler(mut self, scheduler: Option<Arc<Scheduler>>) -> Self {
-        self.scheduler = scheduler;
-        self
+        Self { config, secrets }
     }
 }
 
@@ -402,7 +391,6 @@ impl Gateway for TuiGateway {
                                     &server,
                                     &backend,
                                     &self.secrets,
-                                    self.scheduler.as_ref(),
                                     &approval_tx,
                                     &notify_tx,
                                     &config_role_names,
@@ -434,7 +422,6 @@ impl Gateway for TuiGateway {
                                     &server,
                                     &backend,
                                     &self.secrets,
-                                    self.scheduler.as_ref(),
                                     &config_role_names,
                                     default_role.as_deref(),
                                     session_db_id,
@@ -456,7 +443,6 @@ impl Gateway for TuiGateway {
                                         &server,
                                         &backend,
                                         &self.secrets,
-                                        self.scheduler.as_ref(),
                                         &approval_tx,
                                         &notify_tx,
                                         &config_role_names,
@@ -473,7 +459,6 @@ impl Gateway for TuiGateway {
                                         &server,
                                         &backend,
                                         &self.secrets,
-                                        self.scheduler.as_ref(),
                                         &approval_tx,
                                         &notify_tx,
                                         &config_role_names,
@@ -500,7 +485,6 @@ impl Gateway for TuiGateway {
                                         &server,
                                         &backend,
                                         &self.secrets,
-                                        self.scheduler.as_ref(),
                                         &approval_tx,
                                         &notify_tx,
                                         &config_role_names,
@@ -623,7 +607,6 @@ async fn handle_chat_action(
     server: &Arc<Server>,
     backend: &BackendManager,
     secrets: &SecretStore,
-    scheduler: Option<&Arc<Scheduler>>,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
     config_role_names: &[String],
@@ -670,7 +653,6 @@ async fn handle_chat_action(
             let session_name = tab.session_name.clone();
             let ctx = CommandContext {
                 server,
-                scheduler,
                 secrets,
                 backend,
                 session_db_id: &session_db_id,
@@ -711,7 +693,6 @@ async fn handle_chat_action(
             let session_name = tab.session_name.clone();
             let ctx = CommandContext {
                 server,
-                scheduler,
                 secrets,
                 backend,
                 session_db_id: &session_db_id,
@@ -738,7 +719,6 @@ async fn apply_picker_rename(
     server: &Arc<Server>,
     backend: &BackendManager,
     secrets: &SecretStore,
-    scheduler: Option<&Arc<Scheduler>>,
     config_role_names: &[String],
     default_role: Option<&str>,
     session_db_id: String,
@@ -775,7 +755,6 @@ async fn apply_picker_rename(
     let active_name = tab.session_name.clone();
     let ctx = CommandContext {
         server,
-        scheduler,
         secrets,
         backend,
         session_db_id: &active_db_id,
@@ -804,7 +783,6 @@ async fn dispatch_picker_selection(
     server: &Arc<Server>,
     backend: &BackendManager,
     secrets: &SecretStore,
-    scheduler: Option<&Arc<Scheduler>>,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
     config_role_names: &[String],
@@ -825,7 +803,6 @@ async fn dispatch_picker_selection(
     let session_name = tab.session_name.clone();
     let ctx = CommandContext {
         server,
-        scheduler,
         secrets,
         backend,
         session_db_id: &session_db_id,

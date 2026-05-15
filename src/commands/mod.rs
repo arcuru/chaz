@@ -18,7 +18,6 @@
 //! sweep helper used by `agent_delete` is in [`crate::heartbeat::sweep_for_agent`].
 
 use crate::backends::BackendManager;
-use crate::scheduler::Scheduler;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::types::ConversationId;
@@ -316,7 +315,6 @@ pub struct SessionInfo {
 /// Everything a command handler needs. Borrowed from the gateway.
 pub struct CommandContext<'a> {
     pub server: &'a Arc<Server>,
-    pub scheduler: Option<&'a Arc<Scheduler>>,
     pub secrets: &'a SecretStore,
     pub backend: &'a BackendManager,
     /// The eidetica root ID of the currently active session.

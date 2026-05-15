@@ -22,7 +22,6 @@ mod persona;
 mod role;
 mod routine;
 mod runtime;
-mod scheduler;
 mod security;
 pub mod server;
 mod session;
@@ -449,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
         as std::sync::Arc<dyn tool_host::ToolHost>;
 
     let server = server::Server::new(
-        registry,
+        registry.clone(),
         agent_registry,
         agent_index_store,
         memory_bank_index_store,
@@ -466,32 +465,112 @@ async fn main() -> anyhow::Result<()> {
         "Spawn tool server cell already set"
     );
 
-    // Start the scheduler if any schedules are configured
-    let scheduler = if let Some(schedules) = config.schedules.clone() {
-        if !schedules.is_empty() {
-            let sched = std::sync::Arc::new(
-                scheduler::Scheduler::new(
-                    schedules,
-                    server.clone(),
-                    backends::BackendManager::new(&config.backends, secret_store.clone()),
-                    chaz_peer.clone(),
-                )
-                .await,
+    // Translate YAML schedules into session-scoped Routine rows. Each
+    // ScheduleConfig becomes one cron Routine targeting the scheduler
+    // extension on the resolved session's `routines` table; the engine
+    // (spawned below) picks them up via `register_session`. Idempotent
+    // by routine id == schedule name.
+    if let Some(schedules) = config.schedules.clone() {
+        for cfg in schedules {
+            if !cfg.enabled {
+                info!(schedule = %cfg.name, "Schedule disabled, skipping");
+                continue;
+            }
+            let (_conv, sdb) = match registry.resolve_session(&cfg.session).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(
+                        schedule = %cfg.name,
+                        session = %cfg.session,
+                        "Failed to resolve schedule target session: {e}"
+                    );
+                    continue;
+                }
+            };
+            let existing = routine::list_session_routines(&sdb)
+                .await
+                .unwrap_or_default();
+            if existing.iter().any(|r| r.id.as_str() == cfg.name) {
+                info!(
+                    schedule = %cfg.name,
+                    "Schedule already present as routine; leaving in place"
+                );
+                continue;
+            }
+            let payload = match serde_json::to_value(extensions::scheduler::SchedulePayload {
+                schedule_name: cfg.name.clone(),
+                task: cfg.task.clone(),
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(schedule = %cfg.name, "Failed to encode payload: {e}");
+                    continue;
+                }
+            };
+            let r = routine::Routine::cron(
+                routine::RoutineId::new(&cfg.name),
+                &cfg.name,
+                cfg.cron.clone(),
+                routine::RoutineTarget {
+                    extension: "scheduler".into(),
+                    payload,
+                },
             );
-            sched.start();
-            Some(sched)
-        } else {
-            None
+            if let Err(e) = routine::upsert_session_routine(&sdb, &r).await {
+                error!(schedule = %cfg.name, "Failed to upsert schedule routine: {e}");
+            } else {
+                info!(
+                    schedule = %cfg.name,
+                    session = %cfg.session,
+                    cron = %cfg.cron,
+                    "Schedule registered as session-scoped routine"
+                );
+            }
         }
-    } else {
-        None
-    };
+    }
 
-    // Start the heartbeat runner. Polls every 30s across all hosted sessions
-    // for due rules whose target agent this peer hosts. Skipped in --cli mode:
-    // the process exits after a single ReAct loop, so the runner never gets a
-    // chance to fire — its setup is pure overhead.
+    // Spawn the routine engine. Loads global routines from
+    // `chaz_peer.routines`, then walks every hosted session and
+    // registers its session-scoped routines (heartbeats + scheduler
+    // fires). Skipped in --cli mode: a single ReAct loop doesn't need
+    // the engine running.
     if !args.cli {
+        let engine =
+            routine::RoutineEngine::new(chaz_peer.clone(), Some(server.extensions().clone()))
+                .await?;
+        // Pick up every session's routines + ensure the server is
+        // watching those sessions so directive writes from fires drive
+        // an agent turn.
+        let sessions = registry.list_sessions().await.unwrap_or_default();
+        let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
+        for s in sessions {
+            let Ok((_conv, sdb)) = registry.open_session(&s.session_db_id).await else {
+                continue;
+            };
+            if let Err(e) = engine.register_session(&s.session_db_id, &sdb).await {
+                error!(session = %s.session_db_id, "engine.register_session failed: {e}");
+                continue;
+            }
+            let routines = routine::list_session_routines(&sdb)
+                .await
+                .unwrap_or_default();
+            if routines.is_empty() {
+                continue;
+            }
+            if let Err(e) = server
+                .register_session(&sdb, default_backend.clone(), None, None)
+                .await
+            {
+                error!(session = %s.session_db_id, "server.register_session failed: {e}");
+            }
+        }
+        let engine_clone = engine.clone();
+        tokio::spawn(async move {
+            engine_clone.run().await;
+        });
+
+        // Legacy heartbeat runner — gutted in commit C; survives only
+        // so this call site keeps compiling until commit F deletes it.
         let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chaz_peer);
         heartbeat_runner.start();
     }
@@ -510,11 +589,10 @@ async fn main() -> anyhow::Result<()> {
         let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt, args.session);
         gateway.run(server).await
     } else if args.tui {
-        let gateway = gateway::tui::TuiGateway::new(config, secret_store).with_scheduler(scheduler);
+        let gateway = gateway::tui::TuiGateway::new(config, secret_store);
         gateway.run(server).await
     } else {
-        let gateway =
-            gateway::matrix::MatrixGateway::new(config, secret_store)?.with_scheduler(scheduler);
+        let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
         gateway.run(server).await
     };
 
