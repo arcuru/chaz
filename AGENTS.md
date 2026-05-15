@@ -40,7 +40,8 @@ agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memor
 db_kind.rs           meta.kind + display_name markers on entity DBs (agent/bank/session classification)
 hosted_index.rs      In-memory peer-local pubkey/name → DB index, built at startup from user.databases()
 memory_bank_db.rs    Standalone memory bank DBs (parallel to agent_db)
-heartbeat.rs         Per-session HeartbeatRule + HeartbeatRunner (30s poll)
+heartbeat.rs         sweep_for_agent helper — per-session heartbeats are Routine rows fired by routine/
+routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines (global + per-session)
 session.rs           SessionRegistry, Session, EntryType, SessionMeta, attach/detach, resolve_agent
 context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)
 tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError

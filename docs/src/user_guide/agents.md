@@ -168,14 +168,14 @@ Mentions are case-insensitive and match exact display names. No prefix matching.
 
 ## Heartbeat rules
 
-A heartbeat rule is a time-driven trigger stored inside the session. The `HeartbeatRunner` on every peer polls hosted sessions every 30s; rules targeting agents this peer hosts get fired. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
+A heartbeat rule is a time-driven trigger stored inside the session as a `Routine` row. The chaz `RoutineEngine` (one per peer) sleeps until the next scheduled fire across every hosted session, then dispatches to the `heartbeat` extension's `RoutineHandler`. The handler silently skips fires whose target agent isn't hosted on this peer, so multi-peer setups don't double-write. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
 
-Two rule shapes share one table:
+Two trigger shapes share one table:
 
-- **Cron rules** fire on a recurring schedule (`cron: "0 */5 * * * *"`). `last_fired` is tracked peer-locally in the `chaz_peer` DB's `heartbeat_last_fired` store, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
-- **One-shot rules** fire once at an absolute `fire_at` time, then delete themselves. These back the `wake_me_up` tool described in [Tools](./tools.md). They don't use `last_fired` — deletion replaces it.
+- **Cron triggers** fire on a recurring schedule (`cron: "0 */5 * * * *"`). `last_fired` is tracked peer-locally in the `chaz_peer` DB's `routine_last_fired` store, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
+- **One-shot triggers** fire once at an absolute `fire_at` time, then the engine drops the row. These back the `wake_me_up` tool described in [Tools](./tools.md). They don't use `last_fired` — deletion replaces it.
 
-Both shapes are subject to up to 30 s of jitter past the scheduled time, since that's the runner's poll interval.
+Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock jump can't strand a routine. The engine fires due rules within seconds of their scheduled time rather than waiting for a poll interval.
 
 ### `/heartbeat` commands
 

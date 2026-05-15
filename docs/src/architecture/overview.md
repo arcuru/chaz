@@ -119,8 +119,8 @@ src/
   memory_bank_db.rs    Standalone Memory Bank DBs (parallel to agent_db)
   db_kind.rs           meta.kind + display_name markers on entity DBs
   hosted_index.rs      In-memory peer-local pubkey/name → DB cache, built from user.databases()
-  heartbeat.rs         HeartbeatRule + HeartbeatRunner (30s poll over hosted sessions)
-  scheduler.rs         Cron-driven scheduled task execution
+  heartbeat.rs         sweep_for_agent helper — per-session heartbeats are Routine rows
+  routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines
   server.rs            Callback-driven server, agent task spawning
   runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning
   context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)

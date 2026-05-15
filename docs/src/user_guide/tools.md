@@ -148,7 +148,7 @@ Delegates a task to another agent in a child session. See [Agents](agents.md).
 
 ### heartbeat_add / heartbeat_modify / heartbeat_remove / heartbeat_list
 
-Agent-facing CRUD over the session's heartbeat rules, mirroring the `/heartbeat` slash commands described in [Agents — Heartbeat rules](agents.md#heartbeat-rules). Rules persist in the session DB and the `HeartbeatRunner` polls them every 30 s. Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+Agent-facing CRUD over the session's heartbeat rules, mirroring the `/heartbeat` slash commands described in [Agents — Heartbeat rules](agents.md#heartbeat-rules). Rules are stored as `Routine` rows in the session DB and fired by chaz's `RoutineEngine`, which sleeps until the next scheduled fire instead of polling. Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
 
 ```json
 {
