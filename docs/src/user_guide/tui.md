@@ -44,6 +44,7 @@ The TUI has three sections:
 | `/name <alias>`               | Set a human-friendly name for the current session                 |
 | `/name`                       | Clear the session name                                            |
 | `/info`                       | Show current session details (name, DB ID, entry counts)          |
+| `/costs`                      | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
 | `/share`                      | Generate a shareable ticket URL for the current session           |
 | `/sync <ticket>`              | Sync a remote session via a ticket URL                            |
 | `/schedules`                  | List configured schedules with status and timing                  |

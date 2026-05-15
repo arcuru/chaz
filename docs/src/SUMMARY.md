@@ -16,6 +16,7 @@
 - [Extensions](user_guide/extensions.md)
 - [Security](user_guide/security.md)
 - [Logging](user_guide/logging.md)
+- [Cost Tracking & Usage](user_guide/usage.md)
 
 # Architecture
 
