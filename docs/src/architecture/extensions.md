@@ -1,54 +1,111 @@
 # Extension Framework
 
-Chaz's extension framework is the single surface for adding capabilities to
-an agent: tools, slash commands, and lifecycle hooks all flow through it.
-An extension is a piece of code that registers handlers for a set of
-hooks — nothing more. The runtime fires events; extensions can choose to
-respond.
+Chaz's extension framework is the single surface for adding capabilities
+to an agent: tools, slash commands, lifecycle hooks, and routine
+(cron / one-shot) handlers all flow through it. An extension is a piece
+of code that declares a capability manifest and an `install()` body —
+the host then resolves the caps it asked for, hands it a typed bundle,
+and drives all of its work through that bundle.
 
-This shape was chosen so that future WASM/sandboxed extensions land on
-the same API as today's in-process Rust extensions, and so per-session
-enforcement can be implemented as a single filter rather than three.
+The shape is built around two future directions: WASM / sandboxed
+extensions land on the same `install()` + `ExtensionCaps` surface as
+today's in-process Rust ones, and per-session enforcement filters one
+attributed handler list rather than three separate registries.
 
 ## Extension trait
 
 ```rust,ignore
 trait Extension: Send + Sync {
     fn name(&self) -> &'static str;
-    fn extension_ref(&self) -> ExtensionRef;           // identity + version
-    fn supported_hooks(&self) -> &[HookKind];          // declaration manifest
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub); // wire handlers
-    fn default_settings(&self) -> serde_json::Value;   // settings schema
-    fn extension_api_version(&self) -> u32;            // hook ABI version
+    fn extension_ref(&self) -> ExtensionRef;            // identity + version
+    fn supported_hooks(&self) -> &[HookKind];           // declaration manifest
+    fn extension_api_version(&self) -> u32;             // hook ABI version
+    fn default_settings(&self) -> serde_json::Value;    // settings schema
+
+    fn manifest(&self) -> ExtensionManifest;            // cap contract
+    fn build_providers(&self)                           // capability impls
+        -> anyhow::Result<HashMap<CapabilityKind, CapProvider>>;
+    async fn install(&self, caps: ExtensionCaps)        // wire handlers
+        -> anyhow::Result<InstalledExtension>;
+
+    // Legacy no-op default. Kept on the trait only because the hub's
+    // own unit tests still drive the pre-cap registration path; no
+    // built-in overrides it.
+    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
 }
 ```
 
-That's the whole surface. Tools and slash commands aren't fields on the
-trait — they're hooks registered inside `register()` via
-`hub.register_tool(...)` and `hub.register_command(...)`.
+The wiring path is `manifest()` → `build_providers()` → `install(caps)`.
+Tools and slash commands aren't fields on the trait — they're registered
+inside `install()` through capability traits the host hands the
+extension. Hook and routine handlers come back as the
+`InstalledExtension` return value.
+
+## Capability surface
+
+An extension's manifest declares what capabilities it consumes and what
+it provides. `ExtensionHub::install_all` resolves the manifest and
+hands the extension an `ExtensionCaps` bundle at install time.
+
+```rust,ignore
+struct ExtensionManifest {
+    name: String,
+    extension_ref: ExtensionRef,
+    supported_hooks: Vec<HookKind>,
+    required_capabilities: Vec<CapabilityRequest>,
+    requested_capabilities: Vec<CapabilityRequest>,
+    provides_capabilities: Vec<CapabilityKind>,
+}
+
+struct ExtensionCaps {
+    session_read: Option<Arc<dyn SessionRead>>,
+    session_write: Option<Arc<dyn SessionWrite>>,
+    settings: Option<Arc<dyn Settings>>,
+    tool_registration: Option<Arc<dyn ToolRegistration>>,
+    command_registration: Option<Arc<dyn CommandRegistration>>,
+    messengers: CapSet<dyn Messenger>,
+    memory: CapSet<dyn MemoryAccess>,
+}
+```
+
+Capabilities split into two ownership groups (`CapabilityKind::is_host_only`
+is authoritative):
+
+- **Host-only** — `SessionRead`, `SessionWrite`, `Settings`,
+  `ToolRegistration`, `CommandRegistration`. Provided by chaz core;
+  extensions can't publish their own impls. Each session has exactly one
+  impl of each, supplied per-fire by the host.
+- **Extension-providable** — `Messenger`, `MemoryAccess`. Any extension
+  can publish an impl via `build_providers()`. Consumers resolve by kind
+  plus optional provider name through a `CapSet`. Zero, one, or many
+  providers may register per kind; the operator picks the default in
+  config (`capability_defaults`).
+
+Manifest entries are `required` (missing → load fails, cascades to
+dependent extensions) or `requested` (missing → slot reads as `None`,
+extension handles it gracefully). Putting a host-only kind in
+`provides_capabilities` is a validation error.
 
 ## Hook kinds
 
 Every registration is tagged with a `HookKind`, and every extension must
 declare in `supported_hooks()` which kinds it intends to use. The hub
-validates the declaration against actual registrations at startup —
-registering a hook kind that wasn't declared is a programming error.
+validates that an extension's installed handlers match its declaration.
 
 ```rust,ignore
 enum HookKind {
     BeforeAgentStart, ToolCall, ToolResult, AgentEnd,
     SessionStart, SessionShutdown,
     Tool, Command,
-    Cron,  // reserved — declarable but not yet fired
 }
 ```
 
 Declaration serves three purposes:
 
-1. **Security.** Only handlers whose extension declared the kind run. For
-   WASM/sandboxed extensions this becomes the manifest — the host can
-   inspect what an extension claims to handle before loading it.
-2. **Efficiency.** The hub can skip extensions that don't handle a given
+1. **Security.** Only handlers whose extension declared the kind run.
+   For WASM / sandboxed extensions this becomes the manifest the host
+   inspects before loading.
+2. **Efficiency.** The hub skips extensions that don't handle a given
    kind without invoking them.
 3. **Inspection.** `/extensions list` reads `supported_hooks()` to
    describe what each extension does.
@@ -57,58 +114,160 @@ Declaration serves three purposes:
 
 The central registry, held on `Server` as `Arc<ExtensionHub>`. It owns:
 
-- The list of registered extensions
-- Per-kind handler vectors (each handler tagged with its owner extension)
-- A name-indexed tool registry (each tool tagged with owner)
-- A name-indexed command registry (each handler tagged with owner)
-- Reverse indexes for inspection: `hooks_for(name)`, `commands_for(name)`,
-  `tools_for(name)`, `extensions_for_kind(kind)`
+- The list of installed extensions
+- Per-kind hook handler vectors, each handler tagged with owner
+- `installed: HashMap<String, InstalledExtension>` — the per-extension
+  return values of `install()` (routine handlers live here)
+- A name-indexed tool registry with owner attribution
+- A name-indexed command registry with owner attribution
+- The capability registry (extension-publishable providers) +
+  operator-configured per-kind defaults
+- A `SessionRegistry` handle for resolving session-scoped routine fires
+- Reverse indexes for inspection (`hooks_for(name)`, etc.)
 
-Owner attribution flows from a hub-private pointer that is set during
-`register_extension(ext)` for the duration of the extension's `register()`
-call. The pointer is `None` outside that window — calling `on_<kind>` or
-`register_tool` / `register_command` from anywhere else panics, which
-prevents un-owned handlers from sneaking in.
+`install_all` is the single entry point. It runs in two phases:
 
 ```rust,ignore
-hub.register_extension(Arc::new(MyExt));
-//   ^^^^^^^^^^^^^^^^^
-// 1. Sets current_registering = Some("my_ext")
-// 2. Calls ext.register(self) — registrations inside capture owner
-// 3. Clears current_registering
-// 4. Validates: registered kinds ⊆ supported_hooks()
+hub.set_session_registry(registry.clone());
+hub.install_all(extensions::all_builtins(deps)).await?;
+//   ^^^^^^^^^^
+// Phase 1: build_providers() for every extension; populate the cap
+//          registry; apply operator defaults.
+// Phase 2: for each extension, assemble its ExtensionCaps bundle
+//          (caps it requested + a fresh ToolRegistration /
+//          CommandRegistration that buffers into pending queues),
+//          call install(), capture the InstalledExtension.
+// Drain:   pending tool / command queues into the owner-attributed
+//          legacy registries.
+// Bridge:  push every cap-based hook handler returned in
+//          InstalledExtension through a hook_bridge::*Adapter into
+//          the legacy per-kind fire vec.
 ```
+
+The bridge step keeps the existing `fire_<kind>` paths in the hub
+unchanged: they iterate `Vec<RegisteredHook<dyn HookXxx>>` and call the
+legacy `Hook*` trait. Each adapter takes a `&HookContext` per fire,
+builds a session-scoped `ExtensionCaps` (populating `session_read`,
+`session_write`, and `settings` from `ctx.session`), then invokes the
+inner cap-based handler. See `src/extension/hook_bridge.rs`.
 
 ## Tools as hooks
 
-Tools used to be registered directly into a `ToolRegistry` from `main.rs`.
-They now flow through extensions:
+Tool registration flows through `caps.tool_registration` inside `install`:
 
 ```rust,ignore
 impl Extension for FsExtension {
     fn name(&self) -> &'static str { "fs" }
     fn supported_hooks(&self) -> &[HookKind] { &[HookKind::Tool] }
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(ReadFile));
-        hub.register_tool(Arc::new(WriteFile));
-        hub.register_tool(Arc::new(EditFile));
+
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            name: self.name().to_string(),
+            extension_ref: ExtensionRef::builtin(self.name()),
+            supported_hooks: vec![HookKind::Tool],
+            required_capabilities: vec![CapabilityRequest::ToolRegistration],
+            requested_capabilities: Vec::new(),
+            provides_capabilities: Vec::new(),
+        }
+    }
+
+    fn install<'a>(
+        &'a self,
+        caps: ExtensionCaps,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+        Box::pin(async move {
+            let tool_reg = caps.tool_registration.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("fs install requires ToolRegistration"))?;
+            for t in [Arc::new(ReadFile), Arc::new(WriteFile), Arc::new(EditFile)] {
+                let t: Arc<dyn Tool> = t;
+                tool_reg.register(t.descriptor(), t).await?;
+            }
+            Ok(InstalledExtension::empty())
+        })
     }
 }
 ```
 
-The legacy `ToolRegistry` still exists — `main.rs` builds it after hub
-registration by draining `hub.tools_for_registry()` into it. The
-registry's entries gain an `owner: Option<&'static str>` field so
-`ScopedTools` can filter by per-session active extension set.
+`InProcToolRegistration` buffers each registration onto a pending
+queue; the hub drains it after `install()` returns and routes each
+entry through the existing owner-attributed registry path. The legacy
+`ToolRegistry` still exists — `main.rs` builds it after `install_all` by
+draining `hub.tools_for_registry()` into it. Each entry carries
+`owner: Option<&'static str>` so `ScopedTools` can filter by
+per-session active extension set.
 
 MCP-loaded tools register with `owner: None`. They're always available
 regardless of which extensions are active on a session — they're not
 subject to the extension lifecycle.
 
+## Hook handlers
+
+Cap-based hook handlers go in `InstalledExtension`. One slot per hook
+kind, each `Option<Box<dyn HookHandler...>>`:
+
+```rust,ignore
+struct InstalledExtension {
+    pub before_agent_start: Option<Box<dyn HookHandlerBeforeAgentStart>>,
+    pub tool_call:          Option<Box<dyn HookHandlerToolCall>>,
+    pub tool_result:        Option<Box<dyn HookHandlerToolResult>>,
+    pub agent_end:          Option<Box<dyn HookHandlerAgentEnd>>,
+    pub session_start:      Option<Box<dyn HookHandlerSessionStart>>,
+    pub session_shutdown:   Option<Box<dyn HookHandlerSessionShutdown>>,
+    pub routine_handler:    Option<Box<dyn RoutineHandler>>,
+}
+```
+
+Each cap-based hook trait receives `&ExtensionCaps` instead of the
+legacy `&HookContext`, so handlers reach the session through narrow
+typed traits (`SessionRead`, `SessionWrite`, `Settings`) rather than
+holding `Arc<Mutex<Session>>` directly. That's the seam that lets the
+same trait shape carry through a sandbox boundary later — the cap
+methods all return plain data over `CapFuture<'a, T>`.
+
+The runtime's `fire_<kind>` paths haven't changed; they call the
+legacy `Hook*` trait on the adapter, which in turn invokes the
+inner cap-based handler. Per-session active-set filtering still happens
+at the fire boundary — `ctx.active_extensions.contains(reg.owner)` —
+because owner attribution is laid down identically through both
+registration paths.
+
+## Routine handlers
+
+Cron and one-shot work fires through the routine engine (see
+`src/routine/`) rather than as a hook. An extension declares
+`routine_handler: Some(...)` in its `InstalledExtension`, and the
+engine dispatches via `ExtensionHub::dispatch_routine(name, &scope, payload)`.
+
+```rust,ignore
+trait RoutineHandler: Send + Sync {
+    fn on_fire<'a>(
+        &'a self,
+        caps: &'a ExtensionCaps,
+        payload: serde_json::Value,
+    ) -> HandlerFuture<'a, anyhow::Result<()>>;
+}
+```
+
+Routine fires come in two scopes:
+
+- **`RoutineScope::Global`** — fired from `chaz_peer.routines`. The
+  caps bundle gets extension-providable defaults (messengers, memory)
+  but no session-scoped slots.
+- **`RoutineScope::Session(id)`** — fired from a session DB's
+  `routines` table. The hub resolves the session through its
+  `SessionRegistry` handle and populates `caps.session_read`,
+  `caps.session_write`, and `caps.settings` for that session. The
+  handler appends directives through `caps.session_write.append(...)`
+  exactly the same way it would inside a normal hook.
+
+The engine handles cron rescheduling and one-shot row deletion; the
+handler's job is just the per-fire work. Auto-disable after
+`max_failures` consecutive errors is bookkeeping the engine owns too.
+
 ## Per-session active set
 
 Each session has an *active set* of extensions: a subset of the peer-
-registered extensions that fire hooks, contribute tools, and dispatch
+installed extensions that fire hooks, contribute tools, and dispatch
 commands on this session. Other sessions on the same peer can have
 different active sets.
 
@@ -126,18 +285,24 @@ impl Server {
 ```
 
 The set flows into hook firing through `HookContext.active_extensions`
-and into tool listing through `ScopedTools::with_active_extensions`. The
-hub's `fire_<kind>` methods skip any handler whose owner isn't in the
-set. `try_dispatch_command` returns `None` for inactive owners.
+and into tool listing through `ScopedTools::with_active_extensions`.
+The hub's `fire_<kind>` methods skip any handler whose owner isn't in
+the set. `try_dispatch_command` returns `None` for inactive owners.
 `ScopedTools::definitions` hides tools whose owner is inactive, and
-`get()` returns `None` for them — the LLM never sees them and can't call
-them even if it tries.
+`get()` returns `None` for them — the LLM never sees them and can't
+call them even if it tries.
+
+Routine fires aren't gated by the active set; the routine engine fires
+any routine that's enabled regardless of whether its owning extension
+is active on the session. (Disabling `heartbeat` on a session and still
+expecting cron rules on that session to fire would be surprising, but
+that's the current behavior.)
 
 ## Activation event log
 
-Active state is persisted as an event log on each session's eidetica DB,
-in a `Table<ExtensionEvent>` store named `extensions`. Each row is one
-activation or deactivation:
+Active state is persisted as an event log on each session's eidetica
+DB, in a `Table<ExtensionEvent>` store named `extensions`. Each row is
+one activation or deactivation:
 
 ```rust,ignore
 enum ExtensionEvent {
@@ -146,13 +311,14 @@ enum ExtensionEvent {
 }
 ```
 
-Current state is derived by folding events: per `name`, the latest event
-by `timestamp` wins. `Activated` keeps it in; `Deactivated` drops it.
-The fold is done in `extension::read_active(session_db)`.
+Current state is derived by folding events: per `name`, the latest
+event by `timestamp` wins. `Activated` keeps it in; `Deactivated`
+drops it. The fold is done in `extension::read_active(session_db)`.
 
-This shape is intentionally CRDT-friendly — each event is a discrete row
-keyed implicitly by eidetica, so two peers concurrently editing the set
-merge cleanly without coordination. There's no shared `Vec` to clobber.
+This shape is intentionally CRDT-friendly — each event is a discrete
+row keyed implicitly by eidetica, so two peers concurrently editing the
+set merge cleanly without coordination. There's no shared `Vec` to
+clobber.
 
 ```mermaid
 graph LR
@@ -169,7 +335,7 @@ graph LR
 ### record_active semantics
 
 `ExtensionHub::record_active(session_db)` runs at every `session_start`
-hook fire. It reconciles the hub's currently-registered extensions
+hook fire. It reconciles the hub's currently-installed extensions
 against the session's log:
 
 | Latest event for name             | Action                                |
@@ -192,25 +358,28 @@ freshly-written event always wins the fold.
 
 Each extension can store a per-session settings blob: arbitrary JSON
 keyed by extension name in a `DocStore` named `extension_settings` on
-the session DB.
+the session DB. Cap-based handlers access it through the `Settings`
+cap:
 
 ```rust,ignore
-// Inside a hook handler:
-let my_settings: serde_json::Value =
-    ctx.get_settings(self.name()).await;
-ctx.set_settings(self.name(), serde_json::json!({"poll_secs": 60}))
+// Inside a cap-based handler:
+let pollover: Option<serde_json::Value> =
+    caps.settings.as_ref().unwrap().get("max_results").await?;
+caps.settings.as_ref().unwrap()
+    .set("max_results", serde_json::json!(8))
     .await?;
 ```
 
-Settings are read/written through `HookContext::{get,set}_settings`,
-which take the extension name explicitly (rather than relying on
-ambient context). This keeps the API forward-compatible with WASM
-extensions where ownership must be proven, not inferred.
+The `Settings` cap is one of the host-only kinds — chaz core owns the
+single in-process impl per `(extension, session)` pair. The legacy
+`HookContext::{get,set}_settings` methods take the extension name
+explicitly (rather than relying on ambient context) and are what the
+bridge adapter calls through under the hood.
 
 `Extension::default_settings()` returns the extension's default schema —
 the `/extensions settings <name>` command surfaces this for users to
-see what's tunable. Missing keys in the stored settings should fall back
-to the default; extensions handle their own merge.
+see what's tunable. Missing keys in the stored settings should fall
+back to the default; extensions handle their own merge.
 
 ## Extension identity
 
@@ -237,9 +406,10 @@ callers that want the addressing token regardless of kind. The type
 serializes with `#[serde(tag = "kind")]` so it round-trips cleanly
 through eidetica.
 
-## HookContext
+## HookContext vs ExtensionCaps
 
-The lightweight handle passed to every hook handler:
+Two handles, depending on which side of the bridge a piece of code
+runs on:
 
 ```rust,ignore
 struct HookContext {
@@ -251,79 +421,96 @@ struct HookContext {
 }
 ```
 
-It's deliberately narrower than `ToolContext` — extensions don't get
-raw access to the tool registry, grants, or the tool host. Session
-access is currently a raw `Arc<Mutex<Session>>`; a future change will
-narrow this to typed capability handles
-(`read_session_history`, `write_session_entry`, ...) so the same API
-surface works for sandboxed WASM extensions.
+`HookContext` is the legacy per-fire handle the runtime constructs and
+hands to the hub's `fire_<kind>` methods. The bridge adapter uses it to
+build a fresh `ExtensionCaps` bundle for the cap-based handler it
+wraps.
+
+New code targets `&ExtensionCaps`. Session access is via
+`caps.session_read.entries(...)` and `caps.session_write.append(...)`
+rather than `ctx.session.lock().await.add_entry(...)` — narrower, typed,
+and the same shape works for sandboxed WASM extensions later.
 
 ## Module layout
 
-| Path                              | Purpose                                  |
-| --------------------------------- | ---------------------------------------- |
-| `src/extension/mod.rs`            | Framework: trait, hub, types, persistence|
-| `src/extension/hooks.rs`          | Per-event hook trait definitions         |
-| `src/extensions/mod.rs`           | `register_builtins` — wires built-ins    |
-| `src/extensions/core.rs`          | `shell`, `compact`, `spawn_*`            |
-| `src/extensions/fs.rs`            | `read_file`, `write_file`, `edit_file`   |
-| `src/extensions/system.rs`        | `get_time`, `calculate`, `describe_tool` |
-| `src/extensions/web.rs`           | `web_fetch`, `web_search`                |
-| `src/extensions/memory.rs`        | `remember`, `recall`, `list_memory_banks`|
-| `src/extensions/heartbeat.rs`     | Heartbeat tools + `/heartbeat` command   |
-| `src/extensions/path_normalizer.rs` | `tool_call` hook stripping `/` suffix  |
+| Path                                  | Purpose                                  |
+| ------------------------------------- | ---------------------------------------- |
+| `src/extension/mod.rs`                | Framework: trait, hub, `install_all`, persistence |
+| `src/extension/caps.rs`               | Cap traits + `ExtensionCaps` bundle      |
+| `src/extension/caps_inproc.rs`        | In-process impls of host-only caps       |
+| `src/extension/manifest.rs`           | `ExtensionManifest` + validation         |
+| `src/extension/registry.rs`           | `CapRegistry` (per-kind provider map)    |
+| `src/extension/handler.rs`            | Cap-based handler traits + `InstalledExtension` |
+| `src/extension/hook_bridge.rs`        | Adapters bridging cap handlers into legacy fire vecs |
+| `src/extension/hooks.rs`              | Legacy per-kind hook trait definitions   |
+| `src/extensions/mod.rs`               | `all_builtins` — wires built-ins         |
+| `src/extensions/core.rs`              | `shell`, `compact`, `spawn_*`            |
+| `src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`   |
+| `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool` |
+| `src/extensions/web.rs`               | `web_fetch`, `web_search`                |
+| `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`|
+| `src/extensions/heartbeat.rs`         | Heartbeat tools + `/heartbeat` command + routine handler |
+| `src/extensions/scheduler.rs`         | YAML-schedule routine handler            |
+| `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping `/` suffix    |
 | `src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt injection patterns |
 
 ## Built-in extensions
 
-| Extension            | Declared hooks      | What it provides                                    |
-| -------------------- | ------------------- | --------------------------------------------------- |
-| `core`               | `Tool`              | `shell`, `compact`, `spawn_agent`, `spawn_task`     |
-| `fs`                 | `Tool`              | `read_file`, `write_file`, `edit_file`              |
-| `system`             | `Tool`              | `get_time`, `calculate`, `describe_tool`            |
-| `web`                | `Tool`              | `web_fetch`, `web_search`                           |
-| `memory`             | `Tool`              | `remember`, `recall`, `list_memory_banks`           |
-| `heartbeat`          | `Tool`, `Command`   | 4 heartbeat tools + `/heartbeat` slash command      |
-| `path_normalizer`    | `ToolCall`          | Strips trailing `/` from filesystem-tool path args  |
-| `security_warnings`  | `ToolResult`        | Logs prompt-injection patterns in tool output       |
+| Extension            | Declared hooks      | Routine handler | What it provides                                    |
+| -------------------- | ------------------- | --------------- | --------------------------------------------------- |
+| `core`               | `Tool`              | —               | `shell`, `compact`, `spawn_agent`, `spawn_task`     |
+| `fs`                 | `Tool`              | —               | `read_file`, `write_file`, `edit_file`              |
+| `system`             | `Tool`              | —               | `get_time`, `calculate`, `describe_tool`            |
+| `web`                | `Tool`              | —               | `web_fetch`, `web_search`                           |
+| `memory`             | `Tool`              | —               | `remember`, `recall`, `list_memory_banks`           |
+| `heartbeat`          | `Tool`, `Command`   | yes             | 5 heartbeat tools + `/heartbeat` command + cron/one-shot directive fires |
+| `scheduler`          | —                   | yes             | YAML `schedules:` translated to per-session Routine rows; fires scheduled Directive entries |
+| `path_normalizer`    | `ToolCall`          | —               | Strips trailing `/` from filesystem-tool path args  |
+| `security_warnings`  | `ToolResult`        | —               | Logs prompt-injection patterns in tool output       |
 
 All are in the default-active set for new sessions (the
 "default = everything" rule). Users can disable individual extensions
-per session via `/extensions remove`.
+per session via `/extensions remove`. `scheduler` has no hooks
+declared — it only exists to receive routine fires the engine
+translated from YAML config.
 
 ## Adding a new extension
 
 1. Create `src/extensions/my_ext.rs` implementing `Extension`.
    - Return your hook kinds from `supported_hooks()`.
-   - Register tools/commands/hooks inside `register()` — the hub
-     captures owner attribution automatically.
+   - Build an `ExtensionManifest` from `manifest()` declaring
+     `required_capabilities` (cap traits the extension *must* have to
+     function) and `requested_capabilities` (caps it would like but
+     can run without). If you publish a cap impl, fill
+     `provides_capabilities` and override `build_providers()`.
+   - In `install(caps)`, register tools / commands through
+     `caps.tool_registration` / `caps.command_registration`, and
+     return an `InstalledExtension` whose slots carry your hook /
+     routine handlers.
 2. Add the module to `src/extensions/mod.rs` and the constructor to the
-   `extensions` list inside `register_builtins`. If the extension needs
-   shared deps (session registry, agent index, embedder, ...), add
-   them to `BuiltinDeps` and thread through `main.rs`.
+   `all_builtins` vec. If the extension needs shared deps (session
+   registry, agent index, embedder, ...), add them to `BuiltinDeps` and
+   thread through `main.rs`.
 3. (Optional) Override `default_settings()` if the extension has a
    tunable config schema.
 4. (Optional) Override `extension_ref()` if the extension's identity
    isn't `Builtin { chaz_version }` — e.g. when implementing a loader
-   for git/IPLD/eidetica refs.
+   for git / IPLD / eidetica refs.
 
-The framework attributes everything you register inside `register()`,
+The framework attributes everything you register through `install()`,
 filters by per-session active set, and surfaces inspection via
-`/extensions list`. No additional plumbing required in `main.rs` or
-the runtime.
+`/extensions list`. No additional plumbing required in `main.rs` or the
+runtime.
 
 ## Deferred / reserved
 
-- **`HookKind::Cron`** — declarable today, no firing path. Once
-  implemented, will let extensions register cron-driven handlers and
-  the framework own the scheduler. Heartbeat's runner is the obvious
-  first migration.
-- **WASM/sandboxed extensions** — `ExtensionRef::{Eidetica, Ipld, Git}`
-  variants are reserved for non-compile-time extensions. The hook
-  declaration model (`supported_hooks()`) was chosen with these in
-  mind — it doubles as the manifest a sandbox host inspects before
-  loading. No loader exists yet.
-- **Typed capability handles on `HookContext`** — currently extensions
-  get a raw `Arc<Mutex<Session>>`. A narrower surface
-  (`read_session_history`, `write_session_entry`, etc.) will land
-  alongside the first sandboxed extension.
+- **WASM / sandboxed extensions** — `ExtensionRef::{Eidetica, Ipld, Git}`
+  variants are reserved for non-compile-time extensions. The cap
+  surface was designed with these in mind: `ExtensionCaps`'s trait
+  methods return plain data over `CapFuture`, so the same handler
+  shape works across a sandbox boundary. No loader exists yet.
+- **Legacy registration helpers** — `ExtensionHub::register_extension`
+  + `on_<kind>` + `register_tool` + `register_command` survive on the
+  hub solely to support the hub's own legacy-path unit tests. Once
+  those tests are ported to `install_all`, the helpers go away along
+  with the trait's no-op `register()` default.
