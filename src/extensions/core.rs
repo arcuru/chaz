@@ -11,10 +11,15 @@
 //! the same construction path as the other built-ins.
 
 use crate::backends::BackendManager;
-use crate::extension::{Extension, ExtensionHub, HookKind};
+use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
+use crate::extension::handler::InstalledExtension;
+use crate::extension::manifest::ExtensionManifest;
+use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
 use crate::security::SecurityContext;
 use crate::server::Server;
 use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnTask};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 pub struct CoreExtension {
@@ -59,5 +64,47 @@ impl Extension for CoreExtension {
             backend: self.backend.clone(),
             security: self.security.clone(),
         }));
+    }
+
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            name: self.name().to_string(),
+            extension_ref: ExtensionRef::builtin(self.name()),
+            supported_hooks: vec![HookKind::Tool],
+            required_capabilities: vec![CapabilityRequest::ToolRegistration],
+            requested_capabilities: Vec::new(),
+            provides_capabilities: Vec::new(),
+        }
+    }
+
+    fn install<'a>(
+        &'a self,
+        caps: ExtensionCaps,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+        Box::pin(async move {
+            let tool_reg = caps
+                .tool_registration
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("core install requires ToolRegistration cap"))?;
+            let tools: Vec<Arc<dyn crate::tool::Tool>> = vec![
+                Arc::new(ShellExec),
+                Arc::new(Compact),
+                Arc::new(SpawnAgent {
+                    server: self.spawn_server_cell.clone(),
+                    backend: self.backend.clone(),
+                    security: self.security.clone(),
+                }),
+                Arc::new(SpawnTask {
+                    server: self.spawn_server_cell.clone(),
+                    backend: self.backend.clone(),
+                    security: self.security.clone(),
+                }),
+            ];
+            for t in tools {
+                let d = t.descriptor();
+                tool_reg.register(d, t).await?;
+            }
+            Ok(InstalledExtension::empty())
+        })
     }
 }

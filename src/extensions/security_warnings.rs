@@ -9,7 +9,12 @@
 //! `runtime::execute`. Demonstrates a pure observability `tool_result`
 //! hook: read the output, log if something looks suspicious, hand it back.
 
-use crate::extension::{Extension, ExtensionHub, HookContext, HookKind, HookToolResult};
+use crate::extension::caps::ExtensionCaps;
+use crate::extension::handler::{HandlerFuture, HookHandlerToolResult, InstalledExtension};
+use crate::extension::manifest::ExtensionManifest;
+use crate::extension::{
+    Extension, ExtensionHub, ExtensionRef, HookContext, HookKind, HookToolResult,
+};
 use crate::security::Sanitizer;
 use std::future::Future;
 use std::pin::Pin;
@@ -30,6 +35,28 @@ impl Extension for SecurityWarnings {
     fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
         hub.on_tool_result(Box::new(SecurityWarningsHook));
     }
+
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            name: self.name().to_string(),
+            extension_ref: ExtensionRef::builtin(self.name()),
+            supported_hooks: vec![HookKind::ToolResult],
+            required_capabilities: Vec::new(),
+            requested_capabilities: Vec::new(),
+            provides_capabilities: Vec::new(),
+        }
+    }
+
+    fn install<'a>(
+        &'a self,
+        _caps: ExtensionCaps,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut installed = InstalledExtension::empty();
+            installed.tool_result = Some(Box::new(SecurityWarningsCapHook));
+            Ok(installed)
+        })
+    }
 }
 
 struct SecurityWarningsHook;
@@ -41,18 +68,33 @@ impl HookToolResult for SecurityWarningsHook {
         tool_name: &'a str,
         result: String,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-        Box::pin(async move {
-            let warnings = Sanitizer::scan(&result);
-            if !warnings.is_empty() {
-                warn!(
-                    tool = %tool_name,
-                    count = warnings.len(),
-                    "Prompt injection patterns detected in tool output"
-                );
-            }
-            result
-        })
+        Box::pin(async move { scan_and_pass(tool_name, result) })
     }
+}
+
+struct SecurityWarningsCapHook;
+
+impl HookHandlerToolResult for SecurityWarningsCapHook {
+    fn on_tool_result<'a>(
+        &'a self,
+        _caps: &'a ExtensionCaps,
+        tool_name: &'a str,
+        result: String,
+    ) -> HandlerFuture<'a, String> {
+        Box::pin(async move { scan_and_pass(tool_name, result) })
+    }
+}
+
+fn scan_and_pass(tool_name: &str, result: String) -> String {
+    let warnings = Sanitizer::scan(&result);
+    if !warnings.is_empty() {
+        warn!(
+            tool = %tool_name,
+            count = warnings.len(),
+            "Prompt injection patterns detected in tool output"
+        );
+    }
+    result
 }
 
 #[cfg(test)]

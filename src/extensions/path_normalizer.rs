@@ -5,8 +5,11 @@
 //! treats as a directory and rejects. Canonicalizing the arg before
 //! execution avoids the round-trip through an error message.
 
+use crate::extension::caps::ExtensionCaps;
+use crate::extension::handler::{HandlerFuture, HookHandlerToolCall, InstalledExtension};
+use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
-    Extension, ExtensionHub, HookContext, HookKind, HookToolCall, ToolCallDecision,
+    Extension, ExtensionHub, ExtensionRef, HookContext, HookKind, HookToolCall, ToolCallDecision,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -26,6 +29,28 @@ impl Extension for PathNormalizer {
     fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
         hub.on_tool_call(Box::new(PathNormalizerHook));
     }
+
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            name: self.name().to_string(),
+            extension_ref: ExtensionRef::builtin(self.name()),
+            supported_hooks: vec![HookKind::ToolCall],
+            required_capabilities: Vec::new(),
+            requested_capabilities: Vec::new(),
+            provides_capabilities: Vec::new(),
+        }
+    }
+
+    fn install<'a>(
+        &'a self,
+        _caps: ExtensionCaps,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut installed = InstalledExtension::empty();
+            installed.tool_call = Some(Box::new(PathNormalizerCapHook));
+            Ok(installed)
+        })
+    }
 }
 
 struct PathNormalizerHook;
@@ -37,22 +62,37 @@ impl HookToolCall for PathNormalizerHook {
         tool_name: &'a str,
         args: &'a mut serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = ToolCallDecision> + Send + 'a>> {
-        Box::pin(async move {
-            if !matches!(tool_name, "read_file" | "write_file" | "edit_file") {
-                return ToolCallDecision::Continue;
-            }
-            if let Some(obj) = args.as_object_mut()
-                && let Some(path_val) = obj.get_mut("path")
-                && let Some(path_str) = path_val.as_str()
-                && path_str != "/"
-                && path_str.ends_with('/')
-            {
-                let trimmed = path_str.trim_end_matches('/').to_string();
-                *path_val = serde_json::Value::String(trimmed);
-            }
-            ToolCallDecision::Continue
-        })
+        Box::pin(async move { normalize_args(tool_name, args) })
     }
+}
+
+struct PathNormalizerCapHook;
+
+impl HookHandlerToolCall for PathNormalizerCapHook {
+    fn on_tool_call<'a>(
+        &'a self,
+        _caps: &'a ExtensionCaps,
+        tool_name: &'a str,
+        args: &'a mut serde_json::Value,
+    ) -> HandlerFuture<'a, ToolCallDecision> {
+        Box::pin(async move { normalize_args(tool_name, args) })
+    }
+}
+
+fn normalize_args(tool_name: &str, args: &mut serde_json::Value) -> ToolCallDecision {
+    if !matches!(tool_name, "read_file" | "write_file" | "edit_file") {
+        return ToolCallDecision::Continue;
+    }
+    if let Some(obj) = args.as_object_mut()
+        && let Some(path_val) = obj.get_mut("path")
+        && let Some(path_str) = path_val.as_str()
+        && path_str != "/"
+        && path_str.ends_with('/')
+    {
+        let trimmed = path_str.trim_end_matches('/').to_string();
+        *path_val = serde_json::Value::String(trimmed);
+    }
+    ToolCallDecision::Continue
 }
 
 #[cfg(test)]

@@ -209,7 +209,7 @@ mod tests {
     use crate::backends::BackendManager;
     use crate::commands::{Command, dispatch};
     use crate::extension::ExtensionHub;
-    use crate::extensions::{BuiltinDeps, register_builtins};
+    use crate::extensions::{BuiltinDeps, all_builtins};
     use crate::hosted_index::HostedIndex;
     use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
     use crate::server::Server;
@@ -256,25 +256,26 @@ mod tests {
             approval_callback: None,
         };
 
-        // Register every built-in extension on the hub, then drain the
-        // hub's tool list into a ToolRegistry (mirroring main.rs).
+        // Install every built-in extension on the hub via the cap-based
+        // install path, then drain the hub's tool list into a
+        // ToolRegistry (mirroring main.rs).
         let mut hub = ExtensionHub::new();
         hub.reserve_builtin_commands(crate::commands::BUILTIN_COMMAND_NAMES.iter().copied());
+        hub.set_session_registry(registry.clone());
         let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
         let spawn_cell = Arc::new(OnceLock::new());
-        register_builtins(
-            &mut hub,
-            BuiltinDeps {
-                agent_index: agent_index.clone(),
-                session_registry: registry.clone(),
-                embedder: None,
-                web_search_backends: Vec::new(),
-                spawn_server_cell: spawn_cell.clone(),
-                backend_manager: backend_mgr.clone(),
-                security: security.clone(),
-            },
-        );
+        hub.install_all(all_builtins(BuiltinDeps {
+            agent_index: agent_index.clone(),
+            session_registry: registry.clone(),
+            embedder: None,
+            web_search_backends: Vec::new(),
+            spawn_server_cell: spawn_cell.clone(),
+            backend_manager: backend_mgr.clone(),
+            security: security.clone(),
+        }))
+        .await
+        .unwrap();
         let mut tool_registry = ToolRegistry::new();
         for (owner, _name, tool) in hub.tools_for_registry() {
             tool_registry.register_arc_owned(tool, Some(owner));

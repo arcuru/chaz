@@ -359,13 +359,15 @@ async fn main() -> anyhow::Result<()> {
     // takes ownership of the cell and constructs the spawn tools.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
 
-    // Register every built-in extension on the hub. Tools and commands
-    // land inside the hub via `register_tool` / `register_command`; once
-    // this returns we drain them out into the legacy ToolRegistry that
-    // the runtime/agent loop currently expects.
-    extensions::register_builtins(
-        &mut extension_hub,
-        extensions::BuiltinDeps {
+    // Install every built-in extension on the hub via the cap-based
+    // install path. Tools and commands flow through the per-extension
+    // `caps.tool_registration` / `caps.command_registration` queues that
+    // `install_all` drains; hook handlers returned in each extension's
+    // `InstalledExtension` are bridged into the legacy hook vectors so
+    // the existing `fire_*` paths run unchanged.
+    extension_hub.set_session_registry(registry.clone());
+    extension_hub
+        .install_all(extensions::all_builtins(extensions::BuiltinDeps {
             agent_index: agent_index_store.clone(),
             session_registry: registry.clone(),
             embedder: embedder.clone(),
@@ -373,8 +375,8 @@ async fn main() -> anyhow::Result<()> {
             spawn_server_cell: spawn_server_cell.clone(),
             backend_manager: backends::BackendManager::new(&config.backends, secret_store.clone()),
             security: security_ctx.clone(),
-        },
-    );
+        }))
+        .await?;
     let extension_names = extension_hub.extension_names();
     if !extension_names.is_empty() {
         info!(?extension_names, "Extensions registered");

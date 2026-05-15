@@ -18,6 +18,7 @@
 pub mod caps;
 pub mod caps_inproc;
 pub mod handler;
+pub(crate) mod hook_bridge;
 pub mod hooks;
 pub mod manifest;
 pub mod registry;
@@ -1174,6 +1175,7 @@ impl ExtensionHub {
             let caps = self.build_install_caps(m, &tool_pending, &command_pending);
             let installed = ext.install(caps).await?;
             self.installed.insert(m.name.clone(), installed);
+            self.extensions.push(ext.clone());
         }
 
         // Drain pending tool / command registrations through the legacy
@@ -1186,6 +1188,91 @@ impl ExtensionHub {
         let pending_commands = std::mem::take(&mut *command_pending.lock().await);
         for p in pending_commands {
             self.register_command_attributed(&p.owner, p.descriptor.name, p.command);
+        }
+
+        // Bridge cap-based hook handlers (`installed[name].tool_call`,
+        // `installed[name].tool_result`, ...) into the legacy hook
+        // vectors so the existing `fire_*` paths run unchanged. The
+        // adapter builds a per-fire `ExtensionCaps` bundle from the
+        // legacy `HookContext` so cap-based handlers see the same
+        // session view their cap traits promise.
+        //
+        // Take<Option<Box<dyn ...>>> moves the handler out of
+        // `installed[name]` — the slot then reads as `None` to
+        // `installed_for(name)`, which is fine: the legacy fire path
+        // is now the source of truth for the handler.
+        let names: Vec<String> = self.installed.keys().cloned().collect();
+        for name in names {
+            let Some(slot) = self.installed.get_mut(&name) else {
+                continue;
+            };
+            let tool_call = slot.tool_call.take();
+            let tool_result = slot.tool_result.take();
+            let before_agent_start = slot.before_agent_start.take();
+            let agent_end = slot.agent_end.take();
+            let session_start = slot.session_start.take();
+            let session_shutdown = slot.session_shutdown.take();
+            let owner: &'static str = self.intern_name(&name);
+            if let Some(inner) = tool_call {
+                self.hooks_by_extension
+                    .entry(owner)
+                    .or_default()
+                    .insert(HookKind::ToolCall);
+                self.tool_call.push(RegisteredHook {
+                    owner,
+                    hook: Box::new(hook_bridge::ToolCallAdapter::new(owner, inner)),
+                });
+            }
+            if let Some(inner) = tool_result {
+                self.hooks_by_extension
+                    .entry(owner)
+                    .or_default()
+                    .insert(HookKind::ToolResult);
+                self.tool_result.push(RegisteredHook {
+                    owner,
+                    hook: Box::new(hook_bridge::ToolResultAdapter::new(owner, inner)),
+                });
+            }
+            if let Some(inner) = before_agent_start {
+                self.hooks_by_extension
+                    .entry(owner)
+                    .or_default()
+                    .insert(HookKind::BeforeAgentStart);
+                self.before_agent_start.push(RegisteredHook {
+                    owner,
+                    hook: Box::new(hook_bridge::BeforeAgentStartAdapter::new(owner, inner)),
+                });
+            }
+            if let Some(inner) = agent_end {
+                self.hooks_by_extension
+                    .entry(owner)
+                    .or_default()
+                    .insert(HookKind::AgentEnd);
+                self.agent_end.push(RegisteredHook {
+                    owner,
+                    hook: Box::new(hook_bridge::AgentEndAdapter::new(owner, inner)),
+                });
+            }
+            if let Some(inner) = session_start {
+                self.hooks_by_extension
+                    .entry(owner)
+                    .or_default()
+                    .insert(HookKind::SessionStart);
+                self.session_start.push(RegisteredHook {
+                    owner,
+                    hook: Box::new(hook_bridge::SessionStartAdapter::new(owner, inner)),
+                });
+            }
+            if let Some(inner) = session_shutdown {
+                self.hooks_by_extension
+                    .entry(owner)
+                    .or_default()
+                    .insert(HookKind::SessionShutdown);
+                self.session_shutdown.push(RegisteredHook {
+                    owner,
+                    hook: Box::new(hook_bridge::SessionShutdownAdapter::new(owner, inner)),
+                });
+            }
         }
 
         Ok(())

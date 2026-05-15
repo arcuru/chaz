@@ -45,8 +45,22 @@ pub struct BuiltinDeps {
 ///
 /// Order is registration order — hooks fire and commands collide in this
 /// sequence.
+///
+/// Legacy entry point; new call sites should use [`all_builtins`] +
+/// [`ExtensionHub::install_all`]. Commit F drops this once nothing
+/// outside main is calling it.
+#[allow(dead_code)]
 pub fn register_builtins(hub: &mut ExtensionHub, deps: BuiltinDeps) {
-    let extensions: Vec<Arc<dyn crate::extension::Extension>> = vec![
+    for ext in all_builtins(deps) {
+        hub.register_extension(ext);
+    }
+}
+
+/// Build the full built-in extension set as a vector. Consumed by
+/// `ExtensionHub::install_all` (cap-based install path); replaces
+/// [`register_builtins`] at the chaz `main` entry point.
+pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extension>> {
+    vec![
         Arc::new(core::CoreExtension::new(
             deps.spawn_server_cell,
             deps.backend_manager,
@@ -63,9 +77,5 @@ pub fn register_builtins(hub: &mut ExtensionHub, deps: BuiltinDeps) {
             deps.embedder,
         )),
         Arc::new(heartbeat::HeartbeatExtension::new(deps.agent_index)),
-    ];
-
-    for ext in extensions {
-        hub.register_extension(ext);
-    }
+    ]
 }
