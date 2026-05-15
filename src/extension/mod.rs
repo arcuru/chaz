@@ -52,9 +52,12 @@ use tracing::warn;
 /// 3. **Inspection**: `/extensions list -v` and similar surfaces use the
 ///    declared sets to describe what each extension does.
 ///
-/// Variants that exist today fire through `fire_<kind>` methods on
-/// [`ExtensionHub`]. Reserved variants ([`HookKind::Cron`]) are accepted
-/// for declaration but not yet fired by the framework.
+/// Every variant fires through a `fire_<kind>` method on
+/// [`ExtensionHub`] (for hook kinds) or surfaces through the
+/// tool/command registries (for `Tool` / `Command`). Scheduled work no
+/// longer flows through hooks — it goes through the
+/// [`crate::routine::RoutineEngine`] introduced in steps 7–8 of the
+/// cap refactor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
@@ -70,9 +73,6 @@ pub enum HookKind {
     /// Extension provides one or more slash commands (via
     /// [`ExtensionHub::register_command`]).
     Command,
-    /// Reserved — scheduled-event hook. Extensions may declare it, but
-    /// the framework does not yet have a firing path.
-    Cron,
 }
 
 /// Eidetica store name where per-session extension activation/deactivation
@@ -1764,27 +1764,6 @@ mod tests {
         assert!(hub.commands_for("with_command").contains("dance"));
         assert_eq!(hub.command_owner("dance"), Some("with_command"));
         assert_eq!(hub.command_owner("not_real"), None);
-    }
-
-    #[test]
-    fn cron_kind_is_declarable_even_though_not_yet_fired() {
-        struct Scheduled;
-        impl Extension for Scheduled {
-            fn name(&self) -> &'static str {
-                "scheduled"
-            }
-            fn supported_hooks(&self) -> &[HookKind] {
-                &[HookKind::Cron]
-            }
-            fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {
-                // No on_cron yet — declaration is forward-compatible.
-            }
-        }
-        let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(Scheduled));
-        // Registered no actual handler — `extensions_for_kind` reflects
-        // registrations, not declarations, so this stays empty.
-        assert!(hub.extensions_for_kind(HookKind::Cron).is_empty());
     }
 
     #[test]
