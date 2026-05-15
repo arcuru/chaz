@@ -397,7 +397,12 @@ pub trait Extension: Send + Sync {
     /// Register hooks, tools, and commands. Called once at startup with
     /// the hub in "registering-as-this-extension" mode so every
     /// `register_*` call captures ownership.
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub);
+    ///
+    /// Legacy entry point; production now drives extension setup
+    /// through [`Self::install`] via
+    /// [`ExtensionHub::install_all`]. The trait method survives only
+    /// for the in-hub legacy tests; built-ins no longer override it.
+    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
 
     /// Hook ABI version. Bumped when the hook interface changes shape in
     /// a backwards-incompatible way. Orthogonal to [`extension_ref`] —

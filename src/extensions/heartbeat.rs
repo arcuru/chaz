@@ -12,8 +12,7 @@ use crate::extension::caps::{
 use crate::extension::handler::{HandlerFuture, InstalledExtension, RoutineHandler};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
-    Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionHub, ExtensionRef, HookContext,
-    HookKind,
+    Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
 };
 use crate::hosted_index::HostedIndex;
 use crate::routine::{
@@ -73,20 +72,6 @@ impl Extension for HeartbeatExtension {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::Tool, HookKind::Command]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(HeartbeatAdd::new(self.agent_index.clone())));
-        hub.register_tool(Arc::new(HeartbeatModify::new(self.agent_index.clone())));
-        hub.register_tool(Arc::new(HeartbeatRemove));
-        hub.register_tool(Arc::new(HeartbeatList::new(self.agent_index.clone())));
-        hub.register_tool(Arc::new(WakeMeUp::new(self.agent_index.clone())));
-        hub.register_command(
-            "heartbeat",
-            Box::new(HeartbeatCommand {
-                agent_index: self.agent_index.clone(),
-            }),
-        );
     }
 
     fn manifest(&self) -> ExtensionManifest {

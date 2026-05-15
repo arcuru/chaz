@@ -568,11 +568,6 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             engine_clone.run().await;
         });
-
-        // Legacy heartbeat runner — gutted in commit C; survives only
-        // so this call site keeps compiling until commit F deletes it.
-        let heartbeat_runner = heartbeat::HeartbeatRunner::new(server.clone(), chaz_peer);
-        heartbeat_runner.start();
     }
 
     // Run the selected gateway

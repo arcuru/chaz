@@ -14,7 +14,7 @@ use crate::backends::BackendManager;
 use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
 use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
+use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::security::SecurityContext;
 use crate::server::Server;
 use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnTask};
@@ -49,21 +49,6 @@ impl Extension for CoreExtension {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::Tool]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(ShellExec));
-        hub.register_tool(Arc::new(Compact));
-        hub.register_tool(Arc::new(SpawnAgent {
-            server: self.spawn_server_cell.clone(),
-            backend: self.backend.clone(),
-            security: self.security.clone(),
-        }));
-        hub.register_tool(Arc::new(SpawnTask {
-            server: self.spawn_server_cell.clone(),
-            backend: self.backend.clone(),
-            security: self.security.clone(),
-        }));
     }
 
     fn manifest(&self) -> ExtensionManifest {

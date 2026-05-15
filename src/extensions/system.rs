@@ -6,7 +6,7 @@
 use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
 use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
+use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::tools::{Calculate, DescribeTool, GetTime};
 use std::future::Future;
 use std::pin::Pin;
@@ -21,12 +21,6 @@ impl Extension for SystemExtension {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::Tool]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(GetTime));
-        hub.register_tool(Arc::new(Calculate));
-        hub.register_tool(Arc::new(DescribeTool));
     }
 
     fn manifest(&self) -> ExtensionManifest {

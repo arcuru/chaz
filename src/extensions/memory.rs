@@ -8,7 +8,7 @@ use crate::embedding::Embedder;
 use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
 use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
+use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
 use crate::tools::{ListMemoryBanks, Recall, Remember};
@@ -43,23 +43,6 @@ impl Extension for MemoryExtension {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::Tool]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(Remember::new(
-            self.registry.clone(),
-            self.agent_index.clone(),
-            self.embedder.clone(),
-        )));
-        hub.register_tool(Arc::new(Recall::new(
-            self.registry.clone(),
-            self.agent_index.clone(),
-            self.embedder.clone(),
-        )));
-        hub.register_tool(Arc::new(ListMemoryBanks::new(
-            self.registry.clone(),
-            self.agent_index.clone(),
-        )));
     }
 
     fn manifest(&self) -> ExtensionManifest {

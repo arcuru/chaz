@@ -17,12 +17,11 @@
 use crate::extension::caps::{CapabilityRequest, ExtensionCaps, SessionEntryDraft};
 use crate::extension::handler::{HandlerFuture, InstalledExtension, RoutineHandler};
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
+use crate::extension::{Extension, ExtensionRef, HookKind};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// Routine payload for scheduler fires.
 ///
@@ -45,8 +44,6 @@ impl Extension for ScheduleExtension {
     fn supported_hooks(&self) -> &[HookKind] {
         &[]
     }
-
-    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
 
     fn manifest(&self) -> ExtensionManifest {
         ExtensionManifest {

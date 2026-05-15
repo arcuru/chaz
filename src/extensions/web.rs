@@ -7,7 +7,7 @@
 use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
 use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
+use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::tools::{SearchBackend, WebFetch, WebSearch};
 use std::future::Future;
 use std::pin::Pin;
@@ -30,11 +30,6 @@ impl Extension for WebExtension {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::Tool]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(WebFetch));
-        hub.register_tool(Arc::new(WebSearch::new(self.search_backends.clone())));
     }
 
     fn manifest(&self) -> ExtensionManifest {

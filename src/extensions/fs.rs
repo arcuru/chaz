@@ -7,7 +7,7 @@
 use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
 use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{Extension, ExtensionHub, ExtensionRef, HookKind};
+use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::tools::{EditFile, ReadFile, WriteFile};
 use std::future::Future;
 use std::pin::Pin;
@@ -22,12 +22,6 @@ impl Extension for FsExtension {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::Tool]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.register_tool(Arc::new(ReadFile));
-        hub.register_tool(Arc::new(WriteFile));
-        hub.register_tool(Arc::new(EditFile));
     }
 
     fn manifest(&self) -> ExtensionManifest {

@@ -8,12 +8,9 @@
 use crate::extension::caps::ExtensionCaps;
 use crate::extension::handler::{HandlerFuture, HookHandlerToolCall, InstalledExtension};
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::{
-    Extension, ExtensionHub, ExtensionRef, HookContext, HookKind, HookToolCall, ToolCallDecision,
-};
+use crate::extension::{Extension, ExtensionRef, HookKind, ToolCallDecision};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 pub struct PathNormalizer;
 
@@ -24,10 +21,6 @@ impl Extension for PathNormalizer {
 
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::ToolCall]
-    }
-
-    fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-        hub.on_tool_call(Box::new(PathNormalizerHook));
     }
 
     fn manifest(&self) -> ExtensionManifest {
@@ -50,19 +43,6 @@ impl Extension for PathNormalizer {
             installed.tool_call = Some(Box::new(PathNormalizerCapHook));
             Ok(installed)
         })
-    }
-}
-
-struct PathNormalizerHook;
-
-impl HookToolCall for PathNormalizerHook {
-    fn on_tool_call<'a>(
-        &'a self,
-        _ctx: &'a HookContext,
-        tool_name: &'a str,
-        args: &'a mut serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = ToolCallDecision> + Send + 'a>> {
-        Box::pin(async move { normalize_args(tool_name, args) })
     }
 }
 
@@ -98,40 +78,13 @@ fn normalize_args(tool_name: &str, args: &mut serde_json::Value) -> ToolCallDeci
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::HookContext;
-    use crate::session::Session;
-    use crate::types::ConversationId;
-    use eidetica::Instance;
-    use eidetica::backend::database::InMemory;
-    use eidetica::crdt::Doc;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    async fn make_ctx() -> HookContext {
-        let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let mut user = instance.login_user("test", None).await.unwrap();
-        let key = user.get_default_key().unwrap();
-        let mut s = Doc::new();
-        s.set("name", "session");
-        let db = user.create_database(s, &key).await.unwrap();
-        let session = Session::new(ConversationId("conv".into()), db).await;
-        HookContext {
-            agent_name: "test".into(),
-            model: None,
-            call_depth: 0,
-            session: Arc::new(Mutex::new(session)),
-            active_extensions: std::collections::HashSet::new(),
-        }
-    }
 
     #[tokio::test]
     async fn strips_trailing_slash_on_read_file() {
-        let hook = PathNormalizerHook;
-        let ctx = make_ctx().await;
+        let caps = ExtensionCaps::empty();
+        let hook = PathNormalizerCapHook;
         let mut args = serde_json::json!({"path": "/etc/hosts/"});
-        let decision = hook.on_tool_call(&ctx, "read_file", &mut args).await;
+        let decision = hook.on_tool_call(&caps, "read_file", &mut args).await;
         assert!(matches!(decision, ToolCallDecision::Continue));
         assert_eq!(
             args.get("path").and_then(|v| v.as_str()),
@@ -141,19 +94,19 @@ mod tests {
 
     #[tokio::test]
     async fn leaves_root_path_alone() {
-        let hook = PathNormalizerHook;
-        let ctx = make_ctx().await;
+        let caps = ExtensionCaps::empty();
+        let hook = PathNormalizerCapHook;
         let mut args = serde_json::json!({"path": "/"});
-        let _ = hook.on_tool_call(&ctx, "read_file", &mut args).await;
+        let _ = hook.on_tool_call(&caps, "read_file", &mut args).await;
         assert_eq!(args.get("path").and_then(|v| v.as_str()), Some("/"));
     }
 
     #[tokio::test]
     async fn ignores_non_matching_tool() {
-        let hook = PathNormalizerHook;
-        let ctx = make_ctx().await;
+        let caps = ExtensionCaps::empty();
+        let hook = PathNormalizerCapHook;
         let mut args = serde_json::json!({"path": "/etc/hosts/"});
-        let _ = hook.on_tool_call(&ctx, "shell", &mut args).await;
+        let _ = hook.on_tool_call(&caps, "shell", &mut args).await;
         assert_eq!(
             args.get("path").and_then(|v| v.as_str()),
             Some("/etc/hosts/")
@@ -162,10 +115,10 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_missing_path() {
-        let hook = PathNormalizerHook;
-        let ctx = make_ctx().await;
+        let caps = ExtensionCaps::empty();
+        let hook = PathNormalizerCapHook;
         let mut args = serde_json::json!({});
-        let _ = hook.on_tool_call(&ctx, "read_file", &mut args).await;
+        let _ = hook.on_tool_call(&caps, "read_file", &mut args).await;
         assert!(args.get("path").is_none());
     }
 }

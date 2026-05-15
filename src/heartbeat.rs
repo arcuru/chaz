@@ -1,44 +1,17 @@
 //! Heartbeat support helpers.
 //!
-//! Per-session heartbeat rules now live as [`crate::routine::Routine`]
+//! Per-session heartbeat rules live as [`crate::routine::Routine`]
 //! rows under the session DB's `routines` table; firing goes through
-//! [`crate::routine::RoutineEngine`] once it's spawned (commit E).
+//! [`crate::routine::RoutineEngine`].
 //!
-//! This module retains two narrow surfaces during the migration:
-//!
-//! * [`sweep_for_agent`] — used by `agent_delete` to drop routines left
-//!   orphaned when their target agent is unregistered. Now operates on
-//!   Routine rows whose payload deserializes to [`HeartbeatPayload`].
-//! * [`HeartbeatRunner`] — a no-op stub whose `start()` survives only
-//!   to keep `main.rs`'s call site compiling until commit F deletes it.
-
-#![allow(dead_code)]
+//! This module retains a single narrow surface: [`sweep_for_agent`],
+//! used by `agent_delete` to drop routines left orphaned when their
+//! target agent is unregistered.
 
 use crate::extensions::heartbeat::HeartbeatPayload;
 use crate::routine::{list_session_routines, remove_session_routine};
 use crate::server::Server;
-use eidetica::Database;
 use std::sync::Arc;
-
-/// Per-session heartbeat runner — gutted for the cap-refactor migration
-/// window. Routine firing moves to [`crate::routine::RoutineEngine`]
-/// once chaz's `main` spawns it (commit E). The struct + its `start()`
-/// method survive this commit only so `main.rs`'s call site keeps
-/// compiling. Commit F deletes them.
-pub struct HeartbeatRunner;
-
-impl HeartbeatRunner {
-    pub fn new(_server: Arc<Server>, _chaz_peer: Database) -> Arc<Self> {
-        Arc::new(Self)
-    }
-
-    pub fn start(self: &Arc<Self>) {
-        // Intentionally no-op: per-session heartbeats fire through the
-        // routine engine once it's spawned. Rules added between this
-        // commit and commit E sit in the routines table until the
-        // engine picks them up.
-    }
-}
 
 /// Walk every known session and remove heartbeat routine rows whose
 /// payload targets `target_db_id`. Returns the number removed.
