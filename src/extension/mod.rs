@@ -22,8 +22,10 @@ pub mod hooks;
 pub mod manifest;
 pub mod registry;
 
+use crate::extension::caps_inproc::{InProcSessionRead, InProcSessionWrite, InProcSettings};
+use crate::routine::RoutineScope;
 use crate::runtime::RuntimeMessage;
-use crate::session::Session;
+use crate::session::{Session, SessionRegistry};
 use crate::tool::Tool;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
@@ -532,6 +534,13 @@ pub struct ExtensionHub {
     /// during the migration window; can be dropped once legacy
     /// registration is gone.
     name_intern: HashSet<&'static str>,
+    /// Session registry handle the hub uses to resolve session-scoped
+    /// routine fires into a `(ConversationId, Database)` so it can
+    /// build per-session caps (SessionRead/Write/Settings). `None` in
+    /// tests that exercise the hub in isolation; production builds set
+    /// it via [`Self::set_session_registry`] after both the hub and
+    /// the registry are constructed.
+    session_registry: Option<Arc<SessionRegistry>>,
 }
 
 impl Default for ExtensionHub {
@@ -561,7 +570,16 @@ impl ExtensionHub {
             capability_defaults: HashMap::new(),
             installed: HashMap::new(),
             name_intern: HashSet::new(),
+            session_registry: None,
         }
+    }
+
+    /// Install the session registry the hub uses to resolve session-
+    /// scoped routine fires into per-session caps. Called once at
+    /// startup from chaz's main, after both [`Self::new`] and
+    /// [`SessionRegistry::new`]. Idempotent — later calls overwrite.
+    pub fn set_session_registry(&mut self, registry: Arc<SessionRegistry>) {
+        self.session_registry = Some(registry);
     }
 
     /// Replace the hub's operator-default-provider map. Called once at
@@ -586,16 +604,29 @@ impl ExtensionHub {
     }
 
     /// Dispatch one routine fire to the named extension's routine
-    /// handler (added in step 8 of the cap refactor).
+    /// handler (added in step 8 of the cap refactor; session-scoped
+    /// caps wired in step 9).
+    ///
+    /// `scope` controls the caps bundle handed to the handler:
+    /// * [`RoutineScope::Global`] — extension-providable caps' default
+    ///   providers only; host-only slots stay `None`.
+    /// * [`RoutineScope::Session(id)`] — same defaults, plus per-
+    ///   session [`caps::SessionRead`] / [`caps::SessionWrite`] /
+    ///   [`caps::Settings`] resolved through the hub's
+    ///   [`SessionRegistry`]. The owner string on `SessionWrite` is
+    ///   the dispatching extension's name so audit trails record who
+    ///   wrote what.
     ///
     /// Returns `Ok(())` if dispatch succeeded (the handler returned
     /// `Ok`); `Err(...)` if the handler errored, the extension isn't
-    /// installed, or the installed extension didn't register a
-    /// routine handler. The engine's failure-handling pass uses the
-    /// `Err` path to drive `consecutive_failures` / auto-disable.
+    /// installed, the installed extension didn't register a routine
+    /// handler, or session resolution failed for a session-scoped
+    /// fire. The engine's failure-handling pass uses the `Err` path
+    /// to drive `consecutive_failures` / auto-disable.
     pub async fn dispatch_routine(
         &self,
         extension: &str,
+        scope: &RoutineScope,
         payload: serde_json::Value,
     ) -> anyhow::Result<()> {
         let installed = self.installed.get(extension).ok_or_else(|| {
@@ -606,19 +637,24 @@ impl ExtensionHub {
                 "extension '{extension}' has no routine_handler — declare it in install()"
             )
         })?;
-        // Engine fires are global today — no calling session. Build a
-        // routine-time bundle: extension-providable caps from the
-        // registry's per-kind defaults, host-only slots stay `None`
-        // (handlers using SessionWrite must be invoked with a
-        // per-session bundle that step 9 wires through the heartbeat
-        // path).
-        let caps = self.build_routine_caps();
+        let caps = self.build_routine_caps(extension, scope).await?;
         handler.on_fire(&caps, payload).await
     }
 
     /// Assemble the routine-fire caps bundle for engine dispatch.
-    /// Today: extension-providable caps' default providers only.
-    fn build_routine_caps(&self) -> caps::ExtensionCaps {
+    ///
+    /// Always populates the extension-providable cap defaults
+    /// (Messenger, Memory) from the registry. For
+    /// [`RoutineScope::Session`] also resolves the target session
+    /// through [`SessionRegistry`] and fills SessionRead, SessionWrite,
+    /// and Settings with per-session in-process impls owned by
+    /// `extension`. Global-scope fires leave the host-only slots
+    /// `None`.
+    async fn build_routine_caps(
+        &self,
+        extension: &str,
+        scope: &RoutineScope,
+    ) -> anyhow::Result<caps::ExtensionCaps> {
         let mut bundle = caps::ExtensionCaps::empty();
         if let Some(map) = self
             .cap_registry
@@ -635,7 +671,24 @@ impl ExtensionHub {
         {
             bundle.memory.default = Some(m.clone());
         }
-        bundle
+
+        if let RoutineScope::Session(session_db_id) = scope {
+            let registry = self.session_registry.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session-scoped routine fire for extension '{extension}' \
+                     requires a SessionRegistry; call ExtensionHub::set_session_registry \
+                     during startup"
+                )
+            })?;
+            let (conv_id, session_db) = registry.open_session(session_db_id).await?;
+            let session = Session::new(conv_id, session_db.clone()).await;
+            let session = Arc::new(Mutex::new(session));
+            bundle.session_read = Some(Arc::new(InProcSessionRead::new(session.clone())));
+            bundle.session_write = Some(Arc::new(InProcSessionWrite::new(session, extension)));
+            bundle.settings = Some(Arc::new(InProcSettings::new(session_db, extension)));
+        }
+
+        Ok(bundle)
     }
 
     /// Reserve built-in slash command names so extensions can't shadow them.
@@ -2306,9 +2359,13 @@ mod tests {
         .await
         .unwrap();
 
-        hub.dispatch_routine("heartbeat", serde_json::json!({"task": "ping"}))
-            .await
-            .unwrap();
+        hub.dispatch_routine(
+            "heartbeat",
+            &RoutineScope::Global,
+            serde_json::json!({"task": "ping"}),
+        )
+        .await
+        .unwrap();
 
         let recorded = seen.lock().unwrap();
         assert_eq!(recorded.len(), 1);
@@ -2319,7 +2376,7 @@ mod tests {
     async fn dispatch_routine_unknown_extension_errors() {
         let hub = ExtensionHub::new();
         let err = hub
-            .dispatch_routine("ghost", serde_json::json!({}))
+            .dispatch_routine("ghost", &RoutineScope::Global, serde_json::json!({}))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("ghost"), "got: {err}");
@@ -2335,7 +2392,7 @@ mod tests {
             .await
             .unwrap();
         let err = hub
-            .dispatch_routine("solo", serde_json::json!({}))
+            .dispatch_routine("solo", &RoutineScope::Global, serde_json::json!({}))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("routine_handler"), "got: {err}");
@@ -2379,10 +2436,129 @@ mod tests {
         let mut hub = ExtensionHub::new();
         hub.install_all(vec![Arc::new(ErroringExt)]).await.unwrap();
         let err = hub
-            .dispatch_routine("broken", serde_json::json!({}))
+            .dispatch_routine("broken", &RoutineScope::Global, serde_json::json!({}))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("simulated"), "got: {err}");
+    }
+
+    /// Extension whose routine handler asserts the per-session caps
+    /// (`session_read`, `session_write`, `settings`) are populated
+    /// and then writes a directive via `caps.session_write`.
+    struct SessionScopedRoutineExt;
+    impl Extension for SessionScopedRoutineExt {
+        fn name(&self) -> &'static str {
+            "session-scoped"
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
+        fn install<'a>(
+            &'a self,
+            _caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            Box::pin(async {
+                struct H;
+                impl handler::RoutineHandler for H {
+                    fn on_fire<'a>(
+                        &'a self,
+                        caps: &'a caps::ExtensionCaps,
+                        payload: serde_json::Value,
+                    ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
+                        Box::pin(async move {
+                            let writer = caps
+                                .session_write
+                                .as_ref()
+                                .ok_or_else(|| anyhow::anyhow!("session_write not populated"))?;
+                            // Read + Settings should also be wired for
+                            // session-scoped fires — they're the host
+                            // contract for "this fire knows its session".
+                            anyhow::ensure!(
+                                caps.session_read.is_some(),
+                                "session_read should be populated"
+                            );
+                            anyhow::ensure!(
+                                caps.settings.is_some(),
+                                "settings should be populated"
+                            );
+                            writer
+                                .append(caps::SessionEntryDraft {
+                                    kind: "directive".into(),
+                                    data: payload,
+                                })
+                                .await?;
+                            Ok(())
+                        })
+                    }
+                }
+                let mut installed = handler::InstalledExtension::empty();
+                installed.routine_handler = Some(Box::new(H));
+                Ok(installed)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_session_scope_populates_session_caps_and_writes() {
+        use crate::agent::AgentRegistry;
+        use crate::session::{EntryType, Session, SessionRegistry};
+
+        // Build a minimal SessionRegistry with one session.
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+        let agents = Arc::new(AgentRegistry::with_default_agent());
+        let registry = Arc::new(
+            SessionRegistry::new(instance.clone(), user, agents)
+                .await
+                .unwrap(),
+        );
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_db_id = session_db.root_id().to_string();
+
+        // Hub knows the registry.
+        let mut hub = ExtensionHub::new();
+        hub.set_session_registry(registry.clone());
+        hub.install_all(vec![Arc::new(SessionScopedRoutineExt)])
+            .await
+            .unwrap();
+
+        hub.dispatch_routine(
+            "session-scoped",
+            &RoutineScope::Session(session_db_id.clone()),
+            serde_json::json!({"task": "summarize"}),
+        )
+        .await
+        .unwrap();
+
+        // The handler wrote a `directive` entry through SessionWrite.
+        // Re-open the session and confirm the entry landed.
+        let (conv_id, db) = registry.open_session(&session_db_id).await.unwrap();
+        let session = Session::new(conv_id, db).await;
+        let entries = session.entries();
+        assert_eq!(entries.len(), 1, "expected one entry, got {entries:?}");
+        assert!(matches!(entries[0].entry_type, EntryType::Directive));
+        assert_eq!(entries[0].sender, "session-scoped");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_session_scope_errors_without_registry() {
+        let mut hub = ExtensionHub::new();
+        hub.install_all(vec![Arc::new(SessionScopedRoutineExt)])
+            .await
+            .unwrap();
+        let err = hub
+            .dispatch_routine(
+                "session-scoped",
+                &RoutineScope::Session("anything".into()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("SessionRegistry"), "got: {err}");
     }
 
     #[tokio::test]

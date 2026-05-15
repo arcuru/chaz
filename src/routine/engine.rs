@@ -408,6 +408,7 @@ impl RoutineEngine {
             Some(hub) => {
                 hub.dispatch_routine(
                     &entry.routine.target.extension,
+                    &entry.scope,
                     entry.routine.target.payload.clone(),
                 )
                 .await
