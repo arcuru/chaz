@@ -47,8 +47,6 @@ The TUI has three sections:
 | `/costs`                      | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
 | `/share`                      | Generate a shareable ticket URL for the current session           |
 | `/sync <ticket>`              | Sync a remote session via a ticket URL                            |
-| `/schedules`                  | List configured schedules with status and timing                  |
-| `/run <name>`                 | Trigger a schedule immediately                                    |
 | `/channels`                   | List Matrix rooms currently attached to the session               |
 | `/compact`                    | Summarize and compact conversation history                        |
 | `/print`                      | Dump the transcript                                               |
