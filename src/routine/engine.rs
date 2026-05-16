@@ -237,6 +237,23 @@ impl RoutineEngine {
         self.notify.notify_one();
     }
 
+    /// Idempotently resync one session's routines from its DB into the
+    /// in-memory heap: drop every in-memory routine for the session,
+    /// then reload the enabled rows currently in `session_db`. This is
+    /// how a `/heartbeat add|remove` or `wake_me_up` takes effect
+    /// without a process restart — the storage helpers call it after a
+    /// committed change. Safe to call repeatedly (no duplicate heap
+    /// entries); `last_fired` is peer-local so reloaded cron routines
+    /// keep their next-fire anchor rather than firing immediately.
+    pub async fn reload_session(
+        self: &Arc<Self>,
+        session_db_id: &str,
+        session_db: &Database,
+    ) -> anyhow::Result<()> {
+        self.deregister_session(session_db_id).await;
+        self.register_session(session_db_id, session_db).await
+    }
+
     /// Insert a new routine. Persists to the appropriate DB then
     /// updates in-memory state and wakes the run loop.
     pub async fn add_routine(
@@ -799,6 +816,39 @@ mod tests {
         engine.register_session("sess-x", &sess).await.unwrap();
         assert_eq!(engine.list_routines().await.len(), 1);
         engine.deregister_session("sess-x").await;
+        assert!(engine.list_routines().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_session_picks_up_added_and_removed_rows() {
+        let (_inst_peer, peer) = fixture_db().await;
+        let (_inst_sess, sess) = fixture_db().await;
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine.register_session("s1", &sess).await.unwrap();
+        assert!(engine.list_routines().await.is_empty());
+
+        // A row written straight to the session DB (what the storage
+        // helpers do) is invisible to the running engine until reload.
+        crate::routine::upsert_session_routine(
+            &sess,
+            &Routine::cron(RoutineId::new("r1"), "r1", "0 * * * * *", target("heartbeat")),
+        )
+        .await
+        .unwrap();
+        assert!(engine.list_routines().await.is_empty());
+
+        engine.reload_session("s1", &sess).await.unwrap();
+        assert_eq!(engine.list_routines().await.len(), 1);
+
+        // Idempotent — reloading with no change keeps exactly one.
+        engine.reload_session("s1", &sess).await.unwrap();
+        assert_eq!(engine.list_routines().await.len(), 1);
+
+        // Removal is reflected on the next reload too.
+        crate::routine::remove_session_routine(&sess, &RoutineId::new("r1"))
+            .await
+            .unwrap();
+        engine.reload_session("s1", &sess).await.unwrap();
         assert!(engine.list_routines().await.is_empty());
     }
 

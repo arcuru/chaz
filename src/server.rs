@@ -470,6 +470,11 @@ impl Server {
         // Drop the cached active set so a future re-register starts fresh.
         let mut cache = self.active_extensions.lock().await;
         cache.remove(session_db_id);
+        drop(cache);
+
+        // Prune this session's routines from the running engine's heap
+        // so a closed session stops firing heartbeats/wakeups.
+        crate::routine::notify_session_closed(session_db_id).await;
 
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_db_id);

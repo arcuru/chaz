@@ -27,6 +27,53 @@ pub use types::{Routine, RoutineId, RoutineScope, RoutineTarget, Trigger, genera
 
 use eidetica::Database;
 use eidetica::store::Table;
+use std::sync::{Arc, OnceLock, Weak};
+use tracing::warn;
+
+/// Process-global handle to the running [`RoutineEngine`], set once at
+/// startup (`main.rs`, non-`--cli`). Stored as a `Weak` so the engine's
+/// lifetime stays owned by its run task; the helpers below upgrade on
+/// demand and no-op when there is no engine (`--cli`, tests, shutdown).
+///
+/// This is the seam that makes scheduling live: every routine mutation
+/// funnels through [`upsert_session_routine`] / [`remove_session_routine`]
+/// (tools, the `/heartbeat` command, `wake_me_up`, `agent_delete`'s
+/// sweep), so resyncing the engine here covers all of them — including
+/// future callers — without threading an engine handle through every
+/// tool/command context.
+static ENGINE: OnceLock<Weak<RoutineEngine>> = OnceLock::new();
+
+/// Register the running engine so the storage helpers can push live
+/// changes into its in-memory schedule. Idempotent — first call wins
+/// (one engine per process).
+pub fn set_engine(engine: &Arc<RoutineEngine>) {
+    let _ = ENGINE.set(Arc::downgrade(engine));
+}
+
+fn engine() -> Option<Arc<RoutineEngine>> {
+    ENGINE.get().and_then(Weak::upgrade)
+}
+
+/// Resync a session's in-memory schedule after a committed change to
+/// its `routines` table. Best-effort: a reload failure is logged, not
+/// propagated — the durable DB write already succeeded.
+async fn notify_session_routines_changed(session_db: &Database) {
+    let Some(engine) = engine() else {
+        return;
+    };
+    let session_db_id = session_db.root_id().to_string();
+    if let Err(e) = engine.reload_session(&session_db_id, session_db).await {
+        warn!(session = %session_db_id, "routine engine reload after change failed: {e}");
+    }
+}
+
+/// Drop a closed session's routines from the running engine's heap.
+/// Called from `Server::deregister_session`.
+pub async fn notify_session_closed(session_db_id: &str) {
+    if let Some(engine) = engine() {
+        engine.deregister_session(session_db_id).await;
+    }
+}
 
 /// List every routine row in a session DB's `routines` table.
 ///
@@ -67,6 +114,7 @@ pub async fn upsert_session_routine(
         store.insert(routine.clone()).await?;
     }
     txn.commit().await?;
+    notify_session_routines_changed(session_db).await;
     Ok(())
 }
 
@@ -87,6 +135,7 @@ pub async fn remove_session_routine(session_db: &Database, id: &RoutineId) -> an
     }
     if removed {
         txn.commit().await?;
+        notify_session_routines_changed(session_db).await;
     }
     Ok(removed)
 }

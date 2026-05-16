@@ -538,6 +538,10 @@ async fn main() -> anyhow::Result<()> {
         let engine =
             routine::RoutineEngine::new(chaz_peer.clone(), Some(server.extensions().clone()))
                 .await?;
+        // Make the engine reachable to the session-storage helpers so
+        // `/heartbeat add|remove`, `wake_me_up`, and `agent_delete`'s
+        // sweep resync the live schedule without a restart.
+        routine::set_engine(&engine);
         // Pick up every session's routines + ensure the server is
         // watching those sessions so directive writes from fires drive
         // an agent turn.
