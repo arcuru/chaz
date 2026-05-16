@@ -227,10 +227,6 @@ pub enum Command {
     /// control surface would be a footgun.
     Extensions(ExtensionsAction),
 
-    // --- Scheduler ---
-    ListSchedules,
-    TriggerSchedule(String),
-
     // --- LLM configuration (per-session) ---
     Model(Option<String>),
     Role(Option<(String, Option<String>)>),
@@ -409,8 +405,6 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
         Command::SharingStatus => sharing::sharing_status(ctx).await,
         Command::Extensions(action) => extensions::dispatch(action, ctx).await,
-        Command::ListSchedules => session::list_schedules(ctx).await,
-        Command::TriggerSchedule(name) => session::trigger_schedule(&name, ctx).await,
         Command::Model(arg) => session::model(arg, ctx).await,
         Command::Role(arg) => session::role(arg, ctx).await,
         Command::SetBackend { name, url, api_key } => {

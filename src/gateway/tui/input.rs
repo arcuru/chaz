@@ -289,7 +289,6 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         "/share" => return Some(ChatAction::Dispatch(Command::Share)),
         "/unshare" => return Some(ChatAction::Dispatch(Command::SessionUnshare)),
         "/compact" => return Some(ChatAction::Dispatch(Command::Compact)),
-        "/schedules" => return Some(ChatAction::Dispatch(Command::ListSchedules)),
         "/info" => return Some(ChatAction::Dispatch(Command::Info)),
         "/costs" => return Some(ChatAction::Dispatch(Command::ListCosts)),
         "/print" => return Some(ChatAction::Dispatch(Command::Print)),
@@ -727,13 +726,6 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         let ticket = arg.trim().to_string();
         if !ticket.is_empty() {
             return Some(ChatAction::Dispatch(Command::Sync(ticket)));
-        }
-        return None;
-    }
-    if let Some(arg) = text.strip_prefix("/run ") {
-        let name = arg.trim().to_string();
-        if !name.is_empty() {
-            return Some(ChatAction::Dispatch(Command::TriggerSchedule(name)));
         }
         return None;
     }

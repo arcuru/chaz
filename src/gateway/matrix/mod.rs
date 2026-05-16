@@ -816,27 +816,6 @@ impl Gateway for MatrixGateway {
             |_t| { Some(Command::ListChannels) }
         );
 
-        // --- Scheduler ---
-        register_shared!(
-            "schedules",
-            "".to_string(),
-            "List configured schedules",
-            |_t| { Some(Command::ListSchedules) }
-        );
-        register_shared!(
-            "run",
-            "<name>".to_string(),
-            "Trigger a schedule immediately",
-            |text| {
-                let arg = matrix_args(&text);
-                if arg.trim().is_empty() {
-                    None
-                } else {
-                    Some(Command::TriggerSchedule(arg.trim().to_string()))
-                }
-            }
-        );
-
         // --- LLM config ---
         register_shared!(
             "model",

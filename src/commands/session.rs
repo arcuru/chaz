@@ -462,28 +462,6 @@ pub(super) async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
 }
 
 // -----------------------------------------------------------------------------
-// Scheduler
-// -----------------------------------------------------------------------------
-
-pub(super) async fn list_schedules(_ctx: &CommandContext<'_>) -> CommandOutcome {
-    // YAML schedules now ride on per-session Routine rows fired by
-    // `RoutineEngine`. Browsing them is `heartbeat_list` on the
-    // schedule's target session, or `/heartbeat list` from inside it.
-    CommandOutcome::Text(
-        "Scheduler retired — YAML schedules fire through the routine engine. \
-         List them with `/heartbeat list` inside the target session."
-            .into(),
-    )
-}
-
-pub(super) async fn trigger_schedule(name: &str, _ctx: &CommandContext<'_>) -> CommandOutcome {
-    CommandOutcome::Error(format!(
-        "Manual scheduler triggers are not supported after the routine-engine \
-         refactor. Routine '{name}' will fire on its next cron tick."
-    ))
-}
-
-// -----------------------------------------------------------------------------
 // LLM config (per-session)
 // -----------------------------------------------------------------------------
 
