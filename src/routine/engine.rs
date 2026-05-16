@@ -838,7 +838,6 @@ mod tests {
             fn supported_hooks(&self) -> &[HookKind] {
                 &[]
             }
-            fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
             fn install<'a>(
                 &'a self,
                 _caps: caps::ExtensionCaps,

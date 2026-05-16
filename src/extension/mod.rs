@@ -384,25 +384,13 @@ pub trait Extension: Send + Sync {
         ExtensionRef::builtin(self.name())
     }
 
-    /// Declare every hook kind this extension intends to register. Used
-    /// at startup to validate that `register_*` calls inside [`register`]
-    /// match the declaration, and at runtime for inspection / future
-    /// sandboxing surfaces.
+    /// Declare every hook kind this extension intends to handle. Used
+    /// at runtime for inspection / future sandboxing surfaces.
     ///
     /// Tools and commands count: an extension that registers any tool
     /// must include [`HookKind::Tool`]; any command requires
     /// [`HookKind::Command`].
     fn supported_hooks(&self) -> &[HookKind];
-
-    /// Register hooks, tools, and commands. Called once at startup with
-    /// the hub in "registering-as-this-extension" mode so every
-    /// `register_*` call captures ownership.
-    ///
-    /// Legacy entry point; production now drives extension setup
-    /// through [`Self::install`] via
-    /// [`ExtensionHub::install_all`]. The trait method survives only
-    /// for the in-hub legacy tests; built-ins no longer override it.
-    fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
 
     /// Hook ABI version. Bumped when the hook interface changes shape in
     /// a backwards-incompatible way. Orthogonal to [`extension_ref`] —
@@ -421,12 +409,11 @@ pub trait Extension: Send + Sync {
         serde_json::json!({})
     }
 
-    // ---- Cap refactor — new install path (step 5) -----------------------
+    // ---- Cap-based install path -----------------------------------------
     //
-    // These methods drive the cap-based install flow added in step 5.
-    // Existing extensions get sensible defaults (manifest derived from
-    // legacy methods, no providers, empty install) so they keep working
-    // through the legacy `register` path until step 6 migrates them.
+    // These methods drive the cap-based install flow. Extensions that
+    // register nothing get sensible defaults (manifest derived from
+    // name + ref + supported_hooks, no providers, empty install).
 
     /// Static contract the extension publishes. The default derives
     /// from [`Self::name`] + [`Self::extension_ref`] + [`Self::supported_hooks`]
@@ -452,8 +439,7 @@ pub trait Extension: Send + Sync {
 
     /// Phase 2 of `install_all`: receive the fully-resolved consumer
     /// bundle and produce the per-hook + routine handlers. Default:
-    /// no handlers — extensions still using `register` keep installing
-    /// hooks the legacy way.
+    /// no handlers (an extension that only provides caps, or nothing).
     fn install<'a>(
         &'a self,
         _caps: caps::ExtensionCaps,
@@ -515,12 +501,6 @@ pub struct ExtensionHub {
     commands_by_extension: HashMap<&'static str, HashSet<String>>,
     /// Reverse index: which tools did each extension register?
     tools_by_extension: HashMap<&'static str, HashSet<String>>,
-    /// Set to `Some(name)` for the duration of one extension's
-    /// `Extension::register` call so `on_<kind>` and `register_command`
-    /// know who's currently registering. None outside that window —
-    /// callers that hit `None` are calling from the wrong place and the
-    /// hub panics rather than producing un-owned handlers.
-    current_registering: Option<&'static str>,
 
     // ---- Cap refactor — step 5 -----------------------------------------
     /// Capability registry — host-only impls plus per-kind extension
@@ -571,7 +551,6 @@ impl ExtensionHub {
             hooks_by_extension: HashMap::new(),
             commands_by_extension: HashMap::new(),
             tools_by_extension: HashMap::new(),
-            current_registering: None,
             cap_registry: registry::CapRegistry::new(),
             capability_defaults: HashMap::new(),
             installed: HashMap::new(),
@@ -705,41 +684,6 @@ impl ExtensionHub {
     {
         self.reserved_command_names
             .extend(names.into_iter().map(Into::into));
-    }
-
-    /// Register one extension. Sets the hub into "registering as `name`"
-    /// mode for the duration of the extension's `register` call so the
-    /// `on_<kind>` calls inside can capture the owner, then validates
-    /// that every registered kind was declared in `supported_hooks()`.
-    pub fn register_extension(&mut self, ext: Arc<dyn Extension>) {
-        let name = ext.name();
-        assert!(
-            self.current_registering.is_none(),
-            "register_extension is not re-entrant; '{name}' tried to register \
-             while another extension was mid-registration"
-        );
-        self.current_registering = Some(name);
-        self.hooks_by_extension.entry(name).or_default();
-        self.commands_by_extension.entry(name).or_default();
-        self.tools_by_extension.entry(name).or_default();
-        ext.clone().register(self);
-        self.current_registering = None;
-
-        let declared: HashSet<HookKind> = ext.supported_hooks().iter().copied().collect();
-        let registered = self
-            .hooks_by_extension
-            .get(name)
-            .cloned()
-            .unwrap_or_default();
-        let undeclared: Vec<HookKind> = registered.difference(&declared).copied().collect();
-        assert!(
-            undeclared.is_empty(),
-            "Extension '{name}' registered hook kinds {undeclared:?} that were \
-             not in supported_hooks() {declared:?} — declare every kind your \
-             register() call uses"
-        );
-
-        self.extensions.push(ext);
     }
 
     pub fn extension_names(&self) -> Vec<&'static str> {
@@ -885,118 +829,15 @@ impl ExtensionHub {
         Ok(())
     }
 
-    // --- registration API used inside Extension::register ---
-
-    fn current_owner(&self, method: &str) -> &'static str {
-        self.current_registering.unwrap_or_else(|| {
-            panic!(
-                "{method} called outside Extension::register(); \
-                 every hook registration must happen inside register_extension's window"
-            )
-        })
-    }
-
+    /// Record that `owner` has a handler for `kind` in the reverse
+    /// index. Called by the install_all drain helpers
+    /// ([`Self::register_tool_attributed`] /
+    /// [`Self::register_command_attributed`]) and the hook-bridge wiring.
     fn note_hook(&mut self, owner: &'static str, kind: HookKind) {
         self.hooks_by_extension
             .entry(owner)
             .or_default()
             .insert(kind);
-    }
-
-    pub fn on_before_agent_start(&mut self, hook: Box<dyn HookBeforeAgentStart>) {
-        let owner = self.current_owner("on_before_agent_start");
-        self.note_hook(owner, HookKind::BeforeAgentStart);
-        self.before_agent_start.push(RegisteredHook { owner, hook });
-    }
-
-    pub fn on_tool_call(&mut self, hook: Box<dyn HookToolCall>) {
-        let owner = self.current_owner("on_tool_call");
-        self.note_hook(owner, HookKind::ToolCall);
-        self.tool_call.push(RegisteredHook { owner, hook });
-    }
-
-    pub fn on_tool_result(&mut self, hook: Box<dyn HookToolResult>) {
-        let owner = self.current_owner("on_tool_result");
-        self.note_hook(owner, HookKind::ToolResult);
-        self.tool_result.push(RegisteredHook { owner, hook });
-    }
-
-    pub fn on_agent_end(&mut self, hook: Box<dyn HookAgentEnd>) {
-        let owner = self.current_owner("on_agent_end");
-        self.note_hook(owner, HookKind::AgentEnd);
-        self.agent_end.push(RegisteredHook { owner, hook });
-    }
-
-    pub fn on_session_start(&mut self, hook: Box<dyn HookSessionStart>) {
-        let owner = self.current_owner("on_session_start");
-        self.note_hook(owner, HookKind::SessionStart);
-        self.session_start.push(RegisteredHook { owner, hook });
-    }
-
-    pub fn on_session_shutdown(&mut self, hook: Box<dyn HookSessionShutdown>) {
-        let owner = self.current_owner("on_session_shutdown");
-        self.note_hook(owner, HookKind::SessionShutdown);
-        self.session_shutdown.push(RegisteredHook { owner, hook });
-    }
-
-    /// Register an extension slash command.
-    ///
-    /// Names colliding with a built-in or an already-registered extension
-    /// command are rejected with a warning. First registration wins on
-    /// cross-extension collision.
-    pub fn register_command<S: Into<String>>(
-        &mut self,
-        name: S,
-        handler: Box<dyn ExtensionCommand>,
-    ) {
-        let owner = self.current_owner("register_command");
-        let name = name.into();
-        if self.reserved_command_names.contains(&name) {
-            warn!(
-                command = %name,
-                extension = %owner,
-                "Extension command shadows a built-in; ignoring registration"
-            );
-            return;
-        }
-        if self.commands.contains_key(&name) {
-            warn!(
-                command = %name,
-                extension = %owner,
-                "Duplicate extension command registration; keeping first registration"
-            );
-            return;
-        }
-        self.note_hook(owner, HookKind::Command);
-        self.commands_by_extension
-            .entry(owner)
-            .or_default()
-            .insert(name.clone());
-        self.commands
-            .insert(name, RegisteredCommand { owner, handler });
-    }
-
-    /// Register a tool provided by the currently-registering extension.
-    /// The tool is indexed by its descriptor name; collisions log a
-    /// warning and keep the first registration (mirrors the command
-    /// collision policy).
-    pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
-        let owner = self.current_owner("register_tool");
-        let name = tool.descriptor().name;
-        if self.tools.contains_key(&name) {
-            warn!(
-                tool = %name,
-                extension = %owner,
-                "Duplicate tool registration; keeping first registration"
-            );
-            return;
-        }
-        self.note_hook(owner, HookKind::Tool);
-        self.tools_by_extension
-            .entry(owner)
-            .or_default()
-            .insert(name.clone());
-        self.tools.insert(name, RegisteredTool { owner, tool });
     }
 
     pub fn has_command(&self, name: &str) -> bool {
@@ -1371,10 +1212,9 @@ impl ExtensionHub {
         leaked
     }
 
-    /// Internal: register a tool against an explicit owner name without
-    /// going through `current_registering`. Used to drain the install_all
-    /// pending queues. Same first-write-wins + reverse-index policy as
-    /// the legacy `register_tool`.
+    /// Internal: register a tool against an explicit owner name. Used
+    /// to drain the install_all pending queues, applying first-write-wins
+    /// collision handling plus the reverse-index bookkeeping.
     fn register_tool_attributed(&mut self, owner: &str, tool: Arc<dyn Tool>) {
         let owner_static = self.intern_name(owner);
         let name = tool.descriptor().name;
@@ -1400,9 +1240,8 @@ impl ExtensionHub {
         );
     }
 
-    /// Internal: register a slash command against an explicit owner.
-    /// Same first-write-wins + reservation policy as the legacy
-    /// `register_command`.
+    /// Internal: register a slash command against an explicit owner,
+    /// applying the first-write-wins + built-in-name reservation policy.
     fn register_command_attributed(
         &mut self,
         owner: &str,
@@ -1566,7 +1405,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
     }
 
     async fn make_session_db() -> (Instance, Database) {
@@ -1664,8 +1502,12 @@ mod tests {
     async fn record_active_writes_events_for_each_extension() {
         let (_inst, db) = make_session_db().await;
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(NamedExt("alpha")));
-        hub.register_extension(Arc::new(NamedExt("beta")));
+        hub.install_all(vec![
+            Arc::new(NamedExt("alpha")),
+            Arc::new(NamedExt("beta")),
+        ])
+        .await
+        .unwrap();
 
         hub.record_active(&db).await.unwrap();
 
@@ -1683,7 +1525,9 @@ mod tests {
     async fn record_active_is_idempotent_when_set_unchanged() {
         let (_inst, db) = make_session_db().await;
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(NamedExt("alpha")));
+        hub.install_all(vec![Arc::new(NamedExt("alpha"))])
+            .await
+            .unwrap();
 
         hub.record_active(&db).await.unwrap();
         let after_first = list_events(&db).await.unwrap().len();
@@ -1704,7 +1548,9 @@ mod tests {
         // contract: respect explicit removal across restarts.
         let (_inst, db) = make_session_db().await;
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(NamedExt("alpha")));
+        hub.install_all(vec![Arc::new(NamedExt("alpha"))])
+            .await
+            .unwrap();
 
         hub.record_active(&db).await.unwrap();
         append_event(
@@ -1784,7 +1630,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
     }
 
     #[tokio::test]
@@ -1792,14 +1637,20 @@ mod tests {
         let (_inst, db) = make_session_db().await;
 
         let mut hub_v1 = ExtensionHub::new();
-        hub_v1.register_extension(Arc::new(VersionedExt("loop", "sha1")));
+        hub_v1
+            .install_all(vec![Arc::new(VersionedExt("loop", "sha1"))])
+            .await
+            .unwrap();
         hub_v1.record_active(&db).await.unwrap();
         assert_eq!(list_events(&db).await.unwrap().len(), 1);
 
         // Fresh hub with the same name but different SHA: must write a new
         // event so the upgrade is captured in the log.
         let mut hub_v2 = ExtensionHub::new();
-        hub_v2.register_extension(Arc::new(VersionedExt("loop", "sha2")));
+        hub_v2
+            .install_all(vec![Arc::new(VersionedExt("loop", "sha2"))])
+            .await
+            .unwrap();
         hub_v2.record_active(&db).await.unwrap();
         let events = list_events(&db).await.unwrap();
         assert_eq!(events.len(), 2);
@@ -1816,27 +1667,39 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[HookKind::ToolCall]
         }
-        fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-            struct Pass;
-            impl HookToolCall for Pass {
-                fn on_tool_call<'a>(
-                    &'a self,
-                    _: &'a HookContext,
-                    _: &'a str,
-                    _: &'a mut serde_json::Value,
-                ) -> Pin<Box<dyn Future<Output = ToolCallDecision> + Send + 'a>> {
-                    Box::pin(async { ToolCallDecision::Continue })
+        fn install<'a>(
+            &'a self,
+            _caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                struct Pass;
+                impl handler::HookHandlerToolCall for Pass {
+                    fn on_tool_call<'a>(
+                        &'a self,
+                        _: &'a caps::ExtensionCaps,
+                        _: &'a str,
+                        _: &'a mut serde_json::Value,
+                    ) -> handler::HandlerFuture<'a, ToolCallDecision> {
+                        Box::pin(async { ToolCallDecision::Continue })
+                    }
                 }
-            }
-            hub.on_tool_call(Box::new(Pass));
+                let mut installed = handler::InstalledExtension::empty();
+                installed.tool_call = Some(Box::new(Pass));
+                Ok(installed)
+            })
         }
     }
 
-    #[test]
-    fn hub_records_owner_for_each_hook_registration() {
+    #[tokio::test]
+    async fn hub_records_owner_for_each_hook_registration() {
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(ToolCallExt("alpha")));
-        hub.register_extension(Arc::new(ToolCallExt("beta")));
+        hub.install_all(vec![
+            Arc::new(ToolCallExt("alpha")),
+            Arc::new(ToolCallExt("beta")),
+        ])
+        .await
+        .unwrap();
 
         let alpha_kinds = hub.hooks_for("alpha");
         assert!(alpha_kinds.contains(&HookKind::ToolCall));
@@ -1846,52 +1709,24 @@ mod tests {
         assert!(!alpha_kinds.contains(&HookKind::ToolResult));
     }
 
-    #[test]
-    fn extensions_for_kind_returns_only_handlers_in_registration_order() {
+    #[tokio::test]
+    async fn extensions_for_kind_returns_only_handlers_in_registration_order() {
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(NamedExt("noop")));
-        hub.register_extension(Arc::new(ToolCallExt("alpha")));
-        hub.register_extension(Arc::new(ToolCallExt("beta")));
+        hub.install_all(vec![
+            Arc::new(NamedExt("noop")),
+            Arc::new(ToolCallExt("alpha")),
+            Arc::new(ToolCallExt("beta")),
+        ])
+        .await
+        .unwrap();
         let owners = hub.extensions_for_kind(HookKind::ToolCall);
         assert_eq!(owners, vec!["alpha", "beta"]);
         let none = hub.extensions_for_kind(HookKind::AgentEnd);
         assert!(none.is_empty());
     }
 
-    #[test]
-    #[should_panic(expected = "registered hook kinds")]
-    fn undeclared_hook_registration_panics() {
-        struct Sneaky;
-        impl Extension for Sneaky {
-            fn name(&self) -> &'static str {
-                "sneaky"
-            }
-            fn supported_hooks(&self) -> &[HookKind] {
-                // Declares nothing, but tries to register a hook anyway.
-                &[]
-            }
-            fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-                struct Pass;
-                impl HookToolCall for Pass {
-                    fn on_tool_call<'a>(
-                        &'a self,
-                        _: &'a HookContext,
-                        _: &'a str,
-                        _: &'a mut serde_json::Value,
-                    ) -> Pin<Box<dyn Future<Output = ToolCallDecision> + Send + 'a>>
-                    {
-                        Box::pin(async { ToolCallDecision::Continue })
-                    }
-                }
-                hub.on_tool_call(Box::new(Pass));
-            }
-        }
-        let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(Sneaky));
-    }
-
-    #[test]
-    fn commands_track_owner_and_are_queryable() {
+    #[tokio::test]
+    async fn commands_track_owner_and_are_queryable() {
         struct CmdExt;
         impl Extension for CmdExt {
             fn name(&self) -> &'static str {
@@ -1900,22 +1735,55 @@ mod tests {
             fn supported_hooks(&self) -> &[HookKind] {
                 &[HookKind::Command]
             }
-            fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-                hub.register_command("dance", Box::new(DummyCmd));
+            fn manifest(&self) -> manifest::ExtensionManifest {
+                manifest::ExtensionManifest {
+                    name: "with_command".to_string(),
+                    extension_ref: ExtensionRef::builtin("with_command"),
+                    supported_hooks: vec![HookKind::Command],
+                    required_capabilities: Vec::new(),
+                    requested_capabilities: vec![caps::CapabilityRequest::CommandRegistration],
+                    provides_capabilities: Vec::new(),
+                }
+            }
+            fn install<'a>(
+                &'a self,
+                caps: caps::ExtensionCaps,
+            ) -> Pin<
+                Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    let reg = caps
+                        .command_registration
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("command_registration cap not granted"))?;
+                    reg.register(
+                        caps::CommandDescriptor {
+                            name: "dance".into(),
+                            description: "test command".into(),
+                        },
+                        Box::new(DummyCmd),
+                    )
+                    .await?;
+                    Ok(handler::InstalledExtension::empty())
+                })
             }
         }
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(CmdExt));
+        hub.install_all(vec![Arc::new(CmdExt)]).await.unwrap();
         assert!(hub.commands_for("with_command").contains("dance"));
         assert_eq!(hub.command_owner("dance"), Some("with_command"));
         assert_eq!(hub.command_owner("not_real"), None);
     }
 
-    #[test]
-    fn hub_extension_refs_returns_one_per_extension_in_order() {
+    #[tokio::test]
+    async fn hub_extension_refs_returns_one_per_extension_in_order() {
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(NamedExt("alpha")));
-        hub.register_extension(Arc::new(NamedExt("beta")));
+        hub.install_all(vec![
+            Arc::new(NamedExt("alpha")),
+            Arc::new(NamedExt("beta")),
+        ])
+        .await
+        .unwrap();
         let refs = hub.extension_refs();
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].name(), "alpha");
@@ -1961,11 +1829,11 @@ mod tests {
     struct CountingHook {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
-    impl HookBeforeAgentStart for CountingHook {
+    impl handler::HookHandlerBeforeAgentStart for CountingHook {
         fn on_before_agent_start<'a>(
             &'a self,
-            _ctx: &'a HookContext,
-        ) -> Pin<Box<dyn Future<Output = Vec<RuntimeMessage>> + Send + 'a>> {
+            _caps: &'a caps::ExtensionCaps,
+        ) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
             let calls = self.calls.clone();
             Box::pin(async move {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1985,10 +1853,17 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[HookKind::BeforeAgentStart]
         }
-        fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-            hub.on_before_agent_start(Box::new(CountingHook {
-                calls: self.calls.clone(),
-            }));
+        fn install<'a>(
+            &'a self,
+            _caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                let mut installed = handler::InstalledExtension::empty();
+                installed.before_agent_start = Some(Box::new(CountingHook { calls }));
+                Ok(installed)
+            })
         }
     }
 
@@ -1996,14 +1871,18 @@ mod tests {
     async fn before_agent_start_runs_in_registration_order() {
         let mut hub = ExtensionHub::new();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        hub.register_extension(Arc::new(CountingExt {
-            name_: "a",
-            calls: calls.clone(),
-        }));
-        hub.register_extension(Arc::new(CountingExt {
-            name_: "b",
-            calls: calls.clone(),
-        }));
+        hub.install_all(vec![
+            Arc::new(CountingExt {
+                name_: "a",
+                calls: calls.clone(),
+            }),
+            Arc::new(CountingExt {
+                name_: "b",
+                calls: calls.clone(),
+            }),
+        ])
+        .await
+        .unwrap();
         let ctx = fixture_ctx_with_active(all_active(&["a", "b"])).await;
         let injected = hub.fire_before_agent_start(&ctx).await;
         assert_eq!(injected.len(), 2);
@@ -2015,27 +1894,31 @@ mod tests {
         // Only "a" is active; "b" must be skipped despite being registered.
         let mut hub = ExtensionHub::new();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        hub.register_extension(Arc::new(CountingExt {
-            name_: "a",
-            calls: calls.clone(),
-        }));
-        hub.register_extension(Arc::new(CountingExt {
-            name_: "b",
-            calls: calls.clone(),
-        }));
+        hub.install_all(vec![
+            Arc::new(CountingExt {
+                name_: "a",
+                calls: calls.clone(),
+            }),
+            Arc::new(CountingExt {
+                name_: "b",
+                calls: calls.clone(),
+            }),
+        ])
+        .await
+        .unwrap();
         let ctx = fixture_ctx_with_active(all_active(&["a"])).await;
         hub.fire_before_agent_start(&ctx).await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     struct BlockingHook;
-    impl HookToolCall for BlockingHook {
+    impl handler::HookHandlerToolCall for BlockingHook {
         fn on_tool_call<'a>(
             &'a self,
-            _ctx: &'a HookContext,
+            _caps: &'a caps::ExtensionCaps,
             name: &'a str,
             _args: &'a mut serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = ToolCallDecision> + Send + 'a>> {
+        ) -> handler::HandlerFuture<'a, ToolCallDecision> {
             Box::pin(async move {
                 if name == "shell" {
                     ToolCallDecision::Block {
@@ -2049,13 +1932,13 @@ mod tests {
     }
 
     struct MutatingHook;
-    impl HookToolCall for MutatingHook {
+    impl handler::HookHandlerToolCall for MutatingHook {
         fn on_tool_call<'a>(
             &'a self,
-            _ctx: &'a HookContext,
+            _caps: &'a caps::ExtensionCaps,
             _name: &'a str,
             args: &'a mut serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = ToolCallDecision> + Send + 'a>> {
+        ) -> handler::HandlerFuture<'a, ToolCallDecision> {
             Box::pin(async move {
                 if let Some(obj) = args.as_object_mut() {
                     obj.insert("touched".into(), serde_json::Value::Bool(true));
@@ -2073,8 +1956,16 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[HookKind::ToolCall]
         }
-        fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-            hub.on_tool_call(Box::new(MutatingHook));
+        fn install<'a>(
+            &'a self,
+            _caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut installed = handler::InstalledExtension::empty();
+                installed.tool_call = Some(Box::new(MutatingHook));
+                Ok(installed)
+            })
         }
     }
     struct BlockingExt;
@@ -2085,16 +1976,25 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[HookKind::ToolCall]
         }
-        fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-            hub.on_tool_call(Box::new(BlockingHook));
+        fn install<'a>(
+            &'a self,
+            _caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut installed = handler::InstalledExtension::empty();
+                installed.tool_call = Some(Box::new(BlockingHook));
+                Ok(installed)
+            })
         }
     }
 
     #[tokio::test]
     async fn tool_call_block_short_circuits_and_mutation_propagates() {
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(MutatingExt));
-        hub.register_extension(Arc::new(BlockingExt));
+        hub.install_all(vec![Arc::new(MutatingExt), Arc::new(BlockingExt)])
+            .await
+            .unwrap();
         let ctx = fixture_ctx_with_active(all_active(&["mutating", "blocking"])).await;
 
         let mut args = serde_json::json!({});
@@ -2132,8 +2032,37 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[HookKind::Command]
         }
-        fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-            hub.register_command(self.1, Box::new(DummyCmd));
+        fn manifest(&self) -> manifest::ExtensionManifest {
+            manifest::ExtensionManifest {
+                name: self.0.to_string(),
+                extension_ref: ExtensionRef::builtin(self.0),
+                supported_hooks: vec![HookKind::Command],
+                required_capabilities: Vec::new(),
+                requested_capabilities: vec![caps::CapabilityRequest::CommandRegistration],
+                provides_capabilities: Vec::new(),
+            }
+        }
+        fn install<'a>(
+            &'a self,
+            caps: caps::ExtensionCaps,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>>
+        {
+            let cmd_name = self.1.to_string();
+            Box::pin(async move {
+                let reg = caps
+                    .command_registration
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("command_registration cap not granted"))?;
+                reg.register(
+                    caps::CommandDescriptor {
+                        name: cmd_name,
+                        description: "test command".into(),
+                    },
+                    Box::new(DummyCmd),
+                )
+                .await?;
+                Ok(handler::InstalledExtension::empty())
+            })
         }
     }
 
@@ -2141,14 +2070,15 @@ mod tests {
     async fn command_collision_with_builtin_is_rejected() {
         let mut hub = ExtensionHub::new();
         hub.reserve_builtin_commands(["info"]);
-        hub.register_extension(Arc::new(DummyCmdExt("ext", "info")));
+        hub.install_all(vec![Arc::new(DummyCmdExt("ext", "info"))])
+            .await
+            .unwrap();
         assert!(!hub.has_command("info"));
     }
 
     #[tokio::test]
     async fn duplicate_extension_command_keeps_first() {
         let mut hub = ExtensionHub::new();
-        hub.register_extension(Arc::new(DummyCmdExt("first", "greet")));
         struct OtherCmd;
         impl ExtensionCommand for OtherCmd {
             fn description(&self) -> &'static str {
@@ -2173,11 +2103,47 @@ mod tests {
                 // honest about intent.
                 &[HookKind::Command]
             }
-            fn register(self: Arc<Self>, hub: &mut ExtensionHub) {
-                hub.register_command("greet", Box::new(OtherCmd));
+            fn manifest(&self) -> manifest::ExtensionManifest {
+                manifest::ExtensionManifest {
+                    name: "second".to_string(),
+                    extension_ref: ExtensionRef::builtin("second"),
+                    supported_hooks: vec![HookKind::Command],
+                    required_capabilities: Vec::new(),
+                    requested_capabilities: vec![caps::CapabilityRequest::CommandRegistration],
+                    provides_capabilities: Vec::new(),
+                }
+            }
+            fn install<'a>(
+                &'a self,
+                caps: caps::ExtensionCaps,
+            ) -> Pin<
+                Box<dyn Future<Output = anyhow::Result<handler::InstalledExtension>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    let reg = caps
+                        .command_registration
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("command_registration cap not granted"))?;
+                    reg.register(
+                        caps::CommandDescriptor {
+                            name: "greet".into(),
+                            description: "other".into(),
+                        },
+                        Box::new(OtherCmd),
+                    )
+                    .await?;
+                    Ok(handler::InstalledExtension::empty())
+                })
             }
         }
-        hub.register_extension(Arc::new(OtherCmdExt));
+        // Drain order = vec order: "first" registers "greet" before
+        // "second" tries to — first-write-wins keeps "first".
+        hub.install_all(vec![
+            Arc::new(DummyCmdExt("first", "greet")),
+            Arc::new(OtherCmdExt),
+        ])
+        .await
+        .unwrap();
         // "first" wins the collision and owns the command; needs to be
         // in the active set or dispatch will return None.
         let ctx = fixture_ctx_with_active(all_active(&["first"])).await;
@@ -2206,7 +2172,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
     }
 
     /// Extension that declares it provides a `Messenger`. Returns a
@@ -2234,7 +2199,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
         fn manifest(&self) -> manifest::ExtensionManifest {
             manifest::ExtensionManifest {
                 name: self.0.to_string(),
@@ -2265,7 +2229,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
         fn manifest(&self) -> manifest::ExtensionManifest {
             manifest::ExtensionManifest {
                 name: self.0.to_string(),
@@ -2409,7 +2372,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
         fn install<'a>(
             &'a self,
             _caps: caps::ExtensionCaps,
@@ -2500,7 +2462,6 @@ mod tests {
             fn supported_hooks(&self) -> &[HookKind] {
                 &[]
             }
-            fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
             fn install<'a>(
                 &'a self,
                 _caps: caps::ExtensionCaps,
@@ -2545,7 +2506,6 @@ mod tests {
         fn supported_hooks(&self) -> &[HookKind] {
             &[]
         }
-        fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
         fn install<'a>(
             &'a self,
             _caps: caps::ExtensionCaps,
@@ -2665,7 +2625,6 @@ mod tests {
             fn supported_hooks(&self) -> &[HookKind] {
                 &[]
             }
-            fn register(self: Arc<Self>, _hub: &mut ExtensionHub) {}
             fn manifest(&self) -> manifest::ExtensionManifest {
                 manifest::ExtensionManifest {
                     name: String::new(), // <-- triggers EmptyName
