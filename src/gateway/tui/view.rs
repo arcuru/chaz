@@ -395,9 +395,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     // Snapshot what we need from `tab` before releasing the borrow so the
     // approval panel can take a &mut borrow of app.click_regions.
     let scroll_offset = tab.scroll_offset;
+    // Never surface the full session DB id here — it's long and noisy. Show
+    // the alias if set, otherwise a short id prefix; the full id is available
+    // via /info and /share when actually needed.
     let session_label = match &tab.session_name {
-        Some(name) => format!("{} ({})", name, tab.session_db_id),
-        None => tab.session_db_id.clone(),
+        Some(name) => name.clone(),
+        None => short_session_id(&tab.session_db_id),
     };
     let current_agent = tab.current_agent.clone();
     let msg_count = tab
