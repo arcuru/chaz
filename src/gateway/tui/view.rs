@@ -409,6 +409,46 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         .iter()
         .filter(|e| e.entry_type == EntryType::Message)
         .count();
+    // Aggregate this session's LLM usage for the status bar. Mirrors
+    // `commands::session::format_usage_summary`: only entries carrying
+    // response metadata count, and `cached` is the cache-read subset of
+    // prompt tokens.
+    let usage_segment = {
+        let (mut prompt, mut completion, mut cached) = (0u64, 0u64, 0u64);
+        let mut cost = 0.0f64;
+        let mut saw_cost = false;
+        let mut calls = 0u32;
+        for e in &tab.entries {
+            let Some(m) = &e.metadata else { continue };
+            calls += 1;
+            prompt += m.usage.prompt_tokens as u64;
+            completion += m.usage.completion_tokens as u64;
+            cached += m.usage.cached_tokens.unwrap_or(0) as u64;
+            if let Some(c) = m.usage.cost_usd {
+                cost += c;
+                saw_cost = true;
+            }
+        }
+        if calls == 0 {
+            String::new()
+        } else {
+            let pct = if prompt > 0 {
+                (cached as f64 / prompt as f64 * 100.0).round() as u64
+            } else {
+                0
+            };
+            let cost_part = if saw_cost {
+                format!(" • ${cost:.4}")
+            } else {
+                String::new()
+            };
+            format!(
+                " | {}/{} tok • {pct}% cached{cost_part}",
+                human_tokens(prompt),
+                human_tokens(completion)
+            )
+        }
+    };
     let approval_info = tab.pending_approval.as_ref().map(|ex| {
         (
             ex.info.name.clone(),
@@ -450,8 +490,8 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
 
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let status_text = format!(
-        " {} | agent: {} | messages: {}{} | /help",
-        session_label, current_agent, msg_count, debug_indicator
+        " {} | agent: {} | messages: {}{}{} | /help",
+        session_label, current_agent, msg_count, usage_segment, debug_indicator
     );
     let status =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
@@ -737,6 +777,17 @@ fn render_approval_panel(
     });
 }
 
+/// Compact token count for the status bar: `942`, `12.3k`, `1.5M`.
+fn human_tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
 /// "5m ago", "3h ago", "2d ago", "5w ago" — coarse age for the picker.
 /// Returns `"—"` for legacy sessions that predate the catalog.
 fn humanize_age(created_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
@@ -918,6 +969,14 @@ mod tests {
     fn display_lines_splits_on_newlines() {
         let out = display_lines("one\ntwo\nthree", None);
         assert_eq!(out, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn human_tokens_scales() {
+        assert_eq!(human_tokens(0), "0");
+        assert_eq!(human_tokens(942), "942");
+        assert_eq!(human_tokens(12_345), "12.3k");
+        assert_eq!(human_tokens(1_500_000), "1.5M");
     }
 
     #[test]
