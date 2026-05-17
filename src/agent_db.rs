@@ -226,7 +226,7 @@ impl Timer {
 /// freshly-created session's address is recoverable ("this timer
 /// fired and the session it created is at X"); for `Pinned` it
 /// records the run against the existing session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimerFire {
     pub timer_id: String,
     pub fired_at: DateTime<Utc>,
@@ -234,6 +234,12 @@ pub struct TimerFire {
     pub session_db_id: String,
     /// True when this fire created a new session (Fresh target).
     pub fresh: bool,
+    /// Token/cost provenance for the turn this fire drove. Attributing
+    /// it here keeps autonomous-wake cost on the *agent's* ledger
+    /// rather than the session's (session usage stays Message-only by
+    /// design). `None` if the turn produced no usable metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::runtime::ResponseMetadata>,
 }
 
 /// Handle over the eidetica `Database` that holds an agent's state.
@@ -950,19 +956,26 @@ mod tests {
             fired_at: Utc::now(),
             session_db_id: "sha256:fresh1".into(),
             fresh: true,
+            usage: None,
         };
         let f2 = TimerFire {
             timer_id: "daily".into(),
             fired_at: Utc::now() + chrono::Duration::seconds(5),
             session_db_id: "sha256:pinned".into(),
             fresh: false,
+            usage: None,
         };
         db.record_timer_fire(f2.clone()).await.unwrap();
         db.record_timer_fire(f1.clone()).await.unwrap();
 
         // Sorted by fired_at regardless of insertion order.
         let fires = db.list_timer_fires().await.unwrap();
-        assert_eq!(fires, vec![f1, f2]);
+        assert_eq!(fires.len(), 2);
+        assert_eq!(fires[0].timer_id, "nightly");
+        assert!(fires[0].fresh);
+        assert_eq!(fires[0].session_db_id, "sha256:fresh1");
+        assert_eq!(fires[1].timer_id, "daily");
+        assert!(!fires[1].fresh);
     }
 
     #[tokio::test]
