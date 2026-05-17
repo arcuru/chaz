@@ -41,6 +41,7 @@ pub const MEMORY_STORE: &str = "memory";
 pub const META_STORE: &str = "meta";
 pub const HISTORY_STORE: &str = "history";
 pub const MEMORY_BANKS_STORE: &str = "memory_banks";
+pub const TIMERS_STORE: &str = "timers";
 
 const BLOB_KEY: &str = "value";
 
@@ -152,6 +153,73 @@ pub struct MemoryBankRef {
     pub permission: BankPermission,
 }
 
+fn default_true() -> bool {
+    true
+}
+fn default_timer_max_failures() -> u32 {
+    3
+}
+
+/// Where a fired [`Timer`] runs.
+///
+/// The agent's "home"/default session is **not** a separate concept —
+/// it is just a `Pinned` timer whose `session_db_id` is that session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimerTarget {
+    /// Fire into this existing session.
+    Pinned { session_db_id: String },
+    /// Create a fresh session per fire (autonomous recurring task).
+    Fresh,
+}
+
+/// An agent-owned scheduled wake. Lives in the owning agent's DB
+/// `timers` store, so it syncs and travels with the agent across peers
+/// exactly like its persona/config — the agent is the unit of
+/// ownership, chaz is the runtime that fires it.
+///
+/// The `prompt` is invocation-scoped input handed to the agent when the
+/// timer fires; it is *not* written as a broadcast session entry.
+/// Failure-tracking fields mirror [`crate::routine::Routine`] so the
+/// engine's auto-disable pass can operate on timers uniformly
+/// (`max_failures == 0` opts out).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Timer {
+    pub id: String,
+    pub trigger: crate::routine::Trigger,
+    pub prompt: String,
+    pub target: TimerTarget,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default = "default_timer_max_failures")]
+    pub max_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl Timer {
+    /// Construct a timer with default resilience settings.
+    pub fn new(
+        id: impl Into<String>,
+        trigger: crate::routine::Trigger,
+        prompt: impl Into<String>,
+        target: TimerTarget,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            trigger,
+            prompt: prompt.into(),
+            target,
+            enabled: true,
+            consecutive_failures: 0,
+            max_failures: 3,
+            last_error: None,
+        }
+    }
+}
+
 /// Handle over the eidetica `Database` that holds an agent's state.
 #[derive(Clone)]
 pub struct AgentDb {
@@ -202,8 +270,58 @@ impl AgentDb {
             .await?;
         txn.get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
             .await?;
+        txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Agent-owned timers (Agent-Owned Timers — Stage 1)
+    // -----------------------------------------------------------------
+
+    /// List every timer owned by this agent.
+    pub async fn list_timers(&self) -> anyhow::Result<Vec<Timer>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
+        let rows = store.search(|_: &Timer| true).await?;
+        Ok(rows.into_iter().map(|(_, t)| t).collect())
+    }
+
+    /// Insert a timer, or replace the existing one with the same `id`.
+    /// Dedup-by-id keeps edits and failure-state updates idempotent
+    /// (same pattern as `attach_memory_bank`'s dedup-by-name).
+    pub async fn upsert_timer(&self, timer: Timer) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
+        let existing = store.search(|t: &Timer| t.id == timer.id).await?;
+        for (row_id, _) in existing {
+            store.delete(&row_id).await?;
+        }
+        store.insert(timer).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Remove the timer with the given `id`. Returns true if a row was
+    /// removed; no-op (false) on an unknown id.
+    pub async fn remove_timer(&self, id: &str) -> anyhow::Result<bool> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
+        let existing = store.search(|t: &Timer| t.id == id).await?;
+        let removed = !existing.is_empty();
+        for (row_id, _) in existing {
+            store.delete(&row_id).await?;
+        }
+        txn.commit().await?;
+        Ok(removed)
+    }
+
+    /// Find a single timer by `id`.
+    pub async fn find_timer(&self, id: &str) -> anyhow::Result<Option<Timer>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
+        let mut rows = store.search(|t: &Timer| t.id == id).await?;
+        Ok(rows.pop().map(|(_, t)| t))
     }
 
     // -----------------------------------------------------------------
@@ -704,5 +822,101 @@ mod tests {
         assert_eq!(found.permission, BankPermission::Write);
 
         assert!(db.find_memory_bank("missing").await.unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Agent-owned timers (Stage 1)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn timers_empty_by_default() {
+        let (_user, db) = peer_with_agent_db().await;
+        assert!(db.list_timers().await.unwrap().is_empty());
+        assert!(db.find_timer("nope").await.unwrap().is_none());
+        assert!(!db.remove_timer("nope").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn timer_crud_round_trips_pinned_and_fresh() {
+        use crate::routine::Trigger;
+        let (_user, db) = peer_with_agent_db().await;
+
+        let pinned = Timer::new(
+            "daily-brief",
+            Trigger::Cron {
+                expr: "0 0 9 * * *".into(),
+            },
+            "summarize overnight activity",
+            TimerTarget::Pinned {
+                session_db_id: "sha256:sess".into(),
+            },
+        );
+        let fresh = Timer::new(
+            "nightly-task",
+            Trigger::OneShot {
+                fire_at: Utc::now() + chrono::Duration::hours(1),
+            },
+            "run the nightly sweep",
+            TimerTarget::Fresh,
+        );
+        db.upsert_timer(pinned.clone()).await.unwrap();
+        db.upsert_timer(fresh.clone()).await.unwrap();
+
+        let mut got = db.list_timers().await.unwrap();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(got, vec![pinned.clone(), fresh.clone()]);
+        assert_eq!(db.find_timer("daily-brief").await.unwrap(), Some(pinned));
+
+        // Defaults applied by Timer::new.
+        let f = db.find_timer("nightly-task").await.unwrap().unwrap();
+        assert!(f.enabled);
+        assert_eq!(f.max_failures, 3);
+        assert_eq!(f.consecutive_failures, 0);
+        assert!(matches!(f.target, TimerTarget::Fresh));
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_by_id_not_appends() {
+        use crate::routine::Trigger;
+        let (_user, db) = peer_with_agent_db().await;
+        let mut t = Timer::new(
+            "t1",
+            Trigger::Cron {
+                expr: "0 * * * * *".into(),
+            },
+            "first",
+            TimerTarget::Fresh,
+        );
+        db.upsert_timer(t.clone()).await.unwrap();
+
+        // Same id, mutated state (e.g. a failure-tracking update).
+        t.prompt = "second".into();
+        t.consecutive_failures = 2;
+        t.enabled = false;
+        db.upsert_timer(t.clone()).await.unwrap();
+
+        let all = db.list_timers().await.unwrap();
+        assert_eq!(all.len(), 1, "upsert must replace, not append");
+        assert_eq!(all[0].prompt, "second");
+        assert_eq!(all[0].consecutive_failures, 2);
+        assert!(!all[0].enabled);
+
+        assert!(db.remove_timer("t1").await.unwrap());
+        assert!(db.list_timers().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timer_serde_tags_target_kind() {
+        let p = serde_json::to_string(&TimerTarget::Pinned {
+            session_db_id: "sha256:x".into(),
+        })
+        .unwrap();
+        assert!(p.contains("\"kind\":\"pinned\""), "got: {p}");
+        let f = serde_json::to_string(&TimerTarget::Fresh).unwrap();
+        assert!(f.contains("\"kind\":\"fresh\""), "got: {f}");
+        assert_eq!(
+            serde_json::from_str::<TimerTarget>(&f).unwrap(),
+            TimerTarget::Fresh
+        );
     }
 }
