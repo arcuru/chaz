@@ -778,16 +778,51 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     // y offset inside inner area — starts at 1 because of the leading blank.
     let mut y_off: u16 = 1;
 
+    // Virtual "New session" row — always pinned at the top and visually
+    // distinct from real sessions. Display index 0; opens a new session.
+    {
+        let is_selected = app.picker_index == 0;
+        let marker = if is_selected { "> " } else { "  " };
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        };
+        if y_off < inner_h {
+            let clipped_h = 2u16.min(inner_h - y_off);
+            if clipped_h > 0 {
+                app.click_regions.push(ClickRegion {
+                    x: inner_x,
+                    y: inner_y + y_off,
+                    w: inner_w,
+                    h: clipped_h,
+                    target: ClickTarget::PickerNew,
+                });
+            }
+        }
+        lines.push(Line::from(vec![Span::styled(
+            format!("{marker}+ New session"),
+            style,
+        )]));
+        lines.push(Line::from(""));
+        y_off = y_off.saturating_add(2);
+    }
+
     if app.session_list.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  No sessions found. Press 'n' to create one.",
+            "  No saved sessions yet — select \"New session\" above.",
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
         let current_session_db_id = app.active().session_db_id.clone();
         let now = Utc::now();
         for (i, info) in app.session_list.iter().enumerate() {
-            let is_selected = i == app.picker_index;
+            let is_selected = i + 1 == app.picker_index;
             let is_current = info.session_db_id == current_session_db_id;
 
             let marker = if is_selected { "> " } else { "  " };
@@ -869,7 +904,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(list, chunks[0]);
 
     let help = Paragraph::new(
-        " [Up/Down] navigate | [Enter] select | [n] new | [r] rename | [Esc/Ctrl+P] cancel",
+        " [Up/Down] navigate | [Enter] open/new | [n] new | [r] rename | [Esc/Ctrl+P] cancel",
     )
     .style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(help, chunks[1]);

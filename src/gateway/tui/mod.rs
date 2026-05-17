@@ -107,7 +107,11 @@ pub(super) enum ClickTarget {
     ApprovalApprove,
     ApprovalDeny,
     ApprovalApproveAll,
+    /// Select session-list row `i` (display index is `i + 1` — the New
+    /// session row is row 0).
     PickerSelect(usize),
+    /// The virtual "New session" row at the top of the picker.
+    PickerNew,
     /// Activate tab at the given index.
     TabActivate(usize),
     /// Close tab at the given index.
@@ -232,6 +236,37 @@ impl App {
         self.tabs
             .iter()
             .position(|t| t.session_db_id == session_db_id)
+    }
+
+    /// Number of selectable rows in the session picker: a virtual "New
+    /// session" row at index 0, then one row per known session.
+    pub(super) fn picker_len(&self) -> usize {
+        self.session_list.len() + 1
+    }
+
+    /// Resolve the highlighted picker row to a dispatch token: the
+    /// `"__new__"` sentinel for the top row, otherwise the session's db id.
+    pub(super) fn picker_selection(&self) -> String {
+        match self.picker_index.checked_sub(1) {
+            None => "__new__".to_string(),
+            Some(i) => self
+                .session_list
+                .get(i)
+                .map(|s| s.session_db_id.clone())
+                .unwrap_or_else(|| "__new__".to_string()),
+        }
+    }
+
+    /// Point the picker cursor at `session_db_id` (offset past the New
+    /// session row). Falls back to the first session, or the New row when
+    /// there are no sessions.
+    pub(super) fn focus_picker_on(&mut self, session_db_id: &str) {
+        self.picker_index = self
+            .session_list
+            .iter()
+            .position(|s| s.session_db_id == session_db_id)
+            .map(|p| p + 1)
+            .unwrap_or(if self.session_list.is_empty() { 0 } else { 1 });
     }
 }
 
@@ -381,6 +416,44 @@ impl Gateway for TuiGateway {
         let config_role_names = get_role_names(self.config.roles.clone());
         let default_role = self.config.role.clone();
 
+        // When prior sessions exist, open straight into the picker so the
+        // user picks one (or the New session row) instead of always landing
+        // in the default session. A fresh install — only the just-created
+        // empty default session — still goes directly to chat.
+        {
+            let (sid, sdb, agent, sname) = {
+                let t = app.active();
+                (
+                    t.session_db_id.clone(),
+                    t.session_db.clone(),
+                    t.current_agent.clone(),
+                    t.session_name.clone(),
+                )
+            };
+            let ctx = CommandContext {
+                server: &server,
+                secrets: &self.secrets,
+                backend: &backend,
+                session_db_id: &sid,
+                session_db: &sdb,
+                current_agent: &agent,
+                session_name: sname.as_deref(),
+                config_roles: Some(config_role_names.to_vec()),
+                default_role: default_role.as_deref(),
+            };
+            if let CommandOutcome::SessionsList(list) =
+                commands::dispatch(Command::ListSessions, &ctx).await
+            {
+                let has_known = list.len() > 1 || list.iter().any(|s| s.entry_count > 0);
+                if has_known {
+                    app.session_list = list;
+                    app.session_list_fresh = true;
+                    app.focus_picker_on(&sid);
+                    app.mode = TuiMode::SessionPicker;
+                }
+            }
+        }
+
         loop {
             terminal.draw(|f| view::ui(f, &mut app))?;
 
@@ -506,24 +579,19 @@ impl Gateway for TuiGateway {
                     if let Some(outcome) = input::handle_mouse(&mut app, m) {
                         match outcome {
                             input::MouseOutcome::PickerOpenSelected => {
-                                if let Some(selected) = app
-                                    .session_list
-                                    .get(app.picker_index)
-                                    .map(|s| s.session_db_id.clone())
-                                {
-                                    dispatch_picker_selection(
-                                        selected,
-                                        &mut app,
-                                        &server,
-                                        &backend,
-                                        &self.secrets,
-                                        &approval_tx,
-                                        &notify_tx,
-                                        &config_role_names,
-                                        default_role.as_deref(),
-                                    )
-                                    .await;
-                                }
+                                let selected = app.picker_selection();
+                                dispatch_picker_selection(
+                                    selected,
+                                    &mut app,
+                                    &server,
+                                    &backend,
+                                    &self.secrets,
+                                    &approval_tx,
+                                    &notify_tx,
+                                    &config_role_names,
+                                    default_role.as_deref(),
+                                )
+                                .await;
                             }
                             input::MouseOutcome::TabActivate(i) => {
                                 if i < app.tabs.len() {
@@ -672,11 +740,7 @@ async fn handle_chat_action(
             // produce. The cost rollup on each row was computed during the
             // prior cold fetch.
             if app.session_list_fresh && !app.session_list.is_empty() {
-                app.picker_index = app
-                    .session_list
-                    .iter()
-                    .position(|s| s.session_db_id == session_db_id)
-                    .unwrap_or(0);
+                app.focus_picker_on(&session_db_id);
                 app.mode = TuiMode::SessionPicker;
                 return;
             }
@@ -696,12 +760,9 @@ async fn handle_chat_action(
             };
             match commands::dispatch(Command::ListSessions, &ctx).await {
                 CommandOutcome::SessionsList(list) => {
-                    app.picker_index = list
-                        .iter()
-                        .position(|s| s.session_db_id == session_db_id)
-                        .unwrap_or(0);
-                    app.session_list_fresh = true;
                     app.session_list = list;
+                    app.session_list_fresh = true;
+                    app.focus_picker_on(&session_db_id);
                     app.mode = TuiMode::SessionPicker;
                 }
                 other => {
@@ -799,12 +860,9 @@ async fn apply_picker_rename(
     if let CommandOutcome::SessionsList(list) =
         commands::dispatch(Command::ListSessions, &ctx).await
     {
-        app.picker_index = list
-            .iter()
-            .position(|s| s.session_db_id == session_db_id)
-            .unwrap_or(app.picker_index.min(list.len().saturating_sub(1)));
         app.session_list = list;
         app.session_list_fresh = true;
+        app.focus_picker_on(&session_db_id);
     }
 }
 

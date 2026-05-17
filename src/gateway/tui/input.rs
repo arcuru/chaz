@@ -362,14 +362,22 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         ClickTarget::ApprovalDeny => apply_approval(app, ApprovalDecision::Deny),
         ClickTarget::ApprovalApproveAll => apply_approval(app, ApprovalDecision::ApproveAll),
         ClickTarget::PickerSelect(i) => {
-            // First click selects; second click on the same row opens. Keeps
-            // the keyboard flow (Up/Down then Enter) intact.
-            if app.picker_index == i && i < app.session_list.len() {
+            // Session row `i` is picker display index `i + 1` (row 0 is the
+            // New session row). First click selects; second click on the
+            // same row opens — mirrors the Up/Down then Enter keyboard flow.
+            if i < app.session_list.len() {
+                let display = i + 1;
+                if app.picker_index == display {
+                    return Some(MouseOutcome::PickerOpenSelected);
+                }
+                app.picker_index = display;
+            }
+        }
+        ClickTarget::PickerNew => {
+            if app.picker_index == 0 {
                 return Some(MouseOutcome::PickerOpenSelected);
             }
-            if i < app.session_list.len() {
-                app.picker_index = i;
-            }
+            app.picker_index = 0;
         }
         ClickTarget::TabActivate(i) => return Some(MouseOutcome::TabActivate(i)),
         ClickTarget::TabClose(i) => return Some(MouseOutcome::TabClose(i)),
@@ -1078,18 +1086,20 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
             None
         }
         KeyCode::Down => {
-            if app.picker_index + 1 < app.session_list.len() {
+            if app.picker_index + 1 < app.picker_len() {
                 app.picker_index += 1;
             }
             None
         }
-        KeyCode::Enter => app
-            .session_list
-            .get(app.picker_index)
-            .map(|info| info.session_db_id.clone()),
+        KeyCode::Enter => Some(app.picker_selection()),
         KeyCode::Char('n') => Some("__new__".to_string()),
         KeyCode::Char('r') => {
-            if let Some(info) = app.session_list.get(app.picker_index) {
+            // Row 0 is "New session" — nothing to rename there.
+            if let Some(info) = app
+                .picker_index
+                .checked_sub(1)
+                .and_then(|i| app.session_list.get(i))
+            {
                 let initial = info.name.clone().unwrap_or_default();
                 let cursor = initial.len();
                 let title = match &info.name {
