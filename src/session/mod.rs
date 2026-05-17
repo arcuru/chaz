@@ -516,6 +516,39 @@ pub fn parse_mentions(text: &str) -> Vec<String> {
     out
 }
 
+/// Count the trailing run of agent-authored `Message` entries, i.e. the
+/// length of the current agent→agent "burst". The run is broken (and the
+/// burst considered reset) by the first human-authored `Message` or any
+/// `Directive` (scheduler/system) walking backward from the latest entry.
+/// Non-conversational entries (`Ack`, `ToolCall`, `ToolResult`, `Error`,
+/// `Summary`, `PersonaSnapshot`) are transparent — they neither extend nor
+/// reset the burst.
+///
+/// `is_agent` decides whether a sender name belongs to a known agent.
+/// Used to bound mention-chained agent→agent recursion: once the trailing
+/// burst reaches the budget, further agent wakes are suppressed until a
+/// human (or Directive) speaks.
+pub fn trailing_agent_message_burst(
+    entries: &[SessionEntry],
+    is_agent: impl Fn(&str) -> bool,
+) -> usize {
+    let mut burst = 0;
+    for e in entries.iter().rev() {
+        match e.entry_type {
+            EntryType::Message => {
+                if is_agent(&e.sender) {
+                    burst += 1;
+                } else {
+                    break; // human message — burst boundary
+                }
+            }
+            EntryType::Directive => break, // scheduler/system — burst boundary
+            _ => {}                        // transparent to the burst
+        }
+    }
+    burst
+}
+
 /// Find or create a named eidetica database for a user.
 async fn find_or_create_db(
     user: &mut eidetica::user::User,
@@ -607,5 +640,60 @@ mod tests {
         assert!(parse_mentions("no mentions here").is_empty());
         assert_eq!(parse_mentions("email a@b.com only"), Vec::<String>::new());
         assert_eq!(parse_mentions("@alpha-bot,"), vec!["alpha-bot"]);
+    }
+
+    #[test]
+    fn trailing_agent_burst_counts_and_resets() {
+        use chrono::Utc;
+
+        let agents = ["alpha", "beta"];
+        let is_agent = |name: &str| agents.contains(&name);
+        let mk = |sender: &str, ty: EntryType| SessionEntry {
+            sender: sender.to_string(),
+            content: String::new(),
+            timestamp: Utc::now(),
+            entry_type: ty,
+            metadata: None,
+        };
+
+        // Empty / no trailing agent messages.
+        assert_eq!(trailing_agent_message_burst(&[], is_agent), 0);
+        assert_eq!(
+            trailing_agent_message_burst(&[mk("patrick", EntryType::Message)], is_agent),
+            0
+        );
+
+        // human → alpha → beta → alpha : burst of 3, human resets the run.
+        let convo = vec![
+            mk("patrick", EntryType::Message),
+            mk("alpha", EntryType::Message),
+            mk("beta", EntryType::Message),
+            mk("alpha", EntryType::Message),
+        ];
+        assert_eq!(trailing_agent_message_burst(&convo, is_agent), 3);
+
+        // Ack / ToolCall / PersonaSnapshot are transparent — don't reset.
+        let with_noise = vec![
+            mk("alpha", EntryType::Message),
+            mk("server", EntryType::Ack),
+            mk("alpha", EntryType::ToolCall),
+            mk("beta", EntryType::Message),
+        ];
+        assert_eq!(trailing_agent_message_burst(&with_noise, is_agent), 2);
+
+        // A Directive (scheduler/system) is a burst boundary.
+        let after_directive = vec![
+            mk("alpha", EntryType::Message),
+            mk("scheduler", EntryType::Directive),
+            mk("beta", EntryType::Message),
+        ];
+        assert_eq!(trailing_agent_message_burst(&after_directive, is_agent), 1);
+
+        // Trailing human message → burst is 0 (handled via the human path).
+        let human_last = vec![
+            mk("alpha", EntryType::Message),
+            mk("patrick", EntryType::Message),
+        ];
+        assert_eq!(trailing_agent_message_burst(&human_last, is_agent), 0);
     }
 }

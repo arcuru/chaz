@@ -61,6 +61,14 @@ struct SpawnContext {
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
+/// Maximum length of an agent→agent "burst" — the run of consecutive
+/// agent-authored messages since the last human message or `Directive`.
+/// Once the trailing burst reaches this, mention-chained agent wakes are
+/// suppressed until a human (or scheduler) speaks again. This is the
+/// runaway backstop for the chat-room model (see
+/// `docs/src/design/autonomous_agents.md`).
+const AGENT_BURST_BUDGET: usize = 6;
+
 /// Callback-driven agent server.
 pub struct Server {
     registry: Arc<SessionRegistry>,
@@ -535,8 +543,44 @@ impl Server {
             None => return Ok(()),
         };
 
+        let sender_is_agent = self.agents.get(&latest.sender).is_some();
+
+        // Chat-room (agent→agent) gate. A human `Message` and any
+        // `Directive` wake an agent via the unchanged path below. An
+        // agent-authored `Message` wakes another agent only when it
+        // explicitly `@mentions` an attached agent (≠ sender) AND the
+        // per-burst turn budget is not exhausted. See
+        // `docs/src/design/autonomous_agents.md`.
+        let agent_to_agent_target = if sender_is_agent
+            && latest.entry_type == EntryType::Message
+        {
+            let burst = crate::session::trailing_agent_message_burst(
+                session.entries(),
+                |name| self.agents.get(name).is_some(),
+            );
+            if burst >= AGENT_BURST_BUDGET {
+                info!(
+                    session_db_id,
+                    burst, "Agent turn budget exhausted — suppressing agent→agent wake"
+                );
+                None
+            } else {
+                self.registry
+                    .resolve_mentioned_agent(
+                        session_db_id,
+                        &latest.content,
+                        &latest.sender,
+                        &self.agent_index,
+                    )
+                    .await
+            }
+        } else {
+            None
+        };
+
         let should_process = match latest.entry_type {
-            EntryType::Message => self.agents.get(&latest.sender).is_none(),
+            EntryType::Message if !sender_is_agent => true,
+            EntryType::Message => agent_to_agent_target.is_some(),
             EntryType::Directive => true,
             _ => false,
         };
@@ -573,15 +617,22 @@ impl Server {
             }
         };
 
-        let agent = self
-            .registry
-            .resolve_agent_for_entry(
-                session_db_id,
-                agent_override.as_deref(),
-                &self.agent_index,
-                Some(&latest.content),
-            )
-            .await;
+        // For the agent→agent case the speaker is already pinned to the
+        // mentioned agent (computed in the gate above); only the
+        // human/Directive path runs the full resolution precedence.
+        let agent = match agent_to_agent_target {
+            Some(a) => a,
+            None => {
+                self.registry
+                    .resolve_agent_for_entry(
+                        session_db_id,
+                        agent_override.as_deref(),
+                        &self.agent_index,
+                        Some(&latest.content),
+                    )
+                    .await
+            }
+        };
 
         // Stage 8 live hydration: if the resolved agent has a Living Agent DB
         // on this peer, rebuild its runtime snapshot from the DB's `config`
@@ -733,10 +784,18 @@ impl Server {
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
             let assembled = {
                 let s = session.lock().await;
+                let roster: Vec<String> = s
+                    .read_meta()
+                    .await
+                    .agents
+                    .into_iter()
+                    .map(|a| a.display_name)
+                    .collect();
                 ContextBuilder::new(s.entries(), &agent_name, &context_config)
                     .with_role(default_role.as_ref())
                     .with_tools(&tool_defs)
                     .with_max_tokens_override(max_context_tokens)
+                    .with_room_participants(&roster)
                     .build()
             };
 

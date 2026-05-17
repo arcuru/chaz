@@ -84,6 +84,45 @@ pub fn latest_persona_snapshot(
         )
 }
 
+/// Build the multi-agent room note for `agent_name`, given the full
+/// participant roster (which normally includes `agent_name` itself).
+///
+/// Returns `None` when fewer than two agents are attached or no
+/// participant other than `agent_name` exists — single-agent sessions
+/// get no note, so their system prompt stays byte-identical (cache-safe).
+/// The roster is rendered in the given order, self excluded, deduped
+/// case-insensitively. A stable roster yields a byte-identical note
+/// every turn; only a membership change perturbs it (one-turn re-cache).
+fn room_note(participants: &[String], agent_name: &str) -> Option<String> {
+    if participants.len() < 2 {
+        return None;
+    }
+    let mut others: Vec<&str> = Vec::new();
+    for p in participants {
+        if p.eq_ignore_ascii_case(agent_name) {
+            continue;
+        }
+        if others.iter().any(|o| o.eq_ignore_ascii_case(p)) {
+            continue;
+        }
+        others.push(p);
+    }
+    if others.is_empty() {
+        return None;
+    }
+    let list = others
+        .iter()
+        .map(|n| format!("@{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "You are in a shared session with other agents: {list}. \
+         To address a participant directly, @mention them by display name. \
+         They will see your message and may reply. Messages with no @mention \
+         are not routed to other agents."
+    ))
+}
+
 /// Assembled context ready for the runtime/backend.
 pub struct AssembledContext {
     pub messages: Vec<RuntimeMessage>,
@@ -104,6 +143,11 @@ pub struct ContextBuilder<'a> {
     config: &'a ContextConfig,
     /// Per-agent override for max context tokens
     max_context_tokens_override: Option<usize>,
+    /// Display names of every agent attached to this session (including
+    /// `agent_name` itself). When more than one agent is attached, a
+    /// standard "room note" listing the *other* participants and the
+    /// `@mention` convention is appended to the system prompt.
+    room_participants: &'a [String],
 }
 
 impl<'a> ContextBuilder<'a> {
@@ -119,7 +163,17 @@ impl<'a> ContextBuilder<'a> {
             tool_defs: &[],
             config,
             max_context_tokens_override: None,
+            room_participants: &[],
         }
+    }
+
+    /// Supply the full roster of agents attached to the session (including
+    /// this agent). With >1 participant, a room note is appended to the
+    /// system prompt so agents learn the `@mention` convention without
+    /// per-persona editing.
+    pub fn with_room_participants(mut self, participants: &'a [String]) -> Self {
+        self.room_participants = participants;
+        self
     }
 
     pub fn with_role(mut self, role: Option<&'a RoleDetails>) -> Self {
@@ -152,9 +206,23 @@ impl<'a> ContextBuilder<'a> {
         //       `/agent set <ref> persona.*`. Authoritative once present.
         //    b. Legacy `role:` lookup, kept for transitional sessions
         //       where no snapshot has been written yet.
-        let system_prompt = latest_persona_snapshot(self.entries, self.agent_name)
+        let mut system_prompt = latest_persona_snapshot(self.entries, self.agent_name)
             .map(|p| p.resolved.text)
             .unwrap_or_else(|| self.role.map(|r| r.get_prompt()).unwrap_or_default());
+
+        // Multi-agent room note. Appended (not baked into the persona
+        // snapshot) so it stays current as membership changes and keeps
+        // single-agent sessions byte-identical. See
+        // `docs/src/design/autonomous_agents.md`.
+        if let Some(note) = room_note(self.room_participants, self.agent_name) {
+            if system_prompt.is_empty() {
+                system_prompt = note;
+            } else {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&note);
+            }
+        }
+
         let system_tokens = if !system_prompt.is_empty() {
             estimate_tokens(&system_prompt) + MESSAGE_OVERHEAD_TOKENS
         } else {
@@ -481,5 +549,59 @@ mod tests {
             .build();
 
         assert!(result_small.entries_included < result_default.entries_included);
+    }
+
+    #[test]
+    fn room_note_only_for_multi_agent_and_excludes_self() {
+        // Single-agent (or empty) roster → no note (cache-safe).
+        assert!(room_note(&[], "alpha").is_none());
+        assert!(room_note(&["alpha".to_string()], "alpha").is_none());
+
+        // Roster of one *other* agent.
+        let note = room_note(&["alpha".to_string(), "beta".to_string()], "alpha").unwrap();
+        assert!(note.contains("@beta"));
+        assert!(!note.contains("@alpha"), "self must be excluded: {note}");
+
+        // Order preserved, self excluded mid-list, case-insensitive dedup.
+        let roster = vec![
+            "beta".to_string(),
+            "Alpha".to_string(), // self, different case
+            "gamma".to_string(),
+            "BETA".to_string(), // dup of beta
+        ];
+        let note = room_note(&roster, "alpha").unwrap();
+        assert!(note.contains("@beta, @gamma"), "got: {note}");
+        assert!(!note.to_lowercase().contains("@alpha"));
+
+        // Roster size ≥2 but every entry is self → no note.
+        assert!(room_note(&["alpha".to_string(), "ALPHA".to_string()], "alpha").is_none());
+    }
+
+    #[test]
+    fn room_note_appended_to_system_prompt_when_multi_agent() {
+        let config = ContextConfig::default();
+        let entries = vec![make_entry("patrick", "hi", EntryType::Message)];
+        let role = crate::role::RoleDetails::new_test("alpha", "You are Alpha.");
+
+        let solo = ContextBuilder::new(&entries, "alpha", &config)
+            .with_role(Some(&role))
+            .build();
+        let roster = vec!["alpha".to_string(), "beta".to_string()];
+        let room = ContextBuilder::new(&entries, "alpha", &config)
+            .with_role(Some(&role))
+            .with_room_participants(&roster)
+            .build();
+
+        let sys = |c: &AssembledContext| match c.messages.first() {
+            Some(RuntimeMessage::System(s)) => s.clone(),
+            _ => String::new(),
+        };
+        assert!(sys(&solo).contains("You are Alpha."));
+        assert!(
+            !sys(&solo).contains("@beta"),
+            "single-agent prompt must stay unchanged"
+        );
+        assert!(sys(&room).contains("You are Alpha."));
+        assert!(sys(&room).contains("@beta"));
     }
 }

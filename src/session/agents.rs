@@ -340,6 +340,39 @@ impl SessionRegistry {
 
         self.agents.default_agent().clone()
     }
+
+    /// Chat-room (agent→agent) resolution. Returns the agent an `@mention`
+    /// in `trigger_text` explicitly addresses, excluding `exclude_sender`
+    /// so an agent cannot wake itself with a self-mention.
+    ///
+    /// Unlike [`Self::resolve_agent_for_entry`] there is **no** host /
+    /// first-authorized / default fallback: `None` means "no attached
+    /// agent was explicitly addressed, so no agent speaks". This is what
+    /// keeps v1 participation strictly mention-gated — an agent's message
+    /// only wakes another agent when it names one.
+    pub async fn resolve_mentioned_agent(
+        &self,
+        session_db_id: &str,
+        trigger_text: &str,
+        exclude_sender: &str,
+        agent_index: &crate::hosted_index::HostedIndex,
+    ) -> Option<Agent> {
+        let (_conv_id, db) = self.open_session(session_db_id).await.ok()?;
+        let authorized = self.authorized_agents(&db, agent_index).await;
+        for mention in parse_mentions(trigger_text) {
+            if mention.eq_ignore_ascii_case(exclude_sender) {
+                continue;
+            }
+            if let Some(entry) = authorized
+                .iter()
+                .find(|e| e.display_name.eq_ignore_ascii_case(&mention))
+                && let Some(agent) = self.agents.get(&entry.display_name)
+            {
+                return Some(agent);
+            }
+        }
+        None
+    }
 }
 
 /// Resolve a persona's file includes, hash sources, and write a
@@ -706,5 +739,82 @@ mod tests {
             .resolve_agent_for_entry(&session_id, None, &index, Some("@gamma huh?"))
             .await;
         assert_eq!(resolved.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn resolve_mentioned_agent_picks_named_excluding_sender() {
+        let (_instance, registry, index) = make_registry_with_two_agents().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let alpha = make_agent_entry(&registry, "alpha").await;
+        let beta = make_agent_entry(&registry, "beta").await;
+        index.register(alpha.clone());
+        index.register(beta.clone());
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &beta)
+            .await
+            .unwrap();
+
+        // alpha addresses beta — beta is woken.
+        let r = registry
+            .resolve_mentioned_agent(&session_id, "what do you think @beta?", "alpha", &index)
+            .await;
+        assert_eq!(r.map(|a| a.name), Some("beta".to_string()));
+
+        // alpha mentions itself first, then beta — self-mention is skipped,
+        // beta still wins.
+        let r = registry
+            .resolve_mentioned_agent(&session_id, "@alpha rambling, @beta help", "alpha", &index)
+            .await;
+        assert_eq!(r.map(|a| a.name), Some("beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn resolve_mentioned_agent_returns_none_when_unaddressed() {
+        let (_instance, registry, index) = make_registry_with_two_agents().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let alpha = make_agent_entry(&registry, "alpha").await;
+        let beta = make_agent_entry(&registry, "beta").await;
+        index.register(alpha.clone());
+        index.register(beta.clone());
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &beta)
+            .await
+            .unwrap();
+
+        // No mention at all — nobody speaks.
+        assert!(
+            registry
+                .resolve_mentioned_agent(&session_id, "just thinking out loud", "alpha", &index)
+                .await
+                .is_none()
+        );
+
+        // Only a self-mention — excluded, so nobody speaks.
+        assert!(
+            registry
+                .resolve_mentioned_agent(&session_id, "@alpha note to self", "alpha", &index)
+                .await
+                .is_none()
+        );
+
+        // Stray mention of an unattached name — no fallback, nobody speaks.
+        assert!(
+            registry
+                .resolve_mentioned_agent(&session_id, "@gamma you there?", "alpha", &index)
+                .await
+                .is_none()
+        );
     }
 }
