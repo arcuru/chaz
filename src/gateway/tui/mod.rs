@@ -448,7 +448,9 @@ impl Gateway for TuiGateway {
                 if has_known {
                     app.session_list = list;
                     app.session_list_fresh = true;
-                    app.focus_picker_on(&sid);
+                    // Always land on the "New session" row when the picker
+                    // first opens.
+                    app.picker_index = 0;
                     app.mode = TuiMode::SessionPicker;
                 }
             }
@@ -740,7 +742,7 @@ async fn handle_chat_action(
             // produce. The cost rollup on each row was computed during the
             // prior cold fetch.
             if app.session_list_fresh && !app.session_list.is_empty() {
-                app.focus_picker_on(&session_db_id);
+                app.picker_index = 0;
                 app.mode = TuiMode::SessionPicker;
                 return;
             }
@@ -762,7 +764,7 @@ async fn handle_chat_action(
                 CommandOutcome::SessionsList(list) => {
                     app.session_list = list;
                     app.session_list_fresh = true;
-                    app.focus_picker_on(&session_db_id);
+                    app.picker_index = 0;
                     app.mode = TuiMode::SessionPicker;
                 }
                 other => {
