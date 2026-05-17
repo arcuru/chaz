@@ -1096,13 +1096,7 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
                     Some(n) => format!("Rename \"{n}\""),
                     None => format!(
                         "Name session {}",
-                        info.session_db_id
-                            .rsplit(':')
-                            .next()
-                            .unwrap_or(&info.session_db_id)
-                            .chars()
-                            .take(8)
-                            .collect::<String>()
+                        super::short_session_id(&info.session_db_id)
                     ),
                 };
                 app.overlay = Some(Overlay::RenamePrompt {

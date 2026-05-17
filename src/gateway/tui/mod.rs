@@ -142,17 +142,28 @@ pub(super) struct Tab {
     pub session_name: Option<String>,
 }
 
+/// Short, human-distinguishable form of a session DB id, used for tab
+/// titles, the status bar, and the picker. Session ids share a long common
+/// leading prefix, so the first characters are useless for telling sessions
+/// apart — show the *trailing* characters (the part that actually differs),
+/// marked with a leading `…` so it's clear it's truncated.
+pub(super) fn short_session_id(s: &str) -> String {
+    let tail = s.rsplit(':').next().unwrap_or(s);
+    let n = tail.chars().count();
+    if n <= 8 {
+        tail.to_string()
+    } else {
+        let suffix: String = tail.chars().skip(n - 8).collect();
+        format!("…{suffix}")
+    }
+}
+
 impl Tab {
-    /// Title shown on the tab bar — session name if set, else a short prefix
-    /// of the DB ID.
+    /// Title shown on the tab bar — session name if set, else a short id.
     pub fn title(&self) -> String {
         match &self.session_name {
             Some(name) => name.clone(),
-            None => {
-                let s = &self.session_db_id;
-                let tail: String = s.rsplit(':').next().unwrap_or(s).chars().take(8).collect();
-                tail
-            }
+            None => short_session_id(&self.session_db_id),
         }
     }
 }

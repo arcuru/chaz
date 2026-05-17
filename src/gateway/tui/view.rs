@@ -16,6 +16,7 @@ use super::ClickRegion;
 use super::ClickTarget;
 use super::Overlay;
 use super::TuiMode;
+use super::short_session_id;
 
 /// Prepare arbitrary content for rendering as ratatui `Line`s. Truncates
 /// char-wise if requested (appending `…`), then splits on `\n`. A `Line`
@@ -734,13 +735,6 @@ fn render_approval_panel(
         h: 1,
         target: ClickTarget::ApprovalApproveAll,
     });
-}
-
-/// Last 8 chars of a session DB id (after stripping any `multihash:` prefix),
-/// used as a short identifier in pickers and tab titles.
-fn short_session_id(s: &str) -> String {
-    let tail = s.rsplit(':').next().unwrap_or(s);
-    tail.chars().take(8).collect()
 }
 
 /// "5m ago", "3h ago", "2d ago", "5w ago" — coarse age for the picker.
