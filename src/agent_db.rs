@@ -42,6 +42,7 @@ pub const META_STORE: &str = "meta";
 pub const HISTORY_STORE: &str = "history";
 pub const MEMORY_BANKS_STORE: &str = "memory_banks";
 pub const TIMERS_STORE: &str = "timers";
+pub const TIMER_FIRES_STORE: &str = "timer_fires";
 
 const BLOB_KEY: &str = "value";
 
@@ -220,6 +221,21 @@ impl Timer {
     }
 }
 
+/// Audit record of one timer fire, written to the owning agent's
+/// `timer_fires` store. For `Fresh` targets this is how the
+/// freshly-created session's address is recoverable ("this timer
+/// fired and the session it created is at X"); for `Pinned` it
+/// records the run against the existing session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimerFire {
+    pub timer_id: String,
+    pub fired_at: DateTime<Utc>,
+    /// The session the fire ran in — created (Fresh) or reused (Pinned).
+    pub session_db_id: String,
+    /// True when this fire created a new session (Fresh target).
+    pub fresh: bool,
+}
+
 /// Handle over the eidetica `Database` that holds an agent's state.
 #[derive(Clone)]
 pub struct AgentDb {
@@ -271,6 +287,7 @@ impl AgentDb {
         txn.get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
             .await?;
         txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
+        txn.get_store::<Table<TimerFire>>(TIMER_FIRES_STORE).await?;
         txn.commit().await?;
         Ok(())
     }
@@ -322,6 +339,24 @@ impl AgentDb {
         let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
         let mut rows = store.search(|t: &Timer| t.id == id).await?;
         Ok(rows.pop().map(|(_, t)| t))
+    }
+
+    /// Append a fire-audit record. Append-only — one row per fire.
+    pub async fn record_timer_fire(&self, fire: TimerFire) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<TimerFire>>(TIMER_FIRES_STORE).await?;
+        store.insert(fire).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// All fire-audit records, newest-last (insertion order).
+    pub async fn list_timer_fires(&self) -> anyhow::Result<Vec<TimerFire>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<TimerFire>>(TIMER_FIRES_STORE).await?;
+        let mut rows = store.search(|_: &TimerFire| true).await?;
+        rows.sort_by(|a, b| a.1.fired_at.cmp(&b.1.fired_at));
+        Ok(rows.into_iter().map(|(_, f)| f).collect())
     }
 
     // -----------------------------------------------------------------
@@ -903,6 +938,31 @@ mod tests {
 
         assert!(db.remove_timer("t1").await.unwrap());
         assert!(db.list_timers().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timer_fires_audit_log_appends_in_order() {
+        let (_user, db) = peer_with_agent_db().await;
+        assert!(db.list_timer_fires().await.unwrap().is_empty());
+
+        let f1 = TimerFire {
+            timer_id: "nightly".into(),
+            fired_at: Utc::now(),
+            session_db_id: "sha256:fresh1".into(),
+            fresh: true,
+        };
+        let f2 = TimerFire {
+            timer_id: "daily".into(),
+            fired_at: Utc::now() + chrono::Duration::seconds(5),
+            session_db_id: "sha256:pinned".into(),
+            fresh: false,
+        };
+        db.record_timer_fire(f2.clone()).await.unwrap();
+        db.record_timer_fire(f1.clone()).await.unwrap();
+
+        // Sorted by fired_at regardless of insertion order.
+        let fires = db.list_timer_fires().await.unwrap();
+        assert_eq!(fires, vec![f1, f2]);
     }
 
     #[tokio::test]

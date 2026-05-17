@@ -568,6 +568,32 @@ async fn main() -> anyhow::Result<()> {
                 error!(session = %s.session_db_id, "server.register_session failed: {e}");
             }
         }
+        // Register every hosted agent's own timers (Agent-Owned
+        // Timers). The agent is the unit of ownership; chaz is the
+        // runtime that loads it and fires the callback. Timers persist
+        // in the agent's DB, so this picks up whatever synced/created
+        // since last boot.
+        for entry in server.agent_index().list() {
+            let opened = {
+                let user = registry.user_lock().await;
+                user.open_database(&entry.db_id).await
+            };
+            let db = match opened {
+                Ok(db) => db,
+                Err(e) => {
+                    error!(agent = %entry.display_name, "open agent DB for timers failed: {e}");
+                    continue;
+                }
+            };
+            let adb = agent_db::AgentDb::from_database(db);
+            if let Err(e) = engine
+                .register_agent(&entry.db_id.to_string(), &adb)
+                .await
+            {
+                error!(agent = %entry.display_name, "engine.register_agent failed: {e}");
+            }
+        }
+
         let engine_clone = engine.clone();
         tokio::spawn(async move {
             engine_clone.run().await;

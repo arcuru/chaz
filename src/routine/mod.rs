@@ -23,7 +23,10 @@ pub mod engine;
 pub mod types;
 
 pub use engine::{GLOBAL_ROUTINES_STORE, LAST_FIRED_STORE, RoutineEngine, SESSION_ROUTINES_STORE};
-pub use types::{Routine, RoutineId, RoutineScope, RoutineTarget, Trigger, generate_id};
+pub use types::{
+    AGENT_TIMER_EXTENSION, AgentTimerPayload, Routine, RoutineId, RoutineScope, RoutineTarget,
+    Trigger, generate_id,
+};
 
 use eidetica::Database;
 use eidetica::store::Table;
