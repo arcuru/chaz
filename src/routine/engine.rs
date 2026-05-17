@@ -831,7 +831,12 @@ mod tests {
         // helpers do) is invisible to the running engine until reload.
         crate::routine::upsert_session_routine(
             &sess,
-            &Routine::cron(RoutineId::new("r1"), "r1", "0 * * * * *", target("heartbeat")),
+            &Routine::cron(
+                RoutineId::new("r1"),
+                "r1",
+                "0 * * * * *",
+                target("heartbeat"),
+            ),
         )
         .await
         .unwrap();
