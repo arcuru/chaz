@@ -838,7 +838,14 @@ async fn dispatch_picker_selection(
     } else {
         Command::SwitchSession(selected)
     };
+    // Creating a session from the picker grows the catalog, so the warm
+    // cache is now stale — invalidate it (mirrors the `/new` chat path) or
+    // the next `/sessions` would show the cached list without this session.
+    let invalidates_cache = matches!(cmd, Command::NewSession);
     let outcome = commands::dispatch(cmd, &ctx).await;
+    if invalidates_cache {
+        app.session_list_fresh = false;
+    }
     render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
     app.mode = TuiMode::Chat;
 }
