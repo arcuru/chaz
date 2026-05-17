@@ -96,7 +96,7 @@ when a key is missing.
 Merges `key = value` into the named extension's per-session settings.
 `<value>` is JSON-parsed first, so:
 
-- `/extensions set heartbeat poll_secs 60` stores the number `60`
+- `/extensions set heartbeat max_retries 3` stores the number `3`
 - `/extensions set heartbeat enabled true` stores the boolean `true`
 - `/extensions set heartbeat label "morning sweep"` stores a string
 - `/extensions set heartbeat tags '["urgent","ops"]'` stores an array

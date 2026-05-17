@@ -157,7 +157,7 @@ These aren't session-scoped; they act on the Living Agent itself.
 
 When a message arrives on a multi-agent session, routing picks one agent in this precedence:
 
-1. Explicit override (scheduler `/run`, gateway directives).
+1. Explicit override (gateway/heartbeat directives).
 2. **`@<name>` mention** in the message text — first token matching an attached agent's display_name wins. `@alpha`, `@beta-bot,`, `@gamma.` all work; `a@b.com` is ignored (no leading `@` at token start).
 3. **Host agent** (`SessionMeta.host_agent_db_id`) if that agent is still attached.
 4. First attached agent in AuthSettings order.
@@ -176,6 +176,22 @@ Two trigger shapes share one table:
 - **One-shot triggers** fire once at an absolute `fire_at` time, then the engine drops the row. These back the `wake_me_up` tool described in [Tools](./tools.md). They don't use `last_fired` — deletion replaces it.
 
 Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock jump can't strand a routine. The engine fires due rules within seconds of their scheduled time rather than waiting for a poll interval.
+
+### Entry points
+
+Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
+
+- **Interactive** — the `/heartbeat add|remove|list` command and the `heartbeat_add|modify|remove|list` / `wake_me_up` tools (this section and [Tools](./tools.md)). This is the only interactive surface; there is no separate `/schedule` command.
+- **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), translated into session-scoped routines at startup.
+
+### When rules fire
+
+Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do *not* need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The fire writes the `Directive` and the agent turn runs on the server regardless; a gateway only affects when you *see* the result.
+
+- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
+- **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
+- **The target agent must be hosted on this peer** — otherwise the handler silently skips (the multi-peer dedupe above).
+- **Changes are live.** `/heartbeat add|remove`, `heartbeat_modify`, and `wake_me_up` take effect on the running engine immediately — no restart needed.
 
 ### `/heartbeat` commands
 
@@ -384,7 +400,7 @@ sequenceDiagram
 /heartbeat add brief 0 0 9 * * Mon-Fri researcher Summarise overnight activity
 ```
 
-Every peer hosting `researcher` polls its sessions every 30s. When a rule fires, it writes a `Directive` — indistinguishable from a user message from the router's perspective.
+Every peer hosting `researcher` runs its own copy of the schedule (sleep-until-next, no polling). When a rule fires it writes a `Directive` server-side — indistinguishable from a user message from the router's perspective — and the agent turn runs whether or not anyone is watching the session.
 
 ### 7. Share the agent with another peer (co-ownership)
 

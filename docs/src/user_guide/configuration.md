@@ -91,12 +91,15 @@ mcp_servers:
       approval: unless_auto_approved
       timeout: 30
 
-# Scheduled tasks
+# Scheduled tasks — compiled into session routines at startup and fired
+# by the same RoutineEngine as /heartbeat (server-side, whenever chaz is
+# running; there is no separate /schedule command). Cron is 6 fields:
+# sec min hour day-of-month month day-of-week.
 schedules:
   - name: daily-check
     session: daily-standup # Session name or eidetica DB root ID
     task: "Run the daily status check"
-    cron: "0 9 * * *"
+    cron: "0 0 9 * * *" # 09:00:00 every day
     enabled: true
 
 # Context window management
