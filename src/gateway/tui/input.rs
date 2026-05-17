@@ -7,7 +7,188 @@ use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
-use super::{App, ChatAction, ClickTarget, Overlay, TuiMode, show_error, show_system_msg};
+use super::{
+    App, ChatAction, ClickTarget, Completion, Overlay, TuiMode, show_error, show_system_msg,
+};
+
+/// Grouped, ordered catalog of every built-in slash command. Single source of
+/// truth shared by the help overlay (which renders the `#`-prefixed section
+/// headers) and inline completion (which skips them). Templates ending in a
+/// space take an argument; the help overlay and completion both insert the
+/// template verbatim so the cursor lands ready for that argument.
+pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("# Session", ""),
+        ("/sessions", "open session picker"),
+        ("/new", "create a new session"),
+        ("/join ", "switch to session by name or DB ID"),
+        ("/name ", "set (or clear) a session alias"),
+        ("/rename ", "alias for /name"),
+        ("/info", "show current session info"),
+        ("/costs", "aggregate LLM usage + cost across all sessions"),
+        ("/channels", "list Matrix rooms attached to this session"),
+        ("/share", "generate shareable ticket for current session"),
+        ("/sync ", "sync a remote session via ticket"),
+        ("/compact", "summarize and compact conversation history"),
+        ("/print", "dump the transcript"),
+        ("# Living Agents", ""),
+        ("/agents", "list agents attached to this session"),
+        ("/agent add ", "attach an agent (display name or DB ID)"),
+        ("/agent remove ", "detach an agent"),
+        ("/agent host ", "set (or clear) the session's host agent"),
+        ("/agent hosted", "list every Living Agent this peer hosts"),
+        (
+            "/agent new ",
+            "create a Living Agent (see docs for k=v fields)",
+        ),
+        (
+            "/agent set ",
+            "edit an agent field; takes effect next message",
+        ),
+        ("/agent delete ", "unregister a Living Agent (DB preserved)"),
+        ("/agent share ", "generate a share ticket for an agent's DB"),
+        (
+            "/agent import ",
+            "request access to an agent DB via ticket [admin|write|read]",
+        ),
+        (
+            "/agent invite ",
+            "preseed another peer's pubkey (admin|write|read)",
+        ),
+        ("/agent revoke-peer ", "revoke a co-owner's access"),
+        ("/pubkey", "show this peer's default pubkey"),
+        ("# Memory banks", ""),
+        ("/memory list", "list memory banks this peer hosts"),
+        ("/memory new ", "create a new bank on this peer"),
+        ("/memory delete ", "unregister a bank (DB preserved)"),
+        (
+            "/memory grant ",
+            "grant an agent access to a bank (read|write)",
+        ),
+        ("/memory revoke ", "revoke an agent's access"),
+        ("/memory share ", "generate a share ticket for a bank's DB"),
+        (
+            "/memory import ",
+            "request access to a bank via ticket [admin|write|read]",
+        ),
+        ("# Sharing queue", ""),
+        ("/sharing", "list databases this peer is sharing"),
+        ("/sharing requests", "list pending bootstrap requests"),
+        ("/sharing approve ", "approve a request by id"),
+        ("/sharing reject ", "reject a request by id"),
+        ("/unshare", "stop sharing the current session"),
+        ("/agent unshare ", "stop sharing an agent DB"),
+        ("/memory unshare ", "stop sharing a memory bank"),
+        ("# Heartbeat", ""),
+        ("/heartbeat list", "list heartbeat rules on this session"),
+        ("/heartbeat add ", "<id> <cron 6 fields> <agent> <task...>"),
+        ("/heartbeat remove ", "remove rule by id"),
+        ("# LLM config", ""),
+        ("/model ", "show or set the model for this session"),
+        ("/role ", "show, select, or define a role"),
+        ("/backend ", "add a custom backend (<name> <url> <key>)"),
+        ("/backends", "list known backends and models"),
+        ("# TUI", ""),
+        ("/clear", "clear display (entries still in DB)"),
+        ("/raw", "dump raw entry data for debugging"),
+        ("/debug", "toggle debug mode (Ctrl+D)"),
+        ("/help", "this help"),
+        ("/quit", "exit"),
+    ]
+}
+
+/// True when accepting `tpl` would extend `input` — i.e. `input` is a strict
+/// (case-insensitive) prefix of `tpl`, so there's more command left to insert.
+/// When this is false the command is either fully typed or the user is typing
+/// its arguments, so Tab/Enter should leave the text alone.
+fn command_extends(input: &str, tpl: &str) -> bool {
+    let (il, tl) = (input.to_lowercase(), tpl.to_lowercase());
+    tl.starts_with(&il) && tl.len() > il.len()
+}
+
+/// Commands to show in the popup for the current `input`. Two modes, so the
+/// command + description stays visible while you type:
+///
+/// * **completion** — every catalog template that `input` is a prefix of
+///   (you're still picking / extending a command). Returned as-is.
+/// * **reference** — if nothing is left to complete, the single most-specific
+///   template that is a prefix of `input` (you've typed the command and are
+///   now filling in its arguments). Keeps that one row visible.
+///
+/// Empty only when `input` isn't a slash command, or matches nothing at all.
+pub(super) fn matching_commands(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    let il = input.to_lowercase();
+    let catalog = command_catalog();
+
+    let completions: Vec<(&'static str, &'static str)> = catalog
+        .iter()
+        .filter(|(tpl, _)| !tpl.starts_with('#'))
+        .filter(|(tpl, _)| tpl.to_lowercase().starts_with(&il))
+        .copied()
+        .collect();
+    if !completions.is_empty() {
+        return completions;
+    }
+
+    // No completion — keep the command being argument-filled on screen by
+    // showing the longest template that is a prefix of the input.
+    catalog
+        .iter()
+        .filter(|(tpl, _)| !tpl.starts_with('#'))
+        .filter(|(tpl, _)| il.starts_with(&tpl.to_lowercase()))
+        .max_by_key(|(tpl, _)| tpl.len())
+        .map(|m| vec![*m])
+        .unwrap_or_default()
+}
+
+/// Recompute `app.completion` from the current input. Opens the popup when the
+/// input starts with `/` and at least one catalog command prefix-matches
+/// (case-insensitively), unless the user dismissed it for this input. Selection
+/// is preserved across recomputes when the highlighted template still matches,
+/// otherwise it resets to the top.
+pub(super) fn recompute_completion(app: &mut App) {
+    if app.completion_dismissed {
+        app.completion = None;
+        return;
+    }
+    let matches = matching_commands(app.input.as_str());
+    if matches.is_empty() {
+        app.completion = None;
+        return;
+    }
+    let prev = app
+        .completion
+        .as_ref()
+        .and_then(|c| c.matches.get(c.selected).map(|(t, _)| *t));
+    let selected = prev
+        .and_then(|t| matches.iter().position(|(m, _)| *m == t))
+        .unwrap_or(0);
+    app.completion = Some(Completion { matches, selected });
+}
+
+/// Insert the highlighted completion row into the input box (cursor to end)
+/// and recompute — so accepting `/agent ` immediately reveals its subcommands.
+/// No-op when the selected row wouldn't extend the input (it's a reference row
+/// for a command whose arguments the user is already typing), so Tab there
+/// doesn't wipe what they've written.
+fn accept_completion(app: &mut App) {
+    let Some(tpl) = app
+        .completion
+        .as_ref()
+        .and_then(|c| c.matches.get(c.selected).map(|(t, _)| *t))
+    else {
+        return;
+    };
+    if !command_extends(&app.input, tpl) {
+        return;
+    }
+    app.input = tpl.to_string();
+    app.cursor = app.input.len();
+    recompute_completion(app);
+}
 
 /// Outcome of routing a key through the active overlay.
 pub(super) enum OverlayKey {
@@ -165,6 +346,17 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             app.input = template.to_string();
             app.cursor = app.input.len();
             app.overlay = None;
+            app.completion_dismissed = false;
+            recompute_completion(app);
+        }
+        ClickTarget::CompletionSelect(i) => {
+            let n = app.completion.as_ref().map_or(0, |c| c.matches.len());
+            if i < n {
+                if let Some(c) = app.completion.as_mut() {
+                    c.selected = i;
+                }
+                accept_completion(app);
+            }
         }
         ClickTarget::ApprovalApprove => apply_approval(app, ApprovalDecision::Approve),
         ClickTarget::ApprovalDeny => apply_approval(app, ApprovalDecision::Deny),
@@ -210,15 +402,50 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
 
     match key.code {
         KeyCode::Enter => {
+            // With the popup open, Enter completes the highlighted command
+            // while there's still more of it to type. Once it's fully typed
+            // (or you're filling in arguments) it falls through and submits,
+            // so a complete command still runs on one Enter.
+            if let Some(c) = app.completion.as_ref()
+                && let Some((tpl, _)) = c.matches.get(c.selected)
+                && command_extends(&app.input, tpl)
+            {
+                accept_completion(app);
+                return None;
+            }
             if !app.input.is_empty() {
                 let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
+                app.completion = None;
+                app.completion_dismissed = false;
                 return parse_chat_line(app, &text);
+            }
+        }
+        KeyCode::Tab => {
+            // Open the popup if it isn't already (user typed `/agent ` then
+            // paused), then insert the highlighted command. Selection is
+            // moved with the arrow keys.
+            if app.completion.is_none() {
+                recompute_completion(app);
+            }
+            if app.completion.is_some() {
+                accept_completion(app);
+            }
+        }
+        KeyCode::BackTab => {
+            // Shift+Tab moves the selection up, mirroring Up.
+            if let Some(c) = app.completion.as_mut() {
+                let n = c.matches.len();
+                if n > 0 {
+                    c.selected = (c.selected + n - 1) % n;
+                }
             }
         }
         KeyCode::Char(c) => {
             app.input.insert(app.cursor, c);
             app.cursor += c.len_utf8();
+            app.completion_dismissed = false;
+            recompute_completion(app);
         }
         KeyCode::Backspace => {
             if app.cursor > 0 {
@@ -229,6 +456,8 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
                     .unwrap_or(0);
                 app.input.drain(prev..app.cursor);
                 app.cursor = prev;
+                app.completion_dismissed = false;
+                recompute_completion(app);
             }
         }
         KeyCode::Left => {
@@ -256,12 +485,28 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
             app.cursor = app.input.len();
         }
         KeyCode::Up => {
-            let off = &mut app.active_mut().scroll_offset;
-            *off = off.saturating_add(3);
+            // When the completion popup is open, arrows move the selection;
+            // otherwise they scroll the chat history as before.
+            if let Some(c) = app.completion.as_mut() {
+                let n = c.matches.len();
+                if n > 0 {
+                    c.selected = (c.selected + n - 1) % n;
+                }
+            } else {
+                let off = &mut app.active_mut().scroll_offset;
+                *off = off.saturating_add(3);
+            }
         }
         KeyCode::Down => {
-            let off = &mut app.active_mut().scroll_offset;
-            *off = off.saturating_sub(3);
+            if let Some(c) = app.completion.as_mut() {
+                let n = c.matches.len();
+                if n > 0 {
+                    c.selected = (c.selected + 1) % n;
+                }
+            } else {
+                let off = &mut app.active_mut().scroll_offset;
+                *off = off.saturating_sub(3);
+            }
         }
         KeyCode::PageUp => {
             let off = &mut app.active_mut().scroll_offset;
@@ -272,7 +517,14 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
             *off = off.saturating_sub(20);
         }
         KeyCode::Esc => {
-            app.should_quit = true;
+            // Esc first dismisses the completion popup (keeping the typed
+            // text); only a second Esc with no popup quits the TUI.
+            if app.completion.is_some() {
+                app.completion = None;
+                app.completion_dismissed = true;
+            } else {
+                app.should_quit = true;
+            }
         }
         KeyCode::F(1) => {
             app.overlay = Some(Overlay::Help { scroll: 0 });
@@ -867,5 +1119,95 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_catalog, command_extends, matching_commands};
+    use std::collections::HashSet;
+
+    #[test]
+    fn catalog_templates_are_well_formed() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (tpl, desc) in command_catalog() {
+            if let Some(h) = tpl.strip_prefix('#') {
+                assert!(!h.trim().is_empty(), "empty section header");
+                assert!(desc.is_empty(), "header {tpl:?} should have no description");
+                continue;
+            }
+            assert!(tpl.starts_with('/'), "command {tpl:?} must start with '/'");
+            assert!(!desc.is_empty(), "command {tpl:?} missing description");
+            assert!(
+                tpl.trim() == tpl || tpl.ends_with(' '),
+                "bad spacing in {tpl:?}"
+            );
+            assert!(seen.insert(tpl), "duplicate catalog template {tpl:?}");
+        }
+    }
+
+    #[test]
+    fn matching_requires_slash_prefix() {
+        assert!(matching_commands("hello").is_empty());
+        assert!(matching_commands("").is_empty());
+    }
+
+    #[test]
+    fn matching_is_prefix_and_case_insensitive() {
+        let m = matching_commands("/ag");
+        assert!(m.iter().any(|(t, _)| *t == "/agents"));
+        assert!(m.iter().any(|(t, _)| *t == "/agent add "));
+        assert!(m.iter().all(|(t, _)| t.to_lowercase().starts_with("/ag")));
+        // No headers ever leak into completion results.
+        assert!(m.iter().all(|(t, _)| !t.starts_with('#')));
+        // Case-insensitive against the catalog.
+        assert!(!matching_commands("/AGENTS").is_empty());
+    }
+
+    #[test]
+    fn matching_narrows_to_subcommands() {
+        let m = matching_commands("/agent ");
+        assert!(m.iter().any(|(t, _)| *t == "/agent add "));
+        assert!(m.iter().any(|(t, _)| *t == "/agent remove "));
+        // "/agents" is not a "/agent " subcommand.
+        assert!(m.iter().all(|(t, _)| *t != "/agents"));
+    }
+
+    #[test]
+    fn fully_typed_command_stays_visible() {
+        // A complete command keeps its row + description on screen.
+        let m = matching_commands("/quit");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, "/quit");
+        // A shorter prefix still lists it for completion.
+        assert!(matching_commands("/q").iter().any(|(t, _)| *t == "/quit"));
+    }
+
+    #[test]
+    fn command_stays_visible_while_typing_arguments() {
+        // Past the template, typing an argument: the command + its
+        // description stays as a single reference row.
+        let m = matching_commands("/agent add my-bot");
+        assert_eq!(
+            m.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            ["/agent add "]
+        );
+
+        // Most-specific template wins over a shorter prefix.
+        let m = matching_commands("/sharing approve abc123");
+        assert_eq!(
+            m.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            ["/sharing approve "]
+        );
+    }
+
+    #[test]
+    fn extends_only_while_command_incomplete() {
+        // Strict prefix → Tab/Enter should complete it.
+        assert!(command_extends("/q", "/quit"));
+        assert!(command_extends("/agent a", "/agent add "));
+        // Fully typed or typing args → leave the text alone.
+        assert!(!command_extends("/quit", "/quit"));
+        assert!(!command_extends("/agent add foo", "/agent add "));
     }
 }

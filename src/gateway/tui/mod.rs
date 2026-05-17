@@ -87,10 +87,23 @@ pub(super) enum Overlay {
     },
 }
 
+/// Inline slash-command completion popup state. Present only while the input
+/// starts with `/` and at least one catalog command prefix-matches it (and the
+/// user hasn't dismissed it with Esc for the current input).
+pub(super) struct Completion {
+    /// `(template, description)` pairs from the command catalog whose template
+    /// prefix-matches the current input, case-insensitively.
+    pub matches: Vec<(&'static str, &'static str)>,
+    /// Index into `matches` of the highlighted row.
+    pub selected: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ClickTarget {
     OverlayDismiss,
     HelpCommand(&'static str),
+    /// Accept completion row `i` into the input box.
+    CompletionSelect(usize),
     ApprovalApprove,
     ApprovalDeny,
     ApprovalApproveAll,
@@ -150,6 +163,12 @@ pub(super) struct App {
     pub(super) click_regions: Vec<ClickRegion>,
     pub(super) input: String,
     pub(super) cursor: usize,
+    /// Active slash-command completion popup, if any. Recomputed on every
+    /// input edit (see `input::recompute_completion`).
+    pub(super) completion: Option<Completion>,
+    /// Set when the user dismisses the popup with Esc; suppresses re-opening
+    /// until the input is edited again.
+    pub(super) completion_dismissed: bool,
     pub(super) tabs: Vec<Tab>,
     pub(super) active_tab: usize,
     pub(super) agent_names: HashSet<String>,
@@ -176,6 +195,8 @@ impl App {
             click_regions: Vec::new(),
             input: String::new(),
             cursor: 0,
+            completion: None,
+            completion_dismissed: false,
             tabs: vec![initial_tab],
             active_tab: 0,
             agent_names,

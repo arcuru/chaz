@@ -86,91 +86,11 @@ fn ui_overlay(f: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
-/// Grouped help catalog. Each (heading, Option<(command_template, description)>)
-/// — a `None` cmd means a section header, `Some` is a clickable command row
-/// that inserts the template into the input box on click.
+/// Grouped help catalog — the shared command catalog (see
+/// `input::command_catalog`). A `#`-prefixed entry is a section header; every
+/// other row is a clickable command that inserts its template on click.
 fn help_entries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("# Session", ""),
-        ("/sessions", "open session picker"),
-        ("/new", "create a new session"),
-        ("/join ", "switch to session by name or DB ID"),
-        ("/name ", "set (or clear) a session alias"),
-        ("/rename ", "alias for /name"),
-        ("/info", "show current session info"),
-        ("/costs", "aggregate LLM usage + cost across all sessions"),
-        ("/channels", "list Matrix rooms attached to this session"),
-        ("/share", "generate shareable ticket for current session"),
-        ("/sync ", "sync a remote session via ticket"),
-        ("/compact", "summarize and compact conversation history"),
-        ("/print", "dump the transcript"),
-        ("# Living Agents", ""),
-        ("/agents", "list agents attached to this session"),
-        ("/agent add ", "attach an agent (display name or DB ID)"),
-        ("/agent remove ", "detach an agent"),
-        ("/agent host ", "set (or clear) the session's host agent"),
-        ("/agent hosted", "list every Living Agent this peer hosts"),
-        (
-            "/agent new ",
-            "create a Living Agent (see docs for k=v fields)",
-        ),
-        (
-            "/agent set ",
-            "edit an agent field; takes effect next message",
-        ),
-        ("/agent delete ", "unregister a Living Agent (DB preserved)"),
-        ("/agent share ", "generate a share ticket for an agent's DB"),
-        (
-            "/agent import ",
-            "request access to an agent DB via ticket [admin|write|read]",
-        ),
-        (
-            "/agent invite ",
-            "preseed another peer's pubkey (admin|write|read)",
-        ),
-        ("/agent revoke-peer ", "revoke a co-owner's access"),
-        ("/pubkey", "show this peer's default pubkey"),
-        ("# Memory banks", ""),
-        ("/memory list", "list memory banks this peer hosts"),
-        ("/memory new ", "create a new bank on this peer"),
-        ("/memory delete ", "unregister a bank (DB preserved)"),
-        (
-            "/memory grant ",
-            "grant an agent access to a bank (read|write)",
-        ),
-        ("/memory revoke ", "revoke an agent's access"),
-        ("/memory share ", "generate a share ticket for a bank's DB"),
-        (
-            "/memory import ",
-            "request access to a bank via ticket [admin|write|read]",
-        ),
-        ("# Sharing queue", ""),
-        ("/sharing", "list databases this peer is sharing"),
-        ("/sharing requests", "list pending bootstrap requests"),
-        ("/sharing approve ", "approve a request by id"),
-        ("/sharing reject ", "reject a request by id"),
-        ("/unshare", "stop sharing the current session"),
-        ("/agent unshare ", "stop sharing an agent DB"),
-        ("/memory unshare ", "stop sharing a memory bank"),
-        ("# Heartbeat", ""),
-        ("/heartbeat list", "list heartbeat rules on this session"),
-        (
-            "/heartbeat add ",
-            "add <id> <cron 6 fields> <agent> <task...>",
-        ),
-        ("/heartbeat remove ", "remove rule by id"),
-        ("# LLM config", ""),
-        ("/model ", "show or set the model for this session"),
-        ("/role ", "show, select, or define a role"),
-        ("/backend ", "add a custom backend (<name> <url> <key>)"),
-        ("/backends", "list known backends and models"),
-        ("# TUI", ""),
-        ("/clear", "clear display (entries still in DB)"),
-        ("/raw", "dump raw entry data for debugging"),
-        ("/debug", "toggle debug mode (Ctrl+D)"),
-        ("/help", "this help"),
-        ("/quit", "exit"),
-    ]
+    super::input::command_catalog()
 }
 
 fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
@@ -536,9 +456,113 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     let input = Paragraph::new(app.input.as_str()).block(Block::bordered().title(" > "));
     f.render_widget(input, chunks[4]);
 
+    // Completion popup floats just above the input box, over the bottom of
+    // the transcript. Drawn after the transcript so it sits on top.
+    render_completion_popup(f, app, chunks[1], chunks[4]);
+
     let cursor_x = chunks[4].x + app.cursor as u16 + 1;
     let cursor_y = chunks[4].y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
+}
+
+/// Slash-command completion dropdown. Anchored to the bottom-left of the input
+/// box (`input_area`), growing upward, clamped to the transcript region
+/// (`msg_area`). Renders nothing when no completion is active. Records a click
+/// region per visible row so a click accepts that command.
+fn render_completion_popup(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    msg_area: Rect,
+    input_area: Rect,
+) {
+    // Snapshot the cheap-to-copy completion state so we don't hold a borrow
+    // of `app.completion` while pushing into `app.click_regions` below
+    // (the `&'static str` pairs are just pointers — clone is trivial).
+    let (matches, selected): (Vec<(&'static str, &'static str)>, usize) = match &app.completion {
+        Some(c) if !c.matches.is_empty() => (c.matches.clone(), c.selected),
+        _ => return,
+    };
+
+    const MAX_ROWS: usize = 8;
+    let total = matches.len();
+    let visible = total.min(MAX_ROWS);
+
+    // Scroll the window so the selected row stays in view.
+    let start = if selected >= visible {
+        selected - visible + 1
+    } else {
+        0
+    };
+
+    // Box height = rows + top/bottom border. Clamp to available space above
+    // the input box so it never overruns the transcript.
+    let max_h = input_area.y.saturating_sub(msg_area.y);
+    let h = ((visible as u16) + 2).min(max_h.max(3));
+    let inner_rows = h.saturating_sub(2) as usize;
+    let w = input_area.width;
+    let x = input_area.x;
+    let y = input_area.y.saturating_sub(h);
+
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" commands — ↑↓ select · Tab insert · Esc dismiss ")
+        .title_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let cmd_w = matches
+        .iter()
+        .map(|(c, _)| c.len())
+        .max()
+        .unwrap_or(0)
+        .min(28);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (cmd, desc)) in matches.iter().enumerate().skip(start).take(inner_rows) {
+        let is_sel = i == selected;
+        let marker = if is_sel { "▸ " } else { "  " };
+        let cmd_style = if is_sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let desc_style = if is_sel {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, cmd_style),
+            Span::styled(format!("{cmd:<cmd_w$}"), cmd_style),
+            Span::raw("  "),
+            Span::styled(*desc, desc_style),
+        ]));
+
+        // Click region for this visible row (absolute terminal coords).
+        let row_y = inner.y + (i - start) as u16;
+        if row_y < inner.y + inner.height {
+            app.click_regions.push(ClickRegion {
+                x: inner.x,
+                y: row_y,
+                w: inner.width,
+                h: 1,
+                target: ClickTarget::CompletionSelect(i),
+            });
+        }
+    }
+
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
 }
 
 /// Render the tab bar: one line across the top showing each tab's title,
