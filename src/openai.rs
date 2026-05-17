@@ -54,11 +54,91 @@ struct UsageOpts {
     include: bool,
 }
 
+/// Anthropic prompt-cache breakpoint marker. On the OpenRouter
+/// OpenAI-compatible endpoint this rides inside a content part (or on a tool
+/// object) and OpenRouter forwards it to Anthropic. `ttl` is omitted for the
+/// default 5-minute cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
+}
+
+impl CacheControl {
+    fn ephemeral() -> Self {
+        CacheControl {
+            kind: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+}
+
+/// One content part in the structured (array) message form. We only ever
+/// emit `text` parts; the optional `cache_control` is what carries a cache
+/// breakpoint on the OpenRouter/Anthropic path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// A message's content. Serializes as a bare JSON string by default; only the
+/// specific message that carries a cache breakpoint is promoted to the parts
+/// array form. Keeping everything else a bare string preserves prefix
+/// stability (the cached bytes must be byte-identical request to request) and
+/// avoids providers mirroring a content-block structure back at us.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Flatten back to plain text. Responses always come back as `Text`;
+    /// `Parts` is only ever something we constructed, so concatenating its
+    /// text parts is a lossless inverse there.
+    fn into_text(self) -> String {
+        match self {
+            MessageContent::Text(s) => s,
+            MessageContent::Parts(parts) => parts
+                .into_iter()
+                .map(|p| p.text)
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Attach a cache breakpoint to this content's last text part,
+    /// promoting a bare string to the single-part array form as needed.
+    fn set_cache_control(&mut self, cc: CacheControl) {
+        match self {
+            MessageContent::Text(s) => {
+                *self = MessageContent::Parts(vec![ContentPart {
+                    kind: "text".to_string(),
+                    text: std::mem::take(s),
+                    cache_control: Some(cc),
+                }]);
+            }
+            MessageContent::Parts(parts) => {
+                if let Some(last_text) = parts.iter_mut().rev().find(|p| p.kind == "text") {
+                    last_text.cache_control = Some(cc);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChatToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +171,11 @@ struct ChatTool {
     #[serde(rename = "type")]
     kind: &'static str,
     function: ChatToolFunction,
+    /// Cache breakpoint, set only on the last tool when caching applies.
+    /// Sits at the tool-object top level (sibling of `function`) — the
+    /// OpenRouter/Anthropic convention, NOT inside `function`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +241,11 @@ struct Usage {
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+    /// OpenRouter-only: tokens written into the cache this turn. Its presence
+    /// also signals OpenRouter's combined-report quirk where `cached_tokens`
+    /// is `(previous_reads + current_writes)` rather than reads alone.
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -170,11 +260,25 @@ impl Usage {
     /// transparently handle both OpenAI-style nested details and
     /// Anthropic-style flat fields.
     fn into_token_usage(self) -> TokenUsage {
-        let cached_tokens = self
+        let reported_cached = self
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens)
             .or(self.cache_read_input_tokens);
+        let cache_write = self
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cache_write_tokens);
+        // OpenRouter quirk: when it reports a nested `cache_write_tokens`,
+        // `cached_tokens` is (previous_reads + current_writes), so back the
+        // writes out to recover the true cache-read count. Native Anthropic
+        // reports reads/creation as already-separate flat fields, which this
+        // leaves untouched (no nested cache_write_tokens present there).
+        let cached_tokens = match (reported_cached, cache_write) {
+            (Some(c), Some(w)) => Some(c.saturating_sub(w)),
+            _ => reported_cached,
+        };
+        let cache_creation_tokens = self.cache_creation_input_tokens.or(cache_write);
         let reasoning_tokens = self
             .completion_tokens_details
             .as_ref()
@@ -184,7 +288,7 @@ impl Usage {
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
             cached_tokens,
-            cache_creation_tokens: self.cache_creation_input_tokens,
+            cache_creation_tokens,
             reasoning_tokens,
             cost_usd: self.cost,
         }
@@ -260,8 +364,14 @@ impl OpenAI {
     ) -> Result<LLMResponse, LlmError> {
         let client = self.build_client()?;
 
-        let openai_messages = convert_runtime_messages(messages);
-        let openai_tools = convert_tool_definitions(tools);
+        let mut openai_messages = convert_runtime_messages(messages);
+        let mut openai_tools = convert_tool_definitions(tools);
+        apply_anthropic_cache_control(
+            &mut openai_messages,
+            &mut openai_tools,
+            model,
+            &self.backend,
+        );
 
         let request = ChatRequest {
             model,
@@ -312,6 +422,9 @@ impl OpenAI {
             extra,
             ..
         } = choice.message;
+        // Responses come back as a bare string; flatten to Option<String>
+        // so the rest of the pipeline is unchanged.
+        let content = content.map(MessageContent::into_text);
 
         tracing::debug!(
             "LLM response: content={:?} tool_calls={:?} extra_fields={:?} finish_reason={:?} usage={:?}",
@@ -388,7 +501,9 @@ impl LLMBackend for OpenAI {
     async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
         let client = self.build_client()?;
         let model_prefix = self.backend.name.clone().unwrap_or("openai".to_string());
-        let (model, messages) = convert_chat_context(context, &model_prefix, &self.default_model());
+        let (model, mut messages) =
+            convert_chat_context(context, &model_prefix, &self.default_model());
+        apply_anthropic_cache_control(&mut messages, &mut [], &model, &self.backend);
 
         tracing::debug!(
             model = %model,
@@ -422,6 +537,7 @@ impl LLMBackend for OpenAI {
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
+            .map(MessageContent::into_text)
             .unwrap_or_else(|| "Error retrieving response".to_string()))
     }
 }
@@ -433,21 +549,21 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
         .map(|msg| match msg {
             RuntimeMessage::System(content) => ChatMessage {
                 role: "system".to_string(),
-                content: Some(content.clone()),
+                content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
                 extra: Map::new(),
             },
             RuntimeMessage::User(content) => ChatMessage {
                 role: "user".to_string(),
-                content: Some(content.clone()),
+                content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
                 extra: Map::new(),
             },
             RuntimeMessage::Assistant(content) => ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(content.clone()),
+                content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: None,
                 extra: Map::new(),
@@ -458,7 +574,7 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                 provider_extra,
             } => ChatMessage {
                 role: "assistant".to_string(),
-                content: content.clone(),
+                content: content.clone().map(MessageContent::Text),
                 tool_calls: Some(
                     tool_calls
                         .iter()
@@ -477,7 +593,7 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
             },
             RuntimeMessage::ToolResult { call_id, content } => ChatMessage {
                 role: "tool".to_string(),
-                content: Some(content.clone()),
+                content: Some(MessageContent::Text(content.clone())),
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
                 extra: Map::new(),
@@ -497,8 +613,83 @@ fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<ChatTool> {
                 description: td.description.clone(),
                 parameters: td.parameters.clone(),
             },
+            cache_control: None,
         })
         .collect()
+}
+
+/// Whether inline Anthropic `cache_control` markers should be emitted: only
+/// for an `anthropic/…` model on OpenRouter. Every other provider/model on an
+/// OpenAI-compatible endpoint caches server-side automatically (and may 400 on
+/// unexpected inline markers), so we send nothing and just read usage back.
+fn anthropic_cache_control(backend: &Backend, model: &str) -> Option<CacheControl> {
+    let is_openrouter = backend
+        .api_base
+        .as_deref()
+        .is_some_and(|b| b.contains("openrouter.ai"))
+        || backend
+            .name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case("openrouter"));
+    if is_openrouter && model.starts_with("anthropic/") {
+        Some(CacheControl::ephemeral())
+    } else {
+        None
+    }
+}
+
+/// Stamp Anthropic prompt-cache breakpoints onto the assembled request.
+///
+/// Three breakpoints — last tool → system → latest user message — allocated
+/// in that order (cache-invalidation order: the most stable region is covered
+/// first) under a hard cap of 4 (Anthropic rejects requests with more). No-op
+/// unless [`anthropic_cache_control`] says caching applies. This is the single
+/// place the breakpoint policy lives; the `cache_control` struct fields are
+/// inert serialization slots it writes into.
+fn apply_anthropic_cache_control(
+    messages: &mut [ChatMessage],
+    tools: &mut [ChatTool],
+    model: &str,
+    backend: &Backend,
+) {
+    let Some(cc) = anthropic_cache_control(backend, model) else {
+        return;
+    };
+    let mut remaining: u8 = 4;
+    let next = |remaining: &mut u8| -> Option<CacheControl> {
+        if *remaining == 0 {
+            return None;
+        }
+        *remaining -= 1;
+        Some(cc.clone())
+    };
+
+    // 1. End of the tool-schema block.
+    if let Some(last_tool) = tools.last_mut()
+        && let Some(c) = next(&mut remaining)
+    {
+        last_tool.cache_control = Some(c);
+    }
+    // 2. System prompt — head of the stable prefix.
+    if let Some(content) = messages
+        .iter_mut()
+        .find(|m| m.role == "system")
+        .and_then(|m| m.content.as_mut())
+        && let Some(c) = next(&mut remaining)
+    {
+        content.set_cache_control(c);
+    }
+    // 3. Latest user message — the conversation boundary that intra-turn
+    //    tool-call round-trips all share, so it's the best hit point.
+    if let Some(content) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_mut())
+        && let Some(c) = next(&mut remaining)
+    {
+        content.set_cache_control(c);
+    }
 }
 
 /// Convert a ChatContext (legacy, no-tools path) to (model, messages) for a request.
@@ -511,7 +702,7 @@ fn convert_chat_context(
     if let Some(role) = &context.role {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: Some(role.get_prompt()),
+            content: Some(MessageContent::Text(role.get_prompt())),
             tool_calls: None,
             tool_call_id: None,
             extra: Map::new(),
@@ -520,7 +711,7 @@ fn convert_chat_context(
     for message in &context.messages {
         messages.push(ChatMessage {
             role: message.role.as_str().to_string(),
-            content: Some(message.content.clone()),
+            content: Some(MessageContent::Text(message.content.clone())),
             tool_calls: None,
             tool_call_id: None,
             extra: Map::new(),
@@ -549,6 +740,7 @@ mod tests {
             cost: Some(0.0123),
             prompt_tokens_details: Some(PromptTokensDetails {
                 cached_tokens: Some(40),
+                ..Default::default()
             }),
             completion_tokens_details: Some(CompletionTokensDetails {
                 reasoning_tokens: Some(20),
@@ -595,6 +787,7 @@ mod tests {
             cost: None,
             prompt_tokens_details: Some(PromptTokensDetails {
                 cached_tokens: Some(7),
+                ..Default::default()
             }),
             completion_tokens_details: None,
             cache_read_input_tokens: Some(99),
@@ -629,5 +822,163 @@ mod tests {
         .expect("response_id alone is enough to surface metadata");
         assert_eq!(m.model, "openai/gpt-5");
         assert_eq!(m.response_id.as_deref(), Some("gen-abc"));
+    }
+
+    // --- prompt caching ---
+
+    fn openrouter_backend() -> Backend {
+        let mut b = Backend::new(crate::config::BackendType::OpenAICompatible);
+        b.name = Some("openrouter".to_string());
+        b.api_base = Some("https://openrouter.ai/api/v1".to_string());
+        b
+    }
+
+    fn msg(role: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: Some(MessageContent::Text(text.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            extra: Map::new(),
+        }
+    }
+
+    fn tool(name: &str) -> ChatTool {
+        ChatTool {
+            kind: "function",
+            function: ChatToolFunction {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: Value::Null,
+            },
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn cache_control_gating() {
+        let or = openrouter_backend();
+        assert!(anthropic_cache_control(&or, "anthropic/claude-sonnet-4.6").is_some());
+        // Non-Anthropic model on OpenRouter → no inline markers.
+        assert!(anthropic_cache_control(&or, "deepseek/deepseek-v4-flash").is_none());
+        assert!(anthropic_cache_control(&or, "inclusionai/ring-2.6-1t:free").is_none());
+        // Anthropic-named model on a non-OpenRouter backend → no markers.
+        let mut other = Backend::new(crate::config::BackendType::OpenAICompatible);
+        other.name = Some("openai".to_string());
+        other.api_base = Some("https://api.openai.com/v1".to_string());
+        assert!(anthropic_cache_control(&other, "anthropic/claude-sonnet-4.6").is_none());
+    }
+
+    #[test]
+    fn apply_places_three_breakpoints_for_anthropic_on_openrouter() {
+        let mut messages = vec![
+            msg("system", "you are helpful"),
+            msg("user", "first"),
+            msg("assistant", "reply"),
+            msg("user", "latest question"),
+        ];
+        let mut tools = vec![tool("a"), tool("b")];
+        apply_anthropic_cache_control(
+            &mut messages,
+            &mut tools,
+            "anthropic/claude-sonnet-4.6",
+            &openrouter_backend(),
+        );
+
+        // Last tool only, at the tool-object top level (sibling of function).
+        assert!(tools[0].cache_control.is_none());
+        let t = serde_json::to_value(&tools[1]).unwrap();
+        assert_eq!(t["cache_control"]["type"], "ephemeral");
+        assert!(t["function"].get("cache_control").is_none());
+
+        // System promoted to a parts array with the marker.
+        let sys = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(sys["content"][0]["type"], "text");
+        assert_eq!(sys["content"][0]["cache_control"]["type"], "ephemeral");
+
+        // The *latest* user message is marked; the earlier one stays a
+        // bare string.
+        assert_eq!(
+            serde_json::to_value(&messages[1]).unwrap()["content"],
+            Value::String("first".into())
+        );
+        let last_user = serde_json::to_value(&messages[3]).unwrap();
+        assert_eq!(
+            last_user["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        // Assistant left untouched (bare string).
+        assert_eq!(
+            serde_json::to_value(&messages[2]).unwrap()["content"],
+            Value::String("reply".into())
+        );
+    }
+
+    #[test]
+    fn apply_is_noop_when_caching_does_not_apply() {
+        let mut messages = vec![msg("system", "s"), msg("user", "u")];
+        let mut tools = vec![tool("a")];
+        apply_anthropic_cache_control(
+            &mut messages,
+            &mut tools,
+            "deepseek/deepseek-v4-flash",
+            &openrouter_backend(),
+        );
+        assert!(tools[0].cache_control.is_none());
+        // Content stays a bare string — no structural churn.
+        for m in &messages {
+            let v = serde_json::to_value(m).unwrap();
+            assert!(v["content"].is_string());
+        }
+    }
+
+    #[test]
+    fn text_content_serializes_as_bare_string() {
+        let v = serde_json::to_value(msg("user", "hello")).unwrap();
+        assert_eq!(v["content"], Value::String("hello".into()));
+    }
+
+    #[test]
+    fn cached_tokens_back_out_openrouter_cache_write_double_count() {
+        // OpenRouter quirk: cached_tokens = previous_reads + current_writes.
+        let u = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 10,
+            total_tokens: 1010,
+            cost: None,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(90),
+                cache_write_tokens: Some(30),
+            }),
+            completion_tokens_details: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        let t = u.into_token_usage();
+        assert_eq!(t.cached_tokens, Some(60), "writes backed out of reads");
+        assert_eq!(
+            t.cache_creation_tokens,
+            Some(30),
+            "nested cache_write surfaced as creation"
+        );
+    }
+
+    #[test]
+    fn anthropic_flat_cache_fields_unaffected_by_double_count_fix() {
+        // Native Anthropic reports reads/creation already separate and has no
+        // nested cache_write_tokens, so the subtraction must not fire.
+        let u = Usage {
+            prompt_tokens: 300,
+            completion_tokens: 100,
+            total_tokens: 400,
+            cost: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+            cache_read_input_tokens: Some(50),
+            cache_creation_input_tokens: Some(10),
+        };
+        let t = u.into_token_usage();
+        assert_eq!(t.cached_tokens, Some(50));
+        assert_eq!(t.cache_creation_tokens, Some(10));
     }
 }
