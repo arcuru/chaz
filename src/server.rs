@@ -30,7 +30,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore, mpsc};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
@@ -873,6 +873,21 @@ impl Server {
 
             let mut s = session.lock().await;
             match result {
+                Ok(outcome) if outcome.body.trim().is_empty() => {
+                    // Silent turn — the agent acted via tools or chose
+                    // not to speak. Write no Message: keeps the room
+                    // and LLM context uncluttered and doesn't trip the
+                    // multi-agent burst counter. The turn's cost is not
+                    // dropped silently — for autonomous wakes the fire
+                    // path attributes it to the agent's own fire log
+                    // (see agent-owned timers); session usage stays
+                    // Message-only by design.
+                    debug!(
+                        agent = %agent_name,
+                        session = %session_db_id,
+                        "Agent produced no message (silent turn) — no entry written"
+                    );
+                }
                 Ok(outcome) => {
                     s.add_entry(SessionEntry {
                         sender: agent_name,
