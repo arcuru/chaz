@@ -4,8 +4,8 @@ mod compact;
 mod describe;
 mod edit;
 mod file;
-mod heartbeat;
 mod memory;
+mod schedule;
 mod search;
 mod shell;
 mod task;
@@ -18,10 +18,8 @@ pub use compact::Compact;
 pub use describe::DescribeTool;
 pub use edit::EditFile;
 pub use file::{ReadFile, WriteFile};
-pub use heartbeat::{
-    HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp,
-};
 pub use memory::{ListMemoryBanks, Recall, Remember};
+pub use schedule::{ScheduleAdd, ScheduleList, ScheduleModify, ScheduleOnce, ScheduleRemove};
 pub use search::{SearchBackend, WebSearch};
 pub use shell::ShellExec;
 pub use task::SpawnTask;

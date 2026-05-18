@@ -266,7 +266,7 @@ handler's job is just the per-fire work. Auto-disable after
 
 ## Per-session active set
 
-Each session has an *active set* of extensions: a subset of the peer-
+Each session has an _active set_ of extensions: a subset of the peer-
 installed extensions that fire hooks, contribute tools, and dispatch
 commands on this session. Other sessions on the same peer can have
 different active sets.
@@ -338,12 +338,12 @@ graph LR
 hook fire. It reconciles the hub's currently-installed extensions
 against the session's log:
 
-| Latest event for name             | Action                                |
-| --------------------------------- | ------------------------------------- |
-| None (no prior event)             | Write `Activated` (default-include)   |
-| `Activated` with same `ref`       | Skip — no-op                          |
-| `Activated` with different `ref`  | Write `Activated` (version bump)      |
-| `Deactivated`                     | Skip — respect the removal            |
+| Latest event for name            | Action                              |
+| -------------------------------- | ----------------------------------- |
+| None (no prior event)            | Write `Activated` (default-include) |
+| `Activated` with same `ref`      | Skip — no-op                        |
+| `Activated` with different `ref` | Write `Activated` (version bump)    |
+| `Deactivated`                    | Skip — respect the removal          |
 
 The "respect Deactivated" rule is what makes `/extensions remove X`
 survive restarts. Reactivation must be an explicit user action that
@@ -433,40 +433,40 @@ and the same shape works for sandboxed WASM extensions later.
 
 ## Module layout
 
-| Path                                  | Purpose                                  |
-| ------------------------------------- | ---------------------------------------- |
-| `src/extension/mod.rs`                | Framework: trait, hub, `install_all`, persistence |
-| `src/extension/caps.rs`               | Cap traits + `ExtensionCaps` bundle      |
-| `src/extension/caps_inproc.rs`        | In-process impls of host-only caps       |
-| `src/extension/manifest.rs`           | `ExtensionManifest` + validation         |
-| `src/extension/registry.rs`           | `CapRegistry` (per-kind provider map)    |
-| `src/extension/handler.rs`            | Cap-based handler traits + `InstalledExtension` |
-| `src/extension/hook_bridge.rs`        | Adapters bridging cap handlers into legacy fire vecs |
-| `src/extension/hooks.rs`              | Legacy per-kind hook trait definitions   |
-| `src/extensions/mod.rs`               | `all_builtins` — wires built-ins         |
-| `src/extensions/core.rs`              | `shell`, `compact`, `spawn_*`            |
-| `src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`   |
-| `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool` |
-| `src/extensions/web.rs`               | `web_fetch`, `web_search`                |
-| `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`|
-| `src/extensions/heartbeat.rs`         | Heartbeat tools + `/heartbeat` command + routine handler |
-| `src/extensions/scheduler.rs`         | YAML-schedule routine handler            |
-| `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping `/` suffix    |
+| Path                                  | Purpose                                                   |
+| ------------------------------------- | --------------------------------------------------------- |
+| `src/extension/mod.rs`                | Framework: trait, hub, `install_all`, persistence         |
+| `src/extension/caps.rs`               | Cap traits + `ExtensionCaps` bundle                       |
+| `src/extension/caps_inproc.rs`        | In-process impls of host-only caps                        |
+| `src/extension/manifest.rs`           | `ExtensionManifest` + validation                          |
+| `src/extension/registry.rs`           | `CapRegistry` (per-kind provider map)                     |
+| `src/extension/handler.rs`            | Cap-based handler traits + `InstalledExtension`           |
+| `src/extension/hook_bridge.rs`        | Adapters bridging cap handlers into legacy fire vecs      |
+| `src/extension/hooks.rs`              | Legacy per-kind hook trait definitions                    |
+| `src/extensions/mod.rs`               | `all_builtins` — wires built-ins                          |
+| `src/extensions/core.rs`              | `shell`, `compact`, `spawn_*`                             |
+| `src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                    |
+| `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                  |
+| `src/extensions/web.rs`               | `web_fetch`, `web_search`                                 |
+| `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`                 |
+| `src/extensions/heartbeat.rs`         | Heartbeat tools + `/heartbeat` command + routine handler  |
+| `src/extensions/scheduler.rs`         | YAML-schedule routine handler                             |
+| `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping `/` suffix                     |
 | `src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt injection patterns |
 
 ## Built-in extensions
 
-| Extension            | Declared hooks      | Routine handler | What it provides                                    |
-| -------------------- | ------------------- | --------------- | --------------------------------------------------- |
-| `core`               | `Tool`              | —               | `shell`, `compact`, `spawn_agent`, `spawn_task`     |
-| `fs`                 | `Tool`              | —               | `read_file`, `write_file`, `edit_file`              |
-| `system`             | `Tool`              | —               | `get_time`, `calculate`, `describe_tool`            |
-| `web`                | `Tool`              | —               | `web_fetch`, `web_search`                           |
-| `memory`             | `Tool`              | —               | `remember`, `recall`, `list_memory_banks`           |
-| `heartbeat`          | `Tool`, `Command`   | yes             | 5 heartbeat tools + `/heartbeat` command + cron/one-shot directive fires |
-| `scheduler`          | —                   | yes             | YAML `schedules:` translated to per-session Routine rows; fires scheduled Directive entries |
-| `path_normalizer`    | `ToolCall`          | —               | Strips trailing `/` from filesystem-tool path args  |
-| `security_warnings`  | `ToolResult`        | —               | Logs prompt-injection patterns in tool output       |
+| Extension           | Declared hooks    | Routine handler | What it provides                                                                            |
+| ------------------- | ----------------- | --------------- | ------------------------------------------------------------------------------------------- |
+| `core`              | `Tool`            | —               | `shell`, `compact`, `spawn_agent`, `spawn_task`                                             |
+| `fs`                | `Tool`            | —               | `read_file`, `write_file`, `edit_file`                                                      |
+| `system`            | `Tool`            | —               | `get_time`, `calculate`, `describe_tool`                                                    |
+| `web`               | `Tool`            | —               | `web_fetch`, `web_search`                                                                   |
+| `memory`            | `Tool`            | —               | `remember`, `recall`, `list_memory_banks`                                                   |
+| `heartbeat`         | `Tool`, `Command` | yes             | 5 heartbeat tools + `/heartbeat` command + cron/one-shot directive fires                    |
+| `scheduler`         | —                 | yes             | YAML `schedules:` translated to per-session Routine rows; fires scheduled Directive entries |
+| `path_normalizer`   | `ToolCall`        | —               | Strips trailing `/` from filesystem-tool path args                                          |
+| `security_warnings` | `ToolResult`      | —               | Logs prompt-injection patterns in tool output                                               |
 
 All are in the default-active set for new sessions (the
 "default = everything" rule). Users can disable individual extensions
@@ -479,7 +479,7 @@ translated from YAML config.
 1. Create `src/extensions/my_ext.rs` implementing `Extension`.
    - Return your hook kinds from `supported_hooks()`.
    - Build an `ExtensionManifest` from `manifest()` declaring
-     `required_capabilities` (cap traits the extension *must* have to
+     `required_capabilities` (cap traits the extension _must_ have to
      function) and `requested_capabilities` (caps it would like but
      can run without). If you publish a cap impl, fill
      `provides_capabilities` and override `build_providers()`.
@@ -510,7 +510,7 @@ runtime.
   methods return plain data over `CapFuture`, so the same handler
   shape works across a sandbox boundary. No loader exists yet.
 - **Legacy registration helpers** — `ExtensionHub::register_extension`
-  + `on_<kind>` + `register_tool` + `register_command` survive on the
-  hub solely to support the hub's own legacy-path unit tests. Once
-  those tests are ported to `install_all`, the helpers go away along
-  with the trait's no-op `register()` default.
+  - `on_<kind>` + `register_tool` + `register_command` survive on the
+    hub solely to support the hub's own legacy-path unit tests. Once
+    those tests are ported to `install_all`, the helpers go away along
+    with the trait's no-op `register()` default.

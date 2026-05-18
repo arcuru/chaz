@@ -22,6 +22,7 @@ All invocation flows through the session-messaging primitive (see
 [Session Messaging](./session_messaging.md)). The relevant constraints:
 
 - **Loop guard** (`server.rs`, `process_session`):
+
   ```text
   match latest.entry_type {
       Message  if sender is NOT a known agent  => spawn agent task
@@ -29,12 +30,13 @@ All invocation flows through the session-messaging primitive (see
       _                                         => ignore
   }
   ```
+
   Any `Message` authored by a known agent — including the agent's own reply
   and any other agent's — is ignored. This is the hard wall preventing
   agent↔agent loops, and it is exactly what blocks the chat-room model.
 
 - **Single speaker**: `resolve_agent_for_entry` (`session/agents.rs`)
-  returns *one* agent by precedence: explicit override → first `@mention`
+  returns _one_ agent by precedence: explicit override → first `@mention`
   → `host_agent_db_id` → first authorized → legacy `agent_name` → default.
 
 - **Serialized turns**: a per-session `processing` lock means one agent
@@ -127,7 +129,7 @@ sender**. The human-message path keeps its full precedence chain
 
 ### Change 3 — per-burst turn budget (the runaway backstop)
 
-Define a *burst* as the run of consecutive agent-authored `Message`
+Define a _burst_ as the run of consecutive agent-authored `Message`
 entries since the last non-agent `Message` (human/Directive). The budget
 is the maximum burst length; when the trailing run of agent messages
 reaches it, further agent→agent triggers are suppressed (logged, not
@@ -145,7 +147,7 @@ terminates — the budget only resets on a human/Directive entry.
 
 ### Change 4 — the room note (making agents aware of the convention)
 
-The wake mechanism only fires when an agent's *own output* contains
+The wake mechanism only fires when an agent's _own output_ contains
 `@othername` — nothing forces that. Rather than require every persona to
 be hand-edited with the convention, `ContextBuilder` injects a short
 **room note** into the system prompt when (and only when) more than one
@@ -157,14 +159,14 @@ agent is attached:
 > routed to other agents.
 
 The roster is the session's `SessionMeta.agents`, **self excluded**,
-order-preserving, case-insensitively deduped. It is *appended at
-context-build time*, not baked into the `PersonaSnapshot`:
+order-preserving, case-insensitively deduped. It is _appended at
+context-build time_, not baked into the `PersonaSnapshot`:
 
 - **Always current** — membership changes are reflected on the next turn;
   a snapshot would go stale and would corrupt the snapshot's hash
   provenance.
 - **Cache-safe for the common case** — the system prompt is a prompt-cache
-  breakpoint. A *stable* roster yields a byte-identical note every turn,
+  breakpoint. A _stable_ roster yields a byte-identical note every turn,
   so the cache still hits. Only an `/agent add`/`remove` perturbs the
   note, costing a single-turn re-cache of the system segment (the
   tool-schema breakpoint before it still hits). Cross-agent cache
@@ -175,20 +177,20 @@ context-build time*, not baked into the `PersonaSnapshot`:
 
 ## Failure Modes & Mitigations
 
-| Failure                          | Mitigation                                                              |
-| -------------------------------- | ----------------------------------------------------------------------- |
-| Infinite agent↔agent loop        | Burst budget; resets only on human/Directive                            |
-| `@alpha`↔`@beta` ping-pong       | Burst budget (counts the run regardless of which agents)                |
-| Cost blowup                      | Serialized turns (kept) × bounded burst length                          |
-| Self-wake via self-mention       | Resolution excludes `display_name == sender`                            |
-| Stray `@name` in prose           | Mention must resolve to an *attached, authorized* agent                 |
-| Human-path regression            | Human-sender branch of `should_process`/resolution is byte-for-byte unchanged |
+| Failure                     | Mitigation                                                                    |
+| --------------------------- | ----------------------------------------------------------------------------- |
+| Infinite agent↔agent loop  | Burst budget; resets only on human/Directive                                  |
+| `@alpha`↔`@beta` ping-pong | Burst budget (counts the run regardless of which agents)                      |
+| Cost blowup                 | Serialized turns (kept) × bounded burst length                                |
+| Self-wake via self-mention  | Resolution excludes `display_name == sender`                                  |
+| Stray `@name` in prose      | Mention must resolve to an _attached, authorized_ agent                       |
+| Human-path regression       | Human-sender branch of `should_process`/resolution is byte-for-byte unchanged |
 
 ## Open Questions
 
 1. Burst budget default — 6 a reasonable start? Constant vs. `SessionMeta`
    field vs. global config for v1.
-2. Exclude the *immediately previous speaker* from being re-woken (tighter
+2. Exclude the _immediately previous speaker_ from being re-woken (tighter
    ping-pong guard), or rely on the budget alone? Budget-only is simpler;
    leaning that way for v1.
 3. Should an agent opt **in** to being mention-wakeable (a flag on

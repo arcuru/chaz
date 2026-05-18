@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque routine identifier. Caller-provided; the engine treats it
 /// as a string token. [`generate_id`] is the convenience for tools
-/// that don't want to invent a name (`wake_me_up`, etc.).
+/// that don't want to invent a name (`schedule_once`, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RoutineId(pub String);
 
@@ -39,7 +39,7 @@ impl std::fmt::Display for RoutineId {
 /// Helper for callers that don't care about the routine id —
 /// produces a unique-enough `<prefix>-<epoch-millis>` token.
 /// Uniqueness within a scope is the caller's responsibility; chaz's
-/// existing `wake_me_up` already uses the same epoch-suffix pattern.
+/// existing `schedule_once` already uses the same epoch-suffix pattern.
 pub fn generate_id(prefix: &str) -> RoutineId {
     let now = Utc::now().timestamp_millis();
     RoutineId(format!("{prefix}-{now}"))
@@ -155,30 +155,30 @@ pub enum RoutineScope {
     Global,
     Session(String),
     /// Owned by an agent (its DB root id). The routine's authoritative
-    /// row lives in that agent's `timers` store, not a session/peer
-    /// table — see [`crate::agent_db::Timer`]. Persistence flows
+    /// row lives in that agent's `schedules` store, not a session/peer
+    /// table — see [`crate::agent_db::Schedule`]. Persistence flows
     /// through `AgentDb` + `RoutineEngine::reload_agent`, never the
     /// engine's session/global store path.
     Agent(String),
 }
 
-/// Extension name the engine dispatches agent-owned timer fires to.
+/// Extension name the engine dispatches agent-owned schedule fires to.
 /// The handler loads the owning agent and invokes it intrinsically.
-pub const AGENT_TIMER_EXTENSION: &str = "agent_timer";
+pub const AGENT_SCHEDULE_EXTENSION: &str = "agent_schedule";
 
-/// In-engine payload for an agent-owned timer fire. Carries everything
-/// the `agent_timer` routine handler needs to resolve the target,
+/// In-engine payload for an agent-owned schedule fire. Carries everything
+/// the `agent_schedule` routine handler needs to resolve the target,
 /// audit the fire, and invoke the owning agent — without re-reading
 /// the agent DB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentTimerPayload {
+pub struct AgentSchedulePayload {
     pub owner_agent_db_id: String,
-    pub timer_id: String,
+    pub schedule_id: String,
     pub prompt: String,
-    /// `crate::agent_db::TimerTarget`, carried as JSON so this type
+    /// `crate::agent_db::ScheduleTarget`, carried as JSON so this type
     /// doesn't depend on the agent_db module.
     pub target: serde_json::Value,
-    /// One-shots are removed from the owning agent's `timers` store
+    /// One-shots are removed from the owning agent's `schedules` store
     /// after a successful fire (the engine drops the in-memory entry;
     /// the handler must clear the persisted row).
     pub one_shot: bool,

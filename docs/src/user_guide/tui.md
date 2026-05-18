@@ -35,29 +35,29 @@ The TUI has three sections:
 
 ## Commands
 
-| Command                       | Description                                                       |
-| ----------------------------- | ----------------------------------------------------------------- |
-| `/help`, `/?`                 | Show all commands and key bindings                                |
-| `/sessions`, `/s`             | Open session picker                                               |
-| `/new`                        | Create a new session                                              |
-| `/join <id>`                  | Switch to a session by name or eidetica DB ID                     |
-| `/name <alias>`               | Set a human-friendly name for the current session                 |
-| `/name`                       | Clear the session name                                            |
-| `/info`                       | Show current session details (name, DB ID, entry counts)          |
+| Command                       | Description                                                            |
+| ----------------------------- | ---------------------------------------------------------------------- |
+| `/help`, `/?`                 | Show all commands and key bindings                                     |
+| `/sessions`, `/s`             | Open session picker                                                    |
+| `/new`                        | Create a new session                                                   |
+| `/join <id>`                  | Switch to a session by name or eidetica DB ID                          |
+| `/name <alias>`               | Set a human-friendly name for the current session                      |
+| `/name`                       | Clear the session name                                                 |
+| `/info`                       | Show current session details (name, DB ID, entry counts)               |
 | `/costs`                      | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
-| `/share`                      | Generate a shareable ticket URL for the current session           |
-| `/sync <ticket>`              | Sync a remote session via a ticket URL                            |
-| `/channels`                   | List Matrix rooms currently attached to the session               |
-| `/compact`                    | Summarize and compact conversation history                        |
-| `/print`                      | Dump the transcript                                               |
-| `/model [<m>]`                | Show or set the model for the session                             |
-| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                    |
-| `/backend <name> <url> <key>` | Add a custom backend for the session                              |
-| `/backends`                   | List known backends and models                                    |
-| `/clear`                      | Clear the display (entries remain in the database)                |
-| `/raw`                        | Dump all raw entry data (index, timestamp, type, sender, content) |
-| `/debug`                      | Toggle debug mode                                                 |
-| `/quit`, `/q`                 | Exit                                                              |
+| `/share`                      | Generate a shareable ticket URL for the current session                |
+| `/sync <ticket>`              | Sync a remote session via a ticket URL                                 |
+| `/channels`                   | List Matrix rooms currently attached to the session                    |
+| `/compact`                    | Summarize and compact conversation history                             |
+| `/print`                      | Dump the transcript                                                    |
+| `/model [<m>]`                | Show or set the model for the session                                  |
+| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                         |
+| `/backend <name> <url> <key>` | Add a custom backend for the session                                   |
+| `/backends`                   | List known backends and models                                         |
+| `/clear`                      | Clear the display (entries remain in the database)                     |
+| `/raw`                        | Dump all raw entry data (index, timestamp, type, sender, content)      |
+| `/debug`                      | Toggle debug mode                                                      |
+| `/quit`, `/q`                 | Exit                                                                   |
 
 ## Key Bindings
 

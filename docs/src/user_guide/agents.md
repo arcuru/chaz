@@ -186,7 +186,7 @@ Routines are created two ways, both compiling to the same `Routine` rows fired b
 
 ### When rules fire
 
-Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do *not* need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The fire writes the `Directive` and the agent turn runs on the server regardless; a gateway only affects when you *see* the result.
+Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The fire writes the `Directive` and the agent turn runs on the server regardless; a gateway only affects when you _see_ the result.
 
 - **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
@@ -197,11 +197,11 @@ Firing is **server-side and independent of any UI**. A rule fires whenever chaz 
 
 Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
 
-| Command                                                                        | What                                                                                                                       |
-| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| Command                                                                        | What                                                                                                                        |
+| ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | `/heartbeat list` (or bare `/heartbeat`)                                       | List rules on the current session. One-shot rules are rendered with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of the cron. |
-| `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                          |
-| `/heartbeat remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                    |
+| `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                           |
+| `/heartbeat remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                     |
 
 To create a one-shot rule from the TUI, agents call the `wake_me_up` tool. There's no slash-command form yet.
 

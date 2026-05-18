@@ -95,7 +95,7 @@ pub enum CapabilityKind {
     Messenger,
     /// Search / write memory in a named scope.
     Memory,
-    /// Read/write agent-owned state (timers, memory, configuration).
+    /// Read/write agent-owned state (schedules, memory, configuration).
     /// Host-only — the hub scopes each impl to the operator-configured
     /// set of agents before the extension sees it.
     AgentStateAdmin,
@@ -428,7 +428,7 @@ pub trait CommandRegistration: Send + Sync {
 }
 
 /// Narrow capability: access hosted agent DBs for state operations
-/// (timers, memory, configuration). The hub scopes each impl to the
+/// (schedules, memory, configuration). The hub scopes each impl to the
 /// operator-configured set of agents before the extension sees it.
 ///
 /// This is a **guardrail, not a sandbox** — it stops a poorly behaved
@@ -444,10 +444,7 @@ pub trait AgentStateAdmin: Send + Sync {
     /// Open the agent DB identified by `entry`. Must be a `DbEntry`
     /// obtained from `resolve_agent` on the same handle. The impl uses
     /// the peer's held key to open the DB.
-    fn open_agent_db<'a>(
-        &'a self,
-        entry: &'a DbEntry,
-    ) -> CapFuture<'a, AgentDb>;
+    fn open_agent_db<'a>(&'a self, entry: &'a DbEntry) -> CapFuture<'a, AgentDb>;
 }
 
 // =========================================================================
@@ -643,10 +640,7 @@ mod tests {
             ),
             (CapabilityKind::Messenger, "\"messenger\""),
             (CapabilityKind::Memory, "\"memory\""),
-            (
-                CapabilityKind::AgentStateAdmin,
-                "\"agent_state_admin\"",
-            ),
+            (CapabilityKind::AgentStateAdmin, "\"agent_state_admin\""),
         ];
         for (kind, wire) in cases {
             let s = serde_json::to_string(&kind).unwrap();
@@ -740,7 +734,10 @@ mod tests {
         let req = CapabilityRequest::AgentStateAdmin {
             agents: Some(vec!["chaz".into(), "bash".into()]),
         };
-        assert_eq!(req.agents(), Some(&["chaz".to_string(), "bash".to_string()][..]));
+        assert_eq!(
+            req.agents(),
+            Some(&["chaz".to_string(), "bash".to_string()][..])
+        );
 
         let req = CapabilityRequest::AgentStateAdmin {
             agents: Some(vec![]),
@@ -785,10 +782,7 @@ mod tests {
             agents: Some(vec!["chaz".into()]),
         };
         let s = serde_json::to_string(&with_agents).unwrap();
-        assert_eq!(
-            s,
-            r#"{"kind":"agent_state_admin","agents":["chaz"]}"#
-        );
+        assert_eq!(s, r#"{"kind":"agent_state_admin","agents":["chaz"]}"#);
         let round: CapabilityRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(round, with_agents);
     }
@@ -888,10 +882,7 @@ mod tests {
         fn resolve_agent(&self, _name: &str) -> Result<DbEntry, String> {
             Err("not implemented".into())
         }
-        fn open_agent_db<'a>(
-            &'a self,
-            _entry: &'a DbEntry,
-        ) -> CapFuture<'a, AgentDb> {
+        fn open_agent_db<'a>(&'a self, _entry: &'a DbEntry) -> CapFuture<'a, AgentDb> {
             Box::pin(async { Err(anyhow::anyhow!("not implemented")) })
         }
     }

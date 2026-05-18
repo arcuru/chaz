@@ -381,7 +381,7 @@ mod tests {
             "system",
             "web",
             "memory",
-            "heartbeat",
+            "schedule",
             "path_normalizer",
             "security_warnings",
         ] {
@@ -482,15 +482,15 @@ mod tests {
         let f = fixture().await;
         let _ = f.server.active_extensions_for(&f.session_db_id).await;
         dispatch(
-            Command::Extensions(ExtensionsAction::Remove("heartbeat".into())),
+            Command::Extensions(ExtensionsAction::Remove("schedule".into())),
             &ctx(&f),
         )
         .await;
 
-        let out = super::super::dispatch_extension("heartbeat", "list", &ctx(&f)).await;
+        let out = super::super::dispatch_extension("schedule", "list", &ctx(&f)).await;
         match out {
             CommandOutcome::Error(msg) => {
-                assert!(msg.contains("heartbeat"), "msg: {msg}");
+                assert!(msg.contains("schedule"), "msg: {msg}");
                 assert!(
                     msg.contains("not active") && msg.contains("/extensions add"),
                     "msg should point user at /extensions add: {msg}"

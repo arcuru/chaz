@@ -14,7 +14,7 @@
 //! - `agent`   — Living Agents participation + lifecycle (attach/detach/new/delete/import/share/...)
 //!
 //! Heartbeat rules used to live here; they now live in
-//! [`crate::extensions::heartbeat`] as a chaz extension. The cross-session
+//! [`crate::extensions::schedule`] as a chaz extension. The cross-session
 //! sweep helper used by `agent_delete` is in [`crate::heartbeat::sweep_for_agent`].
 
 use crate::backends::BackendManager;

@@ -93,10 +93,7 @@ impl AgentStateAdmin for ScopedAgentStateAdmin {
         Ok(entry)
     }
 
-    fn open_agent_db<'a>(
-        &'a self,
-        entry: &'a DbEntry,
-    ) -> CapFuture<'a, AgentDb> {
+    fn open_agent_db<'a>(&'a self, entry: &'a DbEntry) -> CapFuture<'a, AgentDb> {
         Box::pin(async move {
             // Defense in depth — the entry should have come through
             // `resolve_agent`, but verify the scope anyway.
@@ -108,9 +105,7 @@ impl AgentStateAdmin for ScopedAgentStateAdmin {
                 .open_agent_db(&entry.db_id, Some(&entry.pubkey))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to open agent DB: {e}"))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No key for agent '{}' DB", entry.display_name)
-                })?;
+                .ok_or_else(|| anyhow::anyhow!("No key for agent '{}' DB", entry.display_name))?;
             Ok(agent_db)
         })
     }
@@ -165,11 +160,7 @@ mod tests {
     #[tokio::test]
     async fn scoped_resolve_allows_known_agent() {
         let (registry, index) = fixture(vec!["alpha".into()]).await;
-        let scope = ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            Some(vec!["alpha".into()]),
-        );
+        let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["alpha".into()]));
         let entry = scope.resolve_agent("alpha").unwrap();
         assert_eq!(entry.display_name, "alpha");
     }
@@ -177,11 +168,7 @@ mod tests {
     #[tokio::test]
     async fn scoped_resolve_rejects_unknown_agent() {
         let (registry, index) = fixture(vec!["alpha".into(), "beta".into()]).await;
-        let scope = ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            Some(vec!["alpha".into()]),
-        );
+        let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["alpha".into()]));
         let err = scope.resolve_agent("beta").unwrap_err();
         assert!(
             format!("{err:#}").contains("outside the allowed set"),
@@ -195,11 +182,7 @@ mod tests {
         let gamma_entry = index.find_by_name("gamma").unwrap();
         let gamma_id = gamma_entry.db_id.to_string();
 
-        let scope = ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            Some(vec!["gamma".into()]),
-        );
+        let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["gamma".into()]));
         let entry = scope.resolve_agent(&gamma_id).unwrap();
         assert_eq!(entry.display_name, "gamma");
     }
@@ -227,15 +210,8 @@ mod tests {
         let (registry, index) = fixture(vec!["alpha".into(), "beta".into()]).await;
         let beta_entry = index.find_by_name("beta").unwrap();
 
-        let scope = ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            Some(vec!["alpha".into()]),
-        );
-        let err = scope
-            .open_agent_db(&beta_entry)
-            .await
-            .unwrap_err();
+        let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["alpha".into()]));
+        let err = scope.open_agent_db(&beta_entry).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("outside the allowed set"),
             "got: {err}"
@@ -247,15 +223,8 @@ mod tests {
         let (registry, index) = fixture(vec!["alpha".into()]).await;
         let alpha_entry = index.find_by_name("alpha").unwrap();
 
-        let scope = ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            Some(vec!["alpha".into()]),
-        );
-        let db = scope
-            .open_agent_db(&alpha_entry)
-            .await
-            .unwrap();
+        let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["alpha".into()]));
+        let db = scope.open_agent_db(&alpha_entry).await.unwrap();
         // Verify the DB opened successfully — the id chain matches.
         assert_eq!(db.id(), alpha_entry.db_id);
     }
@@ -271,11 +240,7 @@ mod tests {
     #[tokio::test]
     async fn empty_allowlist_denies_all() {
         let (registry, index) = fixture(vec!["alpha".into()]).await;
-        let scope = ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            Some(vec![]),
-        );
+        let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec![]));
         let err = scope.resolve_agent("alpha").unwrap_err();
         assert!(format!("{err:#}").contains("allowlist is empty"));
     }

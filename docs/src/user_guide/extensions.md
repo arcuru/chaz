@@ -120,8 +120,8 @@ disabled and another with it enabled.
 
 When a session is opened on a peer where the binary supports an
 extension that didn't exist when the session was last touched, that
-new extension is default-activated on the first session_start. When a
-session is opened on a peer where the binary is *missing* an extension
+new extension is default-activated on the first session*start. When a
+session is opened on a peer where the binary is \_missing* an extension
 that the session had been using, the activation event for that
 extension stays in the log but does nothing — chaz can't load code
 it doesn't have. Re-opening the session on a peer that has the

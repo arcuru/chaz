@@ -1275,18 +1275,12 @@ impl ExtensionHub {
         manifest_allowlist: Option<Vec<String>>,
         extension_name: &str,
     ) -> agent_state::ScopedAgentStateAdmin {
-        let registry = self
-            .session_registry
-            .clone()
-            .unwrap_or_else(|| {
-                panic!("AgentStateAdmin cap requires session_registry to be set on the hub")
-            });
-        let index = self
-            .hosted_index
-            .clone()
-            .unwrap_or_else(|| {
-                panic!("AgentStateAdmin cap requires hosted_index to be set on the hub")
-            });
+        let registry = self.session_registry.clone().unwrap_or_else(|| {
+            panic!("AgentStateAdmin cap requires session_registry to be set on the hub")
+        });
+        let index = self.hosted_index.clone().unwrap_or_else(|| {
+            panic!("AgentStateAdmin cap requires hosted_index to be set on the hub")
+        });
 
         let operator_allowlist = self.agent_state_allowlist.get(extension_name);
         let effective = resolve_agent_allowlist(manifest_allowlist, operator_allowlist);

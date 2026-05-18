@@ -358,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
     // takes ownership of the cell and constructs the spawn tools.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
 
-    // Default backend used for timer-fired Fresh sessions and as a
+    // Default backend used for schedule-fired Fresh sessions and as a
     // fallback when a Pinned session has no registered SessionRuntime.
     let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
 
@@ -546,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
             routine::RoutineEngine::new(chaz_peer.clone(), Some(server.extensions().clone()))
                 .await?;
         // Make the engine reachable to the session-storage helpers so
-        // `/heartbeat add|remove`, `wake_me_up`, and `agent_delete`'s
+        // `/schedule add|remove`, `schedule_once`, and `agent_delete`'s
         // sweep resync the live schedule without a restart.
         routine::set_engine(&engine);
         // Pick up every session's routines + ensure the server is
@@ -574,9 +574,9 @@ async fn main() -> anyhow::Result<()> {
                 error!(session = %s.session_db_id, "server.register_session failed: {e}");
             }
         }
-        // Register every hosted agent's own timers (Agent-Owned
-        // Timers). The agent is the unit of ownership; chaz is the
-        // runtime that loads it and fires the callback. Timers persist
+        // Register every hosted agent's own schedules (Agent-Owned
+        // Schedules). The agent is the unit of ownership; chaz is the
+        // runtime that loads it and fires the callback. Schedules persist
         // in the agent's DB, so this picks up whatever synced/created
         // since last boot.
         for entry in server.agent_index().list() {
@@ -587,15 +587,12 @@ async fn main() -> anyhow::Result<()> {
             let db = match opened {
                 Ok(db) => db,
                 Err(e) => {
-                    error!(agent = %entry.display_name, "open agent DB for timers failed: {e}");
+                    error!(agent = %entry.display_name, "open agent DB for schedules failed: {e}");
                     continue;
                 }
             };
             let adb = agent_db::AgentDb::from_database(db);
-            if let Err(e) = engine
-                .register_agent(&entry.db_id.to_string(), &adb)
-                .await
-            {
+            if let Err(e) = engine.register_agent(&entry.db_id.to_string(), &adb).await {
                 error!(agent = %entry.display_name, "engine.register_agent failed: {e}");
             }
         }

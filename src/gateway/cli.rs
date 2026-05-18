@@ -3,7 +3,7 @@
 //!
 //! Session behavior:
 //! - Default: each invocation creates a fresh ephemeral session. Suited to
-//!   one-shot batch and timer use where context accumulation would be
+//!   one-shot batch and schedule use where context accumulation would be
 //!   harmful.
 //! - `--session NAME`: find-or-create a named session and reuse it across
 //!   invocations. Suited to scripted multi-turn workflows.

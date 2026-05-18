@@ -40,11 +40,11 @@ chaz --config config.yaml usage
 
 ### Flags
 
-| Flag                | Effect                                                                                      |
-| ------------------- | ------------------------------------------------------------------------------------------- |
-| `--json`            | Emit the rollup as JSON for machine consumption (same shape as the in-memory `UsageRollup`) |
-| `--gateway <KIND>`  | Only count sessions originating from this gateway. Values: `cli`, `tui`, `matrix`, `spawn`, `other` |
-| `--active-only`     | Skip sessions marked `Closed`                                                                |
+| Flag               | Effect                                                                                              |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| `--json`           | Emit the rollup as JSON for machine consumption (same shape as the in-memory `UsageRollup`)         |
+| `--gateway <KIND>` | Only count sessions originating from this gateway. Values: `cli`, `tui`, `matrix`, `spawn`, `other` |
+| `--active-only`    | Skip sessions marked `Closed`                                                                       |
 
 ### Examples
 

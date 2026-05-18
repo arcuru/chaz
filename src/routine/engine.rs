@@ -8,7 +8,7 @@
 //!
 //! Replaces today's poll-based `HeartbeatRunner` (per-30s tick) and
 //! `Scheduler` (separate cron driver) with one engine handling both
-//! recurring cron rules and one-shot timers, scoped globally
+//! recurring cron rules and one-shot schedules, scoped globally
 //! (`chaz_peer.routines`) or per-session (`session_db.rules`).
 //!
 //! # Phasing
@@ -28,13 +28,13 @@
 //! [[scheduling-primitives]] hint #10.
 
 use super::types::{
-    AGENT_TIMER_EXTENSION, AgentTimerPayload, Routine, RoutineId, RoutineScope, RoutineTarget,
-    Trigger,
+    AGENT_SCHEDULE_EXTENSION, AgentSchedulePayload, Routine, RoutineId, RoutineScope,
+    RoutineTarget, Trigger,
 };
 use crate::agent_db::AgentDb;
 use crate::extension::ExtensionHub;
 use chrono::{DateTime, Utc};
-use cron::Schedule;
+use cron::Schedule as CronSchedule;
 use eidetica::Database;
 use eidetica::store::{DocStore, Table};
 use std::cmp::Reverse;
@@ -244,7 +244,7 @@ impl RoutineEngine {
     /// Idempotently resync one session's routines from its DB into the
     /// in-memory heap: drop every in-memory routine for the session,
     /// then reload the enabled rows currently in `session_db`. This is
-    /// how a `/heartbeat add|remove` or `wake_me_up` takes effect
+    /// how a `/schedule add|remove` or `schedule_once` takes effect
     /// without a process restart — the storage helpers call it after a
     /// committed change. Safe to call repeatedly (no duplicate heap
     /// entries); `last_fired` is peer-local so reloaded cron routines
@@ -258,30 +258,30 @@ impl RoutineEngine {
         self.register_session(session_db_id, session_db).await
     }
 
-    /// Register an agent's timers with the engine. Reads the owning
-    /// agent's `timers` store, converts each enabled [`Timer`] into the
+    /// Register an agent's schedules with the engine. Reads the owning
+    /// agent's `schedules` store, converts each enabled [`Schedule`] into the
     /// engine's in-memory [`Routine`] form (dispatched to the
-    /// `agent_timer` extension), and seeds the heap with
+    /// `agent_schedule` extension), and seeds the heap with
     /// [`RoutineScope::Agent`]. Mirrors [`Self::register_session`] —
     /// persistence stays in the Agent DB; the engine only schedules.
     ///
-    /// [`Timer`]: crate::agent_db::Timer
+    /// [`Schedule`]: crate::agent_db::Schedule
     pub async fn register_agent(
         self: &Arc<Self>,
         agent_db_id: &str,
         agent_db: &AgentDb,
     ) -> anyhow::Result<()> {
-        let timers = agent_db.list_timers().await?;
+        let schedules = agent_db.list_schedules().await?;
         let last_fired = load_last_fired(&self.chaz_peer).await;
         let mut state = self.state.lock().await;
-        for t in timers {
+        for t in schedules {
             if !t.enabled {
                 continue;
             }
-            let routine = match timer_to_routine(agent_db_id, &t) {
+            let routine = match schedule_to_routine(agent_db_id, &t) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(agent = agent_db_id, timer = %t.id, "skipping unconvertible timer: {e}");
+                    warn!(agent = agent_db_id, schedule = %t.id, "skipping unconvertible schedule: {e}");
                     continue;
                 }
             };
@@ -319,9 +319,9 @@ impl RoutineEngine {
         self.notify.notify_one();
     }
 
-    /// Resync one agent's timers from its DB into the heap: drop the
+    /// Resync one agent's schedules from its DB into the heap: drop the
     /// in-memory entries for the agent, then reload the enabled rows.
-    /// This is how a timer add/remove (Stage 5 tool) takes effect
+    /// This is how a schedule add/remove (Stage 5 tool) takes effect
     /// without a restart — same contract as [`Self::reload_session`].
     pub async fn reload_agent(
         self: &Arc<Self>,
@@ -340,13 +340,13 @@ impl RoutineEngine {
         scope: RoutineScope,
         session_db: Option<&Database>,
     ) -> anyhow::Result<()> {
-        // Agent-owned timers are persisted via `AgentDb` and synced
+        // Agent-owned schedules are persisted via `AgentDb` and synced
         // into the heap by `register_agent`/`reload_agent` — never
         // through this engine store path (mirrors how session routines
         // flow via the mod.rs helpers, not `add_routine`).
         if let RoutineScope::Agent(_) = scope {
             anyhow::bail!(
-                "agent-owned timers are managed via AgentDb + RoutineEngine::reload_agent, \
+                "agent-owned schedules are managed via AgentDb + RoutineEngine::reload_agent, \
                  not engine.add_routine"
             );
         }
@@ -408,7 +408,7 @@ impl RoutineEngine {
                 (db, SESSION_ROUTINES_STORE)
             }
             // Agent-owned: the in-memory entry is already gone; the
-            // authoritative `timers` row is deleted via AgentDb by the
+            // authoritative `schedules` row is deleted via AgentDb by the
             // caller (Stage 5 tool / one-shot cleanup), not the engine.
             RoutineScope::Agent(_) => {
                 self.notify.notify_one();
@@ -632,20 +632,20 @@ impl RoutineEngine {
     }
 }
 
-/// Convert an agent-owned [`crate::agent_db::Timer`] into the engine's
+/// Convert an agent-owned [`crate::agent_db::Schedule`] into the engine's
 /// in-memory [`Routine`] form. The routine id is namespaced by the
 /// owning agent so `last_fired` (a peer-local, id-keyed store) can't
 /// collide across agents or with session/global routines. Dispatch is
-/// pinned to the `agent_timer` extension; the payload carries
+/// pinned to the `agent_schedule` extension; the payload carries
 /// everything its handler needs to resolve the target and invoke the
 /// owning agent intrinsically.
-fn timer_to_routine(
+fn schedule_to_routine(
     owner_agent_db_id: &str,
-    t: &crate::agent_db::Timer,
+    t: &crate::agent_db::Schedule,
 ) -> anyhow::Result<Routine> {
-    let payload = AgentTimerPayload {
+    let payload = AgentSchedulePayload {
         owner_agent_db_id: owner_agent_db_id.to_string(),
-        timer_id: t.id.clone(),
+        schedule_id: t.id.clone(),
         prompt: t.prompt.clone(),
         target: serde_json::to_value(&t.target)?,
         one_shot: !t.trigger.is_recurring(),
@@ -655,7 +655,7 @@ fn timer_to_routine(
         name: t.id.clone(),
         trigger: t.trigger.clone(),
         target: RoutineTarget {
-            extension: AGENT_TIMER_EXTENSION.to_string(),
+            extension: AGENT_SCHEDULE_EXTENSION.to_string(),
             payload: serde_json::to_value(payload)?,
         },
         enabled: t.enabled,
@@ -676,7 +676,7 @@ fn timer_to_routine(
 fn next_fire_time(trigger: &Trigger, last: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     match trigger {
         Trigger::Cron { expr } => {
-            let schedule = Schedule::from_str(expr).ok()?;
+            let schedule = CronSchedule::from_str(expr).ok()?;
             match last {
                 Some(anchor) => schedule.after(&anchor).next(),
                 None => schedule.upcoming(Utc).next(),
@@ -1101,49 +1101,53 @@ mod tests {
         assert!(out.ends_with("..."));
     }
 
-    // ---- Agent-owned timers (Stage 2) -----------------------------------
+    // ---- Agent-owned schedules (Stage 2) -----------------------------------
 
     #[test]
-    fn timer_to_routine_namespaces_id_and_carries_payload() {
-        use crate::agent_db::{Timer, TimerTarget};
-        let t = Timer::new(
+    fn schedule_to_routine_namespaces_id_and_carries_payload() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let t = Schedule::new(
             "daily",
             Trigger::Cron {
                 expr: "0 0 9 * * *".into(),
             },
             "do the brief",
-            TimerTarget::Pinned {
+            ScheduleTarget::Pinned {
                 session_db_id: "sha256:sess".into(),
             },
         );
-        let r = timer_to_routine("sha256:owner", &t).unwrap();
+        let r = schedule_to_routine("sha256:owner", &t).unwrap();
         assert_eq!(r.id, RoutineId::new("agent:sha256:owner:daily"));
         assert_eq!(r.name, "daily");
-        assert_eq!(r.target.extension, AGENT_TIMER_EXTENSION);
-        let p: AgentTimerPayload = serde_json::from_value(r.target.payload).unwrap();
+        assert_eq!(r.target.extension, AGENT_SCHEDULE_EXTENSION);
+        let p: AgentSchedulePayload = serde_json::from_value(r.target.payload).unwrap();
         assert_eq!(p.owner_agent_db_id, "sha256:owner");
-        assert_eq!(p.timer_id, "daily");
+        assert_eq!(p.schedule_id, "daily");
         assert_eq!(p.prompt, "do the brief");
         assert!(!p.one_shot, "cron is recurring");
 
-        // One-shot timers carry one_shot = true.
-        let os = Timer::new(
+        // One-shot schedules carry one_shot = true.
+        let os = Schedule::new(
             "wake1",
             Trigger::OneShot {
                 fire_at: Utc::now() + chrono::Duration::hours(1),
             },
             "wake",
-            TimerTarget::Fresh,
+            ScheduleTarget::Fresh,
         );
-        let r = timer_to_routine("o", &os).unwrap();
-        let p: AgentTimerPayload = serde_json::from_value(r.target.payload).unwrap();
+        let r = schedule_to_routine("o", &os).unwrap();
+        let p: AgentSchedulePayload = serde_json::from_value(r.target.payload).unwrap();
         assert!(p.one_shot);
     }
 
     /// Fresh peer + user + one Agent DB; user is returned so eidetica's
     /// Instance isn't dropped while the AgentDb is still in use.
-    async fn agent_fixture() -> (Instance, eidetica::user::User, Database, crate::agent_db::AgentDb)
-    {
+    async fn agent_fixture() -> (
+        Instance,
+        eidetica::user::User,
+        Database,
+        crate::agent_db::AgentDb,
+    ) {
         use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
         let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
         let _ = instance.create_user("t", None).await;
@@ -1168,51 +1172,51 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_seeds_heap_and_skips_disabled() {
-        use crate::agent_db::{Timer, TimerTarget};
+        use crate::agent_db::{Schedule, ScheduleTarget};
         let (_inst, _user, peer, adb) = agent_fixture().await;
         let owner = adb.id().to_string();
 
-        adb.upsert_timer(Timer::new(
+        adb.upsert_schedule(Schedule::new(
             "daily",
             Trigger::Cron {
                 expr: "0 0 9 * * *".into(),
             },
             "brief",
-            TimerTarget::Pinned {
+            ScheduleTarget::Pinned {
                 session_db_id: "sha256:s".into(),
             },
         ))
         .await
         .unwrap();
-        let mut disabled = Timer::new(
+        let mut disabled = Schedule::new(
             "off",
             Trigger::Cron {
                 expr: "0 0 * * * *".into(),
             },
             "noop",
-            TimerTarget::Fresh,
+            ScheduleTarget::Fresh,
         );
         disabled.enabled = false;
-        adb.upsert_timer(disabled).await.unwrap();
+        adb.upsert_schedule(disabled).await.unwrap();
 
         let engine = RoutineEngine::new(peer, None).await.unwrap();
         engine.register_agent(&owner, &adb).await.unwrap();
 
         let listed = engine.list_routines().await;
-        assert_eq!(listed.len(), 1, "disabled timer must be skipped");
+        assert_eq!(listed.len(), 1, "disabled schedule must be skipped");
         let (scope, routine) = &listed[0];
         assert_eq!(*scope, RoutineScope::Agent(owner.clone()));
         assert_eq!(routine.id, RoutineId::new(format!("agent:{owner}:daily")));
 
-        // reload picks up an added timer and drops a removed one.
-        adb.remove_timer("daily").await.unwrap();
-        adb.upsert_timer(Timer::new(
+        // reload picks up an added schedule and drops a removed one.
+        adb.remove_schedule("daily").await.unwrap();
+        adb.upsert_schedule(Schedule::new(
             "nightly",
             Trigger::Cron {
                 expr: "0 0 22 * * *".into(),
             },
             "sweep",
-            TimerTarget::Fresh,
+            ScheduleTarget::Fresh,
         ))
         .await
         .unwrap();
@@ -1230,7 +1234,12 @@ mod tests {
     async fn add_routine_rejects_agent_scope() {
         let (_inst, peer) = fixture_db().await;
         let engine = RoutineEngine::new(peer, None).await.unwrap();
-        let r = Routine::cron(RoutineId::new("x"), "x", "0 0 9 * * *", target("agent_timer"));
+        let r = Routine::cron(
+            RoutineId::new("x"),
+            "x",
+            "0 0 9 * * *",
+            target("agent_schedule"),
+        );
         let err = engine
             .add_routine(r, RoutineScope::Agent("o".into()), None)
             .await

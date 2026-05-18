@@ -1109,13 +1109,13 @@ mod tests {
         dispatch(Command::AgentAdd("alpha".to_string()), &ctx).await;
         // Seed a legacy session routine directly — the dispatch surface
         // lives in the heartbeat extension now and isn't wired into this
-        // fixture's hub. Agent-owned timers are the new path; this
+        // fixture's hub. Agent-owned schedules are the new path; this
         // exercises the sweep for residual session routines.
         let alpha_entry = server
             .agent_index()
             .find_by_name("alpha")
             .expect("alpha registered");
-        let payload = serde_json::to_value(crate::extensions::heartbeat::HeartbeatPayload {
+        let payload = serde_json::to_value(crate::extensions::schedule::HeartbeatPayload {
             rule_name: "rule1".into(),
             target_agent_db_id: alpha_entry.db_id.to_string(),
             task: "ping".into(),
@@ -1141,13 +1141,13 @@ mod tests {
 
         // Detach first (delete refuses while attached).
         dispatch(Command::AgentRemove("alpha".to_string()), &ctx).await;
-        // Detach no longer sweeps session routines — timers are now
+        // Detach no longer sweeps session routines — schedules are now
         // agent-owned. Legacy routines remain until agent_delete.
         let after_detach = crate::routine::list_session_routines(&sdb).await.unwrap();
         assert_eq!(
             after_detach.len(),
             1,
-            "legacy routine survives detach (timers now agent-owned)"
+            "legacy routine survives detach (schedules now agent-owned)"
         );
 
         // agent_delete sweeps via sweep_for_agent for legacy cleanup.

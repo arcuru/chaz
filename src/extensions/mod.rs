@@ -6,12 +6,12 @@
 //! are surfaced to the runtime by reading `hub.tools_for_registry()` and
 //! pushing them into the legacy [`crate::tool::ToolRegistry`].
 
-pub mod agent_timer;
+pub mod agent_schedule;
 pub mod core;
 pub mod fs;
-pub mod heartbeat;
 pub mod memory;
 pub mod path_normalizer;
+pub mod schedule;
 pub mod scheduler;
 pub mod security_warnings;
 pub mod system;
@@ -60,8 +60,8 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             deps.agent_index.clone(),
             deps.embedder,
         )),
-        Arc::new(heartbeat::HeartbeatExtension::new(deps.agent_index)),
-        Arc::new(agent_timer::AgentTimerExtension::new(spawn_cell)),
+        Arc::new(schedule::ScheduleExtension::new(deps.agent_index)),
+        Arc::new(agent_schedule::AgentScheduleExtension::new(spawn_cell)),
         Arc::new(scheduler::ScheduleExtension),
     ]
 }

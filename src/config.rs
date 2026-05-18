@@ -73,7 +73,7 @@ pub struct Config {
     #[serde(default)]
     pub capability_defaults: HashMap<CapabilityKind, String>,
     /// Per-extension agent allowlists for the `AgentStateAdmin` cap.
-    /// Each entry maps an extension name (e.g. `"heartbeat"`) to the
+    /// Each entry maps an extension name (e.g. `"schedule"`) to the
     /// list of agent display names that extension's tools may access.
     /// An absent entry means unrestricted (all hosted agents visible).
     /// An empty entry (`[]`) means the cap is effectively denied.
@@ -226,7 +226,7 @@ pub struct AgentConfig {
     pub allowed_callers: Option<Vec<String>>,
     /// Maximum ReAct loop iterations (default: 10)
     pub max_iterations: Option<u32>,
-    /// Whether this agent can run without user input (scheduled/heartbeat)
+    /// Whether this agent can run without user input (scheduled/schedule)
     #[serde(default)]
     pub autonomous: bool,
     /// Named override bundles for spawn-time configuration

@@ -121,9 +121,9 @@ impl SessionRegistry {
         })
         .await?;
 
-        // No routine sweep needed — timers are now agent-owned
-        // (Timer store in agent DB). Fire-time membership check in
-        // `Server::fire_agent_timer` handles detached agent self-skip.
+        // No routine sweep needed — schedules are now agent-owned
+        // (Schedule store in agent DB). Fire-time membership check in
+        // `Server::fire_agent_schedule` handles detached agent self-skip.
 
         info!(
             agent = %agent.display_name,

@@ -21,7 +21,7 @@ not to a session. chaz is the runtime — it hosts one or more agents, and on
 boot it loads each hosted agent and registers that agent's timers. When a
 timer fires, chaz loads the owning agent, resolves the timer's **target**
 (an existing pinned session, or a fresh session created per fire), builds
-context *as that agent*, feeds the wake-prompt as private invocation input,
+context _as that agent_, feeds the wake-prompt as private invocation input,
 and runs the agent's loop. The agent may reply, may act only through tools,
 or may do nothing.
 
@@ -32,7 +32,7 @@ scheduler writes a generically-routed `Directive` entry into a session.
 ## Problem
 
 Today scheduled wakes are **session-owned**: `Routine` rows live in each
-session DB's `routines` table; `HeartbeatPayload` merely *names* a target
+session DB's `routines` table; `HeartbeatPayload` merely _names_ a target
 agent; `RoutineEngine` discovers work by scanning sessions; the
 `HeartbeatRoutineHandler` writes a `Directive` entry that
 `process_session` then routes through `resolve_agent_for_entry` (override →
@@ -44,7 +44,7 @@ agent; `RoutineEngine` discovers work by scanning sessions; the
   across the session DBs it happens to have been used in.
 - The wake-prompt is a broadcast `Directive` entry every participant sees,
   even though it's a private nudge to one agent.
-- A woken agent is *forced* to emit a terminal `Message` even when it only
+- A woken agent is _forced_ to emit a terminal `Message` even when it only
   ran tools or chose to stay silent (`server.rs` always appends one).
 
 ## Model
@@ -65,7 +65,7 @@ Timer {
 }
 ```
 
-- **Pinned** — "resume *this* session at 9pm and check in." The agent's
+- **Pinned** — "resume _this_ session at 9pm and check in." The agent's
   home/default session is **not a separate concept** — it is just a Pinned
   timer whose `session_db_id` is that session.
 - **Fresh** — "every 9pm, go do X" — an autonomous recurring task. Each
@@ -99,14 +99,14 @@ sequenceDiagram
 The engine's discovery inverts: it enumerates **hosted agents** and reads
 their timer registries, rather than scanning session DBs for routine rows.
 The existing "does this peer host the target agent?" check
-(`heartbeat.rs:169`, today only multi-peer dedup) becomes *the* dispatch
+(`heartbeat.rs:169`, today only multi-peer dedup) becomes _the_ dispatch
 gate — the ownership boundary falls out naturally.
 
 ### Intrinsic routing & private wake-prompt
 
 Because the timer belongs to the agent, the fire path invokes that agent
 directly and never consults `resolve_agent_for_entry`. The wake-prompt is
-*invocation-scoped context* for that turn — not a broadcast `Directive`
+_invocation-scoped context_ for that turn — not a broadcast `Directive`
 entry. The agent's resulting tool calls and any `Message` are written to
 the target session as normal entries (audit + visibility land where they
 belong); the prompt itself is not a shared entry.
@@ -119,7 +119,7 @@ machinery. This is a hard requirement: a `Pinned` target **may be a live
 session** a user is actively conversing in, and the timer turn must not
 mutate or hijack that session's `SessionRuntime` (its `agent_override`,
 backend, completion channel, watcher wiring). Reusing
-`register_child_session` (which pins the agent by *overwriting*
+`register_child_session` (which pins the agent by _overwriting_
 `SessionRuntime.agent_override`, `server.rs:369`) is therefore only valid
 for `Fresh`; it is **forbidden for `Pinned`**.
 
@@ -137,17 +137,17 @@ The standalone path:
    entries with a concurrent interactive turn. If the session is busy,
    skip this fire (cron will come around again; a missed one-shot is
    logged) rather than block or run concurrently. The lock is the
-   *only* shared state touched — no `SessionRuntime` entry is created
+   _only_ shared state touched — no `SessionRuntime` entry is created
    or modified, so the live session's own routing is unaffected.
 4. **Run the owner's turn directly** — load + hydrate the owner agent,
-   build context *as that agent* from the session's current entries
+   build context _as that agent_ from the session's current entries
    with the wake-prompt as private invocation input, run the ReAct
-   loop, emit `ToolCall`/`ToolResult` and a terminal `Message` *only if
-   non-empty* (see Optional response). The path **returns the turn
+   loop, emit `ToolCall`/`ToolResult` and a terminal `Message` _only if
+   non-empty_ (see Optional response). The path **returns the turn
    outcome** to its caller — it is not fire-and-forget — so cost is
    recoverable.
 5. **Attribute cost to the agent** — write `TimerFire { …, usage =
-   outcome.metadata }` to the owner's `timer_fires` store. Autonomous
+outcome.metadata }` to the owner's `timer_fires` store. Autonomous
    wake cost lands on the agent's ledger; session usage stays
    Message-only (its tested invariant is untouched).
 6. **One-shot cleanup** — on a successful one-shot fire, delete the
@@ -180,13 +180,13 @@ rows, `sweep_for_agent`): the check moves from "clean up on detach" to
 
 ## Failure Modes & Mitigations
 
-| Failure | Mitigation |
-| --- | --- |
-| Timer fires for an agent this peer doesn't host | Host check is the dispatch gate — silently skip (owning peer fires it) |
-| Pinned target session deleted / agent detached | Membership/existence checked at fire → self-skip + log |
-| Fresh fires accumulate sessions unbounded | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen |
+| Failure                                          | Mitigation                                                                                                                                                            |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Timer fires for an agent this peer doesn't host  | Host check is the dispatch gate — silently skip (owning peer fires it)                                                                                                |
+| Pinned target session deleted / agent detached   | Membership/existence checked at fire → self-skip + log                                                                                                                |
+| Fresh fires accumulate sessions unbounded        | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                             |
 | Self-scheduled tight cron self-sustains activity | Bounded by cron cadence + per-agent `max_iterations`; **not** the chat-room burst budget (a schedule is a deliberate cadence). Revisit a min-interval guard if abused |
-| Woken agent forced to speak | Conditional terminal `Message` — silence produces no entry |
+| Woken agent forced to speak                      | Conditional terminal `Message` — silence produces no entry                                                                                                            |
 
 ## Migration
 

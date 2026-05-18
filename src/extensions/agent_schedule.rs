@@ -1,13 +1,13 @@
-//! Agent-owned timer extension — the routine handler for
-//! [`crate::routine::AgentTimerPayload`].
+//! Agent-owned schedule extension — the routine handler for
+//! [`crate::routine::AgentSchedulePayload`].
 //!
-//! The routine engine fires agent-owned timers and dispatches them to
-//! this extension's routine handler. Unlike heartbeat/scheduler, which
+//! The routine engine fires agent-owned schedules and dispatches them to
+//! this extension's routine handler. Unlike the legacy session-routine path, which
 //! write a Directive entry and let `process_session` handle the turn,
-//! agent timers use a **standalone execution path**: load the agent,
+//! agent schedules use a **standalone execution path**: load the agent,
 //! build context, run the ReAct loop directly via
 //! [`crate::runtime::execute`], write results, and attribute cost to
-//! the agent's `timer_fires` store.
+//! the agent's `schedule_fires` store.
 //!
 //! The handler spawns a `tokio` task for the actual agent turn so the
 //! engine's fire loop isn't blocked on LLM latency.
@@ -21,19 +21,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-pub struct AgentTimerExtension {
+pub struct AgentScheduleExtension {
     server_cell: Arc<OnceLock<Arc<Server>>>,
 }
 
-impl AgentTimerExtension {
+impl AgentScheduleExtension {
     pub fn new(server_cell: Arc<OnceLock<Arc<Server>>>) -> Self {
         Self { server_cell }
     }
 }
 
-impl Extension for AgentTimerExtension {
+impl Extension for AgentScheduleExtension {
     fn name(&self) -> &'static str {
-        "agent_timer"
+        "agent_schedule"
     }
 
     fn supported_hooks(&self) -> &[HookKind] {
@@ -57,7 +57,7 @@ impl Extension for AgentTimerExtension {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
         Box::pin(async move {
             let mut installed = InstalledExtension::empty();
-            installed.routine_handler = Some(Box::new(AgentTimerRoutineHandler {
+            installed.routine_handler = Some(Box::new(AgentScheduleRoutineHandler {
                 server_cell: self.server_cell.clone(),
             }));
             Ok(installed)
@@ -65,30 +65,30 @@ impl Extension for AgentTimerExtension {
     }
 }
 
-struct AgentTimerRoutineHandler {
+struct AgentScheduleRoutineHandler {
     server_cell: Arc<OnceLock<Arc<Server>>>,
 }
 
-impl RoutineHandler for AgentTimerRoutineHandler {
+impl RoutineHandler for AgentScheduleRoutineHandler {
     fn on_fire<'a>(
         &'a self,
         _caps: &'a ExtensionCaps,
         payload: serde_json::Value,
     ) -> HandlerFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            let payload: crate::routine::AgentTimerPayload = serde_json::from_value(payload)
-                .map_err(|e| anyhow::anyhow!("invalid agent_timer payload: {e}"))?;
+            let payload: crate::routine::AgentSchedulePayload = serde_json::from_value(payload)
+                .map_err(|e| anyhow::anyhow!("invalid agent_schedule payload: {e}"))?;
 
             let server = self
                 .server_cell
                 .get()
-                .ok_or_else(|| anyhow::anyhow!("agent_timer fired before server initialized"))?
+                .ok_or_else(|| anyhow::anyhow!("agent_schedule fired before server initialized"))?
                 .clone();
 
             // Spawn the actual agent turn — don't block the engine's fire loop.
             tokio::spawn(async move {
-                if let Err(e) = server.fire_agent_timer(payload).await {
-                    tracing::error!(error = %e, "agent_timer fire failed");
+                if let Err(e) = server.fire_agent_schedule(payload).await {
+                    tracing::error!(error = %e, "agent_schedule fire failed");
                 }
             });
 

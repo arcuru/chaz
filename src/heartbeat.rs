@@ -1,15 +1,15 @@
 //! Heartbeat support helpers.
 //!
 //! Per-session heartbeat rules (legacy) live as [`crate::routine::Routine`]
-//! rows under the session DB's `routines` table. New timers live in the
-//! agent's own DB (`timers` store) — agent-owned, not session-scoped.
+//! rows under the session DB's `routines` table. New schedules live in the
+//! agent's own DB (`schedules` store) — agent-owned, not session-scoped.
 //!
 //! This module retains a single narrow surface: [`sweep_for_agent`],
 //! used by `agent_delete` to drop legacy session routines left orphaned
-//! when their target agent is unregistered. Agent-owned timers don't
+//! when their target agent is unregistered. Agent-owned schedules don't
 //! need this — they die with the agent DB.
 
-use crate::extensions::heartbeat::HeartbeatPayload;
+use crate::extensions::schedule::HeartbeatPayload;
 use crate::routine::{list_session_routines, remove_session_routine};
 use crate::server::Server;
 use std::sync::Arc;

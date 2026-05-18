@@ -1,11 +1,11 @@
-//! Heartbeat extension — agent-owned timers via tools + commands.
+//! Schedule extension — agent-owned schedules via tools + commands.
 //!
-//! Wires the heartbeat surface (5 tools + the `/heartbeat` slash command)
-//! into the extension hub. Timers now live in the owning agent's DB
-//! (`timers` store); the `/heartbeat` command and tools write there
+//! Wires the schedule surface (5 tools + the `/schedule` slash command)
+//! into the extension hub. Schedules live in the owning agent's DB
+//! (`schedules` store); the `/schedule` command and tools write there
 //! instead of the session `routines` table.
 
-use crate::agent_db::{AgentDb, Timer, TimerTarget};
+use crate::agent_db::{AgentDb, Schedule, ScheduleTarget};
 use crate::extension::caps::{
     AgentStateAdmin, CapabilityRequest, CommandDescriptor, ExtensionCaps, SessionEntryDraft,
 };
@@ -15,12 +15,10 @@ use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
 };
 use crate::hosted_index::HostedIndex;
-use crate::routine::{Trigger, notify_agent_timers_changed};
-use crate::tools::{
-    HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp,
-};
+use crate::routine::{Trigger, notify_agent_schedules_changed};
+use crate::tools::{ScheduleAdd, ScheduleList, ScheduleModify, ScheduleOnce, ScheduleRemove};
 use chrono::Utc;
-use cron::Schedule;
+use cron::Schedule as CronSchedule;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -54,22 +52,22 @@ pub struct HeartbeatPayload {
     pub is_one_shot: bool,
 }
 
-/// Heartbeat extension — receives its `AgentStateAdmin` handle from
+/// Schedule extension — receives its `AgentStateAdmin` handle from
 /// the hub at install time (not via constructor). Keeps `HostedIndex`
 /// for the legacy routine handler's host-check only.
-pub struct HeartbeatExtension {
+pub struct ScheduleExtension {
     agent_index: HostedIndex,
 }
 
-impl HeartbeatExtension {
+impl ScheduleExtension {
     pub fn new(agent_index: HostedIndex) -> Self {
         Self { agent_index }
     }
 }
 
-impl Extension for HeartbeatExtension {
+impl Extension for ScheduleExtension {
     fn name(&self) -> &'static str {
-        "heartbeat"
+        "schedule"
     }
 
     fn supported_hooks(&self) -> &[HookKind] {
@@ -97,22 +95,24 @@ impl Extension for HeartbeatExtension {
         caps: ExtensionCaps,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
         Box::pin(async move {
-            let tool_reg = caps.tool_registration.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("heartbeat install requires ToolRegistration cap")
-            })?;
+            let tool_reg = caps
+                .tool_registration
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("schedule install requires ToolRegistration cap"))?;
             let cmd_reg = caps.command_registration.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("heartbeat install requires CommandRegistration cap")
+                anyhow::anyhow!("schedule install requires CommandRegistration cap")
             })?;
-            let agent_state = caps.agent_state_admin.clone().ok_or_else(|| {
-                anyhow::anyhow!("heartbeat install requires AgentStateAdmin cap")
-            })?;
+            let agent_state = caps
+                .agent_state_admin
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("schedule install requires AgentStateAdmin cap"))?;
 
             let tools: Vec<Arc<dyn crate::tool::Tool>> = vec![
-                Arc::new(HeartbeatAdd::new(agent_state.clone())),
-                Arc::new(HeartbeatModify::new(agent_state.clone())),
-                Arc::new(HeartbeatRemove::new(agent_state.clone())),
-                Arc::new(HeartbeatList::new(agent_state.clone())),
-                Arc::new(WakeMeUp::new(agent_state.clone())),
+                Arc::new(ScheduleAdd::new(agent_state.clone())),
+                Arc::new(ScheduleModify::new(agent_state.clone())),
+                Arc::new(ScheduleRemove::new(agent_state.clone())),
+                Arc::new(ScheduleList::new(agent_state.clone())),
+                Arc::new(ScheduleOnce::new(agent_state.clone())),
             ];
             for t in tools {
                 let d = t.descriptor();
@@ -122,13 +122,11 @@ impl Extension for HeartbeatExtension {
             cmd_reg
                 .register(
                     CommandDescriptor {
-                        name: "heartbeat".into(),
-                        description: "Manage heartbeat rules on this session — add | remove | list"
+                        name: "schedule".into(),
+                        description: "Manage agent-owned schedules — add | modify | remove | list"
                             .into(),
                     },
-                    Box::new(HeartbeatCommand {
-                        agent_state,
-                    }),
+                    Box::new(ScheduleCommand { agent_state }),
                 )
                 .await?;
 
@@ -205,13 +203,13 @@ impl RoutineHandler for HeartbeatRoutineHandler {
     }
 }
 
-struct HeartbeatCommand {
+struct ScheduleCommand {
     agent_state: Arc<dyn AgentStateAdmin>,
 }
 
-impl ExtensionCommand for HeartbeatCommand {
+impl ExtensionCommand for ScheduleCommand {
     fn description(&self) -> &'static str {
-        "Manage timers on agents — add | remove | list"
+        "Manage schedules on agents — add | remove | list"
     }
 
     fn invoke<'a>(
@@ -229,16 +227,16 @@ impl ExtensionCommand for HeartbeatCommand {
                 "" | "list" => list_cmd(&*self.agent_state, ctx).await,
                 "remove" | "rm" => {
                     if rest.is_empty() {
-                        ExtensionCommandOutcome::Error("Usage: /heartbeat remove <id> [agent]".into())
+                        ExtensionCommandOutcome::Error(
+                            "Usage: /schedule remove <id> [agent]".into(),
+                        )
                     } else {
                         remove_cmd(rest, &*self.agent_state, ctx).await
                     }
                 }
-                "add" => {
-                    add_cmd(rest, &*self.agent_state, ctx).await
-                }
+                "add" => add_cmd(rest, &*self.agent_state, ctx).await,
                 other => ExtensionCommandOutcome::Error(format!(
-                    "Unknown subcommand '/heartbeat {other}'. Use: add | remove | list"
+                    "Unknown subcommand '/schedule {other}'. Use: add | remove | list"
                 )),
             }
         })
@@ -254,37 +252,32 @@ async fn open_agent_db_for_cmd(
     agent_ref: Option<&str>,
 ) -> Result<(crate::hosted_index::DbEntry, AgentDb), ExtensionCommandOutcome> {
     let name = agent_ref.unwrap_or(&ctx.agent_name);
-    let entry = cap.resolve_agent(name).map_err(|e| {
-        ExtensionCommandOutcome::Error(e)
-    })?;
-    let adb = cap.open_agent_db(&entry).await.map_err(|e| {
-        ExtensionCommandOutcome::Error(format!("{e:#}"))
-    })?;
+    let entry = cap
+        .resolve_agent(name)
+        .map_err(ExtensionCommandOutcome::Error)?;
+    let adb = cap
+        .open_agent_db(&entry)
+        .await
+        .map_err(|e| ExtensionCommandOutcome::Error(format!("{e:#}")))?;
     Ok((entry, adb))
 }
 
-async fn list_cmd(
-    cap: &dyn AgentStateAdmin,
-    ctx: &HookContext,
-) -> ExtensionCommandOutcome {
+async fn list_cmd(cap: &dyn AgentStateAdmin, ctx: &HookContext) -> ExtensionCommandOutcome {
     // Parse optional agent name from the rest of the args.
-    // `/heartbeat list` lists your own timers.
-    // `/heartbeat list <agent>` lists that agent's timers.
+    // `/schedule list` lists your own schedules.
+    // `/schedule list <agent>` lists that agent's schedules.
     // We get the full args via invoke, but here rest is the trimmed sub-arg.
-    // For simplicity, always list the calling agent's timers.
+    // For simplicity, always list the calling agent's schedules.
     let (_, adb) = match open_agent_db_for_cmd(cap, ctx, None).await {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match adb.list_timers().await {
-        Ok(timers) if timers.is_empty() => {
-            ExtensionCommandOutcome::Text(format!(
-                "No timers on agent '{}'.",
-                ctx.agent_name
-            ))
+    match adb.list_schedules().await {
+        Ok(schedules) if schedules.is_empty() => {
+            ExtensionCommandOutcome::Text(format!("No schedules on agent '{}'.", ctx.agent_name))
         }
-        Ok(timers) => {
-            let lines: Vec<String> = timers
+        Ok(schedules) => {
+            let lines: Vec<String> = schedules
                 .iter()
                 .map(|t| {
                     let state = if t.enabled { "" } else { " (disabled)" };
@@ -295,8 +288,8 @@ async fn list_cmd(
                         }
                     };
                     let target_label = match &t.target {
-                        TimerTarget::Pinned { .. } => "pinned".to_string(),
-                        TimerTarget::Fresh => "fresh".to_string(),
+                        ScheduleTarget::Pinned { .. } => "pinned".to_string(),
+                        ScheduleTarget::Fresh => "fresh".to_string(),
                     };
                     format!(
                         "  {} [{schedule}]{state} → {target_label} — {}",
@@ -305,12 +298,12 @@ async fn list_cmd(
                 })
                 .collect();
             ExtensionCommandOutcome::Text(format!(
-                "Timers on '{}':\n{}",
+                "Schedules on '{}':\n{}",
                 ctx.agent_name,
                 lines.join("\n")
             ))
         }
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to list timers: {e}")),
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to list schedules: {e}")),
     }
 }
 
@@ -319,8 +312,8 @@ async fn remove_cmd(
     cap: &dyn AgentStateAdmin,
     ctx: &HookContext,
 ) -> ExtensionCommandOutcome {
-    // Format: /heartbeat remove <id> [agent]
-    let (timer_id, agent_ref) = match rest.split_once(char::is_whitespace) {
+    // Format: /schedule remove <id> [agent]
+    let (schedule_id, agent_ref) = match rest.split_once(char::is_whitespace) {
         Some((id, agent)) => (id.trim(), Some(agent.trim())),
         None => (rest.trim(), None),
     };
@@ -328,24 +321,18 @@ async fn remove_cmd(
         Ok(v) => v,
         Err(e) => return e,
     };
-    match adb.remove_timer(timer_id).await {
+    match adb.remove_schedule(schedule_id).await {
         Ok(true) => {
-            notify_agent_timers_changed(
-                &adb.id().to_string(),
-                &adb,
-            )
-            .await;
-            ExtensionCommandOutcome::Text(format!("Removed timer '{timer_id}'"))
+            notify_agent_schedules_changed(&adb.id().to_string(), &adb).await;
+            ExtensionCommandOutcome::Text(format!("Removed schedule '{schedule_id}'"))
         }
-        Ok(false) => {
-            ExtensionCommandOutcome::Error(format!("No timer with id '{timer_id}'"))
-        }
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to remove timer: {e}")),
+        Ok(false) => ExtensionCommandOutcome::Error(format!("No schedule with id '{schedule_id}'")),
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to remove schedule: {e}")),
     }
 }
 
-/// Parse and execute `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task...>`.
-/// Writes an agent-owned Timer with target = Pinned(current session).
+/// Parse and execute `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task...>`.
+/// Writes an agent-owned Schedule with target = Pinned(current session).
 async fn add_cmd(
     rest: &str,
     cap: &dyn AgentStateAdmin,
@@ -369,13 +356,13 @@ async fn add_cmd(
         }
         _ => {
             return ExtensionCommandOutcome::Error(
-                "Usage: /heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent> <task...>"
+                "Usage: /schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent> <task...>"
                     .into(),
             );
         }
     };
     let cron = format!("{c1} {c2} {c3} {c4} {c5} {c6}");
-    if let Err(e) = Schedule::from_str(&cron) {
+    if let Err(e) = CronSchedule::from_str(&cron) {
         return ExtensionCommandOutcome::Error(format!("Invalid cron '{cron}': {e}"));
     }
     let entry = match cap.resolve_agent(agent_ref) {
@@ -395,25 +382,21 @@ async fn add_cmd(
         s.database().root_id().to_string()
     };
 
-    let timer = Timer::new(
+    let schedule = Schedule::new(
         id.to_string(),
-        Trigger::Cron {
-            expr: cron.clone(),
-        },
+        Trigger::Cron { expr: cron.clone() },
         task.clone(),
-        TimerTarget::Pinned {
-            session_db_id,
-        },
+        ScheduleTarget::Pinned { session_db_id },
     );
-    match adb.upsert_timer(timer).await {
+    match adb.upsert_schedule(schedule).await {
         Ok(()) => {
-            notify_agent_timers_changed(&entry.db_id.to_string(), &adb).await;
+            notify_agent_schedules_changed(&entry.db_id.to_string(), &adb).await;
             ExtensionCommandOutcome::Text(format!(
-                "Timer '{id}' on agent '{}': cron='{cron}' → this session — {task}",
+                "Schedule '{id}' on agent '{}': cron='{cron}' → this session — {task}",
                 entry.display_name
             ))
         }
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save timer: {e}")),
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save schedule: {e}")),
     }
 }
 
@@ -475,14 +458,11 @@ mod tests {
         (instance, index, registry, ctx)
     }
 
-    fn cmd(registry: Arc<crate::session::SessionRegistry>, index: HostedIndex) -> HeartbeatCommand {
+    fn cmd(registry: Arc<crate::session::SessionRegistry>, index: HostedIndex) -> ScheduleCommand {
         // Build a scoped handle for tests — unrestricted (all agents visible).
-        let scoped = crate::extension::agent_state::ScopedAgentStateAdmin::new(
-            registry,
-            index,
-            None,
-        );
-        HeartbeatCommand {
+        let scoped =
+            crate::extension::agent_state::ScopedAgentStateAdmin::new(registry, index, None);
+        ScheduleCommand {
             agent_state: Arc::new(scoped),
         }
     }
@@ -526,7 +506,7 @@ mod tests {
         let c = cmd(registry, index);
         match c.invoke("", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
-                assert!(s.contains("No timers"), "got: {s}")
+                assert!(s.contains("No schedules"), "got: {s}")
             }
             ExtensionCommandOutcome::Error(e) => panic!("expected text, got error: {e}"),
         }
@@ -538,7 +518,7 @@ mod tests {
         let c = cmd(registry, index);
         match c.invoke("remove", &ctx).await {
             ExtensionCommandOutcome::Error(e) => {
-                assert!(e.contains("Usage: /heartbeat remove"), "got: {e}")
+                assert!(e.contains("Usage: /schedule remove"), "got: {e}")
             }
             ExtensionCommandOutcome::Text(s) => panic!("expected error, got text: {s}"),
         }
@@ -552,7 +532,7 @@ mod tests {
         let _ = c.invoke("remove x", &ctx).await;
         match c.invoke("list", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
-                assert!(s.contains("No timers"), "got: {s}")
+                assert!(s.contains("No schedules"), "got: {s}")
             }
             ExtensionCommandOutcome::Error(e) => panic!("list errored: {e}"),
         }

@@ -41,8 +41,8 @@ pub const MEMORY_STORE: &str = "memory";
 pub const META_STORE: &str = "meta";
 pub const HISTORY_STORE: &str = "history";
 pub const MEMORY_BANKS_STORE: &str = "memory_banks";
-pub const TIMERS_STORE: &str = "timers";
-pub const TIMER_FIRES_STORE: &str = "timer_fires";
+pub const SCHEDULES_STORE: &str = "schedules";
+pub const SCHEDULE_FIRES_STORE: &str = "schedule_fires";
 
 const BLOB_KEY: &str = "value";
 
@@ -157,17 +157,17 @@ pub struct MemoryBankRef {
 fn default_true() -> bool {
     true
 }
-fn default_timer_max_failures() -> u32 {
+fn default_schedule_max_failures() -> u32 {
     3
 }
 
-/// Where a fired [`Timer`] runs.
+/// Where a fired [`Schedule`] runs.
 ///
 /// The agent's "home"/default session is **not** a separate concept —
-/// it is just a `Pinned` timer whose `session_db_id` is that session.
+/// it is just a `Pinned` schedule whose `session_db_id` is that session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TimerTarget {
+pub enum ScheduleTarget {
     /// Fire into this existing session.
     Pinned { session_db_id: String },
     /// Create a fresh session per fire (autonomous recurring task).
@@ -175,38 +175,38 @@ pub enum TimerTarget {
 }
 
 /// An agent-owned scheduled wake. Lives in the owning agent's DB
-/// `timers` store, so it syncs and travels with the agent across peers
+/// `schedules` store, so it syncs and travels with the agent across peers
 /// exactly like its persona/config — the agent is the unit of
 /// ownership, chaz is the runtime that fires it.
 ///
 /// The `prompt` is invocation-scoped input handed to the agent when the
-/// timer fires; it is *not* written as a broadcast session entry.
+/// schedule fires; it is *not* written as a broadcast session entry.
 /// Failure-tracking fields mirror [`crate::routine::Routine`] so the
-/// engine's auto-disable pass can operate on timers uniformly
+/// engine's auto-disable pass can operate on schedules uniformly
 /// (`max_failures == 0` opts out).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Timer {
+pub struct Schedule {
     pub id: String,
     pub trigger: crate::routine::Trigger,
     pub prompt: String,
-    pub target: TimerTarget,
+    pub target: ScheduleTarget,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub consecutive_failures: u32,
-    #[serde(default = "default_timer_max_failures")]
+    #[serde(default = "default_schedule_max_failures")]
     pub max_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
-impl Timer {
-    /// Construct a timer with default resilience settings.
+impl Schedule {
+    /// Construct a schedule with default resilience settings.
     pub fn new(
         id: impl Into<String>,
         trigger: crate::routine::Trigger,
         prompt: impl Into<String>,
-        target: TimerTarget,
+        target: ScheduleTarget,
     ) -> Self {
         Self {
             id: id.into(),
@@ -221,14 +221,14 @@ impl Timer {
     }
 }
 
-/// Audit record of one timer fire, written to the owning agent's
-/// `timer_fires` store. For `Fresh` targets this is how the
-/// freshly-created session's address is recoverable ("this timer
+/// Audit record of one schedule fire, written to the owning agent's
+/// `schedule_fires` store. For `Fresh` targets this is how the
+/// freshly-created session's address is recoverable ("this schedule
 /// fired and the session it created is at X"); for `Pinned` it
 /// records the run against the existing session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimerFire {
-    pub timer_id: String,
+pub struct ScheduleFire {
+    pub schedule_id: String,
     pub fired_at: DateTime<Utc>,
     /// The session the fire ran in — created (Fresh) or reused (Pinned).
     pub session_db_id: String,
@@ -292,45 +292,46 @@ impl AgentDb {
             .await?;
         txn.get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
             .await?;
-        txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
-        txn.get_store::<Table<TimerFire>>(TIMER_FIRES_STORE).await?;
+        txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
+        txn.get_store::<Table<ScheduleFire>>(SCHEDULE_FIRES_STORE)
+            .await?;
         txn.commit().await?;
         Ok(())
     }
 
     // -----------------------------------------------------------------
-    // Agent-owned timers (Agent-Owned Timers — Stage 1)
+    // Agent-owned schedules (Agent-Owned Schedules — Stage 1)
     // -----------------------------------------------------------------
 
-    /// List every timer owned by this agent.
-    pub async fn list_timers(&self) -> anyhow::Result<Vec<Timer>> {
+    /// List every schedule owned by this agent.
+    pub async fn list_schedules(&self) -> anyhow::Result<Vec<Schedule>> {
         let txn = self.database.new_transaction().await?;
-        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
-        let rows = store.search(|_: &Timer| true).await?;
+        let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
+        let rows = store.search(|_: &Schedule| true).await?;
         Ok(rows.into_iter().map(|(_, t)| t).collect())
     }
 
-    /// Insert a timer, or replace the existing one with the same `id`.
+    /// Insert a schedule, or replace the existing one with the same `id`.
     /// Dedup-by-id keeps edits and failure-state updates idempotent
     /// (same pattern as `attach_memory_bank`'s dedup-by-name).
-    pub async fn upsert_timer(&self, timer: Timer) -> anyhow::Result<()> {
+    pub async fn upsert_schedule(&self, schedule: Schedule) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
-        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
-        let existing = store.search(|t: &Timer| t.id == timer.id).await?;
+        let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
+        let existing = store.search(|t: &Schedule| t.id == schedule.id).await?;
         for (row_id, _) in existing {
             store.delete(&row_id).await?;
         }
-        store.insert(timer).await?;
+        store.insert(schedule).await?;
         txn.commit().await?;
         Ok(())
     }
 
-    /// Remove the timer with the given `id`. Returns true if a row was
+    /// Remove the schedule with the given `id`. Returns true if a row was
     /// removed; no-op (false) on an unknown id.
-    pub async fn remove_timer(&self, id: &str) -> anyhow::Result<bool> {
+    pub async fn remove_schedule(&self, id: &str) -> anyhow::Result<bool> {
         let txn = self.database.new_transaction().await?;
-        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
-        let existing = store.search(|t: &Timer| t.id == id).await?;
+        let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
+        let existing = store.search(|t: &Schedule| t.id == id).await?;
         let removed = !existing.is_empty();
         for (row_id, _) in existing {
             store.delete(&row_id).await?;
@@ -339,28 +340,32 @@ impl AgentDb {
         Ok(removed)
     }
 
-    /// Find a single timer by `id`.
-    pub async fn find_timer(&self, id: &str) -> anyhow::Result<Option<Timer>> {
+    /// Find a single schedule by `id`.
+    pub async fn find_schedule(&self, id: &str) -> anyhow::Result<Option<Schedule>> {
         let txn = self.database.new_transaction().await?;
-        let store = txn.get_store::<Table<Timer>>(TIMERS_STORE).await?;
-        let mut rows = store.search(|t: &Timer| t.id == id).await?;
+        let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
+        let mut rows = store.search(|t: &Schedule| t.id == id).await?;
         Ok(rows.pop().map(|(_, t)| t))
     }
 
     /// Append a fire-audit record. Append-only — one row per fire.
-    pub async fn record_timer_fire(&self, fire: TimerFire) -> anyhow::Result<()> {
+    pub async fn record_schedule_fire(&self, fire: ScheduleFire) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
-        let store = txn.get_store::<Table<TimerFire>>(TIMER_FIRES_STORE).await?;
+        let store = txn
+            .get_store::<Table<ScheduleFire>>(SCHEDULE_FIRES_STORE)
+            .await?;
         store.insert(fire).await?;
         txn.commit().await?;
         Ok(())
     }
 
     /// All fire-audit records, newest-last (insertion order).
-    pub async fn list_timer_fires(&self) -> anyhow::Result<Vec<TimerFire>> {
+    pub async fn list_schedule_fires(&self) -> anyhow::Result<Vec<ScheduleFire>> {
         let txn = self.database.new_transaction().await?;
-        let store = txn.get_store::<Table<TimerFire>>(TIMER_FIRES_STORE).await?;
-        let mut rows = store.search(|_: &TimerFire| true).await?;
+        let store = txn
+            .get_store::<Table<ScheduleFire>>(SCHEDULE_FIRES_STORE)
+            .await?;
+        let mut rows = store.search(|_: &ScheduleFire| true).await?;
         rows.sort_by(|a, b| a.1.fired_at.cmp(&b.1.fired_at));
         Ok(rows.into_iter().map(|(_, f)| f).collect())
     }
@@ -866,130 +871,130 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Agent-owned timers (Stage 1)
+    // Agent-owned schedules (Stage 1)
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn timers_empty_by_default() {
+    async fn schedules_empty_by_default() {
         let (_user, db) = peer_with_agent_db().await;
-        assert!(db.list_timers().await.unwrap().is_empty());
-        assert!(db.find_timer("nope").await.unwrap().is_none());
-        assert!(!db.remove_timer("nope").await.unwrap());
+        assert!(db.list_schedules().await.unwrap().is_empty());
+        assert!(db.find_schedule("nope").await.unwrap().is_none());
+        assert!(!db.remove_schedule("nope").await.unwrap());
     }
 
     #[tokio::test]
-    async fn timer_crud_round_trips_pinned_and_fresh() {
+    async fn schedule_crud_round_trips_pinned_and_fresh() {
         use crate::routine::Trigger;
         let (_user, db) = peer_with_agent_db().await;
 
-        let pinned = Timer::new(
+        let pinned = Schedule::new(
             "daily-brief",
             Trigger::Cron {
                 expr: "0 0 9 * * *".into(),
             },
             "summarize overnight activity",
-            TimerTarget::Pinned {
+            ScheduleTarget::Pinned {
                 session_db_id: "sha256:sess".into(),
             },
         );
-        let fresh = Timer::new(
+        let fresh = Schedule::new(
             "nightly-task",
             Trigger::OneShot {
                 fire_at: Utc::now() + chrono::Duration::hours(1),
             },
             "run the nightly sweep",
-            TimerTarget::Fresh,
+            ScheduleTarget::Fresh,
         );
-        db.upsert_timer(pinned.clone()).await.unwrap();
-        db.upsert_timer(fresh.clone()).await.unwrap();
+        db.upsert_schedule(pinned.clone()).await.unwrap();
+        db.upsert_schedule(fresh.clone()).await.unwrap();
 
-        let mut got = db.list_timers().await.unwrap();
+        let mut got = db.list_schedules().await.unwrap();
         got.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(got, vec![pinned.clone(), fresh.clone()]);
-        assert_eq!(db.find_timer("daily-brief").await.unwrap(), Some(pinned));
+        assert_eq!(db.find_schedule("daily-brief").await.unwrap(), Some(pinned));
 
-        // Defaults applied by Timer::new.
-        let f = db.find_timer("nightly-task").await.unwrap().unwrap();
+        // Defaults applied by Schedule::new.
+        let f = db.find_schedule("nightly-task").await.unwrap().unwrap();
         assert!(f.enabled);
         assert_eq!(f.max_failures, 3);
         assert_eq!(f.consecutive_failures, 0);
-        assert!(matches!(f.target, TimerTarget::Fresh));
+        assert!(matches!(f.target, ScheduleTarget::Fresh));
     }
 
     #[tokio::test]
     async fn upsert_replaces_by_id_not_appends() {
         use crate::routine::Trigger;
         let (_user, db) = peer_with_agent_db().await;
-        let mut t = Timer::new(
+        let mut t = Schedule::new(
             "t1",
             Trigger::Cron {
                 expr: "0 * * * * *".into(),
             },
             "first",
-            TimerTarget::Fresh,
+            ScheduleTarget::Fresh,
         );
-        db.upsert_timer(t.clone()).await.unwrap();
+        db.upsert_schedule(t.clone()).await.unwrap();
 
         // Same id, mutated state (e.g. a failure-tracking update).
         t.prompt = "second".into();
         t.consecutive_failures = 2;
         t.enabled = false;
-        db.upsert_timer(t.clone()).await.unwrap();
+        db.upsert_schedule(t.clone()).await.unwrap();
 
-        let all = db.list_timers().await.unwrap();
+        let all = db.list_schedules().await.unwrap();
         assert_eq!(all.len(), 1, "upsert must replace, not append");
         assert_eq!(all[0].prompt, "second");
         assert_eq!(all[0].consecutive_failures, 2);
         assert!(!all[0].enabled);
 
-        assert!(db.remove_timer("t1").await.unwrap());
-        assert!(db.list_timers().await.unwrap().is_empty());
+        assert!(db.remove_schedule("t1").await.unwrap());
+        assert!(db.list_schedules().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn timer_fires_audit_log_appends_in_order() {
+    async fn schedule_fires_audit_log_appends_in_order() {
         let (_user, db) = peer_with_agent_db().await;
-        assert!(db.list_timer_fires().await.unwrap().is_empty());
+        assert!(db.list_schedule_fires().await.unwrap().is_empty());
 
-        let f1 = TimerFire {
-            timer_id: "nightly".into(),
+        let f1 = ScheduleFire {
+            schedule_id: "nightly".into(),
             fired_at: Utc::now(),
             session_db_id: "sha256:fresh1".into(),
             fresh: true,
             usage: None,
         };
-        let f2 = TimerFire {
-            timer_id: "daily".into(),
+        let f2 = ScheduleFire {
+            schedule_id: "daily".into(),
             fired_at: Utc::now() + chrono::Duration::seconds(5),
             session_db_id: "sha256:pinned".into(),
             fresh: false,
             usage: None,
         };
-        db.record_timer_fire(f2.clone()).await.unwrap();
-        db.record_timer_fire(f1.clone()).await.unwrap();
+        db.record_schedule_fire(f2.clone()).await.unwrap();
+        db.record_schedule_fire(f1.clone()).await.unwrap();
 
         // Sorted by fired_at regardless of insertion order.
-        let fires = db.list_timer_fires().await.unwrap();
+        let fires = db.list_schedule_fires().await.unwrap();
         assert_eq!(fires.len(), 2);
-        assert_eq!(fires[0].timer_id, "nightly");
+        assert_eq!(fires[0].schedule_id, "nightly");
         assert!(fires[0].fresh);
         assert_eq!(fires[0].session_db_id, "sha256:fresh1");
-        assert_eq!(fires[1].timer_id, "daily");
+        assert_eq!(fires[1].schedule_id, "daily");
         assert!(!fires[1].fresh);
     }
 
     #[tokio::test]
-    async fn timer_serde_tags_target_kind() {
-        let p = serde_json::to_string(&TimerTarget::Pinned {
+    async fn schedule_serde_tags_target_kind() {
+        let p = serde_json::to_string(&ScheduleTarget::Pinned {
             session_db_id: "sha256:x".into(),
         })
         .unwrap();
         assert!(p.contains("\"kind\":\"pinned\""), "got: {p}");
-        let f = serde_json::to_string(&TimerTarget::Fresh).unwrap();
+        let f = serde_json::to_string(&ScheduleTarget::Fresh).unwrap();
         assert!(f.contains("\"kind\":\"fresh\""), "got: {f}");
         assert_eq!(
-            serde_json::from_str::<TimerTarget>(&f).unwrap(),
-            TimerTarget::Fresh
+            serde_json::from_str::<ScheduleTarget>(&f).unwrap(),
+            ScheduleTarget::Fresh
         );
     }
 }

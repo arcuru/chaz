@@ -9,12 +9,12 @@
 
 The distinction matters:
 
-| What the guardrail stops | What it doesn't try to stop |
-|---|---|
-| A too-eager agent scheduling timers on every hosted agent | A tool that discovers it has `Arc<SessionRegistry>` and walks the object graph to escalate |
-| An extension registering tools it didn't declare | A WASM extension that exploits a VM escape |
-| A shell tool that `rm -rf ~/` because an agent hallucinated a cleanup step | An agent that builds and runs native code through the shell tool it was granted |
-| A file-write tool scribbling in `/etc` | A tool using `ptrace` or `/proc` to read another process's memory |
+| What the guardrail stops                                                   | What it doesn't try to stop                                                                |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| A too-eager agent scheduling timers on every hosted agent                  | A tool that discovers it has `Arc<SessionRegistry>` and walks the object graph to escalate |
+| An extension registering tools it didn't declare                           | A WASM extension that exploits a VM escape                                                 |
+| A shell tool that `rm -rf ~/` because an agent hallucinated a cleanup step | An agent that builds and runs native code through the shell tool it was granted            |
+| A file-write tool scribbling in `/etc`                                     | A tool using `ptrace` or `/proc` to read another process's memory                          |
 
 The ceiling (extension capabilities) and floor (tool policy) together create a **defense-in-depth** model where each layer catches different classes of mistakes. Neither layer alone is a security boundary — together they cover the failure modes that actually show up in practice.
 
@@ -23,7 +23,7 @@ The ceiling (extension capabilities) and floor (tool policy) together create a *
 Heartbeat tools (`heartbeat_add`, `heartbeat_modify`, `heartbeat_remove`, `heartbeat_list`, `wake_me_up`) read and write agent-owned timers in the target agent's eidetica DB. Today they receive an `Arc<dyn AgentDbAccess>` handle at construction time — an untyped, unscoped, undeclared capability:
 
 1. **Not in the cap system.** `CapabilityKind` has no variant for "access agent state." The trait exists in `tools/heartbeat.rs`, invisible to manifests, extensions, or the hub.
-2. **No attenuation.** The handle opens *any* hosted agent's DB. There's no way for the operator to say "`chazmina` can schedule timers but only on herself."
+2. **No attenuation.** The handle opens _any_ hosted agent's DB. There's no way for the operator to say "`chazmina` can schedule timers but only on herself."
 3. **Ambient authority.** Tools carry `HostedIndex` (can enumerate all hosted agents by name/id) alongside the access handle. Proper ocap discipline says the tool should only see agents it's been granted.
 
 ## Design
@@ -63,7 +63,7 @@ pub enum CapabilityRequest {
 }
 ```
 
-The `agents` field is not set by the extension's manifest author — it's set by the operator in `tool_policy` and injected into the caps bundle by the hub during resolution. The manifest only declares the *kind*; the operator configures the *scope*.
+The `agents` field is not set by the extension's manifest author — it's set by the operator in `tool_policy` and injected into the caps bundle by the hub during resolution. The manifest only declares the _kind_; the operator configures the _scope_.
 
 ### Trait
 
@@ -253,22 +253,22 @@ Per-extension agent allowlist in chaz config:
 ```yaml
 # chaz config
 agent_state_allowlist:
-  heartbeat: [chaz, bash]       # heartbeat extension can only touch these two agents
+  heartbeat: [chaz, bash] # heartbeat extension can only touch these two agents
 ```
 
 An absent entry means unrestricted (all hosted agents visible). An empty entry (`heartbeat: []`) means deny-all.
 
 The hub resolves these at install time via `resolve_agent_allowlist()`:
 
-| Manifest | Operator | Result |
-|---|---|---|
-| None | None | None (unrestricted) |
-| None | Some([a,b]) | Some([a,b]) (operator narrows) |
-| Some([a,b]) | None | Some([a,b]) (manifest only) |
-| Some([a,b]) | Some([a]) | Some([a]) (intersection) |
-| Some([a]) | Some([c]) | Some([]) (no overlap) |
-| Some([]) | * | Some([]) (manifest deny-all) |
-| * | Some([]) | Some([]) (operator deny-all) |
+| Manifest    | Operator    | Result                         |
+| ----------- | ----------- | ------------------------------ |
+| None        | None        | None (unrestricted)            |
+| None        | Some([a,b]) | Some([a,b]) (operator narrows) |
+| Some([a,b]) | None        | Some([a,b]) (manifest only)    |
+| Some([a,b]) | Some([a])   | Some([a]) (intersection)       |
+| Some([a])   | Some([c])   | Some([]) (no overlap)          |
+| Some([])    | \*          | Some([]) (manifest deny-all)   |
+| \*          | Some([])    | Some([]) (operator deny-all)   |
 
 If the intersection is empty, the effective allowlist is `Some([])` — the `ScopedAgentStateAdmin` rejects all agents. The cap slot is still `Some` (not `None`) because the extension can still function — it just gets `Err` on every operation.
 
@@ -285,44 +285,44 @@ Per-tool scoping (in `tool_policy`) is a future refinement.
 
 ## Relationships to Other Caps
 
-| Capability | Relationship |
-|---|---|
-| `SessionRead` / `SessionWrite` | Session-scoped. `AgentStateAdmin` is agent-scoped. The two are orthogonal — a tool might have both, one, or neither. |
-| `ToolRegistration` | The extension registers tools *using* `ToolRegistration`; those tools *consume* `AgentStateAdmin`. Different lifecycle phases (install vs. execute). |
-| `Memory` | Future: `AgentStateAdmin` could subsume `MemoryAccess` for agent-scoped memory. Today they're separate — `Memory` is text search/recall; `AgentStateAdmin` is raw DB access. |
-| `Shell` / `FileWrite` | OS-level, enforced by `ToolHost` at tool-execute time. `AgentStateAdmin` is data-level, enforced by trait scoping at install time. |
+| Capability                     | Relationship                                                                                                                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SessionRead` / `SessionWrite` | Session-scoped. `AgentStateAdmin` is agent-scoped. The two are orthogonal — a tool might have both, one, or neither.                                                         |
+| `ToolRegistration`             | The extension registers tools _using_ `ToolRegistration`; those tools _consume_ `AgentStateAdmin`. Different lifecycle phases (install vs. execute).                         |
+| `Memory`                       | Future: `AgentStateAdmin` could subsume `MemoryAccess` for agent-scoped memory. Today they're separate — `Memory` is text search/recall; `AgentStateAdmin` is raw DB access. |
+| `Shell` / `FileWrite`          | OS-level, enforced by `ToolHost` at tool-execute time. `AgentStateAdmin` is data-level, enforced by trait scoping at install time.                                           |
 
 ## Implementation Log
 
-| Step | Status |
-|---|---|
-| `CapabilityKind::AgentStateAdmin` + trait + request + provider + caps slot | ✅ `caps.rs` |
-| `ScopedAgentStateAdmin` wrapper | ✅ `agent_state.rs` (8 tests) |
-| Hub wiring — `set_hosted_index`, `build_agent_state_admin` | ✅ `extension/mod.rs` |
-| Operator config — `agent_state_allowlist` in `Config` + `set_agent_state_allowlist` | ✅ `config.rs`, `main.rs` |
-| Allowlist intersection — `resolve_agent_allowlist` | ✅ `extension/mod.rs` (8 tests) |
-| Tool migration — `Arc<dyn AgentStateAdmin>` replaces `HostedIndex` + `AgentDbAccess` | ✅ `tools/heartbeat.rs` |
-| Extension migration — declares `AgentStateAdmin` in manifest | ✅ `extensions/heartbeat.rs` |
-| Remove old `AgentDbAccess`/`RegistryAgentDbAccess` traits | ✅ |
-| Clean up unused `_registry` parameter | ✅ |
+| Step                                                                                 | Status                          |
+| ------------------------------------------------------------------------------------ | ------------------------------- |
+| `CapabilityKind::AgentStateAdmin` + trait + request + provider + caps slot           | ✅ `caps.rs`                    |
+| `ScopedAgentStateAdmin` wrapper                                                      | ✅ `agent_state.rs` (8 tests)   |
+| Hub wiring — `set_hosted_index`, `build_agent_state_admin`                           | ✅ `extension/mod.rs`           |
+| Operator config — `agent_state_allowlist` in `Config` + `set_agent_state_allowlist`  | ✅ `config.rs`, `main.rs`       |
+| Allowlist intersection — `resolve_agent_allowlist`                                   | ✅ `extension/mod.rs` (8 tests) |
+| Tool migration — `Arc<dyn AgentStateAdmin>` replaces `HostedIndex` + `AgentDbAccess` | ✅ `tools/heartbeat.rs`         |
+| Extension migration — declares `AgentStateAdmin` in manifest                         | ✅ `extensions/heartbeat.rs`    |
+| Remove old `AgentDbAccess`/`RegistryAgentDbAccess` traits                            | ✅                              |
+| Clean up unused `_registry` parameter                                                | ✅                              |
 
 ## Tests
 
-| Location | Test | What it verifies |
-|---|---|---|
-| `agent_state.rs` | `scoped_resolve_allows_known_agent` | Agent in allowed set resolves correctly |
-| `agent_state.rs` | `scoped_resolve_rejects_unknown_agent` | Agent outside allowed set returns `Err` |
-| `agent_state.rs` | `scoped_resolve_resolves_by_id_and_checks_scope` | DB id lookup also enforces allowlist |
-| `agent_state.rs` | `scoped_resolve_by_id_rejects_scoped_out_agent` | ID lookup of denied agent fails |
-| `agent_state.rs` | `scoped_open_db_rejects_scoped_out_entry` | `open_agent_db` checks scope even without `resolve_agent` |
-| `agent_state.rs` | `scoped_open_db_succeeds_for_allowed_agent` | Happy path — opens DB for allowed agent |
-| `agent_state.rs` | `none_allowlist_is_unrestricted` | `None` → all agents visible |
-| `agent_state.rs` | `empty_allowlist_denies_all` | `Some([])` → deny-all |
-| `extension/mod.rs` | `both_none_is_unrestricted` | No manifest or operator allowlist |
-| `extension/mod.rs` | `operator_narrows_unrestricted_manifest` | Operator restricts manifest |
-| `extension/mod.rs` | `manifest_only_when_operator_absent` | Manifest stands alone |
-| `extension/mod.rs` | `intersection_when_both_set` | Intersect of manifest + operator |
-| `extension/mod.rs` | `no_overlap_returns_empty_deny_all` | Non-overlapping = deny-all |
-| `extension/mod.rs` | `manifest_empty_is_deny_all` | Manifest empty overrides operator |
-| `extension/mod.rs` | `operator_empty_is_deny_all` | Operator empty overrides manifest |
-| `extension/mod.rs` | `operator_matches_manifest_exactly` | Exact match preserved |
+| Location           | Test                                             | What it verifies                                          |
+| ------------------ | ------------------------------------------------ | --------------------------------------------------------- |
+| `agent_state.rs`   | `scoped_resolve_allows_known_agent`              | Agent in allowed set resolves correctly                   |
+| `agent_state.rs`   | `scoped_resolve_rejects_unknown_agent`           | Agent outside allowed set returns `Err`                   |
+| `agent_state.rs`   | `scoped_resolve_resolves_by_id_and_checks_scope` | DB id lookup also enforces allowlist                      |
+| `agent_state.rs`   | `scoped_resolve_by_id_rejects_scoped_out_agent`  | ID lookup of denied agent fails                           |
+| `agent_state.rs`   | `scoped_open_db_rejects_scoped_out_entry`        | `open_agent_db` checks scope even without `resolve_agent` |
+| `agent_state.rs`   | `scoped_open_db_succeeds_for_allowed_agent`      | Happy path — opens DB for allowed agent                   |
+| `agent_state.rs`   | `none_allowlist_is_unrestricted`                 | `None` → all agents visible                               |
+| `agent_state.rs`   | `empty_allowlist_denies_all`                     | `Some([])` → deny-all                                     |
+| `extension/mod.rs` | `both_none_is_unrestricted`                      | No manifest or operator allowlist                         |
+| `extension/mod.rs` | `operator_narrows_unrestricted_manifest`         | Operator restricts manifest                               |
+| `extension/mod.rs` | `manifest_only_when_operator_absent`             | Manifest stands alone                                     |
+| `extension/mod.rs` | `intersection_when_both_set`                     | Intersect of manifest + operator                          |
+| `extension/mod.rs` | `no_overlap_returns_empty_deny_all`              | Non-overlapping = deny-all                                |
+| `extension/mod.rs` | `manifest_empty_is_deny_all`                     | Manifest empty overrides operator                         |
+| `extension/mod.rs` | `operator_empty_is_deny_all`                     | Operator empty overrides manifest                         |
+| `extension/mod.rs` | `operator_matches_manifest_exactly`              | Exact match preserved                                     |

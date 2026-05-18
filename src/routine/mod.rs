@@ -24,8 +24,8 @@ pub mod types;
 
 pub use engine::{GLOBAL_ROUTINES_STORE, LAST_FIRED_STORE, RoutineEngine, SESSION_ROUTINES_STORE};
 pub use types::{
-    AGENT_TIMER_EXTENSION, AgentTimerPayload, Routine, RoutineId, RoutineScope, RoutineTarget,
-    Trigger, generate_id,
+    AGENT_SCHEDULE_EXTENSION, AgentSchedulePayload, Routine, RoutineId, RoutineScope,
+    RoutineTarget, Trigger, generate_id,
 };
 
 use eidetica::Database;
@@ -40,7 +40,7 @@ use tracing::warn;
 ///
 /// This is the seam that makes scheduling live: every routine mutation
 /// funnels through [`upsert_session_routine`] / [`remove_session_routine`]
-/// (tools, the `/heartbeat` command, `wake_me_up`, `agent_delete`'s
+/// (tools, the `/schedule` command, `schedule_once`, `agent_delete`'s
 /// sweep), so resyncing the engine here covers all of them — including
 /// future callers — without threading an engine handle through every
 /// tool/command context.
@@ -78,11 +78,11 @@ pub async fn notify_session_closed(session_db_id: &str) {
     }
 }
 
-/// Resync one agent's timers from its DB into the running engine's
+/// Resync one agent's schedules from its DB into the running engine's
 /// heap after a committed change (add/remove/edit). Best-effort:
 /// a reload failure is logged, not propagated — the durable DB write
 /// already succeeded.
-pub async fn notify_agent_timers_changed(
+pub async fn notify_agent_schedules_changed(
     agent_db_id: &str,
     agent_db: &crate::agent_db::AgentDb,
 ) {
@@ -90,7 +90,7 @@ pub async fn notify_agent_timers_changed(
         return;
     };
     if let Err(e) = engine.reload_agent(agent_db_id, agent_db).await {
-        warn!(agent = %agent_db_id, "routine engine reload_agent after timer change failed: {e}");
+        warn!(agent = %agent_db_id, "routine engine reload_agent after schedule change failed: {e}");
     }
 }
 
