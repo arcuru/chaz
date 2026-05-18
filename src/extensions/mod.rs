@@ -6,6 +6,7 @@
 //! are surfaced to the runtime by reading `hub.tools_for_registry()` and
 //! pushing them into the legacy [`crate::tool::ToolRegistry`].
 
+pub mod agent_timer;
 pub mod core;
 pub mod fs;
 pub mod heartbeat;
@@ -41,9 +42,11 @@ pub struct BuiltinDeps {
 /// Build the full built-in extension set as a vector. Consumed by
 /// `ExtensionHub::install_all` (cap-based install path).
 pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extension>> {
+    let spawn_cell = deps.spawn_server_cell;
+    let session_registry = deps.session_registry;
     vec![
         Arc::new(core::CoreExtension::new(
-            deps.spawn_server_cell,
+            spawn_cell.clone(),
             deps.backend_manager,
             deps.security,
         )),
@@ -53,11 +56,12 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
         Arc::new(system::SystemExtension),
         Arc::new(web::WebExtension::new(deps.web_search_backends)),
         Arc::new(memory::MemoryExtension::new(
-            deps.session_registry,
+            session_registry.clone(),
             deps.agent_index.clone(),
             deps.embedder,
         )),
         Arc::new(heartbeat::HeartbeatExtension::new(deps.agent_index)),
+        Arc::new(agent_timer::AgentTimerExtension::new(spawn_cell)),
         Arc::new(scheduler::ScheduleExtension),
     ]
 }

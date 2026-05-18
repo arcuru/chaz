@@ -358,6 +358,10 @@ async fn main() -> anyhow::Result<()> {
     // takes ownership of the cell and constructs the spawn tools.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
 
+    // Default backend used for timer-fired Fresh sessions and as a
+    // fallback when a Pinned session has no registered SessionRuntime.
+    let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
+
     // Install every built-in extension on the hub via the cap-based
     // install path. Tools and commands flow through the per-extension
     // `caps.tool_registration` / `caps.command_registration` queues that
@@ -365,6 +369,8 @@ async fn main() -> anyhow::Result<()> {
     // `InstalledExtension` are bridged into the legacy hook vectors so
     // the existing `fire_*` paths run unchanged.
     extension_hub.set_session_registry(registry.clone());
+    extension_hub.set_hosted_index(agent_index_store.clone());
+    extension_hub.set_agent_state_allowlist(config.agent_state_allowlist.clone());
     extension_hub
         .install_all(extensions::all_builtins(extensions::BuiltinDeps {
             agent_index: agent_index_store.clone(),
@@ -372,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
             embedder: embedder.clone(),
             web_search_backends,
             spawn_server_cell: spawn_server_cell.clone(),
-            backend_manager: backends::BackendManager::new(&config.backends, secret_store.clone()),
+            backend_manager: default_backend.clone(),
             security: security_ctx.clone(),
         }))
         .await?;
@@ -459,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
         context_config,
         tool_host,
         extension_hub,
+        default_backend.clone(),
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),
@@ -546,7 +553,6 @@ async fn main() -> anyhow::Result<()> {
         // watching those sessions so directive writes from fires drive
         // an agent turn.
         let sessions = registry.list_sessions().await.unwrap_or_default();
-        let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
         for s in sessions {
             let Ok((_conv, sdb)) = registry.open_session(&s.session_db_id).await else {
                 continue;

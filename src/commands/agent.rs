@@ -907,6 +907,8 @@ mod tests {
             auto_approved_tools: std::collections::HashSet::new(),
             approval_callback: None,
         };
+        let secrets = SecretStore::new(chaz_peer).await;
+        let backend_mgr = BackendManager::new(&None, secrets.clone());
         let server = Server::new(
             registry.clone(),
             agents,
@@ -919,9 +921,8 @@ mod tests {
             Default::default(),
             std::sync::Arc::new(crate::tool_host::NativeToolHost::new()),
             std::sync::Arc::new(crate::extension::ExtensionHub::new()),
+            backend_mgr.clone(),
         );
-        let secrets = SecretStore::new(chaz_peer).await;
-        let backend_mgr = BackendManager::new(&None, secrets.clone());
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
         (
@@ -1106,9 +1107,10 @@ mod tests {
         )
         .await;
         dispatch(Command::AgentAdd("alpha".to_string()), &ctx).await;
-        // Seed the routine directly via the storage primitive — the
-        // dispatch surface lives in the heartbeat *extension* now and
-        // isn't wired into this fixture's hub.
+        // Seed a legacy session routine directly — the dispatch surface
+        // lives in the heartbeat extension now and isn't wired into this
+        // fixture's hub. Agent-owned timers are the new path; this
+        // exercises the sweep for residual session routines.
         let alpha_entry = server
             .agent_index()
             .find_by_name("alpha")
@@ -1137,13 +1139,23 @@ mod tests {
         let before = crate::routine::list_session_routines(&sdb).await.unwrap();
         assert_eq!(before.len(), 1);
 
-        // Detach first (delete refuses while attached), then delete.
+        // Detach first (delete refuses while attached).
         dispatch(Command::AgentRemove("alpha".to_string()), &ctx).await;
-        // Detach-side cleanup should already have removed the routine.
+        // Detach no longer sweeps session routines — timers are now
+        // agent-owned. Legacy routines remain until agent_delete.
         let after_detach = crate::routine::list_session_routines(&sdb).await.unwrap();
+        assert_eq!(
+            after_detach.len(),
+            1,
+            "legacy routine survives detach (timers now agent-owned)"
+        );
+
+        // agent_delete sweeps via sweep_for_agent for legacy cleanup.
+        dispatch(Command::AgentDelete("alpha".to_string()), &ctx).await;
+        let after_delete = crate::routine::list_session_routines(&sdb).await.unwrap();
         assert!(
-            after_detach.is_empty(),
-            "detach should sweep heartbeat routines, got {after_detach:?}"
+            after_delete.is_empty(),
+            "agent_delete should sweep legacy heartbeat routines, got {after_delete:?}"
         );
     }
 

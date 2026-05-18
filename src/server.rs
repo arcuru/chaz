@@ -85,6 +85,9 @@ pub struct Server {
     host: Arc<dyn ToolHost>,
     /// Compile-time extension hub: hook handlers, extension commands.
     extensions: Arc<ExtensionHub>,
+    /// Default backend used for timer-fired Fresh sessions and fallback
+    /// when a Pinned session has no registered SessionRuntime.
+    default_backend: BackendManager,
     /// Per-session runtime state keyed by session_db_id
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     /// Track which session DBs have server callbacks registered
@@ -113,6 +116,7 @@ impl Server {
         context_config: ContextConfig,
         host: Arc<dyn ToolHost>,
         extensions: Arc<ExtensionHub>,
+        default_backend: BackendManager,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
@@ -129,6 +133,7 @@ impl Server {
             context_config,
             host,
             extensions,
+            default_backend,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -408,6 +413,445 @@ impl Server {
             .await;
 
         Ok((conversation_id, session_db, completion_rx))
+    }
+
+    // -----------------------------------------------------------------
+    // Agent-Owned Timer fire path (Stage 3)
+    // -----------------------------------------------------------------
+
+    /// Standalone execution path for agent-owned timer fires.
+    ///
+    /// This is deliberately separate from [`Self::process_session`] — it
+    /// calls [`crate::runtime::execute`] directly without touching the
+    /// session's `SessionRuntime` (agent_override, backend, completion
+    /// channel). A Pinned timer firing into a live session the user is
+    /// chatting in does not hijack the interactive routing.
+    ///
+    /// Steps:
+    /// 1. Host check — skip if the agent isn't on this peer.
+    /// 2. Resolve target — Fresh creates a session + attaches the owner;
+    ///    Pinned opens the existing session + idempotently attaches.
+    /// 3. Acquire the session's `processing` lock; skip if busy.
+    /// 4. Load the agent, build context with the wake-prompt as a private
+    ///    System message, run the ReAct loop.
+    /// 5. Write ToolCall/ToolResult entries + a terminal Message (only if
+    ///    non-empty; silent turns produce no entry).
+    /// 6. Record a [`crate::agent_db::TimerFire`] with usage on the
+    ///    agent's DB.
+    /// 7. One-shot cleanup: delete the Timer row from the agent DB.
+    pub async fn fire_agent_timer(
+        &self,
+        payload: crate::routine::AgentTimerPayload,
+    ) -> anyhow::Result<()> {
+        use crate::agent_db::{TimerFire, TimerTarget};
+
+        // 1. Host check — unparseable IDs are silently skipped (they
+        //    can't possibly be hosted on this peer).
+        let owner_id = match eidetica::entry::ID::parse(&payload.owner_agent_db_id) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::debug!(
+                    agent_db_id = %payload.owner_agent_db_id,
+                    timer = %payload.timer_id,
+                    "Unparseable owner_agent_db_id; skipping timer fire: {e}"
+                );
+                return Ok(());
+            }
+        };
+        let Some(agent_entry) = self.agent_index.find_by_id(&owner_id) else {
+            tracing::debug!(
+                agent_db_id = %payload.owner_agent_db_id,
+                timer = %payload.timer_id,
+                "Agent not hosted on this peer; skipping timer fire"
+            );
+            return Ok(());
+        };
+
+        // 2. Resolve target
+        let target: TimerTarget = serde_json::from_value(payload.target)
+            .map_err(|e| anyhow::anyhow!("invalid timer target in payload: {e}"))?;
+
+        let agent_name = agent_entry.display_name.clone();
+
+        let (session_db, is_fresh, session_db_id) = match &target {
+            TimerTarget::Fresh => {
+                let source =
+                    format!("timer:{}:{}", payload.owner_agent_db_id, payload.timer_id);
+                let (_conv, db) = self.registry.create_session(Some(&source)).await?;
+                let sid = db.root_id().to_string();
+
+                // Attach the owner agent to the session so it has Write
+                // permission and the session meta records membership.
+                self.registry
+                    .attach_agent_to_session(&sid, &agent_entry)
+                    .await?;
+
+                // Register with the server so the session has a
+                // SessionRuntime (backend + on_write callback) for any
+                // tools that need it (spawn_agent writes to the on_write
+                // path). The agent_override is set to the timer owner so
+                // future interactive writes route to this agent.
+                self.register_session(
+                    &db,
+                    self.default_backend.clone(),
+                    Some(agent_name.clone()),
+                    None,
+                )
+                .await?;
+
+                tracing::info!(
+                    session = %sid,
+                    agent = %agent_name,
+                    timer = %payload.timer_id,
+                    "Created Fresh session for agent timer fire"
+                );
+
+                (db, true, sid)
+            }
+            TimerTarget::Pinned { session_db_id } => {
+                let (_conv, db) = self.registry.open_session(session_db_id).await?;
+                let sid = session_db_id.clone();
+
+                // Idempotent attach: if the agent was detached after the
+                // timer was created, the fire-time membership check
+                // catches it and re-attaches. If attach fails (session
+                // gone, auth broken), skip this fire.
+                let session = Session::new(
+                    ConversationId(sid.clone()),
+                    db.clone(),
+                )
+                .await;
+                let meta = session.read_meta().await;
+                let already_member = meta
+                    .agents
+                    .iter()
+                    .any(|a| a.db_id == agent_entry.db_id.to_string());
+                if !already_member {
+                    if let Err(e) = self
+                        .registry
+                        .attach_agent_to_session(&sid, &agent_entry)
+                        .await
+                    {
+                        tracing::warn!(
+                            session = %sid,
+                            agent = %agent_name,
+                            timer = %payload.timer_id,
+                            "Pinned timer: failed to re-attach agent to session: {e}"
+                        );
+                        return Ok(()); // self-skip
+                    }
+                    tracing::info!(
+                        session = %sid,
+                        agent = %agent_name,
+                        timer = %payload.timer_id,
+                        "Pinned timer: re-attached agent to session"
+                    );
+                }
+
+                (db, false, sid)
+            }
+        };
+
+        // 3. Acquire the processing lock (skip if session is busy).
+        //    Release at the end of this scope via the deferred block.
+        {
+            let mut processing = self.processing.lock().await;
+            if !processing.insert(session_db_id.clone()) {
+                tracing::debug!(
+                    session = %session_db_id,
+                    timer = %payload.timer_id,
+                    "Session busy; skipping timer fire"
+                );
+                return Ok(());
+            }
+        }
+
+        // 4. Load the agent + build context + run the turn.
+        let outcome = self
+            .run_timer_turn(
+                &agent_name,
+                &session_db,
+                &session_db_id,
+                &payload.prompt,
+                &payload.timer_id,
+            )
+            .await;
+
+        // Release the processing lock.
+        {
+            let mut processing = self.processing.lock().await;
+            processing.remove(&session_db_id);
+        }
+
+        // 5. Record TimerFire on the agent's DB (best-effort audit).
+        let fired_at = Utc::now();
+        if let Some(adb) = self.open_agent_db_for_timer(&agent_entry).await {
+            let fire = TimerFire {
+                timer_id: payload.timer_id.clone(),
+                fired_at,
+                session_db_id: session_db_id.clone(),
+                fresh: is_fresh,
+                usage: outcome.as_ref().ok().and_then(|o| o.metadata.clone()),
+            };
+            if let Err(e) = adb.record_timer_fire(fire).await {
+                tracing::error!(
+                    agent = %agent_name,
+                    timer = %payload.timer_id,
+                    "Failed to record TimerFire: {e}"
+                );
+            }
+        }
+
+        // 6. One-shot cleanup: delete the Timer row after a successful fire.
+        if payload.one_shot
+            && let Some(adb) = self.open_agent_db_for_timer(&agent_entry).await
+        {
+            if let Err(e) = adb.remove_timer(&payload.timer_id).await {
+                tracing::error!(
+                    agent = %agent_name,
+                    timer = %payload.timer_id,
+                    "Failed to remove one-shot timer: {e}"
+                );
+            } else {
+                tracing::info!(
+                    agent = %agent_name,
+                    timer = %payload.timer_id,
+                    "Removed one-shot timer after successful fire"
+                );
+            }
+        }
+
+        // Surface any runtime error
+        outcome.map(|_| ())
+    }
+
+    /// Open the agent's Living Agent DB if this peer hosts the agent.
+    async fn open_agent_db_for_timer(
+        &self,
+        entry: &crate::hosted_index::DbEntry,
+    ) -> Option<crate::agent_db::AgentDb> {
+        match self
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+        {
+            Ok(Some(adb)) => Some(adb),
+            Ok(None) => {
+                tracing::warn!(agent = %entry.display_name, "No key for agent DB; can't write fire audit");
+                None
+            }
+            Err(e) => {
+                tracing::error!(agent = %entry.display_name, "Failed to open agent DB: {e}");
+                None
+            }
+        }
+    }
+
+    /// Load the agent, hydrate from DB, build context with the wake-prompt
+    /// as a private System message, run the ReAct loop, and write entries.
+    ///
+    /// Returns the [`crate::runtime::RuntimeOutcome`] so the caller can
+    /// extract usage metadata for cost attribution.
+    async fn run_timer_turn(
+        &self,
+        agent_name: &str,
+        session_db: &eidetica::Database,
+        session_db_id: &str,
+        wake_prompt: &str,
+        timer_id: &str,
+    ) -> anyhow::Result<crate::runtime::RuntimeOutcome> {
+        // Load the agent: check the in-memory registry first; build from
+        // DB config if not present (agent was never attached to a session
+        // this boot).
+        let mut agent = match self.agents.get(agent_name) {
+            Some(a) => a,
+            None => {
+                // Build a minimal agent from the DB config.
+                // hydrate_agent_from_db below will fill in the rest.
+                self.agents
+                    .build_from_db_config(agent_name, &crate::agent_db::AgentDbConfig::default())
+            }
+        };
+        // Hydrate from the Living Agent DB (Stage 8 refresh).
+        agent = self.hydrate_agent_from_db(agent).await;
+
+        let default_model = agent.default_model.clone();
+        let allowed_tools = agent.allowed_tools.clone();
+        let agent_grants = agent.grants.clone();
+        let max_call_depth = agent.max_iterations as usize;
+        let max_context_tokens = agent.max_context_tokens;
+        let profile = agent
+            .tool_profile
+            .as_ref()
+            .and_then(|name| self.tool_profiles.get(name))
+            .cloned()
+            .unwrap_or_default();
+
+        let active_extensions = self.active_extensions_for(session_db_id).await;
+        let scoped_tools = ScopedTools::new(self.tools.clone(), allowed_tools)
+            .with_active_extensions(Some(active_extensions.clone()));
+
+        // Build the session view + context
+        let session = Session::new(
+            ConversationId(session_db_id.to_string()),
+            session_db.clone(),
+        )
+        .await;
+        let session = Arc::new(tokio::sync::Mutex::new(session));
+
+        let tool_ctx = ToolContext {
+            agent_name: agent_name.to_string(),
+            call_depth: 0,
+            max_call_depth,
+            tools: scoped_tools,
+            profile,
+            session: session.clone(),
+            grants: Default::default(),
+            agent_grants,
+            host: self.host.clone(),
+            active_extensions: active_extensions.clone(),
+        };
+
+        let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+        let mut assembled = {
+            let s = session.lock().await;
+            let roster: Vec<String> = s
+                .read_meta()
+                .await
+                .agents
+                .iter()
+                .map(|a| a.display_name.clone())
+                .collect();
+            ContextBuilder::new(s.entries(), agent_name, &self.context_config)
+                .with_role(agent.default_role.as_ref())
+                .with_tools(&tool_defs)
+                .with_max_tokens_override(max_context_tokens)
+                .with_room_participants(&roster)
+                .build()
+        };
+
+        // Prepend the wake-prompt as a private System message. This is
+        // invocation-scoped — it never appears as a session entry.
+        assembled
+            .messages
+            .insert(0, crate::runtime::RuntimeMessage::System(wake_prompt.to_string()));
+
+        if assembled.truncated {
+            tracing::info!(
+                agent = %agent_name,
+                timer = %timer_id,
+                "Context truncated: {} entries, ~{} tokens",
+                assembled.entries_included,
+                assembled.estimated_tokens
+            );
+        }
+
+        // Event writer: capture ToolCall/ToolResult as session entries.
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<crate::runtime::RuntimeEvent>(64);
+        let event_session = session.clone();
+        let event_agent = agent_name.to_string();
+        let event_writer = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                let mut s = event_session.lock().await;
+                match event {
+                    crate::runtime::RuntimeEvent::ToolCall {
+                        name,
+                        arguments,
+                        ..
+                    } => {
+                        s.add_entry(SessionEntry {
+                            sender: event_agent.clone(),
+                            content: format!("{name}({arguments})"),
+                            timestamp: Utc::now(),
+                            entry_type: EntryType::ToolCall,
+                            metadata: None,
+                        })
+                        .await;
+                    }
+                    crate::runtime::RuntimeEvent::ToolResult {
+                        name,
+                        output,
+                        is_error,
+                        ..
+                    } => {
+                        let content = if is_error {
+                            format!("{name}: ERROR: {output}")
+                        } else {
+                            let t = crate::util::truncate_chars(&output, 500);
+                            let truncated = if t.len() < output.len() {
+                                format!("{t}…")
+                            } else {
+                                output
+                            };
+                            format!("{name}: {truncated}")
+                        };
+                        s.add_entry(SessionEntry {
+                            sender: event_agent.clone(),
+                            content,
+                            timestamp: Utc::now(),
+                            entry_type: EntryType::ToolResult,
+                            metadata: None,
+                        })
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let request_security = SecurityContext {
+            leak_detector: self.security.leak_detector.clone(),
+            auto_approved_tools: self.security.auto_approved_tools.clone(),
+            approval_callback: None, // no interactive approval for timer fires
+        };
+
+        let result = crate::runtime::execute(
+            default_model.as_deref(),
+            assembled.messages,
+            &self.default_backend,
+            &request_security,
+            &tool_ctx,
+            &self.policies,
+            Some(event_tx),
+            Some(self.extensions.as_ref()),
+        )
+        .await;
+
+        let _ = event_writer.await;
+
+        // Write the terminal Message (conditional — skip empty).
+        let mut s = session.lock().await;
+        match &result {
+            Ok(outcome) if outcome.body.trim().is_empty() => {
+                tracing::debug!(
+                    agent = %agent_name,
+                    timer = %timer_id,
+                    "Silent timer turn — no Message written"
+                );
+            }
+            Ok(outcome) => {
+                s.add_entry(SessionEntry {
+                    sender: agent_name.to_string(),
+                    content: outcome.body.clone(),
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Message,
+                    metadata: outcome.metadata.clone(),
+                })
+                .await;
+            }
+            Err(err) => {
+                s.add_entry(SessionEntry {
+                    sender: agent_name.to_string(),
+                    content: format!("Error: {err}"),
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Error,
+                    metadata: None,
+                })
+                .await;
+            }
+        }
+
+        result.map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Build a `HookContext` for the given session and fire `session_start`.
@@ -956,6 +1400,8 @@ mod tests {
             auto_approved_tools: std::collections::HashSet::new(),
             approval_callback: None,
         };
+        let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+        let default_backend = crate::backends::BackendManager::new(&None, secrets);
         let server = Server::new(
             registry.clone(),
             agents,
@@ -968,6 +1414,7 @@ mod tests {
             Default::default(),
             Arc::new(crate::tool_host::NativeToolHost::new()),
             Arc::new(crate::extension::ExtensionHub::new()),
+            default_backend,
         );
         (instance, server, registry)
     }
@@ -1085,5 +1532,311 @@ mod tests {
         assert_eq!(result.name, "phantom");
         assert_eq!(result.default_model.as_deref(), Some("ghost"));
         assert_eq!(result.max_iterations, 7);
+    }
+
+    // -----------------------------------------------------------------
+    // Agent-Owned Timer integration tests (Stage 3)
+    // -----------------------------------------------------------------
+    //
+    // These tests exercise `fire_agent_timer` through the full plumbing
+    // (session creation, agent attachment, timer-fire audit, one-shot
+    // cleanup, processing lock). The LLM call fails deterministically
+    // (empty backend), which is fine — the plumbing around the call is
+    // what we're testing.
+
+    use crate::agent_db::Timer;
+    use crate::routine::{AgentTimerPayload, Trigger};
+
+    /// Create an agent DB, register it in the HostedIndex, seed its
+    /// config, and return the DbEntry and AgentDb handle.
+    async fn seed_agent(
+        server: &Server,
+        registry: &crate::session::SessionRegistry,
+        name: &str,
+    ) -> (DbEntry, crate::agent_db::AgentDb) {
+        let (adb, pubkey) = {
+            let mut user = registry.user_for_tests().await;
+            create_agent_db(
+                &mut user,
+                name,
+                &AgentDbConfig {
+                    model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+                &AgentMeta {
+                    display_name: Some(name.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        };
+        let entry = DbEntry {
+            db_id: adb.id(),
+            display_name: name.to_string(),
+            pubkey,
+        };
+        server.agent_index().register(entry.clone());
+        (entry, adb)
+    }
+
+    /// Build an `AgentTimerPayload` for a Fresh (non-recurring) timer.
+    fn fresh_timer_payload(
+        owner_agent_db_id: &str,
+        timer_id: &str,
+        prompt: &str,
+    ) -> AgentTimerPayload {
+        AgentTimerPayload {
+            owner_agent_db_id: owner_agent_db_id.to_string(),
+            timer_id: timer_id.to_string(),
+            prompt: prompt.to_string(),
+            target: serde_json::to_value(crate::agent_db::TimerTarget::Fresh).unwrap(),
+            one_shot: true,
+        }
+    }
+
+    /// Build an `AgentTimerPayload` for a Pinned timer.
+    fn pinned_timer_payload(
+        owner_agent_db_id: &str,
+        timer_id: &str,
+        prompt: &str,
+        session_db_id: &str,
+    ) -> AgentTimerPayload {
+        AgentTimerPayload {
+            owner_agent_db_id: owner_agent_db_id.to_string(),
+            timer_id: timer_id.to_string(),
+            prompt: prompt.to_string(),
+            target: serde_json::to_value(crate::agent_db::TimerTarget::Pinned {
+                session_db_id: session_db_id.to_string(),
+            })
+            .unwrap(),
+            one_shot: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_timer_host_check_skips_non_hosted() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        // Create an agent DB but DON'T register it in the hosted index —
+        // its ID is valid but find_by_id will return None.
+        let (adb, _pubkey) = {
+            let mut user = registry.user_for_tests().await;
+            create_agent_db(
+                &mut user,
+                "ghost",
+                &AgentDbConfig::default(),
+                &AgentMeta {
+                    display_name: Some("ghost".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        };
+        let unhosted_id = adb.id().to_string();
+
+        let payload = fresh_timer_payload(&unhosted_id, "t1", "wake up");
+        let result = server.fire_agent_timer(payload).await;
+        assert!(result.is_ok(), "host check should return Ok(()) — just skip: {result:?}");
+        // No sessions should have been created.
+        let sessions = registry.list_sessions().await.unwrap_or_default();
+        assert!(
+            !sessions.iter().any(|s| {
+                s.source
+                    .as_deref()
+                    .is_some_and(|src| src.contains("ghost") || src.contains("timer:"))
+            }),
+            "no timer session should exist for a non-hosted agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_timer_fresh_creates_session_and_attaches_agent() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        // Seed an agent.
+        let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+
+        // Add a timer to the agent DB.
+        adb.upsert_timer(Timer::new(
+            "morning".to_string(),
+            Trigger::OneShot {
+                fire_at: chrono::Utc::now(),
+            },
+            "good morning".to_string(),
+            crate::agent_db::TimerTarget::Fresh,
+        ))
+        .await
+        .unwrap();
+
+        let payload = fresh_timer_payload(&entry.db_id.to_string(), "morning", "good morning");
+        let result = server.fire_agent_timer(payload).await;
+        // LLM call fails (no backends), but the plumbing should succeed.
+        // Errors from the LLM are propagated through the outcome.
+        match result {
+            Ok(()) => {} // if somehow it succeeded, that's fine too
+            Err(e) => assert!(
+                e.to_string().contains("No backends configured"),
+                "expected backend error, got: {e}"
+            ),
+        }
+
+        // Verify a Fresh session was created with the correct source tag.
+        let sessions = registry.list_sessions().await.unwrap_or_default();
+        let timer_session = sessions
+            .iter()
+            .find(|s| {
+                s.source
+                    .as_deref()
+                    .is_some_and(|src| src.starts_with("timer:"))
+            })
+            .expect("a timer session should exist");
+        assert!(
+            timer_session
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("morning")),
+            "session source should contain timer id"
+        );
+
+        // Verify the agent is attached to the session.
+        let (_conv, session_db) = registry
+            .open_session(&timer_session.session_db_id)
+            .await
+            .unwrap();
+        let session = Session::new(
+            ConversationId(timer_session.session_db_id.clone()),
+            session_db,
+        )
+        .await;
+        let meta = session.read_meta().await;
+        assert!(
+            meta.agents.iter().any(|a| a.display_name == "alpha"),
+            "agent should be attached to the fresh session: {:?}",
+            meta.agents
+        );
+
+        // Verify TimerFire was recorded in the agent DB.
+        let fires = adb.list_timer_fires().await.unwrap();
+        assert_eq!(fires.len(), 1, "one TimerFire should be recorded");
+        let fire = &fires[0];
+        assert_eq!(fire.timer_id, "morning");
+        assert!(fire.fresh, "should be marked as fresh");
+        assert_eq!(
+            fire.session_db_id, timer_session.session_db_id,
+            "fire should reference the created session"
+        );
+
+        // One-shot: timer should be deleted.
+        let remaining = adb.list_timers().await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "one-shot timer should be deleted after fire, got {} timers",
+            remaining.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_timer_pinned_reuses_existing_session() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        // Seed an agent.
+        let (entry, adb) = seed_agent(&server, &registry, "beta").await;
+
+        // Create a session and attach the agent.
+        let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
+        let session_db_id = session_db.root_id().to_string();
+        registry
+            .attach_agent_to_session(&session_db_id, &entry)
+            .await
+            .unwrap();
+
+        // Add a Pinned timer targeting this session.
+        adb.upsert_timer(Timer::new(
+            "checkin".to_string(),
+            Trigger::OneShot {
+                fire_at: chrono::Utc::now(),
+            },
+            "checking in".to_string(),
+            crate::agent_db::TimerTarget::Pinned {
+                session_db_id: session_db_id.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let session_count_before = registry.list_sessions().await.unwrap_or_default().len();
+
+        let payload =
+            pinned_timer_payload(&entry.db_id.to_string(), "checkin", "checking in", &session_db_id);
+        let result = server.fire_agent_timer(payload).await;
+        match result {
+            Ok(()) => {}
+            Err(e) => assert!(e.to_string().contains("No backends configured"), "{e}"),
+        }
+
+        // No new session should have been created.
+        let session_count_after = registry.list_sessions().await.unwrap_or_default().len();
+        assert_eq!(
+            session_count_before, session_count_after,
+            "Pinned fire should not create a new session"
+        );
+
+        // TimerFire should still be recorded.
+        let fires = adb.list_timer_fires().await.unwrap();
+        assert_eq!(fires.len(), 1);
+        assert!(!fires[0].fresh, "should NOT be marked as fresh");
+        assert_eq!(fires[0].session_db_id, session_db_id);
+    }
+
+    #[tokio::test]
+    async fn agent_timer_processing_lock_skips_busy_session() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        let (entry, _adb) = seed_agent(&server, &registry, "gamma").await;
+
+        // Create a session and attach the agent.
+        let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
+        let session_db_id = session_db.root_id().to_string();
+        registry
+            .attach_agent_to_session(&session_db_id, &entry)
+            .await
+            .unwrap();
+
+        // Manually insert the session into the processing set to simulate
+        // a busy session.
+        server
+            .processing
+            .lock()
+            .await
+            .insert(session_db_id.clone());
+
+        let payload =
+            pinned_timer_payload(&entry.db_id.to_string(), "t1", "wake", &session_db_id);
+        let result = server.fire_agent_timer(payload).await;
+        assert!(result.is_ok(), "busy session should be skipped gracefully");
+
+        // The lock should still be held (we inserted it manually).
+        assert!(server.processing.lock().await.contains(&session_db_id));
+        // Clean up.
+        server.processing.lock().await.remove(&session_db_id);
+    }
+
+    #[tokio::test]
+    async fn agent_timer_records_fire_even_on_llm_failure() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        let (entry, adb) = seed_agent(&server, &registry, "delta").await;
+
+        let payload = fresh_timer_payload(&entry.db_id.to_string(), "f1", "do thing");
+        let _ = server.fire_agent_timer(payload).await;
+
+        // TimerFire should be recorded regardless of LLM outcome.
+        let fires = adb.list_timer_fires().await.unwrap();
+        assert_eq!(fires.len(), 1, "TimerFire should be recorded even on failure");
+        assert_eq!(fires[0].timer_id, "f1");
+        // Usage metadata will be None since the LLM call failed.
+        assert!(fires[0].usage.is_none());
     }
 }

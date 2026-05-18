@@ -407,6 +407,8 @@ mod tests {
             auto_approved_tools: std::collections::HashSet::new(),
             approval_callback: None,
         };
+        let secrets = SecretStore::new(chaz_peer).await;
+        let backend_mgr = BackendManager::new(&None, secrets.clone());
         let server = Server::new(
             registry.clone(),
             agents,
@@ -419,9 +421,8 @@ mod tests {
             Default::default(),
             std::sync::Arc::new(crate::tool_host::NativeToolHost::new()),
             std::sync::Arc::new(crate::extension::ExtensionHub::new()),
+            backend_mgr.clone(),
         );
-        let secrets = SecretStore::new(chaz_peer).await;
-        let backend_mgr = BackendManager::new(&None, secrets.clone());
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
         (

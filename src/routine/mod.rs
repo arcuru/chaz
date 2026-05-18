@@ -78,6 +78,22 @@ pub async fn notify_session_closed(session_db_id: &str) {
     }
 }
 
+/// Resync one agent's timers from its DB into the running engine's
+/// heap after a committed change (add/remove/edit). Best-effort:
+/// a reload failure is logged, not propagated — the durable DB write
+/// already succeeded.
+pub async fn notify_agent_timers_changed(
+    agent_db_id: &str,
+    agent_db: &crate::agent_db::AgentDb,
+) {
+    let Some(engine) = engine() else {
+        return;
+    };
+    if let Err(e) = engine.reload_agent(agent_db_id, agent_db).await {
+        warn!(agent = %agent_db_id, "routine engine reload_agent after timer change failed: {e}");
+    }
+}
+
 /// List every routine row in a session DB's `routines` table.
 ///
 /// Returns `Ok(Vec::new())` when the table doesn't exist yet (a session

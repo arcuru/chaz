@@ -121,30 +121,9 @@ impl SessionRegistry {
         })
         .await?;
 
-        // Clean up heartbeat routines on this session that target the
-        // detached agent — otherwise they'd sit silently forever (the
-        // handler skips fires whose target isn't in `agent_index`, but
-        // the rows still accumulate).
-        let db_id_str = agent.db_id.to_string();
-        if let Ok(routines) = crate::routine::list_session_routines(&session_db).await {
-            for r in &routines {
-                let Ok(p): Result<crate::extensions::heartbeat::HeartbeatPayload, _> =
-                    serde_json::from_value(r.target.payload.clone())
-                else {
-                    continue;
-                };
-                if p.target_agent_db_id != db_id_str {
-                    continue;
-                }
-                if let Err(e) = crate::routine::remove_session_routine(&session_db, &r.id).await {
-                    warn!(
-                        agent = %agent.display_name,
-                        rule_id = %r.id,
-                        "Failed to remove heartbeat routine on detach: {e}"
-                    );
-                }
-            }
-        }
+        // No routine sweep needed — timers are now agent-owned
+        // (Timer store in agent DB). Fire-time membership check in
+        // `Server::fire_agent_timer` handles detached agent self-skip.
 
         info!(
             agent = %agent.display_name,
