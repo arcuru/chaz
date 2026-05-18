@@ -1,6 +1,15 @@
 # Agent-Owned Timers
 
-> **Status: Proposed** — supersedes the session-scoped heartbeat/routine model for scheduled agent wakes.
+> **Status: In progress** — supersedes the session-scoped heartbeat/routine model for scheduled agent wakes.
+>
+> Shipped: Agent-DB `Timer` type + store (Stage 1); engine agent-source
+> discovery + `timer_fires` audit log (Stage 2); conditional terminal
+> `Message` on silent turns (Stage 4); `TimerFire.usage` cost-on-agent.
+> Remaining: the standalone fire path below (Stage 3) and the
+> heartbeat-tool repoint + migration (Stage 5). The fire path's
+> live-turn/cost-capture is the one part not coverable by the repo's
+> existing handler-fixture test bar — it needs live integration
+> verification.
 
 ## Summary
 
@@ -99,6 +108,55 @@ entry. The agent's resulting tool calls and any `Message` are written to
 the target session as normal entries (audit + visibility land where they
 belong); the prompt itself is not a shared entry.
 
+### Execution path (decided: standalone; never touches the target's runtime)
+
+A fired timer's turn runs through a **standalone execution path**, not
+the interactive `process_session` → `SessionRuntime` → `spawn_agent_task`
+machinery. This is a hard requirement: a `Pinned` target **may be a live
+session** a user is actively conversing in, and the timer turn must not
+mutate or hijack that session's `SessionRuntime` (its `agent_override`,
+backend, completion channel, watcher wiring). Reusing
+`register_child_session` (which pins the agent by *overwriting*
+`SessionRuntime.agent_override`, `server.rs:369`) is therefore only valid
+for `Fresh`; it is **forbidden for `Pinned`**.
+
+The standalone path:
+
+1. **Host check** — `agent_index.find_by_id(owner)`; not hosted ⇒ skip
+   (the owning peer fires it). This is the dispatch gate.
+2. **Resolve session** — `Fresh`: create a new session
+   (`source = timer:<owner_db_id>:<timer_id>`) and attach the owner.
+   `Pinned`: open the existing session; idempotently (re)attach the
+   owner so it's authorized; if the session is gone or the owner can't
+   be a member, **self-skip + log** (membership-at-fire).
+3. **Serialize, don't hijack** — acquire the session's existing
+   per-session `processing` lock so the timer turn cannot interleave
+   entries with a concurrent interactive turn. If the session is busy,
+   skip this fire (cron will come around again; a missed one-shot is
+   logged) rather than block or run concurrently. The lock is the
+   *only* shared state touched — no `SessionRuntime` entry is created
+   or modified, so the live session's own routing is unaffected.
+4. **Run the owner's turn directly** — load + hydrate the owner agent,
+   build context *as that agent* from the session's current entries
+   with the wake-prompt as private invocation input, run the ReAct
+   loop, emit `ToolCall`/`ToolResult` and a terminal `Message` *only if
+   non-empty* (see Optional response). The path **returns the turn
+   outcome** to its caller — it is not fire-and-forget — so cost is
+   recoverable.
+5. **Attribute cost to the agent** — write `TimerFire { …, usage =
+   outcome.metadata }` to the owner's `timer_fires` store. Autonomous
+   wake cost lands on the agent's ledger; session usage stays
+   Message-only (its tested invariant is untouched).
+6. **One-shot cleanup** — on a successful one-shot fire, delete the
+   `Timer` row from the owner's `timers` store (the engine drops the
+   in-memory entry via its existing OneShot path).
+
+Implementation note: the standalone runner is a focused, separate method
+— it deliberately does **not** modify `spawn_agent_task`, to keep the
+interactive hot path untouched. Some assemble/execute sequence is
+duplicated; that cost is accepted to isolate risk from every
+interactive turn.
+
 ### Optional response
 
 The runtime must allow a turn to end **without** a `Message`. Today
@@ -154,10 +212,10 @@ Existing session-scoped routines (`routines` table, `HeartbeatPayload`,
 
 ## Implementation Touch Points
 
-- Agent DB: new `timers` store + `Timer` type (schedule, prompt, target, enabled).
-- `routine` engine: agent-source discovery (enumerate hosted agents → their timers) alongside the existing session/global sources.
-- Fire path: load owning agent → resolve `target` (open Pinned | create Fresh) → invoke that agent directly (no `resolve_agent_for_entry`), wake-prompt as private context.
-- `server.rs`: conditional terminal `Message` (skip when body empty).
-- Tools/commands: `heartbeat_add`/`/heartbeat` write agent-owned Timers (default `Pinned(current session)`); add a `target: fresh` option.
-- Retire detach-side routine sweep in favor of fire-time membership check.
-- Migration shim for existing session `routines` rows.
+- ✅ Agent DB: `timers` store + `Timer` type; `timer_fires` audit store + `TimerFire` (incl. `usage`).
+- ✅ `routine` engine: `RoutineScope::Agent`, `AgentTimerPayload`, `Timer→Routine` conversion, `register_agent`/`reload_agent`/`deregister_agent`, boot wiring.
+- ✅ `server.rs`: conditional terminal `Message` (skip when body empty).
+- ☐ **Standalone fire path** (Stage 3): `Server::fire_agent_timer` + `agent_timer` extension/handler installed on the hub via `OnceLock<Server>`. Host check → resolve `target` (open Pinned | create Fresh, idempotent owner attach) → acquire the session's `processing` lock (skip-if-busy; never create/modify a `SessionRuntime`) → run the owner's turn directly, returning the outcome → write `TimerFire{usage}` → one-shot cleanup. Pinned-into-live-session safe by construction; `register_child_session` reuse is Fresh-only.
+- ☐ Tools/commands (Stage 5): `heartbeat_add`/`/heartbeat` write agent-owned `Timer`s (default `Pinned(current session)`); add a `target: fresh` option; then `reload_agent`.
+- ☐ Retire detach-side routine sweep in favor of fire-time membership check.
+- ☐ Migration shim for existing session `routines` rows.
