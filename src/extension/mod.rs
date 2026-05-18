@@ -15,6 +15,7 @@
 //! through the agent turn. (TODO: add `catch_unwind` isolation once the
 //! `futures` crate is in the tree.)
 
+pub mod agent_state;
 pub mod caps;
 pub mod caps_inproc;
 pub mod handler;
@@ -24,6 +25,7 @@ pub mod manifest;
 pub mod registry;
 
 use crate::extension::caps_inproc::{InProcSessionRead, InProcSessionWrite, InProcSettings};
+use crate::hosted_index::HostedIndex;
 use crate::routine::RoutineScope;
 use crate::runtime::RuntimeMessage;
 use crate::session::{Session, SessionRegistry};
@@ -527,6 +529,15 @@ pub struct ExtensionHub {
     /// it via [`Self::set_session_registry`] after both the hub and
     /// the registry are constructed.
     session_registry: Option<Arc<SessionRegistry>>,
+    /// Hosted index — the hub uses this (together with
+    /// `session_registry`) to build scoped `AgentStateAdmin` handles
+    /// for extensions that declare the cap. `None` until
+    /// [`Self::set_hosted_index`] is called during bootstrap.
+    hosted_index: Option<HostedIndex>,
+    /// Per-extension agent allowlist sourced from
+    /// `Config::agent_state_allowlist`. Maps extension name → allowed
+    /// agent display names. An absent entry means unrestricted.
+    agent_state_allowlist: HashMap<String, Vec<String>>,
 }
 
 impl Default for ExtensionHub {
@@ -556,6 +567,8 @@ impl ExtensionHub {
             installed: HashMap::new(),
             name_intern: HashSet::new(),
             session_registry: None,
+            hosted_index: None,
+            agent_state_allowlist: HashMap::new(),
         }
     }
 
@@ -565,6 +578,20 @@ impl ExtensionHub {
     /// [`SessionRegistry::new`]. Idempotent — later calls overwrite.
     pub fn set_session_registry(&mut self, registry: Arc<SessionRegistry>) {
         self.session_registry = Some(registry);
+    }
+
+    /// Install the hosted index the hub uses to build scoped
+    /// `AgentStateAdmin` handles. Called once at startup from chaz's
+    /// main. Must be set before `install_all`.
+    pub fn set_hosted_index(&mut self, index: HostedIndex) {
+        self.hosted_index = Some(index);
+    }
+
+    /// Install the per-extension agent allowlist sourced from
+    /// `Config::agent_state_allowlist`. Called once at startup from
+    /// chaz's main. Must be set before `install_all`.
+    pub fn set_agent_state_allowlist(&mut self, allowlist: HashMap<String, Vec<String>>) {
+        self.agent_state_allowlist = allowlist;
     }
 
     /// Replace the hub's operator-default-provider map. Called once at
@@ -1193,9 +1220,78 @@ impl ExtensionHub {
                         },
                     );
                 }
+                K::AgentStateAdmin => {
+                    let allowlist = req.agents().map(|a| a.to_vec());
+                    let scoped = self.build_agent_state_admin(allowlist, &m.name);
+                    bundle.agent_state_admin = Some(Arc::new(scoped));
+                }
             }
         }
         bundle
+    }
+} // impl ExtensionHub
+
+// ── Standalone helper ──────────────────────────────────────────────
+
+/// Intersect the manifest's agent allowlist with the operator's
+/// config allowlist to produce the effective allowlist.
+///
+/// | Manifest | Operator | Result |
+/// |----------|----------|--------|
+/// | None | None | None (unrestricted) |
+/// | None | Some([a,b]) | Some([a,b]) (operator narrows) |
+/// | Some([a,b]) | None | Some([a,b]) (manifest only) |
+/// | Some([a,b]) | Some([a,b]) | Some([a,b]) (both agree) |
+/// | Some([a,b]) | Some([a]) | Some([a]) (intersection) |
+/// | Some([a]) | Some([c]) | Some([]) (no overlap → deny-all) |
+/// | Some([]) | * | Some([]) (manifest deny-all) |
+/// | * | Some([]) | Some([]) (operator deny-all) |
+pub(crate) fn resolve_agent_allowlist(
+    manifest: Option<Vec<String>>,
+    operator: Option<&Vec<String>>,
+) -> Option<Vec<String>> {
+    match operator {
+        Some(op_list) => match manifest {
+            Some(ref m_list) if m_list.is_empty() => Some(vec![]),
+            Some(ref _m_list) if op_list.is_empty() => Some(vec![]),
+            Some(m_list) => {
+                let op_set: std::collections::HashSet<_> = op_list.iter().collect();
+                let intersection: Vec<String> =
+                    m_list.into_iter().filter(|a| op_set.contains(a)).collect();
+                Some(intersection)
+            }
+            None => Some(op_list.clone()),
+        },
+        None => manifest,
+    }
+}
+
+impl ExtensionHub {
+    /// Build a scoped `AgentStateAdmin` handle for one extension. When
+    /// the hub doesn't have its `session_registry` or `hosted_index` set
+    /// (test path), panics — these must be set before `install_all`.
+    fn build_agent_state_admin(
+        &self,
+        manifest_allowlist: Option<Vec<String>>,
+        extension_name: &str,
+    ) -> agent_state::ScopedAgentStateAdmin {
+        let registry = self
+            .session_registry
+            .clone()
+            .unwrap_or_else(|| {
+                panic!("AgentStateAdmin cap requires session_registry to be set on the hub")
+            });
+        let index = self
+            .hosted_index
+            .clone()
+            .unwrap_or_else(|| {
+                panic!("AgentStateAdmin cap requires hosted_index to be set on the hub")
+            });
+
+        let operator_allowlist = self.agent_state_allowlist.get(extension_name);
+        let effective = resolve_agent_allowlist(manifest_allowlist, operator_allowlist);
+
+        agent_state::ScopedAgentStateAdmin::new(registry, index, effective)
     }
 
     /// Intern a `String` extension name into a `&'static str`. Required
@@ -2642,5 +2738,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("name"), "got: {err}");
+    }
+
+    // ── resolve_agent_allowlist tests ───────────────────────────────
+
+    fn list(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn both_none_is_unrestricted() {
+        assert_eq!(resolve_agent_allowlist(None, None), None);
+    }
+
+    #[test]
+    fn operator_narrows_unrestricted_manifest() {
+        assert_eq!(
+            resolve_agent_allowlist(None, Some(&list(&["a"]))),
+            Some(list(&["a"]))
+        );
+    }
+
+    #[test]
+    fn manifest_only_when_operator_absent() {
+        assert_eq!(
+            resolve_agent_allowlist(Some(list(&["a", "b"])), None),
+            Some(list(&["a", "b"]))
+        );
+    }
+
+    #[test]
+    fn intersection_when_both_set() {
+        assert_eq!(
+            resolve_agent_allowlist(Some(list(&["a", "b"])), Some(&list(&["b", "c"]))),
+            Some(list(&["b"]))
+        );
+    }
+
+    #[test]
+    fn no_overlap_returns_empty_deny_all() {
+        assert_eq!(
+            resolve_agent_allowlist(Some(list(&["a"])), Some(&list(&["c"]))),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn manifest_empty_is_deny_all() {
+        assert_eq!(
+            resolve_agent_allowlist(Some(vec![]), Some(&list(&["a"]))),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn operator_empty_is_deny_all() {
+        assert_eq!(
+            resolve_agent_allowlist(Some(list(&["a"])), Some(&vec![])),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn operator_matches_manifest_exactly() {
+        assert_eq!(
+            resolve_agent_allowlist(Some(list(&["a", "b"])), Some(&list(&["a", "b"]))),
+            Some(list(&["a", "b"]))
+        );
     }
 }

@@ -31,3 +31,4 @@
 - [Session Messaging Primitive](design/session_messaging.md)
 - [Autonomous Agents in Shared Sessions](design/autonomous_agents.md)
 - [Agent-Owned Timers](design/agent_timers.md)
+- [Agent State Admin Capability](design/agent_state_admin.md)

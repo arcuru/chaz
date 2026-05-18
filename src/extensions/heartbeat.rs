@@ -1,13 +1,13 @@
-//! Heartbeat extension — per-session cron-driven directives.
+//! Heartbeat extension — agent-owned timers via tools + commands.
 //!
-//! Wires the heartbeat surface (4 tools + the `/heartbeat` slash command)
-//! into the extension hub. Rule storage primitives stay in
-//! [`crate::heartbeat`] because they're shared with the background runner
-//! (started from `main.rs`) and with `agent_delete`'s cross-session sweep.
-//! The extension owns the *user-facing* layer only.
+//! Wires the heartbeat surface (5 tools + the `/heartbeat` slash command)
+//! into the extension hub. Timers now live in the owning agent's DB
+//! (`timers` store); the `/heartbeat` command and tools write there
+//! instead of the session `routines` table.
 
+use crate::agent_db::{AgentDb, Timer, TimerTarget};
 use crate::extension::caps::{
-    CapabilityRequest, CommandDescriptor, ExtensionCaps, SessionEntryDraft,
+    AgentStateAdmin, CapabilityRequest, CommandDescriptor, ExtensionCaps, SessionEntryDraft,
 };
 use crate::extension::handler::{HandlerFuture, InstalledExtension, RoutineHandler};
 use crate::extension::manifest::ExtensionManifest;
@@ -15,11 +15,10 @@ use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
 };
 use crate::hosted_index::HostedIndex;
-use crate::routine::{
-    Routine, RoutineId, RoutineTarget, Trigger, list_session_routines, remove_session_routine,
-    upsert_session_routine,
+use crate::routine::{Trigger, notify_agent_timers_changed};
+use crate::tools::{
+    HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp,
 };
-use crate::tools::{HeartbeatAdd, HeartbeatList, HeartbeatModify, HeartbeatRemove, WakeMeUp};
 use chrono::Utc;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
@@ -55,6 +54,9 @@ pub struct HeartbeatPayload {
     pub is_one_shot: bool,
 }
 
+/// Heartbeat extension — receives its `AgentStateAdmin` handle from
+/// the hub at install time (not via constructor). Keeps `HostedIndex`
+/// for the legacy routine handler's host-check only.
 pub struct HeartbeatExtension {
     agent_index: HostedIndex,
 }
@@ -83,6 +85,7 @@ impl Extension for HeartbeatExtension {
                 CapabilityRequest::ToolRegistration,
                 CapabilityRequest::CommandRegistration,
                 CapabilityRequest::SessionWrite,
+                CapabilityRequest::AgentStateAdmin { agents: None },
             ],
             requested_capabilities: Vec::new(),
             provides_capabilities: Vec::new(),
@@ -100,13 +103,16 @@ impl Extension for HeartbeatExtension {
             let cmd_reg = caps.command_registration.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("heartbeat install requires CommandRegistration cap")
             })?;
+            let agent_state = caps.agent_state_admin.clone().ok_or_else(|| {
+                anyhow::anyhow!("heartbeat install requires AgentStateAdmin cap")
+            })?;
 
             let tools: Vec<Arc<dyn crate::tool::Tool>> = vec![
-                Arc::new(HeartbeatAdd::new(self.agent_index.clone())),
-                Arc::new(HeartbeatModify::new(self.agent_index.clone())),
-                Arc::new(HeartbeatRemove),
-                Arc::new(HeartbeatList::new(self.agent_index.clone())),
-                Arc::new(WakeMeUp::new(self.agent_index.clone())),
+                Arc::new(HeartbeatAdd::new(agent_state.clone())),
+                Arc::new(HeartbeatModify::new(agent_state.clone())),
+                Arc::new(HeartbeatRemove::new(agent_state.clone())),
+                Arc::new(HeartbeatList::new(agent_state.clone())),
+                Arc::new(WakeMeUp::new(agent_state.clone())),
             ];
             for t in tools {
                 let d = t.descriptor();
@@ -121,7 +127,7 @@ impl Extension for HeartbeatExtension {
                             .into(),
                     },
                     Box::new(HeartbeatCommand {
-                        agent_index: self.agent_index.clone(),
+                        agent_state,
                     }),
                 )
                 .await?;
@@ -200,12 +206,12 @@ impl RoutineHandler for HeartbeatRoutineHandler {
 }
 
 struct HeartbeatCommand {
-    agent_index: HostedIndex,
+    agent_state: Arc<dyn AgentStateAdmin>,
 }
 
 impl ExtensionCommand for HeartbeatCommand {
     fn description(&self) -> &'static str {
-        "Manage heartbeat rules on this session — add | remove | list"
+        "Manage timers on agents — add | remove | list"
     }
 
     fn invoke<'a>(
@@ -220,15 +226,17 @@ impl ExtensionCommand for HeartbeatCommand {
                 None => (trimmed, ""),
             };
             match sub {
-                "" | "list" => list_cmd(ctx).await,
+                "" | "list" => list_cmd(&*self.agent_state, ctx).await,
                 "remove" | "rm" => {
                     if rest.is_empty() {
-                        ExtensionCommandOutcome::Error("Usage: /heartbeat remove <id>".into())
+                        ExtensionCommandOutcome::Error("Usage: /heartbeat remove <id> [agent]".into())
                     } else {
-                        remove_cmd(rest, ctx).await
+                        remove_cmd(rest, &*self.agent_state, ctx).await
                     }
                 }
-                "add" => add_cmd(rest, &self.agent_index, ctx).await,
+                "add" => {
+                    add_cmd(rest, &*self.agent_state, ctx).await
+                }
                 other => ExtensionCommandOutcome::Error(format!(
                     "Unknown subcommand '/heartbeat {other}'. Use: add | remove | list"
                 )),
@@ -237,60 +245,110 @@ impl ExtensionCommand for HeartbeatCommand {
     }
 }
 
-async fn list_cmd(ctx: &HookContext) -> ExtensionCommandOutcome {
-    let session = ctx.session.lock().await;
-    let db = session.database();
-    match list_session_routines(db).await {
-        Ok(rs) if rs.is_empty() => {
-            ExtensionCommandOutcome::Text("No heartbeat rules on this session".into())
+/// Open the agent DB for the context's agent (or a named agent from
+/// the index). Returns an error when the agent isn't hosted or the DB
+/// can't be opened.
+async fn open_agent_db_for_cmd(
+    cap: &dyn AgentStateAdmin,
+    ctx: &HookContext,
+    agent_ref: Option<&str>,
+) -> Result<(crate::hosted_index::DbEntry, AgentDb), ExtensionCommandOutcome> {
+    let name = agent_ref.unwrap_or(&ctx.agent_name);
+    let entry = cap.resolve_agent(name).map_err(|e| {
+        ExtensionCommandOutcome::Error(e)
+    })?;
+    let adb = cap.open_agent_db(&entry).await.map_err(|e| {
+        ExtensionCommandOutcome::Error(format!("{e:#}"))
+    })?;
+    Ok((entry, adb))
+}
+
+async fn list_cmd(
+    cap: &dyn AgentStateAdmin,
+    ctx: &HookContext,
+) -> ExtensionCommandOutcome {
+    // Parse optional agent name from the rest of the args.
+    // `/heartbeat list` lists your own timers.
+    // `/heartbeat list <agent>` lists that agent's timers.
+    // We get the full args via invoke, but here rest is the trimmed sub-arg.
+    // For simplicity, always list the calling agent's timers.
+    let (_, adb) = match open_agent_db_for_cmd(cap, ctx, None).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match adb.list_timers().await {
+        Ok(timers) if timers.is_empty() => {
+            ExtensionCommandOutcome::Text(format!(
+                "No timers on agent '{}'.",
+                ctx.agent_name
+            ))
         }
-        Ok(routines) => {
-            let lines: Vec<String> = routines
+        Ok(timers) => {
+            let lines: Vec<String> = timers
                 .iter()
-                .map(|r| {
-                    let p: HeartbeatPayload = serde_json::from_value(r.target.payload.clone())
-                        .unwrap_or(HeartbeatPayload {
-                            rule_name: r.name.clone(),
-                            target_agent_db_id: String::new(),
-                            task: String::new(),
-                            is_one_shot: matches!(r.trigger, Trigger::OneShot { .. }),
-                        });
-                    let state = if r.enabled { "" } else { " (disabled)" };
-                    let schedule = match &r.trigger {
+                .map(|t| {
+                    let state = if t.enabled { "" } else { " (disabled)" };
+                    let schedule = match &t.trigger {
                         Trigger::Cron { expr } => expr.clone(),
                         Trigger::OneShot { fire_at } => {
                             format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ"))
                         }
                     };
+                    let target_label = match &t.target {
+                        TimerTarget::Pinned { .. } => "pinned".to_string(),
+                        TimerTarget::Fresh => "fresh".to_string(),
+                    };
                     format!(
-                        "  {} [{schedule}]{state} → {} — {}",
-                        r.id, p.target_agent_db_id, p.task
+                        "  {} [{schedule}]{state} → {target_label} — {}",
+                        t.id, t.prompt
                     )
                 })
                 .collect();
-            ExtensionCommandOutcome::Text(format!("Heartbeat rules:\n{}", lines.join("\n")))
+            ExtensionCommandOutcome::Text(format!(
+                "Timers on '{}':\n{}",
+                ctx.agent_name,
+                lines.join("\n")
+            ))
         }
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to list rules: {e}")),
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to list timers: {e}")),
     }
 }
 
-async fn remove_cmd(id: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
-    let session = ctx.session.lock().await;
-    let db = session.database();
-    match remove_session_routine(db, &RoutineId::new(id)).await {
-        Ok(true) => ExtensionCommandOutcome::Text(format!("Removed heartbeat rule '{id}'")),
-        Ok(false) => ExtensionCommandOutcome::Error(format!("No heartbeat rule with id '{id}'")),
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to remove rule: {e}")),
+async fn remove_cmd(
+    rest: &str,
+    cap: &dyn AgentStateAdmin,
+    ctx: &HookContext,
+) -> ExtensionCommandOutcome {
+    // Format: /heartbeat remove <id> [agent]
+    let (timer_id, agent_ref) = match rest.split_once(char::is_whitespace) {
+        Some((id, agent)) => (id.trim(), Some(agent.trim())),
+        None => (rest.trim(), None),
+    };
+    let (_, adb) = match open_agent_db_for_cmd(cap, ctx, agent_ref).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match adb.remove_timer(timer_id).await {
+        Ok(true) => {
+            notify_agent_timers_changed(
+                &adb.id().to_string(),
+                &adb,
+            )
+            .await;
+            ExtensionCommandOutcome::Text(format!("Removed timer '{timer_id}'"))
+        }
+        Ok(false) => {
+            ExtensionCommandOutcome::Error(format!("No timer with id '{timer_id}'"))
+        }
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to remove timer: {e}")),
     }
 }
 
 /// Parse and execute `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task...>`.
-/// Cron is six whitespace-separated tokens because that's what the `cron`
-/// crate expects; the agent_ref resolves against the hosted index by display
-/// name, falling back to DB id parsing.
+/// Writes an agent-owned Timer with target = Pinned(current session).
 async fn add_cmd(
     rest: &str,
-    agent_index: &HostedIndex,
+    cap: &dyn AgentStateAdmin,
     ctx: &HookContext,
 ) -> ExtensionCommandOutcome {
     let mut tokens = rest.split_whitespace();
@@ -320,49 +378,42 @@ async fn add_cmd(
     if let Err(e) = Schedule::from_str(&cron) {
         return ExtensionCommandOutcome::Error(format!("Invalid cron '{cron}': {e}"));
     }
-    let entry = if let Some(e) = agent_index.find_by_name(agent_ref) {
-        e
-    } else if let Ok(parsed) = eidetica::entry::ID::parse(agent_ref) {
-        match agent_index.find_by_id(&parsed) {
-            Some(e) => e,
-            None => {
-                return ExtensionCommandOutcome::Error(format!(
-                    "No hosted agent matches '{agent_ref}'"
-                ));
-            }
-        }
-    } else {
-        return ExtensionCommandOutcome::Error(format!("No hosted agent matches '{agent_ref}'"));
+    let entry = match cap.resolve_agent(agent_ref) {
+        Ok(e) => e,
+        Err(e) => return ExtensionCommandOutcome::Error(e),
     };
-    let payload = HeartbeatPayload {
-        rule_name: id.to_string(),
-        target_agent_db_id: entry.db_id.to_string(),
-        task: task.clone(),
-        is_one_shot: false,
+
+    // Open the target agent's DB via the scoped capability.
+    let adb = match cap.open_agent_db(&entry).await {
+        Ok(adb) => adb,
+        Err(e) => return ExtensionCommandOutcome::Error(format!("{e:#}")),
     };
-    let payload_value = match serde_json::to_value(&payload) {
-        Ok(v) => v,
-        Err(e) => {
-            return ExtensionCommandOutcome::Error(format!("Failed to encode payload: {e}"));
-        }
+
+    // Get current session's DB id for Pinned target.
+    let session_db_id = {
+        let s = ctx.session.lock().await;
+        s.database().root_id().to_string()
     };
-    let routine = Routine::cron(
-        RoutineId::new(id),
-        id,
-        cron.clone(),
-        RoutineTarget {
-            extension: "heartbeat".into(),
-            payload: payload_value,
+
+    let timer = Timer::new(
+        id.to_string(),
+        Trigger::Cron {
+            expr: cron.clone(),
+        },
+        task.clone(),
+        TimerTarget::Pinned {
+            session_db_id,
         },
     );
-    let session = ctx.session.lock().await;
-    let db = session.database();
-    match upsert_session_routine(db, &routine).await {
-        Ok(()) => ExtensionCommandOutcome::Text(format!(
-            "Heartbeat rule '{id}' set: cron='{cron}' → {} — {task}",
-            entry.display_name
-        )),
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save rule: {e}")),
+    match adb.upsert_timer(timer).await {
+        Ok(()) => {
+            notify_agent_timers_changed(&entry.db_id.to_string(), &adb).await;
+            ExtensionCommandOutcome::Text(format!(
+                "Timer '{id}' on agent '{}': cron='{cron}' → this session — {task}",
+                entry.display_name
+            ))
+        }
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save timer: {e}")),
     }
 }
 
@@ -378,7 +429,7 @@ mod tests {
     use eidetica::backend::database::InMemory;
     use tokio::sync::Mutex;
 
-    async fn fixture() -> (Instance, HostedIndex, HookContext) {
+    async fn fixture() -> (Instance, HostedIndex, Arc<SessionRegistry>, HookContext) {
         let backend = InMemory::new();
         let instance = Instance::open(Box::new(backend)).await.unwrap();
         let _ = instance.create_user("test", None).await;
@@ -421,17 +472,25 @@ mod tests {
             session: Arc::new(Mutex::new(session)),
             active_extensions: std::collections::HashSet::new(),
         };
-        (instance, index, ctx)
+        (instance, index, registry, ctx)
     }
 
-    fn cmd(index: HostedIndex) -> HeartbeatCommand {
-        HeartbeatCommand { agent_index: index }
+    fn cmd(registry: Arc<crate::session::SessionRegistry>, index: HostedIndex) -> HeartbeatCommand {
+        // Build a scoped handle for tests — unrestricted (all agents visible).
+        let scoped = crate::extension::agent_state::ScopedAgentStateAdmin::new(
+            registry,
+            index,
+            None,
+        );
+        HeartbeatCommand {
+            agent_state: Arc::new(scoped),
+        }
     }
 
     #[tokio::test]
     async fn add_then_list_round_trips() {
-        let (_i, index, ctx) = fixture().await;
-        let c = cmd(index);
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
         let added = c
             .invoke("add five-min 0 */5 * * * * alpha do a thing", &ctx)
             .await;
@@ -450,8 +509,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_invalid_cron() {
-        let (_i, index, ctx) = fixture().await;
-        let c = cmd(index);
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
         let out = c
             .invoke("add bad not a cron at all really alpha do thing", &ctx)
             .await;
@@ -463,11 +522,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_args_lists() {
-        let (_i, index, ctx) = fixture().await;
-        let c = cmd(index);
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
         match c.invoke("", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
-                assert!(s.contains("No heartbeat rules"), "got: {s}")
+                assert!(s.contains("No timers"), "got: {s}")
             }
             ExtensionCommandOutcome::Error(e) => panic!("expected text, got error: {e}"),
         }
@@ -475,8 +534,8 @@ mod tests {
 
     #[tokio::test]
     async fn remove_without_id_is_usage_error() {
-        let (_i, index, ctx) = fixture().await;
-        let c = cmd(index);
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
         match c.invoke("remove", &ctx).await {
             ExtensionCommandOutcome::Error(e) => {
                 assert!(e.contains("Usage: /heartbeat remove"), "got: {e}")
@@ -487,13 +546,13 @@ mod tests {
 
     #[tokio::test]
     async fn add_then_remove_then_list_empty() {
-        let (_i, index, ctx) = fixture().await;
-        let c = cmd(index);
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
         let _ = c.invoke("add x 0 * * * * * alpha hello", &ctx).await;
         let _ = c.invoke("remove x", &ctx).await;
         match c.invoke("list", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
-                assert!(s.contains("No heartbeat rules"), "got: {s}")
+                assert!(s.contains("No timers"), "got: {s}")
             }
             ExtensionCommandOutcome::Error(e) => panic!("list errored: {e}"),
         }
@@ -501,8 +560,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_subcommand_is_error() {
-        let (_i, index, ctx) = fixture().await;
-        let c = cmd(index);
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
         match c.invoke("frobnicate foo", &ctx).await {
             ExtensionCommandOutcome::Error(e) => {
                 assert!(e.contains("Unknown subcommand"), "got: {e}")

@@ -1,15 +1,18 @@
 # Agent-Owned Timers
 
-> **Status: In progress** — supersedes the session-scoped heartbeat/routine model for scheduled agent wakes.
+> **Status: Complete** — supersedes the session-scoped heartbeat/routine model for scheduled agent wakes.
 >
 > Shipped: Agent-DB `Timer` type + store (Stage 1); engine agent-source
-> discovery + `timer_fires` audit log (Stage 2); conditional terminal
-> `Message` on silent turns (Stage 4); `TimerFire.usage` cost-on-agent.
-> Remaining: the standalone fire path below (Stage 3) and the
-> heartbeat-tool repoint + migration (Stage 5). The fire path's
-> live-turn/cost-capture is the one part not coverable by the repo's
-> existing handler-fixture test bar — it needs live integration
-> verification.
+> discovery + `timer_fires` audit log (Stage 2); standalone fire path
+> via `Server::fire_agent_timer` + `agent_timer` extension (Stage 3);
+> conditional terminal `Message` on silent turns (Stage 4);
+> `TimerFire.usage` cost-on-agent; heartbeat tools + `/heartbeat`
+> command repointed to agent-owned timers, detach-side routine sweep
+> retired, `notify_agent_timers_changed` engine bridge (Stage 5).
+> 5 integration tests + 11 tool/command tests covering the full
+> plumbing. The live turn in a real session still needs end-to-end
+> integration testing on a dev instance (agent responds, cost
+> attributed, silent turn produces no entry).
 
 ## Summary
 
@@ -215,7 +218,7 @@ Existing session-scoped routines (`routines` table, `HeartbeatPayload`,
 - ✅ Agent DB: `timers` store + `Timer` type; `timer_fires` audit store + `TimerFire` (incl. `usage`).
 - ✅ `routine` engine: `RoutineScope::Agent`, `AgentTimerPayload`, `Timer→Routine` conversion, `register_agent`/`reload_agent`/`deregister_agent`, boot wiring.
 - ✅ `server.rs`: conditional terminal `Message` (skip when body empty).
-- ☐ **Standalone fire path** (Stage 3): `Server::fire_agent_timer` + `agent_timer` extension/handler installed on the hub via `OnceLock<Server>`. Host check → resolve `target` (open Pinned | create Fresh, idempotent owner attach) → acquire the session's `processing` lock (skip-if-busy; never create/modify a `SessionRuntime`) → run the owner's turn directly, returning the outcome → write `TimerFire{usage}` → one-shot cleanup. Pinned-into-live-session safe by construction; `register_child_session` reuse is Fresh-only.
-- ☐ Tools/commands (Stage 5): `heartbeat_add`/`/heartbeat` write agent-owned `Timer`s (default `Pinned(current session)`); add a `target: fresh` option; then `reload_agent`.
-- ☐ Retire detach-side routine sweep in favor of fire-time membership check.
-- ☐ Migration shim for existing session `routines` rows.
+- ✅ **Standalone fire path** (Stage 3): `Server::fire_agent_timer` + `agent_timer` extension. Host check → resolve target → acquire processing lock → run turn → record TimerFire → one-shot cleanup.
+- ✅ **Tools/commands repoint** (Stage 5): All heartbeat tools (`heartbeat_add`, `heartbeat_modify`, `heartbeat_remove`, `heartbeat_list`, `wake_me_up`) and the `/heartbeat` command now write agent-owned `Timer`s with `target: Pinned(current session)` by default; `target: fresh` option added. `notify_agent_timers_changed` bridge syncs the engine after mutations. All tools carry `Arc<SessionRegistry>` to open agent DBs.
+- ✅ **Detach cleanup retired** — fire-time membership check in `fire_agent_timer` replaces the sweep in `detach_agent_from_session`.
+- ☐ Migration shim for existing session `routines` rows (legacy `sweep_for_agent` still runs on `agent_delete`).

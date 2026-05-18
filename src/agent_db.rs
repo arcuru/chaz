@@ -243,7 +243,7 @@ pub struct TimerFire {
 }
 
 /// Handle over the eidetica `Database` that holds an agent's state.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AgentDb {
     database: Database,
 }

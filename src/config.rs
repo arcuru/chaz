@@ -72,6 +72,13 @@ pub struct Config {
     /// kinds (e.g. `session_write`) are rejected.
     #[serde(default)]
     pub capability_defaults: HashMap<CapabilityKind, String>,
+    /// Per-extension agent allowlists for the `AgentStateAdmin` cap.
+    /// Each entry maps an extension name (e.g. `"heartbeat"`) to the
+    /// list of agent display names that extension's tools may access.
+    /// An absent entry means unrestricted (all hosted agents visible).
+    /// An empty entry (`[]`) means the cap is effectively denied.
+    #[serde(default)]
+    pub agent_state_allowlist: HashMap<String, Vec<String>>,
 }
 
 /// CLI-specific configuration

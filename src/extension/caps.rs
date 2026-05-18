@@ -43,7 +43,9 @@
 //! `~/brain/ava/workspace/chaz-routine-engine-and-capabilities.md` for
 //! the full plan.
 
+use crate::agent_db::AgentDb;
 use crate::extension::ExtensionCommand;
+use crate::hosted_index::DbEntry;
 use crate::tool::{Tool, ToolDescriptor};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,10 @@ pub enum CapabilityKind {
     Messenger,
     /// Search / write memory in a named scope.
     Memory,
+    /// Read/write agent-owned state (timers, memory, configuration).
+    /// Host-only — the hub scopes each impl to the operator-configured
+    /// set of agents before the extension sees it.
+    AgentStateAdmin,
 }
 
 impl CapabilityKind {
@@ -105,7 +111,8 @@ impl CapabilityKind {
                 | Self::SessionWrite
                 | Self::Settings
                 | Self::ToolRegistration
-                | Self::CommandRegistration,
+                | Self::CommandRegistration
+                | Self::AgentStateAdmin,
         )
     }
 
@@ -126,6 +133,7 @@ impl CapabilityKind {
             Self::CommandRegistration => "command_registration",
             Self::Messenger => "messenger",
             Self::Memory => "memory",
+            Self::AgentStateAdmin => "agent_state_admin",
         }
     }
 }
@@ -166,6 +174,13 @@ pub enum CapabilityRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Access hosted agent DBs for state operations. The `agents`
+    /// field is set by the operator (not the extension) — it carries
+    /// the per-extension agent allowlist from `tool_policy`.
+    AgentStateAdmin {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agents: Option<Vec<String>>,
+    },
 }
 
 impl CapabilityRequest {
@@ -180,6 +195,7 @@ impl CapabilityRequest {
             Self::CommandRegistration => CapabilityKind::CommandRegistration,
             Self::Messenger { .. } => CapabilityKind::Messenger,
             Self::Memory { .. } => CapabilityKind::Memory,
+            Self::AgentStateAdmin { .. } => CapabilityKind::AgentStateAdmin,
         }
     }
 
@@ -189,6 +205,16 @@ impl CapabilityRequest {
     pub fn provider(&self) -> Option<&str> {
         match self {
             Self::Messenger { provider } | Self::Memory { provider } => provider.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Agent allowlist carried by this request, if this is an
+    /// `AgentStateAdmin` variant. `None` means "no restriction"
+    /// (all hosted agents). `Some(empty)` means "deny-all."
+    pub fn agents(&self) -> Option<&[String]> {
+        match self {
+            Self::AgentStateAdmin { agents } => agents.as_deref(),
             _ => None,
         }
     }
@@ -401,6 +427,29 @@ pub trait CommandRegistration: Send + Sync {
     ) -> CapFuture<'a, ()>;
 }
 
+/// Narrow capability: access hosted agent DBs for state operations
+/// (timers, memory, configuration). The hub scopes each impl to the
+/// operator-configured set of agents before the extension sees it.
+///
+/// This is a **guardrail, not a sandbox** — it stops a poorly behaved
+/// tool from accidentally touching the wrong agent's DB, but does not
+/// attempt to prevent an adversarial tool from escalating privileges
+/// through other means.
+pub trait AgentStateAdmin: Send + Sync {
+    /// Resolve an agent name or DB id to its `DbEntry`. Only agents in
+    /// the operator-configured allowlist are visible; disallowed names
+    /// return `Err(...)`.
+    fn resolve_agent(&self, name: &str) -> Result<DbEntry, String>;
+
+    /// Open the agent DB identified by `entry`. Must be a `DbEntry`
+    /// obtained from `resolve_agent` on the same handle. The impl uses
+    /// the peer's held key to open the DB.
+    fn open_agent_db<'a>(
+        &'a self,
+        entry: &'a DbEntry,
+    ) -> CapFuture<'a, AgentDb>;
+}
+
 // =========================================================================
 // Extension-providable cap traits
 // =========================================================================
@@ -443,6 +492,7 @@ pub trait MemoryAccess: Send + Sync {
 pub enum CapProvider {
     Messenger(Arc<dyn Messenger>),
     Memory(Arc<dyn MemoryAccess>),
+    AgentStateAdmin(Arc<dyn AgentStateAdmin>),
 }
 
 impl CapProvider {
@@ -451,6 +501,7 @@ impl CapProvider {
         match self {
             Self::Messenger(_) => CapabilityKind::Messenger,
             Self::Memory(_) => CapabilityKind::Memory,
+            Self::AgentStateAdmin(_) => CapabilityKind::AgentStateAdmin,
         }
     }
 }
@@ -489,6 +540,11 @@ pub struct ExtensionCaps {
     pub settings: Option<Arc<dyn Settings>>,
     pub tool_registration: Option<Arc<dyn ToolRegistration>>,
     pub command_registration: Option<Arc<dyn CommandRegistration>>,
+    /// Scoped agent state access — pre-built by the hub from the
+    /// operator's `tool_policy` agent allowlist. `None` when the
+    /// extension didn't request this cap or the allowlist intersected
+    /// to empty (cap denied).
+    pub agent_state_admin: Option<Arc<dyn AgentStateAdmin>>,
     pub messengers: CapSet<dyn Messenger>,
     pub memory: CapSet<dyn MemoryAccess>,
 }
@@ -504,6 +560,7 @@ impl ExtensionCaps {
             settings: None,
             tool_registration: None,
             command_registration: None,
+            agent_state_admin: None,
             messengers: CapSet::new(),
             memory: CapSet::new(),
         }
@@ -517,6 +574,7 @@ impl ExtensionCaps {
             && self.settings.is_none()
             && self.tool_registration.is_none()
             && self.command_registration.is_none()
+            && self.agent_state_admin.is_none()
             && self.messengers.is_empty()
             && self.memory.is_empty()
     }
@@ -536,6 +594,7 @@ impl fmt::Debug for ExtensionCaps {
             .field("settings", &self.settings.is_some())
             .field("tool_registration", &self.tool_registration.is_some())
             .field("command_registration", &self.command_registration.is_some())
+            .field("agent_state_admin", &self.agent_state_admin.is_some())
             .field("messengers", &self.messengers.provider_names())
             .field("memory", &self.memory.provider_names())
             .finish()
@@ -558,6 +617,7 @@ mod tests {
             CapabilityKind::Settings,
             CapabilityKind::ToolRegistration,
             CapabilityKind::CommandRegistration,
+            CapabilityKind::AgentStateAdmin,
         ];
         for k in host_only {
             assert!(k.is_host_only(), "{k} should be host-only");
@@ -583,6 +643,10 @@ mod tests {
             ),
             (CapabilityKind::Messenger, "\"messenger\""),
             (CapabilityKind::Memory, "\"memory\""),
+            (
+                CapabilityKind::AgentStateAdmin,
+                "\"agent_state_admin\"",
+            ),
         ];
         for (kind, wire) in cases {
             let s = serde_json::to_string(&kind).unwrap();
@@ -624,6 +688,16 @@ mod tests {
                 CapabilityRequest::Memory { provider: None },
                 CapabilityKind::Memory,
             ),
+            (
+                CapabilityRequest::AgentStateAdmin { agents: None },
+                CapabilityKind::AgentStateAdmin,
+            ),
+            (
+                CapabilityRequest::AgentStateAdmin {
+                    agents: Some(vec!["chaz".into()]),
+                },
+                CapabilityKind::AgentStateAdmin,
+            ),
         ];
         for (req, expected) in cases {
             assert_eq!(req.kind(), expected);
@@ -634,6 +708,10 @@ mod tests {
     fn capability_request_provider_is_only_set_for_providable_kinds() {
         assert_eq!(CapabilityRequest::SessionRead.provider(), None);
         assert_eq!(CapabilityRequest::Settings.provider(), None);
+        assert_eq!(
+            CapabilityRequest::AgentStateAdmin { agents: None }.provider(),
+            None
+        );
         assert_eq!(
             CapabilityRequest::Messenger { provider: None }.provider(),
             None
@@ -652,6 +730,22 @@ mod tests {
             .provider(),
             Some("store"),
         );
+    }
+
+    #[test]
+    fn agent_state_admin_request_carries_agents() {
+        let req = CapabilityRequest::AgentStateAdmin { agents: None };
+        assert_eq!(req.agents(), None);
+
+        let req = CapabilityRequest::AgentStateAdmin {
+            agents: Some(vec!["chaz".into(), "bash".into()]),
+        };
+        assert_eq!(req.agents(), Some(&["chaz".to_string(), "bash".to_string()][..]));
+
+        let req = CapabilityRequest::AgentStateAdmin {
+            agents: Some(vec![]),
+        };
+        assert_eq!(req.agents(), Some(&[][..]));
     }
 
     #[test]
@@ -678,6 +772,25 @@ mod tests {
         assert_eq!(s, r#"{"kind":"memory","provider":"local"}"#);
         let round: CapabilityRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(round, with_provider);
+
+        // AgentStateAdmin without agents skips the field on the wire.
+        let no_agents = CapabilityRequest::AgentStateAdmin { agents: None };
+        let s = serde_json::to_string(&no_agents).unwrap();
+        assert_eq!(s, r#"{"kind":"agent_state_admin"}"#);
+        let round: CapabilityRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(round, no_agents);
+
+        // AgentStateAdmin with agents serializes them.
+        let with_agents = CapabilityRequest::AgentStateAdmin {
+            agents: Some(vec!["chaz".into()]),
+        };
+        let s = serde_json::to_string(&with_agents).unwrap();
+        assert_eq!(
+            s,
+            r#"{"kind":"agent_state_admin","agents":["chaz"]}"#
+        );
+        let round: CapabilityRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(round, with_agents);
     }
 
     // --- CapSet -----------------------------------------------------------
@@ -770,12 +883,27 @@ mod tests {
         }
     }
 
+    struct NoopAgentStateAdmin;
+    impl AgentStateAdmin for NoopAgentStateAdmin {
+        fn resolve_agent(&self, _name: &str) -> Result<DbEntry, String> {
+            Err("not implemented".into())
+        }
+        fn open_agent_db<'a>(
+            &'a self,
+            _entry: &'a DbEntry,
+        ) -> CapFuture<'a, AgentDb> {
+            Box::pin(async { Err(anyhow::anyhow!("not implemented")) })
+        }
+    }
+
     #[test]
     fn cap_provider_kind_matches_variant() {
         let m: CapProvider = CapProvider::Messenger(Arc::new(NoopMessenger));
         assert_eq!(m.kind(), CapabilityKind::Messenger);
         let mem: CapProvider = CapProvider::Memory(Arc::new(NoopMemory));
         assert_eq!(mem.kind(), CapabilityKind::Memory);
+        let a: CapProvider = CapProvider::AgentStateAdmin(Arc::new(NoopAgentStateAdmin));
+        assert_eq!(a.kind(), CapabilityKind::AgentStateAdmin);
     }
 
     #[test]
@@ -787,6 +915,8 @@ mod tests {
         assert_eq!(format!("{m:?}"), "CapProvider(Messenger)");
         let mem: CapProvider = CapProvider::Memory(Arc::new(NoopMemory));
         assert_eq!(format!("{mem:?}"), "CapProvider(Memory)");
+        let a: CapProvider = CapProvider::AgentStateAdmin(Arc::new(NoopAgentStateAdmin));
+        assert_eq!(format!("{a:?}"), "CapProvider(AgentStateAdmin)");
     }
 
     // --- Data types -------------------------------------------------------

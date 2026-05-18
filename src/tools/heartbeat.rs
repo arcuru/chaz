@@ -1,85 +1,54 @@
-//! Heartbeat tools — let agents schedule recurring directives on the current
-//! session.
+//! Heartbeat tools — let agents schedule recurring work via agent-owned
+//! timers.
 //!
-//! A heartbeat rule fires a Directive entry into this session on a cron
-//! schedule. The target agent receives it via the usual mention-aware
-//! routing path. By default the target is the running agent ("self").
+//! Timers live in the owning agent's DB (`timers` store), not in the
+//! session DB. When a timer fires, the agent is woken in the target
+//! session (Pinned) or a fresh session created for it (Fresh). This
+//! supersedes the session-scoped heartbeat-routine model.
 //!
-//! Four tools, matching the `/agent` CRUD pattern:
-//!   - `heartbeat_add`    — create; rejects a duplicate id
-//!   - `heartbeat_modify` — partial update of an existing rule
-//!   - `heartbeat_remove` — delete by id
-//!   - `heartbeat_list`   — list rules on this session
+//! Five tools, matching the prior `/heartbeat` CRUD pattern:
+//!   - `heartbeat_add`    — create a timer owned by the target agent
+//!   - `heartbeat_modify` — partial update of an existing timer
+//!   - `heartbeat_remove` — delete a timer by id
+//!   - `heartbeat_list`   — list timers owned by an agent
+//!   - `wake_me_up`       — one-shot timer targeting current session
 //!
-//! Rules live in the session DB as [`Routine`] rows whose `target.payload`
-//! deserializes to [`HeartbeatPayload`]. The routine engine picks them up
-//! and dispatches them through the heartbeat extension's `RoutineHandler`.
+//! Tools receive a scoped [`crate::extension::caps::AgentStateAdmin`]
+//! handle — they can resolve and open agent DBs within the operator's
+//! configured allowlist, but cannot enumerate hosts or access agents
+//! outside that set.
 
-use crate::extensions::heartbeat::HeartbeatPayload;
-use crate::hosted_index::{DbEntry, HostedIndex};
-use crate::routine::{
-    Routine, RoutineId, RoutineTarget, Trigger, list_session_routines, remove_session_routine,
-    upsert_session_routine,
-};
+use crate::agent_db::{AgentDb, Timer, TimerTarget};
+use crate::extension::caps::AgentStateAdmin;
+use crate::hosted_index::DbEntry;
+use crate::routine::{Trigger, notify_agent_timers_changed};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use cron::Schedule;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 
-const HEARTBEAT_EXTENSION: &str = "heartbeat";
-
-/// Pull the heartbeat-shaped payload off a routine, falling back to a
-/// debug-only placeholder when the payload didn't deserialize (e.g.
-/// a row written by some other extension into the same store).
-fn payload_for(routine: &Routine) -> HeartbeatPayload {
-    serde_json::from_value(routine.target.payload.clone()).unwrap_or(HeartbeatPayload {
-        rule_name: routine.name.clone(),
-        target_agent_db_id: String::new(),
-        task: String::new(),
-        is_one_shot: matches!(routine.trigger, Trigger::OneShot { .. }),
-    })
-}
-
-fn build_routine(
-    id: &str,
-    trigger: Trigger,
-    payload: HeartbeatPayload,
-    enabled: bool,
-) -> anyhow::Result<Routine> {
-    let target = RoutineTarget {
-        extension: HEARTBEAT_EXTENSION.into(),
-        payload: serde_json::to_value(&payload)?,
-    };
-    let mut r = match trigger {
-        Trigger::Cron { expr } => Routine::cron(RoutineId::new(id), id, expr, target),
-        Trigger::OneShot { fire_at } => Routine::one_shot(RoutineId::new(id), id, fire_at, target),
-    };
-    r.enabled = enabled;
-    Ok(r)
-}
-
-/// Resolve an agent reference to a `DbEntry`. `None` = the running agent.
-/// Matches the resolution order used by `/agent` commands: display name first,
-/// then DB id.
+/// Resolve an agent reference to a `DbEntry` via the scoped cap.
+/// `None` = the running agent.
 fn resolve_target_agent(
     ctx: &ToolContext,
-    index: &HostedIndex,
+    cap: &dyn AgentStateAdmin,
     agent_ref: Option<&str>,
 ) -> Result<DbEntry, String> {
     let name = agent_ref.unwrap_or(ctx.agent_name.as_str());
-    if let Some(entry) = index.find_by_name(name) {
-        return Ok(entry);
-    }
-    if let Ok(id) = eidetica::entry::ID::parse(name)
-        && let Some(entry) = index.find_by_id(&id)
-    {
-        return Ok(entry);
-    }
-    Err(format!(
-        "No hosted agent matches '{name}' — pass a display name or DB id, or omit to target yourself"
-    ))
+    cap.resolve_agent(name)
+}
+
+/// Open the target agent's DB for timer CRUD via the scoped cap.
+async fn open_agent_db(
+    cap: &dyn AgentStateAdmin,
+    entry: &DbEntry,
+) -> Result<AgentDb, String> {
+    cap.open_agent_db(entry)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 fn str_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -103,18 +72,30 @@ fn validate_cron(expr: &str) -> Result<(), String> {
         .map_err(|e| format!("Invalid cron '{expr}': {e}"))
 }
 
+/// Parse the optional `target` argument: `"pinned"` (default) or
+/// `"fresh"`. Returns the [`TimerTarget`] variant.
+fn parse_target(target_str: Option<&str>, session_db_id: &str) -> TimerTarget {
+    match target_str {
+        Some("fresh") => TimerTarget::Fresh,
+        _ => TimerTarget::Pinned {
+            session_db_id: session_db_id.to_string(),
+        },
+    }
+}
+
 // -----------------------------------------------------------------------------
 // heartbeat_add
 // -----------------------------------------------------------------------------
 
-/// Schedule a recurring directive on the current session.
+/// Schedule a recurring timer on the target agent.
 pub struct HeartbeatAdd {
-    agent_index: HostedIndex,
+    
+    agent_state: Arc<dyn AgentStateAdmin>,
 }
 
 impl HeartbeatAdd {
-    pub fn new(agent_index: HostedIndex) -> Self {
-        Self { agent_index }
+    pub fn new(agent_state: Arc<dyn AgentStateAdmin>) -> Self {
+        Self { agent_state }
     }
 }
 
@@ -123,15 +104,16 @@ impl Tool for HeartbeatAdd {
         ToolDescriptor {
             name: "heartbeat_add".to_string(),
             description:
-                "Schedule a recurring directive on this session. When the cron fires, a Directive entry is written to the session telling the target agent to do `task`. The target defaults to you (the running agent). Rules persist in the session DB and survive restarts. Fails if a rule with this id already exists — use heartbeat_modify to edit."
+                "Schedule a recurring timer on an agent. The timer fires into the current session by default (Pinned), or creates a fresh session each time (Fresh). The owning agent is woken with the task prompt. Timers live in the agent's DB and survive restarts. Fails if a timer with this id already exists — use heartbeat_modify to edit."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "id":    { "type": "string", "description": "Unique id for this rule on this session (e.g. 'hourly-check', 'daily-backup'). Referenced by heartbeat_modify and heartbeat_remove." },
-                    "cron":  { "type": "string", "description": "6-field cron expression: sec min hour day-of-month month day-of-week. Examples: '0 */5 * * * *' = every 5 minutes; '0 0 9 * * *' = 9am daily." },
-                    "task":  { "type": "string", "description": "Free-form instruction the target agent receives when the rule fires." },
-                    "agent": { "type": "string", "description": "Optional: agent that receives the directive, by display name or DB id. Omit to target yourself." }
+                    "id":     { "type": "string", "description": "Unique id for this timer (e.g. 'hourly-check', 'daily-backup'). Referenced by heartbeat_modify and heartbeat_remove." },
+                    "cron":   { "type": "string", "description": "6-field cron expression: sec min hour day-of-month month day-of-week. Examples: '0 */5 * * * *' = every 5 minutes; '0 0 9 * * *' = 9am daily." },
+                    "task":   { "type": "string", "description": "Free-form instruction the agent receives when the timer fires." },
+                    "agent":  { "type": "string", "description": "Optional: agent that owns the timer, by display name or DB id. Omit to target yourself." },
+                    "target": { "type": "string", "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." }
                 },
                 "required": ["id", "cron", "task"]
             }),
@@ -148,46 +130,50 @@ impl Tool for HeartbeatAdd {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let id = str_arg(&arguments, "id")?;
+            let user_id = str_arg(&arguments, "id")?;
             let cron = str_arg(&arguments, "cron")?;
             let task = str_arg(&arguments, "task")?;
             validate_cron(cron)?;
 
-            let target =
-                resolve_target_agent(ctx, &self.agent_index, opt_str(&arguments, "agent"))?;
+            let entry =
+                resolve_target_agent(ctx, &*self.agent_state, opt_str(&arguments, "agent"))?;
+            let adb = open_agent_db(&*self.agent_state, &entry).await?;
 
-            let session = ctx.session.lock().await;
-            let db = session.database();
-
-            let existing = list_session_routines(db)
-                .await
-                .map_err(|e| format!("Failed to read routines: {e}"))?;
-            if existing.iter().any(|r| r.id.as_str() == id) {
+            // Check for duplicate id.
+            if adb.find_timer(user_id).await.map_err(|e| e.to_string())?.is_some() {
                 return Err(format!(
-                    "Heartbeat rule '{id}' already exists; use heartbeat_modify to edit or heartbeat_remove first"
+                    "Timer '{user_id}' already exists on agent '{}'; use heartbeat_modify to edit or heartbeat_remove first",
+                    entry.display_name
                 )
                 .into());
             }
 
-            let routine = build_routine(
-                id,
-                Trigger::Cron { expr: cron.into() },
-                HeartbeatPayload {
-                    rule_name: id.to_string(),
-                    target_agent_db_id: target.db_id.to_string(),
-                    task: task.to_string(),
-                    is_one_shot: false,
-                },
-                true,
-            )
-            .map_err(|e| format!("Failed to encode routine payload: {e}"))?;
-            upsert_session_routine(db, &routine)
-                .await
-                .map_err(|e| format!("Failed to save rule: {e}"))?;
+            let session_db_id = {
+                let s = ctx.session.lock().await;
+                s.database().root_id().to_string()
+            };
+            let timer_target = parse_target(opt_str(&arguments, "target"), &session_db_id);
 
+            let timer = Timer::new(
+                user_id.to_string(),
+                Trigger::Cron {
+                    expr: cron.to_string(),
+                },
+                task.to_string(),
+                timer_target,
+            );
+            adb.upsert_timer(timer)
+                .await
+                .map_err(|e| format!("Failed to save timer: {e}"))?;
+            notify_agent_timers_changed(&entry.db_id.to_string(), &adb).await;
+
+            let target_label = match opt_str(&arguments, "target") {
+                Some("fresh") => "fresh session".to_string(),
+                _ => "this session".to_string(),
+            };
             Ok(format!(
-                "Added heartbeat '{id}': cron='{cron}' → {} — {task}",
-                target.display_name
+                "Added timer '{user_id}' on agent '{}': cron='{cron}' → {target_label} — {task}",
+                entry.display_name
             ))
         })
     }
@@ -197,14 +183,15 @@ impl Tool for HeartbeatAdd {
 // heartbeat_modify
 // -----------------------------------------------------------------------------
 
-/// Partial update of an existing heartbeat rule.
+/// Partial update of an existing timer.
 pub struct HeartbeatModify {
-    agent_index: HostedIndex,
+    
+    agent_state: Arc<dyn AgentStateAdmin>,
 }
 
 impl HeartbeatModify {
-    pub fn new(agent_index: HostedIndex) -> Self {
-        Self { agent_index }
+    pub fn new(agent_state: Arc<dyn AgentStateAdmin>) -> Self {
+        Self { agent_state }
     }
 }
 
@@ -213,16 +200,17 @@ impl Tool for HeartbeatModify {
         ToolDescriptor {
             name: "heartbeat_modify".to_string(),
             description:
-                "Edit an existing heartbeat rule on this session. Only the fields you pass are updated; others are left alone. Fails if no rule with this id exists."
+                "Edit an existing timer on an agent. Only the fields you pass are updated; others are left alone. Fails if no timer with this id exists."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "id":      { "type": "string", "description": "Id of the rule to edit (as returned by heartbeat_list)." },
+                    "id":      { "type": "string", "description": "Id of the timer to edit (as returned by heartbeat_list)." },
+                    "agent":   { "type": "string", "description": "Optional: agent that owns the timer (defaults to yourself). Required if the timer is owned by a different agent." },
                     "cron":    { "type": "string", "description": "Optional: new 6-field cron expression." },
                     "task":    { "type": "string", "description": "Optional: new task text." },
-                    "agent":   { "type": "string", "description": "Optional: new target agent (display name or DB id)." },
-                    "enabled": { "type": "boolean", "description": "Optional: toggle the rule on/off without deleting it." }
+                    "target":  { "type": "string", "description": "Optional: 'pinned' or 'fresh'." },
+                    "enabled": { "type": "boolean", "description": "Optional: toggle the timer on/off without deleting it." }
                 },
                 "required": ["id"]
             }),
@@ -242,65 +230,68 @@ impl Tool for HeartbeatModify {
             let id = str_arg(&arguments, "id")?;
             let new_cron = opt_str(&arguments, "cron");
             let new_task = opt_str(&arguments, "task");
-            let new_agent = opt_str(&arguments, "agent");
+            let new_target = opt_str(&arguments, "target");
             let new_enabled = opt_bool(&arguments, "enabled");
 
             if new_cron.is_none()
                 && new_task.is_none()
-                && new_agent.is_none()
+                && new_target.is_none()
                 && new_enabled.is_none()
             {
                 return Err(
-                    "No fields to modify — pass at least one of: cron, task, agent, enabled".into(),
+                    "No fields to modify — pass at least one of: cron, task, target, enabled"
+                        .into(),
                 );
             }
             if let Some(c) = new_cron {
                 validate_cron(c)?;
             }
 
-            let session = ctx.session.lock().await;
-            let db = session.database();
+            let entry =
+                resolve_target_agent(ctx, &*self.agent_state, opt_str(&arguments, "agent"))?;
+            let adb = open_agent_db(&*self.agent_state, &entry).await?;
 
-            let mut routine = list_session_routines(db)
+            let mut timer = adb
+                .find_timer(id)
                 .await
-                .map_err(|e| format!("Failed to read routines: {e}"))?
-                .into_iter()
-                .find(|r| r.id.as_str() == id)
-                .ok_or_else(|| format!("No heartbeat rule with id '{id}' on this session"))?;
-            let mut payload = payload_for(&routine);
+                .map_err(|e| format!("Failed to read timers: {e}"))?
+                .ok_or_else(|| {
+                    format!("No timer with id '{id}' on agent '{}'", entry.display_name)
+                })?;
 
             if let Some(c) = new_cron {
-                routine.trigger = Trigger::Cron { expr: c.into() };
+                timer.trigger = Trigger::Cron {
+                    expr: c.to_string(),
+                };
             }
             if let Some(t) = new_task {
-                payload.task = t.to_string();
+                timer.prompt = t.to_string();
             }
-            let target_display = if let Some(a) = new_agent {
-                let target = resolve_target_agent(ctx, &self.agent_index, Some(a))?;
-                payload.target_agent_db_id = target.db_id.to_string();
-                Some(target.display_name)
-            } else {
-                None
-            };
+            if let Some(t) = new_target {
+                let session_db_id = {
+                    let s = ctx.session.lock().await;
+                    s.database().root_id().to_string()
+                };
+                timer.target = parse_target(Some(t), &session_db_id);
+            }
             if let Some(e) = new_enabled {
-                routine.enabled = e;
+                timer.enabled = e;
             }
-            routine.target.payload = serde_json::to_value(&payload)
-                .map_err(|e| format!("Failed to encode payload: {e}"))?;
 
-            upsert_session_routine(db, &routine)
+            adb.upsert_timer(timer)
                 .await
-                .map_err(|e| format!("Failed to save rule: {e}"))?;
+                .map_err(|e| format!("Failed to save timer: {e}"))?;
+            notify_agent_timers_changed(&entry.db_id.to_string(), &adb).await;
 
-            let mut parts = vec![format!("Modified heartbeat '{id}':")];
+            let mut parts = vec![format!("Modified timer '{id}' on '{}':", entry.display_name)];
             if let Some(c) = new_cron {
                 parts.push(format!("cron='{c}'"));
             }
             if let Some(t) = new_task {
                 parts.push(format!("task='{t}'"));
             }
-            if let Some(name) = target_display {
-                parts.push(format!("agent={name}"));
+            if let Some(t) = new_target {
+                parts.push(format!("target={t}"));
             }
             if let Some(e) = new_enabled {
                 parts.push(format!("enabled={e}"));
@@ -314,18 +305,30 @@ impl Tool for HeartbeatModify {
 // heartbeat_remove
 // -----------------------------------------------------------------------------
 
-/// Remove a heartbeat rule by id.
-pub struct HeartbeatRemove;
+/// Remove a timer by id from an agent.
+pub struct HeartbeatRemove {
+    
+    agent_state: Arc<dyn AgentStateAdmin>,
+}
+
+impl HeartbeatRemove {
+    pub fn new(agent_state: Arc<dyn AgentStateAdmin>) -> Self {
+        Self { agent_state }
+    }
+}
 
 impl Tool for HeartbeatRemove {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "heartbeat_remove".to_string(),
-            description: "Delete a heartbeat rule from this session by id.".to_string(),
+            description:
+                "Delete a timer from an agent by id. Pass the agent name if the timer belongs to a different agent."
+                    .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "Id of the rule to delete (as returned by heartbeat_list)." }
+                    "id":    { "type": "string", "description": "Id of the timer to delete (as returned by heartbeat_list)." },
+                    "agent": { "type": "string", "description": "Optional: agent that owns the timer (defaults to yourself)." }
                 },
                 "required": ["id"]
             }),
@@ -343,14 +346,21 @@ impl Tool for HeartbeatRemove {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let id = str_arg(&arguments, "id")?;
-            let session = ctx.session.lock().await;
-            let db = session.database();
-            match remove_session_routine(db, &RoutineId::new(id)).await {
-                Ok(true) => Ok(format!("Removed heartbeat '{id}'")),
-                Ok(false) => {
-                    Err(format!("No heartbeat rule with id '{id}' on this session").into())
+            let entry =
+                resolve_target_agent(ctx, &*self.agent_state, opt_str(&arguments, "agent"))?;
+            let adb = open_agent_db(&*self.agent_state, &entry).await?;
+
+            match adb.remove_timer(id).await {
+                Ok(true) => {
+                    notify_agent_timers_changed(&entry.db_id.to_string(), &adb).await;
+                    Ok(format!("Removed timer '{id}' from agent '{}'", entry.display_name))
                 }
-                Err(e) => Err(format!("Failed to remove rule: {e}").into()),
+                Ok(false) => Err(format!(
+                    "No timer with id '{id}' on agent '{}'",
+                    entry.display_name
+                )
+                .into()),
+                Err(e) => Err(format!("Failed to remove timer: {e}").into()),
             }
         })
     }
@@ -360,15 +370,15 @@ impl Tool for HeartbeatRemove {
 // heartbeat_list
 // -----------------------------------------------------------------------------
 
-/// List heartbeat rules on the current session. Resolves target agent DB ids to
-/// display names where possible.
+/// List timers owned by an agent.
 pub struct HeartbeatList {
-    agent_index: HostedIndex,
+    
+    agent_state: Arc<dyn AgentStateAdmin>,
 }
 
 impl HeartbeatList {
-    pub fn new(agent_index: HostedIndex) -> Self {
-        Self { agent_index }
+    pub fn new(agent_state: Arc<dyn AgentStateAdmin>) -> Self {
+        Self { agent_state }
     }
 }
 
@@ -377,9 +387,14 @@ impl Tool for HeartbeatList {
         ToolDescriptor {
             name: "heartbeat_list".to_string(),
             description:
-                "List heartbeat rules on this session — id, cron, target agent, task, and whether the rule is enabled."
+                "List timers owned by an agent — id, schedule, target (pinned/fresh), task, and whether enabled. Pass agent name to list another agent's timers."
                     .to_string(),
-            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "Optional: agent whose timers to list (defaults to yourself)." }
+                }
+            }),
         }
     }
 
@@ -389,40 +404,41 @@ impl Tool for HeartbeatList {
 
     fn execute<'a>(
         &'a self,
-        _arguments: Value,
+        arguments: Value,
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let session = ctx.session.lock().await;
-            let db = session.database();
-            let routines = list_session_routines(db)
+            let entry =
+                resolve_target_agent(ctx, &*self.agent_state, opt_str(&arguments, "agent"))?;
+            let adb = open_agent_db(&*self.agent_state, &entry).await?;
+
+            let timers = adb
+                .list_timers()
                 .await
-                .map_err(|e| format!("Failed to list rules: {e}"))?;
-            if routines.is_empty() {
-                return Ok("No heartbeat rules on this session.".to_string());
+                .map_err(|e| format!("Failed to list timers: {e}"))?;
+            if timers.is_empty() {
+                return Ok(format!(
+                    "No timers on agent '{}'.",
+                    entry.display_name
+                ));
             }
-            let mut lines = Vec::with_capacity(routines.len() + 1);
-            lines.push("Heartbeat rules:".to_string());
-            for r in &routines {
-                let p = payload_for(r);
-                let target_display = match eidetica::entry::ID::parse(&p.target_agent_db_id) {
-                    Ok(id) => self
-                        .agent_index
-                        .find_by_id(&id)
-                        .map(|e| e.display_name)
-                        .unwrap_or_else(|| p.target_agent_db_id.clone()),
-                    Err(_) => p.target_agent_db_id.clone(),
-                };
-                let state = if r.enabled { "" } else { " (disabled)" };
-                let schedule = match &r.trigger {
+            let mut lines = Vec::with_capacity(timers.len() + 1);
+            lines.push(format!("Timers on '{}':", entry.display_name));
+            for t in &timers {
+                let state = if t.enabled { "" } else { " (disabled)" };
+                let schedule = match &t.trigger {
                     Trigger::Cron { expr } => expr.clone(),
                     Trigger::OneShot { fire_at } => {
                         format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ"))
                     }
                 };
+                let target_label = match &t.target {
+                    TimerTarget::Pinned { .. } => "pinned".to_string(),
+                    TimerTarget::Fresh => "fresh".to_string(),
+                };
                 lines.push(format!(
-                    "- **{}** [{schedule}]{state} → {} — {}",
-                    r.id, target_display, p.task
+                    "- **{}** [{schedule}]{state} → {target_label} — {}",
+                    t.id, t.prompt
                 ));
             }
             Ok(lines.join("\n"))
@@ -442,16 +458,16 @@ const WAKE_MIN_SECONDS: u64 = 30;
 /// is impossible.
 const WAKE_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 
-/// Schedule a one-shot wakeup that fires a Directive into this session after a
-/// delay, then deletes itself. The wakeup targets the calling agent so the
-/// resulting directive is routed back to *you*.
+/// Schedule a one-shot timer that fires into the current session after a
+/// delay, then deletes itself. The timer is owned by the calling agent.
 pub struct WakeMeUp {
-    agent_index: HostedIndex,
+    
+    agent_state: Arc<dyn AgentStateAdmin>,
 }
 
 impl WakeMeUp {
-    pub fn new(agent_index: HostedIndex) -> Self {
-        Self { agent_index }
+    pub fn new(agent_state: Arc<dyn AgentStateAdmin>) -> Self {
+        Self { agent_state }
     }
 }
 
@@ -460,8 +476,8 @@ impl Tool for WakeMeUp {
         ToolDescriptor {
             name: "wake_me_up".to_string(),
             description: format!(
-                "Schedule a one-shot wakeup that fires `task` into this session after `after_seconds`. \
-                 The directive is routed to you (the calling agent); the rule deletes itself once it fires. \
+                "Schedule a one-shot timer that fires `task` into this session after `after_seconds`. \
+                 The timer is owned by you; it deletes itself after firing. \
                  Use this when you need to come back to a session later — e.g. 'check the build in 10 minutes'. \
                  Range: {WAKE_MIN_SECONDS}–{WAKE_MAX_SECONDS} seconds. For recurring work, use heartbeat_add instead."
             ),
@@ -472,11 +488,11 @@ impl Tool for WakeMeUp {
                         "type": "integer",
                         "minimum": WAKE_MIN_SECONDS,
                         "maximum": WAKE_MAX_SECONDS,
-                        "description": "Seconds from now until the wakeup fires.",
+                        "description": "Seconds from now until the timer fires.",
                     },
                     "task": {
                         "type": "string",
-                        "description": "The instruction you'll receive when the wakeup fires.",
+                        "description": "The instruction you'll receive when the timer fires.",
                     }
                 },
                 "required": ["after_seconds", "task"]
@@ -509,39 +525,38 @@ impl Tool for WakeMeUp {
                 return Err("'task' must not be empty".into());
             }
 
-            // Target is always self — agents wake themselves, not each other.
-            // Cross-agent scheduling stays in `heartbeat_add`.
-            let target = resolve_target_agent(ctx, &self.agent_index, None)?;
+            // Timer is always owned by the calling agent and targets the
+            // current session (Pinned). Cross-agent scheduling stays in
+            // `heartbeat_add`.
+            let entry = resolve_target_agent(ctx, &*self.agent_state, None)?;
+            let adb = open_agent_db(&*self.agent_state, &entry).await?;
 
             let now = chrono::Utc::now();
             let fire_at = now + chrono::Duration::seconds(after as i64);
-            // Epoch-ms id keeps it unique and sortable for /heartbeat list and
-            // heartbeat_list output; no need for randomness in single-process use.
             let id = format!("wakeup-{}", now.timestamp_millis());
 
-            let session = ctx.session.lock().await;
-            let db = session.database();
-            let routine = build_routine(
-                &id,
+            let session_db_id = {
+                let s = ctx.session.lock().await;
+                s.database().root_id().to_string()
+            };
+
+            let timer = Timer::new(
+                id.clone(),
                 Trigger::OneShot { fire_at },
-                HeartbeatPayload {
-                    rule_name: id.clone(),
-                    target_agent_db_id: target.db_id.to_string(),
-                    task: task.to_string(),
-                    is_one_shot: true,
+                task.to_string(),
+                TimerTarget::Pinned {
+                    session_db_id,
                 },
-                true,
-            )
-            .map_err(|e| format!("Failed to encode wakeup payload: {e}"))?;
-            upsert_session_routine(db, &routine)
+            );
+            adb.upsert_timer(timer)
                 .await
                 .map_err(|e| format!("Failed to save wakeup: {e}"))?;
+            notify_agent_timers_changed(&entry.db_id.to_string(), &adb).await;
 
             Ok(format!(
-                "Wakeup '{id}' scheduled for {} ({}s from now) → {}",
+                "Wakeup '{id}' scheduled for {} ({}s from now)",
                 fire_at.format("%Y-%m-%d %H:%M:%S UTC"),
-                after,
-                target.display_name
+                after
             ))
         })
     }
@@ -561,8 +576,13 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
-    /// Same shape as memory.rs's fixture — peer with registry, a single
-    /// registered agent, and a blank session for ToolContext.
+    /// Build an unrestricted AgentStateAdmin scoped handle for tests.
+    fn scoped(registry: Arc<SessionRegistry>, index: HostedIndex) -> Arc<dyn AgentStateAdmin> {
+        Arc::new(
+            crate::extension::agent_state::ScopedAgentStateAdmin::new(registry, index, None),
+        )
+    }
+
     async fn fixture(
         agent_name: &str,
     ) -> (
@@ -628,9 +648,10 @@ mod tests {
 
     #[tokio::test]
     async fn add_then_list_round_trips() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index.clone());
-        let list = HeartbeatList::new(index.clone());
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let astate = scoped(registry, index);
+        let add = HeartbeatAdd::new(astate.clone());
+        let list = HeartbeatList::new(astate);
         let ctx = make_ctx("alpha", session);
 
         add.execute(
@@ -647,14 +668,13 @@ mod tests {
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(out.contains("five-min"), "id missing: {out}");
         assert!(out.contains("0 */5 * * * *"), "cron missing: {out}");
-        assert!(out.contains("alpha"), "target display missing: {out}");
         assert!(out.contains("check in"), "task missing: {out}");
     }
 
     #[tokio::test]
     async fn add_rejects_duplicate_id() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         add.execute(
@@ -676,8 +696,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_invalid_cron() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let err = add
@@ -692,8 +712,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_unknown_agent() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let err = add
@@ -713,10 +733,10 @@ mod tests {
 
     #[tokio::test]
     async fn modify_partial_updates_only_given_fields() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index.clone());
-        let modify = HeartbeatModify::new(index.clone());
-        let list = HeartbeatList::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = HeartbeatModify::new(scoped(registry.clone(), index.clone()));
+        let list = HeartbeatList::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         add.execute(
@@ -741,9 +761,9 @@ mod tests {
 
     #[tokio::test]
     async fn modify_requires_at_least_one_field() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index.clone());
-        let modify = HeartbeatModify::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = HeartbeatModify::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         add.execute(
@@ -762,23 +782,23 @@ mod tests {
 
     #[tokio::test]
     async fn modify_rejects_unknown_id() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let modify = HeartbeatModify::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let modify = HeartbeatModify::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let err = modify
             .execute(serde_json::json!({ "id": "missing", "task": "t" }), &ctx)
             .await
             .expect_err("unknown id should fail");
-        assert!(format!("{err:?}").contains("No heartbeat rule"));
+        assert!(format!("{err:?}").contains("No timer"));
     }
 
     #[tokio::test]
     async fn modify_can_disable_and_reenable() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index.clone());
-        let modify = HeartbeatModify::new(index.clone());
-        let list = HeartbeatList::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = HeartbeatModify::new(scoped(registry.clone(), index.clone()));
+        let list = HeartbeatList::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         add.execute(
@@ -807,11 +827,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_deletes_rule() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let add = HeartbeatAdd::new(index.clone());
-        let remove = HeartbeatRemove;
-        let list = HeartbeatList::new(index);
+    async fn remove_deletes_timer() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry.clone(), index.clone()));
+        let remove = HeartbeatRemove::new(scoped(registry.clone(), index.clone()));
+        let list = HeartbeatList::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         add.execute(
@@ -827,39 +847,39 @@ mod tests {
             .unwrap();
 
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
-        assert!(out.contains("No heartbeat rules"), "expected empty: {out}");
+        assert!(out.contains("No timers"), "expected empty: {out}");
     }
 
     #[tokio::test]
     async fn remove_rejects_unknown_id() {
-        let (_i, _r, _index, session) = fixture("alpha").await;
-        let remove = HeartbeatRemove;
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let remove = HeartbeatRemove::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let err = remove
             .execute(serde_json::json!({ "id": "missing" }), &ctx)
             .await
             .expect_err("unknown remove should fail");
-        assert!(format!("{err:?}").contains("No heartbeat rule"));
+        assert!(format!("{err:?}").contains("No timer"));
     }
 
     #[tokio::test]
     async fn list_empty_returns_friendly_message() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let list = HeartbeatList::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let list = HeartbeatList::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
-        assert!(out.contains("No heartbeat rules"), "got: {out}");
+        assert!(out.contains("No timers"), "got: {out}");
     }
 
     #[tokio::test]
-    async fn wake_me_up_writes_one_shot_rule_targeting_self() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let wake = WakeMeUp::new(index);
-        let ctx = make_ctx("alpha", session.clone());
+    async fn wake_me_up_creates_one_shot_timer() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(scoped(registry.clone(), index.clone()));
+        let list = HeartbeatList::new(scoped(registry, index));
+        let ctx = make_ctx("alpha", session);
 
-        let before = chrono::Utc::now();
         let out = wake
             .execute(
                 serde_json::json!({ "after_seconds": 60, "task": "check on build" }),
@@ -868,31 +888,17 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("Wakeup"), "unexpected msg: {out}");
-        assert!(out.contains("alpha"), "should target self: {out}");
 
-        let db = session.lock().await.database().clone();
-        let routines = list_session_routines(&db).await.unwrap();
-        assert_eq!(routines.len(), 1);
-        let r = &routines[0];
-        let fire_at = match r.trigger {
-            Trigger::OneShot { fire_at } => fire_at,
-            ref other => panic!("expected OneShot, got {other:?}"),
-        };
-        let delta = fire_at - before;
-        // We asked for 60s; allow some slack for clock motion.
-        assert!(
-            delta.num_seconds() >= 59 && delta.num_seconds() <= 65,
-            "fire_at off: {delta}"
-        );
-        let payload = payload_for(r);
-        assert!(payload.is_one_shot);
-        assert_eq!(payload.task, "check on build");
+        let listed = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(listed.contains("wakeup-"), "timer id missing: {listed}");
+        assert!(listed.contains("check on build"), "task missing: {listed}");
+        assert!(listed.contains("[@"), "fire_at marker missing: {listed}");
     }
 
     #[tokio::test]
     async fn wake_me_up_rejects_too_short() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let wake = WakeMeUp::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let err = wake
@@ -904,8 +910,8 @@ mod tests {
 
     #[tokio::test]
     async fn wake_me_up_rejects_empty_task() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let wake = WakeMeUp::new(index);
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let wake = WakeMeUp::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
         let err = wake
@@ -919,23 +925,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_renders_one_shot_rule_with_fire_at() {
-        let (_i, _r, index, session) = fixture("alpha").await;
-        let wake = WakeMeUp::new(index.clone());
-        let list = HeartbeatList::new(index);
+    async fn add_with_fresh_target() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = HeartbeatAdd::new(scoped(registry.clone(), index.clone()));
+        let list = HeartbeatList::new(scoped(registry, index));
         let ctx = make_ctx("alpha", session);
 
-        wake.execute(
-            serde_json::json!({ "after_seconds": 120, "task": "later thing" }),
+        add.execute(
+            serde_json::json!({
+                "id": "fresh-one",
+                "cron": "0 0 * * * *",
+                "task": "daily report",
+                "target": "fresh"
+            }),
             &ctx,
         )
         .await
         .unwrap();
 
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
-        assert!(out.contains("wakeup-"), "id missing: {out}");
-        // Format prefix "@YYYY-MM-DD ..." distinguishes one-shot from cron.
-        assert!(out.contains("[@"), "fire_at marker missing: {out}");
-        assert!(out.contains("later thing"), "task missing: {out}");
+        assert!(out.contains("fresh-one"), "id missing: {out}");
+        assert!(out.contains("fresh"), "target label missing: {out}");
     }
 }

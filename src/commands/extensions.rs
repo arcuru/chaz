@@ -262,6 +262,7 @@ mod tests {
         let mut hub = ExtensionHub::new();
         hub.reserve_builtin_commands(crate::commands::BUILTIN_COMMAND_NAMES.iter().copied());
         hub.set_session_registry(registry.clone());
+        hub.set_hosted_index(agent_index.clone());
         let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
         let spawn_cell = Arc::new(OnceLock::new());
@@ -295,6 +296,7 @@ mod tests {
             Default::default(),
             Arc::new(NativeToolHost::new()),
             hub,
+            backend_mgr.clone(),
         );
         let _ = spawn_cell.set(server.clone());
 
