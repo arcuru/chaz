@@ -100,6 +100,13 @@ agents:
 
 Both still parse for one release, with a deprecation warning at startup. At runtime, an agent with `role:` set and `persona:` unset gets a synthetic persona built from the role's prompt — same behavior, different shape. New configs should drop `roles:` and put the prompt directly under the agent's `persona:`.
 
+Two signals tell you migration is needed and exactly how:
+
+- **At startup**, a one-shot `WARN` per legacy key — `config.role`, `config.roles`, and one per agent that still has `role:` (named) and no `persona:`.
+- **At runtime**, `/agent persona show <ref>` flags `legacy role: <r> (deprecated)` and prints the exact `/agent set <ref> persona.prompt "…"` (or `persona.files <path>`) command that replaces it. Running that writes a real persona to the agent DB and a fresh `PersonaSnapshot`, after which the legacy path is dead for that agent.
+
+The migration is non-destructive: until you set a persona, the role keeps working via the runtime synthesis, so you can migrate agents one at a time.
+
 ## Agent DB schema
 
 Each Agent DB contains five well-known stores:

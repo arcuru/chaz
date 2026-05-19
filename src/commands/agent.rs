@@ -671,7 +671,15 @@ pub(super) async fn agent_persona_show(
         None => {
             out.push_str("  (no persona set)\n");
             if let Some(role) = &cfg.role {
-                out.push_str(&format!("  legacy role: {role}\n"));
+                out.push_str(&format!("  legacy role: {role}  (deprecated)\n"));
+                out.push_str(&format!(
+                    "  ↳ migrate: this role's prompt is auto-wrapped into a persona at runtime,\n     \
+                     but `role:` is going away. Replace it with an explicit persona:\n       \
+                     /agent set {0} persona.prompt \"<the role's instructions>\"\n     \
+                     (or `persona.files <path>` for a file-backed prompt). See\n     \
+                     docs/src/user_guide/agents.md#migrating-from-role.\n",
+                    entry.display_name
+                ));
             }
         }
         Some(p) => {
@@ -1244,6 +1252,35 @@ mod tests {
             db.read_config().await.unwrap().model.as_deref(),
             Some("opus")
         );
+    }
+
+    #[tokio::test]
+    async fn persona_show_flags_legacy_role_with_migration_guidance() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+        // Create an agent with a legacy `role:` and no persona.
+        dispatch(
+            Command::AgentNew {
+                name: "legacy".to_string(),
+                overrides: vec![("role".into(), "chaz".into())],
+            },
+            &ctx,
+        )
+        .await;
+
+        match dispatch(Command::AgentPersonaShow("legacy".to_string()), &ctx).await {
+            CommandOutcome::Text(msg) => {
+                assert!(msg.contains("legacy role: chaz"), "got: {msg}");
+                assert!(msg.contains("(deprecated)"), "no deprecation flag: {msg}");
+                assert!(
+                    msg.contains("/agent set legacy persona.prompt"),
+                    "no actionable migration command: {msg}"
+                );
+            }
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
     }
 
     #[tokio::test]
