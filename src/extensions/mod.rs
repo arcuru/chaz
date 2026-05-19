@@ -12,7 +12,6 @@ pub mod fs;
 pub mod memory;
 pub mod path_normalizer;
 pub mod schedule;
-pub mod scheduler;
 pub mod security_warnings;
 pub mod system;
 pub mod web;
@@ -62,6 +61,5 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
         )),
         Arc::new(schedule::ScheduleExtension::new(deps.agent_index)),
         Arc::new(agent_schedule::AgentScheduleExtension::new(spawn_cell)),
-        Arc::new(scheduler::ScheduleExtension),
     ]
 }

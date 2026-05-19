@@ -338,9 +338,16 @@ pub enum BackendType {
 pub struct ScheduleConfig {
     /// Unique name for this schedule
     pub name: String,
-    /// Target session identifier — session name or eidetica DB root ID
+    /// Target session identifier — session name or eidetica DB root ID.
+    /// The owning agent is woken into this session (Pinned) when the
+    /// schedule fires.
     pub session: String,
-    /// Task instructions sent as the directive content
+    /// Owning agent (display name or DB id). The schedule lives in this
+    /// agent's DB and that agent is the one woken on fire. Omit to use
+    /// the peer's default agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Task instructions handed to the agent as the wake prompt
     pub task: String,
     /// Cron expression (e.g., "0 9 * * *")
     pub cron: String,

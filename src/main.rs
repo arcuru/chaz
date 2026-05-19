@@ -472,19 +472,41 @@ async fn main() -> anyhow::Result<()> {
         "Spawn tool server cell already set"
     );
 
-    // Translate YAML schedules into session-scoped Routine rows. Each
-    // ScheduleConfig becomes one cron Routine targeting the scheduler
-    // extension on the resolved session's `routines` table; the engine
-    // (spawned below) picks them up via `register_session`. Idempotent
-    // by routine id == schedule name.
+    // Translate YAML `schedules:` into agent-owned Schedules. Each
+    // ScheduleConfig becomes one cron Schedule in the owning agent's DB,
+    // Pinned to the resolved session. The routine engine picks these up
+    // via `register_agent` below — there is no session-scoped routine row
+    // and no broadcast Directive. Idempotent by schedule id == schedule
+    // name within the owning agent.
     if let Some(schedules) = config.schedules.clone() {
         for cfg in schedules {
             if !cfg.enabled {
                 info!(schedule = %cfg.name, "Schedule disabled, skipping");
                 continue;
             }
-            let (_conv, sdb) = match registry.resolve_session(&cfg.session).await {
-                Ok(s) => s,
+            // Owning agent: explicit `agent:` else the peer's default.
+            let owner_ref = cfg
+                .agent
+                .clone()
+                .unwrap_or_else(|| server.agents().default_agent().name);
+            let entry = match server.agent_index().find_by_name(&owner_ref).or_else(|| {
+                eidetica::entry::ID::parse(&owner_ref)
+                    .ok()
+                    .and_then(|id| server.agent_index().find_by_id(&id))
+            }) {
+                Some(e) => e,
+                None => {
+                    error!(
+                        schedule = %cfg.name,
+                        agent = %owner_ref,
+                        "Failed to resolve schedule owning agent; skipping"
+                    );
+                    continue;
+                }
+            };
+            // Resolve the Pinned target session.
+            let session_db_id = match registry.resolve_session(&cfg.session).await {
+                Ok((_conv, sdb)) => sdb.root_id().to_string(),
                 Err(e) => {
                     error!(
                         schedule = %cfg.name,
@@ -494,43 +516,55 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
-            let existing = routine::list_session_routines(&sdb)
-                .await
-                .unwrap_or_default();
-            if existing.iter().any(|r| r.id.as_str() == cfg.name) {
-                info!(
-                    schedule = %cfg.name,
-                    "Schedule already present as routine; leaving in place"
-                );
-                continue;
-            }
-            let payload = match serde_json::to_value(extensions::scheduler::SchedulePayload {
-                schedule_name: cfg.name.clone(),
-                task: cfg.task.clone(),
-            }) {
-                Ok(v) => v,
+            // Open the owning agent's DB.
+            let opened = {
+                let user = registry.user_lock().await;
+                user.open_database(&entry.db_id).await
+            };
+            let adb = match opened {
+                Ok(db) => agent_db::AgentDb::from_database(db),
                 Err(e) => {
-                    error!(schedule = %cfg.name, "Failed to encode payload: {e}");
+                    error!(
+                        schedule = %cfg.name,
+                        agent = %entry.display_name,
+                        "Open agent DB for schedule failed: {e}"
+                    );
                     continue;
                 }
             };
-            let r = routine::Routine::cron(
-                routine::RoutineId::new(&cfg.name),
-                &cfg.name,
-                cfg.cron.clone(),
-                routine::RoutineTarget {
-                    extension: "scheduler".into(),
-                    payload,
+            // Idempotent by schedule id within the owning agent.
+            match adb.find_schedule(&cfg.name).await {
+                Ok(Some(_)) => {
+                    info!(
+                        schedule = %cfg.name,
+                        agent = %entry.display_name,
+                        "Schedule already present on agent; leaving in place"
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(schedule = %cfg.name, "find_schedule failed: {e}");
+                    continue;
+                }
+            }
+            let schedule = agent_db::Schedule::new(
+                cfg.name.clone(),
+                routine::Trigger::Cron {
+                    expr: cfg.cron.clone(),
                 },
+                cfg.task.clone(),
+                agent_db::ScheduleTarget::Pinned { session_db_id },
             );
-            if let Err(e) = routine::upsert_session_routine(&sdb, &r).await {
-                error!(schedule = %cfg.name, "Failed to upsert schedule routine: {e}");
+            if let Err(e) = adb.upsert_schedule(schedule).await {
+                error!(schedule = %cfg.name, "Failed to save schedule: {e}");
             } else {
                 info!(
                     schedule = %cfg.name,
+                    agent = %entry.display_name,
                     session = %cfg.session,
                     cron = %cfg.cron,
-                    "Schedule registered as session-scoped routine"
+                    "Schedule registered as agent-owned schedule"
                 );
             }
         }
