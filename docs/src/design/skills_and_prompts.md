@@ -10,6 +10,7 @@
 ## Summary
 
 **What dies:**
+
 - `src/role.rs` — removed. The one-release migration window closes.
 - `src/persona.rs` — removed. `Persona`, `ResolvedPersona`, `PersonaSnapshot`,
   `PersonaSnapshotPayload`, `SnapshotReason` all gone.
@@ -17,6 +18,7 @@
 - All `default_role` / `role:` fields on `Agent`, `AgentDbConfig`, `AgentConfig`.
 
 **What replaces them:**
+
 - **Agent fields** — `system_prompt: String`, `system_prompt_files: Vec<PathBuf>`.
   These live in `AgentDbConfig` and the runtime `Agent` struct. File resolution
   happens at agent construction time — files are read once and the concatenated
@@ -30,6 +32,7 @@
   context assembly time. Per-session extension filtering gates participation.
 
 **What stays:**
+
 - `SystemPromptSnapshot` entry type — renamed from `PersonaSnapshot`, now just
   records the final assembled prompt text + a reason. But the snapshot is
   _observational_ (audit-only), not _authoritative_. ContextBuilder always
@@ -58,12 +61,12 @@ Today chaz has three tangled layers for what should be one thing:
 
 The ecosystem has converged on a cleaner model:
 
-| Concept | Role in chaz today | Role after |
-|---------|-------------------|------------|
-| Agent identity | Persona (files + inline prompt) | `Agent.system_prompt` + `system_prompt_files` |
-| Reusable templates | `RoleDetails` | Skills (contextual, trigger-matched) |
-| Parameterized prompts | None | Future: prompt templates with `{{var}}` substitution |
-| Audit trail | PersonaSnapshot (authoritative) | `SystemPromptSnapshot` (observational only) |
+| Concept               | Role in chaz today              | Role after                                           |
+| --------------------- | ------------------------------- | ---------------------------------------------------- |
+| Agent identity        | Persona (files + inline prompt) | `Agent.system_prompt` + `system_prompt_files`        |
+| Reusable templates    | `RoleDetails`                   | Skills (contextual, trigger-matched)                 |
+| Parameterized prompts | None                            | Future: prompt templates with `{{var}}` substitution |
+| Audit trail           | PersonaSnapshot (authoritative) | `SystemPromptSnapshot` (observational only)          |
 
 ## Model
 
@@ -129,6 +132,7 @@ requires_tools: []
 # Nix skill
 
 Guidelines for working with Nix:
+
 - Use `nix develop .#` not `nix-shell`
 - Prefer `home-manager switch` over manual edits
 - ...
@@ -171,10 +175,10 @@ embedding-based or LLM-based selection to prevent circular manipulation.
 
 Two tiers, matching IronClaw's model:
 
-| Tier | Location | Trust | Tool access |
-|------|----------|-------|-------------|
-| `trusted` | `.chaz/skills/`, `~/.config/chaz/skills/` | Operator-placed | Full (no restriction) |
-| `installed` | Future: `~/.config/chaz/skills/installed/` | Registry download | Read-only tools only |
+| Tier        | Location                                   | Trust             | Tool access           |
+| ----------- | ------------------------------------------ | ----------------- | --------------------- |
+| `trusted`   | `.chaz/skills/`, `~/.config/chaz/skills/`  | Operator-placed   | Full (no restriction) |
+| `installed` | Future: `~/.config/chaz/skills/installed/` | Registry download | Read-only tools only  |
 
 v1 is `trusted` only. `installed` depends on a skill registry (future work).
 
@@ -182,11 +186,11 @@ The effective tool ceiling for a turn is `min(agent's tool set, lowest-trust act
 
 #### Built-in tools
 
-| Tool | Risk | Description |
-|------|------|-------------|
-| `skill_list` | Low | List loaded skills with name, description, trigger count, trust tier |
-| `skill_search` | Low | Full-text search across skill names + descriptions + trigger lists |
-| `skill_show` | Low | Display the full body of a named skill (for the agent to read on-demand) |
+| Tool           | Risk | Description                                                              |
+| -------------- | ---- | ------------------------------------------------------------------------ |
+| `skill_list`   | Low  | List loaded skills with name, description, trigger count, trust tier     |
+| `skill_search` | Low  | Full-text search across skill names + descriptions + trigger lists       |
+| `skill_show`   | Low  | Display the full body of a named skill (for the agent to read on-demand) |
 
 `skill_install` and `skill_remove` are deferred to v2 (registry integration).
 
@@ -350,25 +354,25 @@ extensions, not new abstractions.
 
 ## Implementation Touch Points
 
-| File | Change |
-|------|--------|
-| `src/role.rs` | **Delete** |
-| `src/persona.rs` | **Delete** |
-| `src/agent.rs` | Drop `persona`, `default_role`; add `system_prompt`, `system_prompt_files`; drop `migrate_role_to_persona()` |
-| `src/agent_db.rs` | `AgentDbConfig` loses `persona`, `role`; gains `system_prompt`, `system_prompt_files` |
-| `src/config.rs` | `AgentConfig` schema: same field swap |
-| `src/context.rs` | `ContextBuilder::build()`: drop snapshot lookup, add hub augmentation call |
-| `src/extension/caps.rs` | Add `PromptAugmentation` trait + `Capability::PromptAugmentation` variant |
-| `src/extension/mod.rs` | `ExtensionHub::augment_system_prompt()` — iterates providers, concatenates |
+| File                       | Change                                                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/role.rs`              | **Delete**                                                                                                                                                   |
+| `src/persona.rs`           | **Delete**                                                                                                                                                   |
+| `src/agent.rs`             | Drop `persona`, `default_role`; add `system_prompt`, `system_prompt_files`; drop `migrate_role_to_persona()`                                                 |
+| `src/agent_db.rs`          | `AgentDbConfig` loses `persona`, `role`; gains `system_prompt`, `system_prompt_files`                                                                        |
+| `src/config.rs`            | `AgentConfig` schema: same field swap                                                                                                                        |
+| `src/context.rs`           | `ContextBuilder::build()`: drop snapshot lookup, add hub augmentation call                                                                                   |
+| `src/extension/caps.rs`    | Add `PromptAugmentation` trait + `Capability::PromptAugmentation` variant                                                                                    |
+| `src/extension/mod.rs`     | `ExtensionHub::augment_system_prompt()` — iterates providers, concatenates                                                                                   |
 | `src/extensions/skills.rs` | **New** — `SkillRegistry`, `SkillManifest`, SKILL.md parser, trigger prefiltering, `skill_list`/`skill_search`/`skill_show` tools, `PromptAugmentation` impl |
-| `src/extensions/mod.rs` | Add `pub mod skills;` |
-| `src/main.rs` | Register `skills` in builtins list |
-| `src/server.rs` | `write_persona_snapshot()` → `write_system_prompt_snapshot()`; snapshot writes on initial attach + reload, not on first LLM call |
-| `src/session/agents.rs` | Same snapshot rename; `/agent persona` commands removed |
-| `src/commands/agent.rs` | Remove `persona` sub-commands; add `/agent reload <ref>` |
-| `src/types.rs` | Entry type: `PersonaSnapshot` → `SystemPromptSnapshot`; `SnapshotReason` stays |
-| `src/defaults.rs` | Built-in agent defs: `persona` → `system_prompt` + `system_prompt_files` |
-| `docs/src/` | User guide: skills directory, SKILL.md format, `/agent reload`; architecture: PromptAugmentation cap |
+| `src/extensions/mod.rs`    | Add `pub mod skills;`                                                                                                                                        |
+| `src/main.rs`              | Register `skills` in builtins list                                                                                                                           |
+| `src/server.rs`            | `write_persona_snapshot()` → `write_system_prompt_snapshot()`; snapshot writes on initial attach + reload, not on first LLM call                             |
+| `src/session/agents.rs`    | Same snapshot rename; `/agent persona` commands removed                                                                                                      |
+| `src/commands/agent.rs`    | Remove `persona` sub-commands; add `/agent reload <ref>`                                                                                                     |
+| `src/types.rs`             | Entry type: `PersonaSnapshot` → `SystemPromptSnapshot`; `SnapshotReason` stays                                                                               |
+| `src/defaults.rs`          | Built-in agent defs: `persona` → `system_prompt` + `system_prompt_files`                                                                                     |
+| `docs/src/`                | User guide: skills directory, SKILL.md format, `/agent reload`; architecture: PromptAugmentation cap                                                         |
 
 ## Testing
 

@@ -356,33 +356,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                 }
                 lines.push(Line::from(""));
             }
-            EntryType::PersonaSnapshot => {
-                // Audit-only — render a single dim line so the entry is
-                // visible in the transcript without leaking the full
-                // resolved prompt by default. `/agent persona show`
-                // surfaces the contents on demand.
-                let summary = match serde_json::from_str::<crate::persona::PersonaSnapshotPayload>(
-                    &entry.content,
-                ) {
-                    Ok(p) => format!(
-                        "--- persona snapshot ({}, {}, {} src, {} chars) ---",
-                        p.agent,
-                        match p.reason {
-                            crate::persona::SnapshotReason::Initial => "initial",
-                            crate::persona::SnapshotReason::Bump => "bump",
-                            crate::persona::SnapshotReason::Edit => "edit",
-                        },
-                        p.resolved.sources.len(),
-                        p.resolved.text.len(),
-                    ),
-                    Err(_) => "--- persona snapshot (malformed) ---".to_string(),
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}{summary}"),
-                    dim,
-                )]));
-                lines.push(Line::from(""));
-            }
         }
     }
 

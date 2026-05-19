@@ -60,18 +60,12 @@ pub struct AgentMeta {
 /// downgraded to bootstrap sugar (Stage 6).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentDbConfig {
-    /// Persona definition: file includes + optional inline text. The
-    /// resolved string is what becomes the LLM's system message; live
-    /// snapshots written into each session DB freeze the resolved text
-    /// at attach/bump time so disk edits don't silently mutate ongoing
-    /// sessions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persona: Option<crate::persona::Persona>,
-    /// Deprecated: name of a config-level `roles:` entry. Migrated into
-    /// `persona` at runtime when `persona` is unset (Stage transition).
-    /// Kept on the schema so older AgentDbs continue to deserialize.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
+    /// System prompt string (the LLM's system message).
+    #[serde(default)]
+    pub system_prompt: String,
+    /// Paths to system-prompt files, concatenated before `system_prompt`.
+    #[serde(default)]
+    pub system_prompt_files: Vec<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
     #[serde(default)]
@@ -92,8 +86,8 @@ pub struct AgentDbConfig {
 impl AgentDbConfig {
     pub fn from_agent_config(cfg: &AgentConfig) -> Self {
         Self {
-            persona: cfg.persona.clone(),
-            role: cfg.role.clone(),
+            system_prompt: cfg.system_prompt.clone().unwrap_or_default(),
+            system_prompt_files: cfg.system_prompt_files.clone().unwrap_or_default(),
             model: cfg.model.clone(),
             tools: cfg.tools.clone(),
             can_spawn: cfg.can_spawn.clone().unwrap_or_default(),
@@ -650,8 +644,8 @@ mod tests {
     fn agent_cfg(name: &str) -> AgentConfig {
         AgentConfig {
             name: name.to_string(),
-            persona: None,
-            role: Some("default".to_string()),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            system_prompt_files: None,
             model: Some("sonnet".to_string()),
             tools: Some(vec!["get_time".into(), "calculate".into()]),
             can_spawn: None,
@@ -669,8 +663,8 @@ mod tests {
     async fn config_round_trip() {
         let mut user = test_peer_user().await;
         let cfg = AgentDbConfig {
-            persona: None,
-            role: Some("researcher".to_string()),
+            system_prompt: "You are a researcher.".to_string(),
+            system_prompt_files: vec![],
             model: Some("opus".to_string()),
             tools: Some(vec!["web_fetch".into()]),
             can_spawn: vec!["writer".into()],
@@ -703,7 +697,6 @@ mod tests {
     async fn reopen_by_id() {
         let mut user = test_peer_user().await;
         let cfg = AgentDbConfig {
-            role: Some("r".to_string()),
             ..Default::default()
         };
         let meta = AgentMeta {

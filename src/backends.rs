@@ -7,7 +7,6 @@ use crate::{
     config::Backend,
     error::LlmError,
     openai::OpenAI,
-    role::RoleDetails,
     runtime::{LLMResponse, RuntimeMessage},
     security::SecretStore,
     tool::ToolDefinition,
@@ -100,7 +99,7 @@ impl Message {
 pub struct ChatContext {
     pub messages: Vec<Message>,
     pub model: Option<String>,
-    pub role: Option<RoleDetails>,
+    pub system_prompt: Option<String>,
 }
 
 impl ChatContext {
@@ -332,7 +331,7 @@ mod tests {
                 Message::new(MessageRole::User, "hi"),
             ],
             model: None,
-            role: None,
+            system_prompt: None,
         };
         let out = ctx.string_prompt();
         assert!(out.starts_with("SYSTEM: be helpful"));
@@ -483,7 +482,7 @@ mod tests {
         let ctx = ChatContext {
             messages: vec![Message::new(MessageRole::User, "hi")],
             model: None,
-            role: None,
+            system_prompt: None,
         };
         let err = mgr.execute(&ctx).await.unwrap_err();
         assert!(matches!(err, LlmError::Configuration { .. }));

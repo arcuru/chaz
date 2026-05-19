@@ -139,13 +139,6 @@ pub enum Command {
         field: String,
         value: String,
     },
-    /// Show the agent's current persona definition + a summary of the
-    /// most recent `PersonaSnapshot` written into the active session.
-    AgentPersonaShow(String),
-    /// Re-resolve the agent's persona files and write a fresh
-    /// `PersonaSnapshot` to the active session. Use after editing source
-    /// files (e.g. ~/AGENTS.md) so existing sessions pick up the change.
-    AgentPersonaBump(String),
     /// Print this peer's default pubkey so an agent owner can paste it
     /// into `/agent invite` on their peer (Co-owned Agents Stage 10).
     Pubkey,
@@ -321,8 +314,6 @@ pub struct CommandContext<'a> {
     pub session_db: &'a eidetica::Database,
     pub current_agent: &'a str,
     pub session_name: Option<&'a str>,
-    pub config_roles: Option<Vec<String>>,
-    pub default_role: Option<&'a str>,
 }
 
 pub struct SessionSwitch {
@@ -374,8 +365,6 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             field,
             value,
         } => agent::agent_set(&agent_ref, &field, &value, ctx).await,
-        Command::AgentPersonaShow(r) => agent::agent_persona_show(&r, ctx).await,
-        Command::AgentPersonaBump(r) => agent::agent_persona_bump(&r, ctx).await,
         Command::Pubkey => agent::pubkey(ctx).await,
         Command::AgentInvite {
             agent_ref,

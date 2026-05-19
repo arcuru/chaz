@@ -251,8 +251,6 @@ mod tests {
             session_db,
             current_agent: "chaz",
             session_name: None,
-            config_roles: None,
-            default_role: None,
         }
     }
 

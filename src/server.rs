@@ -797,12 +797,16 @@ impl Server {
                 .iter()
                 .map(|a| a.display_name.clone())
                 .collect();
-            ContextBuilder::new(s.entries(), agent_name, &self.context_config)
-                .with_role(agent.default_role.as_ref())
-                .with_tools(&tool_defs)
-                .with_max_tokens_override(max_context_tokens)
-                .with_room_participants(&roster)
-                .build()
+            ContextBuilder::new(
+                s.entries(),
+                agent_name,
+                &agent.system_prompt,
+                &self.context_config,
+            )
+            .with_tools(&tool_defs)
+            .with_max_tokens_override(max_context_tokens)
+            .with_room_participants(&roster)
+            .build()
         };
 
         // Prepend the wake-prompt as a private System message. This is
@@ -1180,8 +1184,7 @@ impl Server {
         spawn: SpawnContext,
     ) {
         let agent_name = agent.name.clone();
-        let default_role = agent.default_role.clone();
-        let agent_persona = agent.persona.clone();
+        let system_prompt = agent.system_prompt.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
         let agent_grants = agent.grants.clone();
@@ -1224,50 +1227,6 @@ impl Server {
                 .await;
             }
 
-            // Lazy PersonaSnapshot: if this agent has a persona but no
-            // snapshot has been written for it on this session, resolve
-            // and write one now (reason = Initial). Covers fresh
-            // sessions, CLI mode, sessions where `/agent add` happened
-            // before the persona feature, and sessions synced from a
-            // peer that hadn't run the agent yet. Failures are logged
-            // and the call proceeds — ContextBuilder falls back to the
-            // legacy `default_role` and the operator sees an empty or
-            // partial system prompt rather than a crash.
-            if let Some(persona) = agent_persona.as_ref() {
-                let needs_snapshot = {
-                    let s = session.lock().await;
-                    crate::context::latest_persona_snapshot(s.entries(), &agent_name).is_none()
-                };
-                if needs_snapshot {
-                    let session_db = {
-                        let s = session.lock().await;
-                        s.database().clone()
-                    };
-                    match crate::session::write_persona_snapshot(
-                        &session_db,
-                        &agent_name,
-                        persona,
-                        crate::persona::SnapshotReason::Initial,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            // Re-read the session so the freshly-written
-                            // snapshot enters the in-memory entries
-                            // before ContextBuilder runs.
-                            let mut s = session.lock().await;
-                            *s = Session::new(s.conversation_id.clone(), session_db).await;
-                        }
-                        Err(e) => {
-                            error!(
-                                agent = %agent_name,
-                                "Failed to write Initial PersonaSnapshot: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-
             let request_security = SecurityContext {
                 leak_detector: security.leak_detector.clone(),
                 auto_approved_tools: security.auto_approved_tools.clone(),
@@ -1308,8 +1267,7 @@ impl Server {
                     .into_iter()
                     .map(|a| a.display_name)
                     .collect();
-                ContextBuilder::new(s.entries(), &agent_name, &context_config)
-                    .with_role(default_role.as_ref())
+                ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
                     .with_tools(&tool_defs)
                     .with_max_tokens_override(max_context_tokens)
                     .with_room_participants(&roster)
@@ -1526,8 +1484,8 @@ mod tests {
         // hydration happened before a DB edit.
         let mut stale = crate::agent::Agent {
             name: "alpha".to_string(),
-            persona: None,
-            default_role: None,
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
             default_model: Some("opus".to_string()),
             allowed_tools: None,
             can_spawn: vec![],
@@ -1588,8 +1546,8 @@ mod tests {
         // No DB for "phantom"; hydration should return the input unchanged.
         let input = crate::agent::Agent {
             name: "phantom".to_string(),
-            persona: None,
-            default_role: None,
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
             default_model: Some("ghost".to_string()),
             allowed_tools: None,
             can_spawn: vec![],

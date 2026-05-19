@@ -699,10 +699,10 @@ fn convert_chat_context(
     default_model: &Option<String>,
 ) -> (String, Vec<ChatMessage>) {
     let mut messages = Vec::new();
-    if let Some(role) = &context.role {
+    if let Some(prompt) = &context.system_prompt {
         messages.push(ChatMessage {
             role: "system".to_string(),
-            content: Some(MessageContent::Text(role.get_prompt())),
+            content: Some(MessageContent::Text(prompt.clone())),
             tool_calls: None,
             tool_call_id: None,
             extra: Map::new(),

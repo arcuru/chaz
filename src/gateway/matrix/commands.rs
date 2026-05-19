@@ -7,8 +7,6 @@
 
 use crate::backends::{BackendManager, ChatContext, Message, MessageRole};
 use crate::config::*;
-use crate::defaults::DEFAULT_CONFIG;
-use crate::role::{RoleDetails, get_role};
 use crate::security::SecretStore;
 use crate::session::{SessionMeta, SessionRegistry};
 
@@ -92,7 +90,7 @@ pub async fn send(
     let no_context = ChatContext {
         messages: vec![Message::new(MessageRole::User, input.to_string())],
         model: context.model,
-        role: context.role,
+        system_prompt: context.system_prompt,
     };
 
     info!(
@@ -268,13 +266,8 @@ pub async fn get_context(
     let mut context = ChatContext {
         messages: Vec::new(),
         model: None,
-        role: None,
+        system_prompt: None,
     };
-    context.role = get_role(
-        config.role.clone(),
-        config.roles.clone(),
-        DEFAULT_CONFIG.roles.clone(),
-    );
 
     let mut options = MessagesOptions::backward();
 
@@ -368,21 +361,8 @@ pub async fn get_context(
         if let Some(model) = &meta.model {
             context.model = Some(model.clone());
         }
-        if let Some(role_name) = &meta.role_name {
-            if let Some(prompt) = &meta.role_prompt {
-                context.role = Some(RoleDetails::new(
-                    role_name,
-                    None,
-                    Some(prompt.clone()),
-                    None,
-                ));
-            } else {
-                context.role = get_role(
-                    Some(role_name.clone()),
-                    config.roles.clone(),
-                    DEFAULT_CONFIG.roles.clone(),
-                );
-            }
+        if let Some(prompt) = &meta.role_prompt {
+            context.system_prompt = Some(prompt.clone());
         }
     }
 

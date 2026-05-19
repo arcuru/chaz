@@ -1,5 +1,4 @@
 use crate::extension::caps::CapabilityKind;
-use crate::role::RoleDetails;
 use crate::tool::PresentationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,10 +24,6 @@ pub struct Config {
     pub state_dir: Option<String>,
     /// Model to use for summarizing chats
     pub chat_summary_model: Option<String>,
-    /// Default role
-    pub role: Option<String>,
-    /// Definitions of roles
-    pub roles: Option<Vec<RoleDetails>>,
     /// Backend configuration
     pub backends: Option<Vec<Backend>>,
     /// Agent definitions
@@ -226,15 +221,12 @@ pub enum WebSearchBackendKind {
 pub struct AgentConfig {
     /// Name of the agent
     pub name: String,
-    /// System-prompt definition: file includes + optional inline text. The
-    /// resolved string is what becomes the LLM's system message. If unset,
-    /// the legacy `role:` lookup is used as a deprecated fallback.
-    pub persona: Option<crate::persona::Persona>,
-    /// Deprecated: name of a top-level `roles:` entry whose `prompt:` is
-    /// used as the system prompt. Kept for one release so existing configs
-    /// still parse; new configs should use `persona:` directly. When both
-    /// are set, `persona:` wins.
-    pub role: Option<String>,
+    /// System prompt string. The resolved text that becomes the LLM's
+    /// system message. When combined with system_prompt_files, the
+    /// files are concatenated first, then this string's content appended.
+    pub system_prompt: Option<String>,
+    /// Paths to files whose content is concatenated into the system prompt.
+    pub system_prompt_files: Option<Vec<String>>,
     /// Default model for this agent
     pub model: Option<String>,
     /// List of tool names this agent is allowed to use (None = all tools)
@@ -504,14 +496,12 @@ message_limit: 500
 room_size_limit: 100
 state_dir: "/var/lib/chaz"
 chat_summary_model: "gpt-4"
-role: "assistant"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.homeserver_url, "https://matrix.org");
         assert_eq!(cfg.username, "@bot:matrix.org");
         assert_eq!(cfg.password.as_deref(), Some("s3cret"));
         assert_eq!(cfg.message_limit, Some(500));
-        assert_eq!(cfg.role.as_deref(), Some("assistant"));
     }
 
     #[test]
@@ -519,7 +509,7 @@ role: "assistant"
         let yaml = r#"
 agents:
   - name: researcher
-    role: analyst
+    system_prompt: "You are a research analyst."
     model: gpt-4
     tools: [web_fetch, calculate]
     max_iterations: 20
@@ -531,7 +521,10 @@ agents:
         let agents = cfg.agents.unwrap();
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "researcher");
-        assert_eq!(agents[0].role.as_deref(), Some("analyst"));
+        assert_eq!(
+            agents[0].system_prompt.as_deref(),
+            Some("You are a research analyst.")
+        );
         assert_eq!(agents[0].model.as_deref(), Some("gpt-4"));
         assert_eq!(agents[0].max_iterations, Some(20));
         assert!(agents[0].autonomous);

@@ -5,8 +5,6 @@
 //! scheduler pointers, and per-session LLM config (model/role/backend).
 
 use crate::backends::{ChatContext, Message, MessageRole};
-use crate::defaults::DEFAULT_CONFIG;
-use crate::role::get_role_names;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::types::ConversationId;
 
@@ -373,7 +371,7 @@ pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
             ),
         ],
         model: None,
-        role: None,
+        system_prompt: None,
     };
 
     let summary = match ctx.backend.execute(&chat_ctx).await {
@@ -518,22 +516,12 @@ pub(super) async fn role(
     match arg {
         None => {
             let meta = session.read_meta().await;
-            let current_role = meta
-                .role_name
-                .or_else(|| ctx.default_role.map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown".to_string());
-            let config_roles = ctx.config_roles.clone().unwrap_or_default();
-            let default_roles = get_role_names(DEFAULT_CONFIG.roles.clone());
-            let mut msg = format!("Current Role: {current_role}");
-            if !config_roles.is_empty() {
-                msg.push_str(&format!(
-                    "\n\nConfigured Roles:\n{}",
-                    config_roles.join("\n")
-                ));
-            }
-            if !default_roles.is_empty() {
-                msg.push_str(&format!("\n\nBuiltin Roles:\n{}", default_roles.join("\n")));
-            }
+            let current_role = meta.role_name.unwrap_or_else(|| "none".to_string());
+            let role_prompt = meta.role_prompt.as_deref().unwrap_or("(none)");
+            let msg = format!(
+                "Current Role: {current_role}\nPrompt: {role_prompt}\n\n\
+                 Roles are deprecated. Use per-agent system_prompt: /agent set <name> system_prompt <text>"
+            );
             CommandOutcome::Text(msg)
         }
         Some((name, prompt)) => {

@@ -6,7 +6,6 @@ use crate::commands::{
 };
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
-use crate::role::get_role_names;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
@@ -125,8 +124,6 @@ async fn dispatch_in_room(
         .registry()
         .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
-    let config_roles = Some(get_role_names(config.roles.clone()));
-
     let ctx = CommandContext {
         server: &server,
         secrets: &secrets,
@@ -135,8 +132,6 @@ async fn dispatch_in_room(
         session_db: &session_db,
         current_agent: &agent.name,
         session_name: meta.name.as_deref(),
-        config_roles,
-        default_role: config.role.as_deref(),
     };
 
     let outcome = shared_commands::dispatch(cmd, &ctx).await;
@@ -528,21 +523,6 @@ impl Gateway for MatrixGateway {
                                 field: field.to_string(),
                                 value: value.to_string(),
                             })
-                        }
-                    }
-                    "persona" if !rest.is_empty() => {
-                        // `!chaz agent persona show <ref>` / `!chaz agent persona bump <ref>`
-                        let mut parts = rest.splitn(2, char::is_whitespace);
-                        let sub = parts.next().unwrap_or("").trim();
-                        let target = parts.next().unwrap_or("").trim();
-                        if target.is_empty() {
-                            None
-                        } else {
-                            match sub {
-                                "show" => Some(Command::AgentPersonaShow(target.to_string())),
-                                "bump" => Some(Command::AgentPersonaBump(target.to_string())),
-                                _ => None,
-                            }
                         }
                     }
                     "invite" if !rest.is_empty() => {

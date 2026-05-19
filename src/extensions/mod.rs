@@ -14,6 +14,7 @@ pub mod memory;
 pub mod path_normalizer;
 pub mod schedule;
 pub mod security_warnings;
+pub mod skills;
 pub mod system;
 pub mod web;
 
@@ -61,6 +62,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             deps.embedder,
         )),
         Arc::new(schedule::ScheduleExtension::new()),
+        Arc::new(skills::SkillsExtension::new()),
         Arc::new(agent_schedule::AgentScheduleExtension::new(spawn_cell)),
     ]
 }

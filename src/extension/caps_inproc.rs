@@ -299,7 +299,6 @@ fn map_kind_to_type(kind: &str) -> EntryType {
         "ack" => EntryType::Ack,
         "error" => EntryType::Error,
         "summary" => EntryType::Summary,
-        "persona_snapshot" => EntryType::PersonaSnapshot,
         _ => EntryType::Message,
     }
 }
@@ -313,7 +312,6 @@ fn map_type_to_kind(t: &EntryType) -> &'static str {
         EntryType::Ack => "ack",
         EntryType::Error => "error",
         EntryType::Summary => "summary",
-        EntryType::PersonaSnapshot => "persona_snapshot",
     }
 }
 
@@ -388,7 +386,6 @@ mod tests {
             "ack",
             "error",
             "summary",
-            "persona_snapshot",
         ];
         for k in kinds {
             let t = map_kind_to_type(k);

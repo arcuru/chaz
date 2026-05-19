@@ -1,23 +1,15 @@
 use crate::config::{AgentConfig, AgentPreset, Config};
-use crate::defaults::DEFAULT_CONFIG;
 use crate::grants::Grants;
-use crate::persona::Persona;
-use crate::role::{RoleDetails, get_role};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::warn;
 
 /// Agent definition — personality, model preferences, tool visibility, and spawn permissions.
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,
-    /// Persona definition. When set, this is the source of truth for the
-    /// agent's system prompt: ContextBuilder either reads the latest
-    /// `PersonaSnapshot` for the agent on the active session, or
-    /// resolves this persona live and writes a snapshot.
-    /// Coexists with `default_role` for the duration of the deprecation
-    /// window — `default_role` only applies when `persona` is `None`.
-    pub persona: Option<Persona>,
-    pub default_role: Option<RoleDetails>,
+    pub system_prompt: String,
+    pub system_prompt_files: Vec<PathBuf>,
     pub default_model: Option<String>,
     /// Tool names this agent can use. None = all tools (no filtering).
     pub allowed_tools: Option<Vec<String>>,
@@ -51,27 +43,17 @@ pub struct ResolvedOverrides {
 }
 
 impl Agent {
-    fn from_agent_config(agent_config: &AgentConfig, config: &Config) -> Self {
-        let default_role = get_role(
-            agent_config.role.clone(),
-            config.roles.clone(),
-            DEFAULT_CONFIG.roles.clone(),
-        );
-        // Persona resolution priority:
-        //   1. Explicit persona on this agent's config.
-        //   2. Migrated from the agent's `role:` reference (legacy).
-        //   3. Built-in agent of the same name (e.g. `chaz`,
-        //      `chazmina`, `bash`) — lets users declare an agent by
-        //      name alone and inherit the canonical persona.
-        let persona = agent_config
-            .persona
-            .clone()
-            .or_else(|| migrate_role_to_persona(agent_config.role.as_deref(), config))
-            .or_else(|| crate::defaults::default_agent(&agent_config.name).and_then(|a| a.persona));
+    fn from_agent_config(agent_config: &AgentConfig, _config: &Config) -> Self {
         Agent {
             name: agent_config.name.clone(),
-            persona,
-            default_role,
+            system_prompt: agent_config.system_prompt.clone().unwrap_or_default(),
+            system_prompt_files: agent_config
+                .system_prompt_files
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             default_model: agent_config.model.clone(),
             allowed_tools: agent_config.tools.clone(),
             can_spawn: agent_config.can_spawn.clone().unwrap_or_default(),
@@ -86,20 +68,17 @@ impl Agent {
     }
 
     /// Build a runtime Agent from a Living Agent's DB config (Stage 6
-    /// `/agent new` and `/agent import`). Role resolution falls back to the
-    /// in-built defaults (`DEFAULT_CONFIG.roles`) so the agent participates
-    /// in ReAct even without a named role.
+    /// `/agent new` and `/agent import`).
     pub fn from_db_config(name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Self {
-        let default_role = get_role(cfg.role.clone(), None, DEFAULT_CONFIG.roles.clone());
-        let persona = cfg
-            .persona
-            .clone()
-            .or_else(|| migrate_role_name_to_persona(cfg.role.as_deref(), None))
-            .or_else(|| crate::defaults::default_agent(name).and_then(|a| a.persona));
         Agent {
             name: name.to_string(),
-            persona,
-            default_role,
+            system_prompt: cfg.system_prompt.clone(),
+            system_prompt_files: cfg
+                .system_prompt_files
+                .clone()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
             can_spawn: cfg.can_spawn.clone(),
@@ -170,52 +149,6 @@ impl Agent {
     }
 }
 
-/// Build a `Persona` from a deprecated `role:` name, looking it up in
-/// the user's `roles:` list and falling back to `DEFAULT_CONFIG.roles`.
-/// Returns `None` if the name doesn't resolve — caller is responsible
-/// for deciding whether that's an error or just an empty system prompt.
-fn migrate_role_to_persona(role_name: Option<&str>, config: &Config) -> Option<Persona> {
-    let name = role_name?;
-    let role = get_role(
-        Some(name.to_string()),
-        config.roles.clone(),
-        DEFAULT_CONFIG.roles.clone(),
-    )?;
-    let prompt = role.get_prompt();
-    if prompt.trim().is_empty() {
-        return None;
-    }
-    Some(Persona {
-        description: Some(format!("(migrated from role:{name})")),
-        prompt: Some(prompt),
-        ..Default::default()
-    })
-}
-
-/// Same as [`migrate_role_to_persona`] but used when only the built-in
-/// defaults are available (e.g. live hydration from an AgentDb that has
-/// neither `persona` nor a referenceable user-defined role list).
-fn migrate_role_name_to_persona(
-    role_name: Option<&str>,
-    extra_roles: Option<&[RoleDetails]>,
-) -> Option<Persona> {
-    let name = role_name?;
-    let role = get_role(
-        Some(name.to_string()),
-        extra_roles.map(|r| r.to_vec()),
-        DEFAULT_CONFIG.roles.clone(),
-    )?;
-    let prompt = role.get_prompt();
-    if prompt.trim().is_empty() {
-        return None;
-    }
-    Some(Persona {
-        description: Some(format!("(migrated from role:{name})")),
-        prompt: Some(prompt),
-        ..Default::default()
-    })
-}
-
 /// Intersect a tool override list with an existing allowlist.
 /// If base is None (all tools), the override becomes the allowlist.
 /// If both are set, only tools in both lists are kept.
@@ -238,13 +171,8 @@ fn intersect_tools(base: &Option<Vec<String>>, override_tools: &[String]) -> Vec
 /// `/agent new`); yaml-bootstrapped agents land here at startup, and
 /// subsequently-created Living Agents join via [`AgentRegistry::register`].
 /// All read accessors clone out `Agent` values — Agent is cheap to clone.
-///
-/// `config_roles` stashes the user's `roles:` list so live hydration from
-/// `AgentDb::config` can resolve role names defined outside
-/// `DEFAULT_CONFIG.roles` (Stage 8).
 pub struct AgentRegistry {
     agents: std::sync::RwLock<Vec<Agent>>,
-    config_roles: Option<Vec<RoleDetails>>,
 }
 
 impl AgentRegistry {
@@ -263,7 +191,6 @@ impl AgentRegistry {
 
         let registry = Self {
             agents: std::sync::RwLock::new(agents),
-            config_roles: config.roles.clone(),
         };
         registry.validate_references();
         registry
@@ -278,8 +205,8 @@ impl AgentRegistry {
         Self {
             agents: std::sync::RwLock::new(vec![Agent {
                 name: "default".to_string(),
-                persona: None,
-                default_role: None,
+                system_prompt: String::new(),
+                system_prompt_files: vec![],
                 default_model: None,
                 allowed_tools: None,
                 can_spawn: Vec::new(),
@@ -291,34 +218,17 @@ impl AgentRegistry {
                 max_context_tokens: None,
                 grants: HashMap::new(),
             }]),
-            config_roles: None,
         }
     }
 
-    /// Synthesize and register a `"chaz"` agent built from the top-level
-    /// `role`/`roles` config — the legacy "user provided no `agents:`
-    /// block" fallback. Called by `main.rs` when [`from_config`] yielded
-    /// an empty registry; tests don't need this (they use
-    /// [`with_default_agent`]).
-    pub fn register_default_chaz(&self, config: &Config) -> anyhow::Result<()> {
-        let default_role = get_role(
-            config.role.clone(),
-            config.roles.clone(),
-            DEFAULT_CONFIG.roles.clone(),
-        );
-        // Persona lookup priority:
-        //   1. Migrate the legacy top-level `role: <name>` (if set) by
-        //      looking up that role's prompt in user `roles:` /
-        //      DEFAULT_CONFIG.roles (the latter is empty post-rename).
-        //   2. Fall back to the built-in `chaz` agent's persona from
-        //      DEFAULT_CONFIG.agents — the canonical "Chaz refers to
-        //      himself in the third person" prompt.
-        let persona = migrate_role_to_persona(config.role.as_deref(), config)
-            .or_else(|| crate::defaults::default_agent("chaz").and_then(|a| a.persona));
+    /// Synthesize and register a `"chaz"` agent as the fallback when no
+    /// agents are declared in config. Called by `main.rs` when
+    /// [`from_config`] yields an empty registry.
+    pub fn register_default_chaz(&self, _config: &Config) -> anyhow::Result<()> {
         self.register(Agent {
             name: "chaz".to_string(),
-            persona,
-            default_role,
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
             default_model: None,
             allowed_tools: None,
             can_spawn: Vec::new(),
@@ -337,13 +247,6 @@ impl AgentRegistry {
     /// `"chaz"` agent.
     pub fn is_empty(&self) -> bool {
         self.agents.read().unwrap().is_empty()
-    }
-
-    /// Access the user-config roles stashed at registry-build time. Used by
-    /// live hydration from AgentDb::config so role names reference the same
-    /// roles that yaml-bootstrapped agents resolve against.
-    pub fn config_roles(&self) -> Option<&Vec<RoleDetails>> {
-        self.config_roles.as_ref()
     }
 
     /// Get the default agent (first in the list). Panics if the registry is
@@ -429,38 +332,10 @@ impl AgentRegistry {
         agents.len() != before
     }
 
-    /// Build a runtime `Agent` from a Living Agent's DB config, resolving the
-    /// role name against this registry's `config_roles` (falling back to
-    /// `DEFAULT_CONFIG.roles`). Use this instead of `Agent::from_db_config`
-    /// when the user's yaml-defined roles need to be honored.
+    /// Build a runtime `Agent` from a Living Agent's DB config.
+    /// Delegates to [`Agent::from_db_config`].
     pub fn build_from_db_config(&self, name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Agent {
-        let default_role = get_role(
-            cfg.role.clone(),
-            self.config_roles.clone(),
-            DEFAULT_CONFIG.roles.clone(),
-        );
-        let persona = cfg
-            .persona
-            .clone()
-            .or_else(|| {
-                migrate_role_name_to_persona(cfg.role.as_deref(), self.config_roles.as_deref())
-            })
-            .or_else(|| crate::defaults::default_agent(name).and_then(|a| a.persona));
-        Agent {
-            name: name.to_string(),
-            persona,
-            default_role,
-            default_model: cfg.model.clone(),
-            allowed_tools: cfg.tools.clone(),
-            can_spawn: cfg.can_spawn.clone(),
-            allowed_callers: cfg.allowed_callers.clone(),
-            max_iterations: cfg.max_iterations.unwrap_or(10),
-            autonomous: cfg.autonomous,
-            presets: cfg.presets.clone(),
-            tool_profile: cfg.tool_profile.clone(),
-            max_context_tokens: cfg.max_context_tokens,
-            grants: cfg.grants.clone(),
-        }
+        Agent::from_db_config(name, cfg)
     }
 
     /// Validate that all names in can_spawn and allowed_callers reference existing agents.
@@ -495,8 +370,8 @@ mod tests {
     fn make_agent(name: &str, can_spawn: Vec<&str>, allowed_callers: Vec<&str>) -> Agent {
         Agent {
             name: name.to_string(),
-            persona: None,
-            default_role: None,
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
             default_model: None,
             allowed_tools: None,
             can_spawn: can_spawn.into_iter().map(String::from).collect(),
@@ -517,7 +392,6 @@ mod tests {
                 make_agent("chaz", vec!["researcher"], vec![]),
                 make_agent("researcher", vec![], vec!["chaz"]),
             ]),
-            config_roles: None,
         };
         assert!(registry.can_spawn("chaz", "researcher"));
         assert!(!registry.can_spawn("researcher", "chaz"));
@@ -530,7 +404,6 @@ mod tests {
                 make_agent("chaz", vec!["coder"], vec![]),
                 make_agent("coder", vec![], vec![]), // empty = anyone
             ]),
-            config_roles: None,
         };
         assert!(registry.can_spawn("chaz", "coder"));
     }
@@ -542,7 +415,6 @@ mod tests {
                 make_agent("chaz", vec!["mayor"], vec![]),
                 make_agent("mayor", vec![], vec!["researcher"]), // only researcher can call
             ]),
-            config_roles: None,
         };
         assert!(!registry.can_spawn("chaz", "mayor"));
     }
@@ -551,7 +423,6 @@ mod tests {
     fn test_spawn_unknown_target() {
         let registry = AgentRegistry {
             agents: std::sync::RwLock::new(vec![make_agent("chaz", vec!["nonexistent"], vec![])]),
-            config_roles: None,
         };
         assert!(!registry.can_spawn("chaz", "nonexistent"));
     }
@@ -631,7 +502,6 @@ mod tests {
     fn registry_register_adds_and_rejects_duplicates() {
         let registry = AgentRegistry {
             agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
-            config_roles: None,
         };
         let new_agent = make_agent("researcher", vec![], vec![]);
         registry.register(new_agent).unwrap();
@@ -689,27 +559,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_from_db_config_resolves_role_via_registry_config_roles() {
-        let custom_role = RoleDetails::new_test("custom", "you are custom");
-        let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![]),
-            config_roles: Some(vec![custom_role]),
-        };
-        let cfg = crate::agent_db::AgentDbConfig {
-            role: Some("custom".to_string()),
-            ..Default::default()
-        };
-        let agent = registry.build_from_db_config("alpha", &cfg);
-        let resolved = agent.default_role.expect("role should resolve");
-        assert_eq!(resolved.name, "custom");
-        assert_eq!(resolved.get_prompt(), "you are custom");
-    }
-
-    #[test]
     fn upsert_replaces_existing_entry() {
         let registry = AgentRegistry {
             agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
-            config_roles: None,
         };
         let mut updated = make_agent("chaz", vec!["researcher"], vec![]);
         updated.default_model = Some("opus".to_string());
@@ -725,7 +577,6 @@ mod tests {
     fn upsert_inserts_when_absent() {
         let registry = AgentRegistry {
             agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
-            config_roles: None,
         };
         registry.upsert(make_agent("beta", vec![], vec![]));
         assert_eq!(registry.names().len(), 2);
@@ -738,7 +589,6 @@ mod tests {
         // config writes V2 → runtime rebuilds → sees V2.
         let registry = AgentRegistry {
             agents: std::sync::RwLock::new(vec![]),
-            config_roles: None,
         };
 
         let v1 = crate::agent_db::AgentDbConfig {

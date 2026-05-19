@@ -30,8 +30,8 @@ pub(crate) async fn test_session_db() -> (Instance, eidetica::user::User, eideti
 pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
     AgentConfig {
         name: name.to_string(),
-        persona: None,
-        role: None,
+        system_prompt: Some("You are a test agent.".to_string()),
+        system_prompt_files: None,
         model: None,
         tools: None,
         can_spawn: None,

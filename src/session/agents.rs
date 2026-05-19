@@ -16,11 +16,7 @@ use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::store::Table;
 use tracing::{info, warn};
 
-use super::{
-    AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db,
-    write_persona_snapshot_to_db,
-};
-use crate::persona::{Persona, PersonaSnapshotPayload, SnapshotReason};
+use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
 
 impl SessionRegistry {
     /// Attach an agent to a session. Grants the agent's pubkey Write
@@ -76,12 +72,8 @@ impl SessionRegistry {
             );
         }
 
-        // The first PersonaSnapshot is written lazily on first LLM call
-        // for this agent in this session — see `spawn_agent_task` in
-        // server.rs. Attach is just auth + meta + history; persona
-        // resolution happens at message-time so file errors surface to
-        // the operator who triggered the message rather than the
-        // operator who ran `/agent add`.
+        // The system prompt is set on the agent definition and passed
+        // directly to the LLM — no session-level snapshot needed.
 
         info!(
             agent = %agent.display_name,
@@ -384,142 +376,10 @@ impl SessionRegistry {
     }
 }
 
-/// Resolve a persona's file includes, hash sources, and write a
-/// `PersonaSnapshot` entry to the session DB. The base directory for
-/// relative paths is the chaz process's CWD (absolute paths and `~`
-/// expansion are unaffected).
-///
-/// Used by `spawn_agent_task` (lazy initial write), `/agent persona
-/// bump`, and `/agent set <ref> persona.*`.
-pub async fn write_persona_snapshot(
-    session_db: &Database,
-    agent_name: &str,
-    persona: &Persona,
-    reason: SnapshotReason,
-) -> anyhow::Result<()> {
-    let base_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    let resolved = persona.resolve(&base_dir)?;
-    let payload = PersonaSnapshotPayload {
-        agent: agent_name.to_string(),
-        resolved,
-        reason,
-        written_at: Utc::now(),
-    };
-    write_persona_snapshot_to_db(session_db, agent_name, &payload).await?;
-    info!(
-        agent = agent_name,
-        files = persona.files.len(),
-        reason = ?reason,
-        "Wrote PersonaSnapshot"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-
-    #[tokio::test]
-    async fn write_persona_snapshot_round_trips_through_session_db() {
-        // The snapshot lifecycle is: resolve persona → write entry →
-        // read entries back → ContextBuilder finds the latest. This test
-        // covers the data-plane half (write + read); spawn_agent_task's
-        // lazy-write logic is integration-tested via the runtime.
-        use crate::context::latest_persona_snapshot;
-        use crate::persona::{Persona, SnapshotReason};
-        use std::io::Write;
-
-        let (_instance, _user, db) = test_session_db().await;
-
-        // Sanity: empty session has no snapshot for any agent.
-        let session_initial = crate::session::Session::new(
-            crate::types::ConversationId("test".to_string()),
-            db.clone(),
-        )
-        .await;
-        assert!(latest_persona_snapshot(session_initial.entries(), "ava").is_none());
-
-        // Write a persona file with known content.
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "you are ava, be terse.").unwrap();
-        let path = tmp.path().to_string_lossy().into_owned();
-
-        let persona = Persona {
-            description: Some("test persona".to_string()),
-            files: vec![path],
-            prompt: Some("Extra inline rule.".to_string()),
-        };
-
-        write_persona_snapshot(&db, "ava", &persona, SnapshotReason::Initial)
-            .await
-            .unwrap();
-
-        // Reload — the snapshot should be visible and resolvable.
-        let session_after = crate::session::Session::new(
-            crate::types::ConversationId("test".to_string()),
-            db.clone(),
-        )
-        .await;
-        let snap = latest_persona_snapshot(session_after.entries(), "ava")
-            .expect("snapshot must exist after write");
-        assert_eq!(snap.agent, "ava");
-        assert_eq!(snap.reason, SnapshotReason::Initial);
-        assert!(
-            snap.resolved.text.contains("you are ava, be terse."),
-            "file content missing from resolved text: {:?}",
-            snap.resolved.text
-        );
-        assert!(
-            snap.resolved.text.contains("Extra inline rule."),
-            "inline prompt missing from resolved text: {:?}",
-            snap.resolved.text
-        );
-        assert_eq!(snap.resolved.sources.len(), 1);
-        assert!(snap.resolved.sources[0].bytes > 0);
-
-        // A different agent's snapshot lookup must not see ava's snapshot —
-        // sender filtering is what keeps multi-agent sessions distinct.
-        assert!(latest_persona_snapshot(session_after.entries(), "other").is_none());
-    }
-
-    #[tokio::test]
-    async fn snapshot_latest_wins_across_multiple_writes() {
-        // ContextBuilder picks the newest snapshot for the active agent;
-        // earlier snapshots stay in the entries log for audit but don't
-        // override.
-        use crate::context::latest_persona_snapshot;
-        use crate::persona::{Persona, SnapshotReason};
-
-        let (_instance, _user, db) = test_session_db().await;
-
-        // Two writes back-to-back with distinct inline prompts.
-        let p1 = Persona {
-            prompt: Some("v1: be terse".to_string()),
-            ..Default::default()
-        };
-        write_persona_snapshot(&db, "ava", &p1, SnapshotReason::Initial)
-            .await
-            .unwrap();
-
-        let p2 = Persona {
-            prompt: Some("v2: be verbose".to_string()),
-            ..Default::default()
-        };
-        write_persona_snapshot(&db, "ava", &p2, SnapshotReason::Bump)
-            .await
-            .unwrap();
-
-        let session = crate::session::Session::new(
-            crate::types::ConversationId("test".to_string()),
-            db.clone(),
-        )
-        .await;
-        let latest = latest_persona_snapshot(session.entries(), "ava").unwrap();
-        assert_eq!(latest.reason, SnapshotReason::Bump);
-        assert!(latest.resolved.text.contains("v2: be verbose"));
-        assert!(!latest.resolved.text.contains("v1: be terse"));
-    }
 
     #[tokio::test]
     async fn attach_agent_updates_auth_meta_and_history() {

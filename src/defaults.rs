@@ -29,72 +29,55 @@ username: ""
 # Optional. Set a room size limit to respond in.
 #room_size_limit: 0
 
-# Built-in agents. Each agent has an embedded `persona:` (file includes
-# + inline prompt) — there is no longer a separate `roles:` section.
-# Users can reference these agent names from their own configs (e.g.
-# clone the chaz prompt by referring to it) or replace them entirely.
+# Built-in agents. Each agent has a `system_prompt:` string.
+# Users can reference these agent names from their own configs.
 agents:
   - name: chaz
-    persona:
-      description: Chaz is Chaz
-      prompt: "Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person."
+    system_prompt: "Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person."
   - name: chazmina
-    persona:
-      description: Chaz is Chazmina
-      prompt: "Your name is Chazmina, you are an AI assistant, and you refer to yourself in the third person."
+    system_prompt: "Your name is Chazmina, you are an AI assistant, and you refer to yourself in the third person."
   - name: cave-chaz
-    persona:
-      description: Chaz is Cave Man Chaz
-      prompt: "Your name is Chaz, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
+    system_prompt: "Your name is Chaz, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
   - name: cave-chazmina
-    persona:
-      description: Chaz is Cave Man Chazmina
-      prompt: "Your name is Chazmina, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
+    system_prompt: "Your name is Chazmina, you are an AI assistant, you talk like a cave man, and you refer to yourself in the third person."
   - name: bash
-    persona:
-      description: Get a bash shell command
-      prompt: >
-        Based on the following user description, generate a corresponding Bash shell command.
-        Focus solely on interpreting the requirements and translating them into a single, executable Bash command.
-        Ensure accuracy and relevance to the user's description.
-        The output should be a valid Bash command that directly aligns with the user's intent, ready for execution in a command-line environment.
-        Do not output anything except for the command.
-        No code block, no English explanation, no newlines, and no start/end tags.
+    system_prompt: >
+      Based on the following user description, generate a corresponding Bash shell command.
+      Focus solely on interpreting the requirements and translating them into a single, executable Bash command.
+      Ensure accuracy and relevance to the user's description.
+      The output should be a valid Bash command that directly aligns with the user's intent, ready for execution in a command-line environment.
+      Do not output anything except for the command.
+      No code block, no English explanation, no newlines, and no start/end tags.
   - name: fish
-    persona:
-      description: Get a fish shell command
-      prompt: >
-        Based on the following user description, generate a corresponding Fish shell command.
-        Focus solely on interpreting the requirements and translating them into a single, executable Fish command.
-        Ensure accuracy and relevance to the user's description.
-        The output should be a valid Fish command that directly aligns with the user's intent, ready for execution in a command-line environment.
-        Do not output anything except for the command.
-        No code block, no English explanation, no newlines, and no start/end tags.
+    system_prompt: >
+      Based on the following user description, generate a corresponding Fish shell command.
+      Focus solely on interpreting the requirements and translating them into a single, executable Fish command.
+      Ensure accuracy and relevance to the user's description.
+      The output should be a valid Fish command that directly aligns with the user's intent, ready for execution in a command-line environment.
+      Do not output anything except for the command.
+      No code block, no English explanation, no newlines, and no start/end tags.
   - name: zsh
-    persona:
-      description: Get a zsh shell command
-      prompt: >
-        Based on the following user description, generate a corresponding Zsh shell command.
-        Focus solely on interpreting the requirements and translating them into a single, executable Zsh command.
-        Ensure accuracy and relevance to the user's description.
-        The output should be a valid Zsh command that directly aligns with the user's intent, ready for execution in a command-line environment.
-        Do not output anything except for the command.
-        No code block, no English explanation, no newlines, and no start/end tags.
+    system_prompt: >
+      Based on the following user description, generate a corresponding Zsh shell command.
+      Focus solely on interpreting the requirements and translating them into a single, executable Zsh command.
+      Ensure accuracy and relevance to the user's description.
+      The output should be a valid Zsh command that directly aligns with the user's intent, ready for execution in a command-line environment.
+      Do not output anything except for the command.
+      No code block, no English explanation, no newlines, and no start/end tags.
   - name: nu
-    persona:
-      description: Get a nushell command
-      prompt: >
-        Based on the following user description, generate a corresponding Nushell shell command.
-        Focus solely on interpreting the requirements and translating them into a single, executable Nushell command.
-        Ensure accuracy and relevance to the user's description.
-        The output should be a valid Nushell command that directly aligns with the user's intent, ready for execution in a command-line environment.
-        Do not output anything except for the command.
-        No code block, no English explanation, no newlines, and no start/end tags.
+    system_prompt: >
+      Based on the following user description, generate a corresponding Nushell shell command.
+      Focus solely on interpreting the requirements and translating them into a single, executable Nushell command.
+      Ensure accuracy and relevance to the user's description.
+      The output should be a valid Nushell command that directly aligns with the user's intent, ready for execution in a command-line environment.
+      Do not output anything except for the command.
+      No code block, no English explanation, no newlines, and no start/end tags.
 "#).unwrap();
 }
 
 /// Look up a built-in agent by name in `DEFAULT_CONFIG.agents`. Returns
 /// the first match — names are unique by construction.
+#[allow(dead_code)]
 pub fn default_agent(name: &str) -> Option<crate::config::AgentConfig> {
     DEFAULT_CONFIG
         .agents
@@ -136,11 +119,23 @@ mod tests {
     }
 
     #[test]
-    fn default_config_drops_legacy_roles_section() {
-        // `roles:` is dropped in favor of embedded `persona:` on agents.
-        // Legacy field is still on the schema as Option<...> so existing
-        // user configs keep parsing — we just don't ship default roles.
-        assert!(DEFAULT_CONFIG.roles.is_none());
+    fn default_config_no_legacy_roles_field() {
+        // `roles:` and `role:` are removed from Config. Agents use
+        // `system_prompt:` directly. No assertion needed; the struct
+        // won't deserialize a `roles:` key.
+    }
+
+    #[test]
+    fn default_agents_all_have_system_prompts() {
+        let agents = DEFAULT_CONFIG.agents.as_ref().unwrap();
+        for agent in agents {
+            let prompt = agent.system_prompt.as_deref().unwrap_or("");
+            assert!(
+                !prompt.trim().is_empty(),
+                "default agent '{}' has empty system_prompt",
+                agent.name
+            );
+        }
     }
 
     #[test]
@@ -148,23 +143,6 @@ mod tests {
         // Users are expected to configure their own LLM backend. If we ever
         // ship a demo backend, change this test to document what it is.
         assert!(DEFAULT_CONFIG.backends.is_none());
-    }
-
-    #[test]
-    fn default_agents_all_have_personas_with_prompts() {
-        let agents = DEFAULT_CONFIG.agents.as_ref().unwrap();
-        for agent in agents {
-            let persona = agent
-                .persona
-                .as_ref()
-                .unwrap_or_else(|| panic!("default agent '{}' has no persona", agent.name));
-            let prompt = persona.prompt.as_deref().unwrap_or("");
-            assert!(
-                !prompt.trim().is_empty(),
-                "default agent '{}' has empty persona prompt",
-                agent.name
-            );
-        }
     }
 
     #[test]

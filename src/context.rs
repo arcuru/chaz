@@ -13,8 +13,6 @@
 //! - Always includes the system prompt and at least the most recent message
 
 use crate::config::ContextConfig;
-use crate::persona::PersonaSnapshotPayload;
-use crate::role::RoleDetails;
 use crate::runtime::RuntimeMessage;
 use crate::session::{EntryType, SessionEntry};
 use crate::tool::ToolDefinition;
@@ -56,33 +54,6 @@ fn estimate_tool_tokens(def: &ToolDefinition) -> usize {
 
 /// Per-message framing overhead in tokens (role label, JSON structure).
 const MESSAGE_OVERHEAD_TOKENS: usize = 8;
-
-/// Find the most recent `PersonaSnapshot` entry whose `sender` matches
-/// `agent_name`, deserialize its payload, and return it. Returns `None`
-/// when no snapshot exists yet (legacy sessions) or the payload is
-/// malformed (logged + ignored to keep one corrupt entry from
-/// neutering the agent).
-pub fn latest_persona_snapshot(
-    entries: &[SessionEntry],
-    agent_name: &str,
-) -> Option<PersonaSnapshotPayload> {
-    entries
-        .iter()
-        .rev()
-        .find(|e| e.entry_type == EntryType::PersonaSnapshot && e.sender == agent_name)
-        .and_then(
-            |e| match serde_json::from_str::<PersonaSnapshotPayload>(&e.content) {
-                Ok(p) => Some(p),
-                Err(err) => {
-                    tracing::warn!(
-                        agent = agent_name,
-                        "Skipping malformed PersonaSnapshot entry: {err}"
-                    );
-                    None
-                }
-            },
-        )
-}
 
 /// Build the multi-agent room note for `agent_name`, given the full
 /// participant roster (which normally includes `agent_name` itself).
@@ -138,7 +109,7 @@ pub struct AssembledContext {
 pub struct ContextBuilder<'a> {
     entries: &'a [SessionEntry],
     agent_name: &'a str,
-    role: Option<&'a RoleDetails>,
+    system_prompt: &'a str,
     tool_defs: &'a [ToolDefinition],
     config: &'a ContextConfig,
     /// Per-agent override for max context tokens
@@ -154,12 +125,13 @@ impl<'a> ContextBuilder<'a> {
     pub fn new(
         entries: &'a [SessionEntry],
         agent_name: &'a str,
+        system_prompt: &'a str,
         config: &'a ContextConfig,
     ) -> Self {
         Self {
             entries,
             agent_name,
-            role: None,
+            system_prompt,
             tool_defs: &[],
             config,
             max_context_tokens_override: None,
@@ -170,14 +142,9 @@ impl<'a> ContextBuilder<'a> {
     /// Supply the full roster of agents attached to the session (including
     /// this agent). With >1 participant, a room note is appended to the
     /// system prompt so agents learn the `@mention` convention without
-    /// per-persona editing.
+    /// per-system-prompt editing.
     pub fn with_room_participants(mut self, participants: &'a [String]) -> Self {
         self.room_participants = participants;
-        self
-    }
-
-    pub fn with_role(mut self, role: Option<&'a RoleDetails>) -> Self {
-        self.role = role;
         self
     }
 
@@ -200,19 +167,12 @@ impl<'a> ContextBuilder<'a> {
 
         let mut used_tokens: usize = 0;
 
-        // 1. System prompt (always included). Source priority:
-        //    a. Latest `PersonaSnapshot` entry for `agent_name` on this
-        //       session — written at attach / `/agent persona bump` /
-        //       `/agent set <ref> persona.*`. Authoritative once present.
-        //    b. Legacy `role:` lookup, kept for transitional sessions
-        //       where no snapshot has been written yet.
-        let mut system_prompt = latest_persona_snapshot(self.entries, self.agent_name)
-            .map(|p| p.resolved.text)
-            .unwrap_or_else(|| self.role.map(|r| r.get_prompt()).unwrap_or_default());
+        // 1. System prompt (always included). The caller provides the
+        //    agent's system_prompt directly — no snapshot lookup needed.
+        let mut system_prompt = self.system_prompt.to_string();
 
-        // Multi-agent room note. Appended (not baked into the persona
-        // snapshot) so it stays current as membership changes and keeps
-        // single-agent sessions byte-identical. See
+        // Multi-agent room note. Appended so it stays current as membership
+        // changes and keeps single-agent sessions byte-identical. See
         // `docs/src/design/autonomous_agents.md`.
         if let Some(note) = room_note(self.room_participants, self.agent_name) {
             if system_prompt.is_empty() {
@@ -350,7 +310,7 @@ mod tests {
             make_entry("user", "How are you?", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         assert_eq!(result.entries_included, 3);
         assert!(!result.truncated);
@@ -375,7 +335,7 @@ mod tests {
             make_entry("agent", "New response", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         // Should include: Summary + 2 new messages = 3 entries
         assert_eq!(result.entries_included, 3);
@@ -398,7 +358,7 @@ mod tests {
             make_entry("agent", "Response", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         assert_eq!(result.entries_included, 2); // Only Message entries
         assert_eq!(result.messages.len(), 2);
@@ -418,7 +378,7 @@ mod tests {
         // Budget: 1000 - 100 reserved = 900 tokens
         // Each message: ~58 tokens → fits ~15 messages
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         assert!(result.truncated);
         assert!(result.entries_included < 100);
@@ -434,14 +394,12 @@ mod tests {
     fn test_system_prompt_counted() {
         let entries = vec![make_entry("user", "Hello", EntryType::Message)];
         // Use a long enough prompt that it takes significant tokens
-        let role = crate::role::RoleDetails::new_test("system", &"word ".repeat(500));
+        let prompt = "word ".repeat(500);
         let config = ContextConfig {
             max_context_tokens: 600,
             reserved_output_tokens: 50,
         };
-        let result = ContextBuilder::new(&entries, "agent", &config)
-            .with_role(Some(&role))
-            .build();
+        let result = ContextBuilder::new(&entries, "agent", &prompt, &config).build();
 
         // System prompt takes significant tokens
         assert!(result.estimated_tokens > 100);
@@ -463,7 +421,7 @@ mod tests {
         let config = default_config();
 
         // Without tools
-        let result_no_tools = ContextBuilder::new(&entries, "agent", &config).build();
+        let result_no_tools = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         // With tools (takes up budget)
         let tools = vec![ToolDefinition {
@@ -477,7 +435,7 @@ mod tests {
                 }
             }),
         }];
-        let result_with_tools = ContextBuilder::new(&entries, "agent", &config)
+        let result_with_tools = ContextBuilder::new(&entries, "agent", "", &config)
             .with_tools(&tools)
             .build();
 
@@ -497,7 +455,7 @@ mod tests {
             max_context_tokens: 200,
             reserved_output_tokens: 50,
         };
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         assert_eq!(result.entries_included, 1);
         assert_eq!(result.messages.len(), 1);
@@ -510,7 +468,7 @@ mod tests {
             make_entry("agent", "Done", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         assert_eq!(result.entries_included, 2);
         assert!(matches!(
@@ -523,7 +481,7 @@ mod tests {
     fn test_empty_session() {
         let entries: Vec<SessionEntry> = vec![];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
 
         assert_eq!(result.entries_included, 0);
         assert_eq!(result.messages.len(), 0);
@@ -543,8 +501,8 @@ mod tests {
             .collect();
         let config = default_config();
 
-        let result_default = ContextBuilder::new(&entries, "agent", &config).build();
-        let result_small = ContextBuilder::new(&entries, "agent", &config)
+        let result_default = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result_small = ContextBuilder::new(&entries, "agent", "", &config)
             .with_max_tokens_override(Some(300))
             .build();
 
@@ -581,14 +539,11 @@ mod tests {
     fn room_note_appended_to_system_prompt_when_multi_agent() {
         let config = ContextConfig::default();
         let entries = vec![make_entry("patrick", "hi", EntryType::Message)];
-        let role = crate::role::RoleDetails::new_test("alpha", "You are Alpha.");
+        let prompt = "You are Alpha.";
 
-        let solo = ContextBuilder::new(&entries, "alpha", &config)
-            .with_role(Some(&role))
-            .build();
+        let solo = ContextBuilder::new(&entries, "alpha", prompt, &config).build();
         let roster = vec!["alpha".to_string(), "beta".to_string()];
-        let room = ContextBuilder::new(&entries, "alpha", &config)
-            .with_role(Some(&role))
+        let room = ContextBuilder::new(&entries, "alpha", prompt, &config)
             .with_room_participants(&roster)
             .build();
 

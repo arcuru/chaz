@@ -99,6 +99,10 @@ pub enum CapabilityKind {
     /// Host-only — the hub scopes each impl to the operator-configured
     /// set of agents before the extension sees it.
     AgentStateAdmin,
+    /// Append text to the agent's system prompt at context assembly time.
+    /// Extension-providable — extensions like `skills` publish impls;
+    /// the host collects and concatenates results.
+    PromptAugmentation,
 }
 
 impl CapabilityKind {
@@ -134,6 +138,7 @@ impl CapabilityKind {
             Self::Messenger => "messenger",
             Self::Memory => "memory",
             Self::AgentStateAdmin => "agent_state_admin",
+            Self::PromptAugmentation => "prompt_augmentation",
         }
     }
 }
@@ -181,6 +186,10 @@ pub enum CapabilityRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agents: Option<Vec<String>>,
     },
+    PromptAugmentation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
 }
 
 impl CapabilityRequest {
@@ -196,6 +205,7 @@ impl CapabilityRequest {
             Self::Messenger { .. } => CapabilityKind::Messenger,
             Self::Memory { .. } => CapabilityKind::Memory,
             Self::AgentStateAdmin { .. } => CapabilityKind::AgentStateAdmin,
+            Self::PromptAugmentation { .. } => CapabilityKind::PromptAugmentation,
         }
     }
 
@@ -204,7 +214,9 @@ impl CapabilityRequest {
     /// kinds, or "not applicable" for host-only kinds.
     pub fn provider(&self) -> Option<&str> {
         match self {
-            Self::Messenger { provider } | Self::Memory { provider } => provider.as_deref(),
+            Self::Messenger { provider }
+            | Self::Memory { provider }
+            | Self::PromptAugmentation { provider } => provider.as_deref(),
             _ => None,
         }
     }
@@ -476,6 +488,27 @@ pub trait MemoryAccess: Send + Sync {
     ) -> CapFuture<'a, ()>;
 }
 
+/// Append text to the agent's system prompt during context assembly.
+///
+/// Extension-providable — extensions like `skills` publish an impl;
+/// the host calls every provider and concatenates non-empty results
+/// after the agent's core system prompt. The augmentation receives
+/// the agent and the session's recent message text so it can decide
+/// whether to contribute.
+///
+/// This is intentionally synchronous — extensions hold their data in
+/// memory (skill registry, surfacing index) and string building is
+/// cheap. Async is unnecessary for the `Option<String>` return shape.
+pub trait PromptAugmentation: Send + Sync {
+    /// Return additional system prompt text, or `None` if this
+    /// extension has nothing to contribute for this turn.
+    fn augment_system_prompt(
+        &self,
+        agent_name: &str,
+        recent_message_text: &[String],
+    ) -> Option<String>;
+}
+
 // =========================================================================
 // CapProvider
 // =========================================================================
@@ -490,6 +523,7 @@ pub enum CapProvider {
     Messenger(Arc<dyn Messenger>),
     Memory(Arc<dyn MemoryAccess>),
     AgentStateAdmin(Arc<dyn AgentStateAdmin>),
+    PromptAugmentation(Arc<dyn PromptAugmentation>),
 }
 
 impl CapProvider {
@@ -498,6 +532,7 @@ impl CapProvider {
         match self {
             Self::Messenger(_) => CapabilityKind::Messenger,
             Self::Memory(_) => CapabilityKind::Memory,
+            Self::PromptAugmentation(_) => CapabilityKind::PromptAugmentation,
             Self::AgentStateAdmin(_) => CapabilityKind::AgentStateAdmin,
         }
     }
@@ -544,6 +579,7 @@ pub struct ExtensionCaps {
     pub agent_state_admin: Option<Arc<dyn AgentStateAdmin>>,
     pub messengers: CapSet<dyn Messenger>,
     pub memory: CapSet<dyn MemoryAccess>,
+    pub prompt_augmentation: CapSet<dyn PromptAugmentation>,
 }
 
 impl ExtensionCaps {
@@ -560,6 +596,7 @@ impl ExtensionCaps {
             agent_state_admin: None,
             messengers: CapSet::new(),
             memory: CapSet::new(),
+            prompt_augmentation: CapSet::new(),
         }
     }
 
@@ -574,6 +611,7 @@ impl ExtensionCaps {
             && self.agent_state_admin.is_none()
             && self.messengers.is_empty()
             && self.memory.is_empty()
+            && self.prompt_augmentation.is_empty()
     }
 }
 

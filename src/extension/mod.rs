@@ -1220,6 +1220,18 @@ impl ExtensionHub {
                         },
                     );
                 }
+                K::PromptAugmentation => {
+                    populate_capset(
+                        &mut bundle.prompt_augmentation,
+                        &self.cap_registry,
+                        K::PromptAugmentation,
+                        req.provider(),
+                        |p| match p {
+                            caps::CapProvider::PromptAugmentation(pa) => Some(pa.clone()),
+                            _ => None,
+                        },
+                    );
+                }
                 K::AgentStateAdmin => {
                     let allowlist = req.agents().map(|a| a.to_vec());
                     let scoped = self.build_agent_state_admin(allowlist, &m.name);
@@ -1228,6 +1240,43 @@ impl ExtensionHub {
             }
         }
         bundle
+    }
+
+    /// Collect system prompt augmentations from all installed extensions
+    /// that provide the PromptAugmentation cap.
+    ///
+    /// Iterates installed extensions, calls each PromptAugmentation provider,
+    /// concatenates non-empty results with blank-line separators.
+    /// Per-session extension filtering: if active_extensions is Some, only
+    /// extensions in that set participate.
+    pub fn augment_system_prompt(
+        &self,
+        agent_name: &str,
+        recent_message_text: &[String],
+        active_extensions: Option<&[String]>,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let Some(map) = self
+            .cap_registry
+            .by_kind
+            .get(&crate::extension::caps::CapabilityKind::PromptAugmentation)
+        else {
+            return String::new();
+        };
+        for (provider_name, provider) in &map.providers {
+            if let Some(active) = active_extensions
+                && !active.iter().any(|a| a == provider_name.as_str())
+            {
+                continue;
+            }
+            if let crate::extension::caps::CapProvider::PromptAugmentation(pa) = provider
+                && let Some(text) = pa.augment_system_prompt(agent_name, recent_message_text)
+                && !text.trim().is_empty()
+            {
+                parts.push(text);
+            }
+        }
+        parts.join("\n\n")
     }
 } // impl ExtensionHub
 

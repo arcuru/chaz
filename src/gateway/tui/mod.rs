@@ -14,7 +14,6 @@ use crate::backends::BackendManager;
 use crate::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use crate::config::Config;
 use crate::gateway::{ApprovalExchange, Gateway};
-use crate::role::get_role_names;
 use crate::security::SecretStore;
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
@@ -413,9 +412,6 @@ impl Gateway for TuiGateway {
         let mut terminal = init_terminal()?;
         let mut events = EventStream::new();
 
-        let config_role_names = get_role_names(self.config.roles.clone());
-        let default_role = self.config.role.clone();
-
         // When prior sessions exist, open straight into the picker so the
         // user picks one (or the New session row) instead of always landing
         // in the default session. A fresh install — only the just-created
@@ -438,8 +434,6 @@ impl Gateway for TuiGateway {
                 session_db: &sdb,
                 current_agent: &agent,
                 session_name: sname.as_deref(),
-                config_roles: Some(config_role_names.to_vec()),
-                default_role: default_role.as_deref(),
             };
             if let CommandOutcome::SessionsList(list) =
                 commands::dispatch(Command::ListSessions, &ctx).await
@@ -500,8 +494,6 @@ impl Gateway for TuiGateway {
                                     &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
-                                    &config_role_names,
-                                    default_role.as_deref(),
                                 )
                                 .await;
                             }
@@ -529,8 +521,6 @@ impl Gateway for TuiGateway {
                                     &server,
                                     &backend,
                                     &self.secrets,
-                                    &config_role_names,
-                                    default_role.as_deref(),
                                     session_db_id,
                                     name,
                                 )
@@ -552,8 +542,6 @@ impl Gateway for TuiGateway {
                                         &self.secrets,
                                         &approval_tx,
                                         &notify_tx,
-                                        &config_role_names,
-                                        default_role.as_deref(),
                                     )
                                     .await;
                                 }
@@ -568,8 +556,6 @@ impl Gateway for TuiGateway {
                                         &self.secrets,
                                         &approval_tx,
                                         &notify_tx,
-                                        &config_role_names,
-                                        default_role.as_deref(),
                                     )
                                     .await;
                                 }
@@ -590,8 +576,6 @@ impl Gateway for TuiGateway {
                                     &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
-                                    &config_role_names,
-                                    default_role.as_deref(),
                                 )
                                 .await;
                             }
@@ -711,8 +695,6 @@ async fn handle_chat_action(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-    config_role_names: &[String],
-    default_role: Option<&str>,
 ) {
     match action {
         ChatAction::SendMessage(text) => {
@@ -757,8 +739,6 @@ async fn handle_chat_action(
                 session_db: &session_db,
                 current_agent: &current_agent,
                 session_name: session_name.as_deref(),
-                config_roles: Some(config_role_names.to_vec()),
-                default_role,
             };
             match commands::dispatch(Command::ListSessions, &ctx).await {
                 CommandOutcome::SessionsList(list) => {
@@ -794,8 +774,6 @@ async fn handle_chat_action(
                 session_db: &session_db,
                 current_agent: &current_agent,
                 session_name: session_name.as_deref(),
-                config_roles: Some(config_role_names.to_vec()),
-                default_role,
             };
             let outcome = commands::dispatch(cmd, &ctx).await;
             render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
@@ -814,8 +792,6 @@ async fn apply_picker_rename(
     server: &Arc<Server>,
     backend: &BackendManager,
     secrets: &SecretStore,
-    config_role_names: &[String],
-    default_role: Option<&str>,
     session_db_id: String,
     name: Option<String>,
 ) {
@@ -856,8 +832,6 @@ async fn apply_picker_rename(
         session_db: &active_db,
         current_agent: &current_agent,
         session_name: active_name.as_deref(),
-        config_roles: Some(config_role_names.to_vec()),
-        default_role,
     };
     if let CommandOutcome::SessionsList(list) =
         commands::dispatch(Command::ListSessions, &ctx).await
@@ -877,8 +851,6 @@ async fn dispatch_picker_selection(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-    config_role_names: &[String],
-    default_role: Option<&str>,
 ) {
     // If the user picked an already-open session, just activate its tab
     // instead of re-registering it.
@@ -901,8 +873,6 @@ async fn dispatch_picker_selection(
         session_db: &session_db,
         current_agent: &current_agent,
         session_name: session_name.as_deref(),
-        config_roles: Some(config_role_names.to_vec()),
-        default_role,
     };
     let cmd = if selected == "__new__" {
         Command::NewSession
