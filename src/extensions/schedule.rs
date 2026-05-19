@@ -7,61 +7,35 @@
 
 use crate::agent_db::{AgentDb, Schedule, ScheduleTarget};
 use crate::extension::caps::{
-    AgentStateAdmin, CapabilityRequest, CommandDescriptor, ExtensionCaps, SessionEntryDraft,
+    AgentStateAdmin, CapabilityRequest, CommandDescriptor, ExtensionCaps,
 };
-use crate::extension::handler::{HandlerFuture, InstalledExtension, RoutineHandler};
+use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
 };
-use crate::hosted_index::HostedIndex;
 use crate::routine::{Trigger, notify_agent_schedules_changed};
 use crate::tools::{ScheduleAdd, ScheduleList, ScheduleModify, ScheduleOnce, ScheduleRemove};
-use chrono::Utc;
 use cron::Schedule as CronSchedule;
-use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::debug;
 
-/// Routine payload for heartbeat fires.
-///
-/// Carried verbatim inside `Routine.target.payload` by the routine
-/// engine; the engine never inspects it. The handler reads
-/// `target_agent_db_id` to decide whether this peer hosts the target
-/// agent (silently skipping if not), formats the directive body, and
-/// appends through `caps.session_write`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HeartbeatPayload {
-    /// Human-friendly name shown in the directive body ("Heartbeat
-    /// '{rule_name}' at …"). The routine's own `id`/`name` lives on
-    /// the `Routine`, not in the payload.
-    pub rule_name: String,
-    /// Eidetica entry id of the agent this fire targets. The handler
-    /// silently skips fires whose target isn't hosted on this peer.
-    pub target_agent_db_id: String,
-    /// Task text appended to the directive body.
-    pub task: String,
-    /// `true` for one-shot wakeups (wording: "Wakeup …") and `false`
-    /// for recurring cron rules (wording: "Heartbeat …"). One-shot
-    /// row deletion is the engine's concern; this field is purely
-    /// presentational.
-    #[serde(default)]
-    pub is_one_shot: bool,
-}
-
-/// Schedule extension — receives its `AgentStateAdmin` handle from
-/// the hub at install time (not via constructor). Keeps `HostedIndex`
-/// for the legacy routine handler's host-check only.
-pub struct ScheduleExtension {
-    agent_index: HostedIndex,
-}
+/// Schedule extension — receives its `AgentStateAdmin` handle from the
+/// hub at install time. Stateless: agent-owned schedule fires run
+/// through the separate `agent_schedule` extension's standalone path.
+pub struct ScheduleExtension;
 
 impl ScheduleExtension {
-    pub fn new(agent_index: HostedIndex) -> Self {
-        Self { agent_index }
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ScheduleExtension {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -82,7 +56,6 @@ impl Extension for ScheduleExtension {
             required_capabilities: vec![
                 CapabilityRequest::ToolRegistration,
                 CapabilityRequest::CommandRegistration,
-                CapabilityRequest::SessionWrite,
                 CapabilityRequest::AgentStateAdmin { agents: None },
             ],
             requested_capabilities: Vec::new(),
@@ -130,75 +103,7 @@ impl Extension for ScheduleExtension {
                 )
                 .await?;
 
-            let mut installed = InstalledExtension::empty();
-            installed.routine_handler = Some(Box::new(HeartbeatRoutineHandler {
-                agent_index: self.agent_index.clone(),
-            }));
-            Ok(installed)
-        })
-    }
-}
-
-/// Routine handler for cron + one-shot heartbeat fires.
-///
-/// The engine times the fire and reschedules / drops the routine; this
-/// handler's job is just: (a) decide whether this peer hosts the
-/// targeted agent (silently skip otherwise), (b) format the directive
-/// body, (c) append it through the per-session SessionWrite cap.
-pub struct HeartbeatRoutineHandler {
-    agent_index: HostedIndex,
-}
-
-impl RoutineHandler for HeartbeatRoutineHandler {
-    fn on_fire<'a>(
-        &'a self,
-        caps: &'a ExtensionCaps,
-        payload: serde_json::Value,
-    ) -> HandlerFuture<'a, anyhow::Result<()>> {
-        Box::pin(async move {
-            let payload: HeartbeatPayload = serde_json::from_value(payload)
-                .map_err(|e| anyhow::anyhow!("invalid heartbeat payload: {e}"))?;
-
-            // Silently skip if this peer doesn't host the target agent —
-            // matches today's `HeartbeatRunner::maybe_fire` behavior so
-            // multi-peer setups don't double-fire (the rule's owning
-            // peer will write the directive).
-            let Ok(id) = eidetica::entry::ID::parse(&payload.target_agent_db_id) else {
-                debug!(
-                    target = %payload.target_agent_db_id,
-                    "heartbeat target_agent_db_id unparseable; skipping"
-                );
-                return Ok(());
-            };
-            if self.agent_index.find_by_id(&id).is_none() {
-                return Ok(());
-            }
-
-            let writer = caps.session_write.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "heartbeat routine fire without session_write cap — \
-                     dispatcher must build a session-scoped bundle"
-                )
-            })?;
-            let now = Utc::now();
-            let verb = if payload.is_one_shot {
-                "Wakeup"
-            } else {
-                "Heartbeat"
-            };
-            let content = format!(
-                "{verb} '{}' at {}.\n\n{}",
-                payload.rule_name,
-                now.format("%Y-%m-%d %H:%M:%S UTC"),
-                payload.task,
-            );
-            writer
-                .append(SessionEntryDraft {
-                    kind: "directive".into(),
-                    data: serde_json::Value::String(content),
-                })
-                .await?;
-            Ok(())
+            Ok(InstalledExtension::empty())
         })
     }
 }
@@ -405,7 +310,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
-    use crate::hosted_index::DbEntry;
+    use crate::hosted_index::{DbEntry, HostedIndex};
     use crate::session::{Session, SessionRegistry};
     use crate::types::ConversationId;
     use eidetica::Instance;
@@ -548,172 +453,5 @@ mod tests {
             }
             ExtensionCommandOutcome::Text(s) => panic!("expected error, got text: {s}"),
         }
-    }
-
-    // ---- RoutineHandler coverage (cap refactor step 9) ------------------
-
-    /// Bring up a registry + one agent + one session, then build an
-    /// extension caps bundle whose `session_write` points at that
-    /// session. Returns the wiring the handler tests need.
-    async fn handler_fixture() -> (
-        Instance,
-        HostedIndex,
-        Arc<SessionRegistry>,
-        String, // session_db_id
-        ExtensionCaps,
-        eidetica::entry::ID, // hosted agent id
-    ) {
-        let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let user = instance.login_user("test", None).await.unwrap();
-        let agents_reg = Arc::new(AgentRegistry::with_default_agent());
-        let registry = Arc::new(
-            SessionRegistry::new(instance.clone(), user, agents_reg)
-                .await
-                .unwrap(),
-        );
-        let index = HostedIndex::empty("agent");
-
-        let (agent_db, pubkey) = {
-            let mut user = registry.user_for_tests().await;
-            create_agent_db(
-                &mut user,
-                "alpha",
-                &AgentDbConfig::default(),
-                &AgentMeta {
-                    display_name: Some("alpha".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-        };
-        let agent_id = agent_db.id();
-        index.register(DbEntry {
-            db_id: agent_id.clone(),
-            display_name: "alpha".into(),
-            pubkey,
-        });
-
-        let (conv, session_db) = registry.create_session(Some("test")).await.unwrap();
-        let session_db_id = session_db.root_id().to_string();
-        let session = Arc::new(Mutex::new(Session::new(conv, session_db).await));
-        let mut caps = ExtensionCaps::empty();
-        caps.session_write = Some(Arc::new(
-            crate::extension::caps_inproc::InProcSessionWrite::new(session.clone(), "heartbeat"),
-        ));
-        (instance, index, registry, session_db_id, caps, agent_id)
-    }
-
-    #[tokio::test]
-    async fn routine_handler_writes_directive_for_hosted_agent() {
-        let (_i, index, registry, session_db_id, caps, agent_id) = handler_fixture().await;
-        let handler = HeartbeatRoutineHandler { agent_index: index };
-        let payload = serde_json::to_value(HeartbeatPayload {
-            rule_name: "morning-brief".into(),
-            target_agent_db_id: agent_id.to_string(),
-            task: "summarize overnight".into(),
-            is_one_shot: false,
-        })
-        .unwrap();
-        handler.on_fire(&caps, payload).await.unwrap();
-
-        // Re-open the session and verify the directive landed.
-        let (conv, db) = registry.open_session(&session_db_id).await.unwrap();
-        let s = Session::new(conv, db).await;
-        let entries = s.entries();
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
-        assert!(matches!(e.entry_type, crate::session::EntryType::Directive));
-        assert_eq!(e.sender, "heartbeat");
-        assert!(
-            e.content.starts_with("Heartbeat 'morning-brief' at "),
-            "got: {}",
-            e.content
-        );
-        assert!(
-            e.content.contains("summarize overnight"),
-            "got: {}",
-            e.content
-        );
-    }
-
-    #[tokio::test]
-    async fn routine_handler_one_shot_uses_wakeup_verb() {
-        let (_i, index, registry, session_db_id, caps, agent_id) = handler_fixture().await;
-        let handler = HeartbeatRoutineHandler { agent_index: index };
-        let payload = serde_json::to_value(HeartbeatPayload {
-            rule_name: "ping-build".into(),
-            target_agent_db_id: agent_id.to_string(),
-            task: "check the build".into(),
-            is_one_shot: true,
-        })
-        .unwrap();
-        handler.on_fire(&caps, payload).await.unwrap();
-        let (conv, db) = registry.open_session(&session_db_id).await.unwrap();
-        let s = Session::new(conv, db).await;
-        let e = &s.entries()[0];
-        assert!(
-            e.content.starts_with("Wakeup 'ping-build' at "),
-            "got: {}",
-            e.content
-        );
-    }
-
-    #[tokio::test]
-    async fn routine_handler_silently_skips_non_hosted_agent() {
-        let (_i, index, registry, session_db_id, caps, _agent_id) = handler_fixture().await;
-        let handler = HeartbeatRoutineHandler { agent_index: index };
-        // Use a different (well-formed but not hosted) agent id.
-        let other = crate::agent_db::AgentDbConfig::default();
-        let _ = other; // silence unused — we just need a parseable id below
-        let payload = serde_json::to_value(HeartbeatPayload {
-            rule_name: "ghost".into(),
-            // Reuse the session id as a parseable but non-agent id —
-            // it's a valid eidetica entry id that find_by_id will miss.
-            target_agent_db_id: session_db_id.clone(),
-            task: "do nothing".into(),
-            is_one_shot: false,
-        })
-        .unwrap();
-        handler.on_fire(&caps, payload).await.unwrap();
-        let (conv, db) = registry.open_session(&session_db_id).await.unwrap();
-        let s = Session::new(conv, db).await;
-        assert!(
-            s.entries().is_empty(),
-            "non-hosted fire should not write: {:?}",
-            s.entries()
-        );
-    }
-
-    #[tokio::test]
-    async fn routine_handler_rejects_payload_without_session_write() {
-        let (_i, index, _registry, _id, _caps, agent_id) = handler_fixture().await;
-        let handler = HeartbeatRoutineHandler { agent_index: index };
-        let payload = serde_json::to_value(HeartbeatPayload {
-            rule_name: "x".into(),
-            target_agent_db_id: agent_id.to_string(),
-            task: "x".into(),
-            is_one_shot: false,
-        })
-        .unwrap();
-        let empty_caps = ExtensionCaps::empty();
-        let err = handler.on_fire(&empty_caps, payload).await.unwrap_err();
-        assert!(err.to_string().contains("session_write"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn routine_handler_rejects_malformed_payload() {
-        let (_i, index, _registry, _id, caps, _agent_id) = handler_fixture().await;
-        let handler = HeartbeatRoutineHandler { agent_index: index };
-        let err = handler
-            .on_fire(&caps, serde_json::json!({"not": "a payload"}))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("invalid heartbeat payload"),
-            "got: {err}"
-        );
     }
 }

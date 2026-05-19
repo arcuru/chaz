@@ -59,7 +59,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             deps.agent_index.clone(),
             deps.embedder,
         )),
-        Arc::new(schedule::ScheduleExtension::new(deps.agent_index)),
+        Arc::new(schedule::ScheduleExtension::new()),
         Arc::new(agent_schedule::AgentScheduleExtension::new(spawn_cell)),
     ]
 }

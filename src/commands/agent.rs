@@ -482,19 +482,13 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
     ctx.server.agent_index().unregister(&entry.db_id);
     ctx.server.agents().unregister(&entry.display_name);
 
-    // Also drop peer-local heartbeat rules targeting this agent across every
-    // session on this peer. Rules that fire into a missing agent are silent
-    // dead weight; this keeps the state clean.
-    let sweep = crate::heartbeat::sweep_for_agent(ctx.server, &db_id_str).await;
-
-    let mut msg = format!(
+    // Agent-owned schedules die with the agent DB; there is no session
+    // routine sweep. A Pinned schedule whose owner is gone self-skips at
+    // fire time (membership-at-fire check in fire_agent_schedule).
+    CommandOutcome::Text(format!(
         "Deleted Living Agent '{}' (DB {} preserved for archive).",
         entry.display_name, entry.db_id
-    );
-    if sweep > 0 {
-        msg.push_str(&format!(" Removed {sweep} heartbeat rule(s) targeting it."));
-    }
-    CommandOutcome::Text(msg)
+    ))
 }
 
 /// Edit one field on a Living Agent's DB config. Stage 8 live hydration
@@ -1091,72 +1085,6 @@ mod tests {
         }
         // Still registered.
         assert!(server.agents().get("alpha").is_some());
-    }
-
-    #[tokio::test]
-    async fn agent_delete_sweeps_heartbeat_rules() {
-        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
-        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
-
-        dispatch(
-            Command::AgentNew {
-                name: "alpha".to_string(),
-                overrides: vec![],
-            },
-            &ctx,
-        )
-        .await;
-        dispatch(Command::AgentAdd("alpha".to_string()), &ctx).await;
-        // Seed a legacy session routine directly — the dispatch surface
-        // lives in the heartbeat extension now and isn't wired into this
-        // fixture's hub. Agent-owned schedules are the new path; this
-        // exercises the sweep for residual session routines.
-        let alpha_entry = server
-            .agent_index()
-            .find_by_name("alpha")
-            .expect("alpha registered");
-        let payload = serde_json::to_value(crate::extensions::schedule::HeartbeatPayload {
-            rule_name: "rule1".into(),
-            target_agent_db_id: alpha_entry.db_id.to_string(),
-            task: "ping".into(),
-            is_one_shot: false,
-        })
-        .unwrap();
-        let routine = crate::routine::Routine::cron(
-            crate::routine::RoutineId::new("rule1"),
-            "rule1",
-            "0 0 * * * *",
-            crate::routine::RoutineTarget {
-                extension: "heartbeat".into(),
-                payload,
-            },
-        );
-        crate::routine::upsert_session_routine(&sdb, &routine)
-            .await
-            .unwrap();
-
-        // Routine exists before delete.
-        let before = crate::routine::list_session_routines(&sdb).await.unwrap();
-        assert_eq!(before.len(), 1);
-
-        // Detach first (delete refuses while attached).
-        dispatch(Command::AgentRemove("alpha".to_string()), &ctx).await;
-        // Detach no longer sweeps session routines — schedules are now
-        // agent-owned. Legacy routines remain until agent_delete.
-        let after_detach = crate::routine::list_session_routines(&sdb).await.unwrap();
-        assert_eq!(
-            after_detach.len(),
-            1,
-            "legacy routine survives detach (schedules now agent-owned)"
-        );
-
-        // agent_delete sweeps via sweep_for_agent for legacy cleanup.
-        dispatch(Command::AgentDelete("alpha".to_string()), &ctx).await;
-        let after_delete = crate::routine::list_session_routines(&sdb).await.unwrap();
-        assert!(
-            after_delete.is_empty(),
-            "agent_delete should sweep legacy heartbeat routines, got {after_delete:?}"
-        );
     }
 
     // -------------------------------------------------------------------------

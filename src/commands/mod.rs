@@ -13,9 +13,10 @@
 //! - `session` — session CRUD, channels, compact/print, schedules, LLM config
 //! - `agent`   — Living Agents participation + lifecycle (attach/detach/new/delete/import/share/...)
 //!
-//! Heartbeat rules used to live here; they now live in
-//! [`crate::extensions::schedule`] as a chaz extension. The cross-session
-//! sweep helper used by `agent_delete` is in [`crate::heartbeat::sweep_for_agent`].
+//! Scheduling used to live here as session "heartbeat rules"; it now
+//! lives in [`crate::extensions::schedule`] as agent-owned schedules.
+//! There is no detach/delete sweep — a schedule whose owning agent is
+//! gone self-skips at fire time.
 
 use crate::backends::BackendManager;
 use crate::security::SecretStore;

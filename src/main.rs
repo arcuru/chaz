@@ -13,7 +13,6 @@ mod extension;
 mod extensions;
 mod gateway;
 mod grants;
-mod heartbeat;
 mod hosted_index;
 mod mcp;
 mod memory_bank_db;
