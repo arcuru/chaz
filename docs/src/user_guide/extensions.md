@@ -2,7 +2,7 @@
 
 Chaz's tools, hooks, and slash commands are organized into **extensions** —
 each one a bundle of related capabilities (filesystem tools, web tools,
-the heartbeat scheduler, etc.). Every session has its own active subset:
+the schedule scheduler, etc.). Every session has its own active subset:
 you can disable an extension on one session and keep it on another.
 
 The `/extensions` command controls per-session activation and settings.
@@ -25,7 +25,7 @@ Extensions on this peer (✓ = active on this session):
   ✓ system [0.3.0] — Tool
   ✓ web [0.3.0] — Tool
   ✓ memory [0.3.0] — Tool
-  ✓ heartbeat [0.3.0] — Command, Tool
+  ✓ schedule [0.3.0] — Command, Tool
 ```
 
 The version in brackets is the chaz binary version that registered the
@@ -48,7 +48,7 @@ agent turn**:
   list it sees in its next response).
 - The extension's `tool_call` / `tool_result` / `before_agent_start`
   hooks start firing.
-- The extension's slash commands start dispatching (e.g. `/heartbeat`
+- The extension's slash commands start dispatching (e.g. `/schedule`
   begins to work).
 
 Re-running `/extensions add` on an already-active extension is a no-op
@@ -79,7 +79,7 @@ etc. Disable at your own risk.
 ## Inspecting settings
 
 ```
-/extensions settings heartbeat
+/extensions settings schedule
 ```
 
 Prints the per-session settings JSON for the named extension. With no
@@ -96,11 +96,11 @@ when a key is missing.
 Merges `key = value` into the named extension's per-session settings.
 `<value>` is JSON-parsed first, so:
 
-- `/extensions set heartbeat max_retries 3` stores the number `3`
-- `/extensions set heartbeat enabled true` stores the boolean `true`
-- `/extensions set heartbeat label "morning sweep"` stores a string
-- `/extensions set heartbeat tags '["urgent","ops"]'` stores an array
-- `/extensions set heartbeat label foo` — `foo` doesn't parse as JSON,
+- `/extensions set schedule max_retries 3` stores the number `3`
+- `/extensions set schedule enabled true` stores the boolean `true`
+- `/extensions set schedule label "morning sweep"` stores a string
+- `/extensions set schedule tags '["urgent","ops"]'` stores an array
+- `/extensions set schedule label foo` — `foo` doesn't parse as JSON,
   so it's stored as the string `"foo"`
 
 Each call replaces the value at that key while preserving every other
@@ -136,8 +136,8 @@ prefix:
 !chaz extensions
 !chaz extensions add memory
 !chaz extensions remove memory
-!chaz extensions settings heartbeat
-!chaz extensions set heartbeat poll_secs 60
+!chaz extensions settings schedule
+!chaz extensions set schedule poll_secs 60
 ```
 
 ## Where extensions come from today

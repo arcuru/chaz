@@ -40,8 +40,9 @@ agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memor
 db_kind.rs           meta.kind + display_name markers on entity DBs (agent/bank/session classification)
 hosted_index.rs      In-memory peer-local pubkey/name → DB index, built at startup from user.databases()
 memory_bank_db.rs    Standalone memory bank DBs (parallel to agent_db)
-heartbeat.rs         sweep_for_agent helper — per-session heartbeats are Routine rows fired by routine/
-routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines (global + per-session)
+extensions/schedule.rs  /schedule command + schedule_* tools (agent-owned Schedules, agent_db `schedules` store)
+extensions/agent_schedule.rs  RoutineHandler that runs the standalone agent-owned schedule fire path
+routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines (global + per-agent Schedules)
 session.rs           SessionRegistry, Session, EntryType, SessionMeta, attach/detach, resolve_agent
 context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)
 tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError
@@ -64,7 +65,7 @@ defaults.rs          Built-in default config and built-in agents (chaz, chazmina
 ## Key Invariants
 
 - **AgentDb is the runtime source of truth.** YAML `agents:` is a first-boot template only; `bootstrap_from_config` does not overwrite existing AgentDb config. Use `/agent set` for live edits.
-- **Two peer-local DBs, both never sync.** `chaz_group` holds group-level routing/metadata (`sessions`, `matrix_channels`, `session_names`); `chaz_peer` holds peer-runtime state (`credentials`, `heartbeat_last_fired`, `schedule_state`). Sync-ful state lives in per-entity DBs.
+- **Two peer-local DBs, both never sync.** `chaz_group` holds group-level routing/metadata (`sessions`, `matrix_channels`, `session_names`); `chaz_peer` holds peer-runtime state (`credentials`, `schedule_state`). Sync-ful state lives in per-entity DBs.
 - **Hosted-agent / hosted-bank lookups are in-memory only.** `hosted_index::HostedIndex` is built at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker. No persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 - **Authorization = key possession.** Session participation is gated by AuthSettings on the session DB; memory bank access is gated by AuthSettings on the bank DB. No capability flags.
 - **Per-session serialization.** Concurrent writes to the same session while an agent is running are skipped (prevents duplicate responses).
@@ -77,9 +78,9 @@ defaults.rs          Built-in default config and built-in agents (chaz, chazmina
 Live Matrix bot for end-to-end testing:
 
 - Bot: `@chaz-dev:jackson.dev`
-- Config: `~/chaz-test/config.yaml`
-- Logs: `~/chaz-test/chaz.log`
-- Start: `~/chaz-test/run.sh` (foreground) or `nohup ... &` for background
+- Config: `~/code/chaz-test/config.yaml`
+- Logs: `~/code/chaz-test/chaz.log`
+- Start: `~/code/chaz-test/run.sh` (foreground) or `nohup ... &` for background
 - Stop: `kill $(pgrep -f "chaz.*config.yaml")`
 - Check: `ps aux | grep "chaz.*config" | grep -v grep`
 - Backend: OpenRouter (`minimax/minimax-m2.7` default)
@@ -89,7 +90,7 @@ After code changes, rebuild (`nix develop .# -c cargo build --release`) and rest
 TUI against the same state dir:
 
 ```bash
-nix develop .# -c cargo run -- --config ~/chaz-test/config.yaml --tui
+nix develop .# -c cargo run -- --config ~/code/chaz-test/config.yaml --tui
 ```
 
 ## Conventions

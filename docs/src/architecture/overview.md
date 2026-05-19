@@ -27,7 +27,7 @@ graph TD
         LA[(Living Agent DBs<br/>config, memory, meta, history)]
         MB[(Memory Bank DBs<br/>shared memory)]
         CG[(chaz_group DB<br/>peer-local: sessions,<br/>matrix_channels, session_names)]
-        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>heartbeat_last_fired, schedule_state)]
+        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>credentials, schedule_state)]
         HI[HostedIndex<br/>in-memory cache<br/>built from user.databases]
     end
 
@@ -119,7 +119,7 @@ src/
   memory_bank_db.rs    Standalone Memory Bank DBs (parallel to agent_db)
   db_kind.rs           meta.kind + display_name markers on entity DBs
   hosted_index.rs      In-memory peer-local pubkey/name → DB cache, built from user.databases()
-  heartbeat.rs         sweep_for_agent helper — per-session heartbeats are Routine rows
+  schedule.rs         sweep_for_agent helper — agent-owned schedules in the owning agent.s DB
   routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines
   server.rs            Callback-driven server, agent task spawning
   runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning
@@ -144,7 +144,7 @@ src/
     session.rs         /sessions, /info, /name, /share, /sync, etc.
     agent.rs           /agent add|remove|list|host|new|set|delete|share|import|invite|revoke-peer
     memory.rs          /memory new|list|delete|grant|revoke|share|import
-    heartbeat.rs       /heartbeat add|modify|remove|list
+    schedule.rs       /schedule add|modify|remove|list
   tools/               Built-in tools
     agent.rs           spawn_agent (delegate to a Living Agent)
     task.rs            spawn_task (ephemeral sub-agent with revocable key)
@@ -153,7 +153,7 @@ src/
     web.rs             web_fetch with network policy
     search.rs          web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
     memory.rs          remember, recall (optional `bank` arg), list_memory_banks
-    heartbeat.rs       heartbeat_add, heartbeat_modify, heartbeat_remove, heartbeat_list
+    schedule.rs       schedule_add, schedule_modify, schedule_remove, schedule_list
     compact.rs         compact — write Summary entry for context compaction
     describe.rs        describe_tool — on-demand tool discovery
     time.rs            get_time

@@ -157,7 +157,7 @@ These aren't session-scoped; they act on the Living Agent itself.
 
 When a message arrives on a multi-agent session, routing picks one agent in this precedence:
 
-1. Explicit override (gateway/heartbeat directives).
+1. Explicit override (gateway/schedule directives).
 2. **`@<name>` mention** in the message text — first token matching an attached agent's display_name wins. `@alpha`, `@beta-bot,`, `@gamma.` all work; `a@b.com` is ignored (no leading `@` at token start).
 3. **Host agent** (`SessionMeta.host_agent_db_id`) if that agent is still attached.
 4. First attached agent in AuthSettings order.
@@ -166,14 +166,16 @@ When a message arrives on a multi-agent session, routing picks one agent in this
 
 Mentions are case-insensitive and match exact display names. No prefix matching.
 
-## Heartbeat rules
+## Schedules
 
-A heartbeat rule is a time-driven trigger stored inside the session as a `Routine` row. The chaz `RoutineEngine` (one per peer) sleeps until the next scheduled fire across every hosted session, then dispatches to the `heartbeat` extension's `RoutineHandler`. The handler silently skips fires whose target agent isn't hosted on this peer, so multi-peer setups don't double-write. Each firing writes a `Directive` entry to the session, just like a manual message, and the mention-aware router picks the target.
+A schedule is a time-driven, **agent-owned** wake. It lives in the owning agent's DB `schedules` store (so it syncs and travels with the agent, exactly like its persona), not in any session. The chaz `RoutineEngine` (one per peer) sleeps until the next due fire across every hosted agent's schedules, then runs the **standalone fire path**: it loads the owning agent, resolves the schedule's target, and runs that agent's turn directly. The schedule's `prompt` is invocation-scoped input for that turn — it is **not** written as a broadcast `Directive` entry, and there is no "resolve who responds" step (the schedule names its owner). A peer that doesn't host the owning agent silently skips, so multi-peer setups don't double-fire.
 
-Two trigger shapes share one table:
+Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Two trigger shapes:
 
-- **Cron triggers** fire on a recurring schedule (`cron: "0 */5 * * * *"`). `last_fired` is tracked peer-locally in the `chaz_peer` DB's `routine_last_fired` store, not in the synced rule — each peer hosting the target agent fires its own schedule independently.
-- **One-shot triggers** fire once at an absolute `fire_at` time, then the engine drops the row. These back the `wake_me_up` tool described in [Tools](./tools.md). They don't use `last_fired` — deletion replaces it.
+- **Cron triggers** fire on a recurring schedule (`cron: "0 */5 * * * *"`). Each peer hosting the owning agent fires independently.
+- **One-shot triggers** fire once at an absolute `fire_at`, then the engine drops the schedule. These back the `schedule_once` tool described in [Tools](./tools.md).
+
+A schedule whose `Pinned` session is gone, or whose owning agent is no longer a member, self-skips at fire time (logged, not errored) — there is no detach/delete sweep.
 
 Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock jump can't strand a routine. The engine fires due rules within seconds of their scheduled time rather than waiting for a poll interval.
 
@@ -181,7 +183,7 @@ Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock 
 
 Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
 
-- **Interactive** — the `/heartbeat add|remove|list` command and the `heartbeat_add|modify|remove|list` / `wake_me_up` tools (this section and [Tools](./tools.md)). This is the only interactive surface; there is no separate `/schedule` command.
+- **Interactive** — the `/schedule add|remove|list` command and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)). This is the only interactive surface; there is no separate `/schedule` command.
 - **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), translated into session-scoped routines at startup.
 
 ### When rules fire
@@ -191,24 +193,24 @@ Firing is **server-side and independent of any UI**. A rule fires whenever chaz 
 - **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
 - **The target agent must be hosted on this peer** — otherwise the handler silently skips (the multi-peer dedupe above).
-- **Changes are live.** `/heartbeat add|remove`, `heartbeat_modify`, and `wake_me_up` take effect on the running engine immediately — no restart needed.
+- **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.
 
-### `/heartbeat` commands
+### `/schedule` commands
 
 Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
 
-| Command                                                                        | What                                                                                                                        |
-| ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `/heartbeat list` (or bare `/heartbeat`)                                       | List rules on the current session. One-shot rules are rendered with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of the cron. |
-| `/heartbeat add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                           |
-| `/heartbeat remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                     |
+| Command                                                                       | What                                                                                                                        |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. One-shot rules are rendered with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of the cron. |
+| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                           |
+| `/schedule remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                     |
 
-To create a one-shot rule from the TUI, agents call the `wake_me_up` tool. There's no slash-command form yet.
+To create a one-shot rule from the TUI, agents call the `schedule_once` tool. There's no slash-command form yet.
 
 Example — make `researcher` post a morning briefing to the current session weekdays at 09:00:
 
 ```text
-/heartbeat add brief 0 0 9 * * Mon-Fri researcher Summarize overnight activity and surface anything urgent.
+/schedule add brief 0 0 9 * * Mon-Fri researcher Summarize overnight activity and surface anything urgent.
 ```
 
 ## Tool Narrowing
@@ -394,13 +396,13 @@ sequenceDiagram
     S-->>U: rendered reply
 ```
 
-### 6. Schedule heartbeats
+### 6. Schedules
 
 ```text
-/heartbeat add brief 0 0 9 * * Mon-Fri researcher Summarise overnight activity
+/schedule add brief 0 0 9 * * Mon-Fri researcher Summarise overnight activity
 ```
 
-Every peer hosting `researcher` runs its own copy of the schedule (sleep-until-next, no polling). When a rule fires it writes a `Directive` server-side — indistinguishable from a user message from the router's perspective — and the agent turn runs whether or not anyone is watching the session.
+The schedule is stored in `researcher`'s DB. Every peer hosting `researcher` runs its own copy (sleep-until-next, no polling). When it fires, the standalone path runs `researcher`'s turn directly with the prompt as invocation input — no `Directive` is written — whether or not anyone is watching the session.
 
 ### 7. Share the agent with another peer (co-ownership)
 

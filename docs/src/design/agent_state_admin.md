@@ -1,17 +1,17 @@
 # Agent State Admin Capability
 
 **Status:** Implemented (2026-05-18).
-**Depends on:** cap traits landed (`src/extension/caps.rs`), hub wiring (Steps 2–5 of cap refactor), `AgentDbAccess` trait (landed in `src/tools/heartbeat.rs`).
+**Depends on:** cap traits landed (`src/extension/caps.rs`), hub wiring (Steps 2–5 of cap refactor), `AgentDbAccess` trait (landed in `src/tools/schedule.rs`).
 
 ## Security posture
 
-> **This capability system is a guardrail, not a sandbox.** It is designed to stop a poorly behaving agent or tool from doing accidental damage — deleting the wrong timer, scheduling noise into another agent's DB, writing to a path outside `~/code/`. It is **not** designed to contain an LLM or tool that is explicitly, adversarially trying to escape. If we can achieve the latter, that's great, but it is not the requirement driving this design.
+> **This capability system is a guardrail, not a sandbox.** It is designed to stop a poorly behaving agent or tool from doing accidental damage — deleting the wrong schedule, scheduling noise into another agent's DB, writing to a path outside `~/code/`. It is **not** designed to contain an LLM or tool that is explicitly, adversarially trying to escape. If we can achieve the latter, that's great, but it is not the requirement driving this design.
 
 The distinction matters:
 
 | What the guardrail stops                                                   | What it doesn't try to stop                                                                |
 | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| A too-eager agent scheduling timers on every hosted agent                  | A tool that discovers it has `Arc<SessionRegistry>` and walks the object graph to escalate |
+| A too-eager agent scheduling schedules on every hosted agent               | A tool that discovers it has `Arc<SessionRegistry>` and walks the object graph to escalate |
 | An extension registering tools it didn't declare                           | A WASM extension that exploits a VM escape                                                 |
 | A shell tool that `rm -rf ~/` because an agent hallucinated a cleanup step | An agent that builds and runs native code through the shell tool it was granted            |
 | A file-write tool scribbling in `/etc`                                     | A tool using `ptrace` or `/proc` to read another process's memory                          |
@@ -20,10 +20,10 @@ The ceiling (extension capabilities) and floor (tool policy) together create a *
 
 ## Problem
 
-Heartbeat tools (`heartbeat_add`, `heartbeat_modify`, `heartbeat_remove`, `heartbeat_list`, `wake_me_up`) read and write agent-owned timers in the target agent's eidetica DB. Today they receive an `Arc<dyn AgentDbAccess>` handle at construction time — an untyped, unscoped, undeclared capability:
+Heartbeat tools (`schedule_add`, `schedule_modify`, `schedule_remove`, `schedule_list`, `schedule_once`) read and write agent-owned schedules in the target agent's eidetica DB. Today they receive an `Arc<dyn AgentDbAccess>` handle at construction time — an untyped, unscoped, undeclared capability:
 
-1. **Not in the cap system.** `CapabilityKind` has no variant for "access agent state." The trait exists in `tools/heartbeat.rs`, invisible to manifests, extensions, or the hub.
-2. **No attenuation.** The handle opens _any_ hosted agent's DB. There's no way for the operator to say "`chazmina` can schedule timers but only on herself."
+1. **Not in the cap system.** `CapabilityKind` has no variant for "access agent state." The trait exists in `tools/schedule.rs`, invisible to manifests, extensions, or the hub.
+2. **No attenuation.** The handle opens _any_ hosted agent's DB. There's no way for the operator to say "`chazmina` can schedule schedules but only on herself."
 3. **Ambient authority.** Tools carry `HostedIndex` (can enumerate all hosted agents by name/id) alongside the access handle. Proper ocap discipline says the tool should only see agents it's been granted.
 
 ## Design
@@ -37,7 +37,7 @@ Add a new host-only variant to `CapabilityKind`:
 
 pub enum CapabilityKind {
     // ... existing variants ...
-    /// Read/write agent-owned state (timers, memory, configuration).
+    /// Read/write agent-owned state (schedules, memory, configuration).
     /// Host-only — only chaz core may provide the impl. The hub
     /// scopes each impl to the set of agents declared in the
     /// operator's tool_policy before handing it to the extension.
@@ -71,7 +71,7 @@ The `agents` field is not set by the extension's manifest author — it's set by
 // src/extension/caps.rs
 
 /// Narrow capability: access hosted agent DBs for state operations
-/// (timers, memory, etc.). The hub scopes each impl to the set of
+/// (schedules, memory, etc.). The hub scopes each impl to the set of
 /// agents the operator allows before the extension sees it.
 pub trait AgentStateAdmin: Send + Sync {
     /// Resolve an agent name to its `DbEntry`. Only agents in the
@@ -281,7 +281,7 @@ Per-tool scoping (in `tool_policy`) is a future refinement.
 3. Wire the hub to build `ScopedAgentStateAdmin` from operator config + `HostedIndex` + `SessionRegistry` during `install_all`.
 4. Migrate heartbeat tools: drop `HostedIndex` and `Arc<dyn AgentDbAccess>`, take `Arc<dyn AgentStateAdmin>` from caps.
 5. Migrate heartbeat extension: declare the cap in its manifest; tools receive the cap from the bundle.
-6. Remove the `AgentDbAccess` trait from `tools/heartbeat.rs` (no consumers remain).
+6. Remove the `AgentDbAccess` trait from `tools/schedule.rs` (no consumers remain).
 
 ## Relationships to Other Caps
 
@@ -301,8 +301,8 @@ Per-tool scoping (in `tool_policy`) is a future refinement.
 | Hub wiring — `set_hosted_index`, `build_agent_state_admin`                           | ✅ `extension/mod.rs`           |
 | Operator config — `agent_state_allowlist` in `Config` + `set_agent_state_allowlist`  | ✅ `config.rs`, `main.rs`       |
 | Allowlist intersection — `resolve_agent_allowlist`                                   | ✅ `extension/mod.rs` (8 tests) |
-| Tool migration — `Arc<dyn AgentStateAdmin>` replaces `HostedIndex` + `AgentDbAccess` | ✅ `tools/heartbeat.rs`         |
-| Extension migration — declares `AgentStateAdmin` in manifest                         | ✅ `extensions/heartbeat.rs`    |
+| Tool migration — `Arc<dyn AgentStateAdmin>` replaces `HostedIndex` + `AgentDbAccess` | ✅ `tools/schedule.rs`          |
+| Extension migration — declares `AgentStateAdmin` in manifest                         | ✅ `extensions/schedule.rs`     |
 | Remove old `AgentDbAccess`/`RegistryAgentDbAccess` traits                            | ✅                              |
 | Clean up unused `_registry` parameter                                                | ✅                              |
 

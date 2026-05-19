@@ -294,7 +294,7 @@ call them even if it tries.
 
 Routine fires aren't gated by the active set; the routine engine fires
 any routine that's enabled regardless of whether its owning extension
-is active on the session. (Disabling `heartbeat` on a session and still
+is active on the session. (Disabling `schedule` on a session and still
 expecting cron rules on that session to fire would be surprising, but
 that's the current behavior.)
 
@@ -323,9 +323,9 @@ clobber.
 ```mermaid
 graph LR
     A[Session DB] --> B[extensions table]
-    B --> E1[Activated heartbeat<br/>t=10:00]
+    B --> E1[Activated schedule<br/>t=10:00]
     B --> E2[Activated memory<br/>t=10:00]
-    B --> E3[Deactivated heartbeat<br/>t=14:32]
+    B --> E3[Deactivated schedule<br/>t=14:32]
     E1 --> F{fold by name}
     E2 --> F
     E3 --> F
@@ -449,7 +449,7 @@ and the same shape works for sandboxed WASM extensions later.
 | `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                  |
 | `src/extensions/web.rs`               | `web_fetch`, `web_search`                                 |
 | `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`                 |
-| `src/extensions/heartbeat.rs`         | Heartbeat tools + `/heartbeat` command + routine handler  |
+| `src/extensions/schedule.rs`          | Schedule tools + `/schedule` command                      |
 | `src/extensions/scheduler.rs`         | YAML-schedule routine handler                             |
 | `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping `/` suffix                     |
 | `src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt injection patterns |
@@ -463,7 +463,7 @@ and the same shape works for sandboxed WASM extensions later.
 | `system`            | `Tool`            | —               | `get_time`, `calculate`, `describe_tool`                                                    |
 | `web`               | `Tool`            | —               | `web_fetch`, `web_search`                                                                   |
 | `memory`            | `Tool`            | —               | `remember`, `recall`, `list_memory_banks`                                                   |
-| `heartbeat`         | `Tool`, `Command` | yes             | 5 heartbeat tools + `/heartbeat` command + cron/one-shot directive fires                    |
+| `schedule`          | `Tool`, `Command` | yes             | 5 schedule tools + `/schedule` command (agent-owned schedules)                              |
 | `scheduler`         | —                 | yes             | YAML `schedules:` translated to per-session Routine rows; fires scheduled Directive entries |
 | `path_normalizer`   | `ToolCall`        | —               | Strips trailing `/` from filesystem-tool path args                                          |
 | `security_warnings` | `ToolResult`      | —               | Logs prompt-injection patterns in tool output                                               |

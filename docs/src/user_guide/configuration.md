@@ -91,14 +91,16 @@ mcp_servers:
       approval: unless_auto_approved
       timeout: 30
 
-# Scheduled tasks — compiled into session routines at startup and fired
-# by the same RoutineEngine as /heartbeat (server-side, whenever chaz is
-# running; there is no separate /schedule command). Cron is 6 fields:
-# sec min hour day-of-month month day-of-week.
+# Scheduled tasks — imported at startup as agent-owned schedules in the
+# owning agent's DB (Pinned to the resolved session), fired by the same
+# RoutineEngine as the /schedule command. Cron is 6 fields:
+# sec min hour day-of-month month day-of-week. Idempotent by `name`
+# within the owning agent.
 schedules:
   - name: daily-check
-    session: daily-standup # Session name or eidetica DB root ID
-    task: "Run the daily status check"
+    session: daily-standup # Session name or eidetica DB root ID (Pinned target)
+    agent: researcher # Owning agent (display name or DB id). Omit → peer's default agent.
+    task: "Run the daily status check" # Wake prompt handed to the agent
     cron: "0 0 9 * * *" # 09:00:00 every day
     enabled: true
 
@@ -133,7 +135,7 @@ web_search:
 # AgentStateAdmin cap. Maps extension name → agent display names.
 # An absent entry means unrestricted; an empty list means deny-all.
 # agent_state_allowlist:
-#   heartbeat: [chaz, bash]
+#   schedule: [chaz, bash]
 #   memory: [chaz]             # memory tools can only touch chaz agent
 
 # Optional: embedding backend for semantic memory recall.
@@ -256,7 +258,7 @@ External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) 
 
 ## Schedules
 
-Cron-driven task injection into sessions. Each schedule writes a `Directive` entry to the target session on a cron schedule. Sessions are referenced by name or eidetica DB root ID. Responses from scheduled runs are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
+Cron-driven agent wakes. Each entry is imported at startup as an **agent-owned schedule** (see [Agents — Schedules](agents.md#schedules)) in the owning agent's DB, Pinned to the resolved session. On fire, the owning agent's turn runs directly with `task` as the wake prompt — no `Directive` is written to the session. `agent:` names the owner (display name or DB id); omit it to use the peer's default agent. `session:` is referenced by name or eidetica DB root ID. Responses are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
 
 ## Context
 
@@ -266,7 +268,7 @@ Token budgeting for the LLM context window. Uses tiktoken (cl100k_base) for accu
 
 Chaz persists all data in the state directory:
 
-- `eidetica.db` — SQLite database backing every chaz eidetica DB: per-session DBs, per-agent DBs, per-bank DBs, plus the peer-local `chaz_group` (sessions/channels/names) and `chaz_peer` (credentials/heartbeat_last_fired/schedule_state) bookkeeping DBs
+- `eidetica.db` — SQLite database backing every chaz eidetica DB: per-session DBs, per-agent DBs, per-bank DBs, plus the peer-local `chaz_group` (sessions/channels/names) and `chaz_peer` (credentials/schedule_last_fired/schedule_state) bookkeeping DBs
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.

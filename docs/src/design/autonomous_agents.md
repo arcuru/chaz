@@ -196,12 +196,12 @@ context-build time_, not baked into the `PersonaSnapshot`:
 3. Should an agent opt **in** to being mention-wakeable (a flag on
    `AgentRef`), or is "attached" sufficient? v1 proposal: attached is
    sufficient; no new field.
-4. Interaction with scheduled `Directive`s mid-burst — a Directive resets
-   the burst (it's non-agent), which seems correct; confirm. Note: the
-   scheduled-wake mechanism itself is being reframed as agent-owned and
-   private (no shared `Directive` entry) — see [Agent-Owned
-   Timers](./agent_timers.md); under that model a fired timer's prompt is
-   not a burst-resetting entry at all.
+4. **Resolved.** A fired schedule is **not** a burst entry at all.
+   Agent-owned schedules run the standalone fire path and feed their
+   prompt as invocation-scoped input — no shared `Directive` entry is
+   written, so a scheduled wake neither resets nor extends a burst. The
+   legacy session-`Directive` scheduler that raised this question is
+   deleted. See [Agent-Owned Schedules](./agent_schedules.md).
 
 ## Implementation Touch Points
 
