@@ -1285,6 +1285,26 @@ impl ExtensionHub {
         let operator_allowlist = self.agent_state_allowlist.get(extension_name);
         let effective = resolve_agent_allowlist(manifest_allowlist, operator_allowlist);
 
+        // Empty allowlist == deny-all. This is a legitimate config but a
+        // silent footgun (the extension's agent-state tools all fail with
+        // a not-found-looking error). Surface it once at startup so an
+        // operator who didn't mean "[]" finds out here, not from a
+        // confused user. `None` (unrestricted) and non-empty are quiet.
+        match &effective {
+            Some(set) if set.is_empty() => warn!(
+                extension = extension_name,
+                "AgentStateAdmin allowlist resolved to empty — every agent-state \
+                 operation for this extension will be denied (set \
+                 `agent_state_allowlist.{extension_name}` to a non-empty list, \
+                 or remove the entry for unrestricted access)"
+            ),
+            other => tracing::debug!(
+                extension = extension_name,
+                scope = ?other,
+                "AgentStateAdmin scope resolved"
+            ),
+        }
+
         agent_state::ScopedAgentStateAdmin::new(registry, index, effective)
     }
 

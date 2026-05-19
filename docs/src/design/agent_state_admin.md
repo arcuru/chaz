@@ -1,6 +1,6 @@
 # Agent State Admin Capability
 
-**Status:** Implemented (2026-05-18).
+**Status:** Implemented (2026-05-18). Error/UX reconciliation 2026-05-19 (Gap 3): uniform not-found error + startup deny-all `WARN`.
 **Depends on:** cap traits landed (`src/extension/caps.rs`), hub wiring (Steps 2–5 of cap refactor), `AgentDbAccess` trait (landed in `src/tools/schedule.rs`).
 
 ## Security posture
@@ -253,10 +253,18 @@ Per-extension agent allowlist in chaz config:
 ```yaml
 # chaz config
 agent_state_allowlist:
-  heartbeat: [chaz, bash] # heartbeat extension can only touch these two agents
+  schedule: [chaz, bash] # schedule extension can only touch these two agents
 ```
 
-An absent entry means unrestricted (all hosted agents visible). An empty entry (`heartbeat: []`) means deny-all.
+An absent entry means unrestricted (all hosted agents visible). An empty entry (`schedule: []`) means deny-all.
+
+This map is, by design, the **operator mutation surface** — it is
+peer-local operator policy, applied once at startup. There is no runtime
+command to mutate it (a runtime override would need a persistence/sync
+model — peer-local vs. synced, who may change it — that is an open
+decision, deliberately deferred rather than guessed). The effective scope
+_is_ observable at runtime: it is logged at startup (see below), and an
+empty/deny-all resolution is logged at `WARN`.
 
 The hub resolves these at install time via `resolve_agent_allowlist()`:
 
@@ -273,6 +281,23 @@ The hub resolves these at install time via `resolve_agent_allowlist()`:
 If the intersection is empty, the effective allowlist is `Some([])` — the `ScopedAgentStateAdmin` rejects all agents. The cap slot is still `Some` (not `None`) because the extension can still function — it just gets `Err` on every operation.
 
 Per-tool scoping (in `tool_policy`) is a future refinement.
+
+### Error semantics (Gap 3 reconciliation)
+
+A scoped-out agent is **indistinguishable from a non-existent one** at
+the cap boundary: both `resolve_agent` and `open_agent_db` return the
+uniform `No hosted agent matches '<ref>'` — the same wording `/agent`
+uses for an unresolved ref. This collapses the original "two errors for
+one concept" wart (a denied lookup used to say "outside the allowed set"
+while a missing one said "not found") and avoids leaking the existence
+of out-of-scope agents to extension tools.
+
+Because the deny-all (`Some([])`) state is now invisible at the tool
+boundary, it would otherwise be a silent footgun. So the hub emits a
+one-time **`WARN` at startup** when an extension's effective allowlist
+resolves to empty, naming the extension and the config key to fix; the
+non-empty / unrestricted cases log at `DEBUG`. The operator finds out at
+boot, not from a confused user staring at a "not found" error.
 
 ### Migration from AgentDbAccess
 

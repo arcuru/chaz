@@ -57,18 +57,29 @@ impl ScopedAgentStateAdmin {
         self.allowed.is_none()
     }
 
-    fn check_scope(&self, display_name: &str) -> Result<(), String> {
+    /// `true` when `display_name` is within this handle's scope.
+    ///
+    /// Scope denial is deliberately **not** distinguished from
+    /// non-existence at this boundary: a scoped-out agent looks exactly
+    /// like an unknown agent (same not-found error in callers). That
+    /// collapses the old "two errors for one concept" wart (Gap 3) and
+    /// avoids leaking the existence of out-of-scope agents to extension
+    /// tools. The operator-facing diagnostic for an empty (deny-all)
+    /// allowlist is emitted once at startup in
+    /// `ExtensionHub::build_agent_state_admin`, not here.
+    fn in_scope(&self, display_name: &str) -> bool {
         match &self.allowed {
-            None => Ok(()), // unrestricted — all agents visible
-            Some(set) if set.is_empty() => {
-                Err("Agent state cap denied — operator allowlist is empty".into())
-            }
-            Some(set) if set.contains(display_name) => Ok(()),
-            Some(_) => Err(format!(
-                "Agent '{display_name}' is outside the allowed set for this capability"
-            )),
+            None => true,                            // unrestricted
+            Some(set) => set.contains(display_name), // empty ⇒ always false
         }
     }
+}
+
+/// The uniform "no such agent" error — identical whether the agent
+/// truly doesn't exist or is merely scoped out. Mirrors the wording
+/// `/agent` uses for an unresolved ref.
+fn not_found(name: &str) -> String {
+    format!("No hosted agent matches '{name}'")
 }
 
 impl AgentStateAdmin for ScopedAgentStateAdmin {
@@ -84,21 +95,25 @@ impl AgentStateAdmin for ScopedAgentStateAdmin {
         {
             e
         } else {
-            return Err(format!("No hosted agent matches '{name}'"));
+            return Err(not_found(name));
         };
 
-        // Scope check: the agent's display name must be in the
-        // operator-configured allowlist.
-        self.check_scope(&entry.display_name)?;
+        // Scope check: a scoped-out agent is reported as not-found,
+        // identical to a genuinely missing one (see `in_scope`).
+        if !self.in_scope(&entry.display_name) {
+            return Err(not_found(name));
+        }
         Ok(entry)
     }
 
     fn open_agent_db<'a>(&'a self, entry: &'a DbEntry) -> CapFuture<'a, AgentDb> {
         Box::pin(async move {
             // Defense in depth — the entry should have come through
-            // `resolve_agent`, but verify the scope anyway.
-            self.check_scope(&entry.display_name)
-                .map_err(anyhow::Error::msg)?;
+            // `resolve_agent`, but verify the scope anyway. Same
+            // not-found masking as the resolve path.
+            if !self.in_scope(&entry.display_name) {
+                return Err(anyhow::anyhow!(not_found(&entry.display_name)));
+            }
 
             let agent_db = self
                 .registry
@@ -169,11 +184,9 @@ mod tests {
     async fn scoped_resolve_rejects_unknown_agent() {
         let (registry, index) = fixture(vec!["alpha".into(), "beta".into()]).await;
         let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["alpha".into()]));
+        // Scoped-out is reported identically to genuinely missing.
         let err = scope.resolve_agent("beta").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("outside the allowed set"),
-            "got: {err}"
-        );
+        assert_eq!(err, "No hosted agent matches 'beta'");
     }
 
     #[tokio::test]
@@ -199,10 +212,7 @@ mod tests {
             Some(vec![]), // empty = deny all
         );
         let err = scope.resolve_agent(&alpha_id).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("allowlist is empty"),
-            "got: {err}"
-        );
+        assert_eq!(err, format!("No hosted agent matches '{alpha_id}'"));
     }
 
     #[tokio::test]
@@ -213,7 +223,7 @@ mod tests {
         let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec!["alpha".into()]));
         let err = scope.open_agent_db(&beta_entry).await.unwrap_err();
         assert!(
-            format!("{err:#}").contains("outside the allowed set"),
+            format!("{err:#}").contains("No hosted agent matches 'beta'"),
             "got: {err}"
         );
     }
@@ -241,7 +251,9 @@ mod tests {
     async fn empty_allowlist_denies_all() {
         let (registry, index) = fixture(vec!["alpha".into()]).await;
         let scope = ScopedAgentStateAdmin::new(registry, index, Some(vec![]));
+        // Deny-all surfaces to the tool as plain not-found; the operator
+        // diagnostic is the startup warn, not this error.
         let err = scope.resolve_agent("alpha").unwrap_err();
-        assert!(format!("{err:#}").contains("allowlist is empty"));
+        assert_eq!(err, "No hosted agent matches 'alpha'");
     }
 }

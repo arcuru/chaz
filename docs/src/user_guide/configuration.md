@@ -133,7 +133,9 @@ web_search:
 #
 # agent_state_allowlist: per-extension agent allowlists for the
 # AgentStateAdmin cap. Maps extension name → agent display names.
-# An absent entry means unrestricted; an empty list means deny-all.
+# An absent entry means unrestricted; an empty list means deny-all
+# (logged at WARN on startup — to a tool a scoped-out agent is
+# reported identically to a non-existent one).
 # agent_state_allowlist:
 #   schedule: [chaz, bash]
 #   memory: [chaz]             # memory tools can only touch chaz agent
