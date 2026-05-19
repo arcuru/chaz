@@ -5,20 +5,19 @@
 //! - `transport` — stdio + HTTP transports (`Transport` enum)
 //! - `server`    — `McpServer` (per-connection manager) and `McpTool`
 //!
-//! This module exposes the public surface: `McpServer`, `McpTool`, and the
-//! startup helpers `load_server_configs_from_dir` + `start_mcp_servers`.
+//! MCP servers are surfaced as extensions via
+//! [`crate::extensions::mcp::McpExtension`] — each server
+//! participates in the extension hub lifecycle (tool attribution,
+//! per-session filtering, hook surface). The startup helper
+//! `load_server_configs_from_dir` discovers configs from a directory;
+//! the extension constructors handle the rest.
 
 mod parse;
-mod server;
+pub(crate) mod server;
 mod transport;
 
 use crate::config::McpServerConfig;
-use crate::tool::Tool;
-use std::sync::Arc;
-use tracing::{error, info, warn};
-
-pub use server::{McpServer, McpTool};
-use server::{McpToolInfo, McpToolMetadata};
+use tracing::{info, warn};
 
 /// Load MCP server configs from a directory.
 ///
@@ -28,7 +27,7 @@ pub fn load_server_configs_from_dir(dir: &std::path::Path) -> Vec<McpServerConfi
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            error!(
+            warn!(
                 "Failed to read MCP server directory '{}': {e}",
                 dir.display()
             );
@@ -74,62 +73,6 @@ pub fn load_server_configs_from_dir(dir: &std::path::Path) -> Vec<McpServerConfi
     }
 
     configs
-}
-
-/// Start all configured MCP servers and return their tools.
-///
-/// Failed servers are logged and skipped — they don't block startup.
-pub async fn start_mcp_servers(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
-    let mut all_tools: Vec<Box<dyn Tool>> = Vec::new();
-    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for config in configs {
-        match start_one_server(config).await {
-            Ok((server, tool_infos)) => {
-                // Populate the server's shared metadata map
-                {
-                    let mut metadata = server.tool_metadata.write().unwrap();
-                    for info in &tool_infos {
-                        metadata.insert(
-                            info.name.clone(),
-                            McpToolMetadata {
-                                description: info.description.clone(),
-                                input_schema: info.input_schema.clone(),
-                            },
-                        );
-                    }
-                }
-                let server = Arc::new(server);
-                let count = tool_infos.len();
-                for info in tool_infos {
-                    let namespaced = format!("{}.{}", config.name, info.name);
-                    if !seen_names.insert(namespaced.clone()) {
-                        warn!("MCP tool name collision: '{namespaced}' — skipping duplicate");
-                        continue;
-                    }
-                    all_tools.push(Box::new(McpTool {
-                        server: server.clone(),
-                        raw_name: info.name,
-                        namespaced_name: namespaced,
-                    }));
-                }
-                info!("MCP server '{}': registered {count} tool(s)", config.name);
-            }
-            Err(e) => {
-                error!("MCP server '{}' failed to start: {e}", config.name);
-            }
-        }
-    }
-
-    all_tools
-}
-
-async fn start_one_server(
-    config: &McpServerConfig,
-) -> Result<(McpServer, Vec<McpToolInfo>), String> {
-    let server = McpServer::start(config).await?;
-    let tools = server.list_tools().await?;
-    Ok((server, tools))
 }
 
 #[cfg(test)]

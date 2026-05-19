@@ -9,6 +9,7 @@
 pub mod agent_schedule;
 pub mod core;
 pub mod fs;
+pub mod mcp;
 pub mod memory;
 pub mod path_normalizer;
 pub mod schedule;

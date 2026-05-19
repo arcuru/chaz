@@ -35,6 +35,7 @@ use config::Config;
 use gateway::Gateway;
 
 use clap::Parser;
+use std::sync::Arc;
 use std::{fs::File, io::Read, path::PathBuf};
 use tracing::{error, info};
 
@@ -361,42 +362,14 @@ async fn main() -> anyhow::Result<()> {
     // fallback when a Pinned session has no registered SessionRuntime.
     let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
 
-    // Install every built-in extension on the hub via the cap-based
-    // install path. Tools and commands flow through the per-extension
-    // `caps.tool_registration` / `caps.command_registration` queues that
-    // `install_all` drains; hook handlers returned in each extension's
-    // `InstalledExtension` are bridged into the legacy hook vectors so
-    // the existing `fire_*` paths run unchanged.
+    // Set up extension hub infrastructure before install_all.
+    // Tools and commands flow through per-extension caps;
+    // install_all drains them into owner-attributed registries.
     extension_hub.set_session_registry(registry.clone());
     extension_hub.set_hosted_index(agent_index_store.clone());
     extension_hub.set_agent_state_allowlist(config.agent_state_allowlist.clone());
-    extension_hub
-        .install_all(extensions::all_builtins(extensions::BuiltinDeps {
-            agent_index: agent_index_store.clone(),
-            session_registry: registry.clone(),
-            embedder: embedder.clone(),
-            web_search_backends,
-            spawn_server_cell: spawn_server_cell.clone(),
-            backend_manager: default_backend.clone(),
-            security: security_ctx.clone(),
-        }))
-        .await?;
-    let extension_names = extension_hub.extension_names();
-    if !extension_names.is_empty() {
-        info!(?extension_names, "Extensions registered");
-    }
 
-    // Build the legacy ToolRegistry from extension-contributed tools plus
-    // any MCP-provided tools. MCP tools don't fit the extension model yet
-    // (they're config-driven at startup and may grow/shrink at reload time)
-    // so they continue to live directly in the registry — they're just
-    // un-attributed for now.
-    let mut tool_registry = tool::ToolRegistry::new();
-    for (owner, _name, tool) in extension_hub.tools_for_registry() {
-        tool_registry.register_arc_owned(tool, Some(owner));
-    }
-
-    // Collect MCP server configs from inline config + directory scanning
+    // Collect MCP server configs from inline config + directory scanning.
     let mut mcp_configs: Vec<config::McpServerConfig> =
         config.mcp_servers.clone().unwrap_or_default();
     if let Some(dir) = &config.mcp_server_dir {
@@ -412,16 +385,37 @@ async fn main() -> anyhow::Result<()> {
         mcp_configs.extend(dir_configs);
     }
 
-    // Start MCP servers and register their tools
+    // Build the extension list: builtins + one McpExtension per MCP server.
+    // MCP servers are data-driven at startup, not compile-time builtins,
+    // but they participate in the same extension lifecycle — tool
+    // attribution, per-session filtering, hook surface.
+    let mut extensions = extensions::all_builtins(extensions::BuiltinDeps {
+        agent_index: agent_index_store.clone(),
+        session_registry: registry.clone(),
+        embedder: embedder.clone(),
+        web_search_backends,
+        spawn_server_cell: spawn_server_cell.clone(),
+        backend_manager: default_backend.clone(),
+        security: security_ctx.clone(),
+    });
     if !mcp_configs.is_empty() {
-        let mcp_tools = mcp::start_mcp_servers(&mcp_configs).await;
-        let mcp_count = mcp_tools.len();
-        for t in mcp_tools {
-            tool_registry.register_boxed(t);
+        for config in &mcp_configs {
+            extensions.push(Arc::new(extensions::mcp::McpExtension::new(config.clone())));
         }
-        if mcp_count > 0 {
-            info!(mcp_tools = mcp_count, "MCP tools registered");
-        }
+    }
+
+    extension_hub.install_all(extensions).await?;
+    let extension_names = extension_hub.extension_names();
+    if !extension_names.is_empty() {
+        info!(?extension_names, "Extensions registered");
+    }
+
+    // Build the legacy ToolRegistry from extension-contributed tools.
+    // MCP tools now arrive through the same path as built-in tools
+    // (McpExtension contributes them via ToolRegistration cap).
+    let mut tool_registry = tool::ToolRegistry::new();
+    for (owner, _name, tool) in extension_hub.tools_for_registry() {
+        tool_registry.register_arc_owned(tool, Some(owner));
     }
 
     let extension_hub = std::sync::Arc::new(extension_hub);

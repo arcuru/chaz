@@ -272,6 +272,45 @@ impl McpServer {
             .send_notification(&self.name, &notification)
             .await
     }
+    /// Discover tools from the server and return `McpTool` wrappers.
+    ///
+    /// Populates the internal metadata map and creates one `McpTool` per
+    /// discovered tool. Each wrapper shares this server's connection via
+    /// `Arc`. The caller is responsible for holding the `Arc<McpServer>`
+    /// alive — the tools' `execute()` calls route back through it.
+    ///
+    /// Namespaced names are `{server_name}.{tool_name}` (e.g.
+    /// `filesystem.read_file`).
+    pub async fn discover_and_wrap_tools(
+        self: &Arc<Self>,
+        server_name: &str,
+    ) -> Result<Vec<McpTool>, String> {
+        let tool_infos = self.list_tools().await?;
+        {
+            let mut metadata = self.tool_metadata.write().unwrap();
+            for info in &tool_infos {
+                metadata.insert(
+                    info.name.clone(),
+                    McpToolMetadata {
+                        description: info.description.clone(),
+                        input_schema: info.input_schema.clone(),
+                    },
+                );
+            }
+        }
+        Ok(tool_infos
+            .into_iter()
+            .map(|info| {
+                let raw = info.name;
+                let namespaced = format!("{}.{}", server_name, raw);
+                McpTool {
+                    server: self.clone(),
+                    raw_name: raw,
+                    namespaced_name: namespaced,
+                }
+            })
+            .collect())
+    }
 }
 
 /// Metadata for a single tool discovered from an MCP server.
