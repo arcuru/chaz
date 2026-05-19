@@ -555,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             }
-            let schedule = agent_db::Schedule::new(
+            let mut schedule = agent_db::Schedule::new(
                 cfg.name.clone(),
                 routine::Trigger::Cron {
                     expr: cfg.cron.clone(),
@@ -563,6 +563,8 @@ async fn main() -> anyhow::Result<()> {
                 cfg.task.clone(),
                 agent_db::ScheduleTarget::Pinned { session_db_id },
             );
+            schedule.max_fires = cfg.max_fires;
+            schedule.expires_at = cfg.expires_at;
             if let Err(e) = adb.upsert_schedule(schedule).await {
                 error!(schedule = %cfg.name, "Failed to save schedule: {e}");
             } else {

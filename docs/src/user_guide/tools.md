@@ -160,6 +160,13 @@ Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash co
 
 The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
 
+**Lifecycle bounds.** A recurring schedule can be retired automatically:
+
+- `max_fires` — retire after this many fires. `cron` hourly + `max_fires: 8` expresses "wake hourly for 8 hours".
+- `expires_at` — RFC 3339 timestamp after which it stops firing.
+
+Whichever bound is hit first wins; both are optional (omit = unbounded). `fire_count` is tracked authoritatively in the agent DB so `max_fires` survives restarts. When a bound is reached the schedule is persisted as disabled (it shows in `schedule_list` as `(disabled)` with its `[fired N×]` count rather than being deleted, so the history stays auditable). `schedule_modify` can set/replace `max_fires`/`expires_at`; re-enabling a schedule that already passed a bound will simply retire again on its next fire.
+
 ### schedule_once
 
 One-shot wakeup that fires a directive into this session after a delay, then deletes itself. The directive is routed back to the calling agent — cross-agent scheduling stays in `schedule_add`. Use it for "come back to this in N seconds" cases; for recurring work, use `schedule_add` instead.

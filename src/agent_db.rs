@@ -198,6 +198,22 @@ pub struct Schedule {
     pub max_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    // --- Lifecycle bounds (Gap 4) ---
+    /// Absolute time after which the schedule stops firing. `None` =
+    /// never expires. Independent of `max_fires` — whichever bound is
+    /// hit first retires the schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Maximum number of successful fires before the schedule retires.
+    /// `None` = unbounded. Makes "wake hourly for 8 hours" expressible
+    /// (`cron` hourly + `max_fires: 8`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fires: Option<u32>,
+    /// Count of fires that have run the agent turn. Authoritative in the
+    /// agent DB (the engine's in-memory routine is rebuilt from here),
+    /// so `max_fires` survives restarts.
+    #[serde(default)]
+    pub fire_count: u32,
 }
 
 impl Schedule {
@@ -217,7 +233,29 @@ impl Schedule {
             consecutive_failures: 0,
             max_failures: 3,
             last_error: None,
+            expires_at: None,
+            max_fires: None,
+            fire_count: 0,
         }
+    }
+
+    /// Why this schedule should retire *before* running another fire, if
+    /// it should. Checked at fire time (the authoritative chokepoint
+    /// holds the agent DB) and at engine load (so a restart doesn't
+    /// re-seed an already-retired schedule). Returns a human-readable
+    /// reason or `None` if the schedule may still fire.
+    pub fn retirement_reason(&self, now: DateTime<Utc>) -> Option<String> {
+        if let Some(exp) = self.expires_at
+            && now >= exp
+        {
+            return Some(format!("expired at {}", exp.to_rfc3339()));
+        }
+        if let Some(max) = self.max_fires
+            && self.fire_count >= max
+        {
+            return Some(format!("reached max_fires ({max})"));
+        }
+        None
     }
 }
 
@@ -873,6 +911,77 @@ mod tests {
     // -------------------------------------------------------------------------
     // Agent-owned schedules (Stage 1)
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn retirement_reason_honours_expiry_and_max_fires() {
+        use crate::routine::Trigger;
+        let now = Utc::now();
+        let mk = || {
+            Schedule::new(
+                "s",
+                Trigger::Cron {
+                    expr: "0 0 * * * *".into(),
+                },
+                "t",
+                ScheduleTarget::Fresh,
+            )
+        };
+
+        // Unbounded → never retires.
+        assert!(mk().retirement_reason(now).is_none());
+
+        // Expired.
+        let mut exp = mk();
+        exp.expires_at = Some(now - chrono::Duration::seconds(1));
+        assert!(
+            exp.retirement_reason(now)
+                .is_some_and(|r| r.contains("expired"))
+        );
+
+        // Not yet expired.
+        let mut not_yet = mk();
+        not_yet.expires_at = Some(now + chrono::Duration::hours(1));
+        assert!(not_yet.retirement_reason(now).is_none());
+
+        // max_fires reached.
+        let mut maxed = mk();
+        maxed.max_fires = Some(3);
+        maxed.fire_count = 3;
+        assert!(
+            maxed
+                .retirement_reason(now)
+                .is_some_and(|r| r.contains("max_fires"))
+        );
+
+        // Under the fire cap.
+        let mut under = mk();
+        under.max_fires = Some(3);
+        under.fire_count = 2;
+        assert!(under.retirement_reason(now).is_none());
+    }
+
+    #[tokio::test]
+    async fn schedule_round_trips_lifecycle_bounds() {
+        use crate::routine::Trigger;
+        let (_user, db) = peer_with_agent_db().await;
+        let mut s = Schedule::new(
+            "bounded",
+            Trigger::Cron {
+                expr: "0 0 * * * *".into(),
+            },
+            "hourly for a while",
+            ScheduleTarget::Fresh,
+        );
+        s.max_fires = Some(8);
+        s.expires_at = Some(Utc::now() + chrono::Duration::hours(8));
+        s.fire_count = 2;
+        db.upsert_schedule(s.clone()).await.unwrap();
+
+        let back = db.find_schedule("bounded").await.unwrap().unwrap();
+        assert_eq!(back.max_fires, Some(8));
+        assert_eq!(back.fire_count, 2);
+        assert_eq!(back.expires_at, s.expires_at);
+    }
 
     #[tokio::test]
     async fn schedules_empty_by_default() {

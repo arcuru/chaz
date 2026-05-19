@@ -373,6 +373,13 @@ pub struct ScheduleConfig {
     /// Whether this schedule is active (default: true)
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Optional: retire the schedule after this many fires.
+    #[serde(default)]
+    pub max_fires: Option<u32>,
+    /// Optional: RFC 3339 timestamp after which the schedule stops
+    /// firing. Whichever of `max_fires`/`expires_at` is hit first wins.
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_enabled() -> bool {

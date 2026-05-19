@@ -61,6 +61,59 @@ fn opt_bool(arguments: &Value, name: &str) -> Option<bool> {
     arguments.get(name).and_then(|v| v.as_bool())
 }
 
+/// Parse the optional `expires_at` arg (RFC 3339 / ISO 8601, e.g.
+/// `2026-06-01T09:00:00Z`). `Ok(None)` if absent; `Err` if present but
+/// unparseable.
+fn opt_expires_at(arguments: &Value) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    match opt_str(arguments, "expires_at") {
+        None => Ok(None),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+            .map_err(|e| {
+                format!("Invalid expires_at '{s}' (use RFC 3339, e.g. 2026-06-01T09:00:00Z): {e}")
+            }),
+    }
+}
+
+/// Parse the optional `max_fires` arg. `Ok(None)` if absent; `Err` if
+/// present but not a positive integer (0 would retire immediately).
+fn opt_max_fires(arguments: &Value) -> Result<Option<u32>, String> {
+    match arguments.get("max_fires") {
+        None => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| "max_fires must be a positive integer".to_string())?;
+            if n == 0 {
+                return Err("max_fires must be >= 1 (0 would never fire)".to_string());
+            }
+            u32::try_from(n)
+                .map(Some)
+                .map_err(|_| "max_fires too large".to_string())
+        }
+    }
+}
+
+/// Render the lifecycle bounds as a short ` (…)` suffix, or empty when
+/// unbounded. Shared by the add/modify replies and the list output.
+fn fmt_bounds(
+    expires_at: &Option<chrono::DateTime<chrono::Utc>>,
+    max_fires: &Option<u32>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = max_fires {
+        parts.push(format!("max {n} fires"));
+    }
+    if let Some(exp) = expires_at {
+        parts.push(format!("until {}", exp.format("%Y-%m-%d %H:%M:%SZ")));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 fn validate_cron(expr: &str) -> Result<(), String> {
     CronSchedule::from_str(expr)
         .map(|_| ())
@@ -107,7 +160,9 @@ impl Tool for ScheduleAdd {
                     "cron":   { "type": "string", "description": "6-field cron expression: sec min hour day-of-month month day-of-week. Examples: '0 */5 * * * *' = every 5 minutes; '0 0 9 * * *' = 9am daily." },
                     "task":   { "type": "string", "description": "Free-form instruction the agent receives when the schedule fires." },
                     "agent":  { "type": "string", "description": "Optional: agent that owns the schedule, by display name or DB id. Omit to target yourself." },
-                    "target": { "type": "string", "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." }
+                    "target": { "type": "string", "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." },
+                    "max_fires":  { "type": "integer", "description": "Optional: retire the schedule after this many fires. E.g. cron hourly + max_fires 8 = 'wake hourly for 8 hours'." },
+                    "expires_at": { "type": "string", "description": "Optional: RFC 3339 timestamp after which the schedule stops firing (e.g. '2026-06-01T09:00:00Z'). Whichever of max_fires/expires_at is hit first retires it." }
                 },
                 "required": ["id", "cron", "task"]
             }),
@@ -128,6 +183,8 @@ impl Tool for ScheduleAdd {
             let cron = str_arg(&arguments, "cron")?;
             let task = str_arg(&arguments, "task")?;
             validate_cron(cron)?;
+            let expires_at = opt_expires_at(&arguments)?;
+            let max_fires = opt_max_fires(&arguments)?;
 
             let entry =
                 resolve_target_agent(ctx, &*self.agent_state, opt_str(&arguments, "agent"))?;
@@ -153,7 +210,7 @@ impl Tool for ScheduleAdd {
             };
             let schedule_target = parse_target(opt_str(&arguments, "target"), &session_db_id);
 
-            let schedule = Schedule::new(
+            let mut schedule = Schedule::new(
                 user_id.to_string(),
                 Trigger::Cron {
                     expr: cron.to_string(),
@@ -161,6 +218,8 @@ impl Tool for ScheduleAdd {
                 task.to_string(),
                 schedule_target,
             );
+            schedule.expires_at = expires_at;
+            schedule.max_fires = max_fires;
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
@@ -170,8 +229,9 @@ impl Tool for ScheduleAdd {
                 Some("fresh") => "fresh session".to_string(),
                 _ => "this session".to_string(),
             };
+            let bounds = fmt_bounds(&expires_at, &max_fires);
             Ok(format!(
-                "Added schedule '{user_id}' on agent '{}': cron='{cron}' → {target_label} — {task}",
+                "Added schedule '{user_id}' on agent '{}': cron='{cron}' → {target_label}{bounds} — {task}",
                 entry.display_name
             ))
         })
@@ -208,7 +268,9 @@ impl Tool for ScheduleModify {
                     "cron":    { "type": "string", "description": "Optional: new 6-field cron expression." },
                     "task":    { "type": "string", "description": "Optional: new task text." },
                     "target":  { "type": "string", "description": "Optional: 'pinned' or 'fresh'." },
-                    "enabled": { "type": "boolean", "description": "Optional: toggle the schedule on/off without deleting it." }
+                    "enabled": { "type": "boolean", "description": "Optional: toggle the schedule on/off without deleting it. Re-enabling a schedule that already hit its max_fires/expires_at bound will retire again on the next fire." },
+                    "max_fires":  { "type": "integer", "description": "Optional: set/replace the max-fires bound (counts existing fires)." },
+                    "expires_at": { "type": "string", "description": "Optional: set/replace the RFC 3339 expiry timestamp." }
                 },
                 "required": ["id"]
             }),
@@ -230,14 +292,18 @@ impl Tool for ScheduleModify {
             let new_task = opt_str(&arguments, "task");
             let new_target = opt_str(&arguments, "target");
             let new_enabled = opt_bool(&arguments, "enabled");
+            let new_expires_at = opt_expires_at(&arguments)?;
+            let new_max_fires = opt_max_fires(&arguments)?;
 
             if new_cron.is_none()
                 && new_task.is_none()
                 && new_target.is_none()
                 && new_enabled.is_none()
+                && new_expires_at.is_none()
+                && new_max_fires.is_none()
             {
                 return Err(
-                    "No fields to modify — pass at least one of: cron, task, target, enabled"
+                    "No fields to modify — pass at least one of: cron, task, target, enabled, max_fires, expires_at"
                         .into(),
                 );
             }
@@ -278,6 +344,12 @@ impl Tool for ScheduleModify {
             if let Some(e) = new_enabled {
                 schedule.enabled = e;
             }
+            if new_expires_at.is_some() {
+                schedule.expires_at = new_expires_at;
+            }
+            if new_max_fires.is_some() {
+                schedule.max_fires = new_max_fires;
+            }
 
             adb.upsert_schedule(schedule)
                 .await
@@ -299,6 +371,12 @@ impl Tool for ScheduleModify {
             }
             if let Some(e) = new_enabled {
                 parts.push(format!("enabled={e}"));
+            }
+            if let Some(n) = new_max_fires {
+                parts.push(format!("max_fires={n}"));
+            }
+            if let Some(exp) = new_expires_at {
+                parts.push(format!("expires_at={}", exp.to_rfc3339()));
             }
             Ok(parts.join(" "))
         })
@@ -392,7 +470,7 @@ impl Tool for ScheduleList {
         ToolDescriptor {
             name: "schedule_list".to_string(),
             description:
-                "List schedules owned by an agent — id, schedule, target (pinned/fresh), task, and whether enabled. Pass agent name to list another agent's schedules."
+                "List schedules owned by an agent — id, schedule, target (pinned/fresh), task, whether enabled, any lifecycle bounds (max_fires/expires_at) and the fire count. Pass agent name to list another agent's schedules."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -438,8 +516,14 @@ impl Tool for ScheduleList {
                     ScheduleTarget::Pinned { .. } => "pinned".to_string(),
                     ScheduleTarget::Fresh => "fresh".to_string(),
                 };
+                let bounds = fmt_bounds(&t.expires_at, &t.max_fires);
+                let fired = if t.fire_count > 0 {
+                    format!(" [fired {}×]", t.fire_count)
+                } else {
+                    String::new()
+                };
                 lines.push(format!(
-                    "- **{}** [{schedule}]{state} → {target_label} — {}",
+                    "- **{}** [{schedule}]{state}{bounds}{fired} → {target_label} — {}",
                     t.id, t.prompt
                 ));
             }

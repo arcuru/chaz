@@ -62,6 +62,9 @@ Schedule {
     target:   Pinned(session_db_id)   // fire into this existing session
             | Fresh,                  // create a new session per fire
     enabled:  bool,
+    expires_at: Option<DateTime>,     // lifecycle bound (Gap 4)
+    max_fires:  Option<u32>,          // lifecycle bound (Gap 4)
+    fire_count: u32,                  // authoritative; survives restart
 }
 ```
 
@@ -74,6 +77,34 @@ Schedule {
   Sessions](./autonomous_agents.md)) cannot start there.
 
 The `target` choice is made at create time and recorded in the schedule.
+
+### Lifecycle bounds (Gap 4)
+
+A `Cron` schedule is infinite by default; `OneShot` retires itself. Two
+optional bounds make _finite recurring_ work expressible without a third
+trigger type:
+
+- `expires_at` — an absolute instant after which the schedule stops.
+  Robust across restarts for free (absolute time).
+- `max_fires` — retire after N fires. Needs a persisted counter, so
+  `fire_count` lives in the **agent DB** (authoritative), not just the
+  engine's in-memory routine.
+
+Enforcement is at the **fire path** (`Server::fire_agent_schedule`),
+which is the single chokepoint that holds the agent DB. Before running
+the turn it checks `Schedule::retirement_reason(now)`; if bound, it
+persists `enabled = false` and skips. After a successful fire it
+increments and persists `fire_count`, retiring in the same write if the
+increment crossed `max_fires`. `register_agent` also skips an
+already-retired schedule at load, so a restart never resurrects one.
+
+This deliberately leaves the engine's in-memory cron slot ticking until
+the next reload/restart — each post-bound tick simply early-returns at
+the fire path. Correctness lives at the DB-backed chokepoint, not in the
+heap; this avoids threading three more fields through
+`Routine`/`schedule_to_routine` and the dual-write fragility that the
+existing in-memory-only `max_failures` disable already exhibits. The
+cost is a cheap periodic no-op until reload — acceptable and bounded.
 
 ### chaz as runtime
 
@@ -219,8 +250,14 @@ an agent — a schedule). See the
    sufficient and matches ownership.
 2. Should `Fresh` sessions be tagged (source = `schedule:<agent>:<id>`) so
    they're discoverable/groupable? Proposed: yes, mirrors `spawn:` tagging.
-3. Min-interval / per-day cap on fires as an abuse guard — defer until
-   there's evidence it's needed (bounded by cadence + `max_iterations`).
+3. **Partially resolved (Gap 4).** Per-schedule lifecycle bounds
+   (`expires_at`, `max_fires`) landed, so finite recurring work is
+   expressible and a self-scheduled schedule can no longer be
+   _unbounded by construction_. A peer-wide **operator ceiling**
+   (min-interval / max-schedules-per-agent enforced against the
+   operator's will) is still deferred: it's a real policy decision
+   (which knob, enforced where, interaction with synced schedules) and
+   is intentionally not guessed. Tracked in the post-merge gap tracker.
 4. Editing a schedule — `schedule_modify` analogue on the agent DB; does a
    schedule edit need a persona-snapshot-style audit entry? Likely no.
 

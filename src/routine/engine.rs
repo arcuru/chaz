@@ -274,8 +274,21 @@ impl RoutineEngine {
         let schedules = agent_db.list_schedules().await?;
         let last_fired = load_last_fired(&self.chaz_peer).await;
         let mut state = self.state.lock().await;
+        let now = Utc::now();
         for t in schedules {
             if !t.enabled {
+                continue;
+            }
+            // A schedule past its expiry / fire-count bound is never
+            // seeded — a restart must not resurrect a retired schedule.
+            // The authoritative enable=false write happens in the fire
+            // path; this is the load-time guard.
+            if let Some(reason) = t.retirement_reason(now) {
+                tracing::debug!(
+                    agent = agent_db_id,
+                    schedule = %t.id,
+                    "skipping retired schedule at load: {reason}"
+                );
                 continue;
             }
             let routine = match schedule_to_routine(agent_db_id, &t) {

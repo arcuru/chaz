@@ -178,7 +178,27 @@ fn fmt_schedule_line(t: &Schedule) -> String {
         ScheduleTarget::Pinned { .. } => "pinned",
         ScheduleTarget::Fresh => "fresh",
     };
-    format!("  {} [{when}]{state} → {target_label} — {}", t.id, t.prompt)
+    let mut bounds = Vec::new();
+    if let Some(n) = t.max_fires {
+        bounds.push(format!("max {n} fires"));
+    }
+    if let Some(exp) = t.expires_at {
+        bounds.push(format!("until {}", exp.format("%Y-%m-%d %H:%M:%SZ")));
+    }
+    let bounds = if bounds.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", bounds.join(", "))
+    };
+    let fired = if t.fire_count > 0 {
+        format!(" [fired {}×]", t.fire_count)
+    } else {
+        String::new()
+    };
+    format!(
+        "  {} [{when}]{state}{bounds}{fired} → {target_label} — {}",
+        t.id, t.prompt
+    )
 }
 
 /// Render one agent's block: a header line (with a `*host*` marker when

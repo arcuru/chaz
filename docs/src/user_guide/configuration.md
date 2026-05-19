@@ -269,6 +269,19 @@ External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) 
 
 Cron-driven agent wakes. Each entry is imported at startup as an **agent-owned schedule** (see [Agents — Schedules](agents.md#schedules)) in the owning agent's DB, Pinned to the resolved session. On fire, the owning agent's turn runs directly with `task` as the wake prompt — no `Directive` is written to the session. `agent:` names the owner (display name or DB id); omit it to use the peer's default agent. `session:` is referenced by name or eidetica DB root ID. Responses are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
 
+Optional lifecycle bounds mirror the `schedule_add` tool: `max_fires:` (retire after N fires) and `expires_at:` (RFC 3339 instant after which it stops). Whichever is hit first retires the schedule; omit both for an unbounded cron. Example — wake hourly for a day then stop:
+
+```yaml
+schedules:
+  - name: hourly-standup-ping
+    agent: chaz
+    session: ops
+    cron: "0 0 * * * *"
+    task: "Post the hourly status line."
+    max_fires: 24
+    # or: expires_at: "2026-06-01T00:00:00Z"
+```
+
 ## Context
 
 Token budgeting for the LLM context window. Uses tiktoken (cl100k_base) for accurate token counting. `max_context_tokens` sets the total budget, `reserved_output_tokens` is subtracted for the LLM's response. Per-agent overrides via `max_context_tokens` on agent definitions.

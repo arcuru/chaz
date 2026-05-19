@@ -487,6 +487,35 @@ impl Server {
             return Ok(());
         };
 
+        // 1b. Lifecycle bound check (Gap 4). The agent DB is the
+        //     authoritative store; the engine's in-memory routine is
+        //     rebuilt from it. If the schedule has hit its expiry or
+        //     max_fires bound, persist `enabled = false` and skip —
+        //     this is what actually retires a recurring schedule (the
+        //     in-memory routine keeps ticking until the next
+        //     reload/restart, but every tick now early-returns here).
+        if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
+            && let Ok(Some(mut schedule)) = adb.find_schedule(&payload.schedule_id).await
+            && let Some(reason) = schedule.retirement_reason(Utc::now())
+        {
+            if schedule.enabled {
+                schedule.enabled = false;
+                if let Err(e) = adb.upsert_schedule(schedule).await {
+                    tracing::error!(
+                        agent = %agent_entry.display_name,
+                        schedule = %payload.schedule_id,
+                        "Failed to persist schedule retirement: {e}"
+                    );
+                }
+            }
+            tracing::info!(
+                agent = %agent_entry.display_name,
+                schedule = %payload.schedule_id,
+                "Schedule retired ({reason}); skipping fire"
+            );
+            return Ok(());
+        }
+
         // 2. Resolve target
         let target: ScheduleTarget = serde_json::from_value(payload.target)
             .map_err(|e| anyhow::anyhow!("invalid schedule target in payload: {e}"))?;
@@ -617,6 +646,34 @@ impl Server {
                     schedule = %payload.schedule_id,
                     "Failed to record ScheduleFire: {e}"
                 );
+            }
+
+            // Lifecycle accounting (Gap 4): a recurring schedule that
+            // ran its turn increments `fire_count`. When that reaches
+            // `max_fires`, retire it now (persist enabled=false) so the
+            // next tick's pre-check — and any reload — drops it. One-shot
+            // schedules are deleted below, so they don't count.
+            if !payload.one_shot
+                && outcome.is_ok()
+                && let Ok(Some(mut schedule)) = adb.find_schedule(&payload.schedule_id).await
+            {
+                schedule.fire_count = schedule.fire_count.saturating_add(1);
+                if let Some(reason) = schedule.retirement_reason(fired_at) {
+                    schedule.enabled = false;
+                    tracing::info!(
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        fire_count = schedule.fire_count,
+                        "Schedule retired after fire ({reason})"
+                    );
+                }
+                if let Err(e) = adb.upsert_schedule(schedule).await {
+                    tracing::error!(
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        "Failed to persist schedule fire_count: {e}"
+                    );
+                }
             }
         }
 
