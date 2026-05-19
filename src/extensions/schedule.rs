@@ -129,7 +129,7 @@ impl ExtensionCommand for ScheduleCommand {
                 None => (trimmed, ""),
             };
             match sub {
-                "" | "list" => list_cmd(&*self.agent_state, ctx).await,
+                "" | "list" => list_cmd(rest, &*self.agent_state, ctx).await,
                 "remove" | "rm" => {
                     if rest.is_empty() {
                         ExtensionCommandOutcome::Error(
@@ -167,49 +167,72 @@ async fn open_agent_db_for_cmd(
     Ok((entry, adb))
 }
 
-async fn list_cmd(cap: &dyn AgentStateAdmin, ctx: &HookContext) -> ExtensionCommandOutcome {
-    // Parse optional agent name from the rest of the args.
-    // `/schedule list` lists your own schedules.
-    // `/schedule list <agent>` lists that agent's schedules.
-    // We get the full args via invoke, but here rest is the trimmed sub-arg.
-    // For simplicity, always list the calling agent's schedules.
-    let (_, adb) = match open_agent_db_for_cmd(cap, ctx, None).await {
-        Ok(v) => v,
-        Err(e) => return e,
+/// Format one schedule row.
+fn fmt_schedule_line(t: &Schedule) -> String {
+    let state = if t.enabled { "" } else { " (disabled)" };
+    let when = match &t.trigger {
+        Trigger::Cron { expr } => expr.clone(),
+        Trigger::OneShot { fire_at } => format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ")),
+    };
+    let target_label = match &t.target {
+        ScheduleTarget::Pinned { .. } => "pinned",
+        ScheduleTarget::Fresh => "fresh",
+    };
+    format!("  {} [{when}]{state} → {target_label} — {}", t.id, t.prompt)
+}
+
+/// Render one agent's block: a header line (with a `*host*` marker when
+/// applicable) followed by its schedule rows. A scope denial or open
+/// failure degrades to a single explanatory line so one inaccessible
+/// agent never aborts the whole session-wide listing.
+async fn agent_block(cap: &dyn AgentStateAdmin, name: &str, host: bool) -> String {
+    let marker = if host { " *host*" } else { "" };
+    let entry = match cap.resolve_agent(name) {
+        Ok(e) => e,
+        Err(e) => return format!("{name}{marker}: not accessible — {e}"),
+    };
+    let adb = match cap.open_agent_db(&entry).await {
+        Ok(a) => a,
+        Err(e) => return format!("{name}{marker}: failed to open agent DB — {e:#}"),
     };
     match adb.list_schedules().await {
-        Ok(schedules) if schedules.is_empty() => {
-            ExtensionCommandOutcome::Text(format!("No schedules on agent '{}'.", ctx.agent_name))
+        Ok(s) if s.is_empty() => format!("{name}{marker}: (no schedules)"),
+        Ok(s) => {
+            let lines: Vec<String> = s.iter().map(fmt_schedule_line).collect();
+            format!("{name}{marker}:\n{}", lines.join("\n"))
         }
-        Ok(schedules) => {
-            let lines: Vec<String> = schedules
-                .iter()
-                .map(|t| {
-                    let state = if t.enabled { "" } else { " (disabled)" };
-                    let schedule = match &t.trigger {
-                        Trigger::Cron { expr } => expr.clone(),
-                        Trigger::OneShot { fire_at } => {
-                            format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ"))
-                        }
-                    };
-                    let target_label = match &t.target {
-                        ScheduleTarget::Pinned { .. } => "pinned".to_string(),
-                        ScheduleTarget::Fresh => "fresh".to_string(),
-                    };
-                    format!(
-                        "  {} [{schedule}]{state} → {target_label} — {}",
-                        t.id, t.prompt
-                    )
-                })
-                .collect();
-            ExtensionCommandOutcome::Text(format!(
-                "Schedules on '{}':\n{}",
-                ctx.agent_name,
-                lines.join("\n")
-            ))
-        }
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to list schedules: {e}")),
+        Err(e) => format!("{name}{marker}: failed to list — {e}"),
     }
+}
+
+/// `/schedule list` — session-wide inventory across every agent attached
+/// to the current session (host marked). `/schedule list <agent>`
+/// narrows to one agent. A session with no Living Agents attached lists
+/// the calling agent.
+async fn list_cmd(
+    rest: &str,
+    cap: &dyn AgentStateAdmin,
+    ctx: &HookContext,
+) -> ExtensionCommandOutcome {
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        return ExtensionCommandOutcome::Text(agent_block(cap, rest, false).await);
+    }
+    let meta = ctx.session.lock().await.read_meta().await;
+    if meta.agents.is_empty() {
+        return ExtensionCommandOutcome::Text(agent_block(cap, &ctx.agent_name, false).await);
+    }
+    let host = meta.host_agent_db_id.as_deref();
+    let mut blocks = Vec::with_capacity(meta.agents.len());
+    for a in &meta.agents {
+        let is_host = host == Some(a.db_id.as_str());
+        blocks.push(agent_block(cap, &a.display_name, is_host).await);
+    }
+    ExtensionCommandOutcome::Text(format!(
+        "Schedules across {} agent(s) on this session:\n\n{}",
+        meta.agents.len(),
+        blocks.join("\n\n")
+    ))
 }
 
 async fn remove_cmd(
@@ -393,6 +416,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_with_agent_arg_narrows_to_that_agent() {
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
+        let _ = c
+            .invoke("add nine-am 0 0 9 * * * alpha morning brief", &ctx)
+            .await;
+        // `/schedule list alpha` resolves the named agent (the arg used
+        // to be silently ignored before the session-wide rework).
+        match c.invoke("list alpha", &ctx).await {
+            ExtensionCommandOutcome::Text(s) => {
+                assert!(s.starts_with("alpha"), "header missing: {s}");
+                assert!(s.contains("nine-am"), "schedule missing: {s}");
+            }
+            ExtensionCommandOutcome::Error(e) => panic!("list errored: {e}"),
+        }
+    }
+
+    #[tokio::test]
     async fn add_rejects_invalid_cron() {
         let (_i, index, registry, ctx) = fixture().await;
         let c = cmd(registry, index);
@@ -411,7 +452,7 @@ mod tests {
         let c = cmd(registry, index);
         match c.invoke("", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
-                assert!(s.contains("No schedules"), "got: {s}")
+                assert!(s.contains("(no schedules)"), "got: {s}")
             }
             ExtensionCommandOutcome::Error(e) => panic!("expected text, got error: {e}"),
         }
@@ -437,7 +478,7 @@ mod tests {
         let _ = c.invoke("remove x", &ctx).await;
         match c.invoke("list", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
-                assert!(s.contains("No schedules"), "got: {s}")
+                assert!(s.contains("(no schedules)"), "got: {s}")
             }
             ExtensionCommandOutcome::Error(e) => panic!("list errored: {e}"),
         }
