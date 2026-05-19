@@ -456,7 +456,7 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|host|list|hosted|new|delete|share|import|set|invite|revoke-peer <arg>"
+            "add|remove|host|list|room|hosted|new|delete|share|import|set|invite|revoke-peer <arg>"
                 .to_string(),
             "Attach/detach, manage host, list, create/delete/share/import/edit/invite/revoke a Living Agent",
             |text| {
@@ -475,6 +475,7 @@ impl Gateway for MatrixGateway {
                         Some(rest.to_string())
                     })),
                     "list" | "" => Some(Command::AgentsList),
+                    "room" => Some(Command::AgentRoom),
                     "hosted" => Some(Command::AgentHosted),
                     "new" if !rest.is_empty() => (|| {
                         let mut toks = rest.split_whitespace();

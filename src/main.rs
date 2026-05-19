@@ -471,6 +471,14 @@ async fn main() -> anyhow::Result<()> {
         "Spawn tool server cell already set"
     );
 
+    // Apply operator multi-agent tuning before the gateway starts
+    // delivering messages (set_agent_burst_budget is read by
+    // process_session, which only fires on the first inbound notify).
+    if let Some(mc) = &config.multi_agent {
+        server.set_agent_burst_budget(mc.burst_budget);
+        info!(burst_budget = mc.burst_budget, "Applied multi_agent config");
+    }
+
     // Translate YAML `schedules:` into agent-owned Schedules. Each
     // ScheduleConfig becomes one cron Schedule in the owning agent's DB,
     // Pinned to the resolved session. The routine engine picks these up

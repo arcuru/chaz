@@ -36,6 +36,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/agent add ", "attach an agent (display name or DB ID)"),
         ("/agent remove ", "detach an agent"),
         ("/agent host ", "set (or clear) the session's host agent"),
+        (
+            "/agent room",
+            "chat-room status: roster, host, burst budget",
+        ),
         ("/agent hosted", "list every Living Agent this peer hosts"),
         (
             "/agent new ",
@@ -760,6 +764,9 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     }
     if text == "/agent" || text == "/agent list" {
         return Some(ChatAction::Dispatch(Command::AgentsList));
+    }
+    if text == "/agent room" {
+        return Some(ChatAction::Dispatch(Command::AgentRoom));
     }
 
     // --- /memory: bank CRUD (Stage 9.D) ---

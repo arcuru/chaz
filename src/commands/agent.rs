@@ -96,6 +96,58 @@ pub(super) async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
     CommandOutcome::Text(format!("Agents on this session:\n{}", lines.join("\n")))
 }
 
+/// `/agent room` — the multi-agent chat-room status surface (Gap 2).
+/// Shows the attached roster, the designated host (flagging a dangling
+/// host id if one somehow survives), and the burst-budget state so an
+/// operator can see *why* an agent→agent chain stopped.
+pub(super) async fn agent_room(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let meta = crate::session::read_meta_from_db(ctx.session_db).await;
+
+    let mut out = String::from("Chat-room status for this session:\n");
+
+    if meta.agents.is_empty() {
+        out.push_str("  attached agents: (none — single-agent / legacy session)\n");
+    } else {
+        out.push_str("  attached agents:\n");
+        for a in &meta.agents {
+            out.push_str(&format!("    {} ({})\n", a.display_name, a.db_id));
+        }
+    }
+
+    match meta.host_agent_db_id.as_deref() {
+        None => out.push_str("  host: (none — turns use first-authorized order)\n"),
+        Some(host_id) => match meta.agents.iter().find(|a| a.db_id == host_id) {
+            Some(a) => out.push_str(&format!("  host: {}\n", a.display_name)),
+            None => out.push_str(&format!(
+                "  host: <dangling {host_id}> (not attached — will fall back; run /agent host to fix)\n"
+            )),
+        },
+    }
+
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
+    let budget = ctx.server.agent_burst_budget();
+    let burst = crate::session::trailing_agent_message_burst(session.entries(), |name| {
+        ctx.server.agents().get(name).is_some()
+    });
+    out.push_str(&format!(
+        "  agent→agent burst: {burst}/{budget}{}\n",
+        if burst >= budget {
+            " (exhausted — agent→agent wakes suppressed until a human or schedule speaks)"
+        } else {
+            ""
+        }
+    ));
+    if meta.agents.len() < 2 {
+        out.push_str("  note: agent→agent routing is inert until ≥2 agents are attached.\n");
+    }
+
+    CommandOutcome::Text(out)
+}
+
 pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),

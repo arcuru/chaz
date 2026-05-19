@@ -98,6 +98,8 @@ pub enum Command {
     AgentRemove(String),
     /// List agents currently attached to the session.
     AgentsList,
+    /// Multi-agent chat-room status: roster, host, burst-budget state.
+    AgentRoom,
     /// Designate the "host agent" — answers when no @mention pins a turn.
     /// `Some(ref)` sets it; `None` clears it.
     AgentSetHost(Option<String>),
@@ -357,6 +359,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentAdd(r) => agent::agent_add(&r, ctx).await,
         Command::AgentRemove(r) => agent::agent_remove(&r, ctx).await,
         Command::AgentsList => agent::agents_list(ctx).await,
+        Command::AgentRoom => agent::agent_room(ctx).await,
         Command::AgentSetHost(arg) => agent::agent_set_host(arg.as_deref(), ctx).await,
         Command::AgentNew { name, overrides } => agent::agent_new(&name, &overrides, ctx).await,
         Command::AgentShare(r) => agent::agent_share(&r, ctx).await,

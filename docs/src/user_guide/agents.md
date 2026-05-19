@@ -124,13 +124,14 @@ Every transport uses the same set of commands. TUI: `/agent <sub>`. Matrix: `!ch
 
 Every ref is either an agent's display name or its eidetica DB ID; resolution tries display name first.
 
-| Command                      | What                                                                                                                           |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `/agent add <ref>`           | Grant the agent Write permission on the session, append to `SessionMeta.agents`, log entry in the agent's history. Idempotent. |
-| `/agent remove <ref>`        | Revoke the agent's session key and remove from `SessionMeta.agents`. History is append-only and is preserved.                  |
-| `/agent list` (or `/agents`) | List agents attached to the current session. The _host_ agent is marked.                                                       |
-| `/agent host <ref>`          | Designate the session's host agent (see turn-taking). Agent must already be attached.                                          |
-| `/agent host` (no arg)       | Clear the host agent.                                                                                                          |
+| Command                      | What                                                                                                                                   |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `/agent add <ref>`           | Grant the agent Write permission on the session, append to `SessionMeta.agents`, log entry in the agent's history. Idempotent.         |
+| `/agent remove <ref>`        | Revoke the agent's session key and remove from `SessionMeta.agents`. History is append-only and is preserved.                          |
+| `/agent list` (or `/agents`) | List agents attached to the current session. The _host_ agent is marked.                                                               |
+| `/agent host <ref>`          | Designate the session's host agent (see turn-taking). Agent must already be attached.                                                  |
+| `/agent host` (no arg)       | Clear the host agent.                                                                                                                  |
+| `/agent room`                | Chat-room status: attached roster, designated host (flags a dangling host id), and the agent→agent burst-budget state (`used/budget`). |
 
 ### Lifecycle, sharing, and co-ownership
 
@@ -165,6 +166,27 @@ When a message arrives on a multi-agent session, routing picks one agent in this
 6. Default agent from yaml.
 
 Mentions are case-insensitive and match exact display names. No prefix matching.
+
+If a human `@mentions` a name that is **not** an attached agent (typo, or an
+agent that was detached), the turn does **not** fail — it falls through to
+host / first-attached. That fallback is logged at `WARN` (with the
+mentioned vs. attached names) so a misroute is observable rather than
+silent. Use `/agent room` to see the live roster and diagnose it.
+
+### Agent→agent burst budget
+
+In a multi-agent session an agent's reply can `@mention` and wake another
+attached agent. The runaway backstop is a **burst budget**: the maximum
+run of consecutive agent-authored messages since the last human message or
+`Directive`. When the trailing burst reaches the budget, further
+agent→agent wakes are suppressed until a human (or a schedule) speaks
+again. The default is **6**; operators set it via `multi_agent.burst_budget`
+in config (see [Configuration](./configuration.md)). `/agent room` shows
+the current `used/budget` and whether it is exhausted.
+
+Detaching the agent currently designated as host clears
+`host_agent_db_id` automatically, so a removed host can't leave a dangling
+pointer that silently re-routes turns.
 
 ## Schedules
 

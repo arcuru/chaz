@@ -138,6 +138,13 @@ web_search:
 #   schedule: [chaz, bash]
 #   memory: [chaz]             # memory tools can only touch chaz agent
 
+# Multi-agent chat-room tuning. Omit for built-in defaults.
+# multi_agent:
+#   burst_budget: 6            # max consecutive agent→agent turns before
+#                              # the chain is suppressed (until a human or
+#                              # schedule speaks). Inspect at runtime with
+#                              # /agent room.
+
 # Optional: embedding backend for semantic memory recall.
 # Without this section, recall uses BM25 lexical ranking only.
 embedding:

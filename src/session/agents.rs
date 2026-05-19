@@ -116,10 +116,25 @@ impl SessionRegistry {
             txn.commit().await?;
         }
 
+        let mut cleared_host = false;
         update_meta_on_db(&session_db, |m| {
             m.agents.retain(|a| a.db_id != agent.db_id.to_string());
+            // Detaching the designated host would leave a dangling
+            // `host_agent_db_id` that silently falls back to the first
+            // authorized agent. Clear it at the source instead.
+            if m.host_agent_db_id.as_deref() == Some(agent.db_id.to_string().as_str()) {
+                m.host_agent_db_id = None;
+                cleared_host = true;
+            }
         })
         .await?;
+        if cleared_host {
+            warn!(
+                agent = %agent.display_name,
+                session_db_id,
+                "Detached agent was the session host — cleared host_agent_db_id"
+            );
+        }
 
         // No routine sweep needed — schedules are now agent-owned
         // (Schedule store in agent DB). Fire-time membership check in
@@ -282,14 +297,29 @@ impl SessionRegistry {
 
         // (2) @mention.
         if let Some(text) = trigger_text {
-            for mention in parse_mentions(text) {
+            let mentions = parse_mentions(text);
+            for mention in &mentions {
                 if let Some(entry) = authorized
                     .iter()
-                    .find(|e| e.display_name.eq_ignore_ascii_case(&mention))
+                    .find(|e| e.display_name.eq_ignore_ascii_case(mention))
                     && let Some(agent) = self.agents.get(&entry.display_name)
                 {
                     return agent.clone();
                 }
+            }
+            // A human addressed `@someone` but no attached agent matched.
+            // The turn still routes (host / first-authorized below) — but
+            // silently sending it to a different agent than the one named
+            // is the Gap-2 footgun, so make the misroute observable.
+            if !mentions.is_empty() {
+                let roster: Vec<&str> =
+                    authorized.iter().map(|e| e.display_name.as_str()).collect();
+                warn!(
+                    session_db_id,
+                    mentioned = ?mentions,
+                    attached = ?roster,
+                    "No @mentioned agent is attached to this session — falling back to host/first-authorized"
+                );
             }
         }
 
@@ -606,6 +636,38 @@ mod tests {
 
         let meta = read_meta_from_db(&session_db).await;
         assert!(meta.agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detaching_host_agent_clears_dangling_host_id() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+        let agent = make_agent_entry(&registry, "alpha").await;
+
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+        // Designate alpha as host, then detach it.
+        let alpha_id = agent.db_id.to_string();
+        update_meta_on_db(&session_db, |m| {
+            m.host_agent_db_id = Some(alpha_id.clone());
+        })
+        .await
+        .unwrap();
+
+        registry
+            .detach_agent_from_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert!(meta.agents.is_empty());
+        assert!(
+            meta.host_agent_db_id.is_none(),
+            "detaching the host must clear the dangling host id"
+        );
     }
 
     #[tokio::test]

@@ -29,6 +29,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, error, info};
 
@@ -61,13 +62,14 @@ struct SpawnContext {
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
-/// Maximum length of an agent→agent "burst" — the run of consecutive
-/// agent-authored messages since the last human message or `Directive`.
-/// Once the trailing burst reaches this, mention-chained agent wakes are
-/// suppressed until a human (or scheduler) speaks again. This is the
-/// runaway backstop for the chat-room model (see
-/// `docs/src/design/autonomous_agents.md`).
-const AGENT_BURST_BUDGET: usize = 6;
+/// Built-in default for the agent→agent burst budget — the run of
+/// consecutive agent-authored messages since the last human message or
+/// `Directive`. Once the trailing burst reaches this, mention-chained
+/// agent wakes are suppressed until a human (or a schedule) speaks
+/// again. This is the runaway backstop for the chat-room model (see
+/// `docs/src/design/autonomous_agents.md`). Operators override it via
+/// `multi_agent.burst_budget` in config.
+const DEFAULT_AGENT_BURST_BUDGET: usize = 6;
 
 /// Callback-driven agent server.
 pub struct Server {
@@ -100,6 +102,11 @@ pub struct Server {
     active_extensions: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
     /// Internal notification channel — callbacks send session_db_id here
     notify_tx: mpsc::Sender<String>,
+    /// Agent→agent burst budget. Defaults to
+    /// [`DEFAULT_AGENT_BURST_BUDGET`]; operators override it via
+    /// `multi_agent.burst_budget` (applied once at startup before the
+    /// gateway begins delivering messages).
+    agent_burst_budget: AtomicUsize,
 }
 
 impl Server {
@@ -139,6 +146,7 @@ impl Server {
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
+            agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
         });
 
         let server_clone = server.clone();
@@ -156,6 +164,18 @@ impl Server {
 
     pub fn agent_index(&self) -> &HostedIndex {
         &self.agent_index
+    }
+
+    /// Override the agent→agent burst budget. Called once at startup
+    /// from `main.rs` when `multi_agent.burst_budget` is configured,
+    /// before the gateway starts delivering messages.
+    pub fn set_agent_burst_budget(&self, budget: usize) {
+        self.agent_burst_budget.store(budget, Ordering::Relaxed);
+    }
+
+    /// The active agent→agent burst budget (configured or default).
+    pub fn agent_burst_budget(&self) -> usize {
+        self.agent_burst_budget.load(Ordering::Relaxed)
     }
 
     pub fn memory_bank_index(&self) -> &HostedIndex {
@@ -996,10 +1016,12 @@ impl Server {
             let burst = crate::session::trailing_agent_message_burst(session.entries(), |name| {
                 self.agents.get(name).is_some()
             });
-            if burst >= AGENT_BURST_BUDGET {
+            if burst >= self.agent_burst_budget() {
                 info!(
                     session_db_id,
-                    burst, "Agent turn budget exhausted — suppressing agent→agent wake"
+                    burst,
+                    budget = self.agent_burst_budget(),
+                    "Agent turn budget exhausted — suppressing agent→agent wake"
                 );
                 None
             } else {

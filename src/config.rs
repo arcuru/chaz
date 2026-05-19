@@ -79,6 +79,25 @@ pub struct Config {
     /// An empty entry (`[]`) means the cap is effectively denied.
     #[serde(default)]
     pub agent_state_allowlist: HashMap<String, Vec<String>>,
+    /// Multi-agent chat-room tuning. Omit to use built-in defaults.
+    pub multi_agent: Option<MultiAgentConfig>,
+}
+
+/// Tuning for multi-agent chat-room sessions (see
+/// `docs/src/design/autonomous_agents.md`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct MultiAgentConfig {
+    /// Maximum length of an agent→agent "burst" — the run of
+    /// consecutive agent-authored messages since the last human message
+    /// or `Directive`. Once the trailing burst reaches this, further
+    /// mention-chained agent wakes are suppressed until a human (or a
+    /// schedule) speaks again. This is the runaway backstop. Default 6.
+    #[serde(default = "default_burst_budget")]
+    pub burst_budget: usize,
+}
+
+pub(crate) fn default_burst_budget() -> usize {
+    6
 }
 
 /// CLI-specific configuration

@@ -188,8 +188,11 @@ context-build time_, not baked into the `PersonaSnapshot`:
 
 ## Open Questions
 
-1. Burst budget default — 6 a reasonable start? Constant vs. `SessionMeta`
-   field vs. global config for v1.
+1. **Resolved.** The burst budget defaults to 6 and is operator-settable
+   via global config (`multi_agent.burst_budget`), applied once at startup.
+   Per-`SessionMeta` overrides were not needed for v1 — a single peer-wide
+   ceiling is the operator control surface. The live roster, host, and
+   trailing-burst state are inspectable at runtime via `/agent room`.
 2. Exclude the _immediately previous speaker_ from being re-woken (tighter
    ping-pong guard), or rely on the budget alone? Budget-only is simpler;
    leaning that way for v1.
