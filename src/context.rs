@@ -232,6 +232,24 @@ impl<'a> ContextBuilder<'a> {
         let tool_tokens: usize = self.tool_defs.iter().map(estimate_tool_tokens).sum();
         used_tokens += tool_tokens;
 
+        // 2.5. Resolve context tails up front so their tokens count
+        // against the budget *before* we decide how many transcript
+        // messages to keep. Otherwise a large recall payload could push
+        // the assembled context past the model's window.
+        let tail_text = if let Some(ref hub) = self.extension_hub {
+            let t = hub
+                .context_tails(self.agent_name, &recent_text, None, self.session_db)
+                .await;
+            if t.is_empty() { None } else { Some(t) }
+        } else {
+            None
+        };
+        let tail_tokens = match &tail_text {
+            Some(t) => estimate_tokens(t) + MESSAGE_OVERHEAD_TOKENS,
+            None => 0,
+        };
+        used_tokens += tail_tokens;
+
         // 3. Find context boundary: most recent Summary entry
         let boundary_idx = self
             .entries
@@ -300,14 +318,11 @@ impl<'a> ContextBuilder<'a> {
         }
 
         // 8. Context tails — memory surfacing, etc. Appended after the
-        //    conversation messages, not injected into the system prompt.
-        if let Some(ref hub) = self.extension_hub {
-            let tail = hub
-                .context_tails(self.agent_name, &recent_text, None, self.session_db)
-                .await;
-            if !tail.is_empty() {
-                messages.push(RuntimeMessage::User(tail));
-            }
+        //    conversation messages. Tail text and tokens were resolved
+        //    in step 2.5 so they were already deducted from the
+        //    message budget.
+        if let Some(t) = tail_text {
+            messages.push(RuntimeMessage::User(t));
         }
         AssembledContext {
             messages,

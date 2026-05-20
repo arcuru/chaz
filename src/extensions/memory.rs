@@ -30,7 +30,9 @@ use crate::extension::{
 };
 use crate::hosted_index::HostedIndex;
 use crate::session::SessionRegistry;
-use crate::tools::{ListMemoryBanks, Recall, Remember, search_memory, write_memory_entry};
+use crate::tools::{
+    ListMemoryBanks, Recall, Remember, search_memory, search_memory_structured, write_memory_entry,
+};
 use eidetica::Database;
 use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
@@ -397,32 +399,65 @@ fn extract_query(recent_message_text: &[String]) -> String {
 
 struct MemoryAccessImpl {
     registry: Arc<SessionRegistry>,
-    #[allow(dead_code)] // Will be needed when MemoryScope::Agent is implemented.
     agent_index: HostedIndex,
     memory_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl MemoryAccess for MemoryAccessImpl {
-    fn search<'a>(&'a self, query: &'a str, scope: MemoryScope) -> CapFuture<'a, Vec<MemoryHit>> {
+    fn search<'a>(
+        &'a self,
+        agent_name: &'a str,
+        query: &'a str,
+        scope: MemoryScope,
+    ) -> CapFuture<'a, Vec<MemoryHit>> {
         Box::pin(async move {
-            let db = open_scope_db(&self.registry, &self.memory_bank_index, &scope).await?;
-            let formatted =
-                search_memory(&db, MEMORY_STORE, query, &[], 10, self.embedder.as_deref())
-                    .await
-                    .unwrap_or_default();
-            Ok(parse_memory_hits(&formatted))
+            let (db, bank_label) = open_scope_db(
+                &self.registry,
+                &self.agent_index,
+                &self.memory_bank_index,
+                agent_name,
+                &scope,
+            )
+            .await?;
+            let scored = search_memory_structured(
+                &db,
+                MEMORY_STORE,
+                query,
+                &[],
+                10,
+                self.embedder.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(scored
+                .into_iter()
+                .map(|h| MemoryHit {
+                    key: h.entry.key,
+                    value: h.entry.value,
+                    score: h.score,
+                    bank: bank_label.clone(),
+                })
+                .collect())
         })
     }
 
     fn remember<'a>(
         &'a self,
+        agent_name: &'a str,
         key: &'a str,
         value: &'a str,
         scope: MemoryScope,
     ) -> CapFuture<'a, ()> {
         Box::pin(async move {
-            let db = open_scope_db(&self.registry, &self.memory_bank_index, &scope).await?;
+            let (db, _) = open_scope_db(
+                &self.registry,
+                &self.agent_index,
+                &self.memory_bank_index,
+                agent_name,
+                &scope,
+            )
+            .await?;
             let entry = MemoryEntry {
                 key: key.to_string(),
                 value: value.to_string(),
@@ -437,15 +472,28 @@ impl MemoryAccess for MemoryAccessImpl {
     }
 }
 
+/// Resolve a [`MemoryScope`] to its backing eidetica `Database` and a
+/// human-readable bank label (`None` for the agent's own memory). The
+/// label propagates onto each [`MemoryHit::bank`] so downstream
+/// consumers can attribute hits without re-walking the scope.
 async fn open_scope_db(
     registry: &SessionRegistry,
+    agent_index: &HostedIndex,
     memory_bank_index: &HostedIndex,
+    agent_name: &str,
     scope: &MemoryScope,
-) -> anyhow::Result<Database> {
+) -> anyhow::Result<(Database, Option<String>)> {
     match scope {
-        MemoryScope::Agent => Err(anyhow::anyhow!(
-            "MemoryScope::Agent not yet supported via cap; use Bank scope"
-        )),
+        MemoryScope::Agent => {
+            let entry = agent_index
+                .find_by_name(agent_name)
+                .ok_or_else(|| anyhow::anyhow!("agent not found: {}", agent_name))?;
+            let agent_db = registry
+                .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no key for agent: {}", agent_name))?;
+            Ok((agent_db.database().clone(), None))
+        }
         MemoryScope::Bank { name } => {
             let entry = memory_bank_index
                 .find_by_name(name)
@@ -454,28 +502,9 @@ async fn open_scope_db(
                 .open_memory_bank(&entry.db_id, Some(&entry.pubkey))
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("no key for memory bank: {}", name))?;
-            Ok(bank.database().clone())
+            Ok((bank.database().clone(), Some(name.clone())))
         }
     }
-}
-
-fn parse_memory_hits(formatted: &str) -> Vec<MemoryHit> {
-    let mut hits = Vec::new();
-    for line in formatted.lines() {
-        if let Some(rest) = line.strip_prefix("- [")
-            && let Some(close) = rest.find("]: ")
-        {
-            let key = rest[..close].to_string();
-            let value = rest[close + 3..].to_string();
-            hits.push(MemoryHit {
-                key,
-                value,
-                score: 0.0,
-                bank: None,
-            });
-        }
-    }
-    hits
 }
 
 // ── Slash command: /memory ────────────────────────────────────────────
@@ -489,7 +518,7 @@ struct MemoryCommand {
 impl ExtensionCommand for MemoryCommand {
     fn description(&self) -> &'static str {
         "Manage memory banks: list | new | delete | grant | revoke | share | unshare | import | \
-         attach | detach | config"
+         attach <name|db_id|ticket> | detach | config"
     }
 
     fn invoke<'a>(
@@ -528,8 +557,8 @@ impl ExtensionCommand for MemoryCommand {
                 return self.import_cmd(rest.trim()).await;
             }
             // Per-session attachments and auto-recall config.
-            if let Some(bank_name) = args.strip_prefix("attach ") {
-                return attach_cmd(bank_name.trim(), ctx).await;
+            if let Some(arg) = args.strip_prefix("attach ") {
+                return self.attach_cmd(arg.trim(), ctx).await;
             }
             if let Some(bank_name) = args.strip_prefix("detach ") {
                 return detach_cmd(bank_name.trim(), ctx).await;
@@ -547,7 +576,8 @@ impl ExtensionCommand for MemoryCommand {
                 "Unknown memory sub-command: '{args}'. Use: list | new <name> [desc] | \
                  delete <bank> | grant <bank> <agent> <read|write> | revoke <bank> <agent> | \
                  share <bank> | unshare <bank> | import <ticket> [admin|write|read] | \
-                 attach <bank> | detach <bank> | config [show|set <key> <value>|reset]"
+                 attach <bank|db_id|ticket> | detach <bank> | \
+                 config [show|set <key> <value>|reset]"
             ))
         })
     }
@@ -859,7 +889,41 @@ impl MemoryCommand {
             Ok(t) => t,
             Err(e) => return ExtensionCommandOutcome::Error(format!("Invalid ticket: {e}")),
         };
+        match self.import_bank_via_ticket(&ticket, permission).await {
+            Ok(ImportOutcome::Imported {
+                display_name,
+                db_id,
+            }) => ExtensionCommandOutcome::Text(format!(
+                "Imported memory bank '{display_name}' (DB {db_id}). Grant it to agents with \
+                 /memory grant {display_name} <agent> <read|write>."
+            )),
+            Ok(ImportOutcome::AlreadyLocal { display_name }) => ExtensionCommandOutcome::Text(
+                format!("Memory bank '{display_name}' is already hosted on this peer."),
+            ),
+            Ok(ImportOutcome::Pending { request_id }) => ExtensionCommandOutcome::Text(format!(
+                "Bootstrap request {request_id} pending the owner's approval. Re-run \
+                 `/memory import <ticket>` after they run `/sharing approve {request_id}`."
+            )),
+            Err(msg) => ExtensionCommandOutcome::Error(msg),
+        }
+    }
+
+    /// Internal: perform the import flow for a ticket. Shared by
+    /// `/memory import` and the ticket-aware `/memory attach` path so
+    /// both routes converge on the same bootstrap + sync + index
+    /// registration sequence.
+    async fn import_bank_via_ticket(
+        &self,
+        ticket: &eidetica::sync::DatabaseTicket,
+        permission: crate::commands::CoOwnerPermission,
+    ) -> Result<ImportOutcome, String> {
         let db_id = ticket.database_id().clone();
+        if let Some(entry) = self.memory_bank_index.find_by_id(&db_id) {
+            return Ok(ImportOutcome::AlreadyLocal {
+                display_name: entry.display_name,
+            });
+        }
+
         let eidetica_perm = match permission {
             crate::commands::CoOwnerPermission::Admin => {
                 eidetica::auth::types::Permission::Admin(1)
@@ -870,43 +934,30 @@ impl MemoryCommand {
             crate::commands::CoOwnerPermission::Read => eidetica::auth::types::Permission::Read,
         };
 
-        match self
-            .registry
-            .request_db_access(&ticket, eidetica_perm)
-            .await
-        {
+        match self.registry.request_db_access(ticket, eidetica_perm).await {
             Ok(crate::session::BootstrapOutcome::Approved) => {}
             Ok(crate::session::BootstrapOutcome::Pending {
                 request_id,
                 message: _,
-            }) => {
-                return ExtensionCommandOutcome::Text(format!(
-                    "Bootstrap request {request_id} pending the owner's approval. Re-run \
-                     `/memory import <ticket>` after they run `/sharing approve {request_id}`."
-                ));
-            }
-            Err(e) => return ExtensionCommandOutcome::Error(format!("Bootstrap failed: {e}")),
+            }) => return Ok(ImportOutcome::Pending { request_id }),
+            Err(e) => return Err(format!("Bootstrap failed: {e}")),
         }
 
         let bank_db = match self.registry.open_memory_bank(&db_id, None).await {
             Ok(Some(db)) => db,
             Ok(None) => {
-                return ExtensionCommandOutcome::Error(format!(
+                return Err(format!(
                     "Bootstrap reported success on memory bank {db_id} but this peer still holds \
                      no key. Likely an eidetica state mismatch — re-run the import to retry."
                 ));
             }
-            Err(e) => {
-                return ExtensionCommandOutcome::Error(format!("Failed to open synced bank: {e}"));
-            }
+            Err(e) => return Err(format!("Failed to open synced bank: {e}")),
         };
 
-        let meta = match bank_db.read_meta().await {
-            Ok(m) => m,
-            Err(e) => {
-                return ExtensionCommandOutcome::Error(format!("Failed to read bank meta: {e}"));
-            }
-        };
+        let meta = bank_db
+            .read_meta()
+            .await
+            .map_err(|e| format!("Failed to read bank meta: {e}"))?;
         let display_name = meta.display_name.clone().unwrap_or_else(|| {
             format!(
                 "bank-{}",
@@ -914,14 +965,14 @@ impl MemoryCommand {
             )
         });
 
-        let pubkey = match self.registry.find_key_for_db(&db_id).await {
-            Ok(Some(k)) => k,
-            _ => {
-                return ExtensionCommandOutcome::Error(
-                    "Expected a key for this DB (open succeeded) but find_key returned None".into(),
-                );
-            }
-        };
+        let pubkey = self
+            .registry
+            .find_key_for_db(&db_id)
+            .await
+            .map_err(|e| format!("Failed to look up bank key: {e}"))?
+            .ok_or_else(|| {
+                "Expected a key for this DB (open succeeded) but find_key returned None".to_string()
+            })?;
 
         self.memory_bank_index
             .register(crate::hosted_index::DbEntry {
@@ -931,51 +982,129 @@ impl MemoryCommand {
             });
 
         if let Err(e) = self.registry.enable_sync_for(&db_id).await {
-            return ExtensionCommandOutcome::Error(format!(
+            return Err(format!(
                 "Imported memory bank '{display_name}' (DB {db_id}) but failed to enable ongoing \
                  sync: {e}"
             ));
         }
 
-        ExtensionCommandOutcome::Text(format!(
-            "Imported memory bank '{display_name}' (DB {db_id}). Grant it to agents with \
-             /memory grant {display_name} <agent> <read|write>."
-        ))
+        Ok(ImportOutcome::Imported {
+            display_name,
+            db_id,
+        })
     }
 }
 
-async fn attach_cmd(bank_name: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
-    if bank_name.is_empty() {
-        return ExtensionCommandOutcome::Error("Usage: /memory attach <bank_name>".into());
-    }
+/// Result of [`MemoryCommand::import_bank_via_ticket`]. Lets the
+/// caller (`/memory import` or the ticket-aware `/memory attach`)
+/// render appropriate messaging — successful import vs. pending
+/// approval vs. already-local — and, for attach, get the resolved
+/// display name to write into session settings.
+enum ImportOutcome {
+    Imported {
+        display_name: String,
+        db_id: eidetica::entry::ID,
+    },
+    AlreadyLocal {
+        display_name: String,
+    },
+    Pending {
+        request_id: String,
+    },
+}
 
-    let mut settings = ctx.get_settings("memory").await;
-    let banks = settings
-        .as_object_mut()
-        .and_then(|o| o.get_mut("attached_banks"))
-        .and_then(|v| v.as_array_mut());
+impl MemoryCommand {
+    /// `/memory attach <bank|db_id|ticket>` — attach a bank to the
+    /// current session so its memories surface via auto-recall.
+    ///
+    /// Three argument shapes:
+    /// * **Name** — must exist in the local bank index (created locally
+    ///   or previously imported).
+    /// * **DB ID** — resolved against the bank index; supports referring
+    ///   to a bank without remembering its display name.
+    /// * **DatabaseTicket** — bootstraps the bank from the issuing peer
+    ///   first (default Write permission, matching `/memory import`),
+    ///   then attaches the imported display name.
+    ///
+    /// We always store the resolved *display name* in
+    /// `extension_settings["memory"]["attached_banks"]` so auto-recall's
+    /// name-based lookup against `memory_bank_index` works regardless of
+    /// what shape the user typed.
+    async fn attach_cmd(&self, arg: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
+        if arg.is_empty() {
+            return ExtensionCommandOutcome::Error(
+                "Usage: /memory attach <bank|db_id|ticket>".into(),
+            );
+        }
 
-    let bank_json = serde_json::Value::String(bank_name.to_string());
+        let (bank_name, prelude): (String, Option<String>) =
+            if let Ok(ticket) = arg.parse::<eidetica::sync::DatabaseTicket>() {
+                match self
+                    .import_bank_via_ticket(&ticket, crate::commands::CoOwnerPermission::Write)
+                    .await
+                {
+                    Ok(ImportOutcome::Imported {
+                        display_name,
+                        db_id,
+                    }) => (
+                        display_name.clone(),
+                        Some(format!(
+                            "Imported memory bank '{display_name}' (DB {db_id}) via ticket. \
+                             Now attaching to this session."
+                        )),
+                    ),
+                    Ok(ImportOutcome::AlreadyLocal { display_name }) => (display_name, None),
+                    Ok(ImportOutcome::Pending { request_id }) => {
+                        return ExtensionCommandOutcome::Text(format!(
+                            "Bootstrap request {request_id} pending the owner's approval. \
+                             Re-run `/memory attach <ticket>` after they run \
+                             `/sharing approve {request_id}`."
+                        ));
+                    }
+                    Err(msg) => return ExtensionCommandOutcome::Error(msg),
+                }
+            } else {
+                match self.resolve_bank(arg) {
+                    Ok(entry) => (entry.display_name, None),
+                    Err(msg) => {
+                        return ExtensionCommandOutcome::Error(format!(
+                            "{msg}, or pass an eidetica DatabaseTicket URL to import + attach \
+                             in one step"
+                        ));
+                    }
+                }
+            };
 
-    match banks {
-        Some(arr) => {
-            if arr.iter().any(|v| v == &bank_json) {
-                return ExtensionCommandOutcome::Text(format!(
-                    "Bank '{bank_name}' is already attached to this session."
-                ));
+        let mut settings = ctx.get_settings("memory").await;
+        let bank_json = serde_json::Value::String(bank_name.clone());
+        let banks_arr = settings
+            .as_object_mut()
+            .and_then(|o| o.get_mut("attached_banks"))
+            .and_then(|v| v.as_array_mut());
+
+        match banks_arr {
+            Some(arr) => {
+                if arr.iter().any(|v| v == &bank_json) {
+                    return ExtensionCommandOutcome::Text(format!(
+                        "{}Bank '{bank_name}' is already attached to this session.",
+                        prelude.map(|p| format!("{p}\n")).unwrap_or_default()
+                    ));
+                }
+                arr.push(bank_json);
             }
-            arr.push(bank_json);
+            None => {
+                settings = serde_json::json!({"attached_banks": [bank_name]});
+            }
         }
-        None => {
-            settings = serde_json::json!({"attached_banks": [bank_name]});
-        }
-    }
 
-    match ctx.set_settings("memory", settings).await {
-        Ok(()) => ExtensionCommandOutcome::Text(format!(
-            "Attached bank '{bank_name}' to this session. Its memories will be surfaced in context."
-        )),
-        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to persist: {e}")),
+        match ctx.set_settings("memory", settings).await {
+            Ok(()) => ExtensionCommandOutcome::Text(format!(
+                "{}Attached bank '{bank_name}' to this session. Its memories will be surfaced \
+                 in context.",
+                prelude.map(|p| format!("{p}\n")).unwrap_or_default()
+            )),
+            Err(e) => ExtensionCommandOutcome::Error(format!("Failed to persist: {e}")),
+        }
     }
 }
 
@@ -1482,5 +1611,185 @@ mod tests {
             cmd.grant_cmd("patrick alpha wat").await,
             "Unknown permission",
         );
+    }
+
+    // ── MemoryAccess cap: scope plumbing ─────────────────────────────
+
+    /// Build a MemoryAccess provider over the same registry/indices that
+    /// the command fixture uses, so a single test can populate via the
+    /// command surface and then assert via the cap.
+    fn access_for(cmd: &MemoryCommand) -> MemoryAccessImpl {
+        MemoryAccessImpl {
+            registry: cmd.registry.clone(),
+            agent_index: cmd.agent_index.clone(),
+            memory_bank_index: cmd.memory_bank_index.clone(),
+            embedder: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_access_agent_scope_reads_and_writes_own_memory() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        let access = access_for(&cmd);
+
+        access
+            .remember("alpha", "color", "teal", MemoryScope::Agent)
+            .await
+            .unwrap();
+        let hits = access
+            .search("alpha", "color", MemoryScope::Agent)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "color");
+        assert_eq!(hits[0].value, "teal");
+        assert!(hits[0].bank.is_none(), "agent scope hits carry no bank");
+        assert!(hits[0].score > 0.0, "score should propagate");
+    }
+
+    #[tokio::test]
+    async fn memory_access_bank_scope_tags_hits_with_bank_name() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        cmd.new_cmd("shared").await;
+        cmd.grant_cmd("shared alpha write").await;
+        let access = access_for(&cmd);
+
+        access
+            .remember(
+                "alpha",
+                "passphrase",
+                "purple-narwhal-quartz",
+                MemoryScope::Bank {
+                    name: "shared".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let hits = access
+            .search(
+                "alpha",
+                "passphrase",
+                MemoryScope::Bank {
+                    name: "shared".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, "purple-narwhal-quartz");
+        assert_eq!(
+            hits[0].bank.as_deref(),
+            Some("shared"),
+            "bank scope hits carry the bank label"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_access_agent_scope_unknown_agent_errors() {
+        let (_i, _r, cmd) = fixture().await;
+        let access = access_for(&cmd);
+        let err = access
+            .search("ghost", "anything", MemoryScope::Agent)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("agent not found"), "got {err}");
+    }
+
+    // ── /memory attach: ticket / name / DB ID resolution ─────────────
+
+    async fn attach_via_dispatcher(cmd: &MemoryCommand, arg: &str) -> ExtensionCommandOutcome {
+        // Build a HookContext bound to a real session DB so the
+        // attach handler's get_settings/set_settings have somewhere to
+        // land.
+        use crate::session::Session;
+        use crate::types::ConversationId;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+        let (_conv, session_db) = cmd.registry.create_session(Some("test")).await.unwrap();
+        let session = Arc::new(TokioMutex::new(
+            Session::new(ConversationId(session_db.root_id().to_string()), session_db).await,
+        ));
+        let ctx = HookContext {
+            agent_name: "alpha".to_string(),
+            model: None,
+            call_depth: 0,
+            session,
+            active_extensions: std::collections::HashSet::new(),
+        };
+        cmd.attach_cmd(arg, &ctx).await
+    }
+
+    #[tokio::test]
+    async fn attach_cmd_resolves_name() {
+        let (_i, _r, cmd) = fixture().await;
+        cmd.new_cmd("patrick").await;
+        assert_text(
+            attach_via_dispatcher(&cmd, "patrick").await,
+            "Attached bank 'patrick'",
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_cmd_resolves_db_id() {
+        let (_i, _r, cmd) = fixture().await;
+        cmd.new_cmd("patrick").await;
+        let db_id = cmd
+            .memory_bank_index
+            .find_by_name("patrick")
+            .unwrap()
+            .db_id
+            .to_string();
+        // Attach by raw DB ID — should resolve to the display name and
+        // attach as 'patrick'.
+        assert_text(
+            attach_via_dispatcher(&cmd, &db_id).await,
+            "Attached bank 'patrick'",
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_cmd_unknown_arg_suggests_ticket() {
+        let (_i, _r, cmd) = fixture().await;
+        match attach_via_dispatcher(&cmd, "ghost-bank").await {
+            ExtensionCommandOutcome::Error(msg) => {
+                assert!(
+                    msg.contains("No hosted memory bank") && msg.contains("DatabaseTicket"),
+                    "error should mention ticket fallback: {msg}"
+                );
+            }
+            ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_cmd_idempotent_on_repeat() {
+        let (_i, _r, cmd) = fixture().await;
+        cmd.new_cmd("patrick").await;
+        // Use the same session for both calls so we exercise the
+        // "already attached" branch.
+        use crate::session::Session;
+        use crate::types::ConversationId;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+        let (_conv, session_db) = cmd.registry.create_session(Some("t")).await.unwrap();
+        let session = Arc::new(TokioMutex::new(
+            Session::new(ConversationId(session_db.root_id().to_string()), session_db).await,
+        ));
+        let ctx = HookContext {
+            agent_name: "alpha".to_string(),
+            model: None,
+            call_depth: 0,
+            session,
+            active_extensions: std::collections::HashSet::new(),
+        };
+        cmd.attach_cmd("patrick", &ctx).await;
+        match cmd.attach_cmd("patrick", &ctx).await {
+            ExtensionCommandOutcome::Text(s) => {
+                assert!(s.contains("already attached"), "got {s}");
+            }
+            ExtensionCommandOutcome::Error(e) => panic!("unexpected: {e}"),
+        }
     }
 }

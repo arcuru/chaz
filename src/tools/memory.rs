@@ -512,9 +512,65 @@ pub(crate) async fn write_memory_entry(
     Ok(())
 }
 
+/// One entry plus its relevance score. Returned by
+/// [`search_memory_scored`]; thin wrappers format it for tool callers
+/// or map it onto a cap's `MemoryHit` for extension consumers.
+#[derive(Debug, Clone)]
+pub(crate) struct ScoredMemory {
+    pub entry: MemoryEntry,
+    /// RRF score when both rankers ran; raw BM25/cosine score when only
+    /// one did; recency rank-position (descending) on the
+    /// no-query/no-embedder browse path. Comparable only within a
+    /// single result set.
+    pub score: f32,
+}
+
 /// Search memory entries by hybrid lexical + semantic relevance,
 /// optionally pre-filtered by tags. Returns the top `limit` formatted
 /// as a Markdown list.
+///
+/// Thin Markdown-formatting wrapper over [`search_memory_scored`].
+/// Used by the `recall` tool and the auto-recall context tail where
+/// the consumer expects a ready-to-render string. Extension callers
+/// that need structured data should call [`search_memory_structured`]
+/// instead — it skips the format-then-parse round-trip.
+pub(crate) async fn search_memory(
+    database: &Database,
+    store_name: &str,
+    query: &str,
+    tags_filter: &[String],
+    limit: usize,
+    embedder: Option<&dyn Embedder>,
+) -> Result<String, String> {
+    let hits =
+        search_memory_scored(database, store_name, query, tags_filter, limit, embedder).await?;
+    if hits.is_empty() {
+        return Ok(no_results_message(query, tags_filter));
+    }
+    Ok(hits
+        .iter()
+        .map(|h| format_entry(&h.entry))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Structured counterpart to [`search_memory`]: returns the top-`limit`
+/// scored entries without formatting. Empty result is `Ok(vec![])` —
+/// callers compose their own no-results messaging.
+pub(crate) async fn search_memory_structured(
+    database: &Database,
+    store_name: &str,
+    query: &str,
+    tags_filter: &[String],
+    limit: usize,
+    embedder: Option<&dyn Embedder>,
+) -> Result<Vec<ScoredMemory>, String> {
+    search_memory_scored(database, store_name, query, tags_filter, limit, embedder).await
+}
+
+/// Hybrid lexical + semantic search pipeline. The shared core that
+/// both [`search_memory`] and [`search_memory_structured`] sit on top
+/// of.
 ///
 /// Pipeline:
 /// 1. (Outside any txn) Embed the query if an embedder is configured.
@@ -531,14 +587,14 @@ pub(crate) async fn write_memory_entry(
 ///    (over the live embedding vectors). Combine with Reciprocal Rank
 ///    Fusion (k=60). Entries appearing in only one ranker still
 ///    surface.
-pub(crate) async fn search_memory(
+async fn search_memory_scored(
     database: &Database,
     store_name: &str,
     query: &str,
     tags_filter: &[String],
     limit: usize,
     embedder: Option<&dyn Embedder>,
-) -> Result<String, String> {
+) -> Result<Vec<ScoredMemory>, String> {
     let trimmed_query = query.trim();
     // Embed the query first (skip on empty query; embedding "" is wasteful
     // and most providers reject it). Failures degrade to lexical-only.
@@ -587,7 +643,7 @@ pub(crate) async fn search_memory(
         .collect();
 
     if kept.is_empty() {
-        return Ok(no_results_message(query, tags_filter));
+        return Ok(Vec::new());
     }
 
     // Side-load the embedding subtree if we have a query vector. Missing
@@ -622,12 +678,22 @@ pub(crate) async fn search_memory(
     let query_tokens = tokenize(query);
     let entries: Vec<MemoryEntry> = kept.iter().map(|(_, e)| e.clone()).collect();
 
-    let chosen: Vec<MemoryEntry> = if query_tokens.is_empty() && query_embedding.is_none() {
-        // Plain "browse by tag/recency" path.
+    let chosen: Vec<ScoredMemory> = if query_tokens.is_empty() && query_embedding.is_none() {
+        // Plain "browse by tag/recency" path. Assign descending synthetic
+        // scores so callers can still rank/compare; the absolute values
+        // aren't meaningful across result sets.
         let mut sorted = entries;
         sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         sorted.truncate(limit);
+        let n = sorted.len();
         sorted
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| ScoredMemory {
+                entry,
+                score: (n - i) as f32 / n.max(1) as f32,
+            })
+            .collect()
     } else {
         let bm25_ranking = if query_tokens.is_empty() {
             Vec::new()
@@ -641,22 +707,13 @@ pub(crate) async fn search_memory(
             _ => Vec::new(),
         };
         if bm25_ranking.is_empty() && cosine_ranking.is_empty() {
-            // Tokens didn't match anything and no semantic signal either.
             Vec::new()
         } else {
             rrf_combine(&entries, &bm25_ranking, &cosine_ranking, limit)
         }
     };
 
-    if chosen.is_empty() {
-        return Ok(no_results_message(query, tags_filter));
-    }
-
-    Ok(chosen
-        .iter()
-        .map(format_entry)
-        .collect::<Vec<_>>()
-        .join("\n"))
+    Ok(chosen)
 }
 
 fn entry_has_all_tags(entry: &MemoryEntry, required: &[String]) -> bool {
@@ -795,7 +852,7 @@ fn rrf_combine(
     bm25: &[(f64, usize)],
     cosine: &[(f32, usize)],
     limit: usize,
-) -> Vec<MemoryEntry> {
+) -> Vec<ScoredMemory> {
     const K: f64 = 60.0;
     let mut scores: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
     for (rank, (_, idx)) in bm25.iter().enumerate() {
@@ -809,7 +866,10 @@ fn rrf_combine(
     combined.truncate(limit);
     combined
         .into_iter()
-        .map(|(i, _)| entries[i].clone())
+        .map(|(i, s)| ScoredMemory {
+            entry: entries[i].clone(),
+            score: s as f32,
+        })
         .collect()
 }
 
@@ -1490,10 +1550,11 @@ mod tests {
         let bm25 = vec![(10.0_f64, 0)]; // A is the only BM25 hit
         let cos = vec![(0.9_f32, 1)]; // B is the only cosine hit
         let out = rrf_combine(&entries, &bm25, &cos, 10);
-        let keys: Vec<&str> = out.iter().map(|e| e.key.as_str()).collect();
+        let keys: Vec<&str> = out.iter().map(|h| h.entry.key.as_str()).collect();
         assert!(keys.contains(&"a"), "missing BM25 winner: {keys:?}");
         assert!(keys.contains(&"b"), "missing cosine winner: {keys:?}");
         assert!(!keys.contains(&"c"), "non-matching leaked: {keys:?}");
+        assert!(out.iter().all(|h| h.score > 0.0), "scores should populate");
     }
 
     #[tokio::test]
@@ -1514,11 +1575,13 @@ mod tests {
         let out = rrf_combine(&entries, &bm25, &cos, 10);
         assert_eq!(out.len(), 3);
         assert_eq!(
-            out[0].key,
+            out[0].entry.key,
             "both",
             "agreement should rank first: {:?}",
-            out.iter().map(|e| &e.key).collect::<Vec<_>>()
+            out.iter().map(|h| &h.entry.key).collect::<Vec<_>>()
         );
+        // The double-winner should also score strictly above the singles.
+        assert!(out[0].score > out[1].score, "agreement should dominate");
     }
 
     #[tokio::test]

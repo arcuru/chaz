@@ -309,6 +309,7 @@ mod tests {
     impl MemoryAccess for StubMemory {
         fn search<'a>(
             &'a self,
+            _agent_name: &'a str,
             _query: &'a str,
             _scope: MemoryScope,
         ) -> CapFuture<'a, Vec<MemoryHit>> {
@@ -316,6 +317,7 @@ mod tests {
         }
         fn remember<'a>(
             &'a self,
+            _agent_name: &'a str,
             _key: &'a str,
             _value: &'a str,
             _scope: MemoryScope,

@@ -488,11 +488,20 @@ pub trait Messenger: Send + Sync {
 ///
 /// The contract intentionally mirrors the existing `remember` / `recall`
 /// built-in tools so the in-tree `memory` extension can register as
-/// the canonical provider with thin glue.
+/// the canonical provider with thin glue. The `agent_name` argument
+/// identifies the *calling* agent — required for [`MemoryScope::Agent`]
+/// to resolve the right per-agent store, and recorded as the writer for
+/// bank scope.
 pub trait MemoryAccess: Send + Sync {
-    fn search<'a>(&'a self, query: &'a str, scope: MemoryScope) -> CapFuture<'a, Vec<MemoryHit>>;
+    fn search<'a>(
+        &'a self,
+        agent_name: &'a str,
+        query: &'a str,
+        scope: MemoryScope,
+    ) -> CapFuture<'a, Vec<MemoryHit>>;
     fn remember<'a>(
         &'a self,
+        agent_name: &'a str,
         key: &'a str,
         value: &'a str,
         scope: MemoryScope,
@@ -937,6 +946,7 @@ mod tests {
     impl MemoryAccess for NoopMemory {
         fn search<'a>(
             &'a self,
+            _agent_name: &'a str,
             _query: &'a str,
             _scope: MemoryScope,
         ) -> CapFuture<'a, Vec<MemoryHit>> {
@@ -944,6 +954,7 @@ mod tests {
         }
         fn remember<'a>(
             &'a self,
+            _agent_name: &'a str,
             _key: &'a str,
             _value: &'a str,
             _scope: MemoryScope,
