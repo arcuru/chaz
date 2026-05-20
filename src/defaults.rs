@@ -33,6 +33,8 @@ username: ""
 # Users can reference these agent names from their own configs.
 agents:
   - name: chaz
+    default_memory_banks:
+      - chaz-personal
     system_prompt: "Your name is Chaz, you are an AI assistant, and you refer to yourself in the third person."
   - name: chazmina
     system_prompt: "Your name is Chazmina, you are an AI assistant, and you refer to yourself in the third person."

@@ -103,6 +103,10 @@ pub enum CapabilityKind {
     /// Extension-providable — extensions like `skills` publish impls;
     /// the host collects and concatenates results.
     PromptAugmentation,
+    /// Append text after the conversation messages at context assembly time.
+    /// Extension-providable — extensions like 'memory' publish impls;
+    /// the host collects and concatenates results at the end of context.
+    ContextTail,
 }
 
 impl CapabilityKind {
@@ -139,6 +143,7 @@ impl CapabilityKind {
             Self::Memory => "memory",
             Self::AgentStateAdmin => "agent_state_admin",
             Self::PromptAugmentation => "prompt_augmentation",
+            Self::ContextTail => "context_tail",
         }
     }
 }
@@ -190,6 +195,10 @@ pub enum CapabilityRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    ContextTail {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
 }
 
 impl CapabilityRequest {
@@ -206,6 +215,7 @@ impl CapabilityRequest {
             Self::Memory { .. } => CapabilityKind::Memory,
             Self::AgentStateAdmin { .. } => CapabilityKind::AgentStateAdmin,
             Self::PromptAugmentation { .. } => CapabilityKind::PromptAugmentation,
+            Self::ContextTail { .. } => CapabilityKind::ContextTail,
         }
     }
 
@@ -216,7 +226,8 @@ impl CapabilityRequest {
         match self {
             Self::Messenger { provider }
             | Self::Memory { provider }
-            | Self::PromptAugmentation { provider } => provider.as_deref(),
+            | Self::PromptAugmentation { provider }
+            | Self::ContextTail { provider } => provider.as_deref(),
             _ => None,
         }
     }
@@ -495,18 +506,34 @@ pub trait MemoryAccess: Send + Sync {
 /// after the agent's core system prompt. The augmentation receives
 /// the agent and the session's recent message text so it can decide
 /// whether to contribute.
-///
-/// This is intentionally synchronous — extensions hold their data in
-/// memory (skill registry, surfacing index) and string building is
-/// cheap. Async is unnecessary for the `Option<String>` return shape.
+/// The method is async so providers that need database access (e.g.
+/// memory surfacing) can use eidetica without blocking. Extensions
+/// that hold their data purely in memory (skills, rules) return
+/// immediately.
 pub trait PromptAugmentation: Send + Sync {
     /// Return additional system prompt text, or `None` if this
     /// extension has nothing to contribute for this turn.
-    fn augment_system_prompt(
-        &self,
-        agent_name: &str,
-        recent_message_text: &[String],
-    ) -> Option<String>;
+    fn augment_system_prompt<'a>(
+        &'a self,
+        agent_name: &'a str,
+        recent_message_text: &'a [String],
+    ) -> CapFuture<'a, Option<String>>;
+}
+
+/// Append text after the conversation messages at context assembly time.
+///
+/// Extension-providable — extensions like 'memory' publish an impl;
+/// the host calls every provider and concatenates non-empty results
+/// after the assembled messages. Unlike [`PromptAugmentation`], this
+/// fires at the end of context, not in the system prompt.
+pub trait ContextTail: Send + Sync {
+    /// Return additional text to append after the conversation messages,
+    /// or `None` if this extension has nothing to contribute for this turn.
+    fn context_tail<'a>(
+        &'a self,
+        agent_name: &'a str,
+        recent_message_text: &'a [String],
+    ) -> CapFuture<'a, Option<String>>;
 }
 
 // =========================================================================
@@ -524,6 +551,7 @@ pub enum CapProvider {
     Memory(Arc<dyn MemoryAccess>),
     AgentStateAdmin(Arc<dyn AgentStateAdmin>),
     PromptAugmentation(Arc<dyn PromptAugmentation>),
+    ContextTail(Arc<dyn ContextTail>),
 }
 
 impl CapProvider {
@@ -533,6 +561,7 @@ impl CapProvider {
             Self::Messenger(_) => CapabilityKind::Messenger,
             Self::Memory(_) => CapabilityKind::Memory,
             Self::PromptAugmentation(_) => CapabilityKind::PromptAugmentation,
+            Self::ContextTail(_) => CapabilityKind::ContextTail,
             Self::AgentStateAdmin(_) => CapabilityKind::AgentStateAdmin,
         }
     }
@@ -580,6 +609,7 @@ pub struct ExtensionCaps {
     pub messengers: CapSet<dyn Messenger>,
     pub memory: CapSet<dyn MemoryAccess>,
     pub prompt_augmentation: CapSet<dyn PromptAugmentation>,
+    pub context_tail: CapSet<dyn ContextTail>,
 }
 
 impl ExtensionCaps {
@@ -597,6 +627,7 @@ impl ExtensionCaps {
             messengers: CapSet::new(),
             memory: CapSet::new(),
             prompt_augmentation: CapSet::new(),
+            context_tail: CapSet::new(),
         }
     }
 
@@ -612,6 +643,7 @@ impl ExtensionCaps {
             && self.messengers.is_empty()
             && self.memory.is_empty()
             && self.prompt_augmentation.is_empty()
+            && self.context_tail.is_empty()
     }
 }
 
@@ -632,6 +664,11 @@ impl fmt::Debug for ExtensionCaps {
             .field("agent_state_admin", &self.agent_state_admin.is_some())
             .field("messengers", &self.messengers.provider_names())
             .field("memory", &self.memory.provider_names())
+            .field(
+                "prompt_augmentation",
+                &self.prompt_augmentation.provider_names(),
+            )
+            .field("context_tail", &self.context_tail.provider_names())
             .finish()
     }
 }

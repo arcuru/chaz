@@ -332,13 +332,15 @@ struct SkillsPromptAugmentation {
 }
 
 impl PromptAugmentation for SkillsPromptAugmentation {
-    fn augment_system_prompt(
-        &self,
-        _agent_name: &str,
-        recent_message_text: &[String],
-    ) -> Option<String> {
-        let registry = self.registry.read().unwrap();
-        registry.match_and_assemble(recent_message_text)
+    fn augment_system_prompt<'a>(
+        &'a self,
+        _agent_name: &'a str,
+        recent_message_text: &'a [String],
+    ) -> crate::extension::caps::CapFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let registry = self.registry.read().unwrap();
+            Ok(registry.match_and_assemble(recent_message_text))
+        })
     }
 }
 

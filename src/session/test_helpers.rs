@@ -42,6 +42,7 @@ pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
         tool_profile: None,
         max_context_tokens: None,
         grants: None,
+        default_memory_banks: None,
     }
 }
 

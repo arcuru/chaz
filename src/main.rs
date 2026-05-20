@@ -35,7 +35,7 @@ use gateway::Gateway;
 use clap::Parser;
 use std::sync::Arc;
 use std::{fs::File, io::Read, path::PathBuf};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -256,6 +256,83 @@ async fn main() -> anyhow::Result<()> {
         hosted_index::build_from_user(&user).await?
     };
 
+    // Attach default memory banks declared in agent configs. Idempotent —
+    // already-attached banks are skipped (grant_on_memory_bank is idempotent,
+    // and attach_memory_bank overwrites by name). Missing banks/agents are
+    // logged at warn and skipped so a typo in config doesn't fail startup.
+    if let Some(agent_configs) = &config.agents {
+        for ac in agent_configs {
+            if let Some(banks) = &ac.default_memory_banks {
+                for bank_name in banks {
+                    let Some(agent_entry) = agent_index_store.find_by_name(&ac.name) else {
+                        warn!(agent = %ac.name, bank = %bank_name, "Agent not in index; skipping default bank attach");
+                        continue;
+                    };
+                    let bank_entry = match memory_bank_index_store.find_by_name(bank_name) {
+                        Some(e) => e,
+                        None => {
+                            // Auto-create the bank if it doesn't exist
+                            let meta = crate::memory_bank_db::MemoryBankMeta {
+                                display_name: Some(bank_name.clone()),
+                                description: Some(
+                                    "Auto-created from default_memory_banks config".into(),
+                                ),
+                            };
+                            match registry.create_new_memory_bank(bank_name, &meta).await {
+                                Ok((bank, pubkey)) => {
+                                    let entry = crate::hosted_index::DbEntry {
+                                        db_id: bank.id(),
+                                        display_name: bank_name.clone(),
+                                        pubkey,
+                                    };
+                                    memory_bank_index_store.register(entry.clone());
+                                    info!(bank = %bank_name, "Auto-created default memory bank");
+                                    entry
+                                }
+                                Err(e) => {
+                                    warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to auto-create default bank");
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    let key_label = format!("memory:{}:{}", bank_name, ac.name);
+                    if let Err(e) = registry
+                        .grant_on_memory_bank(
+                            &bank_entry.db_id,
+                            &agent_entry.pubkey,
+                            &key_label,
+                            crate::agent_db::BankPermission::Write,
+                        )
+                        .await
+                    {
+                        warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to grant bank access");
+                        continue;
+                    }
+                    match registry
+                        .open_agent_db(&agent_entry.db_id, Some(&agent_entry.pubkey))
+                        .await
+                    {
+                        Ok(Some(agent_db)) => {
+                            let ref_entry = crate::agent_db::MemoryBankRef {
+                                name: bank_name.clone(),
+                                db_id: bank_entry.db_id.to_string(),
+                                permission: crate::agent_db::BankPermission::Write,
+                            };
+                            if let Err(e) = agent_db.attach_memory_bank(ref_entry).await {
+                                warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to attach bank ref; auth already granted");
+                            } else {
+                                info!(agent = %ac.name, bank = %bank_name, "Attached default memory bank");
+                            }
+                        }
+                        _ => {
+                            warn!(agent = %ac.name, "Cannot open agent DB for default bank attach");
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Build secret store backed by the chaz_peer DB.
     let secret_store = security::SecretStore::new(chaz_peer.clone()).await;
     if let Some(backends) = &mut config.backends {

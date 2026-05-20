@@ -76,18 +76,101 @@ Lists every bank the agent can see, with the permission level. Always includes `
 
 Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix uses `!chaz memory <sub>`.
 
-| Command                                      | What                                                                                                                            |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `/memory new <name> [description]`           | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                    |
-| `/memory list`                               | List banks hosted by this peer.                                                                                                 |
-| `/memory delete <ref>`                       | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                           |
-| `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                           |
-| `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                |
-| `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                               |
-| `/memory unshare <bank>`                     | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it. |
-| `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.                                |
+| Command                                      | What                                                                                                                                       |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/memory new <name> [description]`           | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                               |
+| `/memory list`                               | List banks hosted by this peer.                                                                                                            |
+| `/memory delete <ref>`                       | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                                      |
+| `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                                      |
+| `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                           |
+| `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                                          |
+| `/memory unshare <bank>`                     | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.            |
+| `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.                                           |
+| `/memory attach <bank>`                      | Attach a bank to the current session. Its memories are surfaced in context (see [Autonomous Auto-recall](#autonomous-memory-auto-recall)). |
+| `/memory detach <bank>`                      | Detach a previously-attached bank from this session.                                                                                       |
+| `/memory config [show\|set\|reset]`          | View or change memory auto-recall behaviour for this agent. See [Auto-recall config](#auto-recall-configuration).                          |
 
 Refs accept either a display name or an eidetica DB ID.
+
+## Autonomous Memory Auto-recall
+
+When the `memory` extension is active, chaz automatically searches the agent's own memory and all attached banks for facts relevant to the current conversation. The top results are injected at the end of context as a `## Relevant Memories` block — the agent sees them alongside the conversation history, not in its system prompt.
+
+**No manual `recall` needed.** It fires every turn, before the LLM call. If no relevant memories are found, nothing is injected.
+
+### How it works
+
+1. The last 5 conversation messages are joined, tokenized, and stopwords removed to form a query.
+2. The agent's own `memory` store is searched with BM25 + cosine hybrid ranking.
+3. Every attached bank (via `/memory attach` or `default_memory_banks`) is searched the same way.
+4. Up to 3 results per store (configurable) are formatted and appended.
+
+```text
+## Relevant Memories
+- [deploy process]: Build via nix build && scp to prod
+- [api endpoint]: https://api.example.com/v2
+
+_(from bank: project-conventions)_
+- [naming]: Use kebab-case for all new crates
+```
+
+### Attaching banks to a session
+
+Banks must be explicitly attached to participate in auto-recall (even if the agent has a grant). Two ways:
+
+**Per-session** — attach for the current conversation only:
+
+```text
+/memory attach project-conventions
+/memory detach project-conventions
+```
+
+**Per-agent (persistent)** — declare in `config.yaml` to auto-attach at startup:
+
+```yaml
+agents:
+  - name: ava
+    system_prompt: "You are Ava..."
+    default_memory_banks:
+      - project-conventions
+      - shared-facts
+```
+
+`default_memory_banks` are applied at bootstrap and on `/agent reload`. They grant Write access and write a `MemoryBankRef` to the agent DB — idempotent across restarts.
+
+Missing banks are auto-created on first startup — no manual `/memory new` needed for banks listed in `default_memory_banks`. The same bank name can appear on multiple agents to share it between them.
+
+### Auto-recall configuration
+
+Per-agent settings stored in the agent DB. View and change with `/memory config`:
+
+```text
+/memory config show
+# Auto-recall config:
+# ──────────────────────
+# auto_recall_enabled = true
+# max_entries         = 3
+# auto_recall_banks   = (all attached)
+
+/memory config set max_entries 5
+/memory config set auto_recall_banks project-notes,shared-facts
+/memory config set auto_recall_enabled false       # disable auto-recall
+/memory config reset                             # revert to defaults
+```
+
+| Setting               | Default | Range      | What                                                   |
+| --------------------- | ------- | ---------- | ------------------------------------------------------ |
+| `auto_recall_enabled` | `true`  | true/false | Turn autonomous auto-recall on/off                     |
+| `max_entries`         | `3`     | 1–20       | Max results auto-recalled from own memory + per bank   |
+| `auto_recall_banks`   | _(all)_ | names      | Which banks participate; comma-separated, empty = none |
+
+Disabling auto-recall stops the `## Relevant Memories` block but leaves the `remember`/`recall` tools fully functional. Auto-recall only searches banks listed in `auto_recall_banks` (or all attached banks when unset).
+
+When `auto_recall_banks` is set, only the named banks are searched by auto-recall. Other attached banks remain available for explicit `recall bank="..."` — they're just excluded from the automatic `## Relevant Memories` block.
+
+### Trust model
+
+Auto-recall is read-only — it searches existing memory stores, never writes. The write path stays with the `remember` tool (gated by eidetica AuthSettings). Banks the agent can't open (no key, no grant) are silently skipped during auto-recall.
 
 ## Bank Grant: What Actually Happens
 

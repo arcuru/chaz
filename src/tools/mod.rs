@@ -18,6 +18,8 @@ pub use compact::Compact;
 pub use describe::DescribeTool;
 pub use edit::EditFile;
 pub use file::{ReadFile, WriteFile};
+pub(crate) use memory::search_memory;
+pub(crate) use memory::write_memory_entry;
 pub use memory::{ListMemoryBanks, Recall, Remember};
 pub use schedule::{ScheduleAdd, ScheduleList, ScheduleModify, ScheduleOnce, ScheduleRemove};
 pub use search::{SearchBackend, WebSearch};

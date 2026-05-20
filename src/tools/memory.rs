@@ -458,7 +458,7 @@ impl Tool for ListMemoryBanks {
 /// row, joined by the row ID `Table::insert` returns. Embedder failures
 /// are logged at warn and degrade to lexical-only — a transient
 /// embedding API issue must not lose the user's memory.
-async fn write_memory_entry(
+pub(crate) async fn write_memory_entry(
     database: &Database,
     store_name: &str,
     entry: MemoryEntry,
@@ -531,7 +531,7 @@ async fn write_memory_entry(
 ///    (over the live embedding vectors). Combine with Reciprocal Rank
 ///    Fusion (k=60). Entries appearing in only one ranker still
 ///    surface.
-async fn search_memory(
+pub(crate) async fn search_memory(
     database: &Database,
     store_name: &str,
     query: &str,

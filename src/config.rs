@@ -251,6 +251,11 @@ pub struct AgentConfig {
     /// grant for a tool, it replaces the config grant; unset kinds fall
     /// through to the config/default.
     pub grants: Option<HashMap<String, crate::grants::Grants>>,
+    /// Memory banks to auto-attach at agent bootstrap. Each name must
+    /// match a bank created via `/memory new` or listed in the hosted
+    /// index. Missing banks are logged at warn and skipped — a typo in
+    /// config doesn't fail startup.
+    pub default_memory_banks: Option<Vec<String>>,
 }
 
 /// A named bundle of overrides that can be selected at spawn time.

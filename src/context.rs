@@ -13,9 +13,12 @@
 //! - Always includes the system prompt and at least the most recent message
 
 use crate::config::ContextConfig;
+use crate::extension::ExtensionHub;
 use crate::runtime::RuntimeMessage;
 use crate::session::{EntryType, SessionEntry};
 use crate::tool::ToolDefinition;
+use eidetica::Database;
+use std::sync::Arc;
 
 use std::sync::OnceLock;
 use tiktoken_rs::CoreBPE;
@@ -119,6 +122,10 @@ pub struct ContextBuilder<'a> {
     /// standard "room note" listing the *other* participants and the
     /// `@mention` convention is appended to the system prompt.
     room_participants: &'a [String],
+    /// ExtensionHub for system prompt augmentation (skills, memory, etc.).
+    extension_hub: Option<Arc<ExtensionHub>>,
+    /// Session DB passed through to the hub for per-session provider resolution.
+    session_db: Option<&'a Database>,
 }
 
 impl<'a> ContextBuilder<'a> {
@@ -136,7 +143,15 @@ impl<'a> ContextBuilder<'a> {
             config,
             max_context_tokens_override: None,
             room_participants: &[],
+            extension_hub: None,
+            session_db: None,
         }
+    }
+
+    /// Supply the session DB for per-session extension provider resolution.
+    pub fn with_session_db(mut self, db: &'a Database) -> Self {
+        self.session_db = Some(db);
+        self
     }
 
     /// Supply the full roster of agents attached to the session (including
@@ -157,9 +172,13 @@ impl<'a> ContextBuilder<'a> {
         self.max_context_tokens_override = max_tokens;
         self
     }
+    pub fn with_extension_hub(mut self, hub: Arc<ExtensionHub>) -> Self {
+        self.extension_hub = Some(hub);
+        self
+    }
 
     /// Build the context, fitting messages within the token budget.
-    pub fn build(self) -> AssembledContext {
+    pub async fn build(self) -> AssembledContext {
         let max_tokens = self
             .max_context_tokens_override
             .unwrap_or(self.config.max_context_tokens);
@@ -180,6 +199,25 @@ impl<'a> ContextBuilder<'a> {
             } else {
                 system_prompt.push_str("\n\n");
                 system_prompt.push_str(&note);
+            }
+        }
+
+        // 1.5. Extensions: skills, memory, etc. inject augmentations.
+        let recent_text: Vec<String> = self
+            .entries
+            .iter()
+            .rev()
+            .take(10)
+            .filter(|e| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
+            .map(|e| e.content.clone())
+            .collect();
+        if let Some(ref hub) = self.extension_hub {
+            let augmentation = hub
+                .augment_system_prompt(self.agent_name, &recent_text, None, self.session_db)
+                .await;
+            if !augmentation.is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&augmentation);
             }
         }
 
@@ -261,6 +299,16 @@ impl<'a> ContextBuilder<'a> {
             messages.push(rm);
         }
 
+        // 8. Context tails — memory surfacing, etc. Appended after the
+        //    conversation messages, not injected into the system prompt.
+        if let Some(ref hub) = self.extension_hub {
+            let tail = hub
+                .context_tails(self.agent_name, &recent_text, None, self.session_db)
+                .await;
+            if !tail.is_empty() {
+                messages.push(RuntimeMessage::User(tail));
+            }
+        }
         AssembledContext {
             messages,
             estimated_tokens: used_tokens,
@@ -302,15 +350,17 @@ mod tests {
         assert!(hundred_a > 0 && hundred_a < 100);
     }
 
-    #[test]
-    fn test_basic_context_assembly() {
+    #[tokio::test]
+    async fn test_basic_context_assembly() {
         let entries = vec![
             make_entry("user", "Hello", EntryType::Message),
             make_entry("agent", "Hi there!", EntryType::Message),
             make_entry("user", "How are you?", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         assert_eq!(result.entries_included, 3);
         assert!(!result.truncated);
@@ -320,9 +370,8 @@ mod tests {
         assert!(matches!(&result.messages[1], RuntimeMessage::Assistant(s) if s == "Hi there!"));
         assert!(matches!(&result.messages[2], RuntimeMessage::User(s) if s == "How are you?"));
     }
-
-    #[test]
-    fn test_summary_boundary() {
+    #[tokio::test]
+    async fn test_summary_boundary() {
         let entries = vec![
             make_entry("user", "Old message 1", EntryType::Message),
             make_entry("agent", "Old response 1", EntryType::Message),
@@ -335,7 +384,9 @@ mod tests {
             make_entry("agent", "New response", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         // Should include: Summary + 2 new messages = 3 entries
         assert_eq!(result.entries_included, 3);
@@ -347,8 +398,8 @@ mod tests {
         assert!(matches!(&result.messages[2], RuntimeMessage::Assistant(s) if s == "New response"));
     }
 
-    #[test]
-    fn test_filters_non_context_entries() {
+    #[tokio::test]
+    async fn test_filters_non_context_entries() {
         let entries = vec![
             make_entry("user", "Hello", EntryType::Message),
             make_entry("agent", "tool call", EntryType::ToolCall),
@@ -358,14 +409,16 @@ mod tests {
             make_entry("agent", "Response", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         assert_eq!(result.entries_included, 2); // Only Message entries
         assert_eq!(result.messages.len(), 2);
     }
 
-    #[test]
-    fn test_budget_truncation() {
+    #[tokio::test]
+    async fn test_budget_truncation() {
         // Create many messages that exceed the budget
         let mut entries = Vec::new();
         for i in 0..100 {
@@ -378,7 +431,9 @@ mod tests {
         // Budget: 1000 - 100 reserved = 900 tokens
         // Each message: ~58 tokens → fits ~15 messages
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         assert!(result.truncated);
         assert!(result.entries_included < 100);
@@ -390,8 +445,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_system_prompt_counted() {
+    #[tokio::test]
+    async fn test_system_prompt_counted() {
         let entries = vec![make_entry("user", "Hello", EntryType::Message)];
         // Use a long enough prompt that it takes significant tokens
         let prompt = "word ".repeat(500);
@@ -399,7 +454,9 @@ mod tests {
             max_context_tokens: 600,
             reserved_output_tokens: 50,
         };
-        let result = ContextBuilder::new(&entries, "agent", &prompt, &config).build();
+        let result = ContextBuilder::new(&entries, "agent", &prompt, &config)
+            .build()
+            .await;
 
         // System prompt takes significant tokens
         assert!(result.estimated_tokens > 100);
@@ -407,8 +464,8 @@ mod tests {
         assert!(matches!(&result.messages[0], RuntimeMessage::System(_)));
     }
 
-    #[test]
-    fn test_tool_overhead_reduces_budget() {
+    #[tokio::test]
+    async fn test_tool_overhead_reduces_budget() {
         let entries: Vec<SessionEntry> = (0..50)
             .map(|i| {
                 make_entry(
@@ -421,7 +478,9 @@ mod tests {
         let config = default_config();
 
         // Without tools
-        let result_no_tools = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result_no_tools = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         // With tools (takes up budget)
         let tools = vec![ToolDefinition {
@@ -437,14 +496,15 @@ mod tests {
         }];
         let result_with_tools = ContextBuilder::new(&entries, "agent", "", &config)
             .with_tools(&tools)
-            .build();
+            .build()
+            .await;
 
         // Fewer messages should fit when tools eat into the budget
         assert!(result_with_tools.entries_included < result_no_tools.entries_included);
     }
 
-    #[test]
-    fn test_always_includes_last_message() {
+    #[tokio::test]
+    async fn test_always_includes_last_message() {
         // Even with a tiny budget, the last message must be included
         let entries = vec![make_entry(
             "user",
@@ -455,20 +515,24 @@ mod tests {
             max_context_tokens: 200,
             reserved_output_tokens: 50,
         };
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         assert_eq!(result.entries_included, 1);
         assert_eq!(result.messages.len(), 1);
     }
 
-    #[test]
-    fn test_directive_included_as_user() {
+    #[tokio::test]
+    async fn test_directive_included_as_user() {
         let entries = vec![
             make_entry("scheduler", "Do the daily check", EntryType::Directive),
             make_entry("agent", "Done", EntryType::Message),
         ];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         assert_eq!(result.entries_included, 2);
         assert!(matches!(
@@ -477,19 +541,21 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_empty_session() {
+    #[tokio::test]
+    async fn test_empty_session() {
         let entries: Vec<SessionEntry> = vec![];
         let config = default_config();
-        let result = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
 
         assert_eq!(result.entries_included, 0);
         assert_eq!(result.messages.len(), 0);
         assert!(!result.truncated);
     }
 
-    #[test]
-    fn test_per_agent_token_override() {
+    #[tokio::test]
+    async fn test_per_agent_token_override() {
         let entries: Vec<SessionEntry> = (0..50)
             .map(|i| {
                 make_entry(
@@ -501,10 +567,13 @@ mod tests {
             .collect();
         let config = default_config();
 
-        let result_default = ContextBuilder::new(&entries, "agent", "", &config).build();
+        let result_default = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
         let result_small = ContextBuilder::new(&entries, "agent", "", &config)
             .with_max_tokens_override(Some(300))
-            .build();
+            .build()
+            .await;
 
         assert!(result_small.entries_included < result_default.entries_included);
     }
@@ -535,17 +604,20 @@ mod tests {
         assert!(room_note(&["alpha".to_string(), "ALPHA".to_string()], "alpha").is_none());
     }
 
-    #[test]
-    fn room_note_appended_to_system_prompt_when_multi_agent() {
+    #[tokio::test]
+    async fn room_note_appended_to_system_prompt_when_multi_agent() {
         let config = ContextConfig::default();
         let entries = vec![make_entry("patrick", "hi", EntryType::Message)];
         let prompt = "You are Alpha.";
 
-        let solo = ContextBuilder::new(&entries, "alpha", prompt, &config).build();
+        let solo = ContextBuilder::new(&entries, "alpha", prompt, &config)
+            .build()
+            .await;
         let roster = vec!["alpha".to_string(), "beta".to_string()];
         let room = ContextBuilder::new(&entries, "alpha", prompt, &config)
             .with_room_participants(&roster)
-            .build();
+            .build()
+            .await;
 
         let sys = |c: &AssembledContext| match c.messages.first() {
             Some(RuntimeMessage::System(s)) => s.clone(),

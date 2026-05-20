@@ -81,6 +81,9 @@ pub struct AgentDbConfig {
     pub max_context_tokens: Option<usize>,
     #[serde(default)]
     pub grants: HashMap<String, Grants>,
+    /// Memory banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_memory_banks`].
+    #[serde(default)]
+    pub default_memory_banks: Vec<String>,
 }
 
 impl AgentDbConfig {
@@ -98,6 +101,7 @@ impl AgentDbConfig {
             tool_profile: cfg.tool_profile.clone(),
             max_context_tokens: cfg.max_context_tokens,
             grants: cfg.grants.clone().unwrap_or_default(),
+            default_memory_banks: cfg.default_memory_banks.clone().unwrap_or_default(),
         }
     }
 }
@@ -466,7 +470,7 @@ impl AgentDb {
 }
 
 /// Generic read of a JSON blob from a DocStore. Missing blob → `Default::default()`.
-async fn read_blob<T>(database: &Database, store_name: &str) -> anyhow::Result<T>
+pub(crate) async fn read_blob<T>(database: &Database, store_name: &str) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned + Default,
 {
@@ -656,6 +660,7 @@ mod tests {
             tool_profile: None,
             max_context_tokens: None,
             grants: None,
+            default_memory_banks: None,
         }
     }
 
@@ -675,6 +680,7 @@ mod tests {
             tool_profile: Some("deep".to_string()),
             max_context_tokens: Some(200_000),
             grants: HashMap::new(),
+            default_memory_banks: vec![],
         };
         let meta = AgentMeta {
             display_name: Some("researcher".to_string()),

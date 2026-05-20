@@ -439,6 +439,23 @@ pub trait Extension: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// Build per-session capability providers. Called by the hub during
+    /// context assembly for a specific session. Receives the extension's
+    /// per-session settings JSON blob read from the session DB's
+    /// `extension_settings` store.
+    ///
+    /// Return providers for capabilities that depend on session state
+    /// (`ContextTail`, `PromptAugmentation`). Global capabilities
+    /// (`MemoryAccess`, `Messenger`) stay in [`Self::build_providers`].
+    ///
+    /// Default: empty (no per-session providers).
+    fn build_session_providers(
+        &self,
+        _session_settings: &serde_json::Value,
+    ) -> anyhow::Result<HashMap<caps::CapabilityKind, caps::CapProvider>> {
+        Ok(HashMap::new())
+    }
+
     /// Phase 2 of `install_all`: receive the fully-resolved consumer
     /// bundle and produce the per-hook + routine handlers. Default:
     /// no handlers (an extension that only provides caps, or nothing).
@@ -1232,6 +1249,18 @@ impl ExtensionHub {
                         },
                     );
                 }
+                K::ContextTail => {
+                    populate_capset(
+                        &mut bundle.context_tail,
+                        &self.cap_registry,
+                        K::ContextTail,
+                        req.provider(),
+                        |p| match p {
+                            caps::CapProvider::ContextTail(ct) => Some(ct.clone()),
+                            _ => None,
+                        },
+                    );
+                }
                 K::AgentStateAdmin => {
                     let allowlist = req.agents().map(|a| a.to_vec());
                     let scoped = self.build_agent_state_admin(allowlist, &m.name);
@@ -1242,6 +1271,124 @@ impl ExtensionHub {
         bundle
     }
 
+    /// Resolve a PromptAugmentation provider for a session. Tries per-session
+    /// build first (via [`Extension::build_session_providers`]), falls back
+    /// to the global provider from the cap registry.
+    async fn resolve_prompt_augmentation<'a>(
+        &'a self,
+        provider_name: &str,
+        agent_name: &'a str,
+        recent_message_text: &'a [String],
+        session_db: Option<&Database>,
+    ) -> Option<String> {
+        // Try per-session provider first
+        if let Some(session_db) = session_db {
+            let settings = read_settings(session_db, provider_name).await;
+            let Some(ext) = self.extensions.iter().find(|e| e.name() == provider_name) else {
+                return self
+                    .fallback_prompt_augmentation(provider_name, agent_name, recent_message_text)
+                    .await;
+            };
+            let Ok(mut providers) = ext.build_session_providers(&settings) else {
+                return self
+                    .fallback_prompt_augmentation(provider_name, agent_name, recent_message_text)
+                    .await;
+            };
+            if let Some(crate::extension::caps::CapProvider::PromptAugmentation(sp)) =
+                providers.remove(&crate::extension::caps::CapabilityKind::PromptAugmentation)
+            {
+                return match sp
+                    .augment_system_prompt(agent_name, recent_message_text)
+                    .await
+                {
+                    Ok(Some(text)) if !text.trim().is_empty() => Some(text),
+                    _ => None,
+                };
+            }
+        }
+        self.fallback_prompt_augmentation(provider_name, agent_name, recent_message_text)
+            .await
+    }
+
+    async fn fallback_prompt_augmentation<'a>(
+        &'a self,
+        provider_name: &str,
+        agent_name: &'a str,
+        recent_message_text: &'a [String],
+    ) -> Option<String> {
+        let map = self
+            .cap_registry
+            .by_kind
+            .get(&crate::extension::caps::CapabilityKind::PromptAugmentation)?;
+        let provider = map.providers.get(provider_name)?;
+        if let crate::extension::caps::CapProvider::PromptAugmentation(pa) = provider {
+            match pa
+                .augment_system_prompt(agent_name, recent_message_text)
+                .await
+            {
+                Ok(Some(text)) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a ContextTail provider for a session. Tries per-session build
+    /// first, falls back to the global provider from the cap registry.
+    async fn resolve_context_tail<'a>(
+        &'a self,
+        provider_name: &str,
+        agent_name: &'a str,
+        recent_message_text: &'a [String],
+        session_db: Option<&Database>,
+    ) -> Option<String> {
+        if let Some(session_db) = session_db {
+            let settings = read_settings(session_db, provider_name).await;
+            let Some(ext) = self.extensions.iter().find(|e| e.name() == provider_name) else {
+                return self
+                    .fallback_context_tail(provider_name, agent_name, recent_message_text)
+                    .await;
+            };
+            let Ok(mut providers) = ext.build_session_providers(&settings) else {
+                return self
+                    .fallback_context_tail(provider_name, agent_name, recent_message_text)
+                    .await;
+            };
+            if let Some(crate::extension::caps::CapProvider::ContextTail(ct)) =
+                providers.remove(&crate::extension::caps::CapabilityKind::ContextTail)
+            {
+                return match ct.context_tail(agent_name, recent_message_text).await {
+                    Ok(Some(text)) if !text.trim().is_empty() => Some(text),
+                    _ => None,
+                };
+            }
+        }
+        self.fallback_context_tail(provider_name, agent_name, recent_message_text)
+            .await
+    }
+
+    async fn fallback_context_tail<'a>(
+        &'a self,
+        provider_name: &str,
+        agent_name: &'a str,
+        recent_message_text: &'a [String],
+    ) -> Option<String> {
+        let map = self
+            .cap_registry
+            .by_kind
+            .get(&crate::extension::caps::CapabilityKind::ContextTail)?;
+        let provider = map.providers.get(provider_name)?;
+        if let crate::extension::caps::CapProvider::ContextTail(ct) = provider {
+            match ct.context_tail(agent_name, recent_message_text).await {
+                Ok(Some(text)) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Collect system prompt augmentations from all installed extensions
     /// that provide the PromptAugmentation cap.
     ///
@@ -1249,11 +1396,12 @@ impl ExtensionHub {
     /// concatenates non-empty results with blank-line separators.
     /// Per-session extension filtering: if active_extensions is Some, only
     /// extensions in that set participate.
-    pub fn augment_system_prompt(
+    pub async fn augment_system_prompt(
         &self,
         agent_name: &str,
         recent_message_text: &[String],
         active_extensions: Option<&[String]>,
+        session_db: Option<&Database>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
         let Some(map) = self
@@ -1269,9 +1417,57 @@ impl ExtensionHub {
             {
                 continue;
             }
-            if let crate::extension::caps::CapProvider::PromptAugmentation(pa) = provider
-                && let Some(text) = pa.augment_system_prompt(agent_name, recent_message_text)
-                && !text.trim().is_empty()
+            if let crate::extension::caps::CapProvider::PromptAugmentation(_pa) = provider
+                && let Some(text) = self
+                    .resolve_prompt_augmentation(
+                        provider_name,
+                        agent_name,
+                        recent_message_text,
+                        session_db,
+                    )
+                    .await
+            {
+                parts.push(text);
+            }
+        }
+        parts.join("\n\n")
+    }
+
+    /// Collect context tail augmentations from all installed extensions
+    /// that provide the ContextTail cap.
+    ///
+    /// Mirrors [`Self::augment_system_prompt`] but fires at the end of
+    /// context assembly — appended after the conversation messages.
+    pub async fn context_tails(
+        &self,
+        agent_name: &str,
+        recent_message_text: &[String],
+        active_extensions: Option<&[String]>,
+        session_db: Option<&Database>,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let Some(map) = self
+            .cap_registry
+            .by_kind
+            .get(&crate::extension::caps::CapabilityKind::ContextTail)
+        else {
+            return String::new();
+        };
+        for (provider_name, provider) in &map.providers {
+            if let Some(active) = active_extensions
+                && !active.iter().any(|a| a == provider_name.as_str())
+            {
+                continue;
+            }
+            if let crate::extension::caps::CapProvider::ContextTail(_ct) = provider
+                && let Some(text) = self
+                    .resolve_context_tail(
+                        provider_name,
+                        agent_name,
+                        recent_message_text,
+                        session_db,
+                    )
+                    .await
             {
                 parts.push(text);
             }

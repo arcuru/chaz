@@ -806,7 +806,10 @@ impl Server {
             .with_tools(&tool_defs)
             .with_max_tokens_override(max_context_tokens)
             .with_room_participants(&roster)
+            .with_extension_hub(self.extensions.clone())
+            .with_session_db(session_db)
             .build()
+            .await
         };
 
         // Prepend the wake-prompt as a private System message. This is
@@ -1271,7 +1274,10 @@ impl Server {
                     .with_tools(&tool_defs)
                     .with_max_tokens_override(max_context_tokens)
                     .with_room_participants(&roster)
+                    .with_extension_hub(spawn_extensions.clone())
+                    .with_session_db(s.database())
                     .build()
+                    .await
             };
 
             if assembled.truncated {
