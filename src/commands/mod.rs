@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 mod agent;
 mod extensions;
-mod memory;
 mod session;
 mod sharing;
 
@@ -157,44 +156,6 @@ pub enum Command {
         pubkey: String,
     },
 
-    // --- Memory banks (Memory Banks Stage 9.D) ---
-    /// Create a new Memory Bank DB on this peer.
-    MemoryNew {
-        name: String,
-        description: Option<String>,
-    },
-    /// List every Memory Bank this peer hosts.
-    MemoryList,
-    /// Unregister a Memory Bank locally (index entry removed; DB preserved
-    /// for archive, same semantics as `AgentDelete`).
-    MemoryDelete(String),
-    /// Grant an agent access to a memory bank. Writes the agent's pubkey
-    /// to the bank's AuthSettings (authoritative) and mirrors a
-    /// `MemoryBankRef` into the agent's `memory_banks` subtree (view).
-    MemoryGrant {
-        bank_ref: String,
-        agent_ref: String,
-        permission: crate::agent_db::BankPermission,
-    },
-    /// Revoke an agent's access to a memory bank. Reverse of MemoryGrant.
-    MemoryRevoke {
-        bank_ref: String,
-        agent_ref: String,
-    },
-    /// Generate a `DatabaseTicket` URL for a memory bank so another peer
-    /// can import it via `/memory import`.
-    MemoryShare(String),
-    /// Stop sharing a memory bank DB — disable sync so this peer stops
-    /// serving it. Does not revoke keys.
-    MemoryUnshare(String),
-    /// Request access to a memory bank via eidetica's bootstrap workflow.
-    /// Same flow as `AgentImport` — preseeded pubkey → sync proceeds;
-    /// otherwise queued for `/sharing approve`. Default permission: write.
-    MemoryImport {
-        ticket: String,
-        permission: CoOwnerPermission,
-    },
-
     // --- Sharing queue (Co-owned Stage 11) ---
     /// List bootstrap requests on this peer's `_sync` DB that are still
     /// pending an admin's approval. Owner-side surface for `/sharing
@@ -274,7 +235,6 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "?",
     "agent",
     "extensions",
-    "memory",
     "sharing",
     "sync",
     "use",
@@ -373,25 +333,6 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         } => agent::agent_invite(&agent_ref, &pubkey, permission, ctx).await,
         Command::AgentRevokePeer { agent_ref, pubkey } => {
             agent::agent_revoke_peer(&agent_ref, &pubkey, ctx).await
-        }
-        Command::MemoryNew { name, description } => {
-            memory::memory_new(&name, description.as_deref(), ctx).await
-        }
-        Command::MemoryList => memory::memory_list(ctx).await,
-        Command::MemoryDelete(r) => memory::memory_delete(&r, ctx).await,
-        Command::MemoryGrant {
-            bank_ref,
-            agent_ref,
-            permission,
-        } => memory::memory_grant(&bank_ref, &agent_ref, permission, ctx).await,
-        Command::MemoryRevoke {
-            bank_ref,
-            agent_ref,
-        } => memory::memory_revoke(&bank_ref, &agent_ref, ctx).await,
-        Command::MemoryShare(r) => memory::memory_share(&r, ctx).await,
-        Command::MemoryUnshare(r) => memory::memory_unshare(&r, ctx).await,
-        Command::MemoryImport { ticket, permission } => {
-            memory::memory_import(&ticket, permission, ctx).await
         }
         Command::SharingRequests => sharing::sharing_requests(ctx).await,
         Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,

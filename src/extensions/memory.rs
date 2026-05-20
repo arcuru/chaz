@@ -101,6 +101,7 @@ async fn save_auto_recall_config(db: &Database, config: &AutoRecallConfig) -> an
 pub struct MemoryExtension {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -108,11 +109,13 @@ impl MemoryExtension {
     pub fn new(
         registry: Arc<SessionRegistry>,
         agent_index: HostedIndex,
+        memory_bank_index: HostedIndex,
         embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
         Self {
             registry,
             agent_index,
+            memory_bank_index,
             embedder,
         }
     }
@@ -147,6 +150,7 @@ impl Extension for MemoryExtension {
         let ct: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
             registry: self.registry.clone(),
             agent_index: self.agent_index.clone(),
+            memory_bank_index: self.memory_bank_index.clone(),
             embedder: self.embedder.clone(),
             session_attached_banks: Vec::new(),
         });
@@ -155,6 +159,7 @@ impl Extension for MemoryExtension {
         let ma: Arc<dyn MemoryAccess> = Arc::new(MemoryAccessImpl {
             registry: self.registry.clone(),
             agent_index: self.agent_index.clone(),
+            memory_bank_index: self.memory_bank_index.clone(),
             embedder: self.embedder.clone(),
         });
         map.insert(CapabilityKind::Memory, CapProvider::Memory(ma));
@@ -179,6 +184,7 @@ impl Extension for MemoryExtension {
         let ct: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
             registry: self.registry.clone(),
             agent_index: self.agent_index.clone(),
+            memory_bank_index: self.memory_bank_index.clone(),
             embedder: self.embedder.clone(),
             session_attached_banks: attached,
         });
@@ -226,12 +232,14 @@ impl Extension for MemoryExtension {
                 .register(
                     CommandDescriptor {
                         name: "memory".into(),
-                        description:
-                            "Manage memory banks and auto-recall — attach | detach | config".into(),
+                        description: "Manage memory banks: list | new | delete | grant | revoke | \
+                                      share | unshare | import | attach | detach | config"
+                            .into(),
                     },
                     Box::new(MemoryCommand {
                         registry: self.registry.clone(),
                         agent_index: self.agent_index.clone(),
+                        memory_bank_index: self.memory_bank_index.clone(),
                     }),
                 )
                 .await?;
@@ -246,6 +254,7 @@ impl Extension for MemoryExtension {
 struct MemoryContextTail {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
     /// Per-session attached bank names (from extension_settings["memory"]["attached_banks"]).
     /// Populated by [`MemoryExtension::build_session_providers`].
@@ -329,7 +338,7 @@ impl ContextTail for MemoryContextTail {
             // Search each bank
             let mut bank_results = String::new();
             for bank_name in &bank_names {
-                let Some(bank_entry) = self.agent_index.find_by_name(bank_name) else {
+                let Some(bank_entry) = self.memory_bank_index.find_by_name(bank_name) else {
                     continue;
                 };
                 let bank = match self
@@ -388,14 +397,16 @@ fn extract_query(recent_message_text: &[String]) -> String {
 
 struct MemoryAccessImpl {
     registry: Arc<SessionRegistry>,
+    #[allow(dead_code)] // Will be needed when MemoryScope::Agent is implemented.
     agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl MemoryAccess for MemoryAccessImpl {
     fn search<'a>(&'a self, query: &'a str, scope: MemoryScope) -> CapFuture<'a, Vec<MemoryHit>> {
         Box::pin(async move {
-            let db = open_scope_db(&self.registry, &self.agent_index, &scope).await?;
+            let db = open_scope_db(&self.registry, &self.memory_bank_index, &scope).await?;
             let formatted =
                 search_memory(&db, MEMORY_STORE, query, &[], 10, self.embedder.as_deref())
                     .await
@@ -411,7 +422,7 @@ impl MemoryAccess for MemoryAccessImpl {
         scope: MemoryScope,
     ) -> CapFuture<'a, ()> {
         Box::pin(async move {
-            let db = open_scope_db(&self.registry, &self.agent_index, &scope).await?;
+            let db = open_scope_db(&self.registry, &self.memory_bank_index, &scope).await?;
             let entry = MemoryEntry {
                 key: key.to_string(),
                 value: value.to_string(),
@@ -428,7 +439,7 @@ impl MemoryAccess for MemoryAccessImpl {
 
 async fn open_scope_db(
     registry: &SessionRegistry,
-    agent_index: &HostedIndex,
+    memory_bank_index: &HostedIndex,
     scope: &MemoryScope,
 ) -> anyhow::Result<Database> {
     match scope {
@@ -436,7 +447,7 @@ async fn open_scope_db(
             "MemoryScope::Agent not yet supported via cap; use Bank scope"
         )),
         MemoryScope::Bank { name } => {
-            let entry = agent_index
+            let entry = memory_bank_index
                 .find_by_name(name)
                 .ok_or_else(|| anyhow::anyhow!("memory bank not found: {}", name))?;
             let bank = registry
@@ -472,11 +483,13 @@ fn parse_memory_hits(formatted: &str) -> Vec<MemoryHit> {
 struct MemoryCommand {
     registry: Arc<SessionRegistry>,
     agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
 }
 
 impl ExtensionCommand for MemoryCommand {
     fn description(&self) -> &'static str {
-        "Manage memory banks and auto-recall — attach | detach | config"
+        "Manage memory banks: list | new | delete | grant | revoke | share | unshare | import | \
+         attach | detach | config"
     }
 
     fn invoke<'a>(
@@ -486,22 +499,448 @@ impl ExtensionCommand for MemoryCommand {
     ) -> Pin<Box<dyn Future<Output = ExtensionCommandOutcome> + Send + 'a>> {
         Box::pin(async move {
             let args = args.trim();
-            if let Some(bank_name) = args.strip_prefix("attach ") {
-                attach_cmd(bank_name.trim(), ctx).await
-            } else if let Some(bank_name) = args.strip_prefix("detach ") {
-                detach_cmd(bank_name.trim(), ctx).await
-            } else if args == "config" || args == "config show" {
-                config_show_cmd(ctx, &self.registry, &self.agent_index).await
-            } else if let Some(rest) = args.strip_prefix("config set ") {
-                config_set_cmd(rest.trim(), ctx, &self.registry, &self.agent_index).await
-            } else if args == "config reset" {
-                config_reset_cmd(ctx, &self.registry, &self.agent_index).await
-            } else {
-                ExtensionCommandOutcome::Error(format!(
-                    "Unknown memory sub-command: '{args}'. Use: attach <bank> | detach <bank> | config [show|set <key> <value>|reset]"
-                ))
+            // Bank CRUD — read-only first, then mutating, then sharing.
+            if args.is_empty() || args == "list" {
+                return self.list_cmd().await;
             }
+            if let Some(rest) = args.strip_prefix("new ") {
+                return self.new_cmd(rest.trim()).await;
+            }
+            if let Some(rest) = args
+                .strip_prefix("delete ")
+                .or_else(|| args.strip_prefix("del "))
+            {
+                return self.delete_cmd(rest.trim()).await;
+            }
+            if let Some(rest) = args.strip_prefix("grant ") {
+                return self.grant_cmd(rest.trim()).await;
+            }
+            if let Some(rest) = args.strip_prefix("revoke ") {
+                return self.revoke_cmd(rest.trim()).await;
+            }
+            if let Some(rest) = args.strip_prefix("share ") {
+                return self.share_cmd(rest.trim()).await;
+            }
+            if let Some(rest) = args.strip_prefix("unshare ") {
+                return self.unshare_cmd(rest.trim()).await;
+            }
+            if let Some(rest) = args.strip_prefix("import ") {
+                return self.import_cmd(rest.trim()).await;
+            }
+            // Per-session attachments and auto-recall config.
+            if let Some(bank_name) = args.strip_prefix("attach ") {
+                return attach_cmd(bank_name.trim(), ctx).await;
+            }
+            if let Some(bank_name) = args.strip_prefix("detach ") {
+                return detach_cmd(bank_name.trim(), ctx).await;
+            }
+            if args == "config" || args == "config show" {
+                return config_show_cmd(ctx, &self.registry, &self.agent_index).await;
+            }
+            if let Some(rest) = args.strip_prefix("config set ") {
+                return config_set_cmd(rest.trim(), ctx, &self.registry, &self.agent_index).await;
+            }
+            if args == "config reset" {
+                return config_reset_cmd(ctx, &self.registry, &self.agent_index).await;
+            }
+            ExtensionCommandOutcome::Error(format!(
+                "Unknown memory sub-command: '{args}'. Use: list | new <name> [desc] | \
+                 delete <bank> | grant <bank> <agent> <read|write> | revoke <bank> <agent> | \
+                 share <bank> | unshare <bank> | import <ticket> [admin|write|read] | \
+                 attach <bank> | detach <bank> | config [show|set <key> <value>|reset]"
+            ))
         })
+    }
+}
+
+// ── Bank CRUD — list/new/delete/grant/revoke/share/unshare/import ─────
+//
+// These were built-in `/memory` subcommands until memory became a
+// first-class extension. They now live alongside the per-session
+// attach/detach and auto-recall config so the entire `/memory` surface
+// flows through one extension command.
+
+impl MemoryCommand {
+    fn resolve_bank(&self, bank_ref: &str) -> Result<crate::hosted_index::DbEntry, String> {
+        if let Some(entry) = self.memory_bank_index.find_by_name(bank_ref) {
+            return Ok(entry);
+        }
+        if let Ok(id) = eidetica::entry::ID::parse(bank_ref)
+            && let Some(entry) = self.memory_bank_index.find_by_id(&id)
+        {
+            return Ok(entry);
+        }
+        Err(format!(
+            "No hosted memory bank matches '{bank_ref}' (try a display name from /memory list \
+             or a bank DB ID)"
+        ))
+    }
+
+    fn resolve_agent(&self, agent_ref: &str) -> Result<crate::hosted_index::DbEntry, String> {
+        if let Some(entry) = self.agent_index.find_by_name(agent_ref) {
+            return Ok(entry);
+        }
+        if let Ok(id) = eidetica::entry::ID::parse(agent_ref)
+            && let Some(entry) = self.agent_index.find_by_id(&id)
+        {
+            return Ok(entry);
+        }
+        Err(format!(
+            "No hosted agent matches '{agent_ref}' (try a display name from /agents or an agent \
+             DB ID)"
+        ))
+    }
+
+    async fn list_cmd(&self) -> ExtensionCommandOutcome {
+        let entries = self.memory_bank_index.list();
+        if entries.is_empty() {
+            return ExtensionCommandOutcome::Text(
+                "No memory banks on this peer. Create one with /memory new <name>.".into(),
+            );
+        }
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|e| format!("  {} ({})", e.display_name, e.db_id))
+            .collect();
+        ExtensionCommandOutcome::Text(format!("Memory banks on this peer:\n{}", lines.join("\n")))
+    }
+
+    async fn new_cmd(&self, rest: &str) -> ExtensionCommandOutcome {
+        let (name, desc) = match rest.split_once(char::is_whitespace) {
+            Some((n, d)) => (n.trim(), Some(d.trim().to_string())),
+            None => (rest, None),
+        };
+        let desc = desc.filter(|s| !s.is_empty());
+        if name.is_empty() {
+            return ExtensionCommandOutcome::Error("Memory bank name required".into());
+        }
+
+        let meta = crate::memory_bank_db::MemoryBankMeta {
+            display_name: Some(name.to_string()),
+            description: desc,
+        };
+
+        let (bank, pubkey) = match self.registry.create_new_memory_bank(name, &meta).await {
+            Ok(p) => p,
+            Err(e) => {
+                return ExtensionCommandOutcome::Error(format!(
+                    "Failed to create memory bank: {e}"
+                ));
+            }
+        };
+
+        self.memory_bank_index
+            .register(crate::hosted_index::DbEntry {
+                db_id: bank.id(),
+                display_name: name.to_string(),
+                pubkey,
+            });
+
+        ExtensionCommandOutcome::Text(format!(
+            "Created memory bank '{name}' (DB {}). Grant it to an agent with /memory grant.",
+            bank.id()
+        ))
+    }
+
+    async fn delete_cmd(&self, bank_ref: &str) -> ExtensionCommandOutcome {
+        if bank_ref.is_empty() {
+            return ExtensionCommandOutcome::Error("Usage: /memory delete <name|db_id>".into());
+        }
+        let entry = match self.resolve_bank(bank_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+
+        self.memory_bank_index.unregister(&entry.db_id);
+
+        ExtensionCommandOutcome::Text(format!(
+            "Deleted memory bank '{}' (DB {} preserved for archive). Agents with this bank in \
+             their memory_banks subtree will still see it listed — use /memory revoke to remove \
+             grants.",
+            entry.display_name, entry.db_id
+        ))
+    }
+
+    /// Order matters: auth (authoritative) → ref mirror. If the mirror
+    /// fails, best-effort revoke the auth so the two stores stay consistent.
+    async fn grant_cmd(&self, rest: &str) -> ExtensionCommandOutcome {
+        let mut parts = rest.splitn(3, char::is_whitespace);
+        let bank_ref = parts.next().unwrap_or("").trim();
+        let agent_ref = parts.next().unwrap_or("").trim();
+        let perm_tok = parts.next().unwrap_or("").trim();
+        if bank_ref.is_empty() || agent_ref.is_empty() || perm_tok.is_empty() {
+            return ExtensionCommandOutcome::Error(
+                "Usage: /memory grant <bank> <agent> <read|write>".into(),
+            );
+        }
+        let permission = match perm_tok.to_ascii_lowercase().as_str() {
+            "read" | "r" => crate::agent_db::BankPermission::Read,
+            "write" | "w" => crate::agent_db::BankPermission::Write,
+            _ => {
+                return ExtensionCommandOutcome::Error(format!(
+                    "Unknown permission '{perm_tok}' — use read or write"
+                ));
+            }
+        };
+
+        let bank = match self.resolve_bank(bank_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+        let agent = match self.resolve_agent(agent_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+
+        let key_label = format!("memory:{}:{}", bank.display_name, agent.display_name);
+        if let Err(e) = self
+            .registry
+            .grant_on_memory_bank(&bank.db_id, &agent.pubkey, &key_label, permission)
+            .await
+        {
+            return ExtensionCommandOutcome::Error(format!(
+                "Failed to authorize agent on bank: {e}"
+            ));
+        }
+
+        let agent_db = match self
+            .registry
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+        {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                let _ = self
+                    .registry
+                    .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+                    .await;
+                return ExtensionCommandOutcome::Error(format!(
+                    "Granted auth but can't open agent '{}'s DB to record the ref — rolled back",
+                    agent.display_name
+                ));
+            }
+            Err(e) => {
+                let _ = self
+                    .registry
+                    .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+                    .await;
+                return ExtensionCommandOutcome::Error(format!(
+                    "Granted auth but failed to open agent DB — rolled back: {e}"
+                ));
+            }
+        };
+
+        let ref_entry = crate::agent_db::MemoryBankRef {
+            name: bank.display_name.clone(),
+            db_id: bank.db_id.to_string(),
+            permission,
+        };
+        if let Err(e) = agent_db.attach_memory_bank(ref_entry).await {
+            let _ = self
+                .registry
+                .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+                .await;
+            return ExtensionCommandOutcome::Error(format!(
+                "Granted auth but failed to write ref to agent DB — rolled back: {e}"
+            ));
+        }
+
+        ExtensionCommandOutcome::Text(format!(
+            "Granted agent '{}' {:?} access to memory bank '{}'",
+            agent.display_name, permission, bank.display_name
+        ))
+    }
+
+    async fn revoke_cmd(&self, rest: &str) -> ExtensionCommandOutcome {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let bank_ref = parts.next().unwrap_or("").trim();
+        let agent_ref = parts.next().unwrap_or("").trim();
+        if bank_ref.is_empty() || agent_ref.is_empty() {
+            return ExtensionCommandOutcome::Error("Usage: /memory revoke <bank> <agent>".into());
+        }
+        let bank = match self.resolve_bank(bank_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+        let agent = match self.resolve_agent(agent_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+
+        if let Err(e) = self
+            .registry
+            .revoke_on_memory_bank(&bank.db_id, &agent.pubkey)
+            .await
+        {
+            return ExtensionCommandOutcome::Error(format!("Failed to revoke auth: {e}"));
+        }
+
+        let ref_removed = match self
+            .registry
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+        {
+            Ok(Some(db)) => db.detach_memory_bank(&bank.display_name).await.ok(),
+            _ => None,
+        };
+
+        let mut msg = format!(
+            "Revoked agent '{}'s access to memory bank '{}'",
+            agent.display_name, bank.display_name
+        );
+        if ref_removed != Some(true) {
+            msg.push_str(
+                " (note: couldn't remove the ref from the agent's memory_banks subtree — auth \
+                 is revoked regardless)",
+            );
+        }
+        ExtensionCommandOutcome::Text(msg)
+    }
+
+    async fn share_cmd(&self, bank_ref: &str) -> ExtensionCommandOutcome {
+        if bank_ref.is_empty() {
+            return ExtensionCommandOutcome::Error("Usage: /memory share <bank>".into());
+        }
+        let entry = match self.resolve_bank(bank_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+        let instance = self.registry.instance();
+        if instance.sync().is_none() {
+            return ExtensionCommandOutcome::Error("Sync not enabled".into());
+        }
+        match self.registry.share_for(&entry.db_id).await {
+            Ok(ticket) => ExtensionCommandOutcome::Text(format!(
+                "Share this ticket to sync memory bank '{}' (DB {}):\n\n{ticket}",
+                entry.display_name, entry.db_id
+            )),
+            Err(e) => ExtensionCommandOutcome::Error(format!("Failed to share memory bank: {e}")),
+        }
+    }
+
+    async fn unshare_cmd(&self, bank_ref: &str) -> ExtensionCommandOutcome {
+        if bank_ref.is_empty() {
+            return ExtensionCommandOutcome::Error("Usage: /memory unshare <bank>".into());
+        }
+        let entry = match self.resolve_bank(bank_ref) {
+            Ok(e) => e,
+            Err(msg) => return ExtensionCommandOutcome::Error(msg),
+        };
+        match self.registry.disable_sync_for(&entry.db_id).await {
+            Ok(()) => ExtensionCommandOutcome::Text(format!(
+                "Sync disabled for memory bank '{}' — it is no longer shared.",
+                entry.display_name
+            )),
+            Err(e) => ExtensionCommandOutcome::Error(format!("Failed to disable sync: {e}")),
+        }
+    }
+
+    async fn import_cmd(&self, rest: &str) -> ExtensionCommandOutcome {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let ticket_str = parts.next().unwrap_or("").trim();
+        let perm_tok = parts.next().unwrap_or("").trim();
+        if ticket_str.is_empty() {
+            return ExtensionCommandOutcome::Error(
+                "Usage: /memory import <ticket> [admin|write|read]".into(),
+            );
+        }
+        let permission = match perm_tok {
+            "" => crate::commands::CoOwnerPermission::Write,
+            other => match crate::commands::parse_permission_token(other) {
+                Some(p) => p,
+                None => {
+                    return ExtensionCommandOutcome::Error(format!(
+                        "Unknown permission '{other}' — use admin, write, or read (default: write)"
+                    ));
+                }
+            },
+        };
+        let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
+            Ok(t) => t,
+            Err(e) => return ExtensionCommandOutcome::Error(format!("Invalid ticket: {e}")),
+        };
+        let db_id = ticket.database_id().clone();
+        let eidetica_perm = match permission {
+            crate::commands::CoOwnerPermission::Admin => {
+                eidetica::auth::types::Permission::Admin(1)
+            }
+            crate::commands::CoOwnerPermission::Write => {
+                eidetica::auth::types::Permission::Write(10)
+            }
+            crate::commands::CoOwnerPermission::Read => eidetica::auth::types::Permission::Read,
+        };
+
+        match self
+            .registry
+            .request_db_access(&ticket, eidetica_perm)
+            .await
+        {
+            Ok(crate::session::BootstrapOutcome::Approved) => {}
+            Ok(crate::session::BootstrapOutcome::Pending {
+                request_id,
+                message: _,
+            }) => {
+                return ExtensionCommandOutcome::Text(format!(
+                    "Bootstrap request {request_id} pending the owner's approval. Re-run \
+                     `/memory import <ticket>` after they run `/sharing approve {request_id}`."
+                ));
+            }
+            Err(e) => return ExtensionCommandOutcome::Error(format!("Bootstrap failed: {e}")),
+        }
+
+        let bank_db = match self.registry.open_memory_bank(&db_id, None).await {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                return ExtensionCommandOutcome::Error(format!(
+                    "Bootstrap reported success on memory bank {db_id} but this peer still holds \
+                     no key. Likely an eidetica state mismatch — re-run the import to retry."
+                ));
+            }
+            Err(e) => {
+                return ExtensionCommandOutcome::Error(format!("Failed to open synced bank: {e}"));
+            }
+        };
+
+        let meta = match bank_db.read_meta().await {
+            Ok(m) => m,
+            Err(e) => {
+                return ExtensionCommandOutcome::Error(format!("Failed to read bank meta: {e}"));
+            }
+        };
+        let display_name = meta.display_name.clone().unwrap_or_else(|| {
+            format!(
+                "bank-{}",
+                &db_id.to_string()[..8.min(db_id.to_string().len())]
+            )
+        });
+
+        let pubkey = match self.registry.find_key_for_db(&db_id).await {
+            Ok(Some(k)) => k,
+            _ => {
+                return ExtensionCommandOutcome::Error(
+                    "Expected a key for this DB (open succeeded) but find_key returned None".into(),
+                );
+            }
+        };
+
+        self.memory_bank_index
+            .register(crate::hosted_index::DbEntry {
+                db_id: db_id.clone(),
+                display_name: display_name.clone(),
+                pubkey,
+            });
+
+        if let Err(e) = self.registry.enable_sync_for(&db_id).await {
+            return ExtensionCommandOutcome::Error(format!(
+                "Imported memory bank '{display_name}' (DB {db_id}) but failed to enable ongoing \
+                 sync: {e}"
+            ));
+        }
+
+        ExtensionCommandOutcome::Text(format!(
+            "Imported memory bank '{display_name}' (DB {db_id}). Grant it to agents with \
+             /memory grant {display_name} <agent> <read|write>."
+        ))
     }
 }
 
@@ -798,4 +1237,250 @@ fn is_stopword(word: &str) -> bool {
             | "up"
             | "out"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentRegistry;
+    use crate::agent_db::{AgentDbConfig, AgentMeta};
+    use crate::hosted_index::DbEntry;
+    use crate::session::SessionRegistry;
+    use eidetica::Instance;
+    use eidetica::backend::database::InMemory;
+
+    /// Build a MemoryCommand wired to an in-memory eidetica instance plus
+    /// empty hosted indices. Returns the command and the registry so
+    /// tests can seed agents/banks through the command itself.
+    async fn fixture() -> (Instance, Arc<SessionRegistry>, MemoryCommand) {
+        let backend = InMemory::new();
+        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = instance.create_user("test", None).await;
+        let user = instance.login_user("test", None).await.unwrap();
+        let agents = Arc::new(AgentRegistry::with_default_agent());
+        let registry = Arc::new(
+            SessionRegistry::new(instance.clone(), user, agents)
+                .await
+                .unwrap(),
+        );
+        let agent_index = HostedIndex::empty("agent");
+        let memory_bank_index = HostedIndex::empty("bank");
+        let cmd = MemoryCommand {
+            registry: registry.clone(),
+            agent_index,
+            memory_bank_index,
+        };
+        (instance, registry, cmd)
+    }
+
+    /// Provision an agent through the registry and register it with the
+    /// command's agent_index. Mirrors what `/agent new` would do.
+    async fn seed_agent(registry: &SessionRegistry, cmd: &MemoryCommand, name: &str) {
+        let (agent_db, pubkey) = registry
+            .create_new_agent_db(
+                name,
+                &AgentDbConfig::default(),
+                &AgentMeta {
+                    display_name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        cmd.agent_index.register(DbEntry {
+            db_id: agent_db.id(),
+            display_name: name.into(),
+            pubkey,
+        });
+    }
+
+    fn assert_text(outcome: ExtensionCommandOutcome, needle: &str) {
+        match outcome {
+            ExtensionCommandOutcome::Text(s) => {
+                assert!(s.contains(needle), "expected `{needle}` in `{s}`");
+            }
+            ExtensionCommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    fn assert_error(outcome: ExtensionCommandOutcome, needle: &str) {
+        match outcome {
+            ExtensionCommandOutcome::Error(e) => {
+                assert!(e.contains(needle), "expected `{needle}` in error `{e}`");
+            }
+            ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_cmd_creates_and_registers_bank() {
+        let (_i, _r, cmd) = fixture().await;
+        assert_text(cmd.new_cmd("patrick notes about Patrick").await, "patrick");
+        let banks = cmd.memory_bank_index.list();
+        assert_eq!(banks.len(), 1);
+        assert_eq!(banks[0].display_name, "patrick");
+    }
+
+    #[tokio::test]
+    async fn new_cmd_rejects_duplicate_name() {
+        let (_i, _r, cmd) = fixture().await;
+        cmd.new_cmd("patrick").await;
+        assert_error(cmd.new_cmd("patrick").await, "already exists");
+    }
+
+    #[tokio::test]
+    async fn list_cmd_shows_created_banks() {
+        let (_i, _r, cmd) = fixture().await;
+        assert_text(cmd.list_cmd().await, "No memory banks");
+        for name in ["patrick", "projects"] {
+            cmd.new_cmd(name).await;
+        }
+        match cmd.list_cmd().await {
+            ExtensionCommandOutcome::Text(s) => {
+                assert!(s.contains("patrick"), "missing patrick: {s}");
+                assert!(s.contains("projects"), "missing projects: {s}");
+            }
+            ExtensionCommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_cmd_unregisters_but_preserves_db() {
+        let (_i, registry, cmd) = fixture().await;
+        cmd.new_cmd("patrick").await;
+        let db_id = cmd.memory_bank_index.find_by_name("patrick").unwrap().db_id;
+
+        assert_text(cmd.delete_cmd("patrick").await, "Deleted");
+        assert!(cmd.memory_bank_index.find_by_name("patrick").is_none());
+
+        // DB itself is still openable (archive preserved).
+        assert!(
+            registry
+                .open_memory_bank(&db_id, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_cmd_unknown_errors() {
+        let (_i, _r, cmd) = fixture().await;
+        assert_error(cmd.delete_cmd("ghost").await, "No hosted memory bank");
+    }
+
+    #[tokio::test]
+    async fn grant_cmd_writes_auth_and_ref() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        cmd.new_cmd("patrick").await;
+        let agent_db_id = cmd.agent_index.find_by_name("alpha").unwrap().db_id;
+        let bank_db_id = cmd.memory_bank_index.find_by_name("patrick").unwrap().db_id;
+
+        match cmd.grant_cmd("patrick alpha write").await {
+            ExtensionCommandOutcome::Text(s) => {
+                assert!(s.contains("patrick"));
+                assert!(s.contains("Write"));
+            }
+            ExtensionCommandOutcome::Error(e) => panic!("unexpected: {e}"),
+        }
+
+        let agent_db = registry
+            .open_agent_db(&agent_db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let banks = agent_db.list_memory_banks().await.unwrap();
+        assert_eq!(banks.len(), 1);
+        assert_eq!(banks[0].name, "patrick");
+        assert_eq!(banks[0].db_id, bank_db_id.to_string());
+        assert_eq!(banks[0].permission, crate::agent_db::BankPermission::Write);
+    }
+
+    #[tokio::test]
+    async fn revoke_cmd_reverses_grant() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        cmd.new_cmd("patrick").await;
+        let agent_db_id = cmd.agent_index.find_by_name("alpha").unwrap().db_id;
+        cmd.grant_cmd("patrick alpha read").await;
+
+        let agent_db = registry
+            .open_agent_db(&agent_db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent_db.list_memory_banks().await.unwrap().len(), 1);
+
+        assert_text(cmd.revoke_cmd("patrick alpha").await, "Revoked");
+
+        let agent_db = registry
+            .open_agent_db(&agent_db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(agent_db.list_memory_banks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn share_cmd_unknown_bank_errors() {
+        let (_i, _r, cmd) = fixture().await;
+        assert_error(cmd.share_cmd("ghost").await, "No hosted memory bank");
+    }
+
+    #[tokio::test]
+    async fn import_cmd_rejects_invalid_ticket() {
+        let (_i, _r, cmd) = fixture().await;
+        // Sync may or may not be enabled in the fixture; either path surfaces
+        // a clean Error.
+        match cmd.import_cmd("not-a-ticket").await {
+            ExtensionCommandOutcome::Error(e) => {
+                assert!(
+                    e.contains("Invalid ticket") || e.contains("Sync not enabled"),
+                    "got {e}"
+                );
+            }
+            ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_cmd_unknown_bank_errors() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        assert_error(
+            cmd.grant_cmd("nope alpha read").await,
+            "No hosted memory bank",
+        );
+    }
+
+    /// Bank-name resolution is duplicated against the agent path — make
+    /// sure the wrong index isn't accepted by mistake.
+    #[tokio::test]
+    async fn grant_cmd_bank_and_agent_indices_are_disjoint() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        // No bank named "alpha" exists, even though an agent does.
+        assert_error(
+            cmd.grant_cmd("alpha alpha write").await,
+            "No hosted memory bank",
+        );
+    }
+
+    #[tokio::test]
+    async fn new_cmd_rejects_empty_name() {
+        let (_i, _r, cmd) = fixture().await;
+        assert_error(cmd.new_cmd("").await, "name required");
+    }
+
+    #[tokio::test]
+    async fn grant_cmd_rejects_bad_permission() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        cmd.new_cmd("patrick").await;
+        assert_error(
+            cmd.grant_cmd("patrick alpha wat").await,
+            "Unknown permission",
+        );
+    }
 }

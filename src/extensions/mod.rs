@@ -32,6 +32,7 @@ use std::sync::{Arc, OnceLock};
 /// as more extensions are added.
 pub struct BuiltinDeps {
     pub agent_index: HostedIndex,
+    pub memory_bank_index: HostedIndex,
     pub session_registry: Arc<SessionRegistry>,
     pub embedder: Option<Arc<dyn Embedder>>,
     pub web_search_backends: Vec<SearchBackend>,
@@ -59,6 +60,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
         Arc::new(memory::MemoryExtension::new(
             session_registry.clone(),
             deps.agent_index.clone(),
+            deps.memory_bank_index.clone(),
             deps.embedder,
         )),
         Arc::new(schedule::ScheduleExtension::new()),

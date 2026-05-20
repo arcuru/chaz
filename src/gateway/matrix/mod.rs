@@ -564,88 +564,10 @@ impl Gateway for MatrixGateway {
             "Show this peer's default pubkey (for /agent invite on another peer)",
             |_t| { Some(Command::Pubkey) }
         );
-        register_shared!(
-            "memory",
-            "new|list|delete|grant|revoke|share|import <arg>".to_string(),
-            "Manage memory banks: create/list/delete/grant/revoke/share/import",
-            |text| {
-                let arg = matrix_args(&text);
-                let mut parts = arg.trim().splitn(2, char::is_whitespace);
-                let sub = parts.next().unwrap_or("").trim();
-                let rest = parts.next().unwrap_or("").trim();
-                match sub {
-                    "list" | "" => Some(Command::MemoryList),
-                    "new" if !rest.is_empty() => {
-                        let (name, desc) = match rest.split_once(char::is_whitespace) {
-                            Some((n, r)) => (n.trim(), Some(r.trim().to_string())),
-                            None => (rest, None),
-                        };
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some(Command::MemoryNew {
-                                name: name.to_string(),
-                                description: desc.filter(|s| !s.is_empty()),
-                            })
-                        }
-                    }
-                    "delete" | "del" if !rest.is_empty() => {
-                        Some(Command::MemoryDelete(rest.to_string()))
-                    }
-                    "grant" if !rest.is_empty() => (|| {
-                        let mut gparts = rest.splitn(3, char::is_whitespace);
-                        let bank = gparts.next().unwrap_or("").trim();
-                        let agent = gparts.next().unwrap_or("").trim();
-                        let perm = gparts.next().unwrap_or("").trim();
-                        let permission = match perm.to_ascii_lowercase().as_str() {
-                            "read" | "r" => crate::agent_db::BankPermission::Read,
-                            "write" | "w" => crate::agent_db::BankPermission::Write,
-                            _ => return None,
-                        };
-                        if bank.is_empty() || agent.is_empty() {
-                            return None;
-                        }
-                        Some(Command::MemoryGrant {
-                            bank_ref: bank.to_string(),
-                            agent_ref: agent.to_string(),
-                            permission,
-                        })
-                    })(),
-                    "revoke" if !rest.is_empty() => {
-                        let mut rparts = rest.splitn(2, char::is_whitespace);
-                        let bank = rparts.next().unwrap_or("").trim();
-                        let agent = rparts.next().unwrap_or("").trim();
-                        if bank.is_empty() || agent.is_empty() {
-                            None
-                        } else {
-                            Some(Command::MemoryRevoke {
-                                bank_ref: bank.to_string(),
-                                agent_ref: agent.to_string(),
-                            })
-                        }
-                    }
-                    "share" if !rest.is_empty() => Some(Command::MemoryShare(rest.to_string())),
-                    "unshare" if !rest.is_empty() => Some(Command::MemoryUnshare(rest.to_string())),
-                    "import" if !rest.is_empty() => (|| {
-                        let mut parts = rest.splitn(2, char::is_whitespace);
-                        let ticket = parts.next().unwrap_or("").trim();
-                        let perm_tok = parts.next().unwrap_or("").trim();
-                        if ticket.is_empty() {
-                            return None;
-                        }
-                        let permission = match perm_tok {
-                            "" => crate::commands::CoOwnerPermission::Write,
-                            other => crate::commands::parse_permission_token(other)?,
-                        };
-                        Some(Command::MemoryImport {
-                            ticket: ticket.to_string(),
-                            permission,
-                        })
-                    })(),
-                    _ => None,
-                }
-            }
-        );
+        // `/memory …` is wholly owned by the memory extension — every
+        // subcommand routes through `Command::Extension`, registered by
+        // the extension-command loop further down. Built-in name
+        // reservations no longer list "memory".
 
         // --- Bootstrap-queue surface (Co-owned Stage 11) ---
         register_shared!(

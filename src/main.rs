@@ -462,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
     // attribution, per-session filtering, hook surface.
     let mut extensions = extensions::all_builtins(extensions::BuiltinDeps {
         agent_index: agent_index_store.clone(),
+        memory_bank_index: memory_bank_index_store.clone(),
         session_registry: registry.clone(),
         embedder: embedder.clone(),
         web_search_backends,

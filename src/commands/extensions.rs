@@ -268,6 +268,7 @@ mod tests {
         let spawn_cell = Arc::new(OnceLock::new());
         hub.install_all(all_builtins(BuiltinDeps {
             agent_index: agent_index.clone(),
+            memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),
             session_registry: registry.clone(),
             embedder: None,
             web_search_backends: Vec::new(),
