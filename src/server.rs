@@ -265,6 +265,26 @@ impl Server {
         active
     }
 
+    /// Session active set narrowed by the responding agent's opt-outs.
+    ///
+    /// The session set is the upper bound (cached, default-on). The
+    /// agent can only *remove* from it — `effective = session − agent
+    /// opt-outs` — so an agent never silently re-enables an extension
+    /// the session disabled. An agent with no extension records (the
+    /// common case) leaves the session set untouched.
+    pub async fn active_extensions_for_agent(
+        &self,
+        session_db_id: &str,
+        agent_name: &str,
+    ) -> std::collections::HashSet<String> {
+        let session_active = self.active_extensions_for(session_db_id).await;
+        let disabled = self.agent_disabled_extensions(agent_name).await;
+        if disabled.is_empty() {
+            return session_active;
+        }
+        session_active.difference(&disabled).cloned().collect()
+    }
+
     /// Recompute the per-session active set from the session DB (without
     /// using the in-memory cache) and refresh the cache. Called after
     /// `/extensions add|remove` writes an event.
@@ -712,6 +732,35 @@ impl Server {
         outcome.map(|_| ())
     }
 
+    /// Open a hosted agent's Living Agent DB by display name. `None` if
+    /// the agent isn't in this peer's hosted index or the DB can't be
+    /// opened (no key / read error). Used by per-agent extension
+    /// activation (`/extensions … agent`) and the dispatch-time filter.
+    pub async fn open_agent_db_by_name(
+        &self,
+        agent_name: &str,
+    ) -> Option<crate::agent_db::AgentDb> {
+        let entry = self.agent_index.find_by_name(agent_name)?;
+        self.open_agent_db_for_schedule(&entry).await
+    }
+
+    /// Per-agent narrowing filter: extension names the agent has
+    /// explicitly opted out of, folded from its Living Agent DB's
+    /// sparse `extensions` log. Empty when the agent has no records or
+    /// isn't hosted here — i.e. "no opinion, allow everything the
+    /// session allows".
+    pub async fn agent_disabled_extensions(
+        &self,
+        agent_name: &str,
+    ) -> std::collections::HashSet<String> {
+        let Some(adb) = self.open_agent_db_by_name(agent_name).await else {
+            return std::collections::HashSet::new();
+        };
+        crate::extension::read_disabled(adb.database())
+            .await
+            .unwrap_or_default()
+    }
+
     /// Open the agent's Living Agent DB if this peer hosts the agent.
     async fn open_agent_db_for_schedule(
         &self,
@@ -774,7 +823,9 @@ impl Server {
             .cloned()
             .unwrap_or_default();
 
-        let active_extensions = self.active_extensions_for(session_db_id).await;
+        let active_extensions = self
+            .active_extensions_for_agent(session_db_id, agent_name)
+            .await;
         let scoped_tools = ScopedTools::new(self.tools.clone(), allowed_tools)
             .with_active_extensions(Some(active_extensions.clone()));
 
@@ -1224,7 +1275,9 @@ impl Server {
         let host = self.host.clone();
         let spawn_extensions = self.extensions.clone();
         let max_context_tokens = agent.max_context_tokens;
-        let active_extensions = self.active_extensions_for(&session_db_id).await;
+        let active_extensions = self
+            .active_extensions_for_agent(&session_db_id, &agent_name)
+            .await;
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");

@@ -791,23 +791,23 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         )));
     }
     if let Some(arg) = text.strip_prefix("/extensions add ") {
-        let name = arg.trim().to_string();
+        let (name, scope) = crate::commands::split_ext_scope(arg);
         if name.is_empty() {
-            show_error(app, "Usage: /extensions add <name>".into());
+            show_error(app, "Usage: /extensions add <name> [agent]".into());
             return None;
         }
         return Some(ChatAction::Dispatch(Command::Extensions(
-            ExtensionsAction::Add(name),
+            ExtensionsAction::Add(name, scope),
         )));
     }
     if let Some(arg) = text.strip_prefix("/extensions remove ") {
-        let name = arg.trim().to_string();
+        let (name, scope) = crate::commands::split_ext_scope(arg);
         if name.is_empty() {
-            show_error(app, "Usage: /extensions remove <name>".into());
+            show_error(app, "Usage: /extensions remove <name> [agent]".into());
             return None;
         }
         return Some(ChatAction::Dispatch(Command::Extensions(
-            ExtensionsAction::Remove(name),
+            ExtensionsAction::Remove(name, scope),
         )));
     }
     if let Some(arg) = text.strip_prefix("/extensions settings ") {

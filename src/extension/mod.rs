@@ -284,12 +284,37 @@ pub async fn read_active(session_db: &Database) -> anyhow::Result<Vec<ExtensionR
     Ok(active)
 }
 
-/// Append a single event to the session's extension log.
+/// Fold an extension event log into the set of names whose latest
+/// event is `Deactivated`.
 ///
-/// Public for the upcoming runtime remove API (writes a `Deactivated`)
-/// and for tests; the activation path goes through
+/// Where [`read_active`] expects a *comprehensive* log (the session
+/// path writes an `Activated` for every extension at `session_start`),
+/// this expects a *sparse* log: the per-agent extension log only
+/// records explicit opt-outs/opt-ins, so absence of an event means
+/// "no opinion → allowed". An extension is disabled for this scope iff
+/// its latest event is `Deactivated`.
+///
+/// Used to build the per-agent narrowing filter: an agent can only
+/// remove extensions from the session's active set, never add — so the
+/// dispatch path computes `session_active − read_disabled(agent_db)`.
+pub async fn read_disabled(db: &Database) -> anyhow::Result<HashSet<String>> {
+    let mut events = list_events(db).await?;
+    events.sort_by_key(|e| e.timestamp());
+    let mut latest: HashMap<String, ExtensionEvent> = HashMap::new();
+    for e in events {
+        latest.insert(e.name().to_string(), e);
+    }
+    Ok(latest
+        .into_iter()
+        .filter_map(|(name, e)| matches!(e, ExtensionEvent::Deactivated { .. }).then_some(name))
+        .collect())
+}
+
+/// Append a single event to an extension log (session or agent DB).
+///
+/// Used by the runtime remove API (writes a `Deactivated`) and tests;
+/// the session activation path goes through
 /// [`ExtensionHub::record_active`] which batches writes.
-#[allow(dead_code)]
 pub async fn append_event(session_db: &Database, event: ExtensionEvent) -> anyhow::Result<()> {
     let txn = session_db.new_transaction().await?;
     let store = txn
@@ -1990,6 +2015,47 @@ mod tests {
         let active = read_active(&db).await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name(), "beta");
+    }
+
+    #[tokio::test]
+    async fn read_disabled_returns_only_latest_deactivated_names() {
+        let (_inst, db) = make_session_db().await;
+        let t0 = Utc::now();
+        // memory: removed (Deactivated) — should be in the disabled set.
+        append_event(
+            &db,
+            ExtensionEvent::Deactivated {
+                name: "memory".into(),
+                timestamp: t0,
+            },
+        )
+        .await
+        .unwrap();
+        // web: removed then re-added — latest is Activated, so NOT disabled.
+        append_event(
+            &db,
+            ExtensionEvent::Deactivated {
+                name: "web".into(),
+                timestamp: t0,
+            },
+        )
+        .await
+        .unwrap();
+        append_event(
+            &db,
+            ExtensionEvent::Activated {
+                name: "web".into(),
+                extension_ref: ExtensionRef::builtin("web"),
+                timestamp: t0 + chrono::Duration::seconds(10),
+            },
+        )
+        .await
+        .unwrap();
+
+        let disabled = read_disabled(&db).await.unwrap();
+        assert_eq!(disabled.len(), 1);
+        assert!(disabled.contains("memory"));
+        assert!(!disabled.contains("web"));
     }
 
     struct VersionedExt(&'static str, &'static str);

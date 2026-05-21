@@ -3,6 +3,7 @@ mod history;
 
 use crate::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, ExtensionsAction,
+    split_ext_scope,
 };
 use crate::config::Config;
 use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
@@ -782,8 +783,8 @@ impl Gateway for MatrixGateway {
 
         register_shared!(
             "extensions",
-            "list|add|remove|settings|set [args]".to_string(),
-            "Per-session extension control",
+            "list | add|remove <name> [agent] | settings|set <name> …".to_string(),
+            "Per-session/per-agent extension control",
             |text| {
                 let arg = matrix_args(&text);
                 let trimmed = arg.trim();
@@ -793,11 +794,13 @@ impl Gateway for MatrixGateway {
                 match sub {
                     "" | "list" => Some(Command::Extensions(ExtensionsAction::List)),
                     "add" if !rest.is_empty() => {
-                        Some(Command::Extensions(ExtensionsAction::Add(rest.to_string())))
+                        let (name, scope) = split_ext_scope(rest);
+                        Some(Command::Extensions(ExtensionsAction::Add(name, scope)))
                     }
-                    "remove" | "rm" if !rest.is_empty() => Some(Command::Extensions(
-                        ExtensionsAction::Remove(rest.to_string()),
-                    )),
+                    "remove" | "rm" if !rest.is_empty() => {
+                        let (name, scope) = split_ext_scope(rest);
+                        Some(Command::Extensions(ExtensionsAction::Remove(name, scope)))
+                    }
                     "settings" if !rest.is_empty() => Some(Command::Extensions(
                         ExtensionsAction::Settings(rest.to_string()),
                     )),

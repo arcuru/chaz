@@ -30,7 +30,7 @@ mod extensions;
 mod session;
 mod sharing;
 
-pub use extensions::ExtensionsAction;
+pub use extensions::{ExtensionsAction, split_ext_scope};
 
 /// User-visible permission level for co-ownership grants on an Agent DB
 /// (Co-owned Agents Stage 10). Stays separate from eidetica's `Permission`

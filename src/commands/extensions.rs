@@ -12,10 +12,14 @@
 //! - `/extensions` / `/extensions list` — list every extension on this peer
 //!   with active/inactive status, [`crate::extension::ExtensionRef`]
 //!   (so version drift is visible), and declared hook kinds.
-//! - `/extensions add <name>` — activate `<name>` on this session
-//!   (appends an `Activated` event and refreshes the cache).
-//! - `/extensions remove <name>` — deactivate; survives restarts via
-//!   the `record_active` reconciler's "respect Deactivated" rule.
+//! - `/extensions add <name> [agent]` — activate `<name>`. Default
+//!   scope is the session (appends an `Activated` event, refreshes the
+//!   cache). With a trailing `agent`, clears the responding agent's
+//!   opt-out on its Living Agent DB instead.
+//! - `/extensions remove <name> [agent]` — deactivate. Session scope
+//!   survives restarts via the `record_active` reconciler's "respect
+//!   Deactivated" rule. Agent scope records an opt-out that only
+//!   narrows the session set for that one agent and travels with it.
 //! - `/extensions settings <name>` — print the per-session settings
 //!   JSON for `<name>`.
 //! - `/extensions set <name> <key> <value>` — merge `key = value` into
@@ -27,12 +31,25 @@ use super::{CommandContext, CommandOutcome};
 use crate::extension::{ExtensionEvent, ExtensionHub, ExtensionRef, append_event, list_events};
 use chrono::{DateTime, Utc};
 
+/// Which activation log an `add`/`remove` targets.
+///
+/// - `Session` (default) — the session's `extensions` log; affects
+///   every agent responding in the session.
+/// - `Agent` — the responding agent's Living Agent DB log. The agent
+///   can only *narrow* the session set (an opt-out), and its records
+///   travel with the agent when it syncs to other peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtScope {
+    Session,
+    Agent,
+}
+
 /// Parsed `/extensions <action>` from the gateway parser.
 #[derive(Debug)]
 pub enum ExtensionsAction {
     List,
-    Add(String),
-    Remove(String),
+    Add(String, ExtScope),
+    Remove(String, ExtScope),
     Settings(String),
     Set {
         name: String,
@@ -44,8 +61,8 @@ pub enum ExtensionsAction {
 pub async fn dispatch(action: ExtensionsAction, ctx: &CommandContext<'_>) -> CommandOutcome {
     match action {
         ExtensionsAction::List => list(ctx).await,
-        ExtensionsAction::Add(name) => add(&name, ctx).await,
-        ExtensionsAction::Remove(name) => remove(&name, ctx).await,
+        ExtensionsAction::Add(name, scope) => add(&name, scope, ctx).await,
+        ExtensionsAction::Remove(name, scope) => remove(&name, scope, ctx).await,
         ExtensionsAction::Settings(name) => settings(&name, ctx).await,
         ExtensionsAction::Set { name, key, value } => set(&name, &key, &value, ctx).await,
     }
@@ -54,6 +71,8 @@ pub async fn dispatch(action: ExtensionsAction, ctx: &CommandContext<'_>) -> Com
 async fn list(ctx: &CommandContext<'_>) -> CommandOutcome {
     let hub = ctx.server.extensions();
     let active = ctx.server.active_extensions_for(ctx.session_db_id).await;
+    let agent = ctx.current_agent;
+    let agent_disabled = ctx.server.agent_disabled_extensions(agent).await;
     let names = hub.extension_names();
     if names.is_empty() {
         return CommandOutcome::Text("No extensions registered on this peer.".into());
@@ -62,9 +81,19 @@ async fn list(ctx: &CommandContext<'_>) -> CommandOutcome {
     let ref_by_name: std::collections::HashMap<&str, &ExtensionRef> =
         refs.iter().map(|r| (r.name(), r)).collect();
 
-    let mut lines = vec!["Extensions on this peer (✓ = active on this session):".to_string()];
+    let mut lines = vec![format!(
+        "Extensions on this peer (✓ = live for agent '{agent}' this session; ✗ = disabled for this agent):"
+    )];
     for name in &names {
-        let marker = if active.contains(*name) { "✓" } else { " " };
+        let session_on = active.contains(*name);
+        let agent_off = agent_disabled.contains(*name);
+        let marker = if agent_off {
+            "✗"
+        } else if session_on {
+            "✓"
+        } else {
+            " "
+        };
         let version = ref_by_name
             .get(name)
             .map(|r| r.version().to_string())
@@ -80,18 +109,28 @@ async fn list(ctx: &CommandContext<'_>) -> CommandOutcome {
         } else {
             kinds.join(", ")
         };
-        lines.push(format!("  {marker} {name} [{version}] — {kinds_str}"));
+        let note = if agent_off && session_on {
+            "  (session: on, agent: off)"
+        } else {
+            ""
+        };
+        lines.push(format!("  {marker} {name} [{version}] — {kinds_str}{note}"));
     }
     CommandOutcome::Text(lines.join("\n"))
 }
 
-async fn add(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+async fn add(name: &str, scope: ExtScope, ctx: &CommandContext<'_>) -> CommandOutcome {
     let hub = ctx.server.extensions();
     let Some(ext_ref) = find_ref(hub, name) else {
         return CommandOutcome::Error(format!(
             "Unknown extension '{name}'. Use `/extensions list` to see what's available."
         ));
     };
+
+    if scope == ExtScope::Agent {
+        return add_agent(name, ext_ref, ctx).await;
+    }
+
     let active = ctx.server.active_extensions_for(ctx.session_db_id).await;
     if active.contains(name) {
         return CommandOutcome::Text(format!("'{name}' is already active on this session."));
@@ -113,13 +152,48 @@ async fn add(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
-async fn remove(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+/// `add … agent` clears the agent's opt-out (writes an `Activated`
+/// into the agent DB's sparse log). It can only undo a prior
+/// `remove … agent` — the session set is the upper bound.
+async fn add_agent(name: &str, ext_ref: ExtensionRef, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let agent = ctx.current_agent;
+    let Some(adb) = ctx.server.open_agent_db_by_name(agent).await else {
+        return CommandOutcome::Error(format!(
+            "Agent '{agent}' isn't hosted on this peer, so its extension set can't be edited here."
+        ));
+    };
+    let disabled = ctx.server.agent_disabled_extensions(agent).await;
+    if !disabled.contains(name) {
+        return CommandOutcome::Text(format!(
+            "'{name}' is already enabled for agent '{agent}' (agents allow everything the session allows unless explicitly removed)."
+        ));
+    }
+    let timestamp = monotonic_timestamp_after(adb.database()).await;
+    let event = ExtensionEvent::Activated {
+        name: name.to_string(),
+        extension_ref: ext_ref,
+        timestamp,
+    };
+    if let Err(e) = append_event(adb.database(), event).await {
+        return CommandOutcome::Error(format!("Failed to record agent activation: {e}"));
+    }
+    CommandOutcome::Text(format!(
+        "Re-enabled '{name}' for agent '{agent}'. Takes effect on the agent's next turn (still subject to the session's active set)."
+    ))
+}
+
+async fn remove(name: &str, scope: ExtScope, ctx: &CommandContext<'_>) -> CommandOutcome {
     let hub = ctx.server.extensions();
     if !hub.extension_names().contains(&name) {
         return CommandOutcome::Error(format!(
             "Unknown extension '{name}'. Use `/extensions list` to see what's registered."
         ));
     }
+
+    if scope == ExtScope::Agent {
+        return remove_agent(name, ctx).await;
+    }
+
     let active = ctx.server.active_extensions_for(ctx.session_db_id).await;
     if !active.contains(name) {
         return CommandOutcome::Text(format!("'{name}' is already inactive on this session."));
@@ -137,6 +211,33 @@ async fn remove(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
         .await;
     CommandOutcome::Text(format!(
         "Deactivated '{name}' on this session. Hooks stop firing and tools disappear from the LLM tool list on the next agent turn."
+    ))
+}
+
+/// `remove … agent` records an opt-out on the agent DB. The extension
+/// stays available to other agents in the session; this agent just
+/// stops seeing it.
+async fn remove_agent(name: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let agent = ctx.current_agent;
+    let Some(adb) = ctx.server.open_agent_db_by_name(agent).await else {
+        return CommandOutcome::Error(format!(
+            "Agent '{agent}' isn't hosted on this peer, so its extension set can't be edited here."
+        ));
+    };
+    let disabled = ctx.server.agent_disabled_extensions(agent).await;
+    if disabled.contains(name) {
+        return CommandOutcome::Text(format!("'{name}' is already disabled for agent '{agent}'."));
+    }
+    let timestamp = monotonic_timestamp_after(adb.database()).await;
+    let event = ExtensionEvent::Deactivated {
+        name: name.to_string(),
+        timestamp,
+    };
+    if let Err(e) = append_event(adb.database(), event).await {
+        return CommandOutcome::Error(format!("Failed to record agent deactivation: {e}"));
+    }
+    CommandOutcome::Text(format!(
+        "Disabled '{name}' for agent '{agent}'. Other agents in this session keep it. Takes effect on the agent's next turn."
     ))
 }
 
@@ -178,6 +279,22 @@ async fn set(name: &str, key: &str, value: &str, ctx: &CommandContext<'_>) -> Co
 
 fn find_ref(hub: &ExtensionHub, name: &str) -> Option<ExtensionRef> {
     hub.extension_refs().into_iter().find(|r| r.name() == name)
+}
+
+/// Split an `add`/`remove` argument into `(name, scope)`. A trailing
+/// `agent` or `session` word selects the scope; otherwise the whole
+/// string is the name and the scope defaults to `Session`. Shared by
+/// the Matrix and TUI parsers.
+pub fn split_ext_scope(rest: &str) -> (String, ExtScope) {
+    let rest = rest.trim();
+    if let Some((name, last)) = rest.rsplit_once(char::is_whitespace) {
+        match last.trim() {
+            "agent" => return (name.trim().to_string(), ExtScope::Agent),
+            "session" => return (name.trim().to_string(), ExtScope::Session),
+            _ => {}
+        }
+    }
+    (rest.to_string(), ExtScope::Session)
 }
 
 /// Compute a timestamp guaranteed to be strictly after every event
@@ -249,6 +366,30 @@ mod tests {
         let chaz_peer = registry.chaz_peer().clone();
         let agent_index = HostedIndex::empty("agent");
         let bank_index = HostedIndex::empty("bank");
+
+        // Host a "chaz" agent so per-agent `/extensions … agent` paths
+        // have a real Living Agent DB to write opt-outs into.
+        {
+            use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+            use crate::hosted_index::DbEntry;
+            let mut user = registry.user_for_tests().await;
+            let (agent_db, pubkey) = create_agent_db(
+                &mut user,
+                "chaz",
+                &AgentDbConfig::default(),
+                &AgentMeta {
+                    display_name: Some("chaz".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            agent_index.register(DbEntry {
+                db_id: agent_db.id(),
+                display_name: "chaz".into(),
+                pubkey,
+            });
+        }
         let policies = Arc::new(ToolPolicyRegistry::empty());
         let security = SecurityContext {
             leak_detector: LeakDetector::new(LeakPolicy::default()),
@@ -424,7 +565,7 @@ mod tests {
         assert!(before.contains("list_memory_banks"));
 
         let out = dispatch(
-            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Session)),
             &ctx(&f),
         )
         .await;
@@ -447,14 +588,14 @@ mod tests {
         let f = fixture().await;
         let _ = f.server.active_extensions_for(&f.session_db_id).await;
         dispatch(
-            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Session)),
             &ctx(&f),
         )
         .await;
         assert!(!visible_tool_names(&scoped_for(&f).await).contains("remember"));
 
         dispatch(
-            Command::Extensions(ExtensionsAction::Add("memory".into())),
+            Command::Extensions(ExtensionsAction::Add("memory".into(), ExtScope::Session)),
             &ctx(&f),
         )
         .await;
@@ -469,7 +610,7 @@ mod tests {
         let f = fixture().await;
         let _ = f.server.active_extensions_for(&f.session_db_id).await;
         dispatch(
-            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Session)),
             &ctx(&f),
         )
         .await;
@@ -489,6 +630,102 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // per-agent scope
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_remove_narrows_only_that_agent_not_the_session() {
+        let f = fixture().await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+
+        // Disable memory for agent "chaz".
+        let out = dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Agent)),
+            &ctx(&f),
+        )
+        .await;
+        assert!(matches!(out, CommandOutcome::Text(_)));
+
+        // Session set is untouched...
+        let session_active = f.server.active_extensions_for(&f.session_db_id).await;
+        assert!(
+            session_active.contains("memory"),
+            "agent opt-out must not change the session set"
+        );
+        // ...but the agent's effective set drops memory.
+        let agent_active = f
+            .server
+            .active_extensions_for_agent(&f.session_db_id, "chaz")
+            .await;
+        assert!(
+            !agent_active.contains("memory"),
+            "memory should be hidden from agent 'chaz', got: {agent_active:?}"
+        );
+        // A different agent (no records) is unaffected.
+        let other = f
+            .server
+            .active_extensions_for_agent(&f.session_db_id, "someone-else")
+            .await;
+        assert!(other.contains("memory"), "other agents keep memory");
+    }
+
+    #[tokio::test]
+    async fn agent_add_restores_after_agent_remove() {
+        let f = fixture().await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Agent)),
+            &ctx(&f),
+        )
+        .await;
+        assert!(
+            !f.server
+                .active_extensions_for_agent(&f.session_db_id, "chaz")
+                .await
+                .contains("memory")
+        );
+
+        dispatch(
+            Command::Extensions(ExtensionsAction::Add("memory".into(), ExtScope::Agent)),
+            &ctx(&f),
+        )
+        .await;
+        assert!(
+            f.server
+                .active_extensions_for_agent(&f.session_db_id, "chaz")
+                .await
+                .contains("memory"),
+            "agent add should clear the opt-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_remove_cannot_widen_past_session() {
+        // If the session has removed an extension, an agent-scope add
+        // can't bring it back — the session set is the upper bound.
+        let f = fixture().await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Session)),
+            &ctx(&f),
+        )
+        .await;
+        dispatch(
+            Command::Extensions(ExtensionsAction::Add("memory".into(), ExtScope::Agent)),
+            &ctx(&f),
+        )
+        .await;
+        let agent_active = f
+            .server
+            .active_extensions_for_agent(&f.session_db_id, "chaz")
+            .await;
+        assert!(
+            !agent_active.contains("memory"),
+            "session removal wins over agent add"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // command dispatch under inactive extensions
     // -------------------------------------------------------------------------
 
@@ -497,7 +734,10 @@ mod tests {
         let f = fixture().await;
         let _ = f.server.active_extensions_for(&f.session_db_id).await;
         dispatch(
-            Command::Extensions(ExtensionsAction::Remove("schedule".into())),
+            Command::Extensions(ExtensionsAction::Remove(
+                "schedule".into(),
+                ExtScope::Session,
+            )),
             &ctx(&f),
         )
         .await;
@@ -536,7 +776,7 @@ mod tests {
 
         // Remove memory from session A only.
         dispatch(
-            Command::Extensions(ExtensionsAction::Remove("memory".into())),
+            Command::Extensions(ExtensionsAction::Remove("memory".into(), ExtScope::Session)),
             &ctx(&f),
         )
         .await;
@@ -592,7 +832,10 @@ mod tests {
     async fn add_unknown_extension_errors() {
         let f = fixture().await;
         let out = dispatch(
-            Command::Extensions(ExtensionsAction::Add("doesnotexist".into())),
+            Command::Extensions(ExtensionsAction::Add(
+                "doesnotexist".into(),
+                ExtScope::Session,
+            )),
             &ctx(&f),
         )
         .await;
@@ -609,7 +852,10 @@ mod tests {
     async fn remove_unknown_extension_errors() {
         let f = fixture().await;
         let out = dispatch(
-            Command::Extensions(ExtensionsAction::Remove("doesnotexist".into())),
+            Command::Extensions(ExtensionsAction::Remove(
+                "doesnotexist".into(),
+                ExtScope::Session,
+            )),
             &ctx(&f),
         )
         .await;
