@@ -9,8 +9,7 @@
 //! SKILL.md format: YAML frontmatter + Markdown body.
 
 use crate::extension::caps::{
-    CapProvider, CapabilityKind, CapabilityRequest, CommandDescriptor, ExtensionCaps,
-    PromptAugmentation,
+    CapabilityKind, CapabilityRequest, CommandDescriptor, ExtensionCaps, PromptAugmentation,
 };
 use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
@@ -91,39 +90,6 @@ impl SkillRegistry {
         &self.skills
     }
 
-    /// Find skills whose triggers match any word in the recent message text.
-    pub fn match_and_assemble(&self, recent_message_text: &[String]) -> Option<String> {
-        let words: Vec<String> = recent_message_text
-            .iter()
-            .flat_map(|msg| {
-                msg.split(|c: char| !c.is_alphanumeric())
-                    .map(|w| w.to_lowercase())
-                    .filter(|w| !w.is_empty() && !is_stopword(w))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        let mut parts: Vec<String> = Vec::new();
-        for skill in &self.skills {
-            let matched = skill
-                .triggers
-                .iter()
-                .any(|t| words.iter().any(|w| w == t.as_str()));
-            if matched {
-                parts.push(format!(
-                    "<skill name=\"{}\">\n{}\n</skill>",
-                    skill.name, skill.body
-                ));
-            }
-        }
-
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n\n"))
-        }
-    }
-
     pub fn search(&self, query: &str) -> Vec<&Skill> {
         let q = query.to_lowercase();
         self.skills
@@ -135,72 +101,6 @@ impl SkillRegistry {
             })
             .collect()
     }
-}
-
-fn is_stopword(word: &str) -> bool {
-    matches!(
-        word,
-        "the"
-            | "a"
-            | "an"
-            | "is"
-            | "are"
-            | "was"
-            | "were"
-            | "be"
-            | "been"
-            | "in"
-            | "on"
-            | "at"
-            | "to"
-            | "for"
-            | "of"
-            | "with"
-            | "and"
-            | "or"
-            | "but"
-            | "not"
-            | "it"
-            | "this"
-            | "that"
-            | "i"
-            | "you"
-            | "he"
-            | "she"
-            | "we"
-            | "they"
-            | "do"
-            | "does"
-            | "did"
-            | "can"
-            | "will"
-            | "would"
-            | "what"
-            | "how"
-            | "when"
-            | "where"
-            | "which"
-            | "who"
-            | "my"
-            | "your"
-            | "our"
-            | "their"
-            | "just"
-            | "also"
-            | "only"
-            | "now"
-            | "then"
-            | "here"
-            | "so"
-            | "if"
-            | "no"
-            | "yes"
-            | "ok"
-            | "okay"
-            | "please"
-            | "thanks"
-            | "thank"
-    )
 }
 
 fn dirs_fallback() -> PathBuf {
@@ -330,7 +230,10 @@ impl Extension for SkillsExtension {
                     registry: self.disk_registry.clone(),
                 }),
                 Arc::new(SkillShowTool {
-                    registry: self.disk_registry.clone(),
+                    disk: self.disk_registry.clone(),
+                    registry: self.session_registry.clone(),
+                    agent_index: self.agent_index.clone(),
+                    skill_bank_index: self.skill_bank_index.clone(),
                 }),
             ];
             for t in &tools {
@@ -360,34 +263,312 @@ impl Extension for SkillsExtension {
         })
     }
 
-    fn build_providers(&self) -> anyhow::Result<HashMap<CapabilityKind, CapProvider>> {
-        let pa: Arc<dyn PromptAugmentation> = Arc::new(SkillsPromptAugmentation {
-            registry: self.disk_registry.clone(),
-        });
-        Ok([(
-            CapabilityKind::PromptAugmentation,
-            CapProvider::PromptAugmentation(pa),
-        )]
-        .into_iter()
-        .collect())
+    // The skills extension is Scope::PerSession (mirror memory). The
+    // catalog snapshot captured at instantiate time is what the
+    // PromptAugmentation endpoint reads. No global ContextTail /
+    // PromptAugmentation provider — selection is per-session because
+    // session_attached_banks are.
+
+    fn scope(&self) -> crate::extension::Scope {
+        crate::extension::Scope::PerSession
+    }
+
+    fn instantiate<'a>(
+        &'a self,
+        scope_ctx: crate::extension::ScopeCtx<'a>,
+    ) -> crate::extension::instance::InstantiateFuture<'a> {
+        let disk = self.disk_registry.clone();
+        let registry = self.session_registry.clone();
+        let agent_index = self.agent_index.clone();
+        let skill_bank_index = self.skill_bank_index.clone();
+        let manifest = self.manifest();
+        Box::pin(async move {
+            // Session-attached banks live in extension_settings["skills"].
+            // For non-Session scope contexts (the install-time Global
+            // dry-run via `LegacyInstance`), there's no session DB —
+            // we end up with an empty attached list, which means the
+            // catalog at call time will still compose disk + agent
+            // sources.
+            let session_attached_banks: Vec<String> = match &scope_ctx {
+                crate::extension::ScopeCtx::Session { session_db, .. } => {
+                    let settings = crate::extension::read_settings(session_db, "skills").await;
+                    settings
+                        .get("attached_banks")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+
+            let inputs = Arc::new(SessionSkills {
+                disk,
+                registry,
+                agent_index,
+                skill_bank_index,
+                session_attached_banks,
+            });
+
+            Ok(Arc::new(SkillsInstance { manifest, inputs })
+                as Arc<dyn crate::extension::ExtensionInstance>)
+        })
+    }
+}
+
+// ── Per-session instance ─────────────────────────────────────────────
+
+struct SkillsInstance {
+    manifest: ExtensionManifest,
+    inputs: Arc<SessionSkills>,
+}
+
+impl crate::extension::ExtensionInstance for SkillsInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn prompt_augmentation(&self) -> Option<Arc<dyn PromptAugmentation>> {
+        Some(Arc::new(SkillsPromptAugmentation {
+            inputs: self.inputs.clone(),
+        }))
     }
 }
 
 // ── PromptAugmentation impl ─────────────────────────────────────────
+//
+// Per the agentskills.io spec ("progressive disclosure"), we inject
+// the *catalog* — name + description per available skill — into the
+// system prompt. The LLM decides from descriptions when to invoke a
+// skill; activation happens via the `skill_show` tool, which fetches
+// the full body on demand. No host-side keyword matching or relevance
+// scoring — selection is the LLM's job.
 
+/// One catalog entry surfaced in the system prompt and resolvable by
+/// `skill_show`. The four sources (disk + agent.skills + granted
+/// banks + session-attached banks) are composed into a single
+/// `CatalogEntry` list at PromptAugmentation call time.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    /// Provenance label — kept for future UI / debugging surfaces.
+    /// Not part of the agentskills.io spec and deliberately not
+    /// surfaced in the catalog block injected into the system prompt.
+    #[allow(dead_code)]
+    pub source: SkillSource,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // see CatalogEntry::source.
+pub(crate) enum SkillSource {
+    /// Loaded from a `.chaz/skills/` or `~/.config/chaz/skills/` dir.
+    Disk,
+    /// Loaded from `AgentDb.skills` for the active agent.
+    Agent,
+    /// Loaded from a `SkillBankDb` the agent has been granted access to.
+    Bank { name: String },
+    /// Loaded from a `SkillBankDb` attached for this session only.
+    SessionBank { name: String },
+}
+
+/// Compose a catalog from the four layers. Names dedupe across layers
+/// — first one wins. Walking order matters: disk → agent → granted
+/// banks → session-attached banks, with later sources NOT overriding
+/// earlier ones (rationale: disk is the most stable, session-attached
+/// is the most transient; a name collision is almost certainly an
+/// accident, and surfacing the stable definition is the safer default).
+async fn compose_catalog(
+    disk: &Arc<std::sync::RwLock<SkillRegistry>>,
+    registry: &SessionRegistry,
+    agent_index: &HostedIndex,
+    skill_bank_index: &HostedIndex,
+    agent_name: &str,
+    session_attached_banks: &[String],
+) -> Vec<CatalogEntry> {
+    use std::collections::HashSet;
+    let mut entries: Vec<CatalogEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // 1. Disk
+    {
+        let r = disk.read().unwrap();
+        for s in r.list() {
+            if seen.insert(s.name.clone()) {
+                entries.push(CatalogEntry {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    body: s.body.clone(),
+                    source: SkillSource::Disk,
+                });
+            }
+        }
+    }
+
+    // 2. AgentDb.skills (this agent's own private skills)
+    if let Some(agent_entry) = agent_index.find_by_name(agent_name)
+        && let Ok(Some(agent_db)) = registry
+            .open_agent_db(&agent_entry.db_id, Some(&agent_entry.pubkey))
+            .await
+    {
+        for s in read_skill_rows(agent_db.database()).await {
+            if seen.insert(s.name.clone()) {
+                entries.push(CatalogEntry {
+                    name: s.name,
+                    description: s.description,
+                    body: s.body,
+                    source: SkillSource::Agent,
+                });
+            }
+        }
+
+        // 3. Granted SkillBankDbs (per-agent persistent grants)
+        if let Ok(bank_refs) = agent_db.list_skill_banks().await {
+            for bref in bank_refs {
+                let Some(bank_entry) = skill_bank_index.find_by_name(&bref.name) else {
+                    continue;
+                };
+                let Ok(Some(bank)) = registry
+                    .open_skill_bank(&bank_entry.db_id, Some(&bank_entry.pubkey))
+                    .await
+                else {
+                    continue;
+                };
+                for s in read_skill_rows(bank.database()).await {
+                    if seen.insert(s.name.clone()) {
+                        entries.push(CatalogEntry {
+                            name: s.name,
+                            description: s.description,
+                            body: s.body,
+                            source: SkillSource::Bank {
+                                name: bref.name.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Session-attached banks (transient)
+    for bank_name in session_attached_banks {
+        let Some(bank_entry) = skill_bank_index.find_by_name(bank_name) else {
+            continue;
+        };
+        let Ok(Some(bank)) = registry
+            .open_skill_bank(&bank_entry.db_id, Some(&bank_entry.pubkey))
+            .await
+        else {
+            continue;
+        };
+        for s in read_skill_rows(bank.database()).await {
+            if seen.insert(s.name.clone()) {
+                entries.push(CatalogEntry {
+                    name: s.name,
+                    description: s.description,
+                    body: s.body,
+                    source: SkillSource::SessionBank {
+                        name: bank_name.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    entries
+}
+
+/// Pull every `Skill` row from a database's `skills` store. Returns
+/// an empty Vec on any read error (storage layer is best-effort here —
+/// missing skill rows shouldn't fail the whole augmentation).
+async fn read_skill_rows(db: &eidetica::Database) -> Vec<crate::agent_db::Skill> {
+    use eidetica::store::Table;
+    let Ok(txn) = db.new_transaction().await else {
+        return Vec::new();
+    };
+    let Ok(store) = txn
+        .get_store::<Table<crate::agent_db::Skill>>(crate::agent_db::SKILLS_STORE)
+        .await
+    else {
+        return Vec::new();
+    };
+    match store.search(|_: &crate::agent_db::Skill| true).await {
+        Ok(rows) => rows.into_iter().map(|(_, s)| s).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Format the catalog as the Markdown block injected into the system
+/// prompt. Discovery-only — names + descriptions, no bodies.
+fn format_catalog(entries: &[CatalogEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## Available skills\n");
+    out.push_str(
+        "Each line is `name — description`. To use a skill, call the `skill_show` tool with the \
+         skill's `name` to load its full instructions.\n\n",
+    );
+    for e in entries {
+        out.push_str(&format!("- **{}** — {}\n", e.name, e.description));
+    }
+    Some(out)
+}
+
+/// Per-session inputs to catalog composition. Built at session_start
+/// by `SkillsExtension::instantiate(Session)`. The disk registry +
+/// hosted-index handles are immutable across the session; only
+/// `session_attached_banks` reflects per-session state (captured at
+/// instantiate, refreshed at next session_start if the user runs
+/// `/skills attach` mid-session).
+///
+/// The catalog itself is composed at PromptAugmentation call time —
+/// that's when we know the active agent (via the `agent_name`
+/// parameter), and AgentDb.skills depends on it. This mirrors how
+/// `MemoryContextTail` defers per-agent reads to call time.
+pub(crate) struct SessionSkills {
+    pub disk: Arc<std::sync::RwLock<SkillRegistry>>,
+    pub registry: Arc<SessionRegistry>,
+    pub agent_index: HostedIndex,
+    pub skill_bank_index: HostedIndex,
+    pub session_attached_banks: Vec<String>,
+}
+
+impl SessionSkills {
+    pub async fn catalog_for(&self, agent_name: &str) -> Vec<CatalogEntry> {
+        compose_catalog(
+            &self.disk,
+            &self.registry,
+            &self.agent_index,
+            &self.skill_bank_index,
+            agent_name,
+            &self.session_attached_banks,
+        )
+        .await
+    }
+}
+
+/// PromptAugmentation backed by per-session inputs. Composes the
+/// catalog at call time using the active agent's identity.
 struct SkillsPromptAugmentation {
-    registry: Arc<std::sync::RwLock<SkillRegistry>>,
+    inputs: Arc<SessionSkills>,
 }
 
 impl PromptAugmentation for SkillsPromptAugmentation {
     fn augment_system_prompt<'a>(
         &'a self,
-        _agent_name: &'a str,
-        recent_message_text: &'a [String],
+        agent_name: &'a str,
+        _recent_message_text: &'a [String],
     ) -> crate::extension::caps::CapFuture<'a, Option<String>> {
+        let inputs = self.inputs.clone();
+        let agent = agent_name.to_string();
         Box::pin(async move {
-            let registry = self.registry.read().unwrap();
-            Ok(registry.match_and_assemble(recent_message_text))
+            let entries = inputs.catalog_for(&agent).await;
+            Ok(format_catalog(&entries))
         })
     }
 }
@@ -497,8 +678,15 @@ impl Tool for SkillSearchTool {
     }
 }
 
+/// `skill_show` — the "activation" half of progressive disclosure.
+/// Resolves a skill name against all four sources (disk + agent's
+/// own + granted banks + session-attached banks) and returns the
+/// full body JSON for the LLM to execute against.
 struct SkillShowTool {
-    registry: Arc<std::sync::RwLock<SkillRegistry>>,
+    disk: Arc<std::sync::RwLock<SkillRegistry>>,
+    registry: Arc<SessionRegistry>,
+    agent_index: HostedIndex,
+    skill_bank_index: HostedIndex,
 }
 
 impl Tool for SkillShowTool {
@@ -519,24 +707,49 @@ impl Tool for SkillShowTool {
     fn execute<'a>(
         &'a self,
         arguments: Value,
-        _ctx: &'a crate::tool::ToolContext,
+        ctx: &'a crate::tool::ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         let name = arguments["name"].as_str().unwrap_or("").to_string();
-        let found: Option<String> = {
-            let registry = self.registry.read().unwrap();
-            registry.list().iter().find(|s| s.name == name).map(|s| {
-                serde_json::json!({
-                    "text": s.body,
-                    "name": s.name,
-                    "description": s.description,
-                    "triggers": &s.triggers,
-                })
-                .to_string()
-            })
-        };
+        let agent = ctx.agent_name.clone();
+        let session = ctx.session.clone();
         Box::pin(async move {
-            match found {
-                Some(json) => Ok(json),
+            // Session-attached banks aren't held on the tool instance
+            // (the tool is registered globally; the per-session
+            // SkillsInstance is the canonical home for them). Read
+            // them here at call time from the active session DB.
+            let session_attached_banks: Vec<String> = {
+                let session = session.lock().await;
+                let db = session.database();
+                let settings = crate::extension::read_settings(db, "skills").await;
+                settings
+                    .get("attached_banks")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            // Walk the same source order as compose_catalog so
+            // discovery and activation agree on which definition wins.
+            let entries = compose_catalog(
+                &self.disk,
+                &self.registry,
+                &self.agent_index,
+                &self.skill_bank_index,
+                &agent,
+                &session_attached_banks,
+            )
+            .await;
+            match entries.iter().find(|e| e.name == name) {
+                Some(entry) => Ok(serde_json::json!({
+                    "text": entry.body,
+                    "name": entry.name,
+                    "description": entry.description,
+                })
+                .to_string()),
                 None => Ok(format!("No skill named \"{name}\" found.")),
             }
         })
