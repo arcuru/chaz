@@ -21,8 +21,15 @@ pub mod caps_inproc;
 pub mod handler;
 pub(crate) mod hook_bridge;
 pub mod hooks;
+pub mod instance;
 pub mod manifest;
 pub mod registry;
+
+// Scope/ScopeCtx/TurnCtx/PeerHandles/CapResolver are scaffolding for
+// the lifecycle migration. Real consumers (turn-time dispatch, the
+// memory extension's PerSession migration) land in Phase B.
+#[allow(unused_imports)]
+pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
 
 use crate::extension::caps_inproc::{InProcSessionRead, InProcSessionWrite, InProcSettings};
 use crate::hosted_index::HostedIndex;
@@ -466,6 +473,45 @@ pub trait Extension: Send + Sync {
     {
         Box::pin(async move { Ok(handler::InstalledExtension::empty()) })
     }
+
+    // ---- Lifecycle (per-scope) ------------------------------------------
+    //
+    // Path forward for the WASM-bound rebuild: extensions declare their
+    // scope, and the host instantiates them at the matching lifecycle
+    // event (peer start / session open / agent load). Existing
+    // compiled-in extensions default to `Scope::Global` and a no-op
+    // [`instance::LegacyInstance`] so the legacy install path
+    // continues to wire their tools / commands / caps via the cap
+    // registry. Per-session extensions override `scope` to
+    // [`Scope::PerSession`] and `instantiate` to return a real
+    // [`ExtensionInstance`].
+
+    /// Where this extension lives. Default: [`Scope::Global`] — one
+    /// instance per peer for the binary's lifetime, identical to the
+    /// pre-lifecycle behaviour.
+    fn scope(&self) -> instance::Scope {
+        instance::Scope::Global
+    }
+
+    /// Construct a runtime instance of this extension at the given
+    /// scope. The host calls this at the scope's lifecycle event
+    /// (e.g. `session_start` for `Scope::PerSession`) and holds the
+    /// returned instance until the matching teardown.
+    ///
+    /// Default: return a [`instance::LegacyInstance`] — a no-op
+    /// instance that publishes nothing through the new endpoint
+    /// surface. Existing extensions keep using `build_providers` /
+    /// `install` until they explicitly opt into the new model.
+    fn instantiate<'a>(
+        &'a self,
+        _scope_ctx: instance::ScopeCtx<'a>,
+    ) -> instance::InstantiateFuture<'a> {
+        let manifest = self.manifest();
+        Box::pin(async move {
+            Ok(Arc::new(instance::LegacyInstance::new(manifest))
+                as Arc<dyn instance::ExtensionInstance>)
+        })
+    }
 }
 
 /// Internal wrapper that tags a hook handler with the extension that
@@ -555,6 +601,35 @@ pub struct ExtensionHub {
     /// `Config::agent_state_allowlist`. Maps extension name → allowed
     /// agent display names. An absent entry means unrestricted.
     agent_state_allowlist: HashMap<String, Vec<String>>,
+
+    // ---- Lifecycle instance bookkeeping -----------------------------------
+    //
+    // The new extension model (see `instance.rs`) instantiates extensions
+    // at their declared scope and holds the resulting `ExtensionInstance`
+    // until the corresponding teardown. These maps are populated lazily —
+    // on session_start for `PerSession`, on agent load for `PerAgent`,
+    // and at the end of `install_all` for `Global`. Empty until at least
+    // one extension migrates off the legacy install path.
+    /// Global-scope instances: one per extension, keyed by extension
+    /// name. Populated at the end of `install_all` for every extension
+    /// whose `scope()` returns `Scope::Global` — that's the default,
+    /// so this map ends up holding a `LegacyInstance` per extension
+    /// during the migration window.
+    global_instances: HashMap<String, Arc<dyn instance::ExtensionInstance>>,
+
+    /// Per-agent instances, keyed by `(agent_db_id, extension_name)`.
+    /// Empty until per-agent extensions land.
+    agent_instances: HashMap<(eidetica::entry::ID, String), Arc<dyn instance::ExtensionInstance>>,
+
+    /// Per-session instances, keyed by `(session_db_id, extension_name)`.
+    /// Populated on session_start, torn down on session_shutdown.
+    session_instances: HashMap<(String, String), Arc<dyn instance::ExtensionInstance>>,
+
+    /// Peer-handle bag built from the same deps `install_all` uses,
+    /// stored so per-session/per-agent instantiation can hand it to
+    /// `ScopeCtx` without rebuilding from scratch on every event.
+    /// `None` until the host wires it via [`Self::set_peer_handles`].
+    peer_handles: Option<Arc<instance::PeerHandles>>,
 }
 
 impl Default for ExtensionHub {
@@ -586,7 +661,57 @@ impl ExtensionHub {
             session_registry: None,
             hosted_index: None,
             agent_state_allowlist: HashMap::new(),
+            global_instances: HashMap::new(),
+            agent_instances: HashMap::new(),
+            session_instances: HashMap::new(),
+            peer_handles: None,
         }
+    }
+
+    /// Install the peer-handle bag used to construct
+    /// [`instance::ScopeCtx`] for lifecycle instantiation. Must be set
+    /// before any per-session / per-agent extension instantiates.
+    /// Idempotent.
+    pub fn set_peer_handles(&mut self, handles: Arc<instance::PeerHandles>) {
+        self.peer_handles = Some(handles);
+    }
+
+    /// Compose the live instance set for one turn:
+    /// `global ∪ agent ∪ session`. Per-session overrides per-agent
+    /// overrides global when an extension is present at multiple
+    /// scopes (today this can't happen, but the precedence is part of
+    /// the contract for when it will).
+    ///
+    /// `agent_db_id` is the agent's database ID (for the per-agent
+    /// lookup); `session_db_id` is the session DB's root ID string.
+    /// Either may produce no matches — global-only extensions still
+    /// fire.
+    pub fn instances_for_turn(
+        &self,
+        agent_db_id: Option<&eidetica::entry::ID>,
+        session_db_id: Option<&str>,
+    ) -> Vec<Arc<dyn instance::ExtensionInstance>> {
+        // Walk global, then agent, then session, deduping by extension
+        // name. Later wins so per-session > per-agent > global.
+        let mut by_name: HashMap<String, Arc<dyn instance::ExtensionInstance>> = HashMap::new();
+        for (name, inst) in &self.global_instances {
+            by_name.insert(name.clone(), inst.clone());
+        }
+        if let Some(agent_id) = agent_db_id {
+            for ((id, name), inst) in &self.agent_instances {
+                if id == agent_id {
+                    by_name.insert(name.clone(), inst.clone());
+                }
+            }
+        }
+        if let Some(session_id) = session_db_id {
+            for ((id, name), inst) in &self.session_instances {
+                if id == session_id {
+                    by_name.insert(name.clone(), inst.clone());
+                }
+            }
+        }
+        by_name.into_values().collect()
     }
 
     /// Install the session registry the hub uses to resolve session-
@@ -1162,6 +1287,33 @@ impl ExtensionHub {
                     owner,
                     hook: Box::new(hook_bridge::SessionShutdownAdapter::new(owner, inner)),
                 });
+            }
+        }
+
+        // Phase 3 (lifecycle) — for every extension whose declared
+        // scope is `Global`, instantiate now and stash the instance.
+        // Per-session / per-agent scopes are instantiated lazily later
+        // (session_start / agent load).
+        //
+        // Without `peer_handles` we can't build a `ScopeCtx`, so we
+        // skip. That's the bootstrap state — the host wires
+        // `peer_handles` after the hub but before any session opens,
+        // and extensions that depend on the new model declare a
+        // non-Global scope. Until any extension migrates, this loop
+        // is no-op-ish: it allocates one `LegacyInstance` per
+        // extension, which only carries the manifest.
+        if let Some(peer) = self.peer_handles.clone() {
+            for ext in extensions.iter() {
+                if ext.scope() != instance::Scope::Global {
+                    continue;
+                }
+                let m = ext.manifest();
+                if self.global_instances.contains_key(&m.name) {
+                    continue;
+                }
+                let scope_ctx = instance::ScopeCtx::Global { peer: &peer };
+                let inst = ext.instantiate(scope_ctx).await?;
+                self.global_instances.insert(m.name.clone(), inst);
             }
         }
 
