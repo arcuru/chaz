@@ -33,6 +33,11 @@ use std::sync::{Arc, OnceLock};
 pub struct BuiltinDeps {
     pub agent_index: HostedIndex,
     pub memory_bank_index: HostedIndex,
+    /// Hosted index of skill banks. Wired through but unused by any
+    /// built-in extension today — the skills extension migration is
+    /// what starts consuming it.
+    #[allow(dead_code)]
+    pub skill_bank_index: HostedIndex,
     pub session_registry: Arc<SessionRegistry>,
     pub embedder: Option<Arc<dyn Embedder>>,
     pub web_search_backends: Vec<SearchBackend>,

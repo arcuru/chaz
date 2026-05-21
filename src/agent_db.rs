@@ -43,6 +43,8 @@ pub const HISTORY_STORE: &str = "history";
 pub const MEMORY_BANKS_STORE: &str = "memory_banks";
 pub const SCHEDULES_STORE: &str = "schedules";
 pub const SCHEDULE_FIRES_STORE: &str = "schedule_fires";
+pub const SKILLS_STORE: &str = "skills";
+pub const SKILL_BANKS_STORE: &str = "skill_banks";
 
 const BLOB_KEY: &str = "value";
 
@@ -84,6 +86,9 @@ pub struct AgentDbConfig {
     /// Memory banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_memory_banks`].
     #[serde(default)]
     pub default_memory_banks: Vec<String>,
+    /// Skill banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_skill_banks`].
+    #[serde(default)]
+    pub default_skill_banks: Vec<String>,
 }
 
 impl AgentDbConfig {
@@ -102,6 +107,7 @@ impl AgentDbConfig {
             max_context_tokens: cfg.max_context_tokens,
             grants: cfg.grants.clone().unwrap_or_default(),
             default_memory_banks: cfg.default_memory_banks.clone().unwrap_or_default(),
+            default_skill_banks: cfg.default_skill_banks.clone().unwrap_or_default(),
         }
     }
 }
@@ -147,6 +153,43 @@ pub struct MemoryBankRef {
     /// Peer-local display name for this bank (how the LLM refers to it).
     pub name: String,
     /// Eidetica DB root ID of the bank (stable global identity).
+    pub db_id: String,
+    /// What this agent's key can do on the bank.
+    pub permission: BankPermission,
+}
+
+/// One skill — a named prompt fragment the LLM can use. Lives in
+/// either an agent's own `skills` store or in a shared `SkillBankDb`.
+///
+/// Shape mirrors [`MemoryEntry`] (small structured row, queryable via
+/// the same eidetica `Table` machinery) with two skill-specific
+/// fields: `description` is the one-liner shown to the LLM so it can
+/// decide whether to invoke; `body` is the prompt content injected
+/// when the skill is relevant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Skill {
+    /// Unique-within-scope identifier (how the LLM refers to it).
+    pub name: String,
+    /// One-line summary of what the skill does. Surfaced in the list
+    /// the LLM scans when picking which skills to use.
+    pub description: String,
+    /// The actual prompt body injected when this skill fires.
+    pub body: String,
+    pub timestamp: DateTime<Utc>,
+    /// Free-form labels for filtering. Default empty for back-compat.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Reference from an Agent DB to an external skill bank DB it has been
+/// granted access to. Mirrors [`MemoryBankRef`] one-for-one — the
+/// permission model is the same (Read = use the skill, Write = also
+/// add/edit skills in the bank).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillBankRef {
+    /// Peer-local display name for this bank (how the LLM refers to it).
+    pub name: String,
+    /// Eidetica DB root ID of the bank.
     pub db_id: String,
     /// What this agent's key can do on the bank.
     pub permission: BankPermission,
@@ -331,6 +374,9 @@ impl AgentDb {
         txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
         txn.get_store::<Table<ScheduleFire>>(SCHEDULE_FIRES_STORE)
             .await?;
+        txn.get_store::<Table<Skill>>(SKILLS_STORE).await?;
+        txn.get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
+            .await?;
         txn.commit().await?;
         Ok(())
     }
@@ -465,6 +511,72 @@ impl AgentDb {
             .get_store::<Table<MemoryBankRef>>(MEMORY_BANKS_STORE)
             .await?;
         let mut rows = store.search(|r: &MemoryBankRef| r.name == name).await?;
+        Ok(rows.pop().map(|(_, r)| r))
+    }
+
+    // -----------------------------------------------------------------
+    // Skill bank references
+    // -----------------------------------------------------------------
+    //
+    // Mirrors the memory-bank ref machinery one-for-one. Same semantics
+    // (peer-local alias + db_id + permission), same upsert-by-name +
+    // detach-by-name behaviour. Kept as a parallel API instead of
+    // generic so the eidetica `Table<T>` rows can stay strongly typed
+    // and the call sites read naturally.
+
+    /// List every external skill bank this agent has been granted
+    /// access to. The agent's own `skills` store is not included —
+    /// self skills are implicit.
+    pub async fn list_skill_banks(&self) -> anyhow::Result<Vec<SkillBankRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
+            .await?;
+        let rows = store.search(|_: &SkillBankRef| true).await?;
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// Add or update a skill bank reference. Replaces any existing row
+    /// with the same `name`.
+    pub async fn attach_skill_bank(&self, bank_ref: SkillBankRef) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
+            .await?;
+        let existing = store
+            .search(|r: &SkillBankRef| r.name == bank_ref.name)
+            .await?;
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        store.insert(bank_ref).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Remove the skill bank reference with the given name. Returns
+    /// true if a row was removed.
+    pub async fn detach_skill_bank(&self, name: &str) -> anyhow::Result<bool> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
+            .await?;
+        let existing = store.search(|r: &SkillBankRef| r.name == name).await?;
+        let removed = !existing.is_empty();
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        txn.commit().await?;
+        Ok(removed)
+    }
+
+    /// Find a single skill bank reference by its peer-local name.
+    pub async fn find_skill_bank(&self, name: &str) -> anyhow::Result<Option<SkillBankRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
+            .await?;
+        let mut rows = store.search(|r: &SkillBankRef| r.name == name).await?;
         Ok(rows.pop().map(|(_, r)| r))
     }
 }
@@ -661,6 +773,7 @@ mod tests {
             max_context_tokens: None,
             grants: None,
             default_memory_banks: None,
+            default_skill_banks: None,
         }
     }
 
@@ -681,6 +794,7 @@ mod tests {
             max_context_tokens: Some(200_000),
             grants: HashMap::new(),
             default_memory_banks: vec![],
+            default_skill_banks: vec![],
         };
         let meta = AgentMeta {
             display_name: Some("researcher".to_string()),

@@ -256,6 +256,10 @@ pub struct AgentConfig {
     /// index. Missing banks are logged at warn and skipped — a typo in
     /// config doesn't fail startup.
     pub default_memory_banks: Option<Vec<String>>,
+    /// Skill banks to auto-attach at agent bootstrap. Mirrors
+    /// `default_memory_banks` — missing banks are logged at warn and
+    /// skipped, auto-created on first reference if appropriate.
+    pub default_skill_banks: Option<Vec<String>>,
 }
 
 /// A named bundle of overrides that can be selected at spawn time.

@@ -74,6 +74,7 @@ pub struct PeerHandles {
     pub registry: Arc<crate::session::SessionRegistry>,
     pub agent_index: crate::hosted_index::HostedIndex,
     pub memory_bank_index: crate::hosted_index::HostedIndex,
+    pub skill_bank_index: crate::hosted_index::HostedIndex,
     pub embedder: Option<Arc<dyn crate::embedding::Embedder>>,
     pub secrets: Option<Arc<crate::security::SecretStore>>,
 }

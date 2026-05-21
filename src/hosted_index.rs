@@ -139,17 +139,20 @@ impl HostedIndex {
 }
 
 /// Walk `user.databases()`, classify each tracked DB by its `meta.kind`
-/// marker, and return a fully populated `(agents, banks)` pair. Anything
-/// without a recognized marker (chaz_group, chaz_peer, sessions, pre-Stage-4
-/// DBs) is skipped.
+/// marker, and return a fully populated `(agents, memory_banks,
+/// skill_banks)` triple. Anything without a recognized marker
+/// (chaz_group, chaz_peer, sessions, pre-Stage-4 DBs) is skipped.
 ///
 /// O(n) DB opens — fine at chaz scale (dozens of agents/banks). If the
 /// installation grows past that, eidetica's `TrackedDatabase` could carry a
 /// `properties` map so we read everything off the user's own catalog
 /// without opening each DB.
-pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, HostedIndex)> {
+pub async fn build_from_user(
+    user: &User,
+) -> anyhow::Result<(HostedIndex, HostedIndex, HostedIndex)> {
     let agents = HostedIndex::empty("agent");
-    let banks = HostedIndex::empty("bank");
+    let memory_banks = HostedIndex::empty("memory_bank");
+    let skill_banks = HostedIndex::empty("skill_bank");
 
     let tracked = user.databases().await?;
     for td in tracked {
@@ -166,9 +169,6 @@ pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, Hosted
         let Some((kind, marker_name)) = crate::db_kind::read_marker(&database).await else {
             continue;
         };
-        // Prefer the in-DB meta marker (clean name like "alpha"); fall
-        // back to key_display_name (may have "agent:" / "memory:" prefix)
-        // for DBs created without a marker but with a labelled key.
         let display_name = if marker_name.is_empty() {
             user.key_display_name(&td.key_id)
                 .map(|s| s.to_string())
@@ -183,7 +183,8 @@ pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, Hosted
         };
         match kind.as_str() {
             crate::db_kind::KIND_AGENT => agents.register(entry),
-            crate::db_kind::KIND_BANK => banks.register(entry),
+            crate::db_kind::KIND_BANK => memory_banks.register(entry),
+            crate::db_kind::KIND_SKILL_BANK => skill_banks.register(entry),
             crate::db_kind::KIND_SESSION => {} // Sessions aren't cached here.
             other => {
                 warn!(db_id = %td.database_id, kind = %other, "Unknown entity kind, skipping");
@@ -193,11 +194,12 @@ pub async fn build_from_user(user: &User) -> anyhow::Result<(HostedIndex, Hosted
 
     info!(
         agents = agents.len(),
-        banks = banks.len(),
+        memory_banks = memory_banks.len(),
+        skill_banks = skill_banks.len(),
         "Built hosted indices from user.databases()"
     );
 
-    Ok((agents, banks))
+    Ok((agents, memory_banks, skill_banks))
 }
 
 #[cfg(test)]
@@ -274,19 +276,28 @@ mod tests {
         let _ = create_agent_db(&mut user, "alpha", &cfg, &agent_meta)
             .await
             .unwrap();
-        let bank_meta = MemoryBankMeta {
+        let mbank_meta = MemoryBankMeta {
             display_name: Some("patrick".into()),
             ..Default::default()
         };
-        let _ = create_memory_bank(&mut user, "patrick", &bank_meta)
+        let _ = create_memory_bank(&mut user, "patrick", &mbank_meta)
+            .await
+            .unwrap();
+        let sbank_meta = crate::skill_bank_db::SkillBankMeta {
+            display_name: Some("devops".into()),
+            ..Default::default()
+        };
+        let _ = crate::skill_bank_db::create_skill_bank(&mut user, "devops", &sbank_meta)
             .await
             .unwrap();
 
-        let (agents, banks) = build_from_user(&user).await.unwrap();
+        let (agents, memory_banks, skill_banks) = build_from_user(&user).await.unwrap();
         assert_eq!(agents.len(), 1);
-        assert_eq!(banks.len(), 1);
+        assert_eq!(memory_banks.len(), 1);
+        assert_eq!(skill_banks.len(), 1);
         assert!(agents.find_by_name("alpha").is_some());
-        assert!(banks.find_by_name("patrick").is_some());
+        assert!(memory_banks.find_by_name("patrick").is_some());
+        assert!(skill_banks.find_by_name("devops").is_some());
     }
 
     #[tokio::test]

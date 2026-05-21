@@ -751,6 +751,7 @@ mod tests {
             agents,
             index,
             bank_index,
+            crate::hosted_index::HostedIndex::empty("skill_bank"),
             tools,
             policies,
             security,

@@ -22,6 +22,7 @@ mod runtime;
 mod security;
 pub mod server;
 mod session;
+mod skill_bank_db;
 mod tool;
 mod tool_host;
 mod tools;
@@ -251,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     // and Memory Bank indices in-memory by walking eidetica's tracked-DBs
     // list. `meta.kind` (Stage 4) classifies each entry. `/agent new`,
     // `/memory new`, `/agent delete`, etc. mutate these caches at runtime.
-    let (agent_index_store, memory_bank_index_store) = {
+    let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
         hosted_index::build_from_user(&user).await?
     };
@@ -443,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
         registry: registry.clone(),
         agent_index: agent_index_store.clone(),
         memory_bank_index: memory_bank_index_store.clone(),
+        skill_bank_index: skill_bank_index_store.clone(),
         embedder: embedder.clone(),
         secrets: Some(Arc::new(secret_store.clone())),
     }));
@@ -470,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
     let mut extensions = extensions::all_builtins(extensions::BuiltinDeps {
         agent_index: agent_index_store.clone(),
         memory_bank_index: memory_bank_index_store.clone(),
+        skill_bank_index: skill_bank_index_store.clone(),
         session_registry: registry.clone(),
         embedder: embedder.clone(),
         web_search_backends,
@@ -530,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
         agent_registry,
         agent_index_store,
         memory_bank_index_store,
+        skill_bank_index_store.clone(),
         tool_registry,
         policies,
         security_ctx,

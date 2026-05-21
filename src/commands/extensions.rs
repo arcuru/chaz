@@ -269,6 +269,7 @@ mod tests {
         hub.install_all(all_builtins(BuiltinDeps {
             agent_index: agent_index.clone(),
             memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),
+            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
             session_registry: registry.clone(),
             embedder: None,
             web_search_backends: Vec::new(),
@@ -290,6 +291,7 @@ mod tests {
             agents,
             agent_index,
             bank_index,
+            crate::hosted_index::HostedIndex::empty("skill_bank"),
             tool_registry.clone(),
             policies,
             security,

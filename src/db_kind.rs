@@ -20,7 +20,10 @@ pub const KIND_KEY: &str = "kind";
 pub const DISPLAY_NAME_KEY: &str = "display_name";
 
 pub const KIND_AGENT: &str = "agent";
+/// Memory bank — peer-hosted, granted to agents for shared remember/recall.
 pub const KIND_BANK: &str = "bank";
+/// Skill bank — peer-hosted, granted to agents for shared skill prompts.
+pub const KIND_SKILL_BANK: &str = "skill_bank";
 pub const KIND_SESSION: &str = "session";
 
 /// Write `kind` and `display_name` into the database's `meta` store in one

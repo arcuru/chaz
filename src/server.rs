@@ -77,6 +77,11 @@ pub struct Server {
     agents: Arc<AgentRegistry>,
     agent_index: HostedIndex,
     memory_bank_index: HostedIndex,
+    /// Hosted index of skill banks. Wired through but no consumers yet;
+    /// the upcoming `/skills` slash surface and the skills-extension
+    /// PerSession migration are what start reading it.
+    #[allow(dead_code)]
+    skill_bank_index: HostedIndex,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -116,6 +121,7 @@ impl Server {
         agents: Arc<AgentRegistry>,
         agent_index: HostedIndex,
         memory_bank_index: HostedIndex,
+        skill_bank_index: HostedIndex,
         tools: Arc<ToolRegistry>,
         policies: Arc<ToolPolicyRegistry>,
         security: SecurityContext,
@@ -132,6 +138,7 @@ impl Server {
             agents,
             agent_index,
             memory_bank_index,
+            skill_bank_index,
             tools,
             policies,
             security,
@@ -180,6 +187,11 @@ impl Server {
 
     pub fn memory_bank_index(&self) -> &HostedIndex {
         &self.memory_bank_index
+    }
+
+    #[allow(dead_code)]
+    pub fn skill_bank_index(&self) -> &HostedIndex {
+        &self.skill_bank_index
     }
 
     /// Rebuild the runtime snapshot for `agent` from its Living Agent DB's
@@ -1444,6 +1456,7 @@ mod tests {
             agents,
             index,
             bank_index,
+            crate::hosted_index::HostedIndex::empty("skill_bank"),
             tools,
             policies,
             security,

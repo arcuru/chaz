@@ -240,6 +240,110 @@ impl SessionRegistry {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // Skill Bank DB lifecycle — mirrors the memory-bank methods.
+    // -----------------------------------------------------------------
+    //
+    // Skills follow the same three-layer model as memory: an agent has
+    // its own `skills` store, can be granted access to shared
+    // `SkillBankDb`s, and a session can transiently attach a bank for
+    // the duration of the conversation. These methods are the
+    // host-side primitives the `/skills` slash surface and the skills
+    // extension lifecycle drive on top of.
+
+    /// Open a `SkillBankDb` on this peer. Mirrors
+    /// [`Self::open_memory_bank`].
+    pub async fn open_skill_bank(
+        &self,
+        bank_db_id: &eidetica::entry::ID,
+        pubkey: Option<&eidetica::auth::crypto::PublicKey>,
+    ) -> anyhow::Result<Option<crate::skill_bank_db::SkillBankDb>> {
+        let user = self.user.lock().await;
+        let key = match pubkey {
+            Some(pk) => pk.clone(),
+            None => match user.find_key(bank_db_id)? {
+                Some(k) => k,
+                None => return Ok(None),
+            },
+        };
+        let db = user.open_database_with_key(bank_db_id, &key).await?;
+        Ok(Some(crate::skill_bank_db::SkillBankDb::from_database(db)))
+    }
+
+    /// Create a Skill Bank DB. Mirrors
+    /// [`Self::create_new_memory_bank`] — rejects duplicate display
+    /// names so peer-local names stay unique.
+    pub async fn create_new_skill_bank(
+        &self,
+        display_name: &str,
+        meta: &crate::skill_bank_db::SkillBankMeta,
+    ) -> anyhow::Result<(
+        crate::skill_bank_db::SkillBankDb,
+        eidetica::auth::crypto::PublicKey,
+    )> {
+        let mut user = self.user.lock().await;
+        if let Some((existing, _)) =
+            crate::skill_bank_db::find_skill_bank(&user, display_name).await
+        {
+            anyhow::bail!(
+                "Skill bank '{}' already exists (DB {})",
+                display_name,
+                existing.id()
+            );
+        }
+        crate::skill_bank_db::create_skill_bank(&mut user, display_name, meta).await
+    }
+
+    /// Authorize a pubkey on a Skill Bank DB. Same semantics as
+    /// [`Self::grant_on_memory_bank`].
+    pub async fn grant_on_skill_bank(
+        &self,
+        bank_db_id: &eidetica::entry::ID,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+        key_label: &str,
+        permission: crate::agent_db::BankPermission,
+    ) -> anyhow::Result<()> {
+        let bank = self
+            .open_skill_bank(bank_db_id, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Peer holds no key for skill bank {bank_db_id}"))?;
+        let eidetica_perm = match permission {
+            crate::agent_db::BankPermission::Read => Permission::Read,
+            crate::agent_db::BankPermission::Write => Permission::Write(10),
+        };
+        let txn = bank.database().new_transaction().await?;
+        let settings = txn.get_settings()?;
+        settings
+            .set_auth_key(pubkey, AuthKey::active(Some(key_label), eidetica_perm))
+            .await?;
+        txn.commit().await?;
+        info!(
+            bank_db_id = %bank_db_id,
+            key_label,
+            permission = ?permission,
+            "Granted key on skill bank"
+        );
+        Ok(())
+    }
+
+    /// Revoke a pubkey on a Skill Bank DB.
+    pub async fn revoke_on_skill_bank(
+        &self,
+        bank_db_id: &eidetica::entry::ID,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<()> {
+        let bank = self
+            .open_skill_bank(bank_db_id, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Peer holds no key for skill bank {bank_db_id}"))?;
+        let txn = bank.database().new_transaction().await?;
+        let settings = txn.get_settings()?;
+        settings.revoke_auth_key(pubkey).await?;
+        txn.commit().await?;
+        info!(bank_db_id = %bank_db_id, "Revoked key on skill bank");
+        Ok(())
+    }
+
     /// Authorize a pubkey on an Agent DB (Co-owned Agents Stage 10).
     /// Used by `/agent invite` to give another peer's pubkey admin/write/
     /// read permission on the agent DB's AuthSettings. Fails if this peer
