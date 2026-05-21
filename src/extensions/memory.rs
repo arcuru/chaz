@@ -169,31 +169,61 @@ impl Extension for MemoryExtension {
         Ok(map)
     }
 
-    fn build_session_providers(
-        &self,
-        session_settings: &serde_json::Value,
-    ) -> anyhow::Result<HashMap<CapabilityKind, CapProvider>> {
-        let attached: Vec<String> = session_settings
-            .get("attached_banks")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
+    // ── Lifecycle: per-session ────────────────────────────────────────
+    //
+    // Memory is the first extension migrated to the per-session
+    // lifecycle. The hub instantiates one [`MemoryInstance`] per
+    // session on first dispatch, the instance holds the resolved
+    // `attached_banks` list, and its `context_tail()` endpoint is what
+    // the auto-recall path consults. The legacy `build_session_providers`
+    // path (which rebuilt the provider every turn) is gone — the
+    // per-turn re-read of session settings was the band-aid the
+    // lifecycle work is here to replace.
+
+    fn scope(&self) -> crate::extension::Scope {
+        crate::extension::Scope::PerSession
+    }
+
+    fn instantiate<'a>(
+        &'a self,
+        scope_ctx: crate::extension::ScopeCtx<'a>,
+    ) -> crate::extension::instance::InstantiateFuture<'a> {
+        let registry = self.registry.clone();
+        let agent_index = self.agent_index.clone();
+        let memory_bank_index = self.memory_bank_index.clone();
+        let embedder = self.embedder.clone();
+        let manifest = self.manifest();
+        Box::pin(async move {
+            let attached: Vec<String> = match &scope_ctx {
+                crate::extension::ScopeCtx::Session { session_db, .. } => {
+                    let settings = crate::extension::read_settings(session_db, "memory").await;
+                    settings
+                        .get("attached_banks")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+
+            let context_tail: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
+                registry,
+                agent_index,
+                memory_bank_index,
+                embedder,
+                session_attached_banks: attached,
+            });
+
+            Ok(Arc::new(MemoryInstance {
+                manifest,
+                context_tail,
             })
-            .unwrap_or_default();
-
-        let ct: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
-            registry: self.registry.clone(),
-            agent_index: self.agent_index.clone(),
-            memory_bank_index: self.memory_bank_index.clone(),
-            embedder: self.embedder.clone(),
-            session_attached_banks: attached,
-        });
-
-        let mut map = HashMap::new();
-        map.insert(CapabilityKind::ContextTail, CapProvider::ContextTail(ct));
-        Ok(map)
+                as Arc<dyn crate::extension::ExtensionInstance>)
+        })
     }
 
     fn install<'a>(
@@ -248,6 +278,28 @@ impl Extension for MemoryExtension {
 
             Ok(InstalledExtension::empty())
         })
+    }
+}
+
+// ── Per-session instance ─────────────────────────────────────────────
+//
+// The runtime view of memory for one session. Holds the resolved
+// `MemoryContextTail` (with attached_banks captured at instantiation
+// time) and publishes it via the `context_tail()` endpoint the hub
+// invokes on per-turn dispatch.
+
+struct MemoryInstance {
+    manifest: ExtensionManifest,
+    context_tail: Arc<dyn ContextTail>,
+}
+
+impl crate::extension::ExtensionInstance for MemoryInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn context_tail(&self) -> Option<Arc<dyn ContextTail>> {
+        Some(self.context_tail.clone())
     }
 }
 

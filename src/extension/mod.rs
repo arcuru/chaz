@@ -618,12 +618,20 @@ pub struct ExtensionHub {
     global_instances: HashMap<String, Arc<dyn instance::ExtensionInstance>>,
 
     /// Per-agent instances, keyed by `(agent_db_id, extension_name)`.
-    /// Empty until per-agent extensions land.
-    agent_instances: HashMap<(eidetica::entry::ID, String), Arc<dyn instance::ExtensionInstance>>,
+    /// Empty until per-agent extensions land. RwLock so the lazy
+    /// agent-load path can populate from a `&self` dispatch point;
+    /// reads dominate.
+    agent_instances: tokio::sync::RwLock<
+        HashMap<(eidetica::entry::ID, String), Arc<dyn instance::ExtensionInstance>>,
+    >,
 
     /// Per-session instances, keyed by `(session_db_id, extension_name)`.
-    /// Populated on session_start, torn down on session_shutdown.
-    session_instances: HashMap<(String, String), Arc<dyn instance::ExtensionInstance>>,
+    /// Populated lazily on first dispatch for a session (the
+    /// session_start hook surface is the future eager trigger). RwLock
+    /// so context-tail / prompt-augmentation dispatch can populate
+    /// from `&self`.
+    session_instances:
+        tokio::sync::RwLock<HashMap<(String, String), Arc<dyn instance::ExtensionInstance>>>,
 
     /// Peer-handle bag built from the same deps `install_all` uses,
     /// stored so per-session/per-agent instantiation can hand it to
@@ -662,8 +670,8 @@ impl ExtensionHub {
             hosted_index: None,
             agent_state_allowlist: HashMap::new(),
             global_instances: HashMap::new(),
-            agent_instances: HashMap::new(),
-            session_instances: HashMap::new(),
+            agent_instances: tokio::sync::RwLock::new(HashMap::new()),
+            session_instances: tokio::sync::RwLock::new(HashMap::new()),
             peer_handles: None,
         }
     }
@@ -686,7 +694,7 @@ impl ExtensionHub {
     /// lookup); `session_db_id` is the session DB's root ID string.
     /// Either may produce no matches — global-only extensions still
     /// fire.
-    pub fn instances_for_turn(
+    pub async fn instances_for_turn(
         &self,
         agent_db_id: Option<&eidetica::entry::ID>,
         session_db_id: Option<&str>,
@@ -698,20 +706,99 @@ impl ExtensionHub {
             by_name.insert(name.clone(), inst.clone());
         }
         if let Some(agent_id) = agent_db_id {
-            for ((id, name), inst) in &self.agent_instances {
+            let agents = self.agent_instances.read().await;
+            for ((id, name), inst) in agents.iter() {
                 if id == agent_id {
                     by_name.insert(name.clone(), inst.clone());
                 }
             }
         }
         if let Some(session_id) = session_db_id {
-            for ((id, name), inst) in &self.session_instances {
+            let sessions = self.session_instances.read().await;
+            for ((id, name), inst) in sessions.iter() {
                 if id == session_id {
                     by_name.insert(name.clone(), inst.clone());
                 }
             }
         }
         by_name.into_values().collect()
+    }
+
+    /// Lazily instantiate every `Scope::PerSession` extension for the
+    /// given session DB if not already cached. Idempotent — subsequent
+    /// calls for the same session are cheap no-ops. Returns the set of
+    /// instances for the session (cloned `Arc`s).
+    ///
+    /// Called by the dispatch path before iterating per-session
+    /// endpoints. The session_start hook surface will eventually drive
+    /// eager instantiation, but lazy is good enough for the first
+    /// migration: the cost is a single read-then-maybe-write the first
+    /// time a session is dispatched, and zero on every subsequent
+    /// dispatch.
+    pub async fn ensure_session_instances(
+        &self,
+        session_db: &eidetica::Database,
+    ) -> Vec<Arc<dyn instance::ExtensionInstance>> {
+        let session_id = session_db.root_id().to_string();
+        // Fast path: already populated for this session.
+        {
+            let read = self.session_instances.read().await;
+            let existing: Vec<_> = read
+                .iter()
+                .filter(|((sid, _), _)| sid == &session_id)
+                .map(|(_, inst)| inst.clone())
+                .collect();
+            if !existing.is_empty() {
+                return existing;
+            }
+        }
+
+        // Need to populate. We can only build instances if
+        // `peer_handles` has been wired by the host. Without it, fall
+        // back to "no per-session instances" — extensions stay on the
+        // legacy path.
+        let Some(peer) = self.peer_handles.clone() else {
+            return Vec::new();
+        };
+
+        let mut built: Vec<(String, Arc<dyn instance::ExtensionInstance>)> = Vec::new();
+        for ext in &self.extensions {
+            if ext.scope() != instance::Scope::PerSession {
+                continue;
+            }
+            let scope_ctx = instance::ScopeCtx::Session {
+                peer: &peer,
+                session_db_id: &session_id,
+                session_db,
+            };
+            match ext.instantiate(scope_ctx).await {
+                Ok(inst) => {
+                    let name = inst.manifest().name.clone();
+                    built.push((name, inst));
+                }
+                Err(e) => {
+                    warn!(
+                        extension = %ext.manifest().name,
+                        session = %session_id,
+                        error = %e,
+                        "Per-session instantiate failed; extension inactive for this session"
+                    );
+                }
+            }
+        }
+
+        let mut write = self.session_instances.write().await;
+        let mut out = Vec::with_capacity(built.len());
+        for (name, inst) in built {
+            // Another concurrent caller may have populated since the
+            // read above — first-write-wins to keep instance identity
+            // stable across a session.
+            let entry = write
+                .entry((session_id.clone(), name))
+                .or_insert_with(|| inst.clone());
+            out.push(entry.clone());
+        }
+        out
     }
 
     /// Install the session registry the hub uses to resolve session-
@@ -1556,30 +1643,59 @@ impl ExtensionHub {
         session_db: Option<&Database>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
-        let Some(map) = self
+        let mut handled: HashSet<String> = HashSet::new();
+
+        // (1) Per-session instances first — same dispatch order as
+        // [`Self::context_tails`].
+        if let Some(db) = session_db {
+            let instances = self.ensure_session_instances(db).await;
+            for inst in instances {
+                let name = inst.manifest().name.clone();
+                if let Some(active) = active_extensions
+                    && !active.iter().any(|a| a == name.as_str())
+                {
+                    continue;
+                }
+                if let Some(pa) = inst.prompt_augmentation()
+                    && let Ok(Some(text)) = pa
+                        .augment_system_prompt(agent_name, recent_message_text)
+                        .await
+                    && !text.trim().is_empty()
+                {
+                    parts.push(text);
+                }
+                handled.insert(name);
+            }
+        }
+
+        // (2) Legacy registry providers, skipping names already
+        // handled by an instance.
+        if let Some(map) = self
             .cap_registry
             .by_kind
             .get(&crate::extension::caps::CapabilityKind::PromptAugmentation)
-        else {
-            return String::new();
-        };
-        for (provider_name, provider) in &map.providers {
-            if let Some(active) = active_extensions
-                && !active.iter().any(|a| a == provider_name.as_str())
-            {
-                continue;
-            }
-            if let crate::extension::caps::CapProvider::PromptAugmentation(_pa) = provider
-                && let Some(text) = self
-                    .resolve_prompt_augmentation(
-                        provider_name,
-                        agent_name,
-                        recent_message_text,
-                        session_db,
-                    )
-                    .await
-            {
-                parts.push(text);
+        {
+            for (provider_name, provider) in &map.providers {
+                if handled.contains(provider_name) {
+                    continue;
+                }
+                if let Some(active) = active_extensions
+                    && !active.iter().any(|a| a == provider_name.as_str())
+                {
+                    continue;
+                }
+                if let crate::extension::caps::CapProvider::PromptAugmentation(_pa) = provider
+                    && let Some(text) = self
+                        .resolve_prompt_augmentation(
+                            provider_name,
+                            agent_name,
+                            recent_message_text,
+                            session_db,
+                        )
+                        .await
+                {
+                    parts.push(text);
+                }
             }
         }
         parts.join("\n\n")
@@ -1590,6 +1706,15 @@ impl ExtensionHub {
     ///
     /// Mirrors [`Self::augment_system_prompt`] but fires at the end of
     /// context assembly — appended after the conversation messages.
+    ///
+    /// Dispatch order:
+    /// 1. Per-session instances (lazily instantiated via
+    ///    [`Self::ensure_session_instances`]) get first crack.
+    ///    Extensions that have migrated to `Scope::PerSession` ship
+    ///    their `ContextTail` through `ExtensionInstance::context_tail`.
+    /// 2. Legacy global providers in [`registry::CapRegistry`] cover
+    ///    extensions that haven't migrated yet, skipping names
+    ///    already handled by a per-session instance.
     pub async fn context_tails(
         &self,
         agent_name: &str,
@@ -1598,30 +1723,56 @@ impl ExtensionHub {
         session_db: Option<&Database>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
-        let Some(map) = self
+        let mut handled: HashSet<String> = HashSet::new();
+
+        // (1) Per-session instances.
+        if let Some(db) = session_db {
+            let instances = self.ensure_session_instances(db).await;
+            for inst in instances {
+                let name = inst.manifest().name.clone();
+                if let Some(active) = active_extensions
+                    && !active.iter().any(|a| a == name.as_str())
+                {
+                    continue;
+                }
+                if let Some(ct) = inst.context_tail()
+                    && let Ok(Some(text)) = ct.context_tail(agent_name, recent_message_text).await
+                    && !text.trim().is_empty()
+                {
+                    parts.push(text);
+                }
+                handled.insert(name);
+            }
+        }
+
+        // (2) Legacy registry providers, skipping names already
+        // handled by an instance.
+        if let Some(map) = self
             .cap_registry
             .by_kind
             .get(&crate::extension::caps::CapabilityKind::ContextTail)
-        else {
-            return String::new();
-        };
-        for (provider_name, provider) in &map.providers {
-            if let Some(active) = active_extensions
-                && !active.iter().any(|a| a == provider_name.as_str())
-            {
-                continue;
-            }
-            if let crate::extension::caps::CapProvider::ContextTail(_ct) = provider
-                && let Some(text) = self
-                    .resolve_context_tail(
-                        provider_name,
-                        agent_name,
-                        recent_message_text,
-                        session_db,
-                    )
-                    .await
-            {
-                parts.push(text);
+        {
+            for (provider_name, provider) in &map.providers {
+                if handled.contains(provider_name) {
+                    continue;
+                }
+                if let Some(active) = active_extensions
+                    && !active.iter().any(|a| a == provider_name.as_str())
+                {
+                    continue;
+                }
+                if let crate::extension::caps::CapProvider::ContextTail(_ct) = provider
+                    && let Some(text) = self
+                        .resolve_context_tail(
+                            provider_name,
+                            agent_name,
+                            recent_message_text,
+                            session_db,
+                        )
+                        .await
+                {
+                    parts.push(text);
+                }
             }
         }
         parts.join("\n\n")

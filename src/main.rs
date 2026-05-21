@@ -439,6 +439,13 @@ async fn main() -> anyhow::Result<()> {
     extension_hub.set_session_registry(registry.clone());
     extension_hub.set_hosted_index(agent_index_store.clone());
     extension_hub.set_agent_state_allowlist(config.agent_state_allowlist.clone());
+    extension_hub.set_peer_handles(Arc::new(extension::PeerHandles {
+        registry: registry.clone(),
+        agent_index: agent_index_store.clone(),
+        memory_bank_index: memory_bank_index_store.clone(),
+        embedder: embedder.clone(),
+        secrets: Some(Arc::new(secret_store.clone())),
+    }));
 
     // Collect MCP server configs from inline config + directory scanning.
     let mut mcp_configs: Vec<config::McpServerConfig> =
