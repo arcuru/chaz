@@ -1,28 +1,17 @@
 //! Extension lifecycle types — scope, instantiation context, instance trait,
 //! turn-time cap resolver.
 //!
-//! The previous extension model treats extensions as global compile-time
-//! singletons whose providers live in a flat [`crate::extension::registry::CapRegistry`].
-//! That works for caps that don't vary across sessions, but the
-//! autonomous-memory work showed two cracks:
-//!
-//! 1. Per-session providers had to be faked with a per-turn rebuild
-//!    (`build_session_providers`) that re-reads the session DB on every
-//!    context assembly.
-//! 2. Per-agent extension state has no home — agents that should travel
-//!    with their tools (Ava's brain index, schedule-driven personas) have
-//!    nowhere to keep instance state.
-//!
-//! The lifecycle here treats extensions as instantiable at a declared
-//! [`Scope`]. The host fires lifecycle events (peer up / session opened /
-//! agent loaded), each event constructs the instances for that scope, and
-//! the per-turn dispatch composes the live set:
+//! Extensions are instantiable at a declared [`Scope`]. The host fires
+//! lifecycle events (peer up / session opened / agent loaded), each
+//! event constructs the instances for that scope, and the per-turn
+//! dispatch composes the live set:
 //!
 //!   `instances_for_turn(agent, session) = global ∪ agent ∪ session`
 //!
-//! Today's compiled-in extensions stay opt-in to the new model — the
-//! default `Scope::Global` plus a no-op [`ExtensionInstance`] keeps the
-//! legacy install / cap-registry path running unchanged.
+//! Each instance publishes its tools / commands / hook handlers / cap
+//! impls through typed endpoints on [`ExtensionInstance`]. A Global
+//! instance is drained at `install_all`; per-session/per-agent
+//! instances are built lazily at their lifecycle event.
 //!
 //! The trait surface is deliberately the shape the WASM component model
 //! will reach for later: a typed instance with typed endpoints, no
@@ -31,13 +20,10 @@
 //! the [`CapResolver`] so providers and consumers can find each other
 //! at call time rather than at install time.
 //!
-//! Phase A landed only the types and the hub bookkeeping. Phase B
-//! migrated extensions one-by-one onto [`ExtensionInstance`]. Phase C
-//! (this revision) wires [`CapResolver`] into dispatch: the hub builds
-//! a [`HubCapResolver`](crate::extension::HubCapResolver) per turn and
-//! the routine-fire path resolves [`Messenger`] / [`MemoryAccess`]
-//! through it instead of poking the legacy
-//! [`crate::extension::registry::CapRegistry`].
+//! Dispatch resolves extension-providable caps through a per-turn
+//! [`HubCapResolver`](crate::extension::HubCapResolver) that walks the
+//! live instance set (see [`CapResolver`]). The routine-fire path uses
+//! it for [`Messenger`] / [`MemoryAccess`].
 //!
 //! `TurnCtx` still has no production consumer — instance endpoints
 //! today take no args, so the hub never needs to thread a turn
@@ -152,16 +138,13 @@ impl ScopeCtx<'_> {
 /// optional endpoint corresponds to one cap or hook moment; an instance
 /// overrides only the endpoints it actually provides.
 ///
-/// This collapses today's parallel `CapRegistry` (providers) and
-/// `HookHandler` (event handlers) registries into one shape. The host
-/// composes the live instance set at turn time and invokes the relevant
-/// endpoint on each one.
+/// Tools, commands, hook handlers, and cap impls all flow through this
+/// one shape. The host composes the live instance set at turn time and
+/// invokes the relevant endpoint on each one.
 ///
-/// The defaults are deliberately empty so existing extensions can
-/// declare `Scope::Global` and return a no-op instance from
-/// `instantiate` — the legacy install path keeps wiring tools /
-/// commands / caps through the old registries until each extension
-/// chooses to migrate.
+/// The defaults are deliberately empty so an extension that contributes
+/// nothing at a given scope can return a no-op instance from
+/// `instantiate` (see [`LegacyInstance`]).
 #[allow(unused_variables)]
 pub trait ExtensionInstance: Send + Sync + 'static {
     fn manifest(&self) -> &ExtensionManifest;
@@ -312,11 +295,10 @@ pub type InstantiateFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<Arc<dyn ExtensionInstance>>> + Send + 'a>,
 >;
 
-/// Marker instance used by the default `Extension::instantiate`. Used
-/// by legacy extensions that haven't migrated to the new model — they
-/// keep registering tools, commands, and caps via the original
-/// install path, and this empty instance just satisfies the trait
-/// surface so the lifecycle machinery has a uniform return type.
+/// No-op instance returned by the default `Extension::instantiate`.
+/// An extension that contributes nothing at a scope (or a test
+/// fixture that only needs to be registered) gets this — it satisfies
+/// the trait surface with every endpoint defaulting to empty.
 pub(crate) struct LegacyInstance {
     manifest: ExtensionManifest,
 }

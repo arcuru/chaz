@@ -1023,9 +1023,42 @@ mod tests {
         // End-to-end: one-shot routine + an installed extension whose
         // routine handler records the payload. After `fire_due`, the
         // routine is gone and the payload was observed.
-        use crate::extension::{ExtensionHub, HookKind, caps, handler};
+        use crate::extension::{ExtensionHub, HookKind, caps, handler, instance};
         use std::sync::Mutex as StdMutex;
 
+        // Routine handler that records the payload it's fired with.
+        struct Echo {
+            seen: Arc<StdMutex<Vec<serde_json::Value>>>,
+        }
+        impl handler::RoutineHandler for Echo {
+            fn on_fire<'a>(
+                &'a self,
+                _caps: &'a caps::ExtensionCaps,
+                payload: serde_json::Value,
+            ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
+                let seen = self.seen.clone();
+                Box::pin(async move {
+                    seen.lock().unwrap().push(payload);
+                    Ok(())
+                })
+            }
+        }
+        // Extension that publishes that routine handler through its
+        // Global instance.
+        struct EchoInstance {
+            manifest: crate::extension::manifest::ExtensionManifest,
+            seen: Arc<StdMutex<Vec<serde_json::Value>>>,
+        }
+        impl instance::ExtensionInstance for EchoInstance {
+            fn manifest(&self) -> &crate::extension::manifest::ExtensionManifest {
+                &self.manifest
+            }
+            fn routine_handler(&self) -> Option<Arc<dyn handler::RoutineHandler>> {
+                Some(Arc::new(Echo {
+                    seen: self.seen.clone(),
+                }))
+            }
+        }
         struct EchoExt {
             seen: Arc<StdMutex<Vec<serde_json::Value>>>,
         }
@@ -1036,44 +1069,43 @@ mod tests {
             fn supported_hooks(&self) -> &[HookKind] {
                 &[]
             }
-            fn install<'a>(
+            fn instantiate<'a>(
                 &'a self,
-                _caps: caps::ExtensionCaps,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = anyhow::Result<handler::InstalledExtension>>
-                        + Send
-                        + 'a,
-                >,
-            > {
+                _scope_ctx: instance::ScopeCtx<'a>,
+            ) -> instance::InstantiateFuture<'a> {
+                let manifest = self.manifest();
                 let seen = self.seen.clone();
                 Box::pin(async move {
-                    struct Echo {
-                        seen: Arc<StdMutex<Vec<serde_json::Value>>>,
-                    }
-                    impl handler::RoutineHandler for Echo {
-                        fn on_fire<'a>(
-                            &'a self,
-                            _caps: &'a caps::ExtensionCaps,
-                            payload: serde_json::Value,
-                        ) -> handler::HandlerFuture<'a, anyhow::Result<()>>
-                        {
-                            let seen = self.seen.clone();
-                            Box::pin(async move {
-                                seen.lock().unwrap().push(payload);
-                                Ok(())
-                            })
-                        }
-                    }
-                    let mut i = handler::InstalledExtension::empty();
-                    i.routine_handler = Some(Box::new(Echo { seen }));
-                    Ok(i)
+                    Ok(Arc::new(EchoInstance { manifest, seen })
+                        as Arc<dyn instance::ExtensionInstance>)
                 })
             }
         }
 
+        // The Global-instance drain only runs when peer_handles is
+        // wired, so stand up a minimal SessionRegistry-backed peer bag.
+        let inst = Instance::open(Box::new(InMemory::new())).await.unwrap();
+        let _ = inst.create_user("test", None).await;
+        let user = inst.login_user("test", None).await.unwrap();
+        let agents = Arc::new(crate::agent::AgentRegistry::with_default_agent());
+        let registry = Arc::new(
+            crate::session::SessionRegistry::new(inst, user, agents)
+                .await
+                .unwrap(),
+        );
+
         let mut hub = ExtensionHub::new();
         let seen = Arc::new(StdMutex::new(Vec::new()));
+        hub.set_peer_handles(Arc::new(instance::PeerHandles {
+            registry,
+            agent_index: crate::hosted_index::HostedIndex::empty("agent"),
+            memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),
+            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
+            embedder: None,
+            secrets: None,
+            server_cell: Arc::new(std::sync::OnceLock::new()),
+            agent_state_allowlist: Default::default(),
+        }));
         hub.install_all(vec![Arc::new(EchoExt { seen: seen.clone() })])
             .await
             .unwrap();

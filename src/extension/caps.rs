@@ -546,45 +546,6 @@ pub trait ContextTail: Send + Sync {
 }
 
 // =========================================================================
-// CapProvider
-// =========================================================================
-
-/// One impl an extension publishes via `build_providers()`.
-///
-/// One variant per extension-providable kind. The host registers
-/// providers into the cap registry keyed by `(kind, extension_name)`,
-/// then resolves consumer requests against that registry when building
-/// each consumer's bundle.
-pub enum CapProvider {
-    Messenger(Arc<dyn Messenger>),
-    Memory(Arc<dyn MemoryAccess>),
-    AgentStateAdmin(Arc<dyn AgentStateAdmin>),
-    PromptAugmentation(Arc<dyn PromptAugmentation>),
-    ContextTail(Arc<dyn ContextTail>),
-}
-
-impl CapProvider {
-    /// Which [`CapabilityKind`] this provider satisfies.
-    pub fn kind(&self) -> CapabilityKind {
-        match self {
-            Self::Messenger(_) => CapabilityKind::Messenger,
-            Self::Memory(_) => CapabilityKind::Memory,
-            Self::PromptAugmentation(_) => CapabilityKind::PromptAugmentation,
-            Self::ContextTail(_) => CapabilityKind::ContextTail,
-            Self::AgentStateAdmin(_) => CapabilityKind::AgentStateAdmin,
-        }
-    }
-}
-
-impl fmt::Debug for CapProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Skip the `Arc` payload — `dyn Trait` isn't `Debug` and the
-        // kind is the only useful thing to print.
-        f.debug_tuple("CapProvider").field(&self.kind()).finish()
-    }
-}
-
-// =========================================================================
 // ExtensionCaps — per-extension consumer bundle
 // =========================================================================
 
@@ -933,7 +894,7 @@ mod tests {
         assert_eq!(set.get(Some("backup")).unwrap().greeting(), "secondary");
     }
 
-    // --- CapProvider ------------------------------------------------------
+    // --- Cap impls used by bundle tests -----------------------------------
 
     struct NoopMessenger;
     impl Messenger for NoopMessenger {
@@ -961,39 +922,6 @@ mod tests {
         ) -> CapFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
-    }
-
-    struct NoopAgentStateAdmin;
-    impl AgentStateAdmin for NoopAgentStateAdmin {
-        fn resolve_agent(&self, _name: &str) -> Result<DbEntry, String> {
-            Err("not implemented".into())
-        }
-        fn open_agent_db<'a>(&'a self, _entry: &'a DbEntry) -> CapFuture<'a, AgentDb> {
-            Box::pin(async { Err(anyhow::anyhow!("not implemented")) })
-        }
-    }
-
-    #[test]
-    fn cap_provider_kind_matches_variant() {
-        let m: CapProvider = CapProvider::Messenger(Arc::new(NoopMessenger));
-        assert_eq!(m.kind(), CapabilityKind::Messenger);
-        let mem: CapProvider = CapProvider::Memory(Arc::new(NoopMemory));
-        assert_eq!(mem.kind(), CapabilityKind::Memory);
-        let a: CapProvider = CapProvider::AgentStateAdmin(Arc::new(NoopAgentStateAdmin));
-        assert_eq!(a.kind(), CapabilityKind::AgentStateAdmin);
-    }
-
-    #[test]
-    fn cap_provider_debug_redacts_arc_payload() {
-        // Debug prints the Rust variant name (via derived `Debug` on
-        // `CapabilityKind`); the snake_case form is only for `Display`
-        // and the wire encoding.
-        let m: CapProvider = CapProvider::Messenger(Arc::new(NoopMessenger));
-        assert_eq!(format!("{m:?}"), "CapProvider(Messenger)");
-        let mem: CapProvider = CapProvider::Memory(Arc::new(NoopMemory));
-        assert_eq!(format!("{mem:?}"), "CapProvider(Memory)");
-        let a: CapProvider = CapProvider::AgentStateAdmin(Arc::new(NoopAgentStateAdmin));
-        assert_eq!(format!("{a:?}"), "CapProvider(AgentStateAdmin)");
     }
 
     // --- Data types -------------------------------------------------------
