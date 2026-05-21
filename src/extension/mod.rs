@@ -784,6 +784,134 @@ impl ExtensionHub {
         out
     }
 
+    /// True if any registered extension declares [`Scope::PerAgent`].
+    /// The per-agent lifecycle is zero-cost until at least one extension
+    /// opts in: the dispatch path skips agent-DB resolution entirely
+    /// when this returns false.
+    fn has_per_agent_extensions(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|e| e.scopes().contains(&instance::Scope::PerAgent))
+    }
+
+    /// Lazily instantiate every [`Scope::PerAgent`] extension for the
+    /// given agent DB if not already cached. Idempotent; the mirror of
+    /// [`Self::ensure_session_instances`], keyed by the agent DB's root
+    /// ID so two sessions driven by the same agent share one instance.
+    ///
+    /// Like the session path, instantiation needs `peer_handles`; without
+    /// it (isolated tests) this is a no-op and the agent contributes no
+    /// per-agent instances.
+    pub async fn ensure_agent_instances(
+        &self,
+        agent_name: &str,
+        agent_db: &eidetica::Database,
+    ) -> Vec<Arc<dyn instance::ExtensionInstance>> {
+        let agent_id = agent_db.root_id().clone();
+        // Fast path: already populated for this agent.
+        {
+            let read = self.agent_instances.read().await;
+            let existing: Vec<_> = read
+                .iter()
+                .filter(|((aid, _), _)| aid == &agent_id)
+                .map(|(_, inst)| inst.clone())
+                .collect();
+            if !existing.is_empty() {
+                return existing;
+            }
+        }
+
+        let Some(peer) = self.peer_handles.clone() else {
+            return Vec::new();
+        };
+
+        let mut built: Vec<(String, Arc<dyn instance::ExtensionInstance>)> = Vec::new();
+        for ext in &self.extensions {
+            if !ext.scopes().contains(&instance::Scope::PerAgent) {
+                continue;
+            }
+            let scope_ctx = instance::ScopeCtx::Agent {
+                peer: &peer,
+                agent_name,
+                agent_db,
+            };
+            match ext.instantiate(scope_ctx).await {
+                Ok(inst) => {
+                    let name = inst.manifest().name.clone();
+                    built.push((name, inst));
+                }
+                Err(e) => {
+                    warn!(
+                        extension = %ext.manifest().name,
+                        agent = %agent_name,
+                        error = %e,
+                        "Per-agent instantiate failed; extension inactive for this agent"
+                    );
+                }
+            }
+        }
+
+        let mut write = self.agent_instances.write().await;
+        let mut out = Vec::with_capacity(built.len());
+        for (name, inst) in built {
+            let entry = write
+                .entry((agent_id.clone(), name))
+                .or_insert_with(|| inst.clone());
+            out.push(entry.clone());
+        }
+        out
+    }
+
+    /// Resolve and ensure per-agent instances by agent display name.
+    ///
+    /// Opens the agent's Living Agent DB through the running server
+    /// (reached via `peer_handles.server_cell`) and delegates to
+    /// [`Self::ensure_agent_instances`]. Returns empty when no extension
+    /// declares [`Scope::PerAgent`], when the server isn't wired yet
+    /// (isolated tests), or when the agent isn't hosted by this peer.
+    async fn ensure_agent_instances_for_name(
+        &self,
+        agent_name: &str,
+    ) -> Vec<Arc<dyn instance::ExtensionInstance>> {
+        if !self.has_per_agent_extensions() {
+            return Vec::new();
+        }
+        let Some(peer) = self.peer_handles.as_ref() else {
+            return Vec::new();
+        };
+        let Some(server) = peer.server_cell.get() else {
+            return Vec::new();
+        };
+        let Some(adb) = server.open_agent_db_by_name(agent_name).await else {
+            return Vec::new();
+        };
+        self.ensure_agent_instances(agent_name, adb.database())
+            .await
+    }
+
+    /// Compose the per-turn instance set that contributes to LLM context
+    /// (prompt augmentation, context tails): per-session ∪ per-agent,
+    /// deduped by extension name with per-session winning. Global
+    /// instances are intentionally excluded here — they don't carry the
+    /// session/agent context those endpoints need, and never have.
+    async fn context_instances(
+        &self,
+        agent_name: &str,
+        session_db: Option<&Database>,
+    ) -> Vec<Arc<dyn instance::ExtensionInstance>> {
+        let mut by_name: HashMap<String, Arc<dyn instance::ExtensionInstance>> = HashMap::new();
+        // Agent first, so a same-named per-session instance overwrites it.
+        for inst in self.ensure_agent_instances_for_name(agent_name).await {
+            by_name.insert(inst.manifest().name.clone(), inst);
+        }
+        if let Some(db) = session_db {
+            for inst in self.ensure_session_instances(db).await {
+                by_name.insert(inst.manifest().name.clone(), inst);
+            }
+        }
+        by_name.into_values().collect()
+    }
+
     /// Install the session registry the hub uses to resolve session-
     /// scoped routine fires into per-session caps. Called once at
     /// startup from chaz's main, after both [`Self::new`] and
@@ -1377,23 +1505,20 @@ impl ExtensionHub {
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        if let Some(db) = session_db {
-            let instances = self.ensure_session_instances(db).await;
-            for inst in instances {
-                let name = inst.manifest().name.clone();
-                if let Some(active) = active_extensions
-                    && !active.iter().any(|a| a == name.as_str())
-                {
-                    continue;
-                }
-                if let Some(pa) = inst.prompt_augmentation()
-                    && let Ok(Some(text)) = pa
-                        .augment_system_prompt(agent_name, recent_message_text)
-                        .await
-                    && !text.trim().is_empty()
-                {
-                    parts.push(text);
-                }
+        for inst in self.context_instances(agent_name, session_db).await {
+            let name = inst.manifest().name.clone();
+            if let Some(active) = active_extensions
+                && !active.iter().any(|a| a == name.as_str())
+            {
+                continue;
+            }
+            if let Some(pa) = inst.prompt_augmentation()
+                && let Ok(Some(text)) = pa
+                    .augment_system_prompt(agent_name, recent_message_text)
+                    .await
+                && !text.trim().is_empty()
+            {
+                parts.push(text);
             }
         }
         parts.join("\n\n")
@@ -1416,21 +1541,18 @@ impl ExtensionHub {
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        if let Some(db) = session_db {
-            let instances = self.ensure_session_instances(db).await;
-            for inst in instances {
-                let name = inst.manifest().name.clone();
-                if let Some(active) = active_extensions
-                    && !active.iter().any(|a| a == name.as_str())
-                {
-                    continue;
-                }
-                if let Some(ct) = inst.context_tail()
-                    && let Ok(Some(text)) = ct.context_tail(agent_name, recent_message_text).await
-                    && !text.trim().is_empty()
-                {
-                    parts.push(text);
-                }
+        for inst in self.context_instances(agent_name, session_db).await {
+            let name = inst.manifest().name.clone();
+            if let Some(active) = active_extensions
+                && !active.iter().any(|a| a == name.as_str())
+            {
+                continue;
+            }
+            if let Some(ct) = inst.context_tail()
+                && let Ok(Some(text)) = ct.context_tail(agent_name, recent_message_text).await
+                && !text.trim().is_empty()
+            {
+                parts.push(text);
             }
         }
         parts.join("\n\n")
@@ -1683,6 +1805,7 @@ mod tests {
         session_start: Option<Arc<dyn handler::HookHandlerSessionStart>>,
         session_shutdown: Option<Arc<dyn handler::HookHandlerSessionShutdown>>,
         routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
+        prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
         tools: Vec<Arc<dyn Tool>>,
         commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
     }
@@ -1690,6 +1813,7 @@ mod tests {
     struct TestExt {
         name: &'static str,
         supported: Vec<HookKind>,
+        scopes: Vec<instance::Scope>,
         parts: TestParts,
     }
 
@@ -1698,8 +1822,17 @@ mod tests {
             Self {
                 name,
                 supported: Vec::new(),
+                scopes: vec![instance::Scope::Global],
                 parts: TestParts::default(),
             }
+        }
+        fn scopes(mut self, scopes: Vec<instance::Scope>) -> Self {
+            self.scopes = scopes;
+            self
+        }
+        fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
+            self.parts.prompt_augmentation = Some(p);
+            self
         }
         fn tool_call(mut self, h: Arc<dyn handler::HookHandlerToolCall>) -> Self {
             self.supported.push(HookKind::ToolCall);
@@ -1728,6 +1861,9 @@ mod tests {
         }
         fn supported_hooks(&self) -> &[HookKind] {
             &self.supported
+        }
+        fn scopes(&self) -> &[instance::Scope] {
+            &self.scopes
         }
         fn instantiate<'a>(
             &'a self,
@@ -1777,6 +1913,9 @@ mod tests {
         fn routine_handler(&self) -> Option<Arc<dyn handler::RoutineHandler>> {
             self.parts.routine_handler.clone()
         }
+        fn prompt_augmentation(&self) -> Option<Arc<dyn caps::PromptAugmentation>> {
+            self.parts.prompt_augmentation.clone()
+        }
     }
 
     fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandles> {
@@ -1819,6 +1958,79 @@ mod tests {
         s.set("name", "session");
         let db = user.create_database(s, &key).await.unwrap();
         (instance, db)
+    }
+
+    struct FixedAug(&'static str);
+    impl caps::PromptAugmentation for FixedAug {
+        fn augment_system_prompt<'a>(
+            &'a self,
+            _agent_name: &'a str,
+            _recent: &'a [String],
+        ) -> caps::CapFuture<'a, Option<String>> {
+            let text = self.0.to_string();
+            Box::pin(async move { Ok(Some(text)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_agent_instances_instantiates_per_agent_extensions() {
+        let mut hub = test_hub().await;
+        hub.install_all(vec![Arc::new(
+            TestExt::new("per_agent_ext")
+                .scopes(vec![instance::Scope::PerAgent])
+                .prompt_augmentation(Arc::new(FixedAug("AGENT-AUG"))),
+        )])
+        .await
+        .unwrap();
+
+        // A PerAgent-only extension is not drained as a Global instance.
+        assert!(hub.global_instances.is_empty());
+
+        let (_inst, agent_db) = make_session_db().await;
+        let got = hub.ensure_agent_instances("alpha", &agent_db).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].manifest().name, "per_agent_ext");
+        assert!(got[0].prompt_augmentation().is_some());
+
+        // Idempotent: a second call returns the same cached instance.
+        let again = hub.ensure_agent_instances("alpha", &agent_db).await;
+        assert_eq!(again.len(), 1);
+        assert!(Arc::ptr_eq(&got[0], &again[0]));
+    }
+
+    #[tokio::test]
+    async fn ensure_agent_instances_keyed_per_agent_db() {
+        let mut hub = test_hub().await;
+        hub.install_all(vec![Arc::new(
+            TestExt::new("per_agent_ext").scopes(vec![instance::Scope::PerAgent]),
+        )])
+        .await
+        .unwrap();
+
+        let (_i1, db_a) = make_session_db().await;
+        let (_i2, db_b) = make_session_db().await;
+        let a = hub.ensure_agent_instances("alpha", &db_a).await;
+        let b = hub.ensure_agent_instances("beta", &db_b).await;
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        // Distinct agent DBs get distinct instances.
+        assert!(!Arc::ptr_eq(&a[0], &b[0]));
+        assert_eq!(hub.agent_instances.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_agent_instances_noop_without_per_agent_scope() {
+        // A Global-only extension yields no per-agent instances.
+        let mut hub = test_hub().await;
+        hub.install_all(vec![Arc::new(TestExt::new("global_ext"))])
+            .await
+            .unwrap();
+        let (_inst, agent_db) = make_session_db().await;
+        assert!(
+            hub.ensure_agent_instances("alpha", &agent_db)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
