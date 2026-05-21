@@ -1,22 +1,19 @@
 //! MCP-server-as-extension — one `McpExtension` per configured MCP server.
 //!
-//! Each instance wraps an [`McpServer`] and registers its discovered tools
-//! through the extension hub's normal `ToolRegistration` cap. Tools carry
-//! attribution (`owner: "mcp-<server_name>"`) so they participate in
-//! per-session extension filtering, the same as any built-in extension.
+//! Each instance wraps an [`McpServer`] and contributes its discovered
+//! tools through `ExtensionInstance::tools`. Tools carry attribution
+//! (`owner: "mcp-<server_name>"`) so they participate in per-session
+//! extension filtering, the same as any built-in extension.
 //!
 //! Failed servers are logged and produce zero tools (matching the legacy
 //! `start_mcp_servers` resilience contract).
 
 use crate::config::McpServerConfig;
-use crate::extension::caps::{CapabilityRequest, ExtensionCaps};
-use crate::extension::handler::InstalledExtension;
+use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::mcp::server::McpServer;
 use crate::tool::Tool;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -50,62 +47,73 @@ impl Extension for McpExtension {
             name: self.name.to_string(),
             extension_ref: ExtensionRef::builtin(self.name),
             supported_hooks: vec![HookKind::Tool],
-            required_capabilities: vec![CapabilityRequest::ToolRegistration],
+            required_capabilities: Vec::new(),
             requested_capabilities: Vec::new(),
             provides_capabilities: Vec::new(),
         }
     }
 
-    fn install<'a>(
-        &'a self,
-        caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+    fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+        let manifest = self.manifest();
+        let config = self.config.clone();
+        let name = self.name;
         Box::pin(async move {
-            let tool_reg = caps
-                .tool_registration
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("mcp install requires ToolRegistration cap"))?;
-
-            // Start the MCP server. If it fails, log and return empty —
-            // matching the legacy resilience contract.
-            let server: McpServer = match McpServer::start(&self.config).await {
-                Ok(s) => s,
+            // Start the MCP server. If it fails, log and produce an
+            // empty instance — matching the legacy resilience contract.
+            let tools: Vec<Arc<dyn Tool>> = match McpServer::start(&config).await {
+                Ok(server) => {
+                    let server = Arc::new(server);
+                    match server.discover_and_wrap_tools(&config.name).await {
+                        Ok(t) => {
+                            let count = t.len();
+                            tracing::info!(
+                                server = %config.name,
+                                count,
+                                "MCP server registered as extension"
+                            );
+                            t.into_iter().map(|tool| Arc::new(tool) as Arc<dyn Tool>).collect()
+                        }
+                        Err(e) => {
+                            warn!(
+                                server = %config.name,
+                                error = %e,
+                                "MCP server tool discovery failed — skipping"
+                            );
+                            Vec::new()
+                        }
+                    }
+                }
                 Err(e) => {
                     warn!(
-                        server = %self.config.name,
+                        server = %config.name,
                         error = %e,
                         "MCP server failed to start — skipping its tools"
                     );
-                    return Ok(InstalledExtension::empty());
+                    Vec::new()
                 }
             };
 
-            let server = Arc::new(server);
-            let tools = match server.discover_and_wrap_tools(&self.config.name).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        server = %self.config.name,
-                        error = %e,
-                        "MCP server tool discovery failed — skipping"
-                    );
-                    return Ok(InstalledExtension::empty());
-                }
-            };
-
-            let count = tools.len();
-            for t in tools {
-                let d = t.descriptor();
-                tool_reg.register(d, Arc::new(t)).await?;
-            }
-
-            tracing::info!(
-                server = %self.config.name,
-                count,
-                "MCP server registered as extension"
-            );
-
-            Ok(InstalledExtension::empty())
+            Ok(Arc::new(McpInstance {
+                manifest,
+                _name: name,
+                tools,
+            }) as Arc<dyn ExtensionInstance>)
         })
+    }
+}
+
+struct McpInstance {
+    manifest: ExtensionManifest,
+    _name: &'static str,
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl ExtensionInstance for McpInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.clone()
     }
 }

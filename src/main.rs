@@ -447,6 +447,8 @@ async fn main() -> anyhow::Result<()> {
         skill_bank_index: skill_bank_index_store.clone(),
         embedder: embedder.clone(),
         secrets: Some(Arc::new(secret_store.clone())),
+        server_cell: spawn_server_cell.clone(),
+        agent_state_allowlist: config.agent_state_allowlist.clone(),
     }));
 
     // Collect MCP server configs from inline config + directory scanning.

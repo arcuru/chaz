@@ -41,13 +41,14 @@
 use crate::extension::caps::{ContextTail, MemoryAccess, Messenger, PromptAugmentation};
 use crate::extension::handler::{
     HookHandlerAgentEnd, HookHandlerBeforeAgentStart, HookHandlerSessionShutdown,
-    HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult,
+    HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult, RoutineHandler,
 };
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::ExtensionCommand;
 use crate::tool::Tool;
 use eidetica::Database;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Where an extension lives and how long an instance survives.
@@ -83,6 +84,17 @@ pub struct PeerHandles {
     pub skill_bank_index: crate::hosted_index::HostedIndex,
     pub embedder: Option<Arc<dyn crate::embedding::Embedder>>,
     pub secrets: Option<Arc<crate::security::SecretStore>>,
+    /// Server cell — set by main.rs after `Server::new`. Empty until
+    /// then. Instances that need a back-reference to the running server
+    /// (today: the schedule and agent_schedule extensions, which spawn
+    /// sessions / fire agent turns) close over the `Arc<OnceLock>` and
+    /// dereference at fire time.
+    pub server_cell: Arc<std::sync::OnceLock<Arc<crate::server::Server>>>,
+    /// Operator-configured `agent_state` allowlist, keyed by extension
+    /// name. Mirrors the field on the hub — instances that build a
+    /// `ScopedAgentStateAdmin` apply this map themselves rather than
+    /// going through hub-side cap resolution.
+    pub agent_state_allowlist: HashMap<String, Vec<String>>,
 }
 
 /// Context handed to [`crate::extension::Extension::instantiate`]. The
@@ -222,6 +234,15 @@ pub trait ExtensionInstance: Send + Sync + 'static {
         None
     }
     fn session_shutdown_hook(&self) -> Option<Arc<dyn HookHandlerSessionShutdown>> {
+        None
+    }
+
+    /// Routine engine dispatch endpoint. Returned handles flow into
+    /// `installed[name].routine_handler`, where `ExtensionHub::
+    /// dispatch_routine` looks them up. Only Global instances are
+    /// drained for routine handlers — per-session/per-agent routine
+    /// fires aren't supported yet.
+    fn routine_handler(&self) -> Option<Arc<dyn RoutineHandler>> {
         None
     }
 

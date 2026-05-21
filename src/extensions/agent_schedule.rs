@@ -13,12 +13,11 @@
 //! engine's fire loop isn't blocked on LLM latency.
 
 use crate::extension::caps::ExtensionCaps;
-use crate::extension::handler::{HandlerFuture, InstalledExtension, RoutineHandler};
+use crate::extension::handler::{HandlerFuture, RoutineHandler};
+use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::server::Server;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 pub struct AgentScheduleExtension {
@@ -51,17 +50,32 @@ impl Extension for AgentScheduleExtension {
         }
     }
 
-    fn install<'a>(
-        &'a self,
-        _caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+    fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+        let manifest = self.manifest();
+        let server_cell = self.server_cell.clone();
         Box::pin(async move {
-            let mut installed = InstalledExtension::empty();
-            installed.routine_handler = Some(Box::new(AgentScheduleRoutineHandler {
-                server_cell: self.server_cell.clone(),
-            }));
-            Ok(installed)
+            Ok(Arc::new(AgentScheduleInstance {
+                manifest,
+                server_cell,
+            }) as Arc<dyn ExtensionInstance>)
         })
+    }
+}
+
+struct AgentScheduleInstance {
+    manifest: ExtensionManifest,
+    server_cell: Arc<OnceLock<Arc<Server>>>,
+}
+
+impl ExtensionInstance for AgentScheduleInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn routine_handler(&self) -> Option<Arc<dyn RoutineHandler>> {
+        Some(Arc::new(AgentScheduleRoutineHandler {
+            server_cell: self.server_cell.clone(),
+        }))
     }
 }
 

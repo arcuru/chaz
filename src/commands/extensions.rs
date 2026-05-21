@@ -264,6 +264,7 @@ mod tests {
         hub.set_session_registry(registry.clone());
         hub.set_hosted_index(agent_index.clone());
         let skill_bank_index = crate::hosted_index::HostedIndex::empty("skill_bank");
+        let spawn_cell = Arc::new(OnceLock::new());
         // Wire peer_handles so migrated extensions instantiate during
         // `install_all` — without this the global drain path is skipped
         // and tool-only / hook-only extensions silently register nothing.
@@ -274,10 +275,11 @@ mod tests {
             skill_bank_index: skill_bank_index.clone(),
             embedder: None,
             secrets: None,
+            server_cell: spawn_cell.clone(),
+            agent_state_allowlist: Default::default(),
         }));
         let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
-        let spawn_cell = Arc::new(OnceLock::new());
         hub.install_all(all_builtins(BuiltinDeps {
             agent_index: agent_index.clone(),
             memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),

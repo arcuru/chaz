@@ -6,10 +6,9 @@
 //! instead of the session `routines` table.
 
 use crate::agent_db::{AgentDb, Schedule, ScheduleTarget};
-use crate::extension::caps::{
-    AgentStateAdmin, CapabilityRequest, CommandDescriptor, ExtensionCaps,
-};
-use crate::extension::handler::InstalledExtension;
+use crate::extension::agent_state::ScopedAgentStateAdmin;
+use crate::extension::caps::AgentStateAdmin;
+use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
@@ -22,9 +21,10 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// Schedule extension — receives its `AgentStateAdmin` handle from the
-/// hub at install time. Stateless: agent-owned schedule fires run
-/// through the separate `agent_schedule` extension's standalone path.
+/// Schedule extension. Stateless — each instance builds a scoped
+/// `AgentStateAdmin` from the peer handles at instantiate time.
+/// Agent-owned schedule fires run through the separate `agent_schedule`
+/// extension's standalone path.
 pub struct ScheduleExtension;
 
 impl ScheduleExtension {
@@ -53,58 +53,57 @@ impl Extension for ScheduleExtension {
             name: self.name().to_string(),
             extension_ref: ExtensionRef::builtin(self.name()),
             supported_hooks: vec![HookKind::Tool, HookKind::Command],
-            required_capabilities: vec![
-                CapabilityRequest::ToolRegistration,
-                CapabilityRequest::CommandRegistration,
-                CapabilityRequest::AgentStateAdmin { agents: None },
-            ],
+            required_capabilities: Vec::new(),
             requested_capabilities: Vec::new(),
             provides_capabilities: Vec::new(),
         }
     }
 
-    fn install<'a>(
-        &'a self,
-        caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+    fn instantiate<'a>(&'a self, scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+        let manifest = self.manifest();
+        let peer = scope_ctx.peer();
+        let allowlist = peer.agent_state_allowlist.get("schedule").cloned();
+        let agent_state: Arc<dyn AgentStateAdmin> = Arc::new(ScopedAgentStateAdmin::new(
+            peer.registry.clone(),
+            peer.agent_index.clone(),
+            allowlist,
+        ));
         Box::pin(async move {
-            let tool_reg = caps
-                .tool_registration
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("schedule install requires ToolRegistration cap"))?;
-            let cmd_reg = caps.command_registration.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("schedule install requires CommandRegistration cap")
-            })?;
-            let agent_state = caps
-                .agent_state_admin
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("schedule install requires AgentStateAdmin cap"))?;
-
-            let tools: Vec<Arc<dyn crate::tool::Tool>> = vec![
-                Arc::new(ScheduleAdd::new(agent_state.clone())),
-                Arc::new(ScheduleModify::new(agent_state.clone())),
-                Arc::new(ScheduleRemove::new(agent_state.clone())),
-                Arc::new(ScheduleList::new(agent_state.clone())),
-                Arc::new(ScheduleOnce::new(agent_state.clone())),
-            ];
-            for t in tools {
-                let d = t.descriptor();
-                tool_reg.register(d, t).await?;
-            }
-
-            cmd_reg
-                .register(
-                    CommandDescriptor {
-                        name: "schedule".into(),
-                        description: "Manage agent-owned schedules — add | modify | remove | list"
-                            .into(),
-                    },
-                    Box::new(ScheduleCommand { agent_state }),
-                )
-                .await?;
-
-            Ok(InstalledExtension::empty())
+            Ok(Arc::new(ScheduleInstance {
+                manifest,
+                agent_state,
+            }) as Arc<dyn ExtensionInstance>)
         })
+    }
+}
+
+struct ScheduleInstance {
+    manifest: ExtensionManifest,
+    agent_state: Arc<dyn AgentStateAdmin>,
+}
+
+impl ExtensionInstance for ScheduleInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn crate::tool::Tool>> {
+        vec![
+            Arc::new(ScheduleAdd::new(self.agent_state.clone())),
+            Arc::new(ScheduleModify::new(self.agent_state.clone())),
+            Arc::new(ScheduleRemove::new(self.agent_state.clone())),
+            Arc::new(ScheduleList::new(self.agent_state.clone())),
+            Arc::new(ScheduleOnce::new(self.agent_state.clone())),
+        ]
+    }
+
+    fn commands(&self) -> Vec<(String, Arc<dyn ExtensionCommand>)> {
+        vec![(
+            "schedule".into(),
+            Arc::new(ScheduleCommand {
+                agent_state: self.agent_state.clone(),
+            }),
+        )]
     }
 }
 

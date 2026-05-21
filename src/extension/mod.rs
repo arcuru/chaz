@@ -1505,6 +1505,15 @@ impl ExtensionHub {
                 )),
             });
         }
+        if let Some(h) = inst.routine_handler() {
+            // Slot may already exist (legacy `install()` returned
+            // empty); enrich it. dispatch_routine consults
+            // `installed[name].routine_handler` and works unchanged.
+            self.installed
+                .entry(owner.to_string())
+                .or_insert_with(handler::InstalledExtension::empty)
+                .routine_handler = Some(Box::new(h));
+        }
     }
 
     /// Assemble the install-time consumer bundle for `manifest`.

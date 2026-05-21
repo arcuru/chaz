@@ -161,6 +161,16 @@ impl HookHandlerSessionShutdown for Arc<dyn HookHandlerSessionShutdown> {
     }
 }
 
+impl RoutineHandler for Arc<dyn RoutineHandler> {
+    fn on_fire<'a>(
+        &'a self,
+        caps: &'a ExtensionCaps,
+        payload: Value,
+    ) -> HandlerFuture<'a, anyhow::Result<()>> {
+        (**self).on_fire(caps, payload)
+    }
+}
+
 // =========================================================================
 // Routine handler
 // =========================================================================
