@@ -10,12 +10,12 @@
 //! hook: read the output, log if something looks suspicious, hand it back.
 
 use crate::extension::caps::ExtensionCaps;
-use crate::extension::handler::{HandlerFuture, HookHandlerToolResult, InstalledExtension};
+use crate::extension::handler::{HandlerFuture, HookHandlerToolResult};
+use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::security::Sanitizer;
-use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 use tracing::warn;
 
 pub struct SecurityWarnings;
@@ -40,15 +40,26 @@ impl Extension for SecurityWarnings {
         }
     }
 
-    fn install<'a>(
-        &'a self,
-        _caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+    fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+        let manifest = self.manifest();
         Box::pin(async move {
-            let mut installed = InstalledExtension::empty();
-            installed.tool_result = Some(Box::new(SecurityWarningsCapHook));
-            Ok(installed)
+            Ok(Arc::new(SecurityWarningsInstance { manifest })
+                as Arc<dyn ExtensionInstance>)
         })
+    }
+}
+
+struct SecurityWarningsInstance {
+    manifest: ExtensionManifest,
+}
+
+impl ExtensionInstance for SecurityWarningsInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn tool_result_hook(&self) -> Option<Arc<dyn HookHandlerToolResult>> {
+        Some(Arc::new(SecurityWarningsCapHook))
     }
 }
 

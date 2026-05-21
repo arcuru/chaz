@@ -526,9 +526,14 @@ struct RegisteredHook<T: ?Sized> {
 }
 
 /// Internal wrapper that tags an extension slash command with its owner.
+///
+/// `Arc` (not `Box`) so the same handler can flow in from either the
+/// legacy install path (which produces `Box<dyn ExtensionCommand>`,
+/// converted via `Arc::from`) or an `ExtensionInstance::commands()`
+/// drain (which already produces `Arc<dyn ExtensionCommand>`).
 struct RegisteredCommand {
     owner: &'static str,
-    handler: Box<dyn ExtensionCommand>,
+    handler: Arc<dyn ExtensionCommand>,
 }
 
 /// Internal wrapper that tags a registered tool with its owner.
@@ -1378,17 +1383,17 @@ impl ExtensionHub {
         }
 
         // Phase 3 (lifecycle) — for every extension whose declared
-        // scope is `Global`, instantiate now and stash the instance.
-        // Per-session / per-agent scopes are instantiated lazily later
-        // (session_start / agent load).
+        // scope is `Global`, instantiate now and stash the instance,
+        // then drain its tools / commands / hook handlers through the
+        // legacy attribution path so they show up in the
+        // ToolRegistry, the command map, and the per-kind hook
+        // vectors. Migrated extensions return everything through the
+        // instance; the legacy `install()` / `build_providers()` paths
+        // are still consulted for not-yet-migrated extensions.
         //
         // Without `peer_handles` we can't build a `ScopeCtx`, so we
         // skip. That's the bootstrap state — the host wires
-        // `peer_handles` after the hub but before any session opens,
-        // and extensions that depend on the new model declare a
-        // non-Global scope. Until any extension migrates, this loop
-        // is no-op-ish: it allocates one `LegacyInstance` per
-        // extension, which only carries the manifest.
+        // `peer_handles` after the hub but before any session opens.
         if let Some(peer) = self.peer_handles.clone() {
             for ext in extensions.iter() {
                 if ext.scope() != instance::Scope::Global {
@@ -1400,11 +1405,106 @@ impl ExtensionHub {
                 }
                 let scope_ctx = instance::ScopeCtx::Global { peer: &peer };
                 let inst = ext.instantiate(scope_ctx).await?;
+                self.drain_global_instance(&m.name, &inst);
                 self.global_instances.insert(m.name.clone(), inst);
             }
         }
 
         Ok(())
+    }
+
+    /// Drain one Global instance's tools / commands / hook handlers
+    /// into the legacy registries, so the existing `fire_*` paths and
+    /// the [`crate::tool::ToolRegistry`] keep working unchanged.
+    ///
+    /// Called from [`Self::install_all`] right after a Global instance
+    /// is built. Migrated extensions return real values here; legacy
+    /// extensions (default `LegacyInstance`) return everything empty
+    /// and the drain is a no-op for them.
+    fn drain_global_instance(
+        &mut self,
+        owner: &str,
+        inst: &Arc<dyn instance::ExtensionInstance>,
+    ) {
+        for tool in inst.tools() {
+            self.register_tool_attributed(owner, tool);
+        }
+        for (name, handler) in inst.commands() {
+            self.register_command_attributed_arc(owner, name, handler);
+        }
+        let owner_static = self.intern_name(owner);
+        if let Some(h) = inst.before_agent_start_hook() {
+            self.hooks_by_extension
+                .entry(owner_static)
+                .or_default()
+                .insert(HookKind::BeforeAgentStart);
+            self.before_agent_start.push(RegisteredHook {
+                owner: owner_static,
+                hook: Box::new(hook_bridge::BeforeAgentStartAdapter::new(
+                    owner_static,
+                    Box::new(h),
+                )),
+            });
+        }
+        if let Some(h) = inst.tool_call_hook() {
+            self.hooks_by_extension
+                .entry(owner_static)
+                .or_default()
+                .insert(HookKind::ToolCall);
+            self.tool_call.push(RegisteredHook {
+                owner: owner_static,
+                hook: Box::new(hook_bridge::ToolCallAdapter::new(owner_static, Box::new(h))),
+            });
+        }
+        if let Some(h) = inst.tool_result_hook() {
+            self.hooks_by_extension
+                .entry(owner_static)
+                .or_default()
+                .insert(HookKind::ToolResult);
+            self.tool_result.push(RegisteredHook {
+                owner: owner_static,
+                hook: Box::new(hook_bridge::ToolResultAdapter::new(
+                    owner_static,
+                    Box::new(h),
+                )),
+            });
+        }
+        if let Some(h) = inst.agent_end_hook() {
+            self.hooks_by_extension
+                .entry(owner_static)
+                .or_default()
+                .insert(HookKind::AgentEnd);
+            self.agent_end.push(RegisteredHook {
+                owner: owner_static,
+                hook: Box::new(hook_bridge::AgentEndAdapter::new(owner_static, Box::new(h))),
+            });
+        }
+        if let Some(h) = inst.session_start_hook() {
+            self.hooks_by_extension
+                .entry(owner_static)
+                .or_default()
+                .insert(HookKind::SessionStart);
+            self.session_start.push(RegisteredHook {
+                owner: owner_static,
+                hook: Box::new(hook_bridge::SessionStartAdapter::new(
+                    owner_static,
+                    Box::new(h),
+                )),
+            });
+        }
+        if let Some(h) = inst.session_shutdown_hook() {
+            self.hooks_by_extension
+                .entry(owner_static)
+                .or_default()
+                .insert(HookKind::SessionShutdown);
+            self.session_shutdown.push(RegisteredHook {
+                owner: owner_static,
+                hook: Box::new(hook_bridge::SessionShutdownAdapter::new(
+                    owner_static,
+                    Box::new(h),
+                )),
+            });
+        }
     }
 
     /// Assemble the install-time consumer bundle for `manifest`.
@@ -1900,11 +2000,28 @@ impl ExtensionHub {
 
     /// Internal: register a slash command against an explicit owner,
     /// applying the first-write-wins + built-in-name reservation policy.
+    ///
+    /// `Box` shape kept for the legacy install drain that feeds
+    /// `PendingCommand.command: Box<dyn ExtensionCommand>`; converts
+    /// to `Arc` (the storage shape) on the way through.
     fn register_command_attributed(
         &mut self,
         owner: &str,
         name: String,
         handler: Box<dyn ExtensionCommand>,
+    ) {
+        self.register_command_attributed_arc(owner, name, Arc::from(handler));
+    }
+
+    /// Same as [`Self::register_command_attributed`], but accepts an
+    /// already-`Arc`-d handler — used by the [`ExtensionInstance`]
+    /// drain path where commands flow in as `Arc` and reusing the
+    /// `Box` shim would clone-into-Box just to convert back.
+    fn register_command_attributed_arc(
+        &mut self,
+        owner: &str,
+        name: String,
+        handler: Arc<dyn ExtensionCommand>,
     ) {
         let owner_static = self.intern_name(owner);
         if self.reserved_command_names.contains(&name) {

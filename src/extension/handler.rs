@@ -40,6 +40,7 @@ use crate::runtime::RuntimeMessage;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// Boxed future returned by every cap-based handler method.
 pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -97,6 +98,67 @@ pub trait HookHandlerSessionStart: Send + Sync {
 /// process exit / abnormal termination skips this hook.
 pub trait HookHandlerSessionShutdown: Send + Sync {
     fn on_session_shutdown<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()>;
+}
+
+// =========================================================================
+// Arc-to-Box adapters
+// =========================================================================
+//
+// `ExtensionInstance` endpoints (`tool_call_hook()`, …) return
+// `Option<Arc<dyn HookHandler*>>` so the instance keeps ownership and
+// the hub clones the handle into its dispatch path. The hub's legacy
+// `install_all` drain feeds these handles into Box-shaped adapters in
+// `hook_bridge`, so each handler trait gets a blanket impl over
+// `Arc<dyn HookHandler*>`. Boxing the Arc then satisfies the
+// `Box<dyn HookHandler*>` slot on `InstalledExtension`.
+
+impl HookHandlerBeforeAgentStart for Arc<dyn HookHandlerBeforeAgentStart> {
+    fn on_before_agent_start<'a>(
+        &'a self,
+        caps: &'a ExtensionCaps,
+    ) -> HandlerFuture<'a, Vec<RuntimeMessage>> {
+        (**self).on_before_agent_start(caps)
+    }
+}
+
+impl HookHandlerToolCall for Arc<dyn HookHandlerToolCall> {
+    fn on_tool_call<'a>(
+        &'a self,
+        caps: &'a ExtensionCaps,
+        tool_name: &'a str,
+        args: &'a mut Value,
+    ) -> HandlerFuture<'a, ToolCallDecision> {
+        (**self).on_tool_call(caps, tool_name, args)
+    }
+}
+
+impl HookHandlerToolResult for Arc<dyn HookHandlerToolResult> {
+    fn on_tool_result<'a>(
+        &'a self,
+        caps: &'a ExtensionCaps,
+        tool_name: &'a str,
+        result: String,
+    ) -> HandlerFuture<'a, String> {
+        (**self).on_tool_result(caps, tool_name, result)
+    }
+}
+
+impl HookHandlerAgentEnd for Arc<dyn HookHandlerAgentEnd> {
+    fn on_agent_end<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()> {
+        (**self).on_agent_end(caps)
+    }
+}
+
+impl HookHandlerSessionStart for Arc<dyn HookHandlerSessionStart> {
+    fn on_session_start<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()> {
+        (**self).on_session_start(caps)
+    }
+}
+
+impl HookHandlerSessionShutdown for Arc<dyn HookHandlerSessionShutdown> {
+    fn on_session_shutdown<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()> {
+        (**self).on_session_shutdown(caps)
+    }
 }
 
 // =========================================================================

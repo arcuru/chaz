@@ -6,11 +6,11 @@
 //! execution avoids the round-trip through an error message.
 
 use crate::extension::caps::ExtensionCaps;
-use crate::extension::handler::{HandlerFuture, HookHandlerToolCall, InstalledExtension};
+use crate::extension::handler::{HandlerFuture, HookHandlerToolCall};
+use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind, ToolCallDecision};
-use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 
 pub struct PathNormalizer;
 
@@ -34,15 +34,26 @@ impl Extension for PathNormalizer {
         }
     }
 
-    fn install<'a>(
-        &'a self,
-        _caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
+    fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+        let manifest = self.manifest();
         Box::pin(async move {
-            let mut installed = InstalledExtension::empty();
-            installed.tool_call = Some(Box::new(PathNormalizerCapHook));
-            Ok(installed)
+            Ok(Arc::new(PathNormalizerInstance { manifest })
+                as Arc<dyn ExtensionInstance>)
         })
+    }
+}
+
+struct PathNormalizerInstance {
+    manifest: ExtensionManifest,
+}
+
+impl ExtensionInstance for PathNormalizerInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn tool_call_hook(&self) -> Option<Arc<dyn HookHandlerToolCall>> {
+        Some(Arc::new(PathNormalizerCapHook))
     }
 }
 

@@ -39,7 +39,13 @@
 #![allow(dead_code)]
 
 use crate::extension::caps::{ContextTail, MemoryAccess, Messenger, PromptAugmentation};
+use crate::extension::handler::{
+    HookHandlerAgentEnd, HookHandlerBeforeAgentStart, HookHandlerSessionShutdown,
+    HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult,
+};
 use crate::extension::manifest::ExtensionManifest;
+use crate::extension::ExtensionCommand;
+use crate::tool::Tool;
 use eidetica::Database;
 use std::any::Any;
 use std::sync::Arc;
@@ -164,6 +170,58 @@ pub trait ExtensionInstance: Send + Sync + 'static {
         None
     }
     fn messenger(&self) -> Option<Arc<dyn Messenger>> {
+        None
+    }
+
+    // ── Tools + commands ───────────────────────────────────────────
+    //
+    // The host drains these at instance construction time. For Global
+    // instances that's the tail of `install_all` (so tools flow into
+    // the runtime ToolRegistry and commands into the hub's command
+    // map). Per-session/per-agent tool & command scopes will land
+    // alongside the dispatch-time scoping work — today, only Global
+    // instances may publish tools/commands.
+
+    /// Tools this instance publishes. Drained once after instantiation.
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    /// Slash commands as `(name, handler)`. Drained once after
+    /// instantiation; collisions follow the hub's first-write-wins
+    /// policy (built-in reservations win over extension registrations).
+    fn commands(&self) -> Vec<(String, Arc<dyn ExtensionCommand>)> {
+        Vec::new()
+    }
+
+    // ── Hook endpoints ─────────────────────────────────────────────
+    //
+    // Each endpoint mirrors a slot on the legacy
+    // [`crate::extension::handler::InstalledExtension`] — same trait
+    // shape, `Arc` instead of `Box` so the instance can keep
+    // ownership and the host clones the handle into its fire path.
+    //
+    // For Global instances the hub drains the returned handles at
+    // install_all and pushes them through the legacy fire path. Once
+    // dispatch consults instances directly (task #28 / #30), this
+    // drain becomes the source of truth.
+
+    fn before_agent_start_hook(&self) -> Option<Arc<dyn HookHandlerBeforeAgentStart>> {
+        None
+    }
+    fn tool_call_hook(&self) -> Option<Arc<dyn HookHandlerToolCall>> {
+        None
+    }
+    fn tool_result_hook(&self) -> Option<Arc<dyn HookHandlerToolResult>> {
+        None
+    }
+    fn agent_end_hook(&self) -> Option<Arc<dyn HookHandlerAgentEnd>> {
+        None
+    }
+    fn session_start_hook(&self) -> Option<Arc<dyn HookHandlerSessionStart>> {
+        None
+    }
+    fn session_shutdown_hook(&self) -> Option<Arc<dyn HookHandlerSessionShutdown>> {
         None
     }
 
