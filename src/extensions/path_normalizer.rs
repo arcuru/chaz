@@ -37,8 +37,7 @@ impl Extension for PathNormalizer {
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
         Box::pin(async move {
-            Ok(Arc::new(PathNormalizerInstance { manifest })
-                as Arc<dyn ExtensionInstance>)
+            Ok(Arc::new(PathNormalizerInstance { manifest }) as Arc<dyn ExtensionInstance>)
         })
     }
 }

@@ -31,20 +31,29 @@
 //! the [`CapResolver`] so providers and consumers can find each other
 //! at call time rather than at install time.
 //!
-//! Phase A landed only the types and the hub bookkeeping — `TurnCtx`
-//! and `CapResolver` have no production consumers yet, hence the
-//! `#[allow(dead_code)]` on them. Phase B (memory → PerSession) is
-//! where they start being constructed and called.
+//! Phase A landed only the types and the hub bookkeeping. Phase B
+//! migrated extensions one-by-one onto [`ExtensionInstance`]. Phase C
+//! (this revision) wires [`CapResolver`] into dispatch: the hub builds
+//! a [`HubCapResolver`](crate::extension::HubCapResolver) per turn and
+//! the routine-fire path resolves [`Messenger`] / [`MemoryAccess`]
+//! through it instead of poking the legacy
+//! [`crate::extension::registry::CapRegistry`].
+//!
+//! `TurnCtx` still has no production consumer — instance endpoints
+//! today take no args, so the hub never needs to thread a turn
+//! context through them. It stays in the trait surface as the
+//! contract for the next step (endpoints that need to look up other
+//! caps mid-call), gated behind the dead-code allow until then.
 
 #![allow(dead_code)]
 
+use crate::extension::ExtensionCommand;
 use crate::extension::caps::{ContextTail, MemoryAccess, Messenger, PromptAugmentation};
 use crate::extension::handler::{
     HookHandlerAgentEnd, HookHandlerBeforeAgentStart, HookHandlerSessionShutdown,
     HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult, RoutineHandler,
 };
 use crate::extension::manifest::ExtensionManifest;
-use crate::extension::ExtensionCommand;
 use crate::tool::Tool;
 use eidetica::Database;
 use std::any::Any;

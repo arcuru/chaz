@@ -43,8 +43,7 @@ impl Extension for SecurityWarnings {
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
         Box::pin(async move {
-            Ok(Arc::new(SecurityWarningsInstance { manifest })
-                as Arc<dyn ExtensionInstance>)
+            Ok(Arc::new(SecurityWarningsInstance { manifest }) as Arc<dyn ExtensionInstance>)
         })
     }
 }

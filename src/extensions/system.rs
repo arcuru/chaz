@@ -33,9 +33,9 @@ impl Extension for SystemExtension {
 
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
-        Box::pin(async move {
-            Ok(Arc::new(SystemInstance { manifest }) as Arc<dyn ExtensionInstance>)
-        })
+        Box::pin(
+            async move { Ok(Arc::new(SystemInstance { manifest }) as Arc<dyn ExtensionInstance>) },
+        )
     }
 }
 

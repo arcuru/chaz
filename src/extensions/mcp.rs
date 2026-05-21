@@ -71,7 +71,9 @@ impl Extension for McpExtension {
                                 count,
                                 "MCP server registered as extension"
                             );
-                            t.into_iter().map(|tool| Arc::new(tool) as Arc<dyn Tool>).collect()
+                            t.into_iter()
+                                .map(|tool| Arc::new(tool) as Arc<dyn Tool>)
+                                .collect()
                         }
                         Err(e) => {
                             warn!(

@@ -896,8 +896,11 @@ impl ExtensionHub {
 
     /// Assemble the routine-fire caps bundle for engine dispatch.
     ///
-    /// Always populates the extension-providable cap defaults
-    /// (Messenger, Memory) from the registry. For
+    /// Resolves [`caps::Messenger`] and [`caps::MemoryAccess`] defaults
+    /// through a turn-scoped [`HubCapResolver`] — which walks the
+    /// live `instances_for_turn` set (global ∪ session for now)
+    /// and falls back to the legacy [`registry::CapRegistry`] for
+    /// extensions that still publish via `build_providers()`. For
     /// [`RoutineScope::Session`] also resolves the target session
     /// through [`SessionRegistry`] and fills SessionRead, SessionWrite,
     /// and Settings with per-session in-process impls owned by
@@ -909,21 +912,21 @@ impl ExtensionHub {
         scope: &RoutineScope,
     ) -> anyhow::Result<caps::ExtensionCaps> {
         let mut bundle = caps::ExtensionCaps::empty();
-        if let Some(map) = self
-            .cap_registry
-            .by_kind
-            .get(&caps::CapabilityKind::Messenger)
-            && let Some(default_name) = map.default.as_deref()
-            && let Some(caps::CapProvider::Messenger(m)) = map.providers.get(default_name)
-        {
-            bundle.messengers.default = Some(m.clone());
-        }
-        if let Some(map) = self.cap_registry.by_kind.get(&caps::CapabilityKind::Memory)
-            && let Some(default_name) = map.default.as_deref()
-            && let Some(caps::CapProvider::Memory(m)) = map.providers.get(default_name)
-        {
-            bundle.memory.default = Some(m.clone());
-        }
+
+        // Build a resolver for the turn. For session-scoped fires the
+        // session DB participates in instance lookup (PerSession
+        // instances win over Global). For global fires only the
+        // Global instance set contributes.
+        let session_id_for_resolver: Option<String> = match scope {
+            RoutineScope::Session(id) => Some(id.clone()),
+            _ => None,
+        };
+        let resolver = self
+            .cap_resolver_for_turn(None, session_id_for_resolver.as_deref())
+            .await;
+        use instance::CapResolver as _;
+        bundle.messengers.default = resolver.messenger();
+        bundle.memory.default = resolver.memory();
 
         if let RoutineScope::Session(session_db_id) = scope {
             let registry = self.session_registry.as_ref().ok_or_else(|| {
@@ -942,6 +945,34 @@ impl ExtensionHub {
         }
 
         Ok(bundle)
+    }
+
+    /// Build a turn-scoped [`HubCapResolver`] that walks
+    /// `instances_for_turn(agent_db_id, session_db_id)` and falls
+    /// back to the legacy [`registry::CapRegistry`] for caps still
+    /// published through `Extension::build_providers`.
+    ///
+    /// One per turn — cheap to build (snapshots Arcs out of the live
+    /// instance map plus the per-kind default picks from
+    /// `cap_registry`) and small enough to live on the stack of the
+    /// caller. The resolver is `Send + Sync + 'static` so endpoints
+    /// can shove it across `.await` points without lifetime
+    /// gymnastics.
+    pub async fn cap_resolver_for_turn(
+        &self,
+        agent_db_id: Option<&eidetica::entry::ID>,
+        session_db_id: Option<&str>,
+    ) -> HubCapResolver {
+        // Lazy session-instance population — same trigger as the
+        // augment_system_prompt / context_tails paths.
+        if let Some(session_id) = session_db_id
+            && let Some(reg) = self.session_registry.as_ref()
+            && let Ok((_conv_id, session_db)) = reg.open_session(session_id).await
+        {
+            let _ = self.ensure_session_instances(&session_db).await;
+        }
+        let instances = self.instances_for_turn(agent_db_id, session_db_id).await;
+        HubCapResolver::snapshot(self, instances)
     }
 
     /// Reserve built-in slash command names so extensions can't shadow them.
@@ -1428,11 +1459,7 @@ impl ExtensionHub {
     /// is built. Migrated extensions return real values here; legacy
     /// extensions (default `LegacyInstance`) return everything empty
     /// and the drain is a no-op for them.
-    fn drain_global_instance(
-        &mut self,
-        owner: &str,
-        inst: &Arc<dyn instance::ExtensionInstance>,
-    ) {
+    fn drain_global_instance(&mut self, owner: &str, inst: &Arc<dyn instance::ExtensionInstance>) {
         for tool in inst.tools() {
             self.register_tool_attributed(owner, tool);
         }
@@ -2069,6 +2096,149 @@ impl ExtensionHub {
             },
         );
     }
+}
+
+/// Turn-scoped cap lookup that walks live [`ExtensionInstance`]s,
+/// falling back to the legacy [`registry::CapRegistry`] default for
+/// each kind. Built once per turn by
+/// [`ExtensionHub::cap_resolver_for_turn`] and dropped after.
+///
+/// The instance set is already deduped by
+/// [`ExtensionHub::instances_for_turn`] — session > agent > global
+/// precedence is baked in (later wins for same-name extensions). For
+/// caps with multiple providers the first instance reporting `Some`
+/// from its endpoint wins; iteration order matches `HashMap`'s, which
+/// is non-deterministic but irrelevant today since no two extensions
+/// publish the same cap on the instance side. Once that stops being
+/// true the resolver should grow explicit precedence — likely
+/// last-installed-wins to match the `RoutineEngine` schedule rules.
+///
+/// The legacy fallback covers extensions that still publish caps via
+/// `build_providers()` (today: none — memory was the last hold-out
+/// and migrated in this revision). Kept in place so the resolver
+/// remains drop-in correct if a future filesystem- or WASM-loaded
+/// extension chooses the legacy path.
+pub struct HubCapResolver {
+    instances: Vec<Arc<dyn instance::ExtensionInstance>>,
+    legacy_memory: Option<Arc<dyn caps::MemoryAccess>>,
+    legacy_messenger: Option<Arc<dyn caps::Messenger>>,
+    // `context_tail` and `prompt_augmentation` are aggregated, not
+    // single-pick, by the dispatch path (see `context_tails` and
+    // `augment_system_prompt`). The resolver carries them so callers
+    // that *do* want a single best-pick — e.g. a future per-turn
+    // shortcut — get the same fallback semantics as the routine
+    // engine's Memory/Messenger lookup. Today no caller hits these
+    // accessors; allowing dead_code keeps the surface uniform.
+    #[allow(dead_code)]
+    legacy_context_tail: Option<Arc<dyn caps::ContextTail>>,
+    #[allow(dead_code)]
+    legacy_prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
+}
+
+impl HubCapResolver {
+    fn snapshot(hub: &ExtensionHub, instances: Vec<Arc<dyn instance::ExtensionInstance>>) -> Self {
+        let legacy_memory = default_cap_from_registry(
+            &hub.cap_registry,
+            caps::CapabilityKind::Memory,
+            |p| match p {
+                caps::CapProvider::Memory(m) => Some(m.clone()),
+                _ => None,
+            },
+        );
+        let legacy_messenger =
+            default_cap_from_registry(&hub.cap_registry, caps::CapabilityKind::Messenger, |p| {
+                match p {
+                    caps::CapProvider::Messenger(m) => Some(m.clone()),
+                    _ => None,
+                }
+            });
+        let legacy_context_tail =
+            default_cap_from_registry(&hub.cap_registry, caps::CapabilityKind::ContextTail, |p| {
+                match p {
+                    caps::CapProvider::ContextTail(c) => Some(c.clone()),
+                    _ => None,
+                }
+            });
+        let legacy_prompt_augmentation = default_cap_from_registry(
+            &hub.cap_registry,
+            caps::CapabilityKind::PromptAugmentation,
+            |p| match p {
+                caps::CapProvider::PromptAugmentation(pa) => Some(pa.clone()),
+                _ => None,
+            },
+        );
+        Self {
+            instances,
+            legacy_memory,
+            legacy_messenger,
+            legacy_context_tail,
+            legacy_prompt_augmentation,
+        }
+    }
+}
+
+impl instance::CapResolver for HubCapResolver {
+    fn memory(&self) -> Option<Arc<dyn caps::MemoryAccess>> {
+        for inst in &self.instances {
+            if let Some(m) = inst.memory_access() {
+                return Some(m);
+            }
+        }
+        self.legacy_memory.clone()
+    }
+
+    fn messenger(&self) -> Option<Arc<dyn caps::Messenger>> {
+        for inst in &self.instances {
+            if let Some(m) = inst.messenger() {
+                return Some(m);
+            }
+        }
+        self.legacy_messenger.clone()
+    }
+
+    fn context_tail(&self) -> Option<Arc<dyn caps::ContextTail>> {
+        for inst in &self.instances {
+            if let Some(c) = inst.context_tail() {
+                return Some(c);
+            }
+        }
+        self.legacy_context_tail.clone()
+    }
+
+    fn prompt_augmentation(&self) -> Option<Arc<dyn caps::PromptAugmentation>> {
+        for inst in &self.instances {
+            if let Some(pa) = inst.prompt_augmentation() {
+                return Some(pa);
+            }
+        }
+        self.legacy_prompt_augmentation.clone()
+    }
+
+    fn extension_cap_by_id(
+        &self,
+        type_id: std::any::TypeId,
+    ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        for inst in &self.instances {
+            if let Some(c) = inst.extension_cap(type_id) {
+                return Some(c);
+            }
+        }
+        None
+    }
+}
+
+/// Pull the default-provider's `Arc<dyn T>` out of a [`registry::CapRegistry`]
+/// slot. Returns `None` if the kind has no default pick or the default
+/// provider's `CapProvider` variant doesn't match the extractor.
+fn default_cap_from_registry<T: ?Sized>(
+    reg: &registry::CapRegistry,
+    kind: caps::CapabilityKind,
+    extractor: impl Fn(&caps::CapProvider) -> Option<Arc<T>>,
+) -> Option<Arc<T>> {
+    let map = reg.by_kind.get(&kind)?;
+    let default_name = map.default.as_deref()?;
+    let provider = map.providers.get(default_name)?;
+    extractor(provider)
 }
 
 /// Resolve one extension-providable cap request into a `CapSet` slot.
@@ -3385,6 +3555,114 @@ mod tests {
         assert_eq!(entries.len(), 1, "expected one entry, got {entries:?}");
         assert!(matches!(entries[0].entry_type, EntryType::Directive));
         assert_eq!(entries[0].sender, "session-scoped");
+    }
+
+    /// Extension that publishes a Messenger through the instance
+    /// endpoint (no `build_providers`, no `provides_capabilities`).
+    /// Used by `cap_resolver_walks_instance_published_caps` to
+    /// confirm HubCapResolver resolves caps from instances without
+    /// the legacy cap_registry hop.
+    struct InstanceMessengerExt;
+    impl InstanceMessengerExt {
+        fn impls() -> Arc<dyn caps::Messenger> {
+            struct NoopMessenger;
+            impl caps::Messenger for NoopMessenger {
+                fn send<'a>(
+                    &'a self,
+                    _target: String,
+                    _body: caps::MessageBody,
+                ) -> caps::CapFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+            }
+            Arc::new(NoopMessenger)
+        }
+    }
+    impl Extension for InstanceMessengerExt {
+        fn name(&self) -> &'static str {
+            "inst-messenger"
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn manifest(&self) -> manifest::ExtensionManifest {
+            manifest::ExtensionManifest {
+                name: self.name().to_string(),
+                extension_ref: ExtensionRef::builtin(self.name()),
+                supported_hooks: Vec::new(),
+                required_capabilities: Vec::new(),
+                requested_capabilities: Vec::new(),
+                provides_capabilities: Vec::new(),
+            }
+        }
+        fn instantiate<'a>(
+            &'a self,
+            _scope_ctx: instance::ScopeCtx<'a>,
+        ) -> instance::InstantiateFuture<'a> {
+            let manifest = self.manifest();
+            Box::pin(async move {
+                Ok(Arc::new(InstanceMessengerInstance {
+                    manifest,
+                    messenger: InstanceMessengerExt::impls(),
+                }) as Arc<dyn instance::ExtensionInstance>)
+            })
+        }
+    }
+    struct InstanceMessengerInstance {
+        manifest: manifest::ExtensionManifest,
+        messenger: Arc<dyn caps::Messenger>,
+    }
+    impl instance::ExtensionInstance for InstanceMessengerInstance {
+        fn manifest(&self) -> &manifest::ExtensionManifest {
+            &self.manifest
+        }
+        fn messenger(&self) -> Option<Arc<dyn caps::Messenger>> {
+            Some(self.messenger.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_resolver_walks_instance_published_caps() {
+        // Minimal in-memory fixture — install_all only fires the
+        // global-instance drain when peer_handles is set.
+        let backend = InMemory::new();
+        let inst = Instance::open(Box::new(backend)).await.unwrap();
+        let _ = inst.create_user("test", None).await;
+        let user = inst.login_user("test", None).await.unwrap();
+        let agents = Arc::new(crate::agent::AgentRegistry::with_default_agent());
+        let registry = Arc::new(SessionRegistry::new(inst, user, agents).await.unwrap());
+
+        let mut hub = ExtensionHub::new();
+        hub.set_peer_handles(Arc::new(instance::PeerHandles {
+            registry: registry.clone(),
+            agent_index: HostedIndex::empty("agent"),
+            memory_bank_index: HostedIndex::empty("bank"),
+            skill_bank_index: HostedIndex::empty("skill_bank"),
+            embedder: None,
+            secrets: None,
+            server_cell: Arc::new(std::sync::OnceLock::new()),
+            agent_state_allowlist: Default::default(),
+        }));
+        hub.install_all(vec![Arc::new(InstanceMessengerExt)])
+            .await
+            .unwrap();
+
+        // Nothing landed in the legacy cap_registry (the extension
+        // didn't implement build_providers).
+        assert!(
+            !hub.cap_registry
+                .by_kind
+                .contains_key(&caps::CapabilityKind::Messenger),
+            "instance-published cap must not populate cap_registry"
+        );
+
+        // Resolver still finds it through the instance endpoint.
+        let resolver = hub.cap_resolver_for_turn(None, None).await;
+        use instance::CapResolver as _;
+        assert!(
+            resolver.messenger().is_some(),
+            "HubCapResolver should expose an instance-published Messenger"
+        );
     }
 
     #[tokio::test]

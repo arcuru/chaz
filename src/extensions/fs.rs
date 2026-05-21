@@ -34,9 +34,7 @@ impl Extension for FsExtension {
 
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
-        Box::pin(async move {
-            Ok(Arc::new(FsInstance { manifest }) as Arc<dyn ExtensionInstance>)
-        })
+        Box::pin(async move { Ok(Arc::new(FsInstance { manifest }) as Arc<dyn ExtensionInstance>) })
     }
 }
 

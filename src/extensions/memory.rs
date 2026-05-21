@@ -20,8 +20,7 @@
 use crate::agent_db::{MEMORY_STORE, MemoryEntry};
 use crate::embedding::Embedder;
 use crate::extension::caps::{
-    CapFuture, CapProvider, CapabilityKind, CapabilityRequest, ContextTail, MemoryAccess,
-    MemoryHit, MemoryScope,
+    CapFuture, CapabilityKind, CapabilityRequest, ContextTail, MemoryAccess, MemoryHit, MemoryScope,
 };
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
@@ -35,7 +34,6 @@ use crate::tools::{
 use eidetica::Database;
 use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -145,42 +143,18 @@ impl Extension for MemoryExtension {
         }
     }
 
-    fn build_providers(&self) -> anyhow::Result<HashMap<CapabilityKind, CapProvider>> {
-        let mut map = HashMap::new();
-
-        let ct: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
-            registry: self.registry.clone(),
-            agent_index: self.agent_index.clone(),
-            memory_bank_index: self.memory_bank_index.clone(),
-            embedder: self.embedder.clone(),
-            session_attached_banks: Vec::new(),
-        });
-        map.insert(CapabilityKind::ContextTail, CapProvider::ContextTail(ct));
-
-        let ma: Arc<dyn MemoryAccess> = Arc::new(MemoryAccessImpl {
-            registry: self.registry.clone(),
-            agent_index: self.agent_index.clone(),
-            memory_bank_index: self.memory_bank_index.clone(),
-            embedder: self.embedder.clone(),
-        });
-        map.insert(CapabilityKind::Memory, CapProvider::Memory(ma));
-
-        Ok(map)
-    }
-
     // ── Lifecycle ─────────────────────────────────────────────────────
     //
     // Memory lives at two scopes:
     // - Global   → tools (`remember`, `recall`, `list_memory_banks`),
     //              the `/memory` slash command, and the `MemoryAccess`
-    //              cap published to other extensions.
+    //              cap published to other extensions through the
+    //              `MemoryGlobalInstance::memory_access` endpoint —
+    //              the routine engine resolves it through
+    //              `ExtensionHub::cap_resolver_for_turn`.
     // - PerSession → `ContextTail` for auto-recall; reads
     //                `extension_settings["memory"]["attached_banks"]`
     //                at instantiate time and caches it on the instance.
-    //
-    // `build_providers()` is still implemented (above) to keep the
-    // cap_registry filled for the routine engine until task #28
-    // moves dispatch onto a CapResolver that walks instances.
 
     fn scopes(&self) -> &[crate::extension::Scope] {
         &[
@@ -330,7 +304,8 @@ struct MemoryContextTail {
     memory_bank_index: HostedIndex,
     embedder: Option<Arc<dyn Embedder>>,
     /// Per-session attached bank names (from extension_settings["memory"]["attached_banks"]).
-    /// Populated by [`MemoryExtension::build_session_providers`].
+    /// Captured by the per-session [`crate::extension::ExtensionInstance`]
+    /// at instantiate time.
     session_attached_banks: Vec<String>,
 }
 
