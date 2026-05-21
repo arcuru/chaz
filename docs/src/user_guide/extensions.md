@@ -4,8 +4,10 @@ Chaz's tools, hooks, and slash commands are organized into **extensions** —
 each one a bundle of related capabilities (filesystem tools, web tools,
 the schedule scheduler, etc.). Every session has its own active subset:
 you can disable an extension on one session and keep it on another.
+Individual agents can also opt out of an extension just for themselves
+(see [Per-agent scope](#per-agent-scope)).
 
-The `/extensions` command controls per-session activation and settings.
+The `/extensions` command controls activation and settings.
 
 ## Listing extensions
 
@@ -14,24 +16,34 @@ The `/extensions` command controls per-session activation and settings.
 /extensions list
 ```
 
-Both forms show every extension registered on this peer:
+Both forms show every extension registered on this peer, marked for the
+agent responding in this session:
 
 ```
-Extensions on this peer (✓ = active on this session):
+Extensions on this peer (✓ = live for agent 'chaz' this session; ✗ = disabled for this agent):
   ✓ core [0.3.0] — Tool
   ✓ path_normalizer [0.3.0] — ToolCall
   ✓ security_warnings [0.3.0] — ToolResult
   ✓ fs [0.3.0] — Tool
   ✓ system [0.3.0] — Tool
   ✓ web [0.3.0] — Tool
-  ✓ memory [0.3.0] — Tool
-  ✓ schedule [0.3.0] — Command, Tool
+  ✓ memory [0.3.0] — Command, Tool
+  ✓ skills [0.3.0] — Command, Tool
+  ✗ schedule [0.3.0] — Command, Tool  (session: on, agent: off)
 ```
 
 The version in brackets is the chaz binary version that registered the
 extension. The trailing list is the hook kinds it declared — handy for
 seeing at a glance which extensions provide tools, which provide
 commands, and which only hook into the agent lifecycle.
+
+The marker reflects the **effective** state for the responding agent:
+
+- `✓` — active for this agent on this session.
+- `✗` — disabled. A trailing `(session: on, agent: off)` means the
+  session has it on but _this agent_ opted out (see
+  [Per-agent scope](#per-agent-scope)); otherwise it's off for the
+  whole session.
 
 By default every new session starts with every extension active.
 
@@ -75,6 +87,34 @@ defaulting everything back on. If you want the extension back, run
 Some extensions are practical floors (`core`, `system`) — chaz still
 runs without them, but you lose `shell`, `spawn_agent`, `get_time`,
 etc. Disable at your own risk.
+
+## Per-agent scope
+
+`add` and `remove` take an optional trailing scope token — `session`
+(the default) or `agent`:
+
+```
+/extensions remove schedule agent
+/extensions add schedule agent
+```
+
+- **`session`** (default) — edits the session's `extensions` log.
+  Affects every agent responding in the session.
+- **`agent`** — edits the _responding agent's_ Living Agent DB. The
+  agent can only **narrow** the session set: `remove … agent` records an
+  opt-out for that one agent, and `add … agent` clears a prior opt-out.
+  It cannot turn an extension on that the session has turned off — the
+  session set is the upper bound.
+
+The effective set for a turn is therefore **session set minus the
+agent's opt-outs**. An agent's opt-outs travel with it when the agent
+syncs to other peers, so a shared agent keeps its narrowed set
+everywhere it runs. `remove … agent` only works for an agent hosted on
+this peer (the one whose DB this peer can write).
+
+This is useful when several agents share a room but one of them
+shouldn't, say, touch the scheduler — disable it for that agent without
+affecting the others.
 
 ## Inspecting settings
 
@@ -136,6 +176,7 @@ prefix:
 !chaz extensions
 !chaz extensions add memory
 !chaz extensions remove memory
+!chaz extensions remove schedule agent
 !chaz extensions settings schedule
 !chaz extensions set schedule poll_secs 60
 ```
