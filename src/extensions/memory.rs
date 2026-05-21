@@ -20,10 +20,9 @@
 use crate::agent_db::{MEMORY_STORE, MemoryEntry};
 use crate::embedding::Embedder;
 use crate::extension::caps::{
-    CapFuture, CapProvider, CapabilityKind, CapabilityRequest, CommandDescriptor, ContextTail,
-    ExtensionCaps, MemoryAccess, MemoryHit, MemoryScope,
+    CapFuture, CapProvider, CapabilityKind, CapabilityRequest, ContextTail, MemoryAccess,
+    MemoryHit, MemoryScope,
 };
-use crate::extension::handler::InstalledExtension;
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
@@ -169,19 +168,25 @@ impl Extension for MemoryExtension {
         Ok(map)
     }
 
-    // ── Lifecycle: per-session ────────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────────
     //
-    // Memory is the first extension migrated to the per-session
-    // lifecycle. The hub instantiates one [`MemoryInstance`] per
-    // session on first dispatch, the instance holds the resolved
-    // `attached_banks` list, and its `context_tail()` endpoint is what
-    // the auto-recall path consults. The legacy `build_session_providers`
-    // path (which rebuilt the provider every turn) is gone — the
-    // per-turn re-read of session settings was the band-aid the
-    // lifecycle work is here to replace.
+    // Memory lives at two scopes:
+    // - Global   → tools (`remember`, `recall`, `list_memory_banks`),
+    //              the `/memory` slash command, and the `MemoryAccess`
+    //              cap published to other extensions.
+    // - PerSession → `ContextTail` for auto-recall; reads
+    //                `extension_settings["memory"]["attached_banks"]`
+    //                at instantiate time and caches it on the instance.
+    //
+    // `build_providers()` is still implemented (above) to keep the
+    // cap_registry filled for the routine engine until task #28
+    // moves dispatch onto a CapResolver that walks instances.
 
-    fn scope(&self) -> crate::extension::Scope {
-        crate::extension::Scope::PerSession
+    fn scopes(&self) -> &[crate::extension::Scope] {
+        &[
+            crate::extension::Scope::Global,
+            crate::extension::Scope::PerSession,
+        ]
     }
 
     fn instantiate<'a>(
@@ -194,10 +199,18 @@ impl Extension for MemoryExtension {
         let embedder = self.embedder.clone();
         let manifest = self.manifest();
         Box::pin(async move {
-            let attached: Vec<String> = match &scope_ctx {
+            match scope_ctx {
+                crate::extension::ScopeCtx::Global { .. } => Ok(Arc::new(MemoryGlobalInstance {
+                    manifest,
+                    registry,
+                    agent_index,
+                    memory_bank_index,
+                    embedder,
+                })
+                    as Arc<dyn crate::extension::ExtensionInstance>),
                 crate::extension::ScopeCtx::Session { session_db, .. } => {
                     let settings = crate::extension::read_settings(session_db, "memory").await;
-                    settings
+                    let attached: Vec<String> = settings
                         .get("attached_banks")
                         .and_then(|v| v.as_array())
                         .map(|arr| {
@@ -205,79 +218,85 @@ impl Extension for MemoryExtension {
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect()
                         })
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    let context_tail: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
+                        registry,
+                        agent_index,
+                        memory_bank_index,
+                        embedder,
+                        session_attached_banks: attached,
+                    });
+                    Ok(Arc::new(MemoryInstance {
+                        manifest,
+                        context_tail,
+                    })
+                        as Arc<dyn crate::extension::ExtensionInstance>)
                 }
-                _ => Vec::new(),
-            };
-
-            let context_tail: Arc<dyn ContextTail> = Arc::new(MemoryContextTail {
-                registry,
-                agent_index,
-                memory_bank_index,
-                embedder,
-                session_attached_banks: attached,
-            });
-
-            Ok(Arc::new(MemoryInstance {
-                manifest,
-                context_tail,
-            })
-                as Arc<dyn crate::extension::ExtensionInstance>)
+                crate::extension::ScopeCtx::Agent { .. } => {
+                    unreachable!("memory extension does not declare Agent scope")
+                }
+            }
         })
     }
+}
 
-    fn install<'a>(
-        &'a self,
-        caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
-        Box::pin(async move {
-            let tool_reg = caps
-                .tool_registration
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("memory install requires ToolRegistration cap"))?;
-            let cmd_reg = caps.command_registration.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("memory install requires CommandRegistration cap")
-            })?;
+// ── Global instance ──────────────────────────────────────────────────
+//
+// Publishes tools, the `/memory` command, and the `MemoryAccess` cap.
+// The `MemoryAccess` here is the same impl `build_providers()` puts
+// into the cap_registry — kept in both places during the migration
+// window. Task #28's CapResolver will retire the cap_registry path.
 
-            let tools: Vec<Arc<dyn crate::tool::Tool>> = vec![
-                Arc::new(Remember::new(
-                    self.registry.clone(),
-                    self.agent_index.clone(),
-                    self.embedder.clone(),
-                )),
-                Arc::new(Recall::new(
-                    self.registry.clone(),
-                    self.agent_index.clone(),
-                    self.embedder.clone(),
-                )),
-                Arc::new(ListMemoryBanks::new(
-                    self.registry.clone(),
-                    self.agent_index.clone(),
-                )),
-            ];
-            for t in tools {
-                let d = t.descriptor();
-                tool_reg.register(d, t).await?;
-            }
+struct MemoryGlobalInstance {
+    manifest: ExtensionManifest,
+    registry: Arc<SessionRegistry>,
+    agent_index: HostedIndex,
+    memory_bank_index: HostedIndex,
+    embedder: Option<Arc<dyn Embedder>>,
+}
 
-            cmd_reg
-                .register(
-                    CommandDescriptor {
-                        name: "memory".into(),
-                        description: "Manage memory banks: list | new | delete | grant | revoke | \
-                                      share | unshare | import | attach | detach | config"
-                            .into(),
-                    },
-                    Box::new(MemoryCommand {
-                        registry: self.registry.clone(),
-                        agent_index: self.agent_index.clone(),
-                        memory_bank_index: self.memory_bank_index.clone(),
-                    }),
-                )
-                .await?;
+impl crate::extension::ExtensionInstance for MemoryGlobalInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
 
-            Ok(InstalledExtension::empty())
-        })
+    fn tools(&self) -> Vec<Arc<dyn crate::tool::Tool>> {
+        vec![
+            Arc::new(Remember::new(
+                self.registry.clone(),
+                self.agent_index.clone(),
+                self.embedder.clone(),
+            )),
+            Arc::new(Recall::new(
+                self.registry.clone(),
+                self.agent_index.clone(),
+                self.embedder.clone(),
+            )),
+            Arc::new(ListMemoryBanks::new(
+                self.registry.clone(),
+                self.agent_index.clone(),
+            )),
+        ]
+    }
+
+    fn commands(&self) -> Vec<(String, Arc<dyn ExtensionCommand>)> {
+        vec![(
+            "memory".into(),
+            Arc::new(MemoryCommand {
+                registry: self.registry.clone(),
+                agent_index: self.agent_index.clone(),
+                memory_bank_index: self.memory_bank_index.clone(),
+            }),
+        )]
+    }
+
+    fn memory_access(&self) -> Option<Arc<dyn MemoryAccess>> {
+        Some(Arc::new(MemoryAccessImpl {
+            registry: self.registry.clone(),
+            agent_index: self.agent_index.clone(),
+            memory_bank_index: self.memory_bank_index.clone(),
+            embedder: self.embedder.clone(),
+        }))
     }
 }
 

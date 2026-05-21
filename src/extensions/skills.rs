@@ -8,10 +8,7 @@
 //!
 //! SKILL.md format: YAML frontmatter + Markdown body.
 
-use crate::extension::caps::{
-    CapabilityKind, CapabilityRequest, CommandDescriptor, ExtensionCaps, PromptAugmentation,
-};
-use crate::extension::handler::InstalledExtension;
+use crate::extension::caps::{CapabilityKind, CapabilityRequest, PromptAugmentation};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
@@ -203,74 +200,20 @@ impl Extension for SkillsExtension {
         }
     }
 
-    fn install<'a>(
-        &'a self,
-        caps: ExtensionCaps,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<InstalledExtension>> + Send + 'a>> {
-        let skill_count = {
-            let mut registry = self.disk_registry.write().unwrap();
-            registry.scan();
-            registry.list().len()
-        };
+    // ── Lifecycle ────────────────────────────────────────────────────
+    //
+    // Skills lives at two scopes:
+    // - Global   → tools (`skill_list`, `skill_search`, `skill_show`)
+    //              and the `/skills` slash command.
+    // - PerSession → `PromptAugmentation` that injects the per-session
+    //                catalog (disk + agent + granted banks + session-
+    //                attached banks) into the system prompt.
 
-        Box::pin(async move {
-            let tool_reg = caps
-                .tool_registration
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("skills install requires ToolRegistration cap"))?;
-            let cmd_reg = caps.command_registration.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("skills install requires CommandRegistration cap")
-            })?;
-
-            let tools: Vec<Arc<dyn Tool>> = vec![
-                Arc::new(SkillListTool {
-                    registry: self.disk_registry.clone(),
-                }),
-                Arc::new(SkillSearchTool {
-                    registry: self.disk_registry.clone(),
-                }),
-                Arc::new(SkillShowTool {
-                    disk: self.disk_registry.clone(),
-                    registry: self.session_registry.clone(),
-                    agent_index: self.agent_index.clone(),
-                    skill_bank_index: self.skill_bank_index.clone(),
-                }),
-            ];
-            for t in &tools {
-                let d = t.descriptor();
-                tool_reg.register(d, t.clone()).await?;
-            }
-
-            cmd_reg
-                .register(
-                    CommandDescriptor {
-                        name: "skills".into(),
-                        description: "Manage skill banks: list | new | delete | grant | revoke | \
-                                      share | unshare | import | attach <name|db_id|ticket> | \
-                                      detach"
-                            .into(),
-                    },
-                    Box::new(SkillCommand {
-                        registry: self.session_registry.clone(),
-                        agent_index: self.agent_index.clone(),
-                        skill_bank_index: self.skill_bank_index.clone(),
-                    }),
-                )
-                .await?;
-
-            tracing::info!(count = skill_count, "Skills extension installed");
-            Ok(InstalledExtension::empty())
-        })
-    }
-
-    // The skills extension is Scope::PerSession (mirror memory). The
-    // catalog snapshot captured at instantiate time is what the
-    // PromptAugmentation endpoint reads. No global ContextTail /
-    // PromptAugmentation provider — selection is per-session because
-    // session_attached_banks are.
-
-    fn scope(&self) -> crate::extension::Scope {
-        crate::extension::Scope::PerSession
+    fn scopes(&self) -> &[crate::extension::Scope] {
+        &[
+            crate::extension::Scope::Global,
+            crate::extension::Scope::PerSession,
+        ]
     }
 
     fn instantiate<'a>(
@@ -283,16 +226,28 @@ impl Extension for SkillsExtension {
         let skill_bank_index = self.skill_bank_index.clone();
         let manifest = self.manifest();
         Box::pin(async move {
-            // Session-attached banks live in extension_settings["skills"].
-            // For non-Session scope contexts (the install-time Global
-            // dry-run via `LegacyInstance`), there's no session DB —
-            // we end up with an empty attached list, which means the
-            // catalog at call time will still compose disk + agent
-            // sources.
-            let session_attached_banks: Vec<String> = match &scope_ctx {
+            match scope_ctx {
+                crate::extension::ScopeCtx::Global { .. } => {
+                    // Scan disk skills at construction. Subsequent reads
+                    // through `disk_registry` hit the cached set.
+                    let skill_count = {
+                        let mut r = disk.write().unwrap();
+                        r.scan();
+                        r.list().len()
+                    };
+                    tracing::info!(count = skill_count, "Skills extension installed");
+                    Ok(Arc::new(SkillsGlobalInstance {
+                        manifest,
+                        disk,
+                        registry,
+                        agent_index,
+                        skill_bank_index,
+                    })
+                        as Arc<dyn crate::extension::ExtensionInstance>)
+                }
                 crate::extension::ScopeCtx::Session { session_db, .. } => {
                     let settings = crate::extension::read_settings(session_db, "skills").await;
-                    settings
+                    let session_attached_banks: Vec<String> = settings
                         .get("attached_banks")
                         .and_then(|v| v.as_array())
                         .map(|arr| {
@@ -300,22 +255,72 @@ impl Extension for SkillsExtension {
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect()
                         })
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    let inputs = Arc::new(SessionSkills {
+                        disk,
+                        registry,
+                        agent_index,
+                        skill_bank_index,
+                        session_attached_banks,
+                    });
+                    Ok(Arc::new(SkillsInstance { manifest, inputs })
+                        as Arc<dyn crate::extension::ExtensionInstance>)
                 }
-                _ => Vec::new(),
-            };
-
-            let inputs = Arc::new(SessionSkills {
-                disk,
-                registry,
-                agent_index,
-                skill_bank_index,
-                session_attached_banks,
-            });
-
-            Ok(Arc::new(SkillsInstance { manifest, inputs })
-                as Arc<dyn crate::extension::ExtensionInstance>)
+                crate::extension::ScopeCtx::Agent { .. } => {
+                    // Not in `scopes()`; the hub won't call us here.
+                    unreachable!("skills extension does not declare Agent scope")
+                }
+            }
         })
+    }
+}
+
+// ── Global instance ──────────────────────────────────────────────────
+//
+// Publishes tools + the `/skills` slash command. The handles
+// (registry/index/disk) flow from the extension struct through the
+// instance into every tool/command closure — same shape the legacy
+// install() built.
+
+struct SkillsGlobalInstance {
+    manifest: ExtensionManifest,
+    disk: Arc<std::sync::RwLock<SkillRegistry>>,
+    registry: Arc<SessionRegistry>,
+    agent_index: HostedIndex,
+    skill_bank_index: HostedIndex,
+}
+
+impl crate::extension::ExtensionInstance for SkillsGlobalInstance {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(SkillListTool {
+                registry: self.disk.clone(),
+            }),
+            Arc::new(SkillSearchTool {
+                registry: self.disk.clone(),
+            }),
+            Arc::new(SkillShowTool {
+                disk: self.disk.clone(),
+                registry: self.registry.clone(),
+                agent_index: self.agent_index.clone(),
+                skill_bank_index: self.skill_bank_index.clone(),
+            }),
+        ]
+    }
+
+    fn commands(&self) -> Vec<(String, Arc<dyn ExtensionCommand>)> {
+        vec![(
+            "skills".into(),
+            Arc::new(SkillCommand {
+                registry: self.registry.clone(),
+                agent_index: self.agent_index.clone(),
+                skill_bank_index: self.skill_bank_index.clone(),
+            }),
+        )]
     }
 }
 

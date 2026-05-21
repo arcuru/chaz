@@ -486,11 +486,18 @@ pub trait Extension: Send + Sync {
     // [`Scope::PerSession`] and `instantiate` to return a real
     // [`ExtensionInstance`].
 
-    /// Where this extension lives. Default: [`Scope::Global`] — one
+    /// Where this extension lives. Default: `&[Scope::Global]` — one
     /// instance per peer for the binary's lifetime, identical to the
     /// pre-lifecycle behaviour.
-    fn scope(&self) -> instance::Scope {
-        instance::Scope::Global
+    ///
+    /// Extensions that contribute at multiple lifecycle scopes return
+    /// each scope in the slice. The host instantiates them once per
+    /// scope; each `instantiate()` call's `ScopeCtx` variant matches
+    /// the scope being constructed. `memory` and `skills` use this
+    /// to expose Global tools/commands plus per-session caps from one
+    /// extension type.
+    fn scopes(&self) -> &[instance::Scope] {
+        &[instance::Scope::Global]
     }
 
     /// Construct a runtime instance of this extension at the given
@@ -768,7 +775,7 @@ impl ExtensionHub {
 
         let mut built: Vec<(String, Arc<dyn instance::ExtensionInstance>)> = Vec::new();
         for ext in &self.extensions {
-            if ext.scope() != instance::Scope::PerSession {
+            if !ext.scopes().contains(&instance::Scope::PerSession) {
                 continue;
             }
             let scope_ctx = instance::ScopeCtx::Session {
@@ -1396,7 +1403,7 @@ impl ExtensionHub {
         // `peer_handles` after the hub but before any session opens.
         if let Some(peer) = self.peer_handles.clone() {
             for ext in extensions.iter() {
-                if ext.scope() != instance::Scope::Global {
+                if !ext.scopes().contains(&instance::Scope::Global) {
                     continue;
                 }
                 let m = ext.manifest();
