@@ -125,12 +125,6 @@ web_search:
 
 # Extension capabilities — operator-level scoping.
 #
-# capability_defaults: choose which provider an extension-providable cap
-# resolves to when the consumer doesn't specify one. Example:
-#   capability_defaults:
-#     memory: "local"
-#     messenger: "matrix"
-#
 # agent_state_allowlist: per-extension agent allowlists for the
 # AgentStateAdmin cap. Maps extension name → agent display names.
 # An absent entry means unrestricted; an empty list means deny-all

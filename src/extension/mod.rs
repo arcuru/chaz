@@ -17,7 +17,6 @@
 
 pub mod agent_state;
 pub mod caps;
-pub mod caps_inproc;
 pub mod handler;
 pub(crate) mod hook_bridge;
 pub mod hooks;
@@ -27,7 +26,6 @@ pub mod manifest;
 #[allow(unused_imports)]
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
 
-use crate::extension::caps_inproc::{InProcSessionRead, InProcSessionWrite, InProcSettings};
 use crate::hosted_index::HostedIndex;
 use crate::routine::RoutineScope;
 use crate::runtime::RuntimeMessage;
@@ -943,22 +941,14 @@ impl ExtensionHub {
     /// Dispatch one routine fire to the named extension's routine
     /// handler.
     ///
-    /// `scope` controls the caps bundle handed to the handler:
-    /// * [`RoutineScope::Global`] — extension-providable caps resolved
-    ///   through a turn-scoped [`HubCapResolver`]; host-only slots stay
-    ///   `None`.
-    /// * [`RoutineScope::Session(id)`] — same caps, plus per-session
-    ///   [`caps::SessionRead`] / [`caps::SessionWrite`] /
-    ///   [`caps::Settings`] resolved through the hub's
-    ///   [`SessionRegistry`]. The owner string on `SessionWrite` is
-    ///   the dispatching extension's name so audit trails record who
-    ///   wrote what.
+    /// `scope` is recorded for tracing; the routine handler reads the
+    /// session/agent it targets out of its own opaque payload, not from
+    /// the dispatch call.
     ///
     /// Returns `Ok(())` if dispatch succeeded (the handler returned
     /// `Ok`); `Err(...)` if the handler errored, the extension isn't
-    /// installed, the installed extension didn't register a routine
-    /// handler, or session resolution failed for a session-scoped
-    /// fire. The engine's failure-handling pass uses the `Err` path
+    /// installed, or the installed extension didn't register a routine
+    /// handler. The engine's failure-handling pass uses the `Err` path
     /// to drive `consecutive_failures` / auto-disable.
     pub async fn dispatch_routine(
         &self,
@@ -974,61 +964,8 @@ impl ExtensionHub {
                 "extension '{extension}' has no routine_handler — declare it in install()"
             )
         })?;
-        let caps = self.build_routine_caps(extension, scope).await?;
-        handler.on_fire(&caps, payload).await
-    }
-
-    /// Assemble the routine-fire caps bundle for engine dispatch.
-    ///
-    /// Resolves [`caps::Messenger`] and [`caps::MemoryAccess`] defaults
-    /// through a turn-scoped [`HubCapResolver`] — which walks the
-    /// live `instances_for_turn` set (global ∪ session for now)
-    /// and falls back to the legacy [`registry::CapRegistry`] for
-    /// extensions that still publish via `build_providers()`. For
-    /// [`RoutineScope::Session`] also resolves the target session
-    /// through [`SessionRegistry`] and fills SessionRead, SessionWrite,
-    /// and Settings with per-session in-process impls owned by
-    /// `extension`. Global-scope fires leave the host-only slots
-    /// `None`.
-    async fn build_routine_caps(
-        &self,
-        extension: &str,
-        scope: &RoutineScope,
-    ) -> anyhow::Result<caps::ExtensionCaps> {
-        let mut bundle = caps::ExtensionCaps::empty();
-
-        // Build a resolver for the turn. For session-scoped fires the
-        // session DB participates in instance lookup (PerSession
-        // instances win over Global). For global fires only the
-        // Global instance set contributes.
-        let session_id_for_resolver: Option<String> = match scope {
-            RoutineScope::Session(id) => Some(id.clone()),
-            _ => None,
-        };
-        let resolver = self
-            .cap_resolver_for_turn(None, session_id_for_resolver.as_deref())
-            .await;
-        use instance::CapResolver as _;
-        bundle.messengers.default = resolver.messenger();
-        bundle.memory.default = resolver.memory();
-
-        if let RoutineScope::Session(session_db_id) = scope {
-            let registry = self.session_registry.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session-scoped routine fire for extension '{extension}' \
-                     requires a SessionRegistry; call ExtensionHub::set_session_registry \
-                     during startup"
-                )
-            })?;
-            let (conv_id, session_db) = registry.open_session(session_db_id).await?;
-            let session = Session::new(conv_id, session_db.clone()).await;
-            let session = Arc::new(Mutex::new(session));
-            bundle.session_read = Some(Arc::new(InProcSessionRead::new(session.clone())));
-            bundle.session_write = Some(Arc::new(InProcSessionWrite::new(session, extension)));
-            bundle.settings = Some(Arc::new(InProcSettings::new(session_db, extension)));
-        }
-
-        Ok(bundle)
+        tracing::debug!(extension, ?scope, "dispatching routine fire");
+        handler.on_fire(payload).await
     }
 
     /// Build a turn-scoped [`HubCapResolver`] that walks
@@ -1415,10 +1352,7 @@ impl ExtensionHub {
                 .insert(HookKind::BeforeAgentStart);
             self.before_agent_start.push(RegisteredHook {
                 owner: owner_static,
-                hook: Box::new(hook_bridge::BeforeAgentStartAdapter::new(
-                    owner_static,
-                    Box::new(h),
-                )),
+                hook: Box::new(hook_bridge::BeforeAgentStartAdapter::new(Box::new(h))),
             });
         }
         if let Some(h) = inst.tool_call_hook() {
@@ -1428,7 +1362,7 @@ impl ExtensionHub {
                 .insert(HookKind::ToolCall);
             self.tool_call.push(RegisteredHook {
                 owner: owner_static,
-                hook: Box::new(hook_bridge::ToolCallAdapter::new(owner_static, Box::new(h))),
+                hook: Box::new(hook_bridge::ToolCallAdapter::new(Box::new(h))),
             });
         }
         if let Some(h) = inst.tool_result_hook() {
@@ -1438,10 +1372,7 @@ impl ExtensionHub {
                 .insert(HookKind::ToolResult);
             self.tool_result.push(RegisteredHook {
                 owner: owner_static,
-                hook: Box::new(hook_bridge::ToolResultAdapter::new(
-                    owner_static,
-                    Box::new(h),
-                )),
+                hook: Box::new(hook_bridge::ToolResultAdapter::new(Box::new(h))),
             });
         }
         if let Some(h) = inst.agent_end_hook() {
@@ -1451,7 +1382,7 @@ impl ExtensionHub {
                 .insert(HookKind::AgentEnd);
             self.agent_end.push(RegisteredHook {
                 owner: owner_static,
-                hook: Box::new(hook_bridge::AgentEndAdapter::new(owner_static, Box::new(h))),
+                hook: Box::new(hook_bridge::AgentEndAdapter::new(Box::new(h))),
             });
         }
         if let Some(h) = inst.session_start_hook() {
@@ -1461,10 +1392,7 @@ impl ExtensionHub {
                 .insert(HookKind::SessionStart);
             self.session_start.push(RegisteredHook {
                 owner: owner_static,
-                hook: Box::new(hook_bridge::SessionStartAdapter::new(
-                    owner_static,
-                    Box::new(h),
-                )),
+                hook: Box::new(hook_bridge::SessionStartAdapter::new(Box::new(h))),
             });
         }
         if let Some(h) = inst.session_shutdown_hook() {
@@ -1474,10 +1402,7 @@ impl ExtensionHub {
                 .insert(HookKind::SessionShutdown);
             self.session_shutdown.push(RegisteredHook {
                 owner: owner_static,
-                hook: Box::new(hook_bridge::SessionShutdownAdapter::new(
-                    owner_static,
-                    Box::new(h),
-                )),
+                hook: Box::new(hook_bridge::SessionShutdownAdapter::new(Box::new(h))),
             });
         }
         if let Some(h) = inst.routine_handler() {
@@ -1657,6 +1582,18 @@ impl ExtensionHub {
 /// publish the same cap on the instance side. Once that stops being
 /// true the resolver should grow explicit precedence — likely
 /// last-installed-wins to match the `RoutineEngine` schedule rules.
+///
+/// This is the forward resolution surface for extension-to-extension
+/// caps ([`caps::Messenger`] / [`caps::MemoryAccess`]) and the contract
+/// [`instance::TurnCtx`] hands to endpoints. It has no production
+/// consumer yet — context assembly resolves [`caps::PromptAugmentation`]
+/// / [`caps::ContextTail`] by iterating instances directly (see
+/// `context_instances`), and the memory/messenger caps are published
+/// but not yet consumed. Kept (not deleted with the old `ExtensionCaps`
+/// bundle) because it's the instance-based resolver the WASM host
+/// boundary will bind against. `allow(dead_code)` until a consumer
+/// wires it.
+#[allow(dead_code)]
 pub struct HubCapResolver {
     instances: Vec<Arc<dyn instance::ExtensionInstance>>,
 }
@@ -2320,7 +2257,6 @@ mod tests {
     impl handler::HookHandlerToolCall for PassToolCall {
         fn on_tool_call<'a>(
             &'a self,
-            _: &'a caps::ExtensionCaps,
             _: &'a str,
             _: &'a mut serde_json::Value,
         ) -> handler::HandlerFuture<'a, ToolCallDecision> {
@@ -2431,10 +2367,7 @@ mod tests {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl handler::HookHandlerBeforeAgentStart for CountingHook {
-        fn on_before_agent_start<'a>(
-            &'a self,
-            _caps: &'a caps::ExtensionCaps,
-        ) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
+        fn on_before_agent_start<'a>(&'a self) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
             let calls = self.calls.clone();
             Box::pin(async move {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2486,7 +2419,6 @@ mod tests {
     impl handler::HookHandlerToolCall for BlockingHook {
         fn on_tool_call<'a>(
             &'a self,
-            _caps: &'a caps::ExtensionCaps,
             name: &'a str,
             _args: &'a mut serde_json::Value,
         ) -> handler::HandlerFuture<'a, ToolCallDecision> {
@@ -2506,7 +2438,6 @@ mod tests {
     impl handler::HookHandlerToolCall for MutatingHook {
         fn on_tool_call<'a>(
             &'a self,
-            _caps: &'a caps::ExtensionCaps,
             _name: &'a str,
             args: &'a mut serde_json::Value,
         ) -> handler::HandlerFuture<'a, ToolCallDecision> {
@@ -2660,7 +2591,6 @@ mod tests {
     impl handler::RoutineHandler for Recorder {
         fn on_fire<'a>(
             &'a self,
-            _caps: &'a caps::ExtensionCaps,
             payload: serde_json::Value,
         ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
             let seen = self.seen.clone();
@@ -2724,7 +2654,6 @@ mod tests {
         impl handler::RoutineHandler for AlwaysFails {
             fn on_fire<'a>(
                 &'a self,
-                _caps: &'a caps::ExtensionCaps,
                 _payload: serde_json::Value,
             ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
                 Box::pin(async { Err(anyhow::anyhow!("simulated failure")) })
@@ -2741,75 +2670,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("simulated"), "got: {err}");
-    }
-
-    /// Routine handler that asserts the per-session caps
-    /// (`session_read`, `session_write`, `settings`) are populated and
-    /// then writes a directive via `caps.session_write`.
-    struct SessionScopedRoutine;
-    impl handler::RoutineHandler for SessionScopedRoutine {
-        fn on_fire<'a>(
-            &'a self,
-            caps: &'a caps::ExtensionCaps,
-            payload: serde_json::Value,
-        ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
-            Box::pin(async move {
-                let writer = caps
-                    .session_write
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("session_write not populated"))?;
-                // Read + Settings should also be wired for session-scoped
-                // fires — they're the host contract for "this fire knows
-                // its session".
-                anyhow::ensure!(
-                    caps.session_read.is_some(),
-                    "session_read should be populated"
-                );
-                anyhow::ensure!(caps.settings.is_some(), "settings should be populated");
-                writer
-                    .append(caps::SessionEntryDraft {
-                        kind: "directive".into(),
-                        data: payload,
-                    })
-                    .await?;
-                Ok(())
-            })
-        }
-    }
-
-    fn session_scoped_routine_ext() -> Arc<dyn Extension> {
-        Arc::new(TestExt::new("session-scoped").routine_handler(Arc::new(SessionScopedRoutine)))
-    }
-
-    #[tokio::test]
-    async fn dispatch_routine_session_scope_populates_session_caps_and_writes() {
-        use crate::session::{EntryType, Session};
-
-        let mut hub = test_hub().await;
-        let registry = hub.session_registry.clone().unwrap();
-        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
-        let session_db_id = session_db.root_id().to_string();
-
-        hub.install_all(vec![session_scoped_routine_ext()])
-            .await
-            .unwrap();
-
-        hub.dispatch_routine(
-            "session-scoped",
-            &RoutineScope::Session(session_db_id.clone()),
-            serde_json::json!({"task": "summarize"}),
-        )
-        .await
-        .unwrap();
-
-        // The handler wrote a `directive` entry through SessionWrite.
-        // Re-open the session and confirm the entry landed.
-        let (conv_id, db) = registry.open_session(&session_db_id).await.unwrap();
-        let session = Session::new(conv_id, db).await;
-        let entries = session.entries();
-        assert_eq!(entries.len(), 1, "expected one entry, got {entries:?}");
-        assert!(matches!(entries[0].entry_type, EntryType::Directive));
-        assert_eq!(entries[0].sender, "session-scoped");
     }
 
     /// Publishes a no-op Messenger through the instance `messenger()`
@@ -2871,27 +2731,6 @@ mod tests {
             resolver.messenger().is_some(),
             "HubCapResolver should expose an instance-published Messenger"
         );
-    }
-
-    #[tokio::test]
-    async fn dispatch_routine_session_scope_errors_without_registry() {
-        // Drain the global instance (needs peer_handles) but leave the
-        // hub's session_registry unset → session-scoped fire can't
-        // resolve a session.
-        let mut hub = test_hub().await;
-        hub.session_registry = None;
-        hub.install_all(vec![session_scoped_routine_ext()])
-            .await
-            .unwrap();
-        let err = hub
-            .dispatch_routine(
-                "session-scoped",
-                &RoutineScope::Session("anything".into()),
-                serde_json::json!({}),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("SessionRegistry"), "got: {err}");
     }
 
     #[tokio::test]

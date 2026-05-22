@@ -12,7 +12,6 @@
 //! The handler spawns a `tokio` task for the actual agent turn so the
 //! engine's fire loop isn't blocked on LLM latency.
 
-use crate::extension::caps::ExtensionCaps;
 use crate::extension::handler::{HandlerFuture, RoutineHandler};
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
@@ -84,11 +83,7 @@ struct AgentScheduleRoutineHandler {
 }
 
 impl RoutineHandler for AgentScheduleRoutineHandler {
-    fn on_fire<'a>(
-        &'a self,
-        _caps: &'a ExtensionCaps,
-        payload: serde_json::Value,
-    ) -> HandlerFuture<'a, anyhow::Result<()>> {
+    fn on_fire<'a>(&'a self, payload: serde_json::Value) -> HandlerFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let payload: crate::routine::AgentSchedulePayload = serde_json::from_value(payload)
                 .map_err(|e| anyhow::anyhow!("invalid agent_schedule payload: {e}"))?;

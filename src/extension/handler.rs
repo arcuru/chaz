@@ -1,48 +1,32 @@
-// Step 5 of the cap refactor adds the new handler trait surface as a
-// pure addition. The old per-kind `HookToolCall` / `HookBeforeAgentStart`
-// / ... traits and their `&HookContext` signature stay until step 6
-// migrates each built-in extension.
-#![allow(dead_code)]
-
-//! Cap-based handler traits — the new hook + routine dispatch surface.
+//! Hook + routine dispatch handler traits.
 //!
-//! Where the legacy [`crate::extension::hooks`] traits receive
-//! `&HookContext` (which exposes `Arc<Mutex<Session>>`), the cap-based
-//! handlers receive `&ExtensionCaps` — the narrow, typed bundle
-//! produced by the host at install time and at handler-fire time.
+//! These are the runtime handler shapes an [`crate::extension::instance::
+//! ExtensionInstance`] publishes through its `*_hook()` / `routine_handler()`
+//! endpoints. The hub drains them at install time and fires them from the
+//! ReAct loop and the routine engine.
 //!
 //! # Per-kind traits, not a unified `HookHandler`
 //!
-//! The design draft showed one unified `HookHandler::handle(&caps,
-//! HookEvent) -> HookOutcome`. We deliberately split per-kind here:
+//! We split per-kind rather than one `handle(HookEvent) -> HookOutcome`:
 //!
 //! * type safety — each handler's return shape is precise (e.g.
 //!   `tool_call` returns `ToolCallDecision`, not "an outcome that
 //!   might be a decision")
-//! * easier migration — an extension that only cares about
-//!   `tool_call` implements one trait and the others are absent,
-//!   instead of having to handle every event variant
+//! * easier authoring — an extension that only cares about
+//!   `tool_call` implements one trait and the others are absent
 //! * matches chaz's existing convention (one trait per hook kind)
 //!
 //! [`InstalledExtension`] holds an `Option<Box<dyn ...>>` per kind;
 //! `None` means "this extension doesn't handle this kind."
-//!
-//! # Phasing
-//!
-//! Step 5 (this file) defines the traits. The hub's `install_all`
-//! drives the new path alongside the legacy `register_extension`
-//! path. Step 6 migrates each built-in extension and step 11 finally
-//! deletes the legacy surface.
 
 use crate::extension::ToolCallDecision;
-use crate::extension::caps::ExtensionCaps;
 use crate::runtime::RuntimeMessage;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Boxed future returned by every cap-based handler method.
+/// Boxed future returned by every handler method.
 pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // =========================================================================
@@ -52,13 +36,8 @@ pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Fires once per agent turn, after the runtime has assembled the
 /// initial message list but before the first LLM call. Returned
 /// messages are appended in registration order.
-///
-/// Cap-based counterpart of [`crate::extension::HookBeforeAgentStart`].
 pub trait HookHandlerBeforeAgentStart: Send + Sync {
-    fn on_before_agent_start<'a>(
-        &'a self,
-        caps: &'a ExtensionCaps,
-    ) -> HandlerFuture<'a, Vec<RuntimeMessage>>;
+    fn on_before_agent_start<'a>(&'a self) -> HandlerFuture<'a, Vec<RuntimeMessage>>;
 }
 
 /// Fires before each tool call inside the ReAct loop. Handlers may
@@ -66,7 +45,6 @@ pub trait HookHandlerBeforeAgentStart: Send + Sync {
 pub trait HookHandlerToolCall: Send + Sync {
     fn on_tool_call<'a>(
         &'a self,
-        caps: &'a ExtensionCaps,
         tool_name: &'a str,
         args: &'a mut Value,
     ) -> HandlerFuture<'a, ToolCallDecision>;
@@ -77,7 +55,6 @@ pub trait HookHandlerToolCall: Send + Sync {
 pub trait HookHandlerToolResult: Send + Sync {
     fn on_tool_result<'a>(
         &'a self,
-        caps: &'a ExtensionCaps,
         tool_name: &'a str,
         result: String,
     ) -> HandlerFuture<'a, String>;
@@ -86,18 +63,18 @@ pub trait HookHandlerToolResult: Send + Sync {
 /// Fires when the ReAct loop produces a final assistant response,
 /// just before the runtime returns. Fire-and-forget.
 pub trait HookHandlerAgentEnd: Send + Sync {
-    fn on_agent_end<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()>;
+    fn on_agent_end<'a>(&'a self) -> HandlerFuture<'a, ()>;
 }
 
 /// Fires when a session is registered with the server.
 pub trait HookHandlerSessionStart: Send + Sync {
-    fn on_session_start<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()>;
+    fn on_session_start<'a>(&'a self) -> HandlerFuture<'a, ()>;
 }
 
 /// Fires when a session is explicitly deregistered. Best-effort —
 /// process exit / abnormal termination skips this hook.
 pub trait HookHandlerSessionShutdown: Send + Sync {
-    fn on_session_shutdown<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()>;
+    fn on_session_shutdown<'a>(&'a self) -> HandlerFuture<'a, ()>;
 }
 
 // =========================================================================
@@ -106,68 +83,59 @@ pub trait HookHandlerSessionShutdown: Send + Sync {
 //
 // `ExtensionInstance` endpoints (`tool_call_hook()`, …) return
 // `Option<Arc<dyn HookHandler*>>` so the instance keeps ownership and
-// the hub clones the handle into its dispatch path. The hub's legacy
+// the hub clones the handle into its dispatch path. The hub's
 // `install_all` drain feeds these handles into Box-shaped adapters in
 // `hook_bridge`, so each handler trait gets a blanket impl over
 // `Arc<dyn HookHandler*>`. Boxing the Arc then satisfies the
 // `Box<dyn HookHandler*>` slot on `InstalledExtension`.
 
 impl HookHandlerBeforeAgentStart for Arc<dyn HookHandlerBeforeAgentStart> {
-    fn on_before_agent_start<'a>(
-        &'a self,
-        caps: &'a ExtensionCaps,
-    ) -> HandlerFuture<'a, Vec<RuntimeMessage>> {
-        (**self).on_before_agent_start(caps)
+    fn on_before_agent_start<'a>(&'a self) -> HandlerFuture<'a, Vec<RuntimeMessage>> {
+        (**self).on_before_agent_start()
     }
 }
 
 impl HookHandlerToolCall for Arc<dyn HookHandlerToolCall> {
     fn on_tool_call<'a>(
         &'a self,
-        caps: &'a ExtensionCaps,
         tool_name: &'a str,
         args: &'a mut Value,
     ) -> HandlerFuture<'a, ToolCallDecision> {
-        (**self).on_tool_call(caps, tool_name, args)
+        (**self).on_tool_call(tool_name, args)
     }
 }
 
 impl HookHandlerToolResult for Arc<dyn HookHandlerToolResult> {
     fn on_tool_result<'a>(
         &'a self,
-        caps: &'a ExtensionCaps,
         tool_name: &'a str,
         result: String,
     ) -> HandlerFuture<'a, String> {
-        (**self).on_tool_result(caps, tool_name, result)
+        (**self).on_tool_result(tool_name, result)
     }
 }
 
 impl HookHandlerAgentEnd for Arc<dyn HookHandlerAgentEnd> {
-    fn on_agent_end<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()> {
-        (**self).on_agent_end(caps)
+    fn on_agent_end<'a>(&'a self) -> HandlerFuture<'a, ()> {
+        (**self).on_agent_end()
     }
 }
 
 impl HookHandlerSessionStart for Arc<dyn HookHandlerSessionStart> {
-    fn on_session_start<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()> {
-        (**self).on_session_start(caps)
+    fn on_session_start<'a>(&'a self) -> HandlerFuture<'a, ()> {
+        (**self).on_session_start()
     }
 }
 
 impl HookHandlerSessionShutdown for Arc<dyn HookHandlerSessionShutdown> {
-    fn on_session_shutdown<'a>(&'a self, caps: &'a ExtensionCaps) -> HandlerFuture<'a, ()> {
-        (**self).on_session_shutdown(caps)
+    fn on_session_shutdown<'a>(&'a self) -> HandlerFuture<'a, ()> {
+        (**self).on_session_shutdown()
     }
 }
 
 impl RoutineHandler for Arc<dyn RoutineHandler> {
-    fn on_fire<'a>(
-        &'a self,
-        caps: &'a ExtensionCaps,
-        payload: Value,
-    ) -> HandlerFuture<'a, anyhow::Result<()>> {
-        (**self).on_fire(caps, payload)
+    fn on_fire<'a>(&'a self, payload: Value) -> HandlerFuture<'a, anyhow::Result<()>> {
+        (**self).on_fire(payload)
     }
 }
 
@@ -175,35 +143,24 @@ impl RoutineHandler for Arc<dyn RoutineHandler> {
 // Routine handler
 // =========================================================================
 
-/// Fires when the routine engine (added in steps 7–8) dispatches one
-/// routine targeted at this extension. `payload` is the
-/// extension-defined opaque value carried on the routine — the engine
-/// itself never inspects it.
+/// Fires when the routine engine dispatches one routine targeted at
+/// this extension. `payload` is the extension-defined opaque value
+/// carried on the routine — the engine itself never inspects it.
 ///
 /// One handler per extension (extensions handle their own routines).
 pub trait RoutineHandler: Send + Sync {
-    fn on_fire<'a>(
-        &'a self,
-        caps: &'a ExtensionCaps,
-        payload: Value,
-    ) -> HandlerFuture<'a, anyhow::Result<()>>;
+    fn on_fire<'a>(&'a self, payload: Value) -> HandlerFuture<'a, anyhow::Result<()>>;
 }
 
 // =========================================================================
 // InstalledExtension
 // =========================================================================
 
-/// What an extension returns from `Extension::install`.
+/// What the hub collects from an extension's instance endpoints.
 ///
 /// Each hook-kind slot is `Option<Box<dyn HookHandler...>>`; `None`
-/// means the extension declares it doesn't handle that kind. The
-/// `routine_handler` slot covers the routine engine's dispatch (step
-/// 8 wires it).
-///
-/// Per-extension command registrations and tool registrations live in
-/// the cap registry, not here — they flow through
-/// `ExtensionCaps::tool_registration` / `command_registration` during
-/// the install call.
+/// means the extension doesn't handle that kind. The `routine_handler`
+/// slot covers the routine engine's dispatch.
 #[derive(Default)]
 pub struct InstalledExtension {
     pub before_agent_start: Option<Box<dyn HookHandlerBeforeAgentStart>>,
@@ -220,8 +177,6 @@ pub struct InstalledExtension {
 
 impl InstalledExtension {
     /// Convenience: an installed extension that registered nothing.
-    /// Used as the default return when an extension hasn't migrated to
-    /// the new `install` flow.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -240,8 +195,7 @@ impl InstalledExtension {
 
 impl std::fmt::Debug for InstalledExtension {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Same redaction shape as `ExtensionCaps::Debug`: bool per
-        // slot, never the boxed payload.
+        // Redacted: bool per slot, never the boxed payload.
         f.debug_struct("InstalledExtension")
             .field("before_agent_start", &self.before_agent_start.is_some())
             .field("tool_call", &self.tool_call.is_some())
@@ -269,10 +223,7 @@ mod tests {
 
     struct StubBeforeStart;
     impl HookHandlerBeforeAgentStart for StubBeforeStart {
-        fn on_before_agent_start<'a>(
-            &'a self,
-            _caps: &'a ExtensionCaps,
-        ) -> HandlerFuture<'a, Vec<RuntimeMessage>> {
+        fn on_before_agent_start<'a>(&'a self) -> HandlerFuture<'a, Vec<RuntimeMessage>> {
             Box::pin(async { vec![RuntimeMessage::System("hi".into())] })
         }
     }
@@ -291,18 +242,13 @@ mod tests {
     #[tokio::test]
     async fn handler_method_returns_async_value_through_handler_future() {
         let h = StubBeforeStart;
-        let caps = ExtensionCaps::empty();
-        let msgs = h.on_before_agent_start(&caps).await;
+        let msgs = h.on_before_agent_start().await;
         assert_eq!(msgs.len(), 1);
     }
 
     struct StubRoutine;
     impl RoutineHandler for StubRoutine {
-        fn on_fire<'a>(
-            &'a self,
-            _caps: &'a ExtensionCaps,
-            payload: Value,
-        ) -> HandlerFuture<'a, anyhow::Result<()>> {
+        fn on_fire<'a>(&'a self, payload: Value) -> HandlerFuture<'a, anyhow::Result<()>> {
             Box::pin(async move {
                 // Just confirm the payload arrives unchanged — engine never
                 // inspects it.
@@ -315,8 +261,7 @@ mod tests {
     #[tokio::test]
     async fn routine_handler_receives_opaque_payload() {
         let r = StubRoutine;
-        let caps = ExtensionCaps::empty();
-        r.on_fire(&caps, serde_json::json!({"task": "ping"}))
+        r.on_fire(serde_json::json!({"task": "ping"}))
             .await
             .unwrap();
     }

@@ -149,9 +149,10 @@ impl Extension for MemoryExtension {
     // - Global   → tools (`remember`, `recall`, `list_memory_banks`),
     //              the `/memory` slash command, and the `MemoryAccess`
     //              cap published to other extensions through the
-    //              `MemoryGlobalInstance::memory_access` endpoint —
-    //              the routine engine resolves it through
-    //              `ExtensionHub::cap_resolver_for_turn`.
+    //              `MemoryGlobalInstance::memory_access` endpoint.
+    //              Consumers resolve it through
+    //              `ExtensionHub::cap_resolver_for_turn`; no extension
+    //              consumes it yet (the forward resolution path).
     // - PerSession → `ContextTail` for auto-recall; reads
     //                `extension_settings["memory"]["attached_banks"]`
     //                at instantiate time and caches it on the instance.

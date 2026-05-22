@@ -1,5 +1,6 @@
-// Step 2 of the cap refactor is a pure addition: the manifest type is
-// not yet consumed by the hub. Allow until step 5 wires it in.
+// The `CapabilityRequest` accessors are part of the declaration
+// contract but have no consumer beyond validation + tests yet. Allow
+// until a consumer (e.g. the WASM host-import binding) reads them.
 #![allow(dead_code)]
 
 //! Extension manifests — what each extension declares about itself.
@@ -9,21 +10,17 @@
 //! capabilities it consumes from others (split into *required* and
 //! *requested*), and which capabilities it provides for others.
 //!
-//! The host uses the manifest at install time to:
+//! [`ExtensionManifest::validate`] runs per-manifest at install time
+//! (`ExtensionHub::install_all`): non-empty name, no host-only kinds in
+//! `provides_capabilities`, no duplicate entries, no contradictory
+//! required/requested overlap. The declarations are otherwise
+//! descriptive metadata today — runtime cap resolution happens through
+//! the instance model ([`crate::extension::instance::ExtensionInstance`]
+//! endpoints + [`crate::extension::instance::CapResolver`]), not by
+//! consuming the manifest. The declarations are the contract the WASM
+//! host-import boundary will bind against.
 //!
-//! 1. Validate the declaration itself (this module) — non-empty name,
-//!    no host-only kinds in `provides_capabilities`, no duplicate
-//!    entries, no contradictory required/requested overlap.
-//! 2. Cross-validate across the full extension set — `(kind, name)`
-//!    collisions across `provides_capabilities`, required-cap
-//!    satisfiability. That cross-manifest pass lives on the hub and
-//!    lands in refactor step 5; this module covers only the
-//!    per-manifest checks.
-//! 3. Build the per-extension [`crate::extension::caps::ExtensionCaps`]
-//!    bundle that the consumer receives at `install`.
-//!
-//! See `chaz/src/extension/caps.rs` for the cap traits and bundle
-//! shape; this module is the metadata that drives bundle construction.
+//! See `chaz/src/extension/caps.rs` for the cap kinds and trait shapes.
 
 use crate::extension::caps::{CapabilityKind, CapabilityRequest};
 use crate::extension::{ExtensionRef, HookKind};
@@ -32,18 +29,18 @@ use std::collections::HashSet;
 /// What an extension claims at registration time.
 ///
 /// The triple `(required_capabilities, requested_capabilities,
-/// provides_capabilities)` is the contract; everything else is identity
-/// and routing metadata.
+/// provides_capabilities)` is the declared contract; everything else is
+/// identity and routing metadata. Today the triple is descriptive — it
+/// documents intent and is validated for internal consistency, but
+/// runtime cap wiring goes through the instance model. It's the shape
+/// the future WASM host-import binding will read.
 ///
-/// * `required_capabilities` — absent at install time → extension fails
-///   to load. Cascades: if extension A required a cap provided by B and
-///   B becomes inactive on a session, A also becomes inactive there.
-/// * `requested_capabilities` — absent at install time → the slot in
-///   `ExtensionCaps` is `None` / empty; handler code must check. Inert:
-///   if a requested provider deactivates per-session, the slot goes
-///   back to `None` and the extension stays loaded.
-/// * `provides_capabilities` — extension publishes these via
-///   `build_providers()`; host-only kinds are rejected by validation.
+/// * `required_capabilities` — caps the extension cannot run without.
+/// * `requested_capabilities` — caps the extension uses if present and
+///   degrades gracefully without.
+/// * `provides_capabilities` — extension-providable caps the extension
+///   publishes from its instance endpoints; host-only kinds are
+///   rejected by [`Self::validate`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionManifest {
     pub name: String,

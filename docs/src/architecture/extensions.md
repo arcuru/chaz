@@ -123,8 +123,8 @@ into the hub's legacy registries:
 - `commands()` → the hub command map (first-write-wins; built-in
   reserved names win over extension registrations).
 - the six `*_hook()` handlers → the per-kind `RegisteredHook` vectors,
-  wrapped by `hook_bridge::*Adapter`s that build a session-scoped
-  `ExtensionCaps` per fire.
+  wrapped by thin `hook_bridge::*Adapter`s that forward to the
+  instance-published handler (the handlers take no context argument).
 - `routine_handler()` → `installed[name].routine_handler`, where
   `dispatch_routine` looks it up.
 
@@ -145,10 +145,15 @@ endpoints need session/agent context Global instances don't carry), then
 asks each for `prompt_augmentation` / `context_tail`. Per-session
 active-set filtering applies.
 
-Caps for routine fires resolve through `cap_resolver_for_turn` →
+Extension-to-extension caps resolve through `cap_resolver_for_turn` →
 `HubCapResolver` (`mod.rs`), which walks `instances_for_turn`
 (global ∪ agent ∪ session, deduped `session > agent > global`) and
-returns the first instance answering `Some` for a given cap.
+returns the first instance answering `Some` for a given cap. This is
+the forward resolution surface — it has no production consumer yet
+(prompt/context-tail augmentation iterate instances directly via
+`context_instances`; `Messenger`/`MemoryAccess` are published but not
+yet consumed). It's kept as the instance-based resolver the WASM host
+boundary will bind against.
 
 ```rust,ignore
 trait CapResolver: Send + Sync {
@@ -182,26 +187,26 @@ inspection (`/extensions list`).
 ## Capabilities
 
 Caps are the typed services that cross the extension boundary
-(`caps.rs`). They split into two ownership groups
-(`CapabilityKind::is_host_only` is authoritative):
+(`caps.rs`). They return plain data over `CapFuture<'a, T>` — the seam
+that lets the same shape cross a sandbox boundary later. `CapabilityKind`
+splits them into two ownership groups (`CapabilityKind::is_host_only` is
+authoritative):
 
-- **Host-only** — `SessionRead`, `SessionWrite`, `Settings`,
-  `ToolRegistration`, `CommandRegistration`. Provided by chaz core;
-  extensions can't publish their own. Putting a host-only kind in a
-  manifest's `provides_capabilities` is a validation error.
+- **Host-only** — provided by chaz core; an extension can't publish its
+  own, and a host-only kind in a manifest's `provides_capabilities` is a
+  validation error. The one live host-only cap trait is `AgentStateAdmin`
+  (scoped agent-DB access for the schedule tools, via
+  `ScopedAgentStateAdmin`). The remaining host-only `CapabilityKind`s
+  (`SessionRead`/`SessionWrite`/`Settings`/`ToolRegistration`/
+  `CommandRegistration`) are **declaration vocabulary only** — extensions
+  reach their session and publish tools/commands structurally through the
+  instance model (`ExtensionInstance` endpoints + `ScopeCtx`), not through
+  a cap handle.
 - **Extension-providable** — `Messenger`, `MemoryAccess`,
   `PromptAugmentation`, `ContextTail`. Published by an instance through
-  its endpoints and resolved through the `CapResolver`.
-
-The `ExtensionCaps` bundle (`caps.rs`) is the consumer-side handle passed
-to **routine handlers** at fire time. The hub assembles it in
-`build_routine_caps`: extension-providable defaults (`messenger`,
-`memory`) come from the turn's `CapResolver`; for session-scoped fires
-the host-only `session_read` / `session_write` / `settings` slots are
-filled with per-session in-process impls (`caps_inproc.rs`) owned by the
-firing extension. The cap methods all return plain data over
-`CapFuture<'a, T>` — the seam that lets the same handler shape cross a
-sandbox boundary later.
+  its endpoints; `PromptAugmentation`/`ContextTail` are consumed directly
+  by context assembly, `Messenger`/`MemoryAccess` are resolvable through
+  the `CapResolver` (no consumer yet).
 
 ## Routine handlers
 
@@ -212,18 +217,19 @@ payload)`.
 
 ```rust,ignore
 trait RoutineHandler: Send + Sync {
-    fn on_fire<'a>(&'a self, caps: &'a ExtensionCaps, payload: Value)
+    fn on_fire<'a>(&'a self, payload: Value)
         -> HandlerFuture<'a, anyhow::Result<()>>;
 }
 ```
 
-Two fire scopes:
-
-- **`RoutineScope::Global`** — fired from `chaz_peer.routines`. The caps
-  bundle gets extension-providable defaults but no session-scoped slots.
-- **`RoutineScope::Session(id)`** — fired from a session DB's `routines`
-  table. The hub resolves the session through its `SessionRegistry` and
-  fills `session_read` / `session_write` / `settings` for that session.
+The handler reads whatever session/agent it targets out of its own
+opaque `payload` (e.g. `agent_schedule` deserializes an
+`AgentSchedulePayload` and fires the turn through the server). The
+`scope` passed to `dispatch_routine` is recorded for tracing. Three fire
+scopes exist on the engine side (`RoutineScope::Global` from
+`chaz_peer.routines`, `Session(id)` from a session DB's `routines` table,
+`Agent(id)` from an agent DB) — they control where the routine is stored
+and rescheduled, not what the handler receives.
 
 The engine owns cron rescheduling, one-shot row deletion, and
 auto-disable after `max_failures` consecutive errors; the handler just
@@ -331,29 +337,28 @@ so it round-trips through eidetica.
 
 ## Module layout
 
-| Path                                  | Purpose                                                                                        |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `src/extension/mod.rs`                | Framework: `Extension` trait, `ExtensionHub`, `install_all`, dispatch, activation log          |
-| `src/extension/instance.rs`           | `ExtensionInstance`, `Scope`, `ScopeCtx`, `PeerHandles`, `CapResolver`                         |
-| `src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `SessionRead/Write`, `Settings`, …) + `ExtensionCaps` |
-| `src/extension/caps_inproc.rs`        | In-process impls of host-only caps (per-session)                                               |
-| `src/extension/agent_state.rs`        | `AgentStateAdmin` cap + scoped impl                                                            |
-| `src/extension/manifest.rs`           | `ExtensionManifest` + per-manifest validation                                                  |
-| `src/extension/handler.rs`            | Hook-handler traits + `InstalledExtension` (Global drain target)                               |
-| `src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                    |
-| `src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                   |
-| `src/extensions/mod.rs`               | `all_builtins` + `BuiltinDeps` — wires the built-in set                                        |
-| `src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `spawn_task`                                                |
-| `src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                                                         |
-| `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                                                       |
-| `src/extensions/web.rs`               | `web_fetch`, `web_search`                                                                      |
-| `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`, `/memory`, recall context tail                      |
-| `src/extensions/skills.rs`            | skill tools + `/skills`, prompt augmentation                                                   |
-| `src/extensions/schedule.rs`          | schedule tools + `/schedule` (agent-owned schedules)                                           |
-| `src/extensions/agent_schedule.rs`    | routine handler running the agent-owned schedule fire path                                     |
-| `src/extensions/mcp.rs`               | `McpExtension` — one per configured MCP server                                                 |
-| `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping trailing `/` from path args                                         |
-| `src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt-injection patterns                                      |
+| Path                                  | Purpose                                                                                                                                                   |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/extension/mod.rs`                | Framework: `Extension` trait, `ExtensionHub`, `install_all`, dispatch, activation log                                                                     |
+| `src/extension/instance.rs`           | `ExtensionInstance`, `Scope`, `ScopeCtx`, `PeerHandles`, `CapResolver`                                                                                    |
+| `src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `PromptAugmentation`, `ContextTail`, `AgentStateAdmin`) + `CapabilityKind`/`CapabilityRequest` declaration vocab |
+| `src/extension/agent_state.rs`        | `AgentStateAdmin` cap + scoped impl                                                                                                                       |
+| `src/extension/manifest.rs`           | `ExtensionManifest` + per-manifest validation                                                                                                             |
+| `src/extension/handler.rs`            | Hook-handler traits + `InstalledExtension` (Global drain target)                                                                                          |
+| `src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
+| `src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
+| `src/extensions/mod.rs`               | `all_builtins` + `BuiltinDeps` — wires the built-in set                                                                                                   |
+| `src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `spawn_task`                                                                                                           |
+| `src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                                                                                                                    |
+| `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                                                                                                                  |
+| `src/extensions/web.rs`               | `web_fetch`, `web_search`                                                                                                                                 |
+| `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`, `/memory`, recall context tail                                                                                 |
+| `src/extensions/skills.rs`            | skill tools + `/skills`, prompt augmentation                                                                                                              |
+| `src/extensions/schedule.rs`          | schedule tools + `/schedule` (agent-owned schedules)                                                                                                      |
+| `src/extensions/agent_schedule.rs`    | routine handler running the agent-owned schedule fire path                                                                                                |
+| `src/extensions/mcp.rs`               | `McpExtension` — one per configured MCP server                                                                                                            |
+| `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping trailing `/` from path args                                                                                                    |
+| `src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt-injection patterns                                                                                                 |
 
 ## Built-in extensions
 

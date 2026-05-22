@@ -1,60 +1,50 @@
-// Step 1 of the cap refactor is a pure addition: every public item here
-// will be consumed by later steps (manifest/registry/hub). Allow until
-// they're wired up rather than littering per-item `#[allow]`s.
+// `CapabilityRequest`'s accessors and some `CapabilityKind` helpers are
+// exercised only by manifest validation + tests today; they're part of
+// the declaration contract, so allow until a consumer wires them.
 #![allow(dead_code)]
 
 //! Extension capability surface.
 //!
 //! Capabilities are the typed contract by which extensions consume host
-//! services and each other's services. They replace the
-//! `Arc<Mutex<Session>>` handle today's `HookContext` exposes with narrow,
-//! purpose-specific async traits whose input and output types are plain
-//! data — making the same trait shapes reusable across in-process
+//! services and each other's services. Input and output types are plain
+//! data, so the same trait shapes are reusable across in-process
 //! extensions (today) and sandboxed extensions (WASM / subprocess, future).
 //!
 //! # Two flavors
 //!
 //! Capabilities split into two ownership groups:
 //!
-//! * **Host-only** — `SessionRead`, `SessionWrite`, `Settings`,
-//!   `ToolRegistration`, `CommandRegistration`. Provided by the chaz host;
-//!   extensions cannot publish their own impls. Each session has exactly
-//!   one impl of each.
-//! * **Extension-providable** — `Messenger`, `MemoryAccess`. Any
-//!   extension can publish an impl via `build_providers()`; consumers
-//!   resolve a provider by kind plus optional provider name. Zero, one,
-//!   or many providers per kind may register.
+//! * **Host-only** — published by the chaz host; extensions cannot
+//!   provide their own impl. Today the only live host-only cap is
+//!   [`AgentStateAdmin`] (scoped agent-DB access for the schedule
+//!   tools). The remaining host-only kinds in [`CapabilityKind`]
+//!   (session access, tool/command registration) are *declaration
+//!   vocabulary* only — extensions publish tools/commands and reach
+//!   their session structurally through the instance model
+//!   (`ExtensionInstance` endpoints + `ScopeCtx`), not through a cap.
+//! * **Extension-providable** — [`Messenger`], [`MemoryAccess`],
+//!   [`PromptAugmentation`], [`ContextTail`]. An extension publishes an
+//!   impl from the matching [`crate::extension::instance::ExtensionInstance`]
+//!   endpoint; consumers resolve them at turn time through the
+//!   [`crate::extension::instance::CapResolver`].
 //!
-//! [`CapabilityKind::is_host_only`] is the authoritative split. Putting a
-//! host-only kind in `provides_capabilities` is a manifest-validation
-//! error (enforced in step 2 of the refactor).
+//! [`CapabilityKind::is_host_only`] is the authoritative split, used by
+//! manifest validation to reject host-only kinds in
+//! `provides_capabilities`.
 //!
 //! # No `async_trait`
 //!
-//! Trait methods return `CapFuture<'a, T>` (a manually pinned boxed
-//! future), matching the [`crate::extension::hooks`] convention. This
-//! keeps the surface object-safe without a proc-macro dependency.
-//!
-//! # Step 1 scope
-//!
-//! This module is a pure addition: types and trait definitions, no
-//! impls and no wiring. Manifests, registries, and the per-session
-//! bundle land in subsequent refactor steps. See
-//! `~/brain/ava/workspace/chaz-routine-engine-and-capabilities.md` for
-//! the full plan.
+//! Trait methods return [`CapFuture`] (a manually pinned boxed future),
+//! matching the [`crate::extension::hooks`] convention. This keeps the
+//! surface object-safe without a proc-macro dependency.
 
 use crate::agent_db::AgentDb;
-use crate::extension::ExtensionCommand;
 use crate::hosted_index::DbEntry;
-use crate::tool::{Tool, ToolDescriptor};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// Boxed future returned by every cap trait method.
 ///
@@ -70,10 +60,9 @@ pub type CapFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Sen
 
 /// The set of capability kinds the host knows about.
 ///
-/// New kinds are added here when a new cap trait is introduced. Each
-/// extension's manifest declares which kinds it requires, requests, and
-/// provides — see [`CapabilityRequest`] for the consumer side and the
-/// manifest types (added in step 2) for the provider side.
+/// Each extension's manifest declares which kinds it requires, requests,
+/// and provides — see [`CapabilityRequest`] for the consumer side and
+/// the manifest types for the provider side.
 ///
 /// The split between **host-only** and **extension-providable** is
 /// captured by [`Self::is_host_only`]. Host-only kinds cannot appear in
@@ -124,7 +113,7 @@ impl CapabilityKind {
         )
     }
 
-    /// `true` for kinds extensions may publish via `build_providers()`.
+    /// `true` for kinds extensions may publish from an instance endpoint.
     /// Exactly the inverse of [`Self::is_host_only`].
     pub fn is_extension_providable(self) -> bool {
         !self.is_host_only()
@@ -203,7 +192,7 @@ pub enum CapabilityRequest {
 
 impl CapabilityRequest {
     /// Which [`CapabilityKind`] this request resolves against. Useful for
-    /// indexing into the cap registry without matching every variant.
+    /// indexing without matching every variant.
     pub fn kind(&self) -> CapabilityKind {
         match self {
             Self::SessionRead => CapabilityKind::SessionRead,
@@ -244,124 +233,8 @@ impl CapabilityRequest {
 }
 
 // =========================================================================
-// CapSet
-// =========================================================================
-
-/// Per-kind bundle of extension-providable caps a consumer receives.
-///
-/// Holds at most one impl per name plus an optional `default` slot. A
-/// bare request (`Messenger { provider: None }`) resolves to `default`;
-/// a named request (`Messenger { provider: Some("matrix") }`) resolves
-/// to the corresponding entry in `named`.
-///
-/// `T: ?Sized` so callers parameterize over the cap trait directly:
-/// `CapSet<dyn Messenger>` rather than wrapping in a separate handle.
-pub struct CapSet<T: ?Sized> {
-    /// Operator-configured default provider for this kind. `None` when
-    /// the operator hasn't picked one and no provider auto-defaults
-    /// (zero or multiple registered providers).
-    pub default: Option<Arc<T>>,
-    /// All providers registered for this kind, keyed by their extension
-    /// name. The default is *additionally* present here when set.
-    pub named: HashMap<String, Arc<T>>,
-}
-
-impl<T: ?Sized> CapSet<T> {
-    /// Empty `CapSet`: no default, no named providers.
-    pub fn new() -> Self {
-        Self {
-            default: None,
-            named: HashMap::new(),
-        }
-    }
-
-    /// Resolve a consumer request.
-    ///
-    /// * `None` — return the operator default if one was configured.
-    /// * `Some(name)` — return the named provider regardless of what the
-    ///   default is. Names that don't exist resolve to `None` even if a
-    ///   default is set; the consumer asked for a specific provider and
-    ///   the host doesn't silently substitute.
-    pub fn get(&self, name: Option<&str>) -> Option<&Arc<T>> {
-        match name {
-            Some(n) => self.named.get(n),
-            None => self.default.as_ref(),
-        }
-    }
-
-    /// `true` when no providers are registered and no default is set.
-    pub fn is_empty(&self) -> bool {
-        self.default.is_none() && self.named.is_empty()
-    }
-
-    /// Names of every registered provider, sorted for deterministic
-    /// iteration. Useful for diagnostics / `/extensions list -v`.
-    pub fn provider_names(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = self.named.keys().map(String::as_str).collect();
-        out.sort_unstable();
-        out
-    }
-}
-
-impl<T: ?Sized> Default for CapSet<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// =========================================================================
 // Supporting data types
 // =========================================================================
-
-/// Opaque cursor returned by [`SessionRead::entries`] paging. Treat the
-/// inner string as host-defined; consumers should not parse it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntryCursor(pub String);
-
-/// Identifier returned by [`SessionWrite::append`] and embedded in
-/// [`SessionEntryView`]. Opaque — content-addressed by the underlying
-/// eidetica entry id today; consumers should treat it as a string token.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntryId(pub String);
-
-/// Read-side view of one session entry. Capture is intentionally
-/// minimal — extensions that need richer entry shape can deserialize
-/// `data` against their own schema.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionEntryView {
-    pub id: EntryId,
-    /// Entry kind tag (e.g. `"user_message"`, `"directive"`,
-    /// `"tool_call"`). Stable across chaz versions.
-    pub kind: String,
-    pub data: Value,
-    pub timestamp: DateTime<Utc>,
-}
-
-/// Write-side draft for [`SessionWrite::append`]. The host assigns
-/// `id` and `timestamp` on commit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionEntryDraft {
-    pub kind: String,
-    pub data: Value,
-}
-
-/// Stable per-session metadata returned by [`SessionRead::meta`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionMeta {
-    pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-}
-
-/// Descriptor passed to [`CommandRegistration::register`]. Mirrors
-/// [`ToolDescriptor`] so the two registration caps share a shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandDescriptor {
-    pub name: String,
-    pub description: String,
-}
 
 /// Payload handed to [`Messenger::send`]. Text is the lowest common
 /// denominator; richer attachments are an open-ended JSON list so
@@ -401,54 +274,6 @@ pub struct MemoryHit {
 // =========================================================================
 // Host-only cap traits
 // =========================================================================
-
-/// Read-only access to the calling session.
-pub trait SessionRead: Send + Sync {
-    /// Entries on the session, optionally constrained to those after
-    /// `since` (exclusive). Cursor semantics are host-defined; an opaque
-    /// cursor returned from a prior call paginates forward in time.
-    fn entries<'a>(&'a self, since: Option<EntryCursor>) -> CapFuture<'a, Vec<SessionEntryView>>;
-
-    /// Stable per-session metadata.
-    fn meta<'a>(&'a self) -> CapFuture<'a, SessionMeta>;
-}
-
-/// Append entries to the calling session.
-pub trait SessionWrite: Send + Sync {
-    /// Append one entry. The host assigns the [`EntryId`] and timestamp
-    /// on commit and returns the id for callers that need to reference
-    /// the row later.
-    fn append<'a>(&'a self, entry: SessionEntryDraft) -> CapFuture<'a, EntryId>;
-}
-
-/// Per-extension, per-session settings storage.
-///
-/// Values are opaque JSON — extensions deserialize against their own
-/// typed shapes. Missing keys read as `Ok(None)`; that's the canonical
-/// "no override" signal.
-pub trait Settings: Send + Sync {
-    fn get<'a>(&'a self, key: &'a str) -> CapFuture<'a, Option<Value>>;
-    fn set<'a>(&'a self, key: &'a str, value: Value) -> CapFuture<'a, ()>;
-}
-
-/// Register tools the agent can call.
-///
-/// Called from `Extension::install`; the registry seals after install
-/// completes. Re-registering a name later is the host's choice (today:
-/// first-write-wins, like the existing hub).
-pub trait ToolRegistration: Send + Sync {
-    fn register<'a>(&'a self, descriptor: ToolDescriptor, tool: Arc<dyn Tool>)
-    -> CapFuture<'a, ()>;
-}
-
-/// Register slash commands the gateway can dispatch.
-pub trait CommandRegistration: Send + Sync {
-    fn register<'a>(
-        &'a self,
-        descriptor: CommandDescriptor,
-        command: Box<dyn ExtensionCommand>,
-    ) -> CapFuture<'a, ()>;
-}
 
 /// Narrow capability: access hosted agent DBs for state operations
 /// (schedules, memory, configuration). The hub scopes each impl to the
@@ -543,104 +368,6 @@ pub trait ContextTail: Send + Sync {
         agent_name: &'a str,
         recent_message_text: &'a [String],
     ) -> CapFuture<'a, Option<String>>;
-}
-
-// =========================================================================
-// ExtensionCaps — per-extension consumer bundle
-// =========================================================================
-
-/// The fully-resolved bundle of capabilities a consumer extension
-/// receives at `install` time.
-///
-/// One field per host-only kind (each holds at most one impl — the
-/// host's), plus a [`CapSet`] per extension-providable kind so the
-/// consumer can either grab the operator default (bare request) or
-/// look up a specific provider by name.
-///
-/// Slots are `Option` / empty `CapSet` whenever the extension's
-/// manifest didn't grant the corresponding cap. Attempting to use a
-/// missing slot is a logic error on the extension's part — the manifest
-/// contract said it wouldn't.
-///
-/// Built by the hub during phase 2 of `install_all` (added in step 5)
-/// from the operator config, the cap registry, and the requesting
-/// extension's manifest.
-pub struct ExtensionCaps {
-    pub session_read: Option<Arc<dyn SessionRead>>,
-    pub session_write: Option<Arc<dyn SessionWrite>>,
-    pub settings: Option<Arc<dyn Settings>>,
-    pub tool_registration: Option<Arc<dyn ToolRegistration>>,
-    pub command_registration: Option<Arc<dyn CommandRegistration>>,
-    /// Scoped agent state access — pre-built by the hub from the
-    /// operator's `tool_policy` agent allowlist. `None` when the
-    /// extension didn't request this cap or the allowlist intersected
-    /// to empty (cap denied).
-    pub agent_state_admin: Option<Arc<dyn AgentStateAdmin>>,
-    pub messengers: CapSet<dyn Messenger>,
-    pub memory: CapSet<dyn MemoryAccess>,
-    pub prompt_augmentation: CapSet<dyn PromptAugmentation>,
-    pub context_tail: CapSet<dyn ContextTail>,
-}
-
-impl ExtensionCaps {
-    /// Bundle with no caps granted. Convenient for tests and for
-    /// extensions whose manifests grant nothing (e.g., pure hook
-    /// observers that don't consume any cap).
-    pub fn empty() -> Self {
-        Self {
-            session_read: None,
-            session_write: None,
-            settings: None,
-            tool_registration: None,
-            command_registration: None,
-            agent_state_admin: None,
-            messengers: CapSet::new(),
-            memory: CapSet::new(),
-            prompt_augmentation: CapSet::new(),
-            context_tail: CapSet::new(),
-        }
-    }
-
-    /// `true` when no host-only slot is filled and both `CapSet`s are
-    /// empty. Useful in tests and as a manifest sanity check.
-    pub fn is_empty(&self) -> bool {
-        self.session_read.is_none()
-            && self.session_write.is_none()
-            && self.settings.is_none()
-            && self.tool_registration.is_none()
-            && self.command_registration.is_none()
-            && self.agent_state_admin.is_none()
-            && self.messengers.is_empty()
-            && self.memory.is_empty()
-            && self.prompt_augmentation.is_empty()
-            && self.context_tail.is_empty()
-    }
-}
-
-impl Default for ExtensionCaps {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl fmt::Debug for ExtensionCaps {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExtensionCaps")
-            .field("session_read", &self.session_read.is_some())
-            .field("session_write", &self.session_write.is_some())
-            .field("settings", &self.settings.is_some())
-            .field("tool_registration", &self.tool_registration.is_some())
-            .field("command_registration", &self.command_registration.is_some())
-            .field("agent_state_admin", &self.agent_state_admin.is_some())
-            .field("messengers", &self.messengers.provider_names())
-            .field("memory", &self.memory.provider_names())
-            .field(
-                "prompt_augmentation",
-                &self.prompt_augmentation.provider_names(),
-            )
-            .field("context_tail", &self.context_tail.provider_names())
-            .finish()
-    }
 }
 
 // =========================================================================
@@ -832,100 +559,6 @@ mod tests {
         assert_eq!(round, with_agents);
     }
 
-    // --- CapSet -----------------------------------------------------------
-
-    trait Greeter: Send + Sync {
-        fn greeting(&self) -> &str;
-    }
-    struct Hello(&'static str);
-    impl Greeter for Hello {
-        fn greeting(&self) -> &str {
-            self.0
-        }
-    }
-
-    #[test]
-    fn empty_capset_returns_none_for_default_and_named() {
-        let set: CapSet<dyn Greeter> = CapSet::new();
-        assert!(set.is_empty());
-        assert!(set.get(None).is_none());
-        assert!(set.get(Some("anything")).is_none());
-        assert!(set.provider_names().is_empty());
-    }
-
-    #[test]
-    fn capset_default_only_resolves_for_bare_request() {
-        let mut set: CapSet<dyn Greeter> = CapSet::new();
-        set.default = Some(Arc::new(Hello("hi")));
-        assert!(!set.is_empty());
-        assert_eq!(set.get(None).unwrap().greeting(), "hi");
-        // A named request must not silently fall through to the default.
-        assert!(set.get(Some("missing")).is_none());
-    }
-
-    #[test]
-    fn capset_named_lookup_is_exact_match() {
-        let mut set: CapSet<dyn Greeter> = CapSet::new();
-        set.named
-            .insert("matrix".into(), Arc::new(Hello("from matrix")));
-        set.named
-            .insert("email".into(), Arc::new(Hello("from email")));
-        assert_eq!(set.get(Some("matrix")).unwrap().greeting(), "from matrix");
-        assert_eq!(set.get(Some("email")).unwrap().greeting(), "from email");
-        assert!(set.get(Some("slack")).is_none());
-        // Bare request returns None when no default is set, even with
-        // named providers registered.
-        assert!(set.get(None).is_none());
-        assert_eq!(set.provider_names(), vec!["email", "matrix"]);
-    }
-
-    #[test]
-    fn capset_default_and_named_can_coexist() {
-        // Default selection picks one named entry as the bare-request
-        // resolution; the registry sets both pointers to the same Arc.
-        let arc = Arc::new(Hello("primary"));
-        let mut set: CapSet<dyn Greeter> = CapSet::new();
-        set.default = Some(arc.clone());
-        set.named.insert("primary".into(), arc);
-        set.named
-            .insert("backup".into(), Arc::new(Hello("secondary")));
-        assert_eq!(set.get(None).unwrap().greeting(), "primary");
-        assert_eq!(set.get(Some("primary")).unwrap().greeting(), "primary");
-        assert_eq!(set.get(Some("backup")).unwrap().greeting(), "secondary");
-    }
-
-    // --- Cap impls used by bundle tests -----------------------------------
-
-    struct NoopMessenger;
-    impl Messenger for NoopMessenger {
-        fn send<'a>(&'a self, _target: String, _body: MessageBody) -> CapFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    struct NoopMemory;
-    impl MemoryAccess for NoopMemory {
-        fn search<'a>(
-            &'a self,
-            _agent_name: &'a str,
-            _query: &'a str,
-            _scope: MemoryScope,
-        ) -> CapFuture<'a, Vec<MemoryHit>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-        fn remember<'a>(
-            &'a self,
-            _agent_name: &'a str,
-            _key: &'a str,
-            _value: &'a str,
-            _scope: MemoryScope,
-        ) -> CapFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    // --- Data types -------------------------------------------------------
-
     #[test]
     fn memory_scope_serde_round_trip_for_both_variants() {
         let agent = MemoryScope::Agent;
@@ -954,60 +587,6 @@ mod tests {
         assert_eq!(s, r#"{"text":"hello"}"#);
         let round: MessageBody = serde_json::from_str(&s).unwrap();
         assert_eq!(round, body);
-    }
-
-    #[test]
-    fn session_entry_view_round_trip_preserves_shape() {
-        let view = SessionEntryView {
-            id: EntryId("abc123".into()),
-            kind: "user_message".into(),
-            data: serde_json::json!({"text": "hi"}),
-            timestamp: Utc::now(),
-        };
-        let s = serde_json::to_string(&view).unwrap();
-        let round: SessionEntryView = serde_json::from_str(&s).unwrap();
-        assert_eq!(round, view);
-    }
-
-    // --- ExtensionCaps ----------------------------------------------------
-
-    #[test]
-    fn empty_extension_caps_grants_nothing() {
-        let caps = ExtensionCaps::empty();
-        assert!(caps.is_empty());
-        assert!(caps.session_read.is_none());
-        assert!(caps.session_write.is_none());
-        assert!(caps.settings.is_none());
-        assert!(caps.tool_registration.is_none());
-        assert!(caps.command_registration.is_none());
-        assert!(caps.messengers.is_empty());
-        assert!(caps.memory.is_empty());
-    }
-
-    #[test]
-    fn extension_caps_is_empty_flips_when_any_slot_filled() {
-        let mut caps = ExtensionCaps::empty();
-        caps.messengers.default = Some(Arc::new(NoopMessenger));
-        assert!(!caps.is_empty(), "messenger default should count");
-
-        let mut caps = ExtensionCaps::empty();
-        caps.memory
-            .named
-            .insert("local".into(), Arc::new(NoopMemory));
-        assert!(!caps.is_empty(), "named memory should count");
-    }
-
-    #[test]
-    fn extension_caps_debug_summarizes_without_arc_payload() {
-        let mut caps = ExtensionCaps::empty();
-        caps.messengers
-            .named
-            .insert("matrix".into(), Arc::new(NoopMessenger));
-        let s = format!("{caps:?}");
-        // Slot booleans + provider names are present; raw Arc<dyn _>
-        // pointers are not (they're not Debug-printable anyway).
-        assert!(s.contains("session_read: false"), "got: {s}");
-        assert!(s.contains("messengers: [\"matrix\"]"), "got: {s}");
     }
 
     #[test]

@@ -1023,7 +1023,7 @@ mod tests {
         // End-to-end: one-shot routine + an installed extension whose
         // routine handler records the payload. After `fire_due`, the
         // routine is gone and the payload was observed.
-        use crate::extension::{ExtensionHub, HookKind, caps, handler, instance};
+        use crate::extension::{ExtensionHub, HookKind, handler, instance};
         use std::sync::Mutex as StdMutex;
 
         // Routine handler that records the payload it's fired with.
@@ -1033,7 +1033,6 @@ mod tests {
         impl handler::RoutineHandler for Echo {
             fn on_fire<'a>(
                 &'a self,
-                _caps: &'a caps::ExtensionCaps,
                 payload: serde_json::Value,
             ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
                 let seen = self.seen.clone();
