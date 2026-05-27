@@ -13,11 +13,18 @@
 //! force a schema change on `AgentMeta` / `MemoryBankMeta` / `SessionMeta`.
 
 use eidetica::Database;
+use eidetica::auth::crypto::PublicKey;
 use eidetica::store::DocStore;
 
 pub const META_STORE: &str = "meta";
 pub const KIND_KEY: &str = "kind";
 pub const DISPLAY_NAME_KEY: &str = "display_name";
+
+/// Top-level key on an agent DB's `meta` store naming the peer that should
+/// run agent-owned Fresh timer fires (where no session yet exists to carry
+/// a per-session `home_pubkey`). For interactive turns and Pinned timer
+/// fires the gate uses `AgentRef.home_pubkey` on the session instead.
+pub const HOME_PUBKEY_KEY: &str = "home_pubkey";
 
 pub const KIND_AGENT: &str = "agent";
 /// Memory bank — peer-hosted, granted to agents for shared remember/recall.
@@ -52,6 +59,39 @@ pub async fn read_marker(database: &Database) -> Option<(String, String)> {
     Some((kind, display_name))
 }
 
+/// Write the agent-level `home_pubkey` into an agent DB's `meta` store.
+/// Names the peer that should run `TimerTarget::Fresh` timer fires for
+/// this agent. Idempotent — overwrites any prior value.
+pub async fn write_agent_home_pubkey(database: &Database, pk: &PublicKey) -> anyhow::Result<()> {
+    let txn = database.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(META_STORE).await?;
+    store.set_string(HOME_PUBKEY_KEY, pk.to_string()).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Remove the agent-level `home_pubkey` from an agent DB's `meta` store,
+/// restoring the legacy "any keyholder runs Fresh fires" default. Operator
+/// escape hatch for the rare case where a stuck home pubkey needs clearing.
+pub async fn clear_agent_home_pubkey(database: &Database) -> anyhow::Result<()> {
+    let txn = database.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(META_STORE).await?;
+    let _ = store.delete(HOME_PUBKEY_KEY).await;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Read the agent-level `home_pubkey` from an agent DB's `meta` store.
+/// Returns `None` if unset OR if the stored value fails to parse — in the
+/// latter case the gate falls back to legacy "any keyholder runs" behavior
+/// (safer than going silent on corruption).
+pub async fn read_agent_home_pubkey(database: &Database) -> Option<PublicKey> {
+    let txn = database.new_transaction().await.ok()?;
+    let store = txn.get_store::<DocStore>(META_STORE).await.ok()?;
+    let raw = store.get_string(HOME_PUBKEY_KEY).await.ok()?;
+    PublicKey::from_prefixed_string(&raw).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +123,28 @@ mod tests {
     async fn read_on_db_without_marker_returns_none() {
         let (_inst, _user, db) = fresh_db().await;
         assert!(read_marker(&db).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_then_read_home_pubkey_round_trips() {
+        let (_inst, user, db) = fresh_db().await;
+        let pk = user.get_default_key().unwrap();
+        write_agent_home_pubkey(&db, &pk).await.unwrap();
+        assert_eq!(read_agent_home_pubkey(&db).await.as_ref(), Some(&pk));
+    }
+
+    #[tokio::test]
+    async fn clear_home_pubkey_restores_none() {
+        let (_inst, user, db) = fresh_db().await;
+        let pk = user.get_default_key().unwrap();
+        write_agent_home_pubkey(&db, &pk).await.unwrap();
+        clear_agent_home_pubkey(&db).await.unwrap();
+        assert!(read_agent_home_pubkey(&db).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_home_pubkey_on_unset_db_returns_none() {
+        let (_inst, _user, db) = fresh_db().await;
+        assert!(read_agent_home_pubkey(&db).await.is_none());
     }
 }
