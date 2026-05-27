@@ -41,7 +41,10 @@ All invocation flows through the session-messaging primitive (see
 
 - **Serialized turns**: a per-session `processing` lock means one agent
   task runs at a time per session. This is desirable for a room (no two
-  agents talking over each other) and is **kept**.
+  agents talking over each other) and is **kept**. The lock is
+  peer-local; cross-peer serialization (when an agent is co-owned and
+  attached to a session that syncs to multiple peers) is provided by
+  the home-peer gate — see "Home Peer" in [Session Model](../architecture/sessions.md).
 
 - **Multi-membership already exists**: `attach_agent_to_session` grants
   N agents `Write` on the session DB and mirrors them into

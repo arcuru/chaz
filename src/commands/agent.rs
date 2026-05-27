@@ -699,8 +699,7 @@ pub(super) async fn agent_revoke_peer(
     let mut affected_sessions: Vec<String> = Vec::new();
     if let Ok(sessions) = ctx.server.registry().list_sessions().await {
         for s in sessions {
-            let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await
-            else {
+            let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await else {
                 continue;
             };
             let meta = crate::session::read_meta_from_db(&db).await;
@@ -777,7 +776,12 @@ pub(super) async fn agent_rehost(
                 ));
             }
         };
-        let agent_db = match ctx.server.registry().open_agent_db(&entry.db_id, None).await {
+        let agent_db = match ctx
+            .server
+            .registry()
+            .open_agent_db(&entry.db_id, None)
+            .await
+        {
             Ok(Some(a)) => a,
             Ok(None) => {
                 return CommandOutcome::Error(format!(
@@ -812,14 +816,13 @@ pub(super) async fn agent_rehost(
             let target_str = target_pk.as_ref().map(|p| p.to_string());
             let agent_db_id = entry.db_id.to_string();
             let mut found = false;
-            if let Err(e) =
-                crate::session::update_meta_on_db(ctx.session_db, |m| {
-                    if let Some(a) = m.agents.iter_mut().find(|a| a.db_id == agent_db_id) {
-                        a.home_pubkey = target_str.clone();
-                        found = true;
-                    }
-                })
-                .await
+            if let Err(e) = crate::session::update_meta_on_db(ctx.session_db, |m| {
+                if let Some(a) = m.agents.iter_mut().find(|a| a.db_id == agent_db_id) {
+                    a.home_pubkey = target_str.clone();
+                    found = true;
+                }
+            })
+            .await
             {
                 return CommandOutcome::Error(format!("Failed to update session meta: {e}"));
             }
@@ -850,7 +853,12 @@ pub(super) async fn agent_rehost(
             }
         }
         RehostScope::Agent => {
-            let agent_db = match ctx.server.registry().open_agent_db(&entry.db_id, None).await {
+            let agent_db = match ctx
+                .server
+                .registry()
+                .open_agent_db(&entry.db_id, None)
+                .await
+            {
                 Ok(Some(a)) => a,
                 Ok(None) => {
                     return CommandOutcome::Error(format!(
@@ -944,8 +952,7 @@ pub(super) async fn agent_home_status(
         // Per-session homes.
         let mut session_rows: Vec<String> = Vec::new();
         for s in &sessions {
-            let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await
-            else {
+            let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await else {
                 continue;
             };
             let meta = crate::session::read_meta_from_db(&db).await;
@@ -1688,10 +1695,7 @@ mod tests {
         )
         .await;
         let entry = server.agent_index().find_by_name(name).unwrap();
-        registry
-            .attach_agent_to_session(sid, &entry)
-            .await
-            .unwrap();
+        registry.attach_agent_to_session(sid, &entry).await.unwrap();
         entry
     }
 
@@ -1859,7 +1863,10 @@ mod tests {
         .await
         {
             CommandOutcome::Text(msg) => {
-                assert!(msg.contains("Cleared") && msg.contains("WARNING"), "got {msg}")
+                assert!(
+                    msg.contains("Cleared") && msg.contains("WARNING"),
+                    "got {msg}"
+                )
             }
             _ => panic!("expected Text"),
         }
@@ -1880,9 +1887,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(crate::db_kind::read_agent_home_pubkey(agent_db.database())
-            .await
-            .is_some());
+        assert!(
+            crate::db_kind::read_agent_home_pubkey(agent_db.database())
+                .await
+                .is_some()
+        );
 
         match dispatch(
             Command::AgentRehost {
@@ -1934,12 +1943,7 @@ mod tests {
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
         setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
 
-        match dispatch(
-            Command::AgentHomeStatus(Some("alpha".to_string())),
-            &ctx,
-        )
-        .await
-        {
+        match dispatch(Command::AgentHomeStatus(Some("alpha".to_string())), &ctx).await {
             CommandOutcome::Text(out) => {
                 assert!(out.contains("← (me)"), "expected ← (me) tag: {out}");
             }
@@ -1960,12 +1964,7 @@ mod tests {
         .await
         .unwrap();
 
-        match dispatch(
-            Command::AgentHomeStatus(Some("alpha".to_string())),
-            &ctx,
-        )
-        .await
-        {
+        match dispatch(Command::AgentHomeStatus(Some("alpha".to_string())), &ctx).await {
             CommandOutcome::Text(out) => {
                 assert!(out.contains("<unset"), "expected <unset> marker: {out}");
             }

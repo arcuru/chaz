@@ -674,8 +674,7 @@ impl Server {
                 // falls back to the agent DB's `meta.home_pubkey`. Legacy
                 // `None` lets every keyholder run (pre-feature default).
                 if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-                    && let Some(home) =
-                        crate::db_kind::read_agent_home_pubkey(adb.database()).await
+                    && let Some(home) = crate::db_kind::read_agent_home_pubkey(adb.database()).await
                     && home != agent_entry.pubkey
                 {
                     tracing::debug!(
@@ -2461,8 +2460,7 @@ mod tests {
         .await
         .unwrap();
 
-        let payload =
-            pinned_schedule_payload(&entry.db_id.to_string(), "p1", "wake", &sid);
+        let payload = pinned_schedule_payload(&entry.db_id.to_string(), "p1", "wake", &sid);
         let result = server.fire_agent_schedule(payload).await;
         assert!(result.is_ok(), "skip path returns Ok: {result:?}");
 

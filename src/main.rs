@@ -782,7 +782,10 @@ async fn warn_unset_home_pubkey_on_coowned(
 
     for entry in &agents {
         // Count active AuthKeys on the agent DB.
-        let active_count = match registry.open_agent_db(&entry.db_id, Some(&entry.pubkey)).await {
+        let active_count = match registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+        {
             Ok(Some(adb)) => {
                 let Ok(settings) = adb.database().get_settings().await else {
                     continue;
@@ -794,9 +797,7 @@ async fn warn_unset_home_pubkey_on_coowned(
                     continue;
                 };
                 all.values()
-                    .filter(|k| {
-                        matches!(k.status(), eidetica::auth::types::KeyStatus::Active)
-                    })
+                    .filter(|k| matches!(k.status(), eidetica::auth::types::KeyStatus::Active))
                     .count()
             }
             _ => continue,
