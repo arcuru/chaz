@@ -50,6 +50,7 @@ impl SessionRegistry {
         let agent_ref = AgentRef {
             db_id: agent.db_id.to_string(),
             display_name: agent.display_name.clone(),
+            home_pubkey: None,
         };
         update_meta_on_db(&session_db, |m| {
             if let Some(existing) = m.agents.iter_mut().find(|a| a.db_id == agent_ref.db_id) {

@@ -82,10 +82,19 @@ pub struct SessionEntry {
 /// `db_id` is the agent's eidetica Database root ID — its global identity.
 /// `display_name` caches the name so listings don't require opening the
 /// agent's DB. Name is advisory; the DB id is canonical.
+///
+/// `home_pubkey` (per-session home peer): when set, only the peer whose
+/// local key on the agent DB matches this pubkey will run the ReAct loop
+/// for this agent in this session. `None` is the legacy default — any
+/// keyholder runs (the multi-peer race the home-peer system exists to
+/// fix). Set automatically on attach to the attacher's pubkey; rewritten
+/// by `/agent rehost`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRef {
     pub db_id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub home_pubkey: Option<String>,
 }
 
 /// Metadata stored in each session's own eidetica DB (under the "meta" DocStore).
@@ -544,10 +553,12 @@ mod tests {
             AgentRef {
                 db_id: "sha256:abc".to_string(),
                 display_name: "alpha".to_string(),
+                home_pubkey: None,
             },
             AgentRef {
                 db_id: "sha256:def".to_string(),
                 display_name: "beta".to_string(),
+                home_pubkey: None,
             },
         ];
 
@@ -567,6 +578,7 @@ mod tests {
             m.agents.push(AgentRef {
                 db_id: "sha256:x".to_string(),
                 display_name: "alpha".to_string(),
+                home_pubkey: None,
             });
         })
         .await
@@ -586,6 +598,7 @@ mod tests {
             m.agents.push(AgentRef {
                 db_id: "sha256:a".to_string(),
                 display_name: "modern".to_string(),
+                home_pubkey: None,
             });
         })
         .await
@@ -595,6 +608,30 @@ mod tests {
         assert_eq!(meta.agent_name.as_deref(), Some("legacy"));
         assert_eq!(meta.agents.len(), 1);
         assert_eq!(meta.agents[0].display_name, "modern");
+    }
+
+    #[test]
+    fn agent_ref_deserializes_legacy_blob_without_home_pubkey() {
+        // Pre-home_pubkey JSON shape: agents that were serialized before
+        // the field existed must still deserialize with home_pubkey = None
+        // (the `#[serde(default)]` attribute).
+        let legacy = r#"{"db_id":"sha256:abc","display_name":"alpha"}"#;
+        let parsed: AgentRef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.db_id, "sha256:abc");
+        assert_eq!(parsed.display_name, "alpha");
+        assert_eq!(parsed.home_pubkey, None);
+    }
+
+    #[test]
+    fn agent_ref_round_trips_with_home_pubkey_set() {
+        let original = AgentRef {
+            db_id: "sha256:def".to_string(),
+            display_name: "beta".to_string(),
+            home_pubkey: Some("ed25519:AbCdEf".to_string()),
+        };
+        let s = serde_json::to_string(&original).unwrap();
+        let parsed: AgentRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, original);
     }
 
     #[test]
