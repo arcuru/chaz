@@ -1288,6 +1288,21 @@ impl Server {
         // propagate to the next run without a restart.
         let agent = self.hydrate_agent_from_db(agent).await;
 
+        // Per-session home-peer gate. When the session's AgentRef for this
+        // agent names a `home_pubkey`, only the peer whose local key on the
+        // agent DB matches will run the ReAct loop. Co-owning peers see the
+        // same wake, pass `should_process`, but skip here. See
+        // `~/brain/tech/projects/chaz/home-peer-plan.md`.
+        if !self.peer_is_home_for(session_db_id, &agent.name).await {
+            debug!(
+                session_db_id,
+                agent = %agent.name,
+                "Not home peer for this session/agent; skipping turn"
+            );
+            self.processing.lock().await.remove(session_db_id);
+            return Ok(());
+        }
+
         self.spawn_agent_task(
             session_db_id.to_string(),
             session,
@@ -2123,5 +2138,172 @@ mod tests {
         .await
         .unwrap();
         assert!(!server.peer_is_home_for(&sid, "alpha").await);
+    }
+
+    // ---- process_session gate -------------------------------------------
+
+    /// Register an Agent in the in-memory registry so resolve_agent_for_entry
+    /// can return it. Mirrors the shape used in `hydrate_picks_up_db_config_edits`.
+    fn register_alpha_agent_runtime(server: &Server) {
+        server.agents().upsert(crate::agent::Agent {
+            name: "alpha".to_string(),
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
+            default_model: Some("test-model".to_string()),
+            allowed_tools: None,
+            can_spawn: vec![],
+            allowed_callers: vec![],
+            max_iterations: 1,
+            autonomous: false,
+            presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: HashMap::new(),
+        });
+    }
+
+    async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
+        let mut session = crate::session::Session::new(
+            crate::types::ConversationId(sid.to_string()),
+            session_db.clone(),
+        )
+        .await;
+        session
+            .add_entry(crate::session::SessionEntry {
+                sender: "user".to_string(),
+                content: "hello".to_string(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn process_session_skips_when_not_home_peer() {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        register_alpha_agent_runtime(&server);
+
+        let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        registry
+            .attach_agent_to_session(&sid, &entry)
+            .await
+            .unwrap();
+
+        // Pin home to a different peer so the gate fires.
+        let other = registry.new_ephemeral_key("other-peer").await.unwrap();
+        crate::session::update_meta_on_db(&session_db, |m| {
+            m.agents[0].home_pubkey = Some(other.to_string());
+        })
+        .await
+        .unwrap();
+
+        let backend = crate::backends::BackendManager::new(
+            &None,
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .register_session(&session_db, backend, Some("alpha".to_string()), None)
+            .await
+            .unwrap();
+
+        write_user_message(&session_db, &sid).await;
+
+        let entries_before = {
+            let session = crate::session::Session::new(
+                crate::types::ConversationId(sid.clone()),
+                session_db.clone(),
+            )
+            .await;
+            session.entries().len()
+        };
+
+        server.process_session(&sid).await.unwrap();
+
+        // Gate released the lock inline before returning.
+        assert!(!server.processing.lock().await.contains(&sid));
+
+        let entries_after = {
+            let session = crate::session::Session::new(
+                crate::types::ConversationId(sid.clone()),
+                session_db.clone(),
+            )
+            .await;
+            session.entries().len()
+        };
+        assert_eq!(
+            entries_before, entries_after,
+            "non-home peer must not write any new entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_session_runs_when_home_pubkey_unset_legacy() {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        register_alpha_agent_runtime(&server);
+
+        let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        registry
+            .attach_agent_to_session(&sid, &entry)
+            .await
+            .unwrap();
+
+        // Simulate a legacy session: clear the home_pubkey we just set on attach.
+        crate::session::update_meta_on_db(&session_db, |m| {
+            m.agents[0].home_pubkey = None;
+        })
+        .await
+        .unwrap();
+
+        let backend = crate::backends::BackendManager::new(
+            &None,
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .register_session(&session_db, backend, Some("alpha".to_string()), None)
+            .await
+            .unwrap();
+
+        write_user_message(&session_db, &sid).await;
+
+        server.process_session(&sid).await.unwrap();
+
+        // Gate passed → spawn_agent_task was called → spawned tokio task
+        // is pending on current_thread runtime; lock is still held.
+        assert!(server.processing.lock().await.contains(&sid));
+    }
+
+    #[tokio::test]
+    async fn process_session_runs_when_home_matches_self() {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        register_alpha_agent_runtime(&server);
+
+        let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        // attach defaults home_pubkey to this peer's key on alpha.
+        registry
+            .attach_agent_to_session(&sid, &entry)
+            .await
+            .unwrap();
+
+        let backend = crate::backends::BackendManager::new(
+            &None,
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .register_session(&session_db, backend, Some("alpha".to_string()), None)
+            .await
+            .unwrap();
+
+        write_user_message(&session_db, &sid).await;
+
+        server.process_session(&sid).await.unwrap();
+
+        assert!(server.processing.lock().await.contains(&sid));
     }
 }
