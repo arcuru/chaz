@@ -691,10 +691,56 @@ pub(super) async fn agent_revoke_peer(
         return CommandOutcome::Error(format!("Failed to revoke peer: {e}"));
     }
 
-    CommandOutcome::Text(format!(
+    // Soft warning: identify sessions and agent-level state where the
+    // revoked key was the home peer. The revoke succeeded — we don't
+    // block it — but the affected sessions/agents will go silent on
+    // their next wake until a surviving peer runs `/agent rehost`.
+    let revoked_str = pk.to_string();
+    let mut affected_sessions: Vec<String> = Vec::new();
+    if let Ok(sessions) = ctx.server.registry().list_sessions().await {
+        for s in sessions {
+            let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await
+            else {
+                continue;
+            };
+            let meta = crate::session::read_meta_from_db(&db).await;
+            if meta.agents.iter().any(|a| {
+                a.db_id == entry.db_id.to_string()
+                    && a.home_pubkey.as_deref() == Some(revoked_str.as_str())
+            }) {
+                affected_sessions.push(s.session_db_id);
+            }
+        }
+    }
+    let agent_level_was_home = matches!(
+        ctx.server.registry().open_agent_db(&entry.db_id, None).await,
+        Ok(Some(adb)) if matches!(
+            crate::db_kind::read_agent_home_pubkey(adb.database()).await,
+            Some(p) if p == pk
+        )
+    );
+
+    let mut body = format!(
         "Revoked {pubkey_str} from agent '{}'. They retain read access to history but cannot write.",
         entry.display_name
-    ))
+    );
+    if !affected_sessions.is_empty() {
+        body.push_str(&format!(
+            "\n\nWARNING: revoked key was the home peer for {} session(s): {}. \
+             Their next turn will be silent until you run `/agent rehost {}` from a surviving peer.",
+            affected_sessions.len(),
+            affected_sessions.join(", "),
+            entry.display_name
+        ));
+    }
+    if agent_level_was_home {
+        body.push_str(&format!(
+            "\n\nWARNING: revoked key was the agent-level home for '{}'. \
+             Fresh schedule fires will be silent until you run `/agent rehost --agent {}` from a surviving peer.",
+            entry.display_name, entry.display_name
+        ));
+    }
+    CommandOutcome::Text(body)
 }
 
 /// `/agent rehost` — reassign the home peer for an agent in a session
@@ -1945,6 +1991,55 @@ mod tests {
         server.record_home_skip(&sid, "alpha").await;
         server.reset_home_skip(&sid, "alpha").await;
         assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_warns_when_target_was_session_home() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let _entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        // Invite a co-owner and rehost the session to their key.
+        let invitee = fresh_invitee_pubkey(&registry).await;
+        dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee.to_prefixed_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await;
+        dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: Some(invitee.to_prefixed_string()),
+                scope: super::super::RehostScope::Session,
+                clear: false,
+            },
+            &ctx,
+        )
+        .await;
+
+        // Revoke the co-owner. Soft warning should mention this session.
+        match dispatch(
+            Command::AgentRevokePeer {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee.to_prefixed_string(),
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => {
+                assert!(msg.contains("Revoked"), "no revoke confirmation: {msg}");
+                assert!(
+                    msg.contains("WARNING") && msg.contains(&sid),
+                    "missing session warning: {msg}"
+                );
+            }
+            _ => panic!("expected Text"),
+        }
     }
 
     #[tokio::test]
