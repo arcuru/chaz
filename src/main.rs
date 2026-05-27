@@ -257,6 +257,14 @@ async fn main() -> anyhow::Result<()> {
         hosted_index::build_from_user(&user).await?
     };
 
+    // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
+    // still unset (legacy default). These keep working as before — any
+    // keyholder may run — but on co-owned agents that's the multi-peer
+    // race the home-peer system exists to fix. WARN with the recovery
+    // command so operators see actionable migration guidance instead of
+    // silent forks.
+    warn_unset_home_pubkey_on_coowned(&registry, &agent_index_store).await;
+
     // Attach default memory banks declared in agent configs. Idempotent —
     // already-attached banks are skipped (grant_on_memory_bank is idempotent,
     // and attach_memory_bank overwrites by name). Missing banks/agents are
@@ -754,6 +762,94 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolve the configured web-search backend: extract its API key (if any)
+/// Startup migration WARN: any locally-hosted agent that is co-owned
+/// (more than one active AuthKey) but has no `home_pubkey` set — either
+/// on its meta store (agent-level) or on a session's AgentRef — is still
+/// running on the legacy multi-peer "any keyholder runs" path that this
+/// system exists to fix. WARN with the exact `/agent rehost` command
+/// the operator should run.
+///
+/// Solo agents (single AuthKey) are skipped: there's only one peer that
+/// can run them anyway, so the lack of `home_pubkey` causes no fork.
+async fn warn_unset_home_pubkey_on_coowned(
+    registry: &session::SessionRegistry,
+    agent_index: &hosted_index::HostedIndex,
+) {
+    let agents = agent_index.list();
+    let Ok(sessions) = registry.list_sessions().await else {
+        return;
+    };
+
+    for entry in &agents {
+        // Count active AuthKeys on the agent DB.
+        let active_count = match registry.open_agent_db(&entry.db_id, Some(&entry.pubkey)).await {
+            Ok(Some(adb)) => {
+                let Ok(settings) = adb.database().get_settings().await else {
+                    continue;
+                };
+                let Ok(snap) = settings.auth_snapshot().await else {
+                    continue;
+                };
+                let Ok(all) = snap.get_all_keys() else {
+                    continue;
+                };
+                all.values()
+                    .filter(|k| {
+                        matches!(k.status(), eidetica::auth::types::KeyStatus::Active)
+                    })
+                    .count()
+            }
+            _ => continue,
+        };
+
+        if active_count <= 1 {
+            continue; // Solo agent, no race possible.
+        }
+
+        // Agent-level home_pubkey check.
+        let agent_level_home = match registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+        {
+            Ok(Some(adb)) => db_kind::read_agent_home_pubkey(adb.database()).await,
+            _ => None,
+        };
+        if agent_level_home.is_none() {
+            warn!(
+                agent = %entry.display_name,
+                active_keys = active_count,
+                "Co-owned agent has no agent-level home_pubkey set — Fresh schedule \
+                 fires may run on multiple peers. Run `/agent rehost --agent {}` \
+                 from the peer that should own them.",
+                entry.display_name
+            );
+        }
+
+        // Per-session home_pubkey scan.
+        for s in &sessions {
+            let Ok((_conv, db)) = registry.open_session(&s.session_db_id).await else {
+                continue;
+            };
+            let meta = session::read_meta_from_db(&db).await;
+            if let Some(ar) = meta
+                .agents
+                .iter()
+                .find(|a| a.db_id == entry.db_id.to_string())
+                && ar.home_pubkey.is_none()
+            {
+                warn!(
+                    session_db_id = %s.session_db_id,
+                    agent = %entry.display_name,
+                    "Co-owned agent has no home_pubkey on this session — multiple peers \
+                     may both respond. Run `/agent rehost {}` from the peer that should \
+                     own execution.",
+                    entry.display_name
+                );
+            }
+        }
+    }
+}
+
 /// into the SecretStore, then materialize the `SearchBackend` enum. Falls
 /// back to DuckDuckGo HTML scraping when no config or no key is present.
 /// Missing keys for API-backed providers log a warning and also fall back to
