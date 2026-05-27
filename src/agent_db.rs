@@ -646,6 +646,10 @@ pub async fn create_agent_db(
         display_name,
     )
     .await?;
+    // The creating peer is the natural home for agent-owned Fresh timer
+    // fires. Co-owners invited later don't override this unless
+    // `/agent rehost --agent` is run explicitly.
+    crate::db_kind::write_agent_home_pubkey(agent_db.database(), &key).await?;
     Ok((agent_db, key))
 }
 
@@ -811,6 +815,22 @@ mod tests {
         assert_eq!(db.read_meta().await.unwrap(), meta);
         // Returned pubkey is an actual key the user holds for this DB.
         assert_eq!(user.find_key(&db.id()).unwrap(), Some(pubkey));
+    }
+
+    #[tokio::test]
+    async fn create_agent_writes_creator_as_agent_level_home_pubkey() {
+        let mut user = test_peer_user().await;
+        let cfg = AgentDbConfig::default();
+        let meta = AgentMeta {
+            display_name: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        let (db, pubkey) = create_agent_db(&mut user, "alpha", &cfg, &meta)
+            .await
+            .unwrap();
+
+        let home = crate::db_kind::read_agent_home_pubkey(db.database()).await;
+        assert_eq!(home, Some(pubkey));
     }
 
     #[tokio::test]

@@ -47,14 +47,20 @@ impl SessionRegistry {
         }
 
         // 2. SessionMeta: upsert the AgentRef (dedup by db_id).
+        //
+        // `home_pubkey` defaults to the attaching peer's pubkey on the agent
+        // DB — the attacher becomes the home peer for this (session, agent)
+        // pair. Re-attach intentionally preserves a previously-set
+        // home_pubkey (that's `/agent rehost`'s job).
         let agent_ref = AgentRef {
             db_id: agent.db_id.to_string(),
             display_name: agent.display_name.clone(),
-            home_pubkey: None,
+            home_pubkey: Some(agent.pubkey.to_string()),
         };
         update_meta_on_db(&session_db, |m| {
             if let Some(existing) = m.agents.iter_mut().find(|a| a.db_id == agent_ref.db_id) {
                 existing.display_name = agent_ref.display_name.clone();
+                // Intentionally NOT overwriting home_pubkey on re-attach.
             } else {
                 m.agents.push(agent_ref.clone());
             }
@@ -717,6 +723,59 @@ mod tests {
                 .resolve_mentioned_agent(&session_id, "@gamma you there?", "alpha", &index)
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_sets_home_pubkey_to_attacher() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let agent = make_agent_entry(&registry, "alpha").await;
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 1);
+        assert_eq!(
+            meta.agents[0].home_pubkey.as_deref(),
+            Some(agent.pubkey.to_string()).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn reattach_preserves_existing_home_pubkey() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        let agent = make_agent_entry(&registry, "alpha").await;
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        // Simulate `/agent rehost` rewriting home_pubkey to a different value.
+        update_meta_on_db(&session_db, |m| {
+            m.agents[0].home_pubkey = Some("ed25519:rehosted-target".to_string());
+        })
+        .await
+        .unwrap();
+
+        // Re-attach. home_pubkey must NOT be reverted to the attacher's key.
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 1);
+        assert_eq!(
+            meta.agents[0].home_pubkey.as_deref(),
+            Some("ed25519:rehosted-target")
         );
     }
 }
