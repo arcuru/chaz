@@ -617,6 +617,23 @@ impl Server {
 
         let (session_db, is_fresh, session_db_id) = match &target {
             ScheduleTarget::Fresh => {
+                // Home-peer gate (agent-level). Fresh schedules have no
+                // session yet to carry `AgentRef.home_pubkey`, so the gate
+                // falls back to the agent DB's `meta.home_pubkey`. Legacy
+                // `None` lets every keyholder run (pre-feature default).
+                if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
+                    && let Some(home) =
+                        crate::db_kind::read_agent_home_pubkey(adb.database()).await
+                    && home != agent_entry.pubkey
+                {
+                    tracing::debug!(
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        "Not home peer for agent's Fresh schedule fire; skipping"
+                    );
+                    return Ok(());
+                }
+
                 let source = format!(
                     "schedule:{}:{}",
                     payload.owner_agent_db_id, payload.schedule_id
@@ -655,6 +672,21 @@ impl Server {
             ScheduleTarget::Pinned { session_db_id } => {
                 let (_conv, db) = self.registry.open_session(session_db_id).await?;
                 let sid = session_db_id.clone();
+
+                // Home-peer gate (per-session). Pinned schedules fire into
+                // an existing session, so the gate uses that session's
+                // `AgentRef.home_pubkey` — same source as `process_session`.
+                // If the session was rehosted to another peer, this fire
+                // belongs to them.
+                if !self.peer_is_home_for(&sid, &agent_name).await {
+                    tracing::debug!(
+                        session = %sid,
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        "Not home peer for pinned schedule's session; skipping"
+                    );
+                    return Ok(());
+                }
 
                 // Idempotent attach: if the agent was detached after the
                 // schedule was created, the fire-time membership check
@@ -2305,5 +2337,85 @@ mod tests {
         server.process_session(&sid).await.unwrap();
 
         assert!(server.processing.lock().await.contains(&sid));
+    }
+
+    // ---- fire_agent_schedule gate ---------------------------------------
+
+    #[tokio::test]
+    async fn fire_fresh_skips_when_agent_home_is_another_peer() {
+        let (_instance, server, registry) = server_fixture().await;
+        let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+
+        // Overwrite the agent-level home_pubkey to a foreign key.
+        let other = registry.new_ephemeral_key("other-peer").await.unwrap();
+        crate::db_kind::write_agent_home_pubkey(adb.database(), &other)
+            .await
+            .unwrap();
+
+        let sessions_before = registry.list_sessions().await.unwrap_or_default().len();
+        let payload = fresh_schedule_payload(&entry.db_id.to_string(), "f1", "do the thing");
+        let result = server.fire_agent_schedule(payload).await;
+        assert!(result.is_ok(), "skip path returns Ok: {result:?}");
+
+        // No new Fresh session should have been created.
+        let sessions_after = registry.list_sessions().await.unwrap_or_default().len();
+        assert_eq!(sessions_before, sessions_after);
+
+        // No ScheduleFire recorded (the gate fires before any of the
+        // schedule-fire bookkeeping runs).
+        let fires = adb.list_schedule_fires().await.unwrap();
+        assert!(fires.is_empty(), "non-home gate should not record a fire");
+    }
+
+    #[tokio::test]
+    async fn fire_fresh_runs_when_agent_home_is_unset_legacy() {
+        let (_instance, server, registry) = server_fixture().await;
+        let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+
+        // Mimic a pre-feature agent DB by clearing the home_pubkey written
+        // at create time.
+        crate::db_kind::clear_agent_home_pubkey(adb.database())
+            .await
+            .unwrap();
+
+        let payload = fresh_schedule_payload(&entry.db_id.to_string(), "f1", "wake");
+        let _ = server.fire_agent_schedule(payload).await;
+        // Even with the LLM call failing (no backends), a ScheduleFire is
+        // recorded — which only happens when we get past the gate.
+        let fires = adb.list_schedule_fires().await.unwrap();
+        assert_eq!(fires.len(), 1, "legacy None must let the fire through");
+    }
+
+    #[tokio::test]
+    async fn fire_pinned_skips_when_session_home_is_another_peer() {
+        let (_instance, server, registry) = server_fixture().await;
+        let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+
+        let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        registry
+            .attach_agent_to_session(&sid, &entry)
+            .await
+            .unwrap();
+
+        // Rewrite the AgentRef's home_pubkey to another peer.
+        let other = registry.new_ephemeral_key("other-peer").await.unwrap();
+        crate::session::update_meta_on_db(&session_db, |m| {
+            m.agents[0].home_pubkey = Some(other.to_string());
+        })
+        .await
+        .unwrap();
+
+        let payload =
+            pinned_schedule_payload(&entry.db_id.to_string(), "p1", "wake", &sid);
+        let result = server.fire_agent_schedule(payload).await;
+        assert!(result.is_ok(), "skip path returns Ok: {result:?}");
+
+        // No ScheduleFire — gate fires before bookkeeping.
+        let fires = adb.list_schedule_fires().await.unwrap();
+        assert!(
+            fires.is_empty(),
+            "non-home pinned fire should not record a fire"
+        );
     }
 }
