@@ -4,7 +4,7 @@
 use crate::session::Session;
 use crate::types::ConversationId;
 
-use super::{CoOwnerPermission, CommandContext, CommandOutcome};
+use super::{CoOwnerPermission, CommandContext, CommandOutcome, RehostScope};
 
 // -----------------------------------------------------------------------------
 // Shared: agent ref resolution
@@ -697,6 +697,143 @@ pub(super) async fn agent_revoke_peer(
     ))
 }
 
+/// `/agent rehost` — reassign the home peer for an agent in a session
+/// (default scope) or globally (with `--agent`). `--clear` removes the
+/// field. With no explicit pubkey, defaults to "rehost to me".
+pub(super) async fn agent_rehost(
+    agent_ref: &str,
+    pubkey: Option<&str>,
+    scope: RehostScope,
+    clear: bool,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+        Ok(e) => e,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+
+    if clear && pubkey.is_some() {
+        return CommandOutcome::Error(
+            "/agent rehost: cannot combine --clear with an explicit pubkey".to_string(),
+        );
+    }
+
+    // Resolve the target pubkey (None = clear; Some = set to this peer's
+    // local pubkey if no arg, else the parsed-and-authorized arg).
+    let target_pk: Option<eidetica::auth::crypto::PublicKey> = if clear {
+        None
+    } else if let Some(s) = pubkey {
+        let pk = match eidetica::auth::crypto::PublicKey::from_prefixed_string(s) {
+            Ok(k) => k,
+            Err(e) => {
+                return CommandOutcome::Error(format!(
+                    "Invalid pubkey '{s}' — expected ed25519:base64… ({e})"
+                ));
+            }
+        };
+        let agent_db = match ctx.server.registry().open_agent_db(&entry.db_id, None).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return CommandOutcome::Error(format!(
+                    "This peer holds no key for agent '{}'",
+                    entry.display_name
+                ));
+            }
+            Err(e) => return CommandOutcome::Error(format!("Open agent DB failed: {e}")),
+        };
+        let settings = match agent_db.database().get_settings().await {
+            Ok(s) => s,
+            Err(e) => return CommandOutcome::Error(format!("Read settings failed: {e}")),
+        };
+        let active = matches!(
+            settings.get_auth_key(&pk).await,
+            Ok(auth) if auth.status() == &eidetica::auth::types::KeyStatus::Active
+        );
+        if !active {
+            return CommandOutcome::Error(format!(
+                "Target pubkey {s} is not authorized on agent '{}' — invite it first \
+                 with /agent invite",
+                entry.display_name
+            ));
+        }
+        Some(pk)
+    } else {
+        Some(entry.pubkey.clone())
+    };
+
+    match scope {
+        RehostScope::Session => {
+            let target_str = target_pk.as_ref().map(|p| p.to_string());
+            let agent_db_id = entry.db_id.to_string();
+            let mut found = false;
+            if let Err(e) =
+                crate::session::update_meta_on_db(ctx.session_db, |m| {
+                    if let Some(a) = m.agents.iter_mut().find(|a| a.db_id == agent_db_id) {
+                        a.home_pubkey = target_str.clone();
+                        found = true;
+                    }
+                })
+                .await
+            {
+                return CommandOutcome::Error(format!("Failed to update session meta: {e}"));
+            }
+            if !found {
+                return CommandOutcome::Error(format!(
+                    "Agent '{}' is not attached to this session",
+                    entry.display_name
+                ));
+            }
+            if clear {
+                CommandOutcome::Text(format!(
+                    "Cleared session-level home_pubkey for agent '{}'. \
+                     WARNING: this re-introduces the multi-peer execution race \
+                     on this session — two co-owning peers may now both respond.",
+                    entry.display_name
+                ))
+            } else {
+                CommandOutcome::Text(format!(
+                    "Set session-level home_pubkey for agent '{}' to {}",
+                    entry.display_name,
+                    target_pk.as_ref().unwrap()
+                ))
+            }
+        }
+        RehostScope::Agent => {
+            let agent_db = match ctx.server.registry().open_agent_db(&entry.db_id, None).await {
+                Ok(Some(a)) => a,
+                Ok(None) => {
+                    return CommandOutcome::Error(format!(
+                        "This peer holds no key for agent '{}'",
+                        entry.display_name
+                    ));
+                }
+                Err(e) => return CommandOutcome::Error(format!("Open agent DB failed: {e}")),
+            };
+            let result = if let Some(pk) = target_pk.as_ref() {
+                crate::db_kind::write_agent_home_pubkey(agent_db.database(), pk).await
+            } else {
+                crate::db_kind::clear_agent_home_pubkey(agent_db.database()).await
+            };
+            if let Err(e) = result {
+                return CommandOutcome::Error(format!("Failed to update agent meta: {e}"));
+            }
+            if clear {
+                CommandOutcome::Text(format!(
+                    "Cleared agent-level home_pubkey for '{}'. WARNING: this \
+                     re-introduces the multi-peer race on Fresh schedule fires.",
+                    entry.display_name
+                ))
+            } else {
+                CommandOutcome::Text(format!(
+                    "Set agent-level home_pubkey for '{}' to {}",
+                    entry.display_name,
+                    target_pk.as_ref().unwrap()
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{Command, CommandContext, CommandOutcome, dispatch};
@@ -1386,5 +1523,246 @@ mod tests {
             }
             _ => panic!("expected Error"),
         }
+    }
+
+    // ---- /agent rehost ---------------------------------------------------
+
+    /// Set up an agent attached to the session and return its DbEntry.
+    async fn setup_attached_agent(
+        server: &std::sync::Arc<Server>,
+        registry: &crate::session::SessionRegistry,
+        sid: &str,
+        ctx: &CommandContext<'_>,
+        name: &str,
+    ) -> crate::hosted_index::DbEntry {
+        dispatch(
+            Command::AgentNew {
+                name: name.to_string(),
+                overrides: vec![],
+            },
+            ctx,
+        )
+        .await;
+        let entry = server.agent_index().find_by_name(name).unwrap();
+        registry
+            .attach_agent_to_session(sid, &entry)
+            .await
+            .unwrap();
+        entry
+    }
+
+    #[tokio::test]
+    async fn rehost_session_defaults_to_self_pubkey() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        // Pre-condition: attach defaulted home to this peer's pubkey on the agent.
+        // Rewrite it to something else so we can prove rehost-to-self changes it back.
+        let other = registry.new_ephemeral_key("other").await.unwrap();
+        crate::session::update_meta_on_db(&sdb, |m| {
+            m.agents[0].home_pubkey = Some(other.to_string());
+        })
+        .await
+        .unwrap();
+
+        match dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: None,
+                scope: super::super::RehostScope::Session,
+                clear: false,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(_) => {}
+            _ => panic!("expected Text"),
+        }
+
+        let meta = crate::session::read_meta_from_db(&sdb).await;
+        assert_eq!(
+            meta.agents[0].home_pubkey.as_deref(),
+            Some(entry.pubkey.to_string()).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn rehost_session_to_explicit_authorized_pubkey() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let _entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        let invitee = fresh_invitee_pubkey(&registry).await;
+        // Invite the target peer's key so it's authorized on the agent DB.
+        dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee.to_prefixed_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await;
+
+        match dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: Some(invitee.to_prefixed_string()),
+                scope: super::super::RehostScope::Session,
+                clear: false,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => assert!(msg.contains("Set session-level"), "got {msg}"),
+            _ => panic!("expected Text"),
+        }
+
+        let meta = crate::session::read_meta_from_db(&sdb).await;
+        assert_eq!(
+            meta.agents[0].home_pubkey.as_deref(),
+            Some(invitee.to_string()).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn rehost_refuses_unauthorized_target_pubkey() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let _entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        let stranger = fresh_invitee_pubkey(&registry).await;
+        // Note: NOT invited — stranger has no key on the agent DB.
+
+        match dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: Some(stranger.to_prefixed_string()),
+                scope: super::super::RehostScope::Session,
+                clear: false,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("not authorized"), "got {msg}")
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rehost_agent_level_writes_meta_home_pubkey() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        let invitee = fresh_invitee_pubkey(&registry).await;
+        dispatch(
+            Command::AgentInvite {
+                agent_ref: "alpha".to_string(),
+                pubkey: invitee.to_prefixed_string(),
+                permission: CoOwnerPermission::Admin,
+            },
+            &ctx,
+        )
+        .await;
+
+        match dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: Some(invitee.to_prefixed_string()),
+                scope: super::super::RehostScope::Agent,
+                clear: false,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => assert!(msg.contains("Set agent-level"), "got {msg}"),
+            _ => panic!("expected Text"),
+        }
+
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let home = crate::db_kind::read_agent_home_pubkey(agent_db.database()).await;
+        assert_eq!(home, Some(invitee));
+    }
+
+    #[tokio::test]
+    async fn rehost_clear_session_resets_home_to_none() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let _entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        // Pre-condition: attach defaulted home to self. Clear it.
+        match dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: None,
+                scope: super::super::RehostScope::Session,
+                clear: true,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => {
+                assert!(msg.contains("Cleared") && msg.contains("WARNING"), "got {msg}")
+            }
+            _ => panic!("expected Text"),
+        }
+
+        let meta = crate::session::read_meta_from_db(&sdb).await;
+        assert_eq!(meta.agents[0].home_pubkey, None);
+    }
+
+    #[tokio::test]
+    async fn rehost_clear_agent_resets_agent_meta_home_to_none() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        // Pre-condition: agent_db was created with home = creator pubkey.
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::db_kind::read_agent_home_pubkey(agent_db.database())
+            .await
+            .is_some());
+
+        match dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: None,
+                scope: super::super::RehostScope::Agent,
+                clear: true,
+            },
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(msg) => assert!(msg.contains("Cleared"), "got {msg}"),
+            _ => panic!("expected Text"),
+        }
+
+        let agent_db = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::db_kind::read_agent_home_pubkey(agent_db.database()).await,
+            None
+        );
     }
 }

@@ -47,6 +47,15 @@ pub enum CoOwnerPermission {
 /// Parse a CLI permission token (admin | write | read). Empty token =>
 /// `Admin` (the sensible default for `/agent invite`). Shared by TUI and
 /// Matrix parsers so the grammar stays in one place.
+/// Scope flag for `/agent rehost` — picks between rewriting the
+/// per-session `AgentRef.home_pubkey` (default) and the agent-level
+/// `home_pubkey` on the agent DB's meta store (`--agent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RehostScope {
+    Session,
+    Agent,
+}
+
 pub fn parse_permission_token(tok: &str) -> Option<CoOwnerPermission> {
     match tok.to_ascii_lowercase().as_str() {
         "" | "admin" | "a" => Some(CoOwnerPermission::Admin),
@@ -154,6 +163,19 @@ pub enum Command {
     AgentRevokePeer {
         agent_ref: String,
         pubkey: String,
+    },
+    /// Reassign the home peer that runs an agent. Default scope is the
+    /// current session (per-session `AgentRef.home_pubkey`); `--agent`
+    /// scope is the agent-level `home_pubkey` used for Fresh schedule
+    /// fires. `--clear` removes the field (re-introduces the multi-peer
+    /// race on the chosen scope).
+    AgentRehost {
+        agent_ref: String,
+        /// Target pubkey; if `None`, defaults to "rehost to me" (this
+        /// peer's pubkey on the agent DB).
+        pubkey: Option<String>,
+        scope: RehostScope,
+        clear: bool,
     },
 
     // --- Sharing queue (Co-owned Stage 11) ---
@@ -334,6 +356,12 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentRevokePeer { agent_ref, pubkey } => {
             agent::agent_revoke_peer(&agent_ref, &pubkey, ctx).await
         }
+        Command::AgentRehost {
+            agent_ref,
+            pubkey,
+            scope,
+            clear,
+        } => agent::agent_rehost(&agent_ref, pubkey.as_deref(), scope, clear, ctx).await,
         Command::SharingRequests => sharing::sharing_requests(ctx).await,
         Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
         Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,

@@ -452,9 +452,9 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|host|list|room|hosted|new|delete|share|import|set|invite|revoke-peer <arg>"
+            "add|remove|host|list|room|hosted|new|delete|share|import|set|invite|revoke-peer|rehost <arg>"
                 .to_string(),
-            "Attach/detach, manage host, list, create/delete/share/import/edit/invite/revoke a Living Agent",
+            "Attach/detach, manage host, list, create/delete/share/import/edit/invite/revoke/rehost a Living Agent",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -552,6 +552,30 @@ impl Gateway for MatrixGateway {
                             Some(Command::AgentRevokePeer {
                                 agent_ref: agent_ref.to_string(),
                                 pubkey: pubkey.to_string(),
+                            })
+                        }
+                    }
+                    "rehost" if !rest.is_empty() => {
+                        let mut scope = crate::commands::RehostScope::Session;
+                        let mut clear = false;
+                        let mut positional: Vec<&str> = Vec::new();
+                        for tok in rest.split_whitespace() {
+                            match tok {
+                                "--agent" => scope = crate::commands::RehostScope::Agent,
+                                "--clear" => clear = true,
+                                _ => positional.push(tok),
+                            }
+                        }
+                        let agent_ref = positional.first().copied().unwrap_or("").trim();
+                        let pubkey = positional.get(1).copied().map(str::to_string);
+                        if agent_ref.is_empty() || (clear && pubkey.is_some()) {
+                            None
+                        } else {
+                            Some(Command::AgentRehost {
+                                agent_ref: agent_ref.to_string(),
+                                pubkey,
+                                scope,
+                                clear,
                             })
                         }
                     }

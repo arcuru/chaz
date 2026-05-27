@@ -2,7 +2,7 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
-use crate::commands::{Command, ExtensionsAction, parse_permission_token};
+use crate::commands::{Command, ExtensionsAction, RehostScope, parse_permission_token};
 use crate::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -60,6 +60,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
             "preseed another peer's pubkey (admin|write|read)",
         ),
         ("/agent revoke-peer ", "revoke a co-owner's access"),
+        (
+            "/agent rehost ",
+            "reassign home peer [--agent] [--clear] <ref> [pubkey]",
+        ),
         ("/pubkey", "show this peer's default pubkey"),
         ("# Memory banks", ""),
         ("/memory list", "list memory banks this peer hosts"),
@@ -709,6 +713,43 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         return Some(ChatAction::Dispatch(Command::AgentRevokePeer {
             agent_ref: agent_ref.to_string(),
             pubkey: pubkey.to_string(),
+        }));
+    }
+    if let Some(arg) = text.strip_prefix("/agent rehost ") {
+        let trimmed = arg.trim();
+        // Tokens (in any order, before the positional args): --agent, --clear.
+        // Then: <ref> [pubkey]
+        let mut scope = RehostScope::Session;
+        let mut clear = false;
+        let mut positional: Vec<&str> = Vec::new();
+        for tok in trimmed.split_whitespace() {
+            match tok {
+                "--agent" => scope = RehostScope::Agent,
+                "--clear" => clear = true,
+                _ => positional.push(tok),
+            }
+        }
+        let agent_ref = positional.first().copied().unwrap_or("").trim();
+        let pubkey = positional.get(1).copied().map(str::to_string);
+        if agent_ref.is_empty() {
+            show_error(
+                app,
+                "Usage: /agent rehost [--agent] [--clear] <ref> [pubkey]".to_string(),
+            );
+            return None;
+        }
+        if clear && pubkey.is_some() {
+            show_error(
+                app,
+                "/agent rehost: --clear cannot be combined with an explicit pubkey".to_string(),
+            );
+            return None;
+        }
+        return Some(ChatAction::Dispatch(Command::AgentRehost {
+            agent_ref: agent_ref.to_string(),
+            pubkey,
+            scope,
+            clear,
         }));
     }
     if let Some(arg) = text.strip_prefix("/agent set ") {
