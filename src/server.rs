@@ -36,6 +36,38 @@ use tracing::{debug, error, info};
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
 
+/// Pure decider for the per-session home-peer gate. Given a session's
+/// `AgentRef` list, the target agent's DB id, and this peer's pubkey on
+/// that agent DB, decide whether this peer should run the agent.
+///
+/// Returns true (this peer runs) when:
+/// - No `AgentRef` matches `agent_db_id` (defensive — the agent isn't
+///   on the session, no claim to make; let the caller decide).
+/// - The matching `AgentRef.home_pubkey` is `None` (legacy: any
+///   keyholder runs).
+/// - The matching `home_pubkey` fails to parse as a `PublicKey`
+///   (defensive: a corrupt value falls back to legacy behavior rather
+///   than silencing the agent).
+/// - The parsed `home_pubkey` equals `my_pubkey_on_agent`.
+///
+/// Split out as a free function so it can be tested without a `Server`.
+pub(crate) fn is_home_for_agent_ref(
+    agents: &[crate::session::AgentRef],
+    agent_db_id: &str,
+    my_pubkey_on_agent: &eidetica::auth::crypto::PublicKey,
+) -> bool {
+    let Some(agent_ref) = agents.iter().find(|a| a.db_id == agent_db_id) else {
+        return true;
+    };
+    let Some(home_str) = agent_ref.home_pubkey.as_deref() else {
+        return true;
+    };
+    match eidetica::auth::crypto::PublicKey::from_prefixed_string(home_str) {
+        Ok(home_pk) => &home_pk == my_pubkey_on_agent,
+        Err(_) => true,
+    }
+}
+
 /// Per-session runtime state needed for agent processing.
 /// Keyed by `session_db_id` in `Server::sessions`.
 struct SessionRuntime {
@@ -171,6 +203,35 @@ impl Server {
 
     pub fn agent_index(&self) -> &HostedIndex {
         &self.agent_index
+    }
+
+    /// Decide whether this peer is the home for running `agent_name` in
+    /// `session_db_id`. The home-peer gate that prevents two peers from
+    /// both running the ReAct loop on the same human message when they
+    /// both hold a key on a co-owned agent.
+    ///
+    /// Returns true (i.e. "go ahead and run") when:
+    /// - The agent isn't locally hosted (defensive — nothing to gate; the
+    ///   resolver wouldn't have picked us anyway).
+    /// - The session can't be opened (defensive — don't silence on
+    ///   transient I/O).
+    /// - The session's `AgentRef.home_pubkey` for this agent is unset
+    ///   (legacy: any keyholder runs — sessions created before this
+    ///   feature stay on today's behavior until `/agent rehost` writes
+    ///   a value).
+    /// - The matching `home_pubkey` equals this peer's pubkey on the
+    ///   agent DB (`DbEntry.pubkey`).
+    ///
+    /// Otherwise returns false — another peer is the home, skip the turn.
+    pub async fn peer_is_home_for(&self, session_db_id: &str, agent_name: &str) -> bool {
+        let Some(entry) = self.agent_index.find_by_name(agent_name) else {
+            return true;
+        };
+        let Ok((_conv, session_db)) = self.registry.open_session(session_db_id).await else {
+            return true;
+        };
+        let meta = crate::session::read_meta_from_db(&session_db).await;
+        is_home_for_agent_ref(&meta.agents, &entry.db_id.to_string(), &entry.pubkey)
     }
 
     /// Override the agent→agent burst budget. Called once at startup
@@ -1948,5 +2009,119 @@ mod tests {
         assert_eq!(fires[0].schedule_id, "f1");
         // Usage metadata will be None since the LLM call failed.
         assert!(fires[0].usage.is_none());
+    }
+
+    // ---- Home-peer gate ---------------------------------------------------
+
+    fn make_agent_ref(db_id: &str, home: Option<&str>) -> crate::session::AgentRef {
+        crate::session::AgentRef {
+            db_id: db_id.to_string(),
+            display_name: "x".to_string(),
+            home_pubkey: home.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn is_home_returns_true_when_no_agent_ref_matches() {
+        let (_inst, _server, registry) = server_fixture().await;
+        let pk = registry.new_ephemeral_key("t").await.unwrap();
+        let agents = vec![make_agent_ref("sha256:other", Some(&pk.to_string()))];
+        assert!(is_home_for_agent_ref(&agents, "sha256:missing", &pk));
+    }
+
+    #[tokio::test]
+    async fn is_home_returns_true_when_home_pubkey_unset_legacy() {
+        let (_inst, _server, registry) = server_fixture().await;
+        let pk = registry.new_ephemeral_key("t").await.unwrap();
+        let agents = vec![make_agent_ref("sha256:agent", None)];
+        assert!(is_home_for_agent_ref(&agents, "sha256:agent", &pk));
+    }
+
+    #[tokio::test]
+    async fn is_home_returns_true_when_home_pubkey_matches_self() {
+        let (_inst, _server, registry) = server_fixture().await;
+        let pk = registry.new_ephemeral_key("t").await.unwrap();
+        let agents = vec![make_agent_ref("sha256:agent", Some(&pk.to_string()))];
+        assert!(is_home_for_agent_ref(&agents, "sha256:agent", &pk));
+    }
+
+    #[tokio::test]
+    async fn is_home_returns_false_when_home_pubkey_is_another_peer() {
+        let (_inst, _server, registry) = server_fixture().await;
+        let me = registry.new_ephemeral_key("me").await.unwrap();
+        let other = registry.new_ephemeral_key("other").await.unwrap();
+        let agents = vec![make_agent_ref("sha256:agent", Some(&other.to_string()))];
+        assert!(!is_home_for_agent_ref(&agents, "sha256:agent", &me));
+    }
+
+    #[tokio::test]
+    async fn is_home_returns_true_on_corrupt_home_pubkey() {
+        // Defensive: corrupt value yields legacy "any keyholder runs" rather
+        // than silencing the agent permanently.
+        let (_inst, _server, registry) = server_fixture().await;
+        let pk = registry.new_ephemeral_key("t").await.unwrap();
+        let agents = vec![make_agent_ref("sha256:agent", Some("not-a-pubkey"))];
+        assert!(is_home_for_agent_ref(&agents, "sha256:agent", &pk));
+    }
+
+    #[tokio::test]
+    async fn peer_is_home_for_returns_true_when_agent_not_in_index() {
+        let (_inst, server, _registry) = server_fixture().await;
+        // No agent registered. Any session/agent name should pass (the
+        // resolver wouldn't have picked us either way).
+        assert!(server.peer_is_home_for("sha256:any", "ghost").await);
+    }
+
+    #[tokio::test]
+    async fn peer_is_home_for_returns_true_on_legacy_none_session() {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        // Insert an AgentRef with explicit None home (mimics a session that
+        // predates this feature, or one created without using attach).
+        crate::session::update_meta_on_db(&session_db, |m| {
+            m.agents.push(crate::session::AgentRef {
+                db_id: entry.db_id.to_string(),
+                display_name: "alpha".to_string(),
+                home_pubkey: None,
+            });
+        })
+        .await
+        .unwrap();
+        assert!(server.peer_is_home_for(&sid, "alpha").await);
+    }
+
+    #[tokio::test]
+    async fn peer_is_home_for_returns_true_when_home_matches_self() {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        // attach_agent_to_session defaults home_pubkey to the attacher's key.
+        registry
+            .attach_agent_to_session(&sid, &entry)
+            .await
+            .unwrap();
+        assert!(server.peer_is_home_for(&sid, "alpha").await);
+    }
+
+    #[tokio::test]
+    async fn peer_is_home_for_returns_false_when_home_is_another_peer() {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        let other = registry.new_ephemeral_key("other-peer").await.unwrap();
+        let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+        let sid = session_db.root_id().to_string();
+        crate::session::update_meta_on_db(&session_db, |m| {
+            m.agents.push(crate::session::AgentRef {
+                db_id: entry.db_id.to_string(),
+                display_name: "alpha".to_string(),
+                home_pubkey: Some(other.to_string()),
+            });
+        })
+        .await
+        .unwrap();
+        assert!(!server.peer_is_home_for(&sid, "alpha").await);
     }
 }
