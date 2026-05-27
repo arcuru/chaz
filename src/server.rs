@@ -36,6 +36,11 @@ use tracing::{debug, error, info};
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
 
+/// Consecutive home-peer skip count that triggers the operator WARN with
+/// the recovery command. Keeps short outages quiet but surfaces sessions
+/// that have been silent for a sustained period.
+const HOME_SKIP_WARN_THRESHOLD: u32 = 3;
+
 /// Pure decider for the per-session home-peer gate. Given a session's
 /// `AgentRef` list, the target agent's DB id, and this peer's pubkey on
 /// that agent DB, decide whether this peer should run the agent.
@@ -133,6 +138,13 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Home-peer gate skip counter keyed by `(session_db_id, agent_name)`.
+    /// In-memory, peer-local. Incremented on every wake that the gate
+    /// suppresses; cleared when a turn actually runs (home == self) or on
+    /// `/agent rehost`. A WARN with the recovery command is emitted when
+    /// the count crosses [`HOME_SKIP_WARN_THRESHOLD`] so silent sessions
+    /// surface in logs instead of staying invisible.
+    skip_counters: Arc<Mutex<HashMap<(String, String), u32>>>,
     /// Per-session active-extension set, folded from each session's
     /// `extensions` event log and cached in memory. Refreshed at
     /// `register_session` and on `/extensions add|remove`.
@@ -183,6 +195,7 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
@@ -232,6 +245,45 @@ impl Server {
         };
         let meta = crate::session::read_meta_from_db(&session_db).await;
         is_home_for_agent_ref(&meta.agents, &entry.db_id.to_string(), &entry.pubkey)
+    }
+
+    /// Increment the in-memory skip counter for `(session, agent)` and
+    /// emit an operator WARN once the count crosses
+    /// [`HOME_SKIP_WARN_THRESHOLD`]. Called from the gate skip paths.
+    pub(crate) async fn record_home_skip(&self, session_db_id: &str, agent_name: &str) {
+        let mut counters = self.skip_counters.lock().await;
+        let key = (session_db_id.to_string(), agent_name.to_string());
+        let count = counters.entry(key).or_insert(0);
+        *count += 1;
+        if *count == HOME_SKIP_WARN_THRESHOLD {
+            tracing::warn!(
+                session_db_id,
+                agent = %agent_name,
+                skipped_wakes = *count,
+                "Home peer has missed {} consecutive wakes for this session/agent. \
+                 If this is a stuck home, run `/agent rehost {agent_name}` from a \
+                 surviving peer to take over.",
+                *count
+            );
+        }
+    }
+
+    /// Reset the skip counter for `(session, agent)`. Called when a turn
+    /// actually runs and when `/agent rehost` rewrites the home pubkey.
+    pub(crate) async fn reset_home_skip(&self, session_db_id: &str, agent_name: &str) {
+        let mut counters = self.skip_counters.lock().await;
+        counters.remove(&(session_db_id.to_string(), agent_name.to_string()));
+    }
+
+    /// Test-only: read the current skip count for a `(session, agent)`
+    /// pair. `0` if no entry exists.
+    #[cfg(test)]
+    pub(crate) async fn home_skip_count(&self, session_db_id: &str, agent_name: &str) -> u32 {
+        let counters = self.skip_counters.lock().await;
+        counters
+            .get(&(session_db_id.to_string(), agent_name.to_string()))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Override the agent→agent burst budget. Called once at startup
@@ -685,6 +737,7 @@ impl Server {
                         schedule = %payload.schedule_id,
                         "Not home peer for pinned schedule's session; skipping"
                     );
+                    self.record_home_skip(&sid, &agent_name).await;
                     return Ok(());
                 }
 
@@ -1332,8 +1385,10 @@ impl Server {
                 "Not home peer for this session/agent; skipping turn"
             );
             self.processing.lock().await.remove(session_db_id);
+            self.record_home_skip(session_db_id, &agent.name).await;
             return Ok(());
         }
+        self.reset_home_skip(session_db_id, &agent.name).await;
 
         self.spawn_agent_task(
             session_db_id.to_string(),

@@ -64,6 +64,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
             "/agent rehost ",
             "reassign home peer [--agent] [--clear] <ref> [pubkey]",
         ),
+        ("/agent home-status", "list home_pubkey per agent + session"),
         ("/pubkey", "show this peer's default pubkey"),
         ("# Memory banks", ""),
         ("/memory list", "list memory banks this peer hosts"),
@@ -714,6 +715,15 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             agent_ref: agent_ref.to_string(),
             pubkey: pubkey.to_string(),
         }));
+    }
+    if let Some(arg) = text.strip_prefix("/agent home-status") {
+        let trimmed = arg.trim();
+        let agent_ref = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        return Some(ChatAction::Dispatch(Command::AgentHomeStatus(agent_ref)));
     }
     if let Some(arg) = text.strip_prefix("/agent rehost ") {
         let trimmed = arg.trim();

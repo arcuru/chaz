@@ -783,6 +783,11 @@ pub(super) async fn agent_rehost(
                     entry.display_name
                 ));
             }
+            // Reset the home-skip counter so a recently-stuck session that
+            // just got rehosted doesn't WARN again on its next legit skip.
+            ctx.server
+                .reset_home_skip(ctx.session_db_id, &entry.display_name)
+                .await;
             if clear {
                 CommandOutcome::Text(format!(
                     "Cleared session-level home_pubkey for agent '{}'. \
@@ -832,6 +837,99 @@ pub(super) async fn agent_rehost(
             }
         }
     }
+}
+
+/// `/agent home-status [ref]` — print agent-level and per-session
+/// `home_pubkey` for one or all locally-hosted agents. Pubkeys that
+/// match this peer's local key on the agent are tagged `← (me)`.
+pub(super) async fn agent_home_status(
+    agent_ref: Option<&str>,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    use std::fmt::Write as _;
+
+    let agents: Vec<crate::hosted_index::DbEntry> = match agent_ref {
+        Some(r) => match resolve_agent_ref(r, ctx).await {
+            Ok(e) => vec![e],
+            Err(msg) => return CommandOutcome::Error(msg),
+        },
+        None => ctx.server.agent_index().list(),
+    };
+    if agents.is_empty() {
+        return CommandOutcome::Text("No locally-hosted agents.".to_string());
+    }
+
+    let sessions = match ctx.server.registry().list_sessions().await {
+        Ok(v) => v,
+        Err(e) => return CommandOutcome::Error(format!("Failed to list sessions: {e}")),
+    };
+
+    let mut out = String::new();
+    for entry in &agents {
+        let my_pk_str = entry.pubkey.to_string();
+        let _ = writeln!(
+            out,
+            "agent: {} (db_id: {})",
+            entry.display_name, entry.db_id
+        );
+
+        // Agent-level home_pubkey (Fresh-fire owner).
+        let agent_level = match ctx
+            .server
+            .registry()
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+        {
+            Ok(Some(adb)) => crate::db_kind::read_agent_home_pubkey(adb.database()).await,
+            _ => None,
+        };
+        match agent_level {
+            Some(pk) if pk.to_string() == my_pk_str => {
+                let _ = writeln!(out, "  agent-level home: {pk} ← (me)");
+            }
+            Some(pk) => {
+                let _ = writeln!(out, "  agent-level home: {pk}");
+            }
+            None => {
+                let _ = writeln!(out, "  agent-level home: <unset — legacy, any keyholder>");
+            }
+        }
+
+        // Per-session homes.
+        let mut session_rows: Vec<String> = Vec::new();
+        for s in &sessions {
+            let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await
+            else {
+                continue;
+            };
+            let meta = crate::session::read_meta_from_db(&db).await;
+            let Some(ar) = meta
+                .agents
+                .iter()
+                .find(|a| a.db_id == entry.db_id.to_string())
+            else {
+                continue;
+            };
+            let label = meta.name.as_deref().unwrap_or("");
+            let row = match ar.home_pubkey.as_deref() {
+                Some(home) if home == my_pk_str => {
+                    format!("    {} {label:<30} {home} ← (me)", &s.session_db_id)
+                }
+                Some(home) => format!("    {} {label:<30} {home}", &s.session_db_id),
+                None => format!(
+                    "    {} {label:<30} <unset — legacy, any keyholder>",
+                    &s.session_db_id
+                ),
+            };
+            session_rows.push(row);
+        }
+        let _ = writeln!(out, "  sessions ({}):", session_rows.len());
+        for row in session_rows {
+            out.push_str(&row);
+            out.push('\n');
+        }
+    }
+    CommandOutcome::Text(out.trim_end().to_string())
 }
 
 #[cfg(test)]
@@ -1764,5 +1862,112 @@ mod tests {
             crate::db_kind::read_agent_home_pubkey(agent_db.database()).await,
             None
         );
+    }
+
+    // ---- /agent home-status ---------------------------------------------
+
+    #[tokio::test]
+    async fn home_status_lists_all_locally_hosted_agents() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+        setup_attached_agent(&server, &registry, &sid, &ctx, "beta").await;
+
+        match dispatch(Command::AgentHomeStatus(None), &ctx).await {
+            CommandOutcome::Text(out) => {
+                assert!(out.contains("agent: alpha"), "missing alpha: {out}");
+                assert!(out.contains("agent: beta"), "missing beta: {out}");
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn home_status_marks_self_with_me_tag() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        match dispatch(
+            Command::AgentHomeStatus(Some("alpha".to_string())),
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(out) => {
+                assert!(out.contains("← (me)"), "expected ← (me) tag: {out}");
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn home_status_handles_unset_session_home() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let _entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        // Clear the auto-set per-session home so it shows as legacy.
+        crate::session::update_meta_on_db(&sdb, |m| {
+            m.agents[0].home_pubkey = None;
+        })
+        .await
+        .unwrap();
+
+        match dispatch(
+            Command::AgentHomeStatus(Some("alpha".to_string())),
+            &ctx,
+        )
+        .await
+        {
+            CommandOutcome::Text(out) => {
+                assert!(out.contains("<unset"), "expected <unset> marker: {out}");
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    // ---- skip-counter WARN -----------------------------------------------
+
+    #[tokio::test]
+    async fn home_skip_counter_increments_on_record() {
+        let (_i, server, _registry, _secrets, _backend, sid, _sdb) = fixture().await;
+        assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
+        server.record_home_skip(&sid, "alpha").await;
+        server.record_home_skip(&sid, "alpha").await;
+        assert_eq!(server.home_skip_count(&sid, "alpha").await, 2);
+    }
+
+    #[tokio::test]
+    async fn home_skip_counter_resets_on_run() {
+        let (_i, server, _registry, _secrets, _backend, sid, _sdb) = fixture().await;
+        server.record_home_skip(&sid, "alpha").await;
+        server.record_home_skip(&sid, "alpha").await;
+        server.reset_home_skip(&sid, "alpha").await;
+        assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
+    }
+
+    #[tokio::test]
+    async fn home_skip_counter_resets_on_rehost() {
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        let _entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+        server.record_home_skip(&sid, "alpha").await;
+        server.record_home_skip(&sid, "alpha").await;
+        assert_eq!(server.home_skip_count(&sid, "alpha").await, 2);
+
+        dispatch(
+            Command::AgentRehost {
+                agent_ref: "alpha".to_string(),
+                pubkey: None,
+                scope: super::super::RehostScope::Session,
+                clear: false,
+            },
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
     }
 }

@@ -452,9 +452,9 @@ impl Gateway for MatrixGateway {
         );
         register_shared!(
             "agent",
-            "add|remove|host|list|room|hosted|new|delete|share|import|set|invite|revoke-peer|rehost <arg>"
+            "add|remove|host|list|room|hosted|new|delete|share|import|set|invite|revoke-peer|rehost|home-status <arg>"
                 .to_string(),
-            "Attach/detach, manage host, list, create/delete/share/import/edit/invite/revoke/rehost a Living Agent",
+            "Attach/detach, manage host, list, create/delete/share/import/edit/invite/revoke/rehost/home-status a Living Agent",
             |text| {
                 let arg = matrix_args(&text);
                 let mut parts = arg.trim().splitn(2, char::is_whitespace);
@@ -555,6 +555,11 @@ impl Gateway for MatrixGateway {
                             })
                         }
                     }
+                    "home-status" => Some(Command::AgentHomeStatus(if rest.is_empty() {
+                        None
+                    } else {
+                        Some(rest.to_string())
+                    })),
                     "rehost" if !rest.is_empty() => {
                         let mut scope = crate::commands::RehostScope::Session;
                         let mut clear = false;

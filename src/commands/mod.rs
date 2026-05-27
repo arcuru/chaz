@@ -177,6 +177,11 @@ pub enum Command {
         scope: RehostScope,
         clear: bool,
     },
+    /// Show the home-peer state for hosted agents — agent-level
+    /// `home_pubkey` plus the per-session `home_pubkey` for each session
+    /// the agent is attached to. With `None`, walks every locally-hosted
+    /// agent.
+    AgentHomeStatus(Option<String>),
 
     // --- Sharing queue (Co-owned Stage 11) ---
     /// List bootstrap requests on this peer's `_sync` DB that are still
@@ -362,6 +367,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             scope,
             clear,
         } => agent::agent_rehost(&agent_ref, pubkey.as_deref(), scope, clear, ctx).await,
+        Command::AgentHomeStatus(r) => agent::agent_home_status(r.as_deref(), ctx).await,
         Command::SharingRequests => sharing::sharing_requests(ctx).await,
         Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
         Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
