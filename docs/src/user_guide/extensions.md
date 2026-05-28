@@ -9,6 +9,32 @@ Individual agents can also opt out of an extension just for themselves
 
 The `/extensions` command controls activation and settings.
 
+## Built-in extension catalog
+
+These ship in the chaz binary today. The "Provides" column lists the
+[hook kinds](../architecture/extensions.md#hook-kinds) the extension
+declares — `Tool` and `Command` are the surfaces a user notices; the
+others are runtime hooks that fire around each agent turn.
+
+| Extension           | Provides            | What it gives you                                                                                                                                    |
+| ------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `core`              | Tool                | `shell`, `compact`, `spawn_agent`, `spawn_task`. The always-available baseline; disabling it is a footgun.                                           |
+| `system`            | Tool                | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
+| `fs`                | Tool                | `read_file`, `write_file`, `edit_file`.                                                                                                              |
+| `web`               | Tool                | `web_fetch`, `web_search`.                                                                                                                           |
+| `memory`            | Command, Tool       | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
+| `skills`            | Command, Tool       | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
+| `schedule`          | Command, Tool       | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |
+| `agent_schedule`    | _(routine handler)_ | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
+| `mcp-<server>`      | Tool                | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
+| `path_normalizer`   | ToolCall            | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
+| `security_warnings` | ToolResult          | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
+
+Disabling an extension hides its tools from the LLM, stops its hooks
+from firing, and disarms its slash commands. The `core` and `system`
+extensions are practical floors — chaz still runs without them, but
+agents lose `shell`, `spawn_agent`, `get_time`, etc.
+
 ## Listing extensions
 
 ```
@@ -29,6 +55,8 @@ Extensions on this peer (✓ = live for agent 'chaz' this session; ✗ = disable
   ✓ web [0.3.0] — Tool
   ✓ memory [0.3.0] — Command, Tool
   ✓ skills [0.3.0] — Command, Tool
+  ✓ agent_schedule [0.3.0] — —
+  ✓ mcp-filesystem [0.3.0] — Tool
   ✗ schedule [0.3.0] — Command, Tool  (session: on, agent: off)
 ```
 
@@ -166,6 +194,44 @@ that the session had been using, the activation event for that
 extension stays in the log but does nothing — chaz can't load code
 it doesn't have. Re-opening the session on a peer that has the
 extension reactivates it from the existing log.
+
+## Walkthrough: disable scheduling for one agent in a shared room
+
+Scenario: three agents (`chaz`, `nova`, `archivist`) share one Matrix room. You want `nova` to stop being able to schedule itself — but `chaz` and `archivist` should keep their schedulers.
+
+1. From the TUI or Matrix room, while `nova` is the responding agent, scope the change to the agent:
+
+   ```
+   /extensions remove schedule agent
+   ```
+
+   This writes a `Deactivated` event to `nova`'s Living Agent DB. The session's active set is untouched.
+
+2. Verify with `/extensions`. While `nova` is responding you'll see:
+
+   ```
+   ✗ schedule [0.3.0] — Command, Tool  (session: on, agent: off)
+   ```
+
+   Switch the responding agent to `chaz` (`@chaz: …` in the room) and run `/extensions` again — `schedule` is `✓` for `chaz`. The opt-out only narrows `nova`.
+
+3. Confirm `nova` can't use the surface. Have `nova` try:
+
+   ```
+   @nova: schedule a daily summary for 9am
+   ```
+
+   The `schedule_*` tools aren't in `nova`'s tool list any more. If `nova` (or you, while `nova` is responding) tries `/schedule list`, the dispatcher returns:
+
+   ```
+   /schedule is provided by the 'schedule' extension, which is not active on this session. Use `/extensions add schedule` to enable it.
+   ```
+
+   (The slash-command check fires on the session set; for an agent-only opt-out the slash command still works for other agents in the same session — only the tools disappear for `nova`'s turns.)
+
+4. **Recovery**: to undo the opt-out, run `/extensions add schedule agent` while `nova` is responding. The agent's DB records an `Activated` event that clears the opt-out; the next `nova` turn picks it up.
+
+5. **Cross-peer note**: agent opt-outs travel with the agent DB through eidetica sync. If `nova` is co-owned with another peer, that peer also stops surfacing `schedule` for `nova` once the event has synced — no need to repeat the command there.
 
 ## Matrix syntax
 
