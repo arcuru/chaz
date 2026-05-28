@@ -99,3 +99,17 @@ nix develop .# -c cargo run -- --config ~/code/chaz-test/config.yaml --tui
 - Adding a tool: see `docs/src/user_guide/tools.md` and `docs/src/architecture/tools.md`.
 - Adding an MCP server: config-only, no code. See `docs/src/user_guide/mcp.md`.
 - Commit author: "Patrick Jackson <patrick@jackson.dev>"; add `Co-Authored-By` trailer for the AI tool used.
+
+## User-facing feature docs checklist
+
+Every new user-facing feature lands with three docs pieces — not one or two, three. Reference *and* example *and* model. The feature isn't done without them; surfacing complex moving parts is a top-level project goal.
+
+1. **Reference** (`docs/src/user_guide/<area>.md`) — terse command table or settings list. What each knob does in one line. Existing tables under "Lifecycle, sharing, and co-ownership" in `agents.md` are the shape.
+2. **Conceptual section** (`docs/src/user_guide/<area>.md`) — a `##` section that explains *the model* the user has to hold in their head: why it exists, what's automatic vs. what they touch, where the state lives, the failure modes. One per feature, headed memorably so cross-links work.
+3. **Walkthrough** (usually `docs/src/user_guide/session_sharing.md` or the area's own guide) — a numbered scenario that exercises the happy path AND at least one failure/recovery path with verbatim sample output. The example is what makes the feature discoverable to someone scanning for "can chaz do X?"
+
+Architecture-level notes go in `docs/src/architecture/<area>.md` (the mental model for someone reading the code); design rationale and alternatives-considered go in `docs/src/design/<feature>.md`. Those are separate from the user-guide triad above.
+
+Worked example: home-peer execution ownership ships as the `Execution ownership (home peer)` section in `agents.md` (reference + conceptual), the `Co-owning an Agent Across Two Peers` walkthrough in `session_sharing.md`, and the `Home Peer (Per-Session, with Agent-Level Fresh-Timer Default)` section in `architecture/sessions.md`.
+
+Verify with `just doc build` before commit — mdbook warns on broken cross-links and unclosed tags.
