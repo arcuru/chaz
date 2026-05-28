@@ -182,14 +182,20 @@ mod tests {
     fn write_file_default_policy_is_medium_and_requires_approval_unless_auto() {
         let p = WriteFile.default_policy();
         assert!(matches!(p.risk, RiskLevel::Medium));
-        assert!(matches!(p.approval, ApprovalRequirement::UnlessAutoApproved));
+        assert!(matches!(
+            p.approval,
+            ApprovalRequirement::UnlessAutoApproved
+        ));
     }
 
     #[tokio::test]
     async fn read_file_missing_path_errors_without_host_call() {
         let host = Arc::new(MockHost::new());
         let (_i, c) = ctx_with(host.clone()).await;
-        let err = ReadFile.execute(serde_json::json!({}), &c).await.unwrap_err();
+        let err = ReadFile
+            .execute(serde_json::json!({}), &c)
+            .await
+            .unwrap_err();
         assert!(format!("{err}").to_lowercase().contains("path"));
         assert!(host.recorded_calls().is_empty());
     }
@@ -220,7 +226,11 @@ mod tests {
             .execute(serde_json::json!({ "path": "/big" }), &c)
             .await
             .unwrap();
-        assert!(out.ends_with("[truncated]"), "got tail: {}", &out[out.len() - 20..]);
+        assert!(
+            out.ends_with("[truncated]"),
+            "got tail: {}",
+            &out[out.len() - 20..]
+        );
     }
 
     #[tokio::test]

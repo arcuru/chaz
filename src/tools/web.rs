@@ -139,7 +139,10 @@ mod tests {
     fn default_policy_is_medium_unless_auto_approved() {
         let p = WebFetch.default_policy();
         assert!(matches!(p.risk, RiskLevel::Medium));
-        assert!(matches!(p.approval, ApprovalRequirement::UnlessAutoApproved));
+        assert!(matches!(
+            p.approval,
+            ApprovalRequirement::UnlessAutoApproved
+        ));
     }
 
     #[tokio::test]
@@ -185,7 +188,9 @@ mod tests {
             .await
             .unwrap();
         match host.last_call().unwrap() {
-            Capability::HttpRequest { method, body, url, .. } => {
+            Capability::HttpRequest {
+                method, body, url, ..
+            } => {
                 assert_eq!(method, "POST");
                 assert_eq!(url, "https://x");
                 assert_eq!(body.as_deref(), Some("{}"));
@@ -216,7 +221,11 @@ mod tests {
             .execute(serde_json::json!({ "url": "https://big" }), &c)
             .await
             .unwrap();
-        assert!(out.ends_with("[truncated]"), "got tail: {}", &out[out.len() - 20..]);
+        assert!(
+            out.ends_with("[truncated]"),
+            "got tail: {}",
+            &out[out.len() - 20..]
+        );
     }
 
     #[tokio::test]
@@ -228,6 +237,10 @@ mod tests {
             .execute(serde_json::json!({ "url": "https://nope" }), &c)
             .await
             .unwrap_err();
-        assert!(format!("{err}").to_lowercase().contains("connection refused"));
+        assert!(
+            format!("{err}")
+                .to_lowercase()
+                .contains("connection refused")
+        );
     }
 }

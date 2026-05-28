@@ -470,10 +470,7 @@ mod tests {
             let host = Arc::new(ScriptedHost::new());
             let (_i, c) = ctx_with(host).await;
             let err = EditFile
-                .execute(
-                    serde_json::json!({ "path": "/x", "old_text": "foo" }),
-                    &c,
-                )
+                .execute(serde_json::json!({ "path": "/x", "old_text": "foo" }), &c)
                 .await
                 .unwrap_err();
             assert!(format!("{err}").to_lowercase().contains("new_text"));
@@ -484,10 +481,7 @@ mod tests {
             let host = Arc::new(ScriptedHost::new());
             let (_i, c) = ctx_with(host).await;
             let err = EditFile
-                .execute(
-                    serde_json::json!({ "path": "/x", "edits": [] }),
-                    &c,
-                )
+                .execute(serde_json::json!({ "path": "/x", "edits": [] }), &c)
                 .await
                 .unwrap_err();
             assert!(format!("{err}").to_lowercase().contains("no edits"));

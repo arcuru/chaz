@@ -103,6 +103,13 @@ impl MockBackend {
         self.state.lock().unwrap().script.push_back(Err(err));
     }
 
+    /// Queue an arbitrary response. Use when the `push_text` /
+    /// `push_tool_calls` convenience constructors don't expose enough
+    /// control over the response (e.g., to set custom `ResponseMetadata`).
+    pub fn push_response(&self, response: Result<LLMResponse, LlmError>) {
+        self.state.lock().unwrap().script.push_back(response);
+    }
+
     /// Snapshot of all calls recorded so far.
     pub fn recorded_calls(&self) -> Vec<RecordedCall> {
         self.state.lock().unwrap().calls.clone()

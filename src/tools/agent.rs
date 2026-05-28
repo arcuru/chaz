@@ -272,7 +272,10 @@ mod tests {
         let tool = agent_tool().await;
         let p = tool.default_policy();
         assert!(matches!(p.risk, RiskLevel::Medium));
-        assert!(matches!(p.approval, ApprovalRequirement::UnlessAutoApproved));
+        assert!(matches!(
+            p.approval,
+            ApprovalRequirement::UnlessAutoApproved
+        ));
         assert_eq!(p.timeout, 300);
     }
 
@@ -310,6 +313,9 @@ mod tests {
         // Server check fires before depth check in current implementation —
         // either is a valid pre-execution failure mode.
         let msg = format!("{err}").to_lowercase();
-        assert!(msg.contains("server") || msg.contains("depth"), "got: {msg}");
+        assert!(
+            msg.contains("server") || msg.contains("depth"),
+            "got: {msg}"
+        );
     }
 }

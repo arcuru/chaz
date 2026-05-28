@@ -260,7 +260,10 @@ mod tests {
         let tool = task_tool().await;
         let p = tool.default_policy();
         assert!(matches!(p.risk, RiskLevel::Medium));
-        assert!(matches!(p.approval, ApprovalRequirement::UnlessAutoApproved));
+        assert!(matches!(
+            p.approval,
+            ApprovalRequirement::UnlessAutoApproved
+        ));
         assert_eq!(p.timeout, 300, "spawn_task gets a 5-minute timeout");
     }
 
