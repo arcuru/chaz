@@ -1,6 +1,9 @@
 /// Manage all the backends for chaz.
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::{
@@ -59,10 +62,31 @@ pub trait LLMBackend {
     }
 }
 
+/// Dyn-compatible dispatch trait used by `BackendManager::with_mock` to route
+/// LLM calls through an arbitrary implementation. `LLMBackend` itself is not
+/// dyn-compatible (native `async fn` in trait), so the integration-test mock
+/// implements this narrower interface — which is exactly what `BackendManager`
+/// needs for its ReAct-loop call sites.
+pub trait BackendDispatch: Send + Sync {
+    fn supports_tools(&self) -> bool;
+    fn chat_with_tools<'a>(
+        &'a self,
+        messages: &'a [RuntimeMessage],
+        tools: &'a [ToolDefinition],
+        model: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>>;
+}
+
 #[derive(Clone)]
 pub struct BackendManager {
     backends: Vec<Backend>,
     secrets: SecretStore,
+    /// Optional override used by integration tests to bypass the OpenAI dispatch
+    /// path. When set, `chat_with_tools_for_model` and `supports_tools_for_model`
+    /// route through this trait object instead of constructing an `OpenAI` from
+    /// the backend config. Production code never sets this; constructed only
+    /// via `BackendManager::with_mock`.
+    mock: Option<Arc<dyn BackendDispatch>>,
 }
 
 /// A generic Message
@@ -120,6 +144,19 @@ impl BackendManager {
         Self {
             backends: backends.as_ref().cloned().unwrap_or_default(),
             secrets,
+            mock: None,
+        }
+    }
+
+    /// Construct a BackendManager that dispatches all LLM calls to `mock`.
+    /// Bypasses the OpenAI construction path; used by integration tests to
+    /// drive the runtime without a real LLM. The `secrets` argument is held
+    /// for type compatibility but unused on the mock path.
+    pub fn with_mock(mock: Arc<dyn BackendDispatch>, secrets: SecretStore) -> Self {
+        Self {
+            backends: Vec::new(),
+            secrets,
+            mock: Some(mock),
         }
     }
 
@@ -213,6 +250,9 @@ impl BackendManager {
 
     /// Whether the backend for the given model supports tool/function calling.
     pub fn supports_tools_for_model(&self, model: Option<&str>) -> bool {
+        if let Some(mock) = &self.mock {
+            return mock.supports_tools();
+        }
         if self.backends.is_empty() {
             return false;
         }
@@ -261,6 +301,9 @@ impl BackendManager {
         tools: &[ToolDefinition],
         resolved_model: &str,
     ) -> Result<LLMResponse, LlmError> {
+        if let Some(mock) = &self.mock {
+            return mock.chat_with_tools(messages, tools, resolved_model).await;
+        }
         if self.backends.is_empty() {
             return Err(LlmError::Configuration {
                 message: "No backends configured".to_string(),

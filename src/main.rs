@@ -30,6 +30,9 @@ mod types;
 mod util;
 mod wasm_host;
 
+#[cfg(test)]
+mod test_support;
+
 use config::Config;
 use gateway::Gateway;
 
