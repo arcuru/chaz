@@ -1,0 +1,39 @@
+name: Coverage
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Weekly on Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubicloud-standard-8
+    # Scheduled workflow that reads CODECOV_TOKEN: forks don't run it.
+    if: github.repository_owner == 'arcuru'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+
+      - name: Build coverage
+        run: |
+          nix-fast-build --no-nom --no-link \
+            -f '.#legacyPackages.x86_64-linux.coverage.default'
+
+      - name: Extract coverage data
+        run: |
+          mkdir -p coverage
+          cp "$(nix build --no-link --print-out-paths '.#legacyPackages.x86_64-linux.coverage.default')/lcov.info" coverage/lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/lcov.info
+          fail_ci_if_error: false
