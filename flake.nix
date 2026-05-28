@@ -123,6 +123,29 @@
 
         chaz-doc = craneLib.cargoDoc buildArgs;
 
+        # Pre-built instrumented deps for coverage (separate cache: different RUSTFLAGS than buildArgs).
+        coverageArtifacts = craneLib.mkCargoDerivation (commonArgs
+          // {
+            pname = "chaz-coverage-deps";
+            cargoArtifacts = null;
+            buildPhaseCargoCommand = "cargo tarpaulin --no-run --engine llvm";
+            nativeBuildInputs = commonArgs.nativeBuildInputs or [] ++ [pkgs.cargo-tarpaulin];
+            doInstallCargoArtifacts = true;
+          });
+
+        # Coverage build using cargo-tarpaulin with the llvm engine.
+        # Outputs lcov.info into $out (`nix build .#coverage.default -o coverage-result`).
+        # HTML output is intentionally omitted here (it's ~100MB per build); use `just coverage` for local HTML.
+        chaz-coverage = craneLib.cargoTarpaulin (testArgs
+          // {
+            pname = "chaz-coverage";
+            cargoArtifacts = coverageArtifacts;
+            cargoTarpaulinExtraArgs = "--skip-clean --output-dir $out --out lcov --engine llvm --exclude-files target/* --exclude-files target-test/*";
+            nativeBuildInputs = testArgs.nativeBuildInputs or [] ++ [pkgs.cargo-tarpaulin];
+            # Skip installing the post-coverage cargo cache (~1.8GB tarball that nothing reuses).
+            doInstallCargoArtifacts = false;
+          });
+
         chaz-deny = craneLib.mkCargoDerivation (buildArgs
           // {
             pnameSuffix = "-deny";
@@ -167,6 +190,11 @@
           # Doc group
           doc = {
             default = chaz-doc;
+          };
+
+          # Coverage group — nix build .#coverage.default produces lcov.info + tarpaulin-report.html in $out
+          coverage = {
+            default = chaz-coverage;
           };
 
           # Main package
@@ -230,6 +258,7 @@
             alejandra
             cargo-deny
             cargo-nextest
+            cargo-tarpaulin
             deadnix
             git-cliff
             just

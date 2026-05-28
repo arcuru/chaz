@@ -21,3 +21,6 @@ config.yml
 # Claude Code
 /.claude
 target-test/
+
+# Coverage reports (lcov + html from `just coverage`)
+/coverage
