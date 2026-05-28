@@ -10,13 +10,13 @@
 //! - `input` — KeyEvent / MouseEvent handling, slash-command parsing
 //! - `view`  — ratatui rendering
 
-use crate::backends::BackendManager;
-use crate::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
-use crate::config::Config;
-use crate::gateway::{ApprovalExchange, Gateway};
-use crate::security::SecretStore;
-use crate::server::Server;
-use crate::session::{EntryType, Session, SessionEntry};
+use chaz_core::backends::BackendManager;
+use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
+use chaz_core::config::Config;
+use chaz_core::gateway::{ApprovalExchange, Gateway};
+use chaz_core::security::SecretStore;
+use chaz_core::server::Server;
+use chaz_core::session::{EntryType, Session, SessionEntry};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
@@ -330,7 +330,7 @@ async fn setup_session(
 /// Find an existing session named "tui", or create one and name it.
 async fn default_tui_session(
     server: &Server,
-) -> anyhow::Result<(crate::types::ConversationId, eidetica::Database)> {
+) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
     if let Some(id) = server.registry().find_by_name(TUI_DEFAULT_NAME).await? {
         match server.registry().open_session(&id).await {
             Ok(r) => return Ok(r),
@@ -356,7 +356,7 @@ async fn build_tab(server: &Server, session_db: eidetica::Database, session_db_i
         .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
     let session = Session::new(
-        crate::types::ConversationId(session_db_id.clone()),
+        chaz_core::types::ConversationId(session_db_id.clone()),
         session_db.clone(),
     )
     .await;
@@ -597,7 +597,7 @@ impl Gateway for TuiGateway {
                             (tab.session_db_id.clone(), tab.session_db.clone())
                         };
                         let session =
-                            Session::new(crate::types::ConversationId(db_id.clone()), db).await;
+                            Session::new(chaz_core::types::ConversationId(db_id.clone()), db).await;
                         let entries = session.entries().to_vec();
                         let meta = session.read_meta().await;
 
@@ -627,9 +627,10 @@ impl Gateway for TuiGateway {
                             row.entry_count = entries_ref.len();
                             row.name = meta.name.clone();
                             row.agent_name = meta.agent_name.clone();
-                            row.last_message = crate::session::summarize_last_message(entries_ref);
+                            row.last_message =
+                                chaz_core::session::summarize_last_message(entries_ref);
                             let (cost, reported, calls) =
-                                crate::session::sum_session_cost(entries_ref);
+                                chaz_core::session::sum_session_cost(entries_ref);
                             row.total_cost_usd = cost;
                             row.cost_reported = reported;
                             row.llm_call_count = calls;
@@ -644,7 +645,7 @@ impl Gateway for TuiGateway {
                         // so the runtime doesn't hang waiting.
                         let _ = exchange
                             .decision_tx
-                            .send(crate::gateway::ApprovalDecision::Deny);
+                            .send(chaz_core::gateway::ApprovalDecision::Deny);
                     }
                 }
             }
@@ -702,7 +703,7 @@ async fn handle_chat_action(
             let session_db = tab.session_db.clone();
             let session_db_id = tab.session_db_id.clone();
             let mut session =
-                Session::new(crate::types::ConversationId(session_db_id), session_db).await;
+                Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
             session
                 .add_entry(SessionEntry {
                     sender: "user".to_string(),
@@ -940,7 +941,7 @@ async fn render_outcome(
             }
         }
         CommandOutcome::SessionSwitched(switch) => {
-            let crate::commands::SessionSwitch {
+            let chaz_core::commands::SessionSwitch {
                 session_db_id,
                 conv_id,
                 db,

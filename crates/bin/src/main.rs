@@ -1,40 +1,11 @@
-mod agent;
-mod agent_db;
-mod backends;
-mod bubblewrap_host;
-mod commands;
-mod config;
-mod context;
-mod db_kind;
-mod defaults;
-mod embedding;
-mod error;
-mod extension;
-mod extensions;
 mod gateway;
-mod grants;
-mod hosted_index;
-mod mcp;
-mod memory_bank_db;
-mod openai;
-mod routine;
-mod runtime;
-mod security;
-pub mod server;
-mod session;
-mod skill_bank_db;
-mod tool;
-mod tool_host;
-mod tools;
-mod types;
-mod util;
-mod wasm_host;
 
-#[cfg(test)]
-mod test_support;
-
-use config::Config;
-use gateway::Gateway;
+use chaz_core::config::Config;
+use chaz_core::gateway::Gateway;
+use chaz_core::{
+    agent, agent_db, backends, commands, config, db_kind, embedding, extension, extensions, grants,
+    hosted_index, mcp, memory_bank_db, routine, security, server, session, tool, tool_host, tools,
+};
 
 use clap::Parser;
 use std::sync::Arc;
@@ -284,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(e) => e,
                         None => {
                             // Auto-create the bank if it doesn't exist
-                            let meta = crate::memory_bank_db::MemoryBankMeta {
+                            let meta = memory_bank_db::MemoryBankMeta {
                                 display_name: Some(bank_name.clone()),
                                 description: Some(
                                     "Auto-created from default_memory_banks config".into(),
@@ -292,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
                             };
                             match registry.create_new_memory_bank(bank_name, &meta).await {
                                 Ok((bank, pubkey)) => {
-                                    let entry = crate::hosted_index::DbEntry {
+                                    let entry = hosted_index::DbEntry {
                                         db_id: bank.id(),
                                         display_name: bank_name.clone(),
                                         pubkey,
@@ -314,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
                             &bank_entry.db_id,
                             &agent_entry.pubkey,
                             &key_label,
-                            crate::agent_db::BankPermission::Write,
+                            agent_db::BankPermission::Write,
                         )
                         .await
                     {
@@ -326,10 +297,10 @@ async fn main() -> anyhow::Result<()> {
                         .await
                     {
                         Ok(Some(agent_db)) => {
-                            let ref_entry = crate::agent_db::MemoryBankRef {
+                            let ref_entry = agent_db::MemoryBankRef {
                                 name: bank_name.clone(),
                                 db_id: bank_entry.db_id.to_string(),
-                                permission: crate::agent_db::BankPermission::Write,
+                                permission: agent_db::BankPermission::Write,
                             };
                             if let Err(e) = agent_db.attach_memory_bank(ref_entry).await {
                                 warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to attach bank ref; auth already granted");

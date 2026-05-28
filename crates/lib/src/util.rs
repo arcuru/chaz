@@ -3,7 +3,7 @@
 /// Truncate `s` to at most `max_chars` characters. Byte-slicing `&s[..n]`
 /// on arbitrary UTF-8 panics if `n` falls mid-codepoint; this is the
 /// char-aware equivalent.
-pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> &str {
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((i, _)) => &s[..i],
         None => s,

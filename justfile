@@ -47,7 +47,7 @@ test *args='':
 
 # Generate code coverage report (lcov + html into ./coverage/)
 coverage:
-    cargo tarpaulin --output-dir coverage --out lcov --out html --engine llvm --skip-clean \
+    cargo tarpaulin --workspace --output-dir coverage --out lcov --out html --engine llvm --skip-clean \
         --exclude-files 'target/*' --exclude-files 'target-test/*'
 
 # =============================================================================

@@ -1,8 +1,8 @@
 //! Ratatui rendering for the two TUI modes (chat + session picker).
 //! Pure view functions — no mutation, no async.
 
-use crate::session::EntryType;
-use crate::util::truncate_chars;
+use chaz_core::session::EntryType;
+use chaz_core::util::truncate_chars;
 
 use chrono::{DateTime, Utc};
 
@@ -860,8 +860,8 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             let gateway = info.gateway.as_str();
             let age = humanize_age(info.created_at, now);
             let closed_suffix = match info.status {
-                crate::session::SessionStatus::Closed => " (closed)",
-                crate::session::SessionStatus::Active => "",
+                chaz_core::session::SessionStatus::Closed => " (closed)",
+                chaz_core::session::SessionStatus::Active => "",
             };
 
             // Show cost only when the backend reported one. Sessions whose
@@ -877,7 +877,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 info.entry_count
             );
 
-            let is_closed = matches!(info.status, crate::session::SessionStatus::Closed);
+            let is_closed = matches!(info.status, chaz_core::session::SessionStatus::Closed);
             let style = if is_selected {
                 Style::default()
                     .fg(Color::White)

@@ -1,15 +1,15 @@
 mod commands;
 mod history;
 
-use crate::commands::{
+use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, ExtensionsAction,
     split_ext_scope,
 };
-use crate::config::Config;
-use crate::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
-use crate::security::SecretStore;
-use crate::server::Server;
-use crate::session::{EntryType, Session, SessionEntry};
+use chaz_core::config::Config;
+use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
+use chaz_core::security::SecretStore;
+use chaz_core::server::Server;
+use chaz_core::session::{EntryType, Session, SessionEntry};
 
 use headjack::*;
 use matrix_sdk::Room;
@@ -72,7 +72,7 @@ impl MatrixGateway {
 fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
-    agents: Arc<crate::agent::AgentRegistry>,
+    agents: Arc<chaz_core::agent::AgentRegistry>,
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
     session_db
@@ -82,7 +82,7 @@ fn attach_response_callback(
             let db = db.clone();
             let sid = session_db_id.clone();
             Box::pin(async move {
-                let session = Session::new(crate::types::ConversationId(sid), db).await;
+                let session = Session::new(chaz_core::types::ConversationId(sid), db).await;
                 if let Some(latest) = session.latest_entry()
                     && latest.entry_type == EntryType::Message
                     && agents.get(&latest.sender).is_some()
@@ -120,7 +120,7 @@ async fn dispatch_in_room(
         .await?;
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(&room, &config, &secrets, server.registry()).await;
-    let meta = crate::session::read_meta_from_db(&session_db).await;
+    let meta = chaz_core::session::read_meta_from_db(&session_db).await;
     let agent = server
         .registry()
         .resolve_agent(&session_db_id, None, server.agent_index())
@@ -503,8 +503,8 @@ impl Gateway for MatrixGateway {
                             return None;
                         }
                         let permission = match perm_tok {
-                            "" => crate::commands::CoOwnerPermission::Write,
-                            other => crate::commands::parse_permission_token(other)?,
+                            "" => chaz_core::commands::CoOwnerPermission::Write,
+                            other => chaz_core::commands::parse_permission_token(other)?,
                         };
                         Some(Command::AgentImport {
                             ticket: ticket.to_string(),
@@ -531,7 +531,7 @@ impl Gateway for MatrixGateway {
                         let agent_ref = parts.next().unwrap_or("").trim();
                         let pubkey = parts.next().unwrap_or("").trim();
                         let perm = parts.next().unwrap_or("").trim();
-                        match crate::commands::parse_permission_token(perm) {
+                        match chaz_core::commands::parse_permission_token(perm) {
                             Some(permission) if !agent_ref.is_empty() && !pubkey.is_empty() => {
                                 Some(Command::AgentInvite {
                                     agent_ref: agent_ref.to_string(),
@@ -561,12 +561,12 @@ impl Gateway for MatrixGateway {
                         Some(rest.to_string())
                     })),
                     "rehost" if !rest.is_empty() => {
-                        let mut scope = crate::commands::RehostScope::Session;
+                        let mut scope = chaz_core::commands::RehostScope::Session;
                         let mut clear = false;
                         let mut positional: Vec<&str> = Vec::new();
                         for tok in rest.split_whitespace() {
                             match tok {
-                                "--agent" => scope = crate::commands::RehostScope::Agent,
+                                "--agent" => scope = chaz_core::commands::RehostScope::Agent,
                                 "--clear" => clear = true,
                                 _ => positional.push(tok),
                             }
@@ -679,7 +679,7 @@ impl Gateway for MatrixGateway {
                         // reach this room.
                         let backend =
                             get_backend(&room, &config, &secrets, server.registry()).await;
-                        let agent_override = crate::session::read_meta_from_db(&target_db)
+                        let agent_override = chaz_core::session::read_meta_from_db(&target_db)
                             .await
                             .agent_name;
                         let _ = server
@@ -1068,7 +1068,7 @@ impl Gateway for MatrixGateway {
                     let session_db_id = session_db.root_id().to_string();
 
                     // Read agent override from session meta
-                    let agent_override = crate::session::read_meta_from_db(&session_db)
+                    let agent_override = chaz_core::session::read_meta_from_db(&session_db)
                         .await
                         .agent_name;
 
@@ -1111,7 +1111,7 @@ impl Gateway for MatrixGateway {
                             info!("Backfilling history for room {room_id}");
                             let history = read_room_history(&room).await;
                             let mut session = Session::new(
-                                crate::types::ConversationId(session_db_id.clone()),
+                                chaz_core::types::ConversationId(session_db_id.clone()),
                                 session_db.clone(),
                             )
                             .await;
@@ -1121,7 +1121,8 @@ impl Gateway for MatrixGateway {
 
                     // Write user entry to session DB — triggers server → agent → response
                     let mut session =
-                        Session::new(crate::types::ConversationId(session_db_id), session_db).await;
+                        Session::new(chaz_core::types::ConversationId(session_db_id), session_db)
+                            .await;
                     session
                         .add_entry(SessionEntry {
                             sender: sender.to_string(),
@@ -1178,7 +1179,7 @@ async fn attach_existing_channel(
         return;
     };
 
-    let agent_override = crate::session::read_meta_from_db(&session_db)
+    let agent_override = chaz_core::session::read_meta_from_db(&session_db)
         .await
         .agent_name;
     let backend = get_backend(&room, config, secrets, server.registry()).await;

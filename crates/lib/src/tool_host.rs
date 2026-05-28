@@ -138,6 +138,12 @@ pub trait ToolHost: Send + Sync {
 /// bubblewrap host (future).
 pub struct NativeToolHost;
 
+impl Default for NativeToolHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NativeToolHost {
     pub fn new() -> Self {
         Self

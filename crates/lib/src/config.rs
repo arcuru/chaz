@@ -93,7 +93,7 @@ pub struct CliConfig {
     pub auto_approved_tools: Vec<String>,
 }
 
-pub(crate) fn default_cli_auto_approved() -> Vec<String> {
+pub fn default_cli_auto_approved() -> Vec<String> {
     vec!["shell".into(), "write_file".into()]
 }
 

@@ -103,6 +103,12 @@ pub struct RateLimiter {
     calls: HashMap<String, Vec<std::time::Instant>>,
 }
 
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RateLimiter {
     pub fn new() -> Self {
         Self {
@@ -436,6 +442,12 @@ impl RegistryEntry {
 /// per-session active-extension set.
 pub struct ToolRegistry {
     tools: Vec<RegistryEntry>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {

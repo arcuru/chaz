@@ -140,7 +140,7 @@
           // {
             pname = "chaz-coverage";
             cargoArtifacts = coverageArtifacts;
-            cargoTarpaulinExtraArgs = "--skip-clean --output-dir $out --out lcov --engine llvm --exclude-files target/* --exclude-files target-test/*";
+            cargoTarpaulinExtraArgs = "--workspace --skip-clean --output-dir $out --out lcov --engine llvm --exclude-files target/* --exclude-files target-test/*";
             nativeBuildInputs = testArgs.nativeBuildInputs or [] ++ [pkgs.cargo-tarpaulin];
             # Skip installing the post-coverage cargo cache (~1.8GB tarball that nothing reuses).
             doInstallCargoArtifacts = false;

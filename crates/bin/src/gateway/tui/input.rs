@@ -2,8 +2,8 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
-use crate::commands::{Command, ExtensionsAction, RehostScope, parse_permission_token};
-use crate::gateway::ApprovalDecision;
+use chaz_core::commands::{Command, ExtensionsAction, RehostScope, parse_permission_token};
+use chaz_core::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
@@ -644,7 +644,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         // Default for /agent import is write — co-ownership with edit
         // privileges. Admin and Read are explicit opt-ins.
         let permission = match perm_tok {
-            "" => crate::commands::CoOwnerPermission::Write,
+            "" => chaz_core::commands::CoOwnerPermission::Write,
             other => match parse_permission_token(other) {
                 Some(p) => p,
                 None => {
@@ -842,7 +842,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         )));
     }
     if let Some(arg) = text.strip_prefix("/extensions add ") {
-        let (name, scope) = crate::commands::split_ext_scope(arg);
+        let (name, scope) = chaz_core::commands::split_ext_scope(arg);
         if name.is_empty() {
             show_error(app, "Usage: /extensions add <name> [agent]".into());
             return None;
@@ -852,7 +852,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         )));
     }
     if let Some(arg) = text.strip_prefix("/extensions remove ") {
-        let (name, scope) = crate::commands::split_ext_scope(arg);
+        let (name, scope) = chaz_core::commands::split_ext_scope(arg);
         if name.is_empty() {
             show_error(app, "Usage: /extensions remove <name> [agent]".into());
             return None;
@@ -962,7 +962,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             for (i, entry) in app.active().entries.iter().enumerate() {
                 let ts = entry.timestamp.format("%H:%M:%S%.3f");
                 let typ = format!("{:?}", entry.entry_type);
-                let t = crate::util::truncate_chars(&entry.content, 80);
+                let t = chaz_core::util::truncate_chars(&entry.content, 80);
                 let content_preview = if t.len() < entry.content.len() {
                     format!("{t}...")
                 } else {

@@ -770,19 +770,41 @@ name = "chaz"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "chaz-core",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs 5.0.1",
+ "eidetica",
+ "headjack",
+ "matrix-sdk",
+ "ratatui",
+ "regex",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "chaz-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
  "async-openai",
  "blake3",
  "chrono",
  "clap",
  "cron",
- "crossterm",
  "dirs 5.0.1",
  "eidetica",
  "headjack",
  "lazy_static",
  "matrix-sdk",
  "meval",
- "ratatui",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -794,8 +816,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "url",
  "uuid",
  "wasmtime",

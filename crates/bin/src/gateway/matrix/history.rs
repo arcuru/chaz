@@ -1,4 +1,4 @@
-use crate::session::{EntryType, SessionEntry};
+use chaz_core::session::{EntryType, SessionEntry};
 
 use chrono::Utc;
 use matrix_sdk::{

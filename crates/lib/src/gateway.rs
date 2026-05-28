@@ -1,6 +1,9 @@
-pub mod cli;
-pub mod matrix;
-pub mod tui;
+//! Cross-crate gateway surface.
+//!
+//! The [`Gateway`] trait, [`ApprovalExchange`] struct, and
+//! [`ApprovalDecision`] enum live in the library so runtime / security /
+//! server code can reference them. Concrete gateway implementations
+//! (Matrix, TUI, CLI) live in the binary crate.
 
 use crate::server::Server;
 use crate::tool::ToolApprovalInfo;

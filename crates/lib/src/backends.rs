@@ -37,6 +37,12 @@ impl MessageRole {
     }
 }
 
+/// LLM backend trait.
+///
+/// Uses native `async fn` (not `impl Future`) for ergonomic implementor code.
+/// Not dyn-compatible by design — `BackendDispatch` below is the dyn-safe
+/// dispatch shim used by `BackendManager::with_mock`.
+#[allow(async_fn_in_trait)]
 pub trait LLMBackend {
     fn list_models(&self) -> Vec<String>;
     fn default_model(&self) -> Option<String>;

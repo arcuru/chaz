@@ -11,12 +11,12 @@
 //! No interactive approval — tools requiring approval are auto-denied
 //! (see [`SecurityContext::request_approval`] when `approval_callback` is None).
 
-use crate::backends::BackendManager;
-use crate::config::Config;
-use crate::gateway::Gateway;
-use crate::security::SecretStore;
-use crate::server::Server;
-use crate::session::{EntryType, Session, SessionEntry};
+use chaz_core::backends::BackendManager;
+use chaz_core::config::Config;
+use chaz_core::gateway::Gateway;
+use chaz_core::security::SecretStore;
+use chaz_core::server::Server;
+use chaz_core::session::{EntryType, Session, SessionEntry};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -54,7 +54,7 @@ impl CliGateway {
 async fn resolve_cli_session(
     server: &Server,
     session_name: Option<&str>,
-) -> anyhow::Result<(crate::types::ConversationId, eidetica::Database)> {
+) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
     if let Some(name) = session_name {
         if let Some(id) = server.registry().find_by_name(name).await? {
             match server.registry().open_session(&id).await {

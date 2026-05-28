@@ -1,14 +1,14 @@
 //! Matrix-specific gateway commands.
 //!
 //! Commands that have a cross-transport analogue (model/role/compact/share/…)
-//! are handled by `crate::commands::dispatch`. This module keeps only the
+//! are handled by `chaz_core::commands::dispatch`. This module keeps only the
 //! Matrix-specific glue: rate limiting, backend selection for a room, legacy
 //! history reconstruction for `send`/`rename`, and the `rename`/`send` bodies.
 
-use crate::backends::{BackendManager, ChatContext, Message, MessageRole};
-use crate::config::*;
-use crate::security::SecretStore;
-use crate::session::{SessionMeta, SessionRegistry};
+use chaz_core::backends::{BackendManager, ChatContext, Message, MessageRole};
+use chaz_core::config::*;
+use chaz_core::security::SecretStore;
+use chaz_core::session::{SessionMeta, SessionRegistry};
 
 use headjack::*;
 use matrix_sdk::{
@@ -224,7 +224,7 @@ pub async fn get_backend(
     if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await
         && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
     {
-        let meta = crate::session::read_meta_from_db(&db).await;
+        let meta = chaz_core::session::read_meta_from_db(&db).await;
         if let Some(backend) = meta_backend(&meta) {
             backends.push(backend);
         }
@@ -357,7 +357,7 @@ pub async fn get_context(
     if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await
         && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
     {
-        let meta = crate::session::read_meta_from_db(&db).await;
+        let meta = chaz_core::session::read_meta_from_db(&db).await;
         if let Some(model) = &meta.model {
             context.model = Some(model.clone());
         }

@@ -1,0 +1,36 @@
+[package]
+name = "chaz"
+description = "Chaz is an AI agent orchestrator for Matrix."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "chaz"
+path = "src/main.rs"
+
+[dependencies]
+chaz-core = { path = "../lib" }
+
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+dirs.workspace = true
+eidetica.workspace = true
+headjack.workspace = true
+matrix-sdk.workspace = true
+ratatui.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
