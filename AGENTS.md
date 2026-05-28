@@ -57,8 +57,8 @@ gateway/             matrix/ + tui/ — translate platform events ↔ session DB
 error.rs             Error + LlmError (retryable/permanent classification)
 backends.rs          BackendManager, LLMBackend trait, ChatContext, Message
 openai.rs            OpenAI-compatible backend
-persona.rs           Persona + ResolvedPersona + PersonaSnapshotPayload — file-include + inline system prompts
-role.rs              Deprecated role lookup (one-release migration window for legacy `roles:` configs)
+extension/           Extension framework: Scope, ScopeCtx, PeerHandles, HookKind, ExtensionHub (per-agent instance model)
+extensions/          Built-in extensions: schedule, agent_schedule, memory, skills, mcp, agent_state, …
 defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
 ```
 
@@ -71,7 +71,7 @@ defaults.rs          Built-in default config and built-in agents (chaz, chazmina
 - **Per-session serialization.** Concurrent writes to the same session while an agent is running are skipped (prevents duplicate responses).
 - **Tools access system resources through `ToolHost`.** The host (`ctx.host()`) enforces grants at the capability boundary. Tools request capabilities (Shell, FileRead, FileWrite, HttpRequest) rather than calling OS APIs directly. New capability types go in `tool_host.rs`.
 - **Context entries**: only `Message`, `Directive`, and `Summary` enter the LLM context window. `ToolCall`/`ToolResult`/`Ack`/`Error` are audit-only.
-- **PersonaSnapshot is the system-prompt source of truth.** Once written (at agent attach, on `/agent persona bump`, or on `/agent set <ref> persona.*`), the snapshot's `text` is what ContextBuilder injects as the LLM system message — disk edits to a persona's source files do **not** silently mutate ongoing sessions. The legacy `default_role`/`role:` flow only applies to sessions that predate any snapshot.
+- **System prompts rebuild every turn from `AgentDbConfig`.** `system_prompt` + `system_prompt_files` live on the agent's DB config; ContextBuilder assembles them fresh on each turn, plus any `PromptAugmentation` contributions from the extension hub (skills, memory recall, …). Disk edits to a `system_prompt_files` path require a re-write via `/agent set` to be re-read. No per-session snapshot layer — the previous `PersonaSnapshot` entry type, `persona.rs`, and `role.rs` were all deleted; legacy `role:` configs surface a deprecation message pointing to `/agent set <name> system_prompt <text>`.
 
 ## Test Instance
 
@@ -102,10 +102,10 @@ nix develop .# -c cargo run -- --config ~/code/chaz-test/config.yaml --tui
 
 ## User-facing feature docs checklist
 
-Every new user-facing feature lands with three docs pieces — not one or two, three. Reference *and* example *and* model. The feature isn't done without them; surfacing complex moving parts is a top-level project goal.
+Every new user-facing feature lands with three docs pieces — not one or two, three. Reference _and_ example _and_ model. The feature isn't done without them; surfacing complex moving parts is a top-level project goal.
 
 1. **Reference** (`docs/src/user_guide/<area>.md`) — terse command table or settings list. What each knob does in one line. Existing tables under "Lifecycle, sharing, and co-ownership" in `agents.md` are the shape.
-2. **Conceptual section** (`docs/src/user_guide/<area>.md`) — a `##` section that explains *the model* the user has to hold in their head: why it exists, what's automatic vs. what they touch, where the state lives, the failure modes. One per feature, headed memorably so cross-links work.
+2. **Conceptual section** (`docs/src/user_guide/<area>.md`) — a `##` section that explains _the model_ the user has to hold in their head: why it exists, what's automatic vs. what they touch, where the state lives, the failure modes. One per feature, headed memorably so cross-links work.
 3. **Walkthrough** (usually `docs/src/user_guide/session_sharing.md` or the area's own guide) — a numbered scenario that exercises the happy path AND at least one failure/recovery path with verbatim sample output. The example is what makes the feature discoverable to someone scanning for "can chaz do X?"
 
 Architecture-level notes go in `docs/src/architecture/<area>.md` (the mental model for someone reading the code); design rationale and alternatives-considered go in `docs/src/design/<feature>.md`. Those are separate from the user-guide triad above.
