@@ -105,15 +105,16 @@ enum Capability {
 }
 ```
 
-The host enforces grants at the capability boundary — the tool says what it wants to do, the host decides whether to allow it and how to execute it. Different host implementations provide different trust tiers:
+The host enforces grants at the capability boundary — the tool says what it wants to do, the host decides whether to allow it and how to execute it. Two `ToolHost` implementations exist today:
 
-| Host             | Tier       | Isolation                              |
-| ---------------- | ---------- | -------------------------------------- |
-| `NativeToolHost` | Native     | In-process, grant enforcement only     |
-| (future)         | WASM       | VM-enforced sandbox, capability tokens |
-| (future)         | Bubblewrap | OS-level sandboxing via `bwrap`        |
+| Host                 | Tier       | Isolation                                                                | Status                                          |
+| -------------------- | ---------- | ------------------------------------------------------------------------ | ----------------------------------------------- |
+| `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | Default for every built-in tool.                |
+| `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Selected per config (`src/bubblewrap_host.rs`). |
 
-The `Tool` implementations (shell, web, file) are identical across all tiers — they call `ctx.host().request()` regardless of which host sits behind the trait.
+The `Tool` implementations (shell, web, file) are identical across both hosts — they call `ctx.host().request()` regardless of which host sits behind the trait.
+
+A separate WASM-tools path (`src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
 
 ## ToolContext
 
@@ -121,21 +122,36 @@ The `ToolContext` is passed to every tool execution:
 
 ```rust,ignore
 struct ToolContext {
-    agent_name: String,       // current agent
-    call_depth: usize,        // spawn nesting level
-    max_call_depth: usize,    // from agent config
-    tools: ScopedTools,       // narrowed tool set
-    grants: Grants,           // resolved per-call grants
-    host: Arc<dyn ToolHost>,  // sandboxed capability boundary
+    agent_name: String,                          // current agent
+    call_depth: usize,                           // spawn nesting level
+    max_call_depth: usize,                       // from agent config
+    tools: ScopedTools,                          // narrowed tool set
+    profile: ToolProfile,                        // how tool defs are presented
+    session: Arc<Mutex<Session>>,                // for tools that write entries
+    active_extensions: HashSet<String>,          // per-session active-set filter
+    grants: Grants,                              // resolved per-call grants
+    agent_grants: HashMap<String, Grants>,       // per-tool overlays from agent config
+    host: Arc<dyn ToolHost>,                     // sandboxed capability boundary
 }
 ```
 
-Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants()` only for introspection (e.g., `describe_tool` listing available capabilities).
+Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants()` only for introspection (e.g., `describe_tool` listing available capabilities). `active_extensions` is built by `Server::active_extensions_for` and is what `ScopedTools` consults to hide tools from extensions disabled in this session.
 
 ## Adding a New Tool
 
-1. Create `src/tools/my_tool.rs` implementing `Tool`
-2. Add `mod my_tool;` and `pub use` to `src/tools/mod.rs`
-3. Register in `main.rs`: `tool_registry.register(tools::MyTool);`
+Tools are published by [extensions](extensions.md). The `Tool` impl is the
+tool's _behavior_; the extension is what wires it into the runtime registry.
 
-The tool will automatically appear in the LLM's function definitions (filtered by agent scope) and have its policy resolved by the registry.
+1. Create `src/tools/my_tool.rs` implementing `Tool`.
+2. Add `mod my_tool;` + `pub use` to `src/tools/mod.rs`.
+3. Have an extension's `ExtensionInstance::tools()` return your `Tool`. Either
+   add it to an existing built-in (e.g. `extensions/core.rs` for general
+   tools) or create a new extension in `src/extensions/my_ext.rs` and
+   register it in `extensions::all_builtins`.
+
+At install time `install_all` drains every `Global` instance's `tools()`,
+the hub publishes them through `tools_for_registry()`, and `main.rs` builds
+the runtime `ToolRegistry` from that list. Per-session active-set filtering
+hides tools whose owning extension is disabled for the session; policy
+overrides in `security.tool_policies` apply on top of the tool's
+`default_policy()`.

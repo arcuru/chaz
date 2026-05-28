@@ -8,6 +8,8 @@
 > chaz's existing `MemoryAccess` cap trait, the `PromptAugmentation` pattern
 > from the `skills` extension.
 
+> **Status update (2026-05-27):** the v1 surface shipped — `default_memory_banks` on `AgentConfig`/`AgentDbConfig`, the per-session attachment stored in `extension_settings["memory"]["attached_banks"]`, `/memory attach`/`detach`, the `MemoryAccessImpl`, and the per-session context tail that surfaces recent recalls. **Divergence:** surfacing landed as a `ContextTail` (appended after the conversation) rather than a `PromptAugmentation` (appended to the system prompt) — this kept the surfacing close to the messages it derives from and avoided sharing a prompt-cache breakpoint with skills. The cap traits are real either way; what changed is which one `memory` publishes.
+
 ## Summary
 
 **What exists:**

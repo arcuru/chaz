@@ -7,6 +7,14 @@
 > Reference: IronClaw's `ironclaw_skills` crate, pi's `.pi/skills/` +
 > `.pi/prompts/`, Claude Code's `CLAUDE.md` / custom commands.
 
+> **Status update (2026-05-27):**
+>
+> - `role.rs` and `persona.rs` are deleted; `system_prompt` + `system_prompt_files` shipped on `Agent` / `AgentDbConfig` / `AgentConfig`.
+> - The `skills` extension shipped as `src/extensions/skills.rs` with `Scope::{Global, PerSession}`, the `SkillRegistry`, `PromptAugmentation`, and the `skill_list` / `skill_search` / `skill_show` tools.
+> - `PromptAugmentation` shipped as an extension-providable cap (`src/extension/caps.rs`) and is wired through `ContextBuilder::build`.
+> - **Divergence:** the `SystemPromptSnapshot` entry type / `SystemPromptSnapshotPayload` / observational audit log were **not** built; `PersonaSnapshot` was simply removed from `EntryType`. There is no per-turn snapshot today — every turn assembles fresh and the contributions are not persisted.
+> - **Divergence:** `/agent reload <ref>` was not added; live edits go through `/agent set <ref> system_prompt <value>` / `system_prompt_files`. File-include rehydration happens at agent construction (`AgentRegistry::register`) and on AgentDb config write; there is no on-demand reload command.
+
 ## Summary
 
 **What dies:**

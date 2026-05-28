@@ -3,6 +3,8 @@
 **Status:** Implemented (2026-05-18). Error/UX reconciliation 2026-05-19 (Gap 3): uniform not-found error + startup deny-all `WARN`.
 **Depends on:** cap traits landed (`src/extension/caps.rs`), hub wiring (Steps 2–5 of cap refactor), `AgentDbAccess` trait (landed in `src/tools/schedule.rs`).
 
+> **Status update (2026-05-27):** the `ExtensionCaps` bundle layer described below was deleted by `refactor(extension): delete inert ExtensionCaps bundle layer` (commit `03ba480`). The cap itself still exists and is still operator-scoped via `agent_state_allowlist`, but it is now reached through `PeerHandles.agent_state_allowlist` plus `ScopedAgentStateAdmin` built inside an `ExtensionInstance` (see [Extension Framework](../architecture/extensions.md)). The "Extension Caps Slot" / `CapProvider::AgentStateAdmin` sections below describe an intermediate shape that no longer exists in code; the security posture and operator-config layer (`agent_state_allowlist`, intersection table, startup deny-all `WARN`) are unchanged.
+
 ## Security posture
 
 > **This capability system is a guardrail, not a sandbox.** It is designed to stop a poorly behaving agent or tool from doing accidental damage — deleting the wrong schedule, scheduling noise into another agent's DB, writing to a path outside `~/code/`. It is **not** designed to contain an LLM or tool that is explicitly, adversarially trying to escape. If we can achieve the latter, that's great, but it is not the requirement driving this design.

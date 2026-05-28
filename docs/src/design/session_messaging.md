@@ -1,6 +1,8 @@
 # Session Messaging Primitive
 
 > **Status: Implemented**
+>
+> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). The rest of the doc (entry types, server processing logic, `spawn_agent` flow, `OnceLock` wiring, `SpawnContext`, `RuntimeEventSink`) still matches the code.
 
 ## Summary
 

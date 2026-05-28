@@ -13,7 +13,6 @@ enum EntryType {
     Ack,        // Agent is processing (thinking indicator)
     Error,      // An error occurred
     Summary,    // Compacted summary of older messages (context-builder boundary)
-    PersonaSnapshot, // Frozen system prompt for an agent at a point in time
 }
 ```
 
@@ -23,7 +22,7 @@ Each entry has a sender (participant name), content, timestamp, and type.
 
 Only `Message`, `Directive`, and `Summary` entries enter the conversation portion of the LLM context. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
 
-`PersonaSnapshot` entries don't enter the conversation — they're the **source** of the system message. ContextBuilder finds the most recent `PersonaSnapshot` whose `sender` matches the active agent and injects its `text` as the system prompt. See [Personas in `agents.md`](../user_guide/agents.md#personas-system-prompts) for the lifecycle (write at attach, refresh via `/agent persona bump`).
+The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills, memory recall, …) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
 
 `ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its own in-memory tool call history for the ReAct loop. Session-level tool entries exist for audit trail and TUI display only.
 

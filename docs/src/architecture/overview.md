@@ -27,7 +27,7 @@ graph TD
         LA[(Living Agent DBs<br/>config, memory, meta, history)]
         MB[(Memory Bank DBs<br/>shared memory)]
         CG[(chaz_group DB<br/>peer-local: sessions,<br/>matrix_channels, session_names)]
-        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>credentials, schedule_state)]
+        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>routines, schedule_state)]
         HI[HostedIndex<br/>in-memory cache<br/>built from user.databases]
     end
 
@@ -111,49 +111,78 @@ See [Tool System](tools.md) for details.
 
 ```text
 src/
-  main.rs              CLI, config, eidetica init, tool registration, gateway dispatch
-  config.rs            Config types (backends, agents, security)
+  main.rs              CLI, config, eidetica init, extension install, gateway dispatch
+  config.rs            Config types (backends, agents, security, multi_agent, agent_state_allowlist)
   types.rs             ConversationId
+  util.rs              Shared utilities
   agent.rs             Agent definitions, AgentRegistry, spawn permissions
-  agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memory_banks stores)
+  agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memory_banks/skills/schedules stores)
   memory_bank_db.rs    Standalone Memory Bank DBs (parallel to agent_db)
+  skill_bank_db.rs     Standalone Skill Bank DBs (parallel to memory_bank_db)
   db_kind.rs           meta.kind + display_name markers on entity DBs
   hosted_index.rs      In-memory peer-local pubkey/name → DB cache, built from user.databases()
-  schedule.rs         sweep_for_agent helper — agent-owned schedules in the owning agent.s DB
-  routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines
-  server.rs            Callback-driven server, agent task spawning
-  runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning
-  context.rs           ContextBuilder — token-budgeted context assembly (tiktoken)
-  tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError
+  server.rs            Callback-driven server, agent task spawning, home-peer gate, fire_agent_schedule
+  runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning, loop detector
+  context.rs           ContextBuilder — token-budgeted context assembly (tiktoken), room note + augmentation
+  tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError, RateLimiter
   tool_host.rs         ToolHost trait — sandboxed capability boundary (Native, future WASM/bwrap)
+  bubblewrap_host.rs   ToolHost impl wrapping commands in `bwrap` (OS-level sandbox)
+  wasm_host.rs         ToolHost impl for WASM-sandboxed extensions
   grants.rs            Typed capability grants (shell/network/fs)
   error.rs             Error + LlmError (retryable/permanent classification)
   backends.rs          LLMBackend trait, BackendManager, ChatContext
   openai.rs            OpenAI-compatible backend (async-openai byot)
-  role.rs              Role/system prompt management
-  defaults.rs          Built-in default config and roles
-  util.rs              Shared utilities
+  embedding.rs         Embedder trait + OpenAiEmbedder (for memory/skill semantic search)
+  defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
+  routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines
+    mod.rs             Module root + re-exports
+    engine.rs          Engine — register/reload/deregister, fire_due, dispatch through ExtensionHub
+    types.rs           Routine, RoutineId, RoutineScope (Global/Session/Agent), AgentSchedulePayload
   session/             SessionRegistry, Session, EntryType, SessionMeta
-    mod.rs             Public types + helpers
+    mod.rs             Public types (EntryType, SessionEntry, AgentRef, SessionMeta) + helpers
     registry.rs        SessionRegistry struct, chaz_group/chaz_peer accessors, session CRUD
     channels.rs        Matrix channel attach/detach
-    agents.rs          attach/detach + turn-taking resolve_agent
+    agents.rs          attach/detach + turn-taking resolve_agent (home_pubkey set on attach)
     keys.rs            agent DB helpers, ephemeral keys, user_lock accessor
+    usage.rs           Per-session/model/total cost rollups from assistant ResponseMetadata
   commands/            Transport-neutral session commands
-    mod.rs             Command, CommandContext, CommandOutcome, dispatch
+    mod.rs             Command, CommandContext, CommandOutcome, dispatch, CoOwnerPermission
     session.rs         /sessions, /info, /name, /share, /sync, etc.
-    agent.rs           /agent add|remove|list|host|new|set|delete|share|import|invite|revoke-peer
-    memory.rs          /memory new|list|delete|grant|revoke|share|import
-    schedule.rs       /schedule add|modify|remove|list
-  tools/               Built-in tools
+    agent.rs           /agent add|remove|list|host|new|set|delete|share|import|invite|revoke-peer|rehost|home-status
+    sharing.rs         /sharing queue handlers (bootstrap requests across agents/banks/sessions)
+    extensions.rs      /extensions list|add|remove (session/agent scope split)
+  extension/           Extension framework (declaration + per-scope instance model)
+    mod.rs             Extension trait, ExtensionHub, install_all, dispatch, activation log
+    instance.rs        ExtensionInstance trait, Scope, ScopeCtx, PeerHandles, CapResolver
+    caps.rs            CapabilityKind, CapabilityRequest, cap traits (Messenger, MemoryAccess, …)
+    agent_state.rs     AgentStateAdmin cap + ScopedAgentStateAdmin
+    manifest.rs        ExtensionManifest + validation
+    handler.rs         Hook handler traits + InstalledExtension (Global drain target)
+    hook_bridge.rs     Adapters bridging instance hook handlers into the fire vecs
+    hooks.rs           Per-kind hook trait definitions + HookKind
+  extensions/          Built-in extensions (each declares scopes + caps + endpoints)
+    mod.rs             all_builtins, BuiltinDeps
+    core.rs            shell, compact, spawn_agent, spawn_task
+    fs.rs              read_file, write_file, edit_file
+    system.rs          get_time, calculate, describe_tool
+    web.rs             web_fetch, web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
+    memory.rs          remember, recall, list_memory_banks, /memory, recall context tail
+    skills.rs          skill tools, /skills, prompt augmentation
+    schedule.rs        schedule_add|modify|remove|list|once, /schedule (agent-owned)
+    agent_schedule.rs  routine handler running the standalone agent-owned schedule fire path
+    mcp.rs             McpExtension — one per configured MCP server
+    path_normalizer.rs tool_call hook stripping trailing `/` from path args
+    security_warnings.rs tool_result hook scanning for prompt-injection patterns
+  tools/               Built-in tool impls (referenced from extensions/* above)
     agent.rs           spawn_agent (delegate to a Living Agent)
     task.rs            spawn_task (ephemeral sub-agent with revocable key)
     shell.rs           shell execution with allowlist/denylist
     file.rs            read_file, write_file
+    edit.rs            edit_file
     web.rs             web_fetch with network policy
-    search.rs          web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
-    memory.rs          remember, recall (optional `bank` arg), list_memory_banks
-    schedule.rs       schedule_add, schedule_modify, schedule_remove, schedule_list
+    search.rs          WebSearch + SearchBackend variants
+    memory.rs          Remember, Recall, ListMemoryBanks (+ shared search_memory helper)
+    schedule.rs        ScheduleAdd, ScheduleModify, ScheduleRemove, ScheduleList, ScheduleOnce
     compact.rs         compact — write Summary entry for context compaction
     describe.rs        describe_tool — on-demand tool discovery
     time.rs            get_time
@@ -171,7 +200,8 @@ src/
     server.rs          Tool descriptor + invoke
   gateway/             Gateway trait + transport implementations
     mod.rs             Gateway trait, ApprovalExchange
-    tui/               TUI with multi-session tabs, mouse + keyboard nav
+    cli.rs             One-shot CLI gateway (`chaz prompt …`)
+    tui/               TUI with multi-session tabs, mouse + keyboard nav (mod/input/view)
     matrix/            Matrix gateway
       mod.rs           Lifecycle, channel callbacks
       commands.rs      Matrix-syntax command parsing
