@@ -47,10 +47,17 @@ impl SkillRegistry {
 
     /// Scan skill directories, parse SKILL.md files, populate the registry.
     pub fn scan(&mut self) {
-        let mut seen: HashMap<String, usize> = HashMap::new();
         let dirs: Vec<PathBuf> = vec![PathBuf::from(".chaz/skills"), dirs_fallback()];
+        self.scan_paths(&dirs);
+    }
 
-        for dir in &dirs {
+    /// Scan an explicit list of directories — same dedupe / parse behavior as
+    /// [`scan`], but with caller-provided paths. Used by tests; `scan` is the
+    /// production entry point.
+    fn scan_paths(&mut self, dirs: &[PathBuf]) {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        for dir in dirs {
             if !dir.is_dir() {
                 continue;
             }
@@ -1335,4 +1342,446 @@ enum SkillImportOutcome {
     Pending {
         request_id: String,
     },
+}
+
+// ── tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extension::Extension;
+    use crate::test_support::{fresh_session, fresh_session_registry, tool_context};
+    use std::io::Write;
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    fn write_skill(dir: &std::path::Path, filename: &str, body: &str) -> PathBuf {
+        let p = dir.join(filename);
+        let mut f = std::fs::File::create(&p).expect("create skill file");
+        f.write_all(body.as_bytes()).expect("write skill body");
+        p
+    }
+
+    /// Minimal SKILL.md with name + description + triggers.
+    fn skill_md(name: &str, description: &str, triggers: &[&str], body: &str) -> String {
+        let triggers_yaml = if triggers.is_empty() {
+            "triggers: []".to_string()
+        } else {
+            let mut s = String::from("triggers:\n");
+            for t in triggers {
+                s.push_str(&format!("  - {t}\n"));
+            }
+            s.trim_end().to_string()
+        };
+        format!("---\nname: {name}\ndescription: {description}\n{triggers_yaml}\n---\n{body}\n")
+    }
+
+    fn skill(name: &str, description: &str, triggers: &[&str], body: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: description.into(),
+            triggers: triggers.iter().map(|s| (*s).into()).collect(),
+            body: body.into(),
+            source_dir: PathBuf::from("/test"),
+        }
+    }
+
+    fn registry_with(skills: Vec<Skill>) -> SkillRegistry {
+        SkillRegistry { skills }
+    }
+
+    // ── parse_skill_md (6) ───────────────────────────────────────────
+
+    #[test]
+    fn parse_skill_valid_frontmatter_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(
+            dir.path(),
+            "nix.md",
+            &skill_md(
+                "nix",
+                "Nix tips",
+                &["nix", "nixos"],
+                "Use `nix develop .#`.",
+            ),
+        );
+        let s = parse_skill_md(&p).expect("parses");
+        assert_eq!(s.name, "nix");
+        assert_eq!(s.description, "Nix tips");
+        assert_eq!(s.triggers, vec!["nix".to_string(), "nixos".into()]);
+        assert!(s.body.starts_with("Use `nix develop"));
+    }
+
+    #[test]
+    fn parse_skill_missing_leading_dashes_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(dir.path(), "bad.md", "no frontmatter here\n");
+        let err = parse_skill_md(&p).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("frontmatter"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_skill_unclosed_frontmatter_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(dir.path(), "bad.md", "---\nname: foo\nbody never closes\n");
+        let err = parse_skill_md(&p).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("unclosed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_skill_oversize_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // 65 KiB body — total file exceeds 64 KiB limit
+        let body = "x".repeat(65 * 1024);
+        let p = write_skill(
+            dir.path(),
+            "huge.md",
+            &skill_md("huge", "Too big", &[], &body),
+        );
+        let err = parse_skill_md(&p).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("64 kib"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_skill_yaml_missing_name_errors() {
+        // `name:` is required by SkillFrontmatter (no #[serde(default)]).
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(
+            dir.path(),
+            "noname.md",
+            "---\ndescription: just a description\n---\nbody\n",
+        );
+        let err = parse_skill_md(&p).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_skill_optional_fields_default_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(dir.path(), "min.md", "---\nname: bare\n---\nbody only\n");
+        let s = parse_skill_md(&p).expect("parses minimal");
+        assert_eq!(s.name, "bare");
+        assert_eq!(s.description, "");
+        assert!(s.triggers.is_empty());
+        assert_eq!(s.body, "body only");
+    }
+
+    // ── SkillRegistry (3) ────────────────────────────────────────────
+
+    #[test]
+    fn new_registry_is_empty() {
+        let r = SkillRegistry::new();
+        assert!(r.list().is_empty());
+    }
+
+    #[test]
+    fn search_matches_name_description_triggers_case_insensitively() {
+        let r = registry_with(vec![
+            skill("nix", "Nix tips", &["flake"], "body"),
+            skill("rust", "Rust building", &["cargo"], "body"),
+            skill("git", "Version control", &["commit"], "body"),
+        ]);
+        // Name match (case-insensitive)
+        assert_eq!(r.search("NIX").len(), 1);
+        // Description match
+        assert_eq!(r.search("building").len(), 1);
+        assert_eq!(r.search("building")[0].name, "rust");
+        // Trigger match
+        assert_eq!(r.search("flake").len(), 1);
+        // No match
+        assert!(r.search("nothing").is_empty());
+    }
+
+    #[test]
+    fn scan_paths_dedupes_across_dirs_priority_to_first() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        write_skill(
+            dir_a.path(),
+            "shared.md",
+            &skill_md("shared", "from A", &[], "A body"),
+        );
+        write_skill(
+            dir_a.path(),
+            "only_a.md",
+            &skill_md("only_a", "A only", &[], "A only body"),
+        );
+        // Non-.md is skipped
+        write_skill(dir_a.path(), "notes.txt", "ignored");
+        // Malformed .md is skipped (warning logged, doesn't blow up the scan)
+        write_skill(dir_a.path(), "broken.md", "not valid frontmatter\n");
+
+        write_skill(
+            dir_b.path(),
+            "shared.md",
+            &skill_md("shared", "from B", &[], "B body"),
+        );
+        write_skill(
+            dir_b.path(),
+            "only_b.md",
+            &skill_md("only_b", "B only", &[], "B only body"),
+        );
+
+        let mut r = SkillRegistry::new();
+        r.scan_paths(&[
+            dir_a.path().to_path_buf(),
+            dir_b.path().to_path_buf(),
+            // Non-existent dir is silently skipped
+            PathBuf::from("/nonexistent/path/that/does/not/exist"),
+        ]);
+
+        let names: std::collections::HashSet<String> =
+            r.list().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names.len(), 3, "expected 3 unique skills, got {names:?}");
+        assert!(names.contains("shared"));
+        assert!(names.contains("only_a"));
+        assert!(names.contains("only_b"));
+
+        // First-wins dedupe: dir_a's "shared" should win over dir_b's.
+        let shared = r.list().iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.description, "from A");
+    }
+
+    // ── format_catalog (4) ───────────────────────────────────────────
+
+    #[test]
+    fn format_catalog_empty_returns_none() {
+        assert!(format_catalog(&[]).is_none());
+    }
+
+    fn cat_entry(name: &str, description: &str) -> CatalogEntry {
+        CatalogEntry {
+            name: name.into(),
+            description: description.into(),
+            body: String::new(),
+            source: SkillSource::Disk,
+        }
+    }
+
+    #[test]
+    fn format_catalog_single_entry_has_header_and_line() {
+        let out = format_catalog(&[cat_entry("nix", "Nix tips")]).unwrap();
+        assert!(out.starts_with("## Available skills\n"));
+        assert!(out.contains("`name` to load its full instructions"));
+        assert!(out.contains("- **nix** — Nix tips"));
+    }
+
+    #[test]
+    fn format_catalog_preserves_input_order() {
+        let out = format_catalog(&[
+            cat_entry("zebra", "Z"),
+            cat_entry("apple", "A"),
+            cat_entry("mango", "M"),
+        ])
+        .unwrap();
+        let z = out.find("zebra").unwrap();
+        let a = out.find("apple").unwrap();
+        let m = out.find("mango").unwrap();
+        assert!(z < a && a < m, "order not preserved in: {out}");
+    }
+
+    #[test]
+    fn format_catalog_emits_one_line_per_entry() {
+        let out = format_catalog(&[
+            cat_entry("a", "one"),
+            cat_entry("b", "two"),
+            cat_entry("c", "three"),
+        ])
+        .unwrap();
+        let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("- **")).collect();
+        assert_eq!(lines.len(), 3);
+    }
+
+    // ── tools (6) ────────────────────────────────────────────────────
+
+    fn shared_registry(skills: Vec<Skill>) -> Arc<std::sync::RwLock<SkillRegistry>> {
+        Arc::new(std::sync::RwLock::new(registry_with(skills)))
+    }
+
+    #[tokio::test]
+    async fn skill_list_descriptor_and_low_risk() {
+        let t = SkillListTool {
+            registry: shared_registry(vec![]),
+        };
+        let d = t.descriptor();
+        assert_eq!(d.name, "skill_list");
+        // No required arguments.
+        assert!(d.parameters.get("required").is_none());
+        assert!(matches!(t.default_policy().risk, RiskLevel::Low));
+    }
+
+    #[tokio::test]
+    async fn skill_list_empty_registry_returns_sentinel() {
+        let t = SkillListTool {
+            registry: shared_registry(vec![]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert_eq!(out, "(no skills loaded)");
+    }
+
+    #[tokio::test]
+    async fn skill_list_populated_renders_numbered_entries_with_triggers() {
+        let t = SkillListTool {
+            registry: shared_registry(vec![
+                skill("nix", "Nix tips", &["flake", "nixos"], "body"),
+                skill("rust", "Rust building", &["cargo"], "body"),
+            ]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.contains("1. **nix**"));
+        assert!(out.contains("2. **rust**"));
+        assert!(out.contains("flake, nixos"));
+    }
+
+    #[tokio::test]
+    async fn skill_search_descriptor_requires_query() {
+        let t = SkillSearchTool {
+            registry: shared_registry(vec![]),
+        };
+        let d = t.descriptor();
+        assert_eq!(d.name, "skill_search");
+        let required = d.parameters["required"].as_array().expect("required[]");
+        assert!(required.iter().any(|v| v == "query"));
+        assert!(matches!(t.default_policy().risk, RiskLevel::Low));
+    }
+
+    #[tokio::test]
+    async fn skill_search_no_match_returns_helpful_message() {
+        let t = SkillSearchTool {
+            registry: shared_registry(vec![skill("nix", "Nix tips", &["flake"], "body")]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        let out = t
+            .execute(serde_json::json!({ "query": "nothing" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("No skills matching"));
+        assert!(out.contains("nothing"));
+    }
+
+    #[tokio::test]
+    async fn skill_search_matches_render_as_numbered_list() {
+        let t = SkillSearchTool {
+            registry: shared_registry(vec![
+                skill("nix", "Nix tips", &["flake"], "body"),
+                skill("rust", "Rust", &["cargo"], "body"),
+            ]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        let out = t
+            .execute(serde_json::json!({ "query": "nix" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("1. **nix**"));
+        assert!(!out.contains("rust"));
+    }
+
+    // ── PromptAugmentation (2) ───────────────────────────────────────
+
+    fn session_skills_with_disk(
+        disk: Arc<std::sync::RwLock<SkillRegistry>>,
+        registry: Arc<crate::session::SessionRegistry>,
+    ) -> SessionSkills {
+        SessionSkills {
+            disk,
+            registry,
+            agent_index: crate::hosted_index::HostedIndex::empty("agent"),
+            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
+            session_attached_banks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_augmentation_empty_catalog_returns_none() {
+        let (_i, registry) = fresh_session_registry().await;
+        let inputs = Arc::new(session_skills_with_disk(shared_registry(vec![]), registry));
+        let aug = SkillsPromptAugmentation { inputs };
+        let out = aug
+            .augment_system_prompt("test-agent", &[])
+            .await
+            .expect("cap call succeeds");
+        assert!(out.is_none(), "expected no augmentation, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn prompt_augmentation_renders_disk_catalog() {
+        let (_i, registry) = fresh_session_registry().await;
+        let disk = shared_registry(vec![
+            skill("nix", "Nix tips", &[], "body"),
+            skill("rust", "Rust building", &[], "body"),
+        ]);
+        let inputs = Arc::new(session_skills_with_disk(disk, registry));
+        let aug = SkillsPromptAugmentation { inputs };
+        let out = aug
+            .augment_system_prompt("test-agent", &[])
+            .await
+            .expect("cap call succeeds")
+            .expect("non-empty augmentation");
+        assert!(out.starts_with("## Available skills\n"));
+        assert!(out.contains("- **nix** — Nix tips"));
+        assert!(out.contains("- **rust** — Rust building"));
+    }
+
+    // ── Extension trait surface (3) ──────────────────────────────────
+
+    async fn skills_extension() -> SkillsExtension {
+        let (_i, registry) = fresh_session_registry().await;
+        SkillsExtension::new(
+            registry,
+            crate::hosted_index::HostedIndex::empty("agent"),
+            crate::hosted_index::HostedIndex::empty("skill_bank"),
+        )
+    }
+
+    #[tokio::test]
+    async fn extension_name_and_hooks() {
+        let ext = skills_extension().await;
+        assert_eq!(ext.name(), "skills");
+        let hooks = ext.supported_hooks();
+        assert!(hooks.contains(&HookKind::Tool));
+        assert!(hooks.contains(&HookKind::Command));
+    }
+
+    #[tokio::test]
+    async fn extension_scopes_global_and_persession() {
+        let ext = skills_extension().await;
+        let scopes = ext.scopes();
+        assert!(scopes.contains(&crate::extension::Scope::Global));
+        assert!(scopes.contains(&crate::extension::Scope::PerSession));
+        assert!(!scopes.contains(&crate::extension::Scope::PerAgent));
+    }
+
+    #[tokio::test]
+    async fn extension_manifest_provides_prompt_augmentation() {
+        let ext = skills_extension().await;
+        let manifest = ext.manifest();
+        assert_eq!(manifest.name, "skills");
+        assert!(
+            manifest
+                .provides_capabilities
+                .contains(&CapabilityKind::PromptAugmentation)
+        );
+        // Tool + Command hooks reflected on the manifest as well.
+        assert!(manifest.supported_hooks.contains(&HookKind::Tool));
+        assert!(manifest.supported_hooks.contains(&HookKind::Command));
+    }
 }

@@ -13,9 +13,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::agent::AgentRegistry;
 use crate::gateway::{ApprovalDecision, ApprovalExchange};
 use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
-use crate::session::Session;
+use crate::session::{Session, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
 use crate::tool_host::{NativeToolHost, ToolHost};
 use crate::types::ConversationId;
@@ -52,6 +53,19 @@ pub(crate) async fn fresh_session() -> (Instance, Arc<TokioMutex<Session>>) {
     let conv_id = ConversationId(db.root_id().to_string());
     let session = Arc::new(TokioMutex::new(Session::new(conv_id, db).await));
     (instance, session)
+}
+
+/// Fresh in-memory `SessionRegistry` wired against a one-user instance, holding
+/// only the bare-bones `"default"` agent. Used by extension tests that need a
+/// `SessionRegistry` handle (e.g. to construct a `SkillsPromptAugmentation`)
+/// without standing up the full server stack.
+pub(crate) async fn fresh_session_registry() -> (Instance, Arc<SessionRegistry>) {
+    let (instance, user) = fresh_eidetica().await;
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = SessionRegistry::new(instance.clone(), user, agents)
+        .await
+        .unwrap();
+    (instance, Arc::new(registry))
 }
 
 /// Permissive `SecurityContext`: redact-mode leak scanning, no approval gate,
