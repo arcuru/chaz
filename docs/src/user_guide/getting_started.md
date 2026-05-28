@@ -18,12 +18,16 @@ nix run github:arcuru/chaz -- --config config.yaml --tui
 
 ### From Source
 
+Chaz is rustls-based and only needs a Rust toolchain plus `pkg-config` at build time (no system OpenSSL or SQLite). The Nix dev shell provides everything.
+
 ```bash
 git clone https://github.com/arcuru/chaz
 cd chaz
-nix develop .#   # or install pkg-config, openssl, sqlite manually
-cargo build --release
+nix develop .#         # or install rustc + cargo + pkg-config yourself
+cargo build --release  # binary at ./target/release/chaz
 ```
+
+The trailing `.#` on `nix develop` is required — without it Nix picks up eidetica's flake from the workspace.
 
 ### Docker
 
@@ -89,9 +93,29 @@ Type `/help` to see available commands.
 chaz --config config.yaml
 ```
 
-The bot will log in to Matrix, accept room invites from allowed users, and respond to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages.
+The bot will log in to Matrix, accept room invites from allowed users, and respond to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages or messages that @-mention the bot.
 
 See [Matrix Bot](matrix.md) for details.
+
+## Single-shot CLI
+
+For scripted use or scheduling, run a single prompt and exit:
+
+```bash
+chaz --config config.yaml --cli "Summarize the last meeting notes."
+```
+
+There is no interactive approval — tools requiring approval are auto-denied unless they're in the CLI's auto-approved list (default: `shell`, `write_file`; override with the `cli:` config block). Pass `--session NAME` to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (`chaz-cli.log`); only the agent's reply goes to stdout so the output is pipe-friendly.
+
+## Aggregated cost / usage
+
+```bash
+chaz --config config.yaml usage           # human-readable rollup
+chaz --config config.yaml usage --json    # for piping
+chaz --config config.yaml usage --gateway cli --active-only
+```
+
+Walks every session in the state directory and aggregates LLM token/cost metadata. Read-only — no gateway, scheduler, or sync starts. See [Cost Tracking & Usage](usage.md).
 
 ## Troubleshooting
 

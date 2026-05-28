@@ -27,49 +27,150 @@ chaz --config config.yaml --tui
 +-----------------------------------------------------+
 ```
 
-The TUI has three sections:
+The TUI has four main pieces:
 
-1. **Messages area** — conversation history with all entry types
-2. **Status bar** — current session, agent, message count
-3. **Input box** — type messages and commands
+1. **Tab bar** — one tab per open session. Click to switch, `[x]` to close, or use `Ctrl+PageUp`/`Ctrl+PageDown`. Closing the last tab is refused (the TUI always shows at least one session).
+2. **Messages area** — conversation history with all entry types
+3. **Status bar** — current session, agent, message count, `/help` hint
+4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight.
+
+When prior sessions exist, the TUI opens straight into the session picker on launch so you choose which one to resume (or pick the "New session" row). A truly fresh state directory drops directly into the default `tui` session.
 
 ## Commands
 
-| Command                       | Description                                                            |
-| ----------------------------- | ---------------------------------------------------------------------- |
-| `/help`, `/?`                 | Show all commands and key bindings                                     |
-| `/sessions`, `/s`             | Open session picker                                                    |
-| `/new`                        | Create a new session                                                   |
-| `/join <id>`                  | Switch to a session by name or eidetica DB ID                          |
-| `/name <alias>`               | Set a human-friendly name for the current session                      |
-| `/name`                       | Clear the session name                                                 |
-| `/info`                       | Show current session details (name, DB ID, entry counts)               |
-| `/costs`                      | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
-| `/share`                      | Generate a shareable ticket URL for the current session                |
-| `/sync <ticket>`              | Sync a remote session via a ticket URL                                 |
-| `/channels`                   | List Matrix rooms currently attached to the session                    |
-| `/compact`                    | Summarize and compact conversation history                             |
-| `/print`                      | Dump the transcript                                                    |
-| `/model [<m>]`                | Show or set the model for the session                                  |
-| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                         |
-| `/backend <name> <url> <key>` | Add a custom backend for the session                                   |
-| `/backends`                   | List known backends and models                                         |
-| `/clear`                      | Clear the display (entries remain in the database)                     |
-| `/raw`                        | Dump all raw entry data (index, timestamp, type, sender, content)      |
-| `/debug`                      | Toggle debug mode                                                      |
-| `/quit`, `/q`                 | Exit                                                                   |
+The TUI catalogs every built-in slash command in its inline completion popup — type `/` to open it, `Tab` / arrow keys to navigate, `Enter` to insert. `F1` or `/help` shows the same catalog as a scrollable overlay. The list below is the same one rendered there, grouped the same way.
+
+### Session
+
+| Command           | Description                                                            |
+| ----------------- | ---------------------------------------------------------------------- |
+| `/help`, `/?`     | Open the help overlay (also `F1`)                                      |
+| `/sessions`, `/s` | Open the session picker (also `Ctrl+P`)                                |
+| `/new`            | Create a new session and switch to it                                  |
+| `/join <ref>`     | Switch to a session by name or eidetica DB ID                          |
+| `/name <alias>`   | Set a human-friendly alias for the current session (also `/rename`)    |
+| `/name`           | Clear the session alias                                                |
+| `/info`           | Show current session details (name, DB ID, entry counts)               |
+| `/costs`          | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
+| `/channels`       | List Matrix rooms currently attached to this session                   |
+| `/share`          | Generate a shareable ticket URL for the current session                |
+| `/sync <ticket>`  | Sync a remote session via a ticket URL                                 |
+| `/compact`        | Summarize and compact conversation history                             |
+| `/print`          | Dump the transcript                                                    |
+
+### Living Agents
+
+See [Agents](agents.md) for the model and full per-command behaviour.
+
+| Command                                            | Description                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------- |
+| `/agents`, `/agent list`                           | List agents attached to this session                                      |
+| `/agent add <ref>`                                 | Attach an agent (display name or DB ID)                                   |
+| `/agent remove <ref>`                              | Detach an agent                                                           |
+| `/agent host [<ref>]`                              | Set (or clear, with no arg) the session's host agent                      |
+| `/agent room`                                      | Chat-room status: roster, host, burst budget                              |
+| `/agent hosted`                                    | List every Living Agent this peer hosts                                   |
+| `/agent new <name> [k=v ...]`                      | Create a Living Agent on this peer                                        |
+| `/agent set <ref> <field> <value>`                 | Edit an agent's runtime config (takes effect on next message)             |
+| `/agent delete <ref>`                              | Unregister a Living Agent (DB preserved)                                  |
+| `/agent share <ref>`                               | Generate a share ticket for an agent's DB                                 |
+| `/agent unshare <ref>`                             | Stop sharing an agent DB                                                  |
+| `/agent import <ticket> [perm]`                    | Request access to an agent DB (`admin`\|`write`\|`read`, default `write`) |
+| `/agent invite <ref> <pubkey> [perm]`              | Pre-seed another peer's pubkey on this agent (`admin`\|`write`\|`read`)   |
+| `/agent revoke-peer <ref> <pubkey>`                | Revoke a co-owner's access                                                |
+| `/agent rehost [--agent] [--clear] <ref> [pubkey]` | Reassign the home peer for an agent or its session-level entry            |
+| `/agent home-status [<ref>]`                       | List `home_pubkey` per agent + session                                    |
+| `/pubkey`                                          | Show this peer's default pubkey                                           |
+
+### Memory & Skill banks
+
+See [Memory](memory.md).
+
+| Command                               | Description                                                    |
+| ------------------------------------- | -------------------------------------------------------------- |
+| `/memory list`                        | List memory banks this peer hosts                              |
+| `/memory new <name>`                  | Create a new bank on this peer                                 |
+| `/memory delete <name>`               | Unregister a bank (DB preserved)                               |
+| `/memory grant <bank> <agent> [perm]` | Grant an agent access to a bank (`read`\|`write`)              |
+| `/memory revoke <bank> <agent>`       | Revoke an agent's access                                       |
+| `/memory share <name>`                | Generate a share ticket for a bank's DB                        |
+| `/memory unshare <name>`              | Stop sharing a memory bank                                     |
+| `/memory import <ticket> [perm]`      | Request access to a bank via ticket (`admin`\|`write`\|`read`) |
+
+### Sharing queue (co-ownership)
+
+| Command                       | Description                                   |
+| ----------------------------- | --------------------------------------------- |
+| `/sharing`, `/sharing status` | List databases this peer is currently sharing |
+| `/sharing requests`           | List pending bootstrap requests               |
+| `/sharing approve <id>`       | Approve a bootstrap request by id             |
+| `/sharing reject <id>`        | Reject a bootstrap request by id              |
+| `/unshare`                    | Stop sharing the current session              |
+
+### Schedule
+
+See [Agents — Schedules](agents.md#schedules).
+
+| Command                                       | Description                                               |
+| --------------------------------------------- | --------------------------------------------------------- |
+| `/schedule list`                              | List an agent's schedules                                 |
+| `/schedule add <id> <cron> <agent> <task...>` | Add a schedule (6-field cron: `sec min hour dom mon dow`) |
+| `/schedule remove <id>`                       | Remove a schedule by id                                   |
+
+### Extensions
+
+See [Extensions](extensions.md). Extensions can also register their own slash commands; they appear in the completion popup once installed.
+
+| Command                                | Description                                                 |
+| -------------------------------------- | ----------------------------------------------------------- |
+| `/extensions`, `/extensions list`      | List extensions and per-session/per-agent status            |
+| `/extensions add <name> [agent]`       | Enable an extension on this session or for a specific agent |
+| `/extensions remove <name> [agent]`    | Disable an extension                                        |
+| `/extensions settings <name>`          | Print the extension's settings                              |
+| `/extensions set <name> <key> <value>` | Update an extension setting                                 |
+
+### LLM config
+
+| Command                       | Description                           |
+| ----------------------------- | ------------------------------------- |
+| `/model [<model>]`            | Show or set the model for the session |
+| `/role [<name> [<prompt>]]`   | Show, select, or define a role        |
+| `/backend <name> <url> <key>` | Add a custom backend for the session  |
+| `/backends`                   | List known backends and models        |
+
+### TUI utilities
+
+| Command                | Description                                                   |
+| ---------------------- | ------------------------------------------------------------- |
+| `/clear`               | Clear the display (entries remain in the database)            |
+| `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content) |
+| `/debug`               | Toggle debug mode (also `Ctrl+D`)                             |
+| `/quit`, `/q`, `/exit` | Exit                                                          |
+
+Unknown `/<name>` commands route to extension dispatch — see the error you get back for the closest match.
 
 ## Key Bindings
 
-| Key               | Action                            |
-| ----------------- | --------------------------------- |
-| `Enter`           | Send message or execute command   |
-| `Ctrl+D`          | Toggle debug mode                 |
-| `Ctrl+C`          | Quit                              |
-| `Up/Down`         | Scroll messages (3 lines)         |
-| `PageUp/PageDown` | Fast scroll (20 lines)            |
-| `Home/End`        | Move cursor to start/end of input |
-| `Esc`             | Quit                              |
+| Key                             | Action                                                              |
+| ------------------------------- | ------------------------------------------------------------------- |
+| `Enter`                         | Accept highlighted completion (if extending); else send / execute   |
+| `Tab` / `Shift+Tab`             | Open completion popup and cycle highlighted entry                   |
+| `Up` / `Down`                   | Move completion selection if popup is open; else scroll history (3) |
+| `PageUp` / `PageDown`           | Fast scroll history (20 lines)                                      |
+| `Home` / `End`                  | Move cursor to start / end of input                                 |
+| `Esc`                           | First press: dismiss completion popup. Second (no popup): quit      |
+| `F1`                            | Open the help overlay                                               |
+| `Ctrl+P`                        | Toggle the session picker                                           |
+| `Ctrl+D`                        | Toggle debug mode                                                   |
+| `Ctrl+W`                        | Close the active tab (refuses to close the last tab)                |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | Cycle to previous / next tab (wraps)                                |
+| `Ctrl+C`                        | Quit                                                                |
+
+Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` approve all remaining tool calls for this turn.
+
+### Mouse
+
+Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls history (or the active overlay when one is open).
 
 ## Debug Mode
 

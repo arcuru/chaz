@@ -1,27 +1,29 @@
 # Chaz
 
-Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects to LLM providers via OpenAI-compatible APIs and orchestrates agents that reason, act, and use tools in a ReAct loop.
+Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects to OpenAI-compatible LLM providers and orchestrates Living Agents that reason, act, and use tools in a ReAct loop. Agents, memory banks, and sessions are stored in syncable per-entity eidetica databases, so the same agent (with its persona and memories) can co-own conversations across multiple peers.
 
 ## Key Features
 
-- **ReAct tool-calling loop** with 11 built-in tools + external MCP tools
-- **Multi-agent orchestration** with depth limiting and transitive tool narrowing
-- **Persistent sessions** backed by [eidetica](https://github.com/arcuru/eidetica) (CRDT-based, syncable) with named sessions
-- **Session sharing** between instances via eidetica sync and shareable ticket URLs
-- **MCP external tools** with auto-restart, policy enforcement, and tool profiles
-- **TUI mode** for local testing, debugging, and session management
-- **Matrix integration** for production deployment as a chat bot
-- **Scheduled tasks** via cron-driven directive injection
-- **Security controls** including leak detection, SSRF protection, XML output wrapping, tool rate limiting, shell sandboxing, and approval gates
+- **ReAct tool-calling loop** with built-in tools (shell, file I/O, web fetch, search, calculate, time, memory, spawn, compact, schedule, describe) plus external MCP tools.
+- **Living Agents** — per-agent eidetica DBs with persona, memory banks, schedules, presets, and co-ownership across peers.
+- **Multi-agent orchestration** with depth limiting, transitive tool narrowing, and a per-room burst budget to backstop runaways.
+- **Persistent, syncable sessions** backed by [eidetica](https://github.com/arcuru/eidetica). Named sessions; share via ticket URLs.
+- **MCP external tools** with auto-restart, policy enforcement, and presentation modes.
+- **TUI, Matrix, and single-shot CLI** gateways over the same session model.
+- **Scheduled, agent-owned wakes** via a cron-driven routine engine (no broadcast directives).
+- **Security controls** — leak detection, SSRF protection, shell sandboxing (allow/deny + bubblewrap host), tool rate limiting, and explicit approval gates.
 
 ## Quick Start
 
 ```bash
-# Run with Matrix
+# Matrix bot
 chaz --config config.yaml
 
-# Run with TUI
+# Local TUI
 chaz --config config.yaml --tui
+
+# Single-shot CLI (scriptable; one ReAct turn then exit)
+chaz --config config.yaml --cli "Summarize today's stand-up."
 ```
 
 See [Getting Started](user_guide/getting_started.md) for detailed setup instructions.

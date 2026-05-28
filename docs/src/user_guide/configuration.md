@@ -5,11 +5,14 @@ Chaz is configured via a YAML file passed with `--config`.
 ## Full Example
 
 ```yaml
-# Matrix connection (not needed for TUI-only)
+# Matrix connection (not needed for TUI-only or CLI-only modes)
 homeserver_url: https://matrix.org
 username: "chaz"
-password: "hunter2"
-allow_list: "@user:matrix.org|@other:matrix.org" # Regex
+password: "hunter2" # If unset, prompted on first run
+allow_list: "@user:matrix.org|@other:matrix.org" # Regex matched against the sender's Matrix ID
+# message_limit: 500           # Optional: per-account message cap while the bot runs
+# room_size_limit: 100         # Optional: refuse to respond in rooms with more than N members
+# chat_summary_model: "gpt-4o-mini"  # Optional: separate model for chat summarization
 
 # Persistence
 state_dir: "/path/to/state" # Default: $XDG_STATE_HOME/chaz
@@ -32,31 +35,39 @@ backends:
     models:
       - name: llama3
 
-# Agent definitions. Each agent embeds its persona (system prompt)
-# directly. The legacy top-level `roles:` block is deprecated — see
-# `user_guide/agents.md` for the migration path.
+# Agent definitions. Each agent's system prompt comes from `system_prompt:`
+# (inline string) and/or `system_prompt_files:` (file paths whose contents
+# are concatenated, then the inline string is appended).
+#
+# YAML `agents:` is a *first-boot template only* — the per-agent eidetica
+# DB (AgentDb) is the runtime source of truth afterwards. Use `/agent set`
+# (TUI) or `!chaz agent set` (Matrix) to edit a live agent. See
+# `user_guide/agents.md`.
 agents:
   - name: default
-    persona:
-      description: "Default assistant"
-      prompt: "You are Chaz, a helpful AI assistant."
+    system_prompt: "You are Chaz, a helpful AI assistant."
     max_iterations: 10
-    allowed_tools: null # null = all tools
+    tools: null # null = all tools
     can_spawn: ["researcher", "coder"]
   - name: researcher
-    persona:
-      description: "Research agent"
-      prompt: "You are a research assistant. Use web_fetch to find information."
+    system_prompt: "You are a research assistant. Use web_fetch to find information."
     max_iterations: 20
-    allowed_tools: ["web_fetch", "calculate", "get_time", "remember", "recall"]
+    tools: ["web_fetch", "calculate", "get_time", "remember", "recall"]
   - name: coder
-    persona:
-      description: "Coding agent"
-      # Pull repo-level instructions from a file; layer inline guidance on top.
-      files: ["~/code/myproject/AGENTS.md"]
-      prompt: "Edit files in-place; never rewrite from scratch."
+    # Pull repo-level instructions from a file; layer inline guidance on top.
+    system_prompt_files: ["~/code/myproject/AGENTS.md"]
+    system_prompt: "Edit files in-place; never rewrite from scratch."
     max_iterations: 15
-    allowed_tools: ["shell", "read_file", "write_file", "calculate"]
+    tools: ["shell", "read_file", "write_file", "calculate"]
+    # Auto-attach memory/skill banks at agent bootstrap. Missing banks are
+    # warned and skipped; default_memory_banks auto-creates missing banks.
+    default_memory_banks: ["code-notes"]
+    # default_skill_banks: ["coding-skills"]
+    # Optional: who is allowed to spawn this agent (None/empty = any caller
+    # with can_spawn permission)
+    # allowed_callers: ["default"]
+    # Allow this agent to run without user input (scheduled wakes)
+    # autonomous: false
 
 # Security
 security:
@@ -75,21 +86,39 @@ security:
   leak_policy: "redact" # "redact" (default) or "block"
   tool_policies:
     shell:
-      approval: Always
-      rate_limit: 5 # max 5 calls per minute
+      approval: always # never | unless_auto_approved | always
+      rate_limit: 5 # max 5 calls per minute (omit = unlimited)
     web_fetch:
-      approval: UnlessAutoApproved
-      timeout: 30
+      approval: unless_auto_approved
+      timeout: 30 # seconds (default 60)
 
-# MCP external tools (subprocess JSON-RPC)
+# MCP external tools. Stdio subprocess transport when `command` is set;
+# Streamable HTTP transport when `url` is set. See `user_guide/mcp.md`.
 mcp_servers:
   - name: filesystem
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+    env:
+      NODE_ENV: production
     default_policy:
       risk: medium
       approval: unless_auto_approved
       timeout: 30
+  # - name: remote-mcp
+  #   url: "http://localhost:8080/mcp"
+
+# Optional: scan a directory for additional MCP server manifest files
+# (.yaml/.json), one server per file. Merged with `mcp_servers` above.
+# mcp_server_dir: "/etc/chaz/mcp.d"
+
+# Optional: named tool profiles control how the LLM sees tool definitions.
+# Reference one from an agent definition with `tool_profile: brief`.
+# tool_profiles:
+#   brief:
+#     default: full      # full | brief | summary | hidden
+#     tools:
+#       "filesystem.*": summary
+#       shell: full
 
 # Scheduled tasks — imported at startup as agent-owned schedules in the
 # owning agent's DB (Pinned to the resolved session), fired by the same
@@ -147,6 +176,11 @@ embedding:
   backend: openai
   model: text-embedding-3-small
   api_key: "${OPENAI_API_KEY}"
+# Single-shot CLI mode (--cli) cannot prompt for tool approval interactively,
+# so a curated allowlist of tools is auto-approved instead. Defaults to
+# [shell, write_file]. Override or extend with your own list.
+# cli:
+#   auto_approved_tools: [shell, write_file, web_fetch]
 ```
 
 ## Web search
@@ -249,7 +283,25 @@ Retries use exponential backoff (1s, 2s, 4s, … capped at 30s). Rate-limit resp
 
 ## Agents
 
-Agent definitions control which tools an agent can use, which other agents it can spawn, and its system prompt. See [Agents](agents.md) for details.
+Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in the DB, not the YAML. See [Agents](agents.md) for the runtime model and live-edit commands. Per-agent fields:
+
+| Field                  | Type                   | Notes                                                                                                  |
+| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------ |
+| `name`                 | string                 | Required. Display name; also the lookup key for `default_role`, `/agent add`, `can_spawn`, schedules.  |
+| `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                  |
+| `system_prompt_files`  | list of paths          | File contents concatenated into the system prompt. `~` expansion supported.                            |
+| `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.   |
+| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace.*` globs for MCP tools.             |
+| `can_spawn`            | list of agent names    | Which agents this one is allowed to spawn (via `spawn_agent`).                                         |
+| `allowed_callers`      | list of agent names    | Which agents may spawn _this_ one. `null`/empty = anyone with `can_spawn` for it.                      |
+| `max_iterations`       | int                    | ReAct loop cap. Default 10.                                                                            |
+| `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                      |
+| `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                    |
+| `tool_profile`         | string                 | References a key in top-level `tool_profiles`.                                                         |
+| `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy. |
+| `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                           |
+| `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                     |
+| `presets`              | map<name, AgentPreset> | Named override bundles selectable at spawn time (model / iters / tools / role suffix / tool_profile).  |
 
 ## Security
 
@@ -279,6 +331,42 @@ schedules:
 ## Context
 
 Token budgeting for the LLM context window. Uses tiktoken (cl100k_base) for accurate token counting. `max_context_tokens` sets the total budget, `reserved_output_tokens` is subtracted for the LLM's response. Per-agent overrides via `max_context_tokens` on agent definitions.
+
+## Multi-agent rooms
+
+Tuning for chat-room sessions where multiple agents are active. Currently a single knob:
+
+| Field          | Default | Notes                                                                                                                                                                                                                                                                                                                   |
+| -------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `burst_budget` | `6`     | Maximum length of an agent→agent message chain since the last human or `Directive`. Once exceeded, further mention-chained agent wakes are suppressed until a human (or schedule) speaks. Runaway backstop. Inspect at runtime with `/agent room`. See [`design/autonomous_agents.md`](../design/autonomous_agents.md). |
+
+```yaml
+multi_agent:
+  burst_budget: 6
+```
+
+## Extensions
+
+Operator-level scoping for the extension framework. See [Extensions](extensions.md) for the per-extension reference.
+
+`agent_state_allowlist:` maps each extension name to the list of agent display names whose runtime state that extension is allowed to read/mutate via the `AgentStateAdmin` capability. An absent entry is unrestricted (all hosted agents visible); an empty list (`[]`) denies the cap entirely (logged at WARN at startup — to a tool a scoped-out agent looks identical to a non-existent one).
+
+```yaml
+agent_state_allowlist:
+  schedule: [chaz, bash]
+  memory: [chaz]
+```
+
+## CLI mode
+
+`chaz --cli "<prompt>"` runs a single ReAct turn and exits. There is no interactive approval surface, so a small set of tools must be pre-approved to make the mode useful. Defaults to `[shell, write_file]`. Override per-deployment:
+
+```yaml
+cli:
+  auto_approved_tools: [shell, write_file, web_fetch]
+```
+
+`--cli --session NAME` reuses a named session across invocations (find-or-create). Without `--session` each invocation creates a fresh ephemeral session.
 
 ## State Directory
 

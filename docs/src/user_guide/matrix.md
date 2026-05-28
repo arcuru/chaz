@@ -25,31 +25,54 @@ To send without the `!chaz` prefix in a DM, just type normally.
 
 ## Commands
 
-Commands are sent as Matrix messages. Session ops (sessions, info, name, share, sync, compact, print, schedules, run, model, role, backend, backends, channels) go through the same transport-neutral dispatch as the TUI — so both gateways stay in sync.
+Commands are sent as Matrix messages. Session ops go through the same transport-neutral dispatch as the TUI — both gateways stay in sync. Most TUI slash commands have a `!chaz` equivalent; the table below covers the common surface. Extension-registered commands (e.g. `!chaz schedule`, `!chaz memory`) are auto-registered for whichever extensions are installed — see the relevant page for syntax.
 
-| Command                                     | Description                                            |
-| ------------------------------------------- | ------------------------------------------------------ |
-| `!chaz sessions`                            | List every session known to the registry               |
-| `!chaz info`                                | Show details for the session attached to this room     |
-| `!chaz name [<alias>]`                      | Set (or clear) a human-friendly alias for this session |
-| `!chaz attach <session>`                    | Bind this room to a specific session (name or DB ID)   |
-| `!chaz detach`                              | Detach this room from its session                      |
-| `!chaz channels`                            | List Matrix rooms currently attached to this session   |
-| `!chaz share`                               | Generate a shareable ticket URL for this session       |
-| `!chaz sync <ticket>`                       | Sync a remote session via ticket URL                   |
-| `!chaz compact`                             | Summarize and compact conversation history             |
-| `!chaz print`                               | Print the current conversation context                 |
-| `!chaz schedules`                           | List configured schedules                              |
-| `!chaz run <name>`                          | Trigger a schedule immediately                         |
-| `!chaz model <model>`                       | Set the model for this session                         |
-| `!chaz role [<name> [<prompt>]]`            | Show, select, or define a role                         |
-| `!chaz backend <name> <api_base> <api_key>` | Register a custom backend for this session             |
-| `!chaz backends`, `!chaz list`              | List known backends and models                         |
-| `!chaz approve` / `!chaz deny`              | Decide the pending tool approval                       |
-| `!chaz send <msg>`                          | One-shot message with no conversation context          |
-| `!chaz clear`                               | Ignore all messages before this point                  |
-| `!chaz rename`                              | Rename the Matrix room based on conversation content   |
-| `!chaz party`                               | 🎉                                                     |
+### Session
+
+| Command                  | Description                                          |
+| ------------------------ | ---------------------------------------------------- |
+| `!chaz sessions`         | List every session known to the registry             |
+| `!chaz info`             | Show details for the session attached to this room   |
+| `!chaz name [<alias>]`   | Set (or clear, with no arg) a human-friendly alias   |
+| `!chaz attach <session>` | Bind this room to a specific session (name or DB ID) |
+| `!chaz detach`           | Detach this room from its session                    |
+| `!chaz channels`         | List Matrix rooms currently attached to this session |
+| `!chaz share`            | Generate a shareable ticket URL for this session     |
+| `!chaz unshare`          | Stop sharing the current session                     |
+| `!chaz sync <ticket>`    | Sync a remote session via ticket URL                 |
+| `!chaz compact`          | Summarize and compact conversation history           |
+| `!chaz print`            | Print the current conversation context               |
+
+### Living Agents
+
+`!chaz agent <sub> [...]` — `add`, `remove`, `host`, `list`, `room`, `hosted`, `new`, `delete`, `share`, `unshare`, `import`, `set`, `invite`, `revoke-peer`, `rehost`, `home-status`. Mirrors `/agent ...` in the TUI; see [Agents](agents.md). `!chaz agents` lists the agents attached to this session. `!chaz pubkey` prints this peer's default pubkey (for `!chaz agent invite` from another peer).
+
+### Sharing queue
+
+`!chaz sharing [status | requests | approve <id> | reject <id>]` — inspect shared DBs and manage bootstrap requests across agent/bank/session DBs.
+
+### Extensions
+
+`!chaz extensions [list | add <name> [agent] | remove <name> [agent] | settings <name> | set <name> <key> <value>]` — per-session/per-agent extension control. See [Extensions](extensions.md).
+
+### LLM config
+
+| Command                                     | Description                                |
+| ------------------------------------------- | ------------------------------------------ |
+| `!chaz model [<model>]`                     | Show or set the model for this session     |
+| `!chaz role [<name> [<prompt>]]`            | Show, select, or define a role             |
+| `!chaz backend <name> <api_base> <api_key>` | Register a custom backend for this session |
+| `!chaz backends`, `!chaz list`              | List known backends and models             |
+
+### Approval & misc
+
+| Command                        | Description                                                                 |
+| ------------------------------ | --------------------------------------------------------------------------- |
+| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭) |
+| `!chaz send <msg>`             | One-shot message with no conversation context                               |
+| `!chaz clear`                  | Ignore all messages before this point                                       |
+| `!chaz rename`                 | Rename the Matrix room based on conversation content                        |
+| `!chaz party`                  | 🎉                                                                          |
 
 ## Session Attachment
 
