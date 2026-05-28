@@ -786,14 +786,15 @@ async fn save_last_fired(db: &Database, id: &RoutineId, when: DateTime<Utc>) -> 
 mod tests {
     use super::super::types::RoutineTarget;
     use super::*;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
+    use eidetica::{Instance, NewUser};
 
     async fn fixture_db() -> (Instance, Database) {
-        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let mut user = instance.login_user("test", None).await.unwrap();
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = Doc::new();
         s.set("name", "peer");
@@ -1083,9 +1084,10 @@ mod tests {
 
         // The Global-instance drain only runs when peer_handles is
         // wired, so stand up a minimal SessionRegistry-backed peer bag.
-        let inst = Instance::open(Box::new(InMemory::new())).await.unwrap();
-        let _ = inst.create_user("test", None).await;
-        let user = inst.login_user("test", None).await.unwrap();
+        let (inst, user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let agents = Arc::new(crate::agent::AgentRegistry::with_default_agent());
         let registry = Arc::new(
             crate::session::SessionRegistry::new(inst, user, agents)
@@ -1193,9 +1195,10 @@ mod tests {
         crate::agent_db::AgentDb,
     ) {
         use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
-        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
-        let _ = instance.create_user("t", None).await;
-        let mut user = instance.login_user("t", None).await.unwrap();
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+                .await
+                .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = Doc::new();
         s.set("name", "peer");

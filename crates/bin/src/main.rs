@@ -155,9 +155,15 @@ async fn main() -> anyhow::Result<()> {
         .map(|d| d.join("eidetica.db"))
         .unwrap_or_else(|| PathBuf::from("eidetica.db"));
     let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let instance = eidetica::Instance::open(Box::new(backend)).await?;
-    let _ = instance.create_user("chaz", None).await; // OK if already exists
-    let mut user = instance.login_user("chaz", None).await?;
+    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
+        Box::new(backend),
+        eidetica::NewUser::passwordless("chaz"),
+    )
+    .await?;
+    let mut user = match maybe_user {
+        Some(u) => u,
+        None => instance.login_user("chaz", None).await?,
+    };
 
     // Enable eidetica sync for session sharing. Register iroh P2P transport
     // by default (stable peer identity, no address config needed). If
@@ -943,9 +949,15 @@ async fn run_usage_subcommand(
         .map(|d| d.join("eidetica.db"))
         .unwrap_or_else(|| PathBuf::from("eidetica.db"));
     let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let instance = eidetica::Instance::open(Box::new(backend)).await?;
-    let _ = instance.create_user("chaz", None).await;
-    let user = instance.login_user("chaz", None).await?;
+    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
+        Box::new(backend),
+        eidetica::NewUser::passwordless("chaz"),
+    )
+    .await?;
+    let user = match maybe_user {
+        Some(u) => u,
+        None => instance.login_user("chaz", None).await?,
+    };
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {

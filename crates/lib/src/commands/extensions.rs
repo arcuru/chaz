@@ -333,8 +333,8 @@ mod tests {
     use crate::session::SessionRegistry;
     use crate::tool::{ScopedTools, ToolPolicyRegistry, ToolProfile, ToolRegistry};
     use crate::tool_host::NativeToolHost;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
     use std::sync::{Arc, OnceLock};
 
     /// Full-fat fixture: Server with every built-in extension registered,
@@ -354,9 +354,10 @@ mod tests {
 
     async fn fixture() -> Fixture {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let user = instance.login_user("test", None).await.unwrap();
+        let (instance, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             SessionRegistry::new(instance.clone(), user, agents.clone())

@@ -95,13 +95,14 @@ pub async fn read_agent_home_pubkey(database: &Database) -> Option<PublicKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
 
     async fn fresh_db() -> (Instance, eidetica::user::User, Database) {
-        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
-        let _ = instance.create_user("t", None).await;
-        let mut user = instance.login_user("t", None).await.unwrap();
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+                .await
+                .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = eidetica::crdt::Doc::new();
         s.set("name", "x");

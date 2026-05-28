@@ -742,16 +742,18 @@ pub async fn bootstrap_from_config(
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config};
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
 
     /// Test-only fixture: build a fresh in-memory `Instance` and return a
     /// logged-in `User` session against it. Each test gets an isolated peer.
     async fn test_peer_user() -> User {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        instance.login_user("test", None).await.unwrap()
+        let (_instance, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
+        user
     }
 
     fn empty_config_with_agents(agents: Vec<AgentConfig>) -> Config {

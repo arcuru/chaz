@@ -165,8 +165,8 @@ mod tests {
     use crate::hosted_index::HostedIndex;
     use crate::security::SecretStore;
     use crate::server::Server;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
     use std::sync::Arc;
 
     /// Fixture matches `commands/agent.rs::tests::fixture` but takes a
@@ -184,12 +184,13 @@ mod tests {
         eidetica::Database,
     ) {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
+        let (instance, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         if sync_enabled {
             instance.enable_sync().await.unwrap();
         }
-        let _ = instance.create_user("test", None).await;
-        let user = instance.login_user("test", None).await.unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             crate::session::SessionRegistry::new(instance.clone(), user, agents.clone())

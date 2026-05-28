@@ -1638,15 +1638,16 @@ mod tests {
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::DbEntry;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
 
     /// Build a Server with the minimum wiring needed to exercise hydration.
     async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let user = instance.login_user("test", None).await.unwrap();
+        let (instance, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             crate::session::SessionRegistry::new(instance.clone(), user, agents.clone())

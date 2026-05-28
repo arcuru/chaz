@@ -211,13 +211,14 @@ mod tests {
     use super::*;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::memory_bank_db::{MemoryBankMeta, create_memory_bank};
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
 
     async fn fresh_user() -> (Instance, eidetica::user::User) {
-        let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
-        let _ = instance.create_user("t", None).await;
-        let user = instance.login_user("t", None).await.unwrap();
+        let (instance, user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+                .await
+                .unwrap();
         (instance, user)
     }
 

@@ -1422,17 +1422,18 @@ mod tests {
     use crate::agent_db::{AgentDbConfig, AgentMeta};
     use crate::hosted_index::DbEntry;
     use crate::session::SessionRegistry;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
 
     /// Build a MemoryCommand wired to an in-memory eidetica instance plus
     /// empty hosted indices. Returns the command and the registry so
     /// tests can seed agents/banks through the command itself.
     async fn fixture() -> (Instance, Arc<SessionRegistry>, MemoryCommand) {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let user = instance.login_user("test", None).await.unwrap();
+        let (instance, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             SessionRegistry::new(instance.clone(), user, agents)

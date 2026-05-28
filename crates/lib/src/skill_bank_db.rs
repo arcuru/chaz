@@ -158,14 +158,16 @@ pub async fn find_skill_bank(user: &User, display_name: &str) -> Option<(SkillBa
 mod tests {
     use super::*;
     use chrono::Utc;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
 
     async fn test_user() -> User {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        instance.login_user("test", None).await.unwrap()
+        let (_instance, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
+        user
     }
 
     #[tokio::test]

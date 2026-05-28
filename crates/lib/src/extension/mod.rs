@@ -1638,9 +1638,9 @@ mod tests {
     use super::*;
     use crate::runtime::RuntimeMessage;
     use crate::types::ConversationId;
-    use eidetica::Instance;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
+    use eidetica::{Instance, NewUser};
 
     #[test]
     fn builtin_ref_carries_binary_version() {
@@ -1874,9 +1874,10 @@ mod tests {
     async fn test_hub() -> ExtensionHub {
         use crate::agent::AgentRegistry;
         let backend = InMemory::new();
-        let inst = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = inst.create_user("test", None).await;
-        let user = inst.login_user("test", None).await.unwrap();
+        let (inst, user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(SessionRegistry::new(inst, user, agents).await.unwrap());
         let mut hub = ExtensionHub::new();
@@ -1887,9 +1888,10 @@ mod tests {
 
     async fn make_session_db() -> (Instance, Database) {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let mut user = instance.login_user("test", None).await.unwrap();
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = Doc::new();
         s.set("name", "session");
@@ -2346,9 +2348,10 @@ mod tests {
 
     async fn fixture_ctx() -> HookContext {
         let backend = InMemory::new();
-        let instance = Instance::open(Box::new(backend)).await.unwrap();
-        let _ = instance.create_user("test", None).await;
-        let mut user = instance.login_user("test", None).await.unwrap();
+        let (_instance, mut user) =
+            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+                .await
+                .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = Doc::new();
         s.set("name", "session");

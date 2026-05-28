@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use eidetica::Instance;
 use eidetica::backend::database::InMemory;
 use eidetica::user::User;
+use eidetica::{Instance, NewUser};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -23,9 +23,10 @@ use crate::types::ConversationId;
 
 /// Open a fresh in-memory eidetica instance with one logged-in user.
 pub(crate) async fn fresh_eidetica() -> (Instance, User) {
-    let instance = Instance::open(Box::new(InMemory::new())).await.unwrap();
-    let _ = instance.create_user("test", None).await;
-    let user = instance.login_user("test", None).await.unwrap();
+    let (instance, user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+            .await
+            .unwrap();
     (instance, user)
 }
 
