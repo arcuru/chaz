@@ -76,19 +76,19 @@ Lists every bank the agent can see, with the permission level. Always includes `
 
 Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix uses `!chaz memory <sub>`.
 
-| Command                                      | What                                                                                                                                       |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/memory new <name> [description]`           | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                               |
-| `/memory list`                               | List banks hosted by this peer.                                                                                                            |
-| `/memory delete <ref>`                       | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                                      |
-| `/memory grant <bank> <agent> <read\|write>` | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                                      |
-| `/memory revoke <bank> <agent>`              | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                           |
-| `/memory share <bank>`                       | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                                          |
-| `/memory unshare <bank>`                     | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.            |
-| `/memory import <ticket>`                    | Sync a shared bank from another peer's ticket. Requires the ticket to carry a key for this peer.                                           |
-| `/memory attach <bank>`                      | Attach a bank to the current session. Its memories are surfaced in context (see [Autonomous Auto-recall](#autonomous-memory-auto-recall)). |
-| `/memory detach <bank>`                      | Detach a previously-attached bank from this session.                                                                                       |
-| `/memory config [show\|set\|reset]`          | View or change memory auto-recall behaviour for this agent. See [Auto-recall config](#auto-recall-configuration).                          |
+| Command                                        | What                                                                                                                                                                              |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/memory new <name> [description]`             | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                                                                      |
+| `/memory list`                                 | List banks hosted by this peer.                                                                                                                                                   |
+| `/memory delete <ref>`                         | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                                                                             |
+| `/memory grant <bank> <agent> <read\|write>`   | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                                                                             |
+| `/memory revoke <bank> <agent>`                | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                                                                  |
+| `/memory share <bank>`                         | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                                                                                 |
+| `/memory unshare <bank>`                       | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.                                                   |
+| `/memory import <ticket> [admin\|write\|read]` | Sync a shared bank from another peer's ticket. Optional permission (default `write`) is the level requested when bootstrapping. Requires the ticket to carry a key for this peer. |
+| `/memory attach <bank>`                        | Attach a bank to the current session. Its memories are surfaced in context (see [Autonomous Auto-recall](#autonomous-memory-auto-recall)).                                        |
+| `/memory detach <bank>`                        | Detach a previously-attached bank from this session.                                                                                                                              |
+| `/memory config [show\|set\|reset]`            | View or change memory auto-recall behaviour for this agent. See [Auto-recall config](#auto-recall-configuration).                                                                 |
 
 Refs accept either a display name or an eidetica DB ID.
 

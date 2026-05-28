@@ -1,10 +1,23 @@
 # Logging
 
-Chaz uses the [tracing](https://docs.rs/tracing) crate for structured logging. Output goes to stderr in a human-readable format by default.
+Chaz uses the [tracing](https://docs.rs/tracing) crate for structured logging. Default verbosity is `info`.
 
-## Controlling Log Output
+## Where Logs Go
 
-Set the `RUST_LOG` environment variable to control verbosity:
+The sink depends on the gateway mode, because the TUI and `--cli` modes need to keep stdout clean for their own output:
+
+| Mode               | Default destination                                      |
+| ------------------ | -------------------------------------------------------- |
+| Matrix (default)   | stdout (collected by systemd / docker / your supervisor) |
+| `--tui`            | `<state_dir>/chaz-tui.log` (daily-rotated, keeps 7 days) |
+| `--cli`            | `<state_dir>/chaz-cli.log` (daily-rotated, keeps 7 days) |
+| `chaz usage` (CLI) | stderr (stdout is the rollup output)                     |
+
+`state_dir` comes from `state_dir:` in the config or the platform XDG state dir (typically `~/.local/state/chaz`). The startup banner prints the exact log path for the TUI/CLI cases. Tail with `tail -f <state_dir>/chaz-tui.log`.
+
+## Controlling Verbosity
+
+Set the `RUST_LOG` environment variable:
 
 ```bash
 # Default: info level and above
@@ -68,24 +81,30 @@ Verbose output useful for development and troubleshooting:
 
 ## Redirecting to a File
 
-```bash
-# Log to file while keeping TUI clean
-RUST_LOG=info chaz --config config.yaml --tui 2> chaz.log
+For Matrix mode (logs default to stdout), redirect to capture them:
 
+```bash
 # Background with log file
-RUST_LOG=info nohup chaz --config config.yaml > /dev/null 2> chaz.log &
+RUST_LOG=info nohup chaz --config config.yaml > chaz.log 2>&1 &
 
 # Follow logs
 tail -f chaz.log
 ```
 
+TUI and `--cli` modes already log to a daily-rotated file in `state_dir` (see above) — no redirect needed. To follow live, tail that file in another terminal.
+
 ## Security Audit Trail
 
-For security auditing, `warn` level captures all enforcement actions:
+For security auditing, `warn` level captures all enforcement actions. The exact pipeline depends on where the logs land for your gateway:
 
 ```bash
-# Filter to security-relevant events
-RUST_LOG=chaz::security=info,chaz::runtime=warn chaz --config config.yaml --tui 2>&1 | grep -E "WARN|denied|blocked|SSRF|leak|approval"
+# Matrix mode — logs are on stdout/stderr, filter live
+RUST_LOG=chaz::security=info,chaz::runtime=warn chaz --config config.yaml 2>&1 | \
+  grep -E "WARN|denied|blocked|SSRF|leak|Approval"
+
+# TUI / CLI mode — logs are in a rolling file, tail and filter
+tail -F ~/.local/state/chaz/chaz-tui.log | \
+  grep -E "WARN|denied|blocked|SSRF|leak|Approval"
 ```
 
 Key events to monitor:
