@@ -65,3 +65,66 @@ impl Tool for Compact {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::EntryType;
+    use crate::test_support::{fresh_session, tool_context};
+    use crate::tool::ToolRegistry;
+    use std::sync::Arc;
+
+    #[test]
+    fn descriptor_advertises_compact_name_and_required_summary() {
+        let d = Compact.descriptor();
+        assert_eq!(d.name, "compact");
+        let required = d.parameters["required"].as_array().expect("required[]");
+        assert!(required.iter().any(|v| v == "summary"));
+    }
+
+    #[tokio::test]
+    async fn missing_summary_argument_errors() {
+        let (_instance, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+        let err = Compact
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("summary"));
+    }
+
+    #[tokio::test]
+    async fn empty_summary_argument_errors() {
+        let (_instance, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+        let err = Compact
+            .execute(serde_json::json!({ "summary": "   " }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn successful_compact_writes_summary_entry_and_returns_count() {
+        let (_instance, session) = fresh_session().await;
+        let ctx = tool_context(session.clone(), Arc::new(ToolRegistry::new()));
+        let out = Compact
+            .execute(
+                serde_json::json!({ "summary": "we discussed nothing notable" }),
+                &ctx,
+            )
+            .await
+            .expect("compact should succeed");
+        assert!(
+            out.contains("Context compacted"),
+            "expected confirmation text, got: {out}"
+        );
+        // Verify the entry actually landed in the session DB.
+        let s = session.lock().await;
+        let entries = s.entries();
+        assert_eq!(entries.len(), 1, "expected one entry after compact");
+        assert_eq!(entries[0].entry_type, EntryType::Summary);
+        assert_eq!(entries[0].content, "we discussed nothing notable");
+        assert_eq!(entries[0].sender, "test-agent");
+    }
+}

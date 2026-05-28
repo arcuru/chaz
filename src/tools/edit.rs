@@ -408,4 +408,265 @@ mod tests {
             "got: {err}"
         );
     }
+
+    // ---- End-to-end tests against EditFile::execute via test_support::MockHost ----
+    //
+    // The block above tests a local apply_edits helper that mirrors EditFile's
+    // validation logic. The tests below actually drive `EditFile::execute()` so
+    // its argument parsing, host-call sequencing, and output formatting are
+    // covered too.
+
+    mod execute_path {
+        use super::super::EditFile;
+        use crate::test_support::{
+            MockHost as ScriptedHost, fresh_session, tool_context_with_host,
+        };
+        use crate::tool::{Tool, ToolContext, ToolRegistry};
+        use crate::tool_host::Capability;
+        use std::sync::Arc;
+
+        async fn ctx_with(host: Arc<ScriptedHost>) -> (eidetica::Instance, ToolContext) {
+            let (instance, session) = fresh_session().await;
+            let ctx = tool_context_with_host(session, Arc::new(ToolRegistry::new()), host);
+            (instance, ctx)
+        }
+
+        #[tokio::test]
+        async fn descriptor_requires_path_only() {
+            let d = EditFile.descriptor();
+            assert_eq!(d.name, "edit_file");
+            let required = d.parameters["required"].as_array().unwrap();
+            assert!(required.iter().any(|v| v == "path"));
+            // Only `path` is required at the schema level; the function does
+            // the old/new vs edits-array check at runtime.
+            assert_eq!(required.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn missing_path_errors_before_host() {
+            let host = Arc::new(ScriptedHost::new());
+            let (_i, c) = ctx_with(host.clone()).await;
+            let err = EditFile
+                .execute(serde_json::json!({}), &c)
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").to_lowercase().contains("path"));
+            assert!(host.recorded_calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn missing_old_text_and_no_edits_array_errors() {
+            let host = Arc::new(ScriptedHost::new());
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(serde_json::json!({ "path": "/x" }), &c)
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").to_lowercase().contains("old_text"));
+        }
+
+        #[tokio::test]
+        async fn missing_new_text_in_single_edit_errors() {
+            let host = Arc::new(ScriptedHost::new());
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(
+                    serde_json::json!({ "path": "/x", "old_text": "foo" }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").to_lowercase().contains("new_text"));
+        }
+
+        #[tokio::test]
+        async fn empty_edits_array_errors() {
+            let host = Arc::new(ScriptedHost::new());
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(
+                    serde_json::json!({ "path": "/x", "edits": [] }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").to_lowercase().contains("no edits"));
+        }
+
+        #[tokio::test]
+        async fn edits_array_with_missing_old_text_field_errors() {
+            let host = Arc::new(ScriptedHost::new());
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/x",
+                        "edits": [ { "new_text": "y" } ]
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("edits[0]"));
+            assert!(format!("{err}").to_lowercase().contains("old_text"));
+        }
+
+        #[tokio::test]
+        async fn old_text_not_in_file_errors_with_path() {
+            let host = Arc::new(ScriptedHost::new());
+            host.push_file_read(b"hello world".to_vec());
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/some/file",
+                        "old_text": "missing",
+                        "new_text": "x"
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("/some/file"));
+            assert!(format!("{err}").to_lowercase().contains("not found"));
+        }
+
+        #[tokio::test]
+        async fn old_text_appearing_multiple_times_errors() {
+            let host = Arc::new(ScriptedHost::new());
+            host.push_file_read(b"foo foo foo".to_vec());
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/x",
+                        "old_text": "foo",
+                        "new_text": "bar"
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("3 times"));
+        }
+
+        #[tokio::test]
+        async fn happy_path_writes_replaced_content_and_reports_line_delta_zero() {
+            let host = Arc::new(ScriptedHost::new());
+            host.push_file_read(b"alpha\nbeta\ngamma\n".to_vec());
+            host.push_file_write();
+            let (_i, c) = ctx_with(host.clone()).await;
+            let out = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/file",
+                        "old_text": "beta",
+                        "new_text": "BETA"
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap();
+            assert!(out.starts_with("Edited /file: 1 replacement(s), 0 lines"));
+            // Inspect the write capability the host received.
+            let calls = host.recorded_calls();
+            assert_eq!(calls.len(), 2, "one read + one write");
+            match &calls[1] {
+                Capability::FileWrite { path, content } => {
+                    assert_eq!(path, "/file");
+                    assert_eq!(content, "alpha\nBETA\ngamma\n");
+                }
+                other => panic!("expected FileWrite, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn happy_path_reports_positive_line_delta_when_expanding() {
+            let host = Arc::new(ScriptedHost::new());
+            host.push_file_read(b"a".to_vec());
+            host.push_file_write();
+            let (_i, c) = ctx_with(host).await;
+            let out = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/f",
+                        "old_text": "a",
+                        "new_text": "a\nb\nc"
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap();
+            assert!(out.contains("+2 lines"), "got: {out}");
+        }
+
+        #[tokio::test]
+        async fn happy_path_reports_negative_line_delta_when_shrinking() {
+            let host = Arc::new(ScriptedHost::new());
+            host.push_file_read(b"one\ntwo\nthree\n".to_vec());
+            host.push_file_write();
+            let (_i, c) = ctx_with(host).await;
+            let out = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/f",
+                        "old_text": "one\ntwo\nthree\n",
+                        "new_text": "one\n"
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap();
+            assert!(out.contains("-2 lines"), "got: {out}");
+        }
+
+        #[tokio::test]
+        async fn multi_edit_array_applied_atomically() {
+            let host = Arc::new(ScriptedHost::new());
+            host.push_file_read(b"alpha beta gamma".to_vec());
+            host.push_file_write();
+            let (_i, c) = ctx_with(host.clone()).await;
+            let out = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/f",
+                        "edits": [
+                            { "old_text": "alpha", "new_text": "A" },
+                            { "old_text": "gamma", "new_text": "G" }
+                        ]
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap();
+            assert!(out.contains("2 replacement(s)"));
+            let written = host.recorded_calls().pop().unwrap();
+            match written {
+                Capability::FileWrite { content, .. } => {
+                    assert_eq!(content, "A beta G");
+                }
+                other => panic!("expected FileWrite, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn unexpected_read_result_variant_is_execution_error() {
+            // Host responds to FileRead with a Shell result.
+            let host = Arc::new(ScriptedHost::new());
+            host.push_shell("not a file", "", 0);
+            let (_i, c) = ctx_with(host).await;
+            let err = EditFile
+                .execute(
+                    serde_json::json!({
+                        "path": "/f",
+                        "old_text": "x",
+                        "new_text": "y"
+                    }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").to_lowercase().contains("unexpected"));
+        }
+    }
 }

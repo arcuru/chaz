@@ -17,7 +17,7 @@ use crate::gateway::{ApprovalDecision, ApprovalExchange};
 use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
 use crate::session::Session;
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
-use crate::tool_host::NativeToolHost;
+use crate::tool_host::{NativeToolHost, ToolHost};
 use crate::types::ConversationId;
 
 /// Open a fresh in-memory eidetica instance with one logged-in user.
@@ -93,6 +93,16 @@ pub(crate) fn tool_context(
     session: Arc<TokioMutex<Session>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
+    tool_context_with_host(session, registry, Arc::new(NativeToolHost::new()))
+}
+
+/// Variant of `tool_context` that uses a caller-provided `ToolHost` — used by
+/// tool unit tests that script the host's capability responses via `MockHost`.
+pub(crate) fn tool_context_with_host(
+    session: Arc<TokioMutex<Session>>,
+    registry: Arc<ToolRegistry>,
+    host: Arc<dyn ToolHost>,
+) -> ToolContext {
     ToolContext {
         agent_name: "test-agent".to_string(),
         call_depth: 0,
@@ -103,6 +113,6 @@ pub(crate) fn tool_context(
         active_extensions: Default::default(),
         grants: Default::default(),
         agent_grants: Default::default(),
-        host: Arc::new(NativeToolHost::new()),
+        host,
     }
 }

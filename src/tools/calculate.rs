@@ -40,3 +40,66 @@ impl Tool for Calculate {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fresh_session, tool_context};
+    use crate::tool::ToolRegistry;
+    use std::sync::Arc;
+
+    async fn ctx() -> (eidetica::Instance, crate::tool::ToolContext) {
+        let (instance, session) = fresh_session().await;
+        let ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+        (instance, ctx)
+    }
+
+    #[test]
+    fn descriptor_advertises_calculate_name_and_required_expression() {
+        let d = Calculate.descriptor();
+        assert_eq!(d.name, "calculate");
+        assert!(d.description.to_lowercase().contains("mathematical"));
+        let required = d.parameters["required"].as_array().expect("required[]");
+        assert!(required.iter().any(|v| v == "expression"));
+    }
+
+    #[tokio::test]
+    async fn evaluates_basic_arithmetic() {
+        let (_i, c) = ctx().await;
+        let out = Calculate
+            .execute(serde_json::json!({ "expression": "2 + 3 * 4" }), &c)
+            .await
+            .unwrap();
+        assert_eq!(out, "14");
+    }
+
+    #[tokio::test]
+    async fn evaluates_function_call() {
+        let (_i, c) = ctx().await;
+        let out = Calculate
+            .execute(serde_json::json!({ "expression": "sqrt(16)" }), &c)
+            .await
+            .unwrap();
+        assert_eq!(out, "4");
+    }
+
+    #[tokio::test]
+    async fn missing_expression_argument_errors() {
+        let (_i, c) = ctx().await;
+        let err = Calculate
+            .execute(serde_json::json!({}), &c)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("expression"));
+    }
+
+    #[tokio::test]
+    async fn invalid_expression_returns_math_error() {
+        let (_i, c) = ctx().await;
+        let err = Calculate
+            .execute(serde_json::json!({ "expression": "++" }), &c)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("math"));
+    }
+}

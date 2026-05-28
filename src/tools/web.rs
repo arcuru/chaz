@@ -112,3 +112,122 @@ impl Tool for WebFetch {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{MockHost, fresh_session, tool_context_with_host};
+    use crate::tool::ToolRegistry;
+    use crate::tool_host::Capability;
+    use std::sync::Arc;
+
+    async fn ctx_with(host: Arc<MockHost>) -> (eidetica::Instance, ToolContext) {
+        let (instance, session) = fresh_session().await;
+        let ctx = tool_context_with_host(session, Arc::new(ToolRegistry::new()), host);
+        (instance, ctx)
+    }
+
+    #[test]
+    fn descriptor_lists_url_required() {
+        let d = WebFetch.descriptor();
+        assert_eq!(d.name, "web_fetch");
+        let required = d.parameters["required"].as_array().expect("required[]");
+        assert!(required.iter().any(|v| v == "url"));
+    }
+
+    #[test]
+    fn default_policy_is_medium_unless_auto_approved() {
+        let p = WebFetch.default_policy();
+        assert!(matches!(p.risk, RiskLevel::Medium));
+        assert!(matches!(p.approval, ApprovalRequirement::UnlessAutoApproved));
+    }
+
+    #[tokio::test]
+    async fn missing_url_argument_errors() {
+        let host = Arc::new(MockHost::new());
+        let (_i, c) = ctx_with(host.clone()).await;
+        let err = WebFetch
+            .execute(serde_json::json!({}), &c)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("url"));
+        assert!(host.recorded_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_method_is_get_uppercased() {
+        let host = Arc::new(MockHost::new());
+        host.push_http(200, b"".to_vec());
+        let (_i, c) = ctx_with(host.clone()).await;
+        WebFetch
+            .execute(serde_json::json!({ "url": "https://example" }), &c)
+            .await
+            .unwrap();
+        match host.last_call().unwrap() {
+            Capability::HttpRequest { method, body, .. } => {
+                assert_eq!(method, "GET");
+                assert!(body.is_none());
+            }
+            other => panic!("unexpected capability: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lowercase_method_is_uppercased_and_body_forwarded() {
+        let host = Arc::new(MockHost::new());
+        host.push_http(204, b"".to_vec());
+        let (_i, c) = ctx_with(host.clone()).await;
+        WebFetch
+            .execute(
+                serde_json::json!({ "url": "https://x", "method": "post", "body": "{}" }),
+                &c,
+            )
+            .await
+            .unwrap();
+        match host.last_call().unwrap() {
+            Capability::HttpRequest { method, body, url, .. } => {
+                assert_eq!(method, "POST");
+                assert_eq!(url, "https://x");
+                assert_eq!(body.as_deref(), Some("{}"));
+            }
+            other => panic!("unexpected capability: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_includes_status_prefix_and_body() {
+        let host = Arc::new(MockHost::new());
+        host.push_http(418, b"i am a teapot".to_vec());
+        let (_i, c) = ctx_with(host).await;
+        let out = WebFetch
+            .execute(serde_json::json!({ "url": "https://t" }), &c)
+            .await
+            .unwrap();
+        assert!(out.starts_with("[418]"), "got: {out}");
+        assert!(out.contains("i am a teapot"));
+    }
+
+    #[tokio::test]
+    async fn very_long_body_is_truncated() {
+        let host = Arc::new(MockHost::new());
+        host.push_http(200, vec![b'a'; 60_000]);
+        let (_i, c) = ctx_with(host).await;
+        let out = WebFetch
+            .execute(serde_json::json!({ "url": "https://big" }), &c)
+            .await
+            .unwrap();
+        assert!(out.ends_with("[truncated]"), "got tail: {}", &out[out.len() - 20..]);
+    }
+
+    #[tokio::test]
+    async fn host_error_propagates() {
+        let host = Arc::new(MockHost::new());
+        host.push_err(crate::tool::ToolError::Network("connection refused".into()));
+        let (_i, c) = ctx_with(host).await;
+        let err = WebFetch
+            .execute(serde_json::json!({ "url": "https://nope" }), &c)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("connection refused"));
+    }
+}

@@ -12,9 +12,11 @@
 
 pub(crate) mod harness;
 pub(crate) mod mock_backend;
+pub(crate) mod mock_host;
 
 pub(crate) use harness::*;
 pub(crate) use mock_backend::*;
+pub(crate) use mock_host::*;
 
 #[cfg(test)]
 mod runtime_integration;
