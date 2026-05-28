@@ -45,6 +45,13 @@ impl MockBackend {
         }
     }
 
+    /// Configure whether `BackendDispatch::supports_tools` reports true.
+    /// Use `false` to drive the runtime's no-tools fallback.
+    pub fn with_supports_tools(mut self, value: bool) -> Self {
+        self.supports_tools = value;
+        self
+    }
+
     /// Queue a final-text response. Convenience for the common case.
     pub fn push_text(&self, content: impl Into<String>) {
         let model = self.default_model.clone();

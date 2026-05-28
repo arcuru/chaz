@@ -10,7 +10,10 @@ use eidetica::Instance;
 use eidetica::backend::database::InMemory;
 use eidetica::user::User;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
+use crate::gateway::{ApprovalDecision, ApprovalExchange};
 use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
 use crate::session::Session;
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
@@ -60,6 +63,27 @@ pub(crate) fn permissive_security() -> SecurityContext {
         auto_approved_tools: Default::default(),
         approval_callback: None,
     }
+}
+
+/// `SecurityContext` wired to an auto-decision approval task. Every
+/// approval request from the runtime is answered with `decision` until the
+/// channel closes. Returns the context alongside the spawned task handle so
+/// callers can abort it at test end (or let it die with the process).
+pub(crate) fn security_with_decision(
+    decision: ApprovalDecision,
+) -> (SecurityContext, JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
+    let handle = tokio::spawn(async move {
+        while let Some(exchange) = rx.recv().await {
+            let _ = exchange.decision_tx.send(decision.clone());
+        }
+    });
+    let ctx = SecurityContext {
+        leak_detector: LeakDetector::new(LeakPolicy::Redact),
+        auto_approved_tools: Default::default(),
+        approval_callback: Some(tx),
+    };
+    (ctx, handle)
 }
 
 /// Assemble a minimal `ToolContext` against the given session and tool
