@@ -10,8 +10,8 @@
 > **Status update (2026-05-27):**
 >
 > - `role.rs` and `persona.rs` are deleted; `system_prompt` + `system_prompt_files` shipped on `Agent` / `AgentDbConfig` / `AgentConfig`.
-> - The `skills` extension shipped as `src/extensions/skills.rs` with `Scope::{Global, PerSession}`, the `SkillRegistry`, `PromptAugmentation`, and the `skill_list` / `skill_search` / `skill_show` tools.
-> - `PromptAugmentation` shipped as an extension-providable cap (`src/extension/caps.rs`) and is wired through `ContextBuilder::build`.
+> - The `skills` extension shipped as `crates/lib/src/extensions/skills.rs` with `Scope::{Global, PerSession}`, the `SkillRegistry`, `PromptAugmentation`, and the `skill_list` / `skill_search` / `skill_show` tools.
+> - `PromptAugmentation` shipped as an extension-providable cap (`crates/lib/src/extension/caps.rs`) and is wired through `ContextBuilder::build`.
 > - **Divergence:** the `SystemPromptSnapshot` entry type / `SystemPromptSnapshotPayload` / observational audit log were **not** built; `PersonaSnapshot` was simply removed from `EntryType`. There is no per-turn snapshot today — every turn assembles fresh and the contributions are not persisted.
 > - **Divergence:** `/agent reload <ref>` was not added; live edits go through `/agent set <ref> system_prompt <value>` / `system_prompt_files`. File-include rehydration happens at agent construction (`AgentRegistry::register`) and on AgentDb config write; there is no on-demand reload command.
 
@@ -19,8 +19,8 @@
 
 **What dies:**
 
-- `src/role.rs` — removed. The one-release migration window closes.
-- `src/persona.rs` — removed. `Persona`, `ResolvedPersona`, `PersonaSnapshot`,
+- `crates/lib/src/role.rs` — removed. The one-release migration window closes.
+- `crates/lib/src/persona.rs` — removed. `Persona`, `ResolvedPersona`, `PersonaSnapshot`,
   `PersonaSnapshotPayload`, `SnapshotReason` all gone.
 - `migrate_role_to_persona()` — removed.
 - All `default_role` / `role:` fields on `Agent`, `AgentDbConfig`, `AgentConfig`.
@@ -117,7 +117,7 @@ agents:
 
 ### Skills extension
 
-A single built-in extension — `skills` in `src/extensions/skills.rs` — that
+A single built-in extension — `skills` in `crates/lib/src/extensions/skills.rs` — that
 manages the skill catalog and hooks into context assembly.
 
 #### Skill format
@@ -305,19 +305,19 @@ layer to bypass.
 No on-disk migration. The legacy `role:` fields have been warning on startup
 since the persona transition; this closes the window.
 
-1. Remove `src/role.rs` entirely.
-2. Remove `src/persona.rs` entirely.
-3. Remove `migrate_role_to_persona()` from `src/agent.rs`.
+1. Remove `crates/lib/src/role.rs` entirely.
+2. Remove `crates/lib/src/persona.rs` entirely.
+3. Remove `migrate_role_to_persona()` from `crates/lib/src/agent.rs`.
 4. Drop `persona`, `default_role`, `role` from `Agent`, `AgentConfig`,
    `AgentDbConfig`.
 5. Add `system_prompt`, `system_prompt_files` to all three.
 6. Remove `PersonaSnapshotPayload` entry type; add `SystemPromptSnapshotPayload`.
 7. Remove `/agent persona` commands; add `/agent reload`.
 8. Remove legacy startup warnings for `role:` config usage.
-9. Add `PromptAugmentation` capability to `src/extension/caps.rs`.
-10. Create `src/extensions/skills.rs` with `SkillRegistry` + `PromptAugmentation` impl.
+9. Add `PromptAugmentation` capability to `crates/lib/src/extension/caps.rs`.
+10. Create `crates/lib/src/extensions/skills.rs` with `SkillRegistry` + `PromptAugmentation` impl.
 11. Update `ContextBuilder::build()` to call hub for augmentations.
-12. Register `skills` extension in `src/main.rs` builtins list.
+12. Register `skills` extension in `crates/bin/src/main.rs` builtins list.
 
 Config migration for operators: replace `persona:` + `role:` in agent configs:
 
@@ -364,22 +364,22 @@ extensions, not new abstractions.
 
 | File                       | Change                                                                                                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/role.rs`              | **Delete**                                                                                                                                                   |
-| `src/persona.rs`           | **Delete**                                                                                                                                                   |
-| `src/agent.rs`             | Drop `persona`, `default_role`; add `system_prompt`, `system_prompt_files`; drop `migrate_role_to_persona()`                                                 |
-| `src/agent_db.rs`          | `AgentDbConfig` loses `persona`, `role`; gains `system_prompt`, `system_prompt_files`                                                                        |
-| `src/config.rs`            | `AgentConfig` schema: same field swap                                                                                                                        |
-| `src/context.rs`           | `ContextBuilder::build()`: drop snapshot lookup, add hub augmentation call                                                                                   |
-| `src/extension/caps.rs`    | Add `PromptAugmentation` trait + `Capability::PromptAugmentation` variant                                                                                    |
-| `src/extension/mod.rs`     | `ExtensionHub::augment_system_prompt()` — iterates providers, concatenates                                                                                   |
-| `src/extensions/skills.rs` | **New** — `SkillRegistry`, `SkillManifest`, SKILL.md parser, trigger prefiltering, `skill_list`/`skill_search`/`skill_show` tools, `PromptAugmentation` impl |
-| `src/extensions/mod.rs`    | Add `pub mod skills;`                                                                                                                                        |
-| `src/main.rs`              | Register `skills` in builtins list                                                                                                                           |
-| `src/server.rs`            | `write_persona_snapshot()` → `write_system_prompt_snapshot()`; snapshot writes on initial attach + reload, not on first LLM call                             |
-| `src/session/agents.rs`    | Same snapshot rename; `/agent persona` commands removed                                                                                                      |
-| `src/commands/agent.rs`    | Remove `persona` sub-commands; add `/agent reload <ref>`                                                                                                     |
-| `src/types.rs`             | Entry type: `PersonaSnapshot` → `SystemPromptSnapshot`; `SnapshotReason` stays                                                                               |
-| `src/defaults.rs`          | Built-in agent defs: `persona` → `system_prompt` + `system_prompt_files`                                                                                     |
+| `crates/lib/src/role.rs`              | **Delete**                                                                                                                                                   |
+| `crates/lib/src/persona.rs`           | **Delete**                                                                                                                                                   |
+| `crates/lib/src/agent.rs`             | Drop `persona`, `default_role`; add `system_prompt`, `system_prompt_files`; drop `migrate_role_to_persona()`                                                 |
+| `crates/lib/src/agent_db.rs`          | `AgentDbConfig` loses `persona`, `role`; gains `system_prompt`, `system_prompt_files`                                                                        |
+| `crates/lib/src/config.rs`            | `AgentConfig` schema: same field swap                                                                                                                        |
+| `crates/lib/src/context.rs`           | `ContextBuilder::build()`: drop snapshot lookup, add hub augmentation call                                                                                   |
+| `crates/lib/src/extension/caps.rs`    | Add `PromptAugmentation` trait + `Capability::PromptAugmentation` variant                                                                                    |
+| `crates/lib/src/extension/mod.rs`     | `ExtensionHub::augment_system_prompt()` — iterates providers, concatenates                                                                                   |
+| `crates/lib/src/extensions/skills.rs` | **New** — `SkillRegistry`, `SkillManifest`, SKILL.md parser, trigger prefiltering, `skill_list`/`skill_search`/`skill_show` tools, `PromptAugmentation` impl |
+| `crates/lib/src/extensions/mod.rs`    | Add `pub mod skills;`                                                                                                                                        |
+| `crates/bin/src/main.rs`              | Register `skills` in builtins list                                                                                                                           |
+| `crates/lib/src/server.rs`            | `write_persona_snapshot()` → `write_system_prompt_snapshot()`; snapshot writes on initial attach + reload, not on first LLM call                             |
+| `crates/lib/src/session/agents.rs`    | Same snapshot rename; `/agent persona` commands removed                                                                                                      |
+| `crates/lib/src/commands/agent.rs`    | Remove `persona` sub-commands; add `/agent reload <ref>`                                                                                                     |
+| `crates/lib/src/types.rs`             | Entry type: `PersonaSnapshot` → `SystemPromptSnapshot`; `SnapshotReason` stays                                                                               |
+| `crates/lib/src/defaults.rs`          | Built-in agent defs: `persona` → `system_prompt` + `system_prompt_files`                                                                                     |
 | `docs/src/`                | User guide: skills directory, SKILL.md format, `/agent reload`; architecture: PromptAugmentation cap                                                         |
 
 ## Testing

@@ -275,7 +275,7 @@ Today there are three grant kinds, declared per-tool under `security.tool_polici
 | `network` | `allow_private`              | If `false` (default), private IPs and internal hostnames are blocked even when allowed.  |
 | `fs`      | `allow_read` / `allow_write` | Path allowlists. **Schema stub** — accepted in config today, enforcement still pending.  |
 
-Resolution: the tool's `default_policy()` ships baseline grants; `security.tool_policies` overrides per-tool at config load; per-agent grants on `agents:` overlay last, kind-by-kind ([`Grants::merge_over`](https://github.com/arcuru/chaz/blob/vibe/src/grants.rs) — the agent layer replaces a kind only when it explicitly sets one).
+Resolution: the tool's `default_policy()` ships baseline grants; `security.tool_policies` overrides per-tool at config load; per-agent grants on `agents:` overlay last, kind-by-kind ([`Grants::merge_over`](https://github.com/arcuru/chaz/blob/vibe/crates/lib/src/grants.rs) — the agent layer replaces a kind only when it explicitly sets one).
 
 #### Worked example: lock `shell` down to `git` and `ls`, deny everything else
 

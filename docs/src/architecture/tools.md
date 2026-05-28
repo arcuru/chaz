@@ -110,11 +110,11 @@ The host enforces grants at the capability boundary — the tool says what it wa
 | Host                 | Tier       | Isolation                                                                | Status                                          |
 | -------------------- | ---------- | ------------------------------------------------------------------------ | ----------------------------------------------- |
 | `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | Default for every built-in tool.                |
-| `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Selected per config (`src/bubblewrap_host.rs`). |
+| `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Selected per config (`crates/lib/src/bubblewrap_host.rs`). |
 
 The `Tool` implementations (shell, web, file) are identical across both hosts — they call `ctx.host().request()` regardless of which host sits behind the trait.
 
-A separate WASM-tools path (`src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
+A separate WASM-tools path (`crates/lib/src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
 
 ## ToolContext
 
@@ -142,11 +142,11 @@ Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants(
 Tools are published by [extensions](extensions.md). The `Tool` impl is the
 tool's _behavior_; the extension is what wires it into the runtime registry.
 
-1. Create `src/tools/my_tool.rs` implementing `Tool`.
-2. Add `mod my_tool;` + `pub use` to `src/tools/mod.rs`.
+1. Create `crates/lib/src/tools/my_tool.rs` implementing `Tool`.
+2. Add `mod my_tool;` + `pub use` to `crates/lib/src/tools/mod.rs`.
 3. Have an extension's `ExtensionInstance::tools()` return your `Tool`. Either
    add it to an existing built-in (e.g. `extensions/core.rs` for general
-   tools) or create a new extension in `src/extensions/my_ext.rs` and
+   tools) or create a new extension in `crates/lib/src/extensions/my_ext.rs` and
    register it in `extensions::all_builtins`.
 
 At install time `install_all` drains every `Global` instance's `tools()`,

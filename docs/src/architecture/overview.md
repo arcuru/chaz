@@ -62,7 +62,7 @@ Gateways bridge between a transport (Matrix, terminal) and the session database.
 
 Gateways are transport-specific but the server is transport-agnostic. Adding a new gateway (Slack, Discord, HTTP API) requires implementing the `Gateway` trait and writing/reading session entries.
 
-**Source**: `src/gateway/` (Matrix: `matrix/mod.rs`, TUI: `tui.rs`)
+**Source**: `crates/bin/src/gateway/` (Matrix: `matrix/mod.rs`, TUI: `tui.rs`)
 
 ### Server
 
@@ -77,7 +77,7 @@ Per-session serialization ensures only one agent task runs per session at a time
 
 The server also handles child session registration for `spawn_agent`, propagating call depth, tool scope, and completion signals.
 
-**Source**: `src/server.rs`
+**Source**: `crates/lib/src/server.rs`
 
 ### Runtime
 
@@ -91,7 +91,7 @@ The ReAct loop (`runtime::execute`) drives agent reasoning:
 
 The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event sink for audit trail logging.
 
-**Source**: `src/runtime.rs`
+**Source**: `crates/lib/src/runtime.rs`
 
 ### Session Model
 
@@ -110,7 +110,7 @@ See [Tool System](tools.md) for details.
 ## Source Layout
 
 ```text
-src/
+crates/lib/src/
   main.rs              CLI, config, eidetica init, extension install, gateway dispatch
   config.rs            Config types (backends, agents, security, multi_agent, agent_state_allowlist)
   types.rs             ConversationId

@@ -10,7 +10,7 @@ Rust ones.
 
 ## Two-level model
 
-Every extension is two traits, both in `src/extension/`:
+Every extension is two traits, both in `crates/lib/src/extension/`:
 
 - **`Extension`** (`mod.rs`) — the static declaration. It knows its
   `name()`, `manifest()`, `supported_hooks()`, the `scopes()` it lives
@@ -210,7 +210,7 @@ authoritative):
 
 ## Routine handlers
 
-Cron and one-shot work fires through the routine engine (`src/routine/`),
+Cron and one-shot work fires through the routine engine (`crates/lib/src/routine/`),
 not as a hook. A Global instance returns a `routine_handler()`; the
 engine dispatches via `ExtensionHub::dispatch_routine(name, &scope,
 payload)`.
@@ -339,26 +339,26 @@ so it round-trips through eidetica.
 
 | Path                                  | Purpose                                                                                                                                                   |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/extension/mod.rs`                | Framework: `Extension` trait, `ExtensionHub`, `install_all`, dispatch, activation log                                                                     |
-| `src/extension/instance.rs`           | `ExtensionInstance`, `Scope`, `ScopeCtx`, `PeerHandles`, `CapResolver`                                                                                    |
-| `src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `PromptAugmentation`, `ContextTail`, `AgentStateAdmin`) + `CapabilityKind`/`CapabilityRequest` declaration vocab |
-| `src/extension/agent_state.rs`        | `AgentStateAdmin` cap + scoped impl                                                                                                                       |
-| `src/extension/manifest.rs`           | `ExtensionManifest` + per-manifest validation                                                                                                             |
-| `src/extension/handler.rs`            | Hook-handler traits + `InstalledExtension` (Global drain target)                                                                                          |
-| `src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
-| `src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
-| `src/extensions/mod.rs`               | `all_builtins` + `BuiltinDeps` — wires the built-in set                                                                                                   |
-| `src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `spawn_task`                                                                                                           |
-| `src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                                                                                                                    |
-| `src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                                                                                                                  |
-| `src/extensions/web.rs`               | `web_fetch`, `web_search`                                                                                                                                 |
-| `src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`, `/memory`, recall context tail                                                                                 |
-| `src/extensions/skills.rs`            | skill tools + `/skills`, prompt augmentation                                                                                                              |
-| `src/extensions/schedule.rs`          | schedule tools + `/schedule` (agent-owned schedules)                                                                                                      |
-| `src/extensions/agent_schedule.rs`    | routine handler running the agent-owned schedule fire path                                                                                                |
-| `src/extensions/mcp.rs`               | `McpExtension` — one per configured MCP server                                                                                                            |
-| `src/extensions/path_normalizer.rs`   | `tool_call` hook stripping trailing `/` from path args                                                                                                    |
-| `src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt-injection patterns                                                                                                 |
+| `crates/lib/src/extension/mod.rs`                | Framework: `Extension` trait, `ExtensionHub`, `install_all`, dispatch, activation log                                                                     |
+| `crates/lib/src/extension/instance.rs`           | `ExtensionInstance`, `Scope`, `ScopeCtx`, `PeerHandles`, `CapResolver`                                                                                    |
+| `crates/lib/src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `PromptAugmentation`, `ContextTail`, `AgentStateAdmin`) + `CapabilityKind`/`CapabilityRequest` declaration vocab |
+| `crates/lib/src/extension/agent_state.rs`        | `AgentStateAdmin` cap + scoped impl                                                                                                                       |
+| `crates/lib/src/extension/manifest.rs`           | `ExtensionManifest` + per-manifest validation                                                                                                             |
+| `crates/lib/src/extension/handler.rs`            | Hook-handler traits + `InstalledExtension` (Global drain target)                                                                                          |
+| `crates/lib/src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
+| `crates/lib/src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
+| `crates/lib/src/extensions/mod.rs`               | `all_builtins` + `BuiltinDeps` — wires the built-in set                                                                                                   |
+| `crates/lib/src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `spawn_task`                                                                                                           |
+| `crates/lib/src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                                                                                                                    |
+| `crates/lib/src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                                                                                                                  |
+| `crates/lib/src/extensions/web.rs`               | `web_fetch`, `web_search`                                                                                                                                 |
+| `crates/lib/src/extensions/memory.rs`            | `remember`, `recall`, `list_memory_banks`, `/memory`, recall context tail                                                                                 |
+| `crates/lib/src/extensions/skills.rs`            | skill tools + `/skills`, prompt augmentation                                                                                                              |
+| `crates/lib/src/extensions/schedule.rs`          | schedule tools + `/schedule` (agent-owned schedules)                                                                                                      |
+| `crates/lib/src/extensions/agent_schedule.rs`    | routine handler running the agent-owned schedule fire path                                                                                                |
+| `crates/lib/src/extensions/mcp.rs`               | `McpExtension` — one per configured MCP server                                                                                                            |
+| `crates/lib/src/extensions/path_normalizer.rs`   | `tool_call` hook stripping trailing `/` from path args                                                                                                    |
+| `crates/lib/src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt-injection patterns                                                                                                 |
 
 ## Built-in extensions
 
@@ -383,7 +383,7 @@ lifecycle. All built-ins are in the default-active set for new sessions
 
 ## Adding a new extension
 
-1. Create `src/extensions/my_ext.rs` implementing `Extension`:
+1. Create `crates/lib/src/extensions/my_ext.rs` implementing `Extension`:
    - return your hook kinds from `supported_hooks()` and build a
      matching `manifest()`;
    - declare your `scopes()` (default `[Global]`);
@@ -391,7 +391,7 @@ lifecycle. All built-ins are in the default-active set for new sessions
      overrides the endpoints you contribute — `tools()`, `commands()`,
      the `*_hook()` slots, `prompt_augmentation()` / `context_tail()`,
      `memory_access()` / `messenger()`, `routine_handler()`.
-2. Add the module to `src/extensions/mod.rs` and the constructor to the
+2. Add the module to `crates/lib/src/extensions/mod.rs` and the constructor to the
    `all_builtins` vec. If it needs shared deps (session registry, agent
    index, embedder, …), add them to `BuiltinDeps` and thread through
    `main.rs`.

@@ -100,4 +100,4 @@ The bot surfaces approval requests as markdown notices in the room. Respond eith
 
 ## Limitations
 
-- **Text only.** The Matrix gateway currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `src/gateway/matrix/commands.rs` and `src/gateway/matrix/history.rs`.
+- **Text only.** The Matrix gateway currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/bin/src/gateway/matrix/commands.rs` and `crates/bin/src/gateway/matrix/history.rs`.

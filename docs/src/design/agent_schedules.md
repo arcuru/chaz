@@ -229,7 +229,7 @@ outright** rather than migrated:
    the resolved session), owned by an explicit `agent:` or the peer's
    default agent.
 2. `HeartbeatPayload`, `HeartbeatRoutineHandler`, the `scheduler`
-   extension + `SchedulePayload`, and `src/heartbeat.rs`
+   extension + `SchedulePayload`, and `crates/lib/src/heartbeat.rs`
    (`sweep_for_agent`) were removed.
 3. Detach/delete cleanup is replaced by the fire-time membership check
    in `fire_agent_schedule`.
@@ -269,5 +269,5 @@ an agent — a schedule). See the
 - ✅ **Standalone fire path** (Stage 3): `Server::fire_agent_schedule` + `agent_schedule` extension. Host check → resolve target → acquire processing lock → run turn → record ScheduleFire → one-shot cleanup.
 - ✅ **Tools/commands repoint** (Stage 5): All schedule tools (`schedule_add`, `schedule_modify`, `schedule_remove`, `schedule_list`, `schedule_once`) and the `/schedule` command now write agent-owned `Schedule`s with `target: Pinned(current session)` by default; `target: fresh` option added. `notify_agent_schedules_changed` bridge syncs the engine after mutations. All tools carry `Arc<SessionRegistry>` to open agent DBs.
 - ✅ **Detach cleanup retired** — fire-time membership check in `fire_agent_schedule` replaces the sweep in `detach_agent_from_session`.
-- ✅ **Legacy path deleted** (no migration — greenfield): `scheduler` extension, `HeartbeatPayload`/`HeartbeatRoutineHandler`, `src/heartbeat.rs`. YAML `schedules:` imports as agent-owned `Schedule`s.
+- ✅ **Legacy path deleted** (no migration — greenfield): `scheduler` extension, `HeartbeatPayload`/`HeartbeatRoutineHandler`, `crates/lib/src/heartbeat.rs`. YAML `schedules:` imports as agent-owned `Schedule`s.
 - ✅ **Naming reconciled**: one word `schedule` end-to-end (type, tools, command, extension, YAML key); `/schedule list` is session-wide across attached agents.

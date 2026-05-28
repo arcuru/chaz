@@ -14,12 +14,12 @@
 
 **What exists:**
 
-- `src/extensions/memory.rs` — registers `remember`, `recall`, `list_memory_banks` tools
-- `src/agent_db.rs` — per-agent `memory` store (Table<MemoryEntry>)
-- `src/memory_bank_db.rs` — standalone shared memory bank DBs
-- `src/commands/memory.rs` — `/memory new|list|delete|grant|revoke|share|import`
-- `src/extension/caps.rs` — `MemoryAccess` trait (defined, no impl), `PromptAugmentation` trait
-- BM25 + cosine hybrid search in `src/tools/memory.rs::search_memory()`
+- `crates/lib/src/extensions/memory.rs` — registers `remember`, `recall`, `list_memory_banks` tools
+- `crates/lib/src/agent_db.rs` — per-agent `memory` store (Table<MemoryEntry>)
+- `crates/lib/src/memory_bank_db.rs` — standalone shared memory bank DBs
+- `crates/lib/src/commands/memory.rs` — `/memory new|list|delete|grant|revoke|share|import`
+- `crates/lib/src/extension/caps.rs` — `MemoryAccess` trait (defined, no impl), `PromptAugmentation` trait
+- BM25 + cosine hybrid search in `crates/lib/src/tools/memory.rs::search_memory()`
 
 **What this adds:**
 
@@ -108,7 +108,7 @@ clean).
 
 The extension publishes `CapProvider::MemoryAccess(Arc<MemoryAccessImpl>)`.
 The impl delegates to the existing `search_memory` and `write_memory_entry`
-functions in `src/tools/memory.rs` — no duplication.
+functions in `crates/lib/src/tools/memory.rs` — no duplication.
 
 ```rust
 impl MemoryAccess for MemoryAccessImpl {
@@ -146,7 +146,7 @@ At agent DB bootstrap / reload:
    - Grant `Write` auth on the bank DB to the agent's pubkey
    - Write a `MemoryBankRef { db_id, name, permission: Write }` into the
      agent's `memory_banks` store
-4. Same pattern as `memory_grant` in `src/commands/memory.rs`
+4. Same pattern as `memory_grant` in `crates/lib/src/commands/memory.rs`
 
 This is idempotent — re-running bootstrap on an existing agent DB skips
 already-attached banks. Removing a bank from `default_memory_banks` does
@@ -179,7 +179,7 @@ project conventions bank while we're working on this feature").
 ### Extension structure
 
 ```
-src/extensions/memory.rs  (modified)
+crates/lib/src/extensions/memory.rs  (modified)
 ├── MemoryExtension
 │   ├── fields: Arc<SessionRegistry>, HostedIndex, Option<Arc<dyn Embedder>>
 │   ├── manifest: provides [MemoryAccess, PromptAugmentation]

@@ -26,12 +26,24 @@ just fmt            # treefmt (rustfmt, alejandra, prettier)
 just ci             # lint + fmt + test + nix build
 ```
 
-Tests: `CARGO_TARGET_DIR=target-test cargo test --bin chaz` (separate target dir avoids contention with `just build`). rustls-based — no openssl/sqlite system deps; `pkg-config` comes from the Nix shell.
+Tests: `CARGO_TARGET_DIR=target-test cargo test` (separate target dir avoids contention with `just build`; runs both workspace members). Add `-p chaz-core` or `-p chaz` to scope to one crate. rustls-based — no openssl/sqlite system deps; `pkg-config` comes from the Nix shell.
+
+## Workspace
+
+Two-crate Cargo workspace.
+
+- **`crates/lib/`** — `chaz-core` library. Runtime, tools, extensions, session model, security, MCP, backends, commands, sandbox hosts, gateway trait + approval types. The testable surface (~10k lines).
+- **`crates/bin/`** — `chaz` binary. Entrypoint (`main.rs`) and the concrete gateway implementations (Matrix, TUI, CLI). Structurally hard to test without mocking matrix-sdk / ratatui (~3k lines).
+
+Shared dependency versions live in the workspace-root `Cargo.toml` `[workspace.dependencies]` block; each crate pulls them with `workspace = true`.
 
 ## Source Map
 
+Paths below are relative to the crate's `src/` (e.g. `agent.rs` → `crates/lib/src/agent.rs`).
+
+### `chaz-core` (crates/lib/src/)
+
 ```
-main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
 commands.rs          Transport-neutral session commands: Command, CommandContext, CommandOutcome, dispatch()
 config.rs            Config, Backend, AgentConfig, SecurityConfig
 types.rs             ConversationId
@@ -53,13 +65,23 @@ tools/               Built-in tools: agent, task, compact, describe, time, calcu
 security/            SecurityContext, SecretStore, LeakDetector, NetworkPolicy, Sanitizer
 runtime.rs           ReAct loop: approval, timeouts, leak/injection scanning, retry, loop detection
 server.rs            Callback-driven Server: on_local_write → process_session → spawn agent → deliver response
-gateway/             matrix/ + tui/ — translate platform events ↔ session DB entries
+gateway.rs           Gateway trait + ApprovalExchange + ApprovalDecision — concrete impls live in the bin crate
 error.rs             Error + LlmError (retryable/permanent classification)
 backends.rs          BackendManager, LLMBackend trait, ChatContext, Message
 openai.rs            OpenAI-compatible backend
 extension/           Extension framework: Scope, ScopeCtx, PeerHandles, HookKind, ExtensionHub (per-agent instance model)
 extensions/          Built-in extensions: schedule, agent_schedule, memory, skills, mcp, agent_state, …
 defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
+test_support/        #[cfg(test)] harness: MockBackend, MockHost, fresh_session, fresh_session_registry, permissive_security
+```
+
+### `chaz` binary (crates/bin/src/)
+
+```
+main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
+gateway/cli.rs       CliGateway — one-shot --cli prompt runner
+gateway/matrix/      MatrixGateway — matrix-sdk login/sync + session bridging
+gateway/tui/         TuiGateway — ratatui-based local interactive surface
 ```
 
 ## Key Invariants
