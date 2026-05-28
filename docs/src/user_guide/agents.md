@@ -160,6 +160,107 @@ These aren't session-scoped; they act on the Living Agent itself.
 | `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                                                   |
 | `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                                             |
 | `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                                                 |
+| `/agent rehost <ref> [pubkey]`                      | Reassign the home peer for **this session** (default scope). With no `pubkey`, defaults to "rehost to me." See [Execution ownership](#execution-ownership-home-peer) for what this controls.       |
+| `/agent rehost --agent <ref> [pubkey]`              | Reassign the agent-level home — the peer that runs `Fresh` schedule fires for this agent.                                                                                                          |
+| `/agent rehost [--agent] --clear <ref>`             | Clear the chosen home, restoring legacy "any keyholder runs" behavior. **WARNING:** re-introduces the multi-peer race.                                                                             |
+| `/agent home-status [ref]`                          | Print agent-level and per-session `home_pubkey` for one or all locally-hosted agents. This peer's keys are tagged `← (me)`.                                                                        |
+
+## Execution ownership (home peer)
+
+When an agent is **co-owned** — more than one peer holds an authorized key on the agent DB — and attached to the same session, both peers would otherwise wake on the same human message and both run the ReAct loop. You'd get a forked turn, double the token spend, and downstream burst-budget confusion. The **home peer** is the single peer elected to run the agent for a given session.
+
+For a solo agent (one peer holds the key), none of this applies — you'll never notice it.
+
+### What's automatic
+
+You don't have to do anything for the common cases. Two defaults handle them:
+
+- **On `/agent new`** (and yaml bootstrap), the creator becomes the **agent-level** home. Used only by `Fresh` schedule fires, where no session exists yet to carry a per-session value.
+- **On every `/agent add`** (or any other attach), the attaching peer becomes the **per-session** home for that (session, agent) pair. Subsequent re-attaches don't change it — only `/agent rehost` does.
+
+So if Alice creates `alpha` and attaches it to her DM, Alice is the home. If she invites Bob and Bob attaches `alpha` to *his* DM, Bob is the home for *his* DM. They can both edit `alpha`'s config and memory; their DMs don't fight over execution.
+
+### Where the state lives
+
+| Scope         | Stored on        | Field                                            | Used by                       |
+| ------------- | ---------------- | ------------------------------------------------ | ----------------------------- |
+| Per-session   | Session DB meta  | `SessionMeta.agents[i].home_pubkey`              | Interactive turns, Pinned schedules |
+| Agent-level   | Agent DB meta    | `meta.home_pubkey` (top-level key)               | Fresh schedule fires only     |
+
+Both are `Option<PublicKey>` (string-encoded `ed25519:…`). `None` is the legacy default and means "any keyholder runs" — the pre-feature behavior. Pre-existing sessions/agents stay on the legacy path until a `/agent rehost` (or a new attach/create) writes a value.
+
+### Inspecting it
+
+```text
+/agent home-status alpha
+```
+
+```text
+agent: alpha (db_id: sha256:abc...)
+  agent-level home: ed25519:PK_A... ← (me)
+  sessions (3):
+    s_001 morning standup            ed25519:PK_B... 
+    s_002 research thread            ed25519:PK_A... ← (me)
+    s_003 scratch                    <unset — legacy, any keyholder>
+```
+
+Without an argument (`/agent home-status`), every locally-hosted agent is listed. Use this to see at a glance which (session, agent) pairs you own and which belong to other peers.
+
+### Taking over (`/agent rehost`)
+
+```text
+/agent rehost <ref>                        # session-level, rehost to me
+/agent rehost <ref> <pubkey>               # session-level, hand to that peer
+/agent rehost --agent <ref> [pubkey]       # agent-level (Fresh fires)
+/agent rehost --clear <ref>                # session-level, restore legacy None
+/agent rehost --agent --clear <ref>        # agent-level, restore legacy None
+```
+
+The default form rewrites the home for the **current session** to this peer's pubkey on the agent. With an explicit pubkey, the target must already be authorized on the agent DB (`/agent invite` first) — rehost refuses unauthorized pubkeys to prevent bricking the agent.
+
+`--clear` removes the field and prints a warning: clearing re-introduces the multi-peer race on the chosen scope. Use only for recovery from stuck state.
+
+### When the home peer is offline
+
+Failover is explicit and operator-driven in v1. If the home peer's chaz process is down, its (session, agent) pairs go silent — `peer_is_home_for` returns false for everyone, no one responds.
+
+To notice it: chaz logs a `WARN` after the third consecutive skip per (session, agent), with the exact recovery command:
+
+```text
+WARN home peer ed25519:PK_A... has missed 3 consecutive wakes for sid s_001/agent alpha.
+     If this is a stuck home, run `/agent rehost alpha` from a surviving peer to take over.
+```
+
+To recover from a surviving peer:
+
+```text
+/agent home-status alpha          # see the current state, which pair is silent
+/agent rehost alpha               # take over this session
+# (next message wakes you instead)
+```
+
+The skip counter resets on a successful run (home matches self) and on any rehost write.
+
+Why no auto-failover: eidetica's daemon/client split means a peer's sync engine can be up while its chaz process is down (or vice versa), so presence is unreliable to infer remotely. Any opportunistic "the home is stale, I'll claim it" would re-introduce the very fork this system exists to prevent. Revisit when eidetica grows a reliable leasing primitive.
+
+### `/agent revoke-peer` interaction
+
+Revoke is the operator's call — there's no hard block when the revoked key is the current home. The success message lists any sessions and agent-level state where the revoked key was home, with the exact `/agent rehost` command to recover:
+
+```text
+> /agent revoke-peer alpha ed25519:PK_B...
+Revoked ed25519:PK_B... from agent 'alpha'. They retain read access to history but cannot write.
+
+WARNING: revoked key was the home peer for 2 session(s): s_001, s_002. Their next turn will be silent until you run `/agent rehost alpha` from a surviving peer.
+```
+
+### Cross-peer `spawn_agent`
+
+Works without special handling. The spawning peer is the one that calls `attach_agent_to_session` on the child session, so the per-session home defaults to that peer — and the spawning peer runs the child turn. If a co-owner later syncs the child session, their gate skips it.
+
+### Migrating pre-existing co-owned setups
+
+If you had co-owned agents/sessions before this feature landed (post Stage 10), they kept `home_pubkey = None` until someone runs `/agent rehost`. The legacy behavior — both peers respond — continues until then. To surface the migration cleanly, chaz emits a startup `WARN` per affected (agent, session) pair, naming the exact `/agent rehost` command to claim execution. Solo agents are skipped (no race possible).
 
 ## Turn-taking
 

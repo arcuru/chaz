@@ -113,6 +113,139 @@ To stop sharing a database — without revoking keys already held by peers who i
 
 Eidetica doesn't push approved requests back to the requester — the request_id lives on the **source** peer's `_sync` DB only. So after `/sharing approve <id>` the receiver has to re-run their original import command. Re-runs are cheap: tickets just carry the DB id and the source peer's sync addresses.
 
+## Example: Co-owning an Agent Across Two Peers
+
+A walkthrough of the full co-ownership lifecycle — invite, share, attach, observe the home-peer gate firing, hand off execution, recover from an offline home. Two TUIs against separate state dirs. The home-peer reference is in [Agents → Execution ownership](./agents.md#execution-ownership-home-peer).
+
+### Setup
+
+Two state dirs, two configs:
+
+```bash
+# Peer A
+chaz --config ~/peer-a.yaml --tui
+
+# Peer B (separate terminal, separate state_dir in its config)
+chaz --config ~/peer-b.yaml --tui
+```
+
+### 1. Create and share the agent (Peer A)
+
+```text
+> /agent new alpha model=opus
+Created agent 'alpha' …
+
+> /agent home-status alpha
+agent: alpha (db_id: sha256:abc…)
+  agent-level home: ed25519:PK_A_alpha… ← (me)
+  sessions (0):
+```
+
+`alpha` is solo. The agent-level home is Peer A automatically (the creator).
+
+### 2. Invite Peer B
+
+```text
+# On Peer B:
+> /pubkey
+ed25519:PK_B_default…
+
+# On Peer A:
+> /agent invite alpha ed25519:PK_B_default… admin
+Invited ed25519:PK_B_default… as Admin on agent 'alpha' …
+
+> /agent share alpha
+eidetica:?db=sha256:abc…&pr=…
+
+# On Peer B:
+> /agent import <ticket>
+Imported agent 'alpha' (DB sha256:abc…). Attach with /agent add alpha.
+```
+
+Now `alpha` is co-owned: both peers hold an authorized key.
+
+### 3. Attach to a shared session
+
+Create a session, share it, attach `alpha` on both sides:
+
+```text
+# On Peer A:
+> /new          # or just send a message in the current session
+> /agent add alpha
+Attached agent 'alpha' to this session.
+
+> /share
+eidetica:?db=sha256:def…&pr=…
+
+# On Peer B:
+> /sync eidetica:?db=sha256:def…&pr=…
+> /sessions             # select the synced session
+> /agent add alpha
+```
+
+Verify state from either side:
+
+```text
+> /agent home-status alpha
+agent: alpha (db_id: sha256:abc…)
+  agent-level home: ed25519:PK_A_alpha… ← (me)        # on Peer A — Peer B sees no ← (me) here
+  sessions (1):
+    sha256:def…  this room      ed25519:PK_A_alpha…   # ← (me) on A, plain on B
+```
+
+`alpha`'s per-session home is **Peer A** — the peer that attached first wins. Peer B is a keyholder but not the home.
+
+### 4. Watch the gate work
+
+Send a human message in the shared session.
+
+- **Peer A** runs `alpha`'s turn and writes the response.
+- **Peer B**'s log shows `Not home peer for this session/agent; skipping turn` and writes nothing.
+
+Single agent response. No fork. This is the whole point.
+
+### 5. Hand off execution to Peer B
+
+```text
+# On Peer B:
+> /agent rehost alpha
+Set session-level home_pubkey for agent 'alpha' to ed25519:PK_B_alpha…
+```
+
+After eidetica syncs the meta write back to A, the next human message is run by Peer B. Confirm with `/agent home-status alpha` from either side — the session row now shows `PK_B_alpha`.
+
+### 6. Recover from an offline home
+
+Stop Peer B. From Peer A, send three messages in the shared session. After the third, the chaz log on Peer A shows:
+
+```text
+WARN home peer ed25519:PK_B_alpha… has missed 3 consecutive wakes for sid sha256:def…/agent alpha.
+     If this is a stuck home, run `/agent rehost alpha` from a surviving peer to take over.
+```
+
+Take over:
+
+```text
+# On Peer A:
+> /agent home-status alpha    # confirm what's silent
+> /agent rehost alpha
+```
+
+The next message wakes Peer A. When Peer B comes back online, its gate sees `home_pubkey = PK_A_alpha` and silently skips that session until you hand it back.
+
+### 7. Revoke with awareness
+
+If you ever revoke a co-owner whose key is still the home for one or more sessions, the success message names what needs rehosting:
+
+```text
+> /agent revoke-peer alpha ed25519:PK_B_alpha…
+Revoked ed25519:PK_B_alpha… from agent 'alpha'. They retain read access to history but cannot write.
+
+WARNING: revoked key was the home peer for 1 session(s): sha256:def…. Their next turn will be silent until you run `/agent rehost alpha` from a surviving peer.
+```
+
+Revoke doesn't block on this — but the warning surfaces what's about to go silent so you can act before users notice.
+
 ## Example: Watching a Matrix Bot's Session
 
 1. Start the Matrix bot on a server:
