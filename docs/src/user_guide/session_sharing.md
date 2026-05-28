@@ -216,10 +216,11 @@ After eidetica syncs the meta write back to A, the next human message is run by 
 
 ### 6. Recover from an offline home
 
-Stop Peer B. From Peer A, send three messages in the shared session. After the third, the chaz log on Peer A shows:
+Stop Peer B. From Peer A, send three messages in the shared session. After the third, the chaz log on Peer A shows (structured fields `session_db_id`, `agent`, `skipped_wakes` accompany the message):
 
 ```text
-WARN home peer ed25519:PK_B_alpha… has missed 3 consecutive wakes for sid sha256:def…/agent alpha.
+WARN session_db_id="sha256:def…" agent="alpha" skipped_wakes=3
+     Home peer has missed 3 consecutive wakes for this session/agent.
      If this is a stuck home, run `/agent rehost alpha` from a surviving peer to take over.
 ```
 
@@ -313,7 +314,7 @@ This was a real bug fixed in 2026-04 — `/share`/`/agent share`/`/memory share`
 **A co-owner's edits to a synced session don't trigger an agent run on the host.**
 Known limitation: chaz only listens to `on_local_write`, but remote-write callbacks were dead code in eidetica until a recent fix. Until that fix is merged and chaz subscribes to `on_remote_write`, remote pushes land in the database silently — they're visible if you re-render the session, but agents won't react to them. Tracked as the "Remote-write callback subscription" item in the followups.
 
-**`/agent import` reports "Bootstrap request <id> pending" instead of importing.**
+**`/agent import` reports `Bootstrap request <id> pending` instead of importing.**
 Expected when the receiver's pubkey isn't preseeded. The owner needs to run `/sharing requests` to see the queue, then `/sharing approve <id>` to grant the requested permission. After approval, the receiver re-runs `/agent import <ticket>` and the import completes. See "Request flow" above.
 
 **`/sharing approve` errors with "this peer holds no key for DB ... — only an admin on that DB can approve".**

@@ -9,24 +9,22 @@ YAML `agents:` config is the bootstrap path: at startup, chaz materializes one A
 ```yaml
 agents:
   - name: default
-    persona: # System prompt (file includes + inline text)
-      description: "the default chaz agent"
-      files:
-        - ~/AGENTS.md # Tilde expands to $HOME
-      prompt: |
-        Stay terse on Matrix.
+    # System prompt — `system_prompt_files` are concatenated first, then
+    # `system_prompt` is appended.
+    system_prompt_files:
+      - ~/AGENTS.md # Tilde expands to $HOME
+    system_prompt: |
+      Stay terse on Matrix.
     max_iterations: 10 # Max ReAct loop iterations before forced summary
-    allowed_tools: null # null = all tools, or list specific tools
+    tools: null # null = all tools, or list specific tools
     can_spawn: # Which agents this one can delegate to
       - researcher
       - coder
 
   - name: researcher
-    persona:
-      description: "tracks down sources and synthesizes"
-      prompt: "You are a researcher. Cite primary sources."
+    system_prompt: "You are a researcher. Cite primary sources."
     max_iterations: 20
-    allowed_tools:
+    tools:
       - web_fetch
       - calculate
       - get_time
@@ -34,10 +32,9 @@ agents:
       - recall
 
   - name: coder
-    persona:
-      prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
+    system_prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
     max_iterations: 15
-    allowed_tools:
+    tools:
       - shell
       - read_file
       - write_file
@@ -52,72 +49,47 @@ agents:
 
 At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. On subsequent boots, existing DBs are reused without overwriting their `config` — yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
 
-## Personas (system prompts)
+## System Prompts
 
-A persona is what shapes the LLM's behavior — what older systems called the "system prompt." It has three pieces, all optional:
+An agent's system prompt is built from two AgentDbConfig fields, both optional:
 
-| Field         | Type          | Notes                                                         |
-| ------------- | ------------- | ------------------------------------------------------------- |
-| `description` | `String`      | Surfaced in `/agent persona show`. Doesn't enter the prompt.  |
-| `files`       | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. |
-| `prompt`      | `String`      | Inline text appended after file content.                      |
+| Field                 | Type          | Notes                                                                                                                      |
+| --------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `system_prompt_files` | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. Files are read at agent construction time, not per-turn.     |
+| `system_prompt`       | `String`      | Inline text appended after file content. The final prompt the LLM sees is `<concatenated file bodies>\n\n<system_prompt>`. |
 
-### Snapshots: deterministic prompts per session
+The runtime `Agent` holds the assembled text; ContextBuilder injects it as the first chat message. There is no per-session snapshot layer — the prompt is rebuilt fresh from `AgentDbConfig` on every turn, so a `/agent set` edit takes effect on the next message without any explicit refresh step.
 
-When an agent is attached to a session, chaz reads each `files:` path, hashes the content with blake3, and writes a single audit-only `PersonaSnapshot` entry to the session's eidetica DB. That snapshot is what ContextBuilder injects as the system message — **disk edits to the source files do not silently mutate ongoing sessions**. To pick up file changes, run:
+To pick up edits to a `system_prompt_files` path on disk, re-write the agent's config (e.g. `/agent set <ref> system_prompt_files <same-paths>`) — that triggers a re-read. A future `/agent reload` is on the roadmap for the no-op case.
 
-```text
-/agent persona bump <ref>
-```
+### Editing the system prompt
 
-This re-resolves the persona and writes a fresh snapshot. Each snapshot records the source files, their byte counts, and their hashes, so months later you can audit "what instructions was the agent running with on 2026-05-07?"
+| Command                                                | Effect                                                                                  |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `/agent set <ref> system_prompt <text>`                | Set the inline prompt text. Takes effect on the next message.                           |
+| `/agent set <ref> system_prompt_files <path1>,<path2>` | Replace the file list (comma-separated, supports `~`). Files are re-read on this write. |
 
-### Editing a persona
+The `skills` extension can additionally append text to the system prompt at context-assembly time via the `PromptAugmentation` capability — see the design note in [`design/skills_and_prompts.md`](../design/skills_and_prompts.md). A dedicated user-guide page for Skills is not written yet.
 
-Persona fields are edited through `/agent set` with dotted keys; the change writes to the AgentDb and triggers a fresh snapshot on the active session.
+### Legacy `roles:` (deprecated)
 
-| Command                                          | Effect                                                                                 |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `/agent set <ref> persona.files <path1>,<path2>` | Replace the file list (comma-separated, supports `~`).                                 |
-| `/agent set <ref> persona.prompt "<text>"`       | Set the inline prompt text (empty string clears it).                                   |
-| `/agent set <ref> persona.description "<text>"`  | Update the description label.                                                          |
-| `/agent set <ref> persona.clear x`               | Drop the persona entirely. The agent falls back to the migrated `role:` lookup if any. |
-| `/agent persona show <ref>`                      | Print current persona definition + latest snapshot summary.                            |
-| `/agent persona bump <ref>`                      | Re-resolve files and write a new snapshot.                                             |
-
-### Migrating from `role:`
-
-Older configs used a top-level `roles:` block plus an `agent.role:` reference:
-
-```yaml
-roles:
-  - name: chaz
-    prompt: "..."
-agents:
-  - name: default
-    role: chaz
-```
-
-Both still parse for one release, with a deprecation warning at startup. At runtime, an agent with `role:` set and `persona:` unset gets a synthetic persona built from the role's prompt — same behavior, different shape. New configs should drop `roles:` and put the prompt directly under the agent's `persona:`.
-
-Two signals tell you migration is needed and exactly how:
-
-- **At startup**, a one-shot `WARN` per legacy key — `config.role`, `config.roles`, and one per agent that still has `role:` (named) and no `persona:`.
-- **At runtime**, `/agent persona show <ref>` flags `legacy role: <r> (deprecated)` and prints the exact `/agent set <ref> persona.prompt "…"` (or `persona.files <path>`) command that replaces it. Running that writes a real persona to the agent DB and a fresh `PersonaSnapshot`, after which the legacy path is dead for that agent.
-
-The migration is non-destructive: until you set a persona, the role keeps working via the runtime synthesis, so you can migrate agents one at a time.
+Older configs used a top-level `roles:` block and an `agent.role:` reference. The `/role` slash command and `role:` config field have been removed from the live edit path; `/role` now prints a deprecation message pointing to `/agent set <name> system_prompt <text>`. Move any remaining `role:` text into the owning agent's `system_prompt:` field.
 
 ## Agent DB schema
 
-Each Agent DB contains five well-known stores:
+Each Agent DB contains the following well-known stores:
 
-| Store          | Kind                         | Contents                                                                                    |
-| -------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
-| `config`       | DocStore                     | Serialized `AgentDbConfig`: role, model, allowed_tools, max_iterations, grants, presets     |
-| `memory`       | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)        |
-| `meta`         | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar                                |
-| `history`      | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                |
-| `memory_banks` | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission) |
+| Store            | Kind                         | Contents                                                                                            |
+| ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------- |
+| `config`         | DocStore                     | Serialized `AgentDbConfig`: model, tools, max_iterations, grants, presets, `system_prompt`/`_files` |
+| `memory`         | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)                |
+| `meta`           | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar, agent-level `home_pubkey`             |
+| `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                        |
+| `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)         |
+| `schedules`      | `Table<Schedule>`            | Agent-owned cron/one-shot wakes — see [Schedules](#schedules) below                                 |
+| `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution    |
+| `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                   |
+| `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                    |
 
 The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — one for Living Agents and one for standalone Memory Bank DBs — built once at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker (`agent` / `bank` / `session`, written at creation time). Both indices map `db_id ↔ display_name ↔ pubkey`. They exist because eidetica has no inverse "list DBs this key can access" query, and routing reads them on every session entry. Mutations from `/agent new`, `/memory new`, `/agent delete`, etc. update the cache directly. There is no persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 
@@ -144,26 +116,26 @@ Every ref is either an agent's display name or its eidetica DB ID; resolution tr
 
 These aren't session-scoped; they act on the Living Agent itself.
 
-| Command                                             | What                                                                                                                                                                                               |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `role`/`model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`.                           |
-| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                         |
-| `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                                                  |
-| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                   |
-| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                   |
-| `/agent unshare <ref>`                              | Stop sharing the agent's DB — disable sync so this peer stops serving it. Does not revoke keys already held by peers who imported it.                                                              |
-| `/agent import <ticket> [admin\|write\|read]`       | Request access to a synced agent DB via the bootstrap workflow. Default `write`. If the receiver's key is preseeded, sync proceeds; otherwise queues a request for the owner's `/sharing approve`. |
-| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                                                     |
-| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                                                   |
-| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).                            |
-| `/sharing` or `/sharing status`                     | List every database this peer is currently sharing, grouped by kind (agent / bank / session) with DB root IDs.                                                                                     |
-| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                                                   |
-| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                                             |
-| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                                                 |
-| `/agent rehost <ref> [pubkey]`                      | Reassign the home peer for **this session** (default scope). With no `pubkey`, defaults to "rehost to me." See [Execution ownership](#execution-ownership-home-peer) for what this controls.       |
-| `/agent rehost --agent <ref> [pubkey]`              | Reassign the agent-level home — the peer that runs `Fresh` schedule fires for this agent.                                                                                                          |
-| `/agent rehost [--agent] --clear <ref>`             | Clear the chosen home, restoring legacy "any keyholder runs" behavior. **WARNING:** re-introduces the multi-peer race.                                                                             |
-| `/agent home-status [ref]`                          | Print agent-level and per-session `home_pubkey` for one or all locally-hosted agents. This peer's keys are tagged `← (me)`.                                                                        |
+| Command                                             | What                                                                                                                                                                                                                                        |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`/`system_prompt`/`system_prompt_files` (same set accepted by `/agent set`). |
+| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                                                                  |
+| `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                                                                                           |
+| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                                                            |
+| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                                                            |
+| `/agent unshare <ref>`                              | Stop sharing the agent's DB — disable sync so this peer stops serving it. Does not revoke keys already held by peers who imported it.                                                                                                       |
+| `/agent import <ticket> [admin\|write\|read]`       | Request access to a synced agent DB via the bootstrap workflow. Default `write`. If the receiver's key is preseeded, sync proceeds; otherwise queues a request for the owner's `/sharing approve`.                                          |
+| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                                                                                              |
+| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                                                                                            |
+| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).                                                                     |
+| `/sharing` or `/sharing status`                     | List every database this peer is currently sharing, grouped by kind (agent / bank / session) with DB root IDs.                                                                                                                              |
+| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                                                                                            |
+| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                                                                                      |
+| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                                                                                          |
+| `/agent rehost <ref> [pubkey]`                      | Reassign the home peer for **this session** (default scope). With no `pubkey`, defaults to "rehost to me." See [Execution ownership](#execution-ownership-home-peer) for what this controls.                                                |
+| `/agent rehost --agent <ref> [pubkey]`              | Reassign the agent-level home — the peer that runs `Fresh` schedule fires for this agent.                                                                                                                                                   |
+| `/agent rehost [--agent] --clear <ref>`             | Clear the chosen home, restoring legacy "any keyholder runs" behavior. **WARNING:** re-introduces the multi-peer race.                                                                                                                      |
+| `/agent home-status [ref]`                          | Print agent-level and per-session `home_pubkey` for one or all locally-hosted agents. This peer's keys are tagged `← (me)`.                                                                                                                 |
 
 ## Execution ownership (home peer)
 
@@ -178,14 +150,14 @@ You don't have to do anything for the common cases. Two defaults handle them:
 - **On `/agent new`** (and yaml bootstrap), the creator becomes the **agent-level** home. Used only by `Fresh` schedule fires, where no session exists yet to carry a per-session value.
 - **On every `/agent add`** (or any other attach), the attaching peer becomes the **per-session** home for that (session, agent) pair. Subsequent re-attaches don't change it — only `/agent rehost` does.
 
-So if Alice creates `alpha` and attaches it to her DM, Alice is the home. If she invites Bob and Bob attaches `alpha` to *his* DM, Bob is the home for *his* DM. They can both edit `alpha`'s config and memory; their DMs don't fight over execution.
+So if Alice creates `alpha` and attaches it to her DM, Alice is the home. If she invites Bob and Bob attaches `alpha` to _his_ DM, Bob is the home for _his_ DM. They can both edit `alpha`'s config and memory; their DMs don't fight over execution.
 
 ### Where the state lives
 
-| Scope         | Stored on        | Field                                            | Used by                       |
-| ------------- | ---------------- | ------------------------------------------------ | ----------------------------- |
-| Per-session   | Session DB meta  | `SessionMeta.agents[i].home_pubkey`              | Interactive turns, Pinned schedules |
-| Agent-level   | Agent DB meta    | `meta.home_pubkey` (top-level key)               | Fresh schedule fires only     |
+| Scope       | Stored on       | Field                               | Used by                             |
+| ----------- | --------------- | ----------------------------------- | ----------------------------------- |
+| Per-session | Session DB meta | `SessionMeta.agents[i].home_pubkey` | Interactive turns, Pinned schedules |
+| Agent-level | Agent DB meta   | `meta.home_pubkey` (top-level key)  | Fresh schedule fires only           |
 
 Both are `Option<PublicKey>` (string-encoded `ed25519:…`). `None` is the legacy default and means "any keyholder runs" — the pre-feature behavior. Pre-existing sessions/agents stay on the legacy path until a `/agent rehost` (or a new attach/create) writes a value.
 
@@ -199,7 +171,7 @@ Both are `Option<PublicKey>` (string-encoded `ed25519:…`). `None` is the legac
 agent: alpha (db_id: sha256:abc...)
   agent-level home: ed25519:PK_A... ← (me)
   sessions (3):
-    s_001 morning standup            ed25519:PK_B... 
+    s_001 morning standup            ed25519:PK_B...
     s_002 research thread            ed25519:PK_A... ← (me)
     s_003 scratch                    <unset — legacy, any keyholder>
 ```
@@ -224,10 +196,11 @@ The default form rewrites the home for the **current session** to this peer's pu
 
 Failover is explicit and operator-driven in v1. If the home peer's chaz process is down, its (session, agent) pairs go silent — `peer_is_home_for` returns false for everyone, no one responds.
 
-To notice it: chaz logs a `WARN` after the third consecutive skip per (session, agent), with the exact recovery command:
+To notice it: chaz logs a `WARN` after the third consecutive skip per (session, agent), with the exact recovery command. Structured fields (`session_db_id`, `agent`, `skipped_wakes`) accompany the message:
 
 ```text
-WARN home peer ed25519:PK_A... has missed 3 consecutive wakes for sid s_001/agent alpha.
+WARN session_db_id="sha256:def…" agent="alpha" skipped_wakes=3
+     Home peer has missed 3 consecutive wakes for this session/agent.
      If this is a stuck home, run `/agent rehost alpha` from a surviving peer to take over.
 ```
 
@@ -325,7 +298,7 @@ Routines are created two ways, both compiling to the same `Routine` rows fired b
 
 ### When rules fire
 
-Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The fire writes the `Directive` and the agent turn runs on the server regardless; a gateway only affects when you _see_ the result.
+Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a gateway only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
 
 - **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
@@ -354,8 +327,8 @@ Example — make `researcher` post a morning briefing to the current session wee
 
 Tool access is controlled at two levels:
 
-1. **Agent definition**: `allowed_tools` restricts which tools an agent can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace).
-2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `allowed_tools`.
+1. **Agent definition**: the `tools:` field restricts which tools an agent can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace). `tools: null` (or omitted) means "all tools".
+2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `tools:` list.
 
 This means a child agent can never have more tools than its parent, even if its definition allows them.
 
@@ -455,18 +428,19 @@ Either declare it in yaml (bootstrapped once, on first start):
 ```yaml
 agents:
   - name: researcher
-    role: researcher
+    system_prompt: "You are a research assistant. Cite primary sources."
     max_iterations: 20
-    allowed_tools: [web_fetch, calculate, remember, recall]
+    tools: [web_fetch, calculate, remember, recall]
 ```
 
 …or create one live:
 
 ```text
-/agent new researcher role=researcher max_iterations=20 tools=web_fetch,calculate,remember,recall
+/agent new researcher max_iterations=20 tools=web_fetch,calculate,remember,recall
+/agent set researcher system_prompt "You are a research assistant. Cite primary sources."
 ```
 
-Either path produces an Agent DB (`agent:researcher`) signed by a fresh per-agent key, plus a row in the local `agents` index.
+`/agent new` parses `k=v` overrides by whitespace, so values can't contain spaces — set a multi-word `system_prompt` in a follow-up `/agent set` (which takes the remainder of the line verbatim). Either path produces an Agent DB (`agent:researcher`) signed by a fresh per-agent key, plus a row in the local `agents` index.
 
 ### 2. Tweak config without restarting
 
@@ -474,7 +448,7 @@ Edits flow through `/agent set`. The server re-reads each agent's `AgentDb::conf
 
 ```text
 /agent set researcher max_iterations 30
-/agent set researcher role deep-researcher
+/agent set researcher system_prompt "You are a deep-research analyst. Cite primary sources and link your reasoning chain."
 ```
 
 No yaml reload, no restart.
@@ -568,7 +542,7 @@ On peer B, import the ticket:
 /agent import eidetica:?db=sha256:…&pr=http:…
 ```
 
-Because peer B already holds a key for the DB (it's the one the owner pre-authorised), `/agent import` registers the agent under peer B's own key. Both peers now host the agent: either can attach it to sessions, edit config, run turns — and `/agent share` + `/agent import` can daisy-chain further peers from there. The server's per-session serialisation prevents duplicate replies when two peers race on the same message.
+Because peer B already holds a key for the DB (it's the one the owner pre-authorised), `/agent import` registers the agent under peer B's own key. Both peers now host the agent: either can attach it to sessions, edit config, run turns — and `/agent share` + `/agent import` can daisy-chain further peers from there. Once both peers attach the agent to a shared session, the [home peer](#execution-ownership-home-peer) gate elects exactly one of them to actually run each turn (with `/agent rehost` to hand off).
 
 `/agent invite` takes an optional permission — `admin` (default), `write`, or `read`:
 
@@ -601,7 +575,7 @@ History is append-only; detach does not erase it.
 
 A single agent DB can be hosted by several peers simultaneously. Each peer holds its _own_ keypair — `/pubkey` + `/agent invite` is the handshake that pre-authorises a second peer's pubkey on the DB before the ticket ever moves. The keys never sync; only DB entries do.
 
-Each peer keeps its own row in its local `agents` index; eidetica sync replicates `config`, `memory`, `meta`, `history`, and `memory_banks` between peers. Session `AuthSettings` lists each peer's pubkey separately, so routing treats them as distinct authorised writers — whichever peer picks up the entry first answers.
+Each peer keeps its own row in its local `agents` index; eidetica sync replicates every store on the agent DB (`config`, `memory`, `meta`, `history`, `memory_banks`, `schedules`, `schedule_fires`, `skills`, `skill_banks`) between peers. Session `AuthSettings` lists each peer's pubkey separately, so routing treats them as distinct authorised writers — but only the **home peer** (see [Execution ownership](#execution-ownership-home-peer)) actually runs the turn, preventing the multi-peer race.
 
 ```mermaid
 graph LR
@@ -618,4 +592,4 @@ graph LR
     B_agents -.pubkey→db_id.-> B_db
 ```
 
-Turn-taking within a session is still per-entry: whichever peer reads the new entry first and has the target agent hosted picks it up.
+Turn-taking within a session is gated by [Execution ownership](#execution-ownership-home-peer): for each (session, agent) pair exactly one peer is the home, and only that peer runs the turn. The agent's session-level `home_pubkey` is what `peer_is_home_for` checks before letting the ReAct loop wake.
