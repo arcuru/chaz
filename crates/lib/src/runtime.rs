@@ -25,7 +25,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Events emitted during the ReAct loop for audit trail / observability.
-#[allow(dead_code)]
 pub enum RuntimeEvent {
     ToolCall {
         id: String,

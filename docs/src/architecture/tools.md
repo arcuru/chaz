@@ -105,14 +105,14 @@ enum Capability {
 }
 ```
 
-The host enforces grants at the capability boundary — the tool says what it wants to do, the host decides whether to allow it and how to execute it. Two `ToolHost` implementations exist today:
+The host enforces grants at the capability boundary — the tool says what it wants to do, the host decides whether to allow it and how to execute it. Two `ToolHost` implementations live in-tree:
 
-| Host                 | Tier       | Isolation                                                                | Status                                          |
-| -------------------- | ---------- | ------------------------------------------------------------------------ | ----------------------------------------------- |
-| `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | Default for every built-in tool.                |
-| `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Selected per config (`crates/lib/src/bubblewrap_host.rs`). |
+| Host                 | Tier       | Isolation                                                                | Status                                                                                                       |
+| -------------------- | ---------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | The only host wired in today — used for every built-in tool.                                                 |
+| `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Implemented in `crates/lib/src/bubblewrap_host.rs` but not yet config-selectable (`#[allow(dead_code)]`).    |
 
-The `Tool` implementations (shell, web, file) are identical across both hosts — they call `ctx.host().request()` regardless of which host sits behind the trait.
+Tools (shell, web, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
 
 A separate WASM-tools path (`crates/lib/src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
 

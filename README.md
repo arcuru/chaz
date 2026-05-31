@@ -203,11 +203,11 @@ backends:
 # Agent definitions
 agents:
   - name: default
-    role: chaz
+    system_prompt: "You are Chaz, a helpful Matrix assistant."
     allowed_tools: null # null = all tools
     can_spawn: ["researcher"]
   - name: researcher
-    role: researcher
+    system_prompt: "You are a focused research assistant. Use web_fetch and calculate to answer questions concisely."
     max_iterations: 20
     allowed_tools: ["web_fetch", "calculate", "get_time"]
 

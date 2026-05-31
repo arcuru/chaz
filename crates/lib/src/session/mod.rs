@@ -64,9 +64,10 @@ pub enum EntryType {
 /// comparing the sender to its own name.
 ///
 /// `metadata` carries token/cost provenance for assistant `Message` entries
-/// (aggregated across the turn's ReAct loop). It is `None` for human
-/// messages, tool calls, tool results, errors, and persona snapshots.
-/// Stored alongside the entry so cost attribution survives session sync.
+/// (aggregated across the turn's ReAct loop). It is `None` for all other
+/// entry kinds (human messages, directives, tool calls, tool results,
+/// acks, and errors). Stored alongside the entry so cost attribution
+/// survives session sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub sender: String,

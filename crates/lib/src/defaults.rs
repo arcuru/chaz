@@ -111,7 +111,7 @@ mod tests {
         let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
         // These are documented in the user guide as the built-ins. The
         // shell variants (bash/fish/zsh/nu) are stateless agents whose
-        // persona is fully defined by their inline prompt.
+        // behavior is fully defined by their inline system prompt.
         for expected in ["chaz", "chazmina", "bash", "fish", "zsh"] {
             assert!(
                 names.contains(&expected),

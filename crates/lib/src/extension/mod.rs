@@ -268,7 +268,6 @@ pub async fn list_events(session_db: &Database) -> anyhow::Result<Vec<ExtensionE
 ///
 /// Public for the upcoming `/extensions` reader and replay path; tests
 /// exercise it directly.
-#[allow(dead_code)]
 pub async fn read_active(session_db: &Database) -> anyhow::Result<Vec<ExtensionRef>> {
     let mut events = list_events(session_db).await?;
     events.sort_by_key(|e| e.timestamp());

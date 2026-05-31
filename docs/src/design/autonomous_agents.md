@@ -151,10 +151,10 @@ terminates — the budget only resets on a human/Directive entry.
 ### Change 4 — the room note (making agents aware of the convention)
 
 The wake mechanism only fires when an agent's _own output_ contains
-`@othername` — nothing forces that. Rather than require every persona to
-be hand-edited with the convention, `ContextBuilder` injects a short
-**room note** into the system prompt when (and only when) more than one
-agent is attached:
+`@othername` — nothing forces that. Rather than require every agent's
+system prompt to be hand-edited with the convention, `ContextBuilder`
+injects a short **room note** into the system prompt when (and only
+when) more than one agent is attached:
 
 > You are in a shared session with other agents: @beta, @gamma. To
 > address a participant directly, @mention them by display name. They
@@ -163,18 +163,17 @@ agent is attached:
 
 The roster is the session's `SessionMeta.agents`, **self excluded**,
 order-preserving, case-insensitively deduped. It is _appended at
-context-build time_, not baked into the `PersonaSnapshot`:
+context-build time_, not baked into the agent's stored system prompt:
 
 - **Always current** — membership changes are reflected on the next turn;
-  a snapshot would go stale and would corrupt the snapshot's hash
-  provenance.
+  a stored copy would go stale.
 - **Cache-safe for the common case** — the system prompt is a prompt-cache
   breakpoint. A _stable_ roster yields a byte-identical note every turn,
   so the cache still hits. Only an `/agent add`/`remove` perturbs the
   note, costing a single-turn re-cache of the system segment (the
   tool-schema breakpoint before it still hits). Cross-agent cache
-  non-sharing already exists in multi-agent sessions (distinct persona
-  per agent) and is not introduced by the note.
+  non-sharing already exists in multi-agent sessions (distinct system
+  prompt per agent) and is not introduced by the note.
 - **Zero change for single-agent sessions** — `< 2` participants ⇒ no
   note ⇒ system prompt byte-identical to pre-feature behavior.
 

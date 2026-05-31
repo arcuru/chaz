@@ -52,7 +52,7 @@ agent; `RoutineEngine` discovers work by scanning sessions; the
 A **Schedule** is owned by an agent and stored in that agent's Living-Agent
 DB (the same signed eidetica DB that already holds the agent's
 `config`/`meta`/history). Schedules therefore sync and travel with the agent
-across peers, exactly like its persona.
+across peers, exactly like its config.
 
 ```text
 Schedule {
@@ -259,7 +259,7 @@ an agent — a schedule). See the
    (which knob, enforced where, interaction with synced schedules) and
    is intentionally not guessed. Tracked in the post-merge gap tracker.
 4. Editing a schedule — `schedule_modify` analogue on the agent DB; does a
-   schedule edit need a persona-snapshot-style audit entry? Likely no.
+   schedule edit need a dedicated audit entry? Likely no.
 
 ## Implementation Touch Points
 

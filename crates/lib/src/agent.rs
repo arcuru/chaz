@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::warn;
 
-/// Agent definition — personality, model preferences, tool visibility, and spawn permissions.
+/// Agent definition — system prompt, model preferences, tool visibility, and spawn permissions.
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,

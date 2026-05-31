@@ -212,8 +212,8 @@ pub enum ScheduleTarget {
 
 /// An agent-owned scheduled wake. Lives in the owning agent's DB
 /// `schedules` store, so it syncs and travels with the agent across peers
-/// exactly like its persona/config — the agent is the unit of
-/// ownership, chaz is the runtime that fires it.
+/// exactly like its config — the agent is the unit of ownership, chaz is
+/// the runtime that fires it.
 ///
 /// The `prompt` is invocation-scoped input handed to the agent when the
 /// schedule fires; it is *not* written as a broadcast session entry.

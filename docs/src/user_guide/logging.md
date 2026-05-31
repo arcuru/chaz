@@ -30,7 +30,7 @@ RUST_LOG=debug chaz --config config.yaml --tui
 RUST_LOG=error chaz --config config.yaml --tui
 
 # Per-module filtering
-RUST_LOG=chaz::runtime=debug,chaz::security=warn chaz --config config.yaml --tui
+RUST_LOG=chaz_core::runtime=debug,chaz_core::security=warn chaz --config config.yaml --tui
 ```
 
 ## What Gets Logged
@@ -99,7 +99,7 @@ For security auditing, `warn` level captures all enforcement actions. The exact 
 
 ```bash
 # Matrix mode — logs are on stdout/stderr, filter live
-RUST_LOG=chaz::security=info,chaz::runtime=warn chaz --config config.yaml 2>&1 | \
+RUST_LOG=chaz_core::security=info,chaz_core::runtime=warn chaz --config config.yaml 2>&1 | \
   grep -E "WARN|denied|blocked|SSRF|leak|Approval"
 
 # TUI / CLI mode — logs are in a rolling file, tail and filter

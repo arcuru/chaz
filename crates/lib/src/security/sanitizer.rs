@@ -3,7 +3,6 @@ use std::sync::LazyLock;
 use tracing::warn;
 
 /// A detected prompt injection pattern
-#[allow(dead_code)]
 pub struct InjectionWarning {
     pub pattern: &'static str,
     pub snippet: String,

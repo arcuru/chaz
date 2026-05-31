@@ -484,22 +484,6 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
-    /// Get tool definitions for sending to the LLM
-    #[allow(dead_code)]
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
-            .iter()
-            .map(|e| {
-                let desc = e.tool.descriptor();
-                ToolDefinition {
-                    name: desc.name,
-                    description: desc.description,
-                    parameters: desc.parameters,
-                }
-            })
-            .collect()
-    }
-
     /// Look up a tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
