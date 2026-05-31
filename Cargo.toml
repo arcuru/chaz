@@ -45,6 +45,7 @@ tokio-stream = "0.1"
 tiktoken-rs = "0.11"
 wasmtime = "43"
 blake3 = "1"
+futures = "0.3"
 
 # Dev-deps shared.
 wat = "1"

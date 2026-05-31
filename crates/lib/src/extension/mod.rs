@@ -11,9 +11,13 @@
 //! Modeled after pi's `ExtensionAPI` (TypeScript). Hot reload / WASM-loaded
 //! extensions are deliberately out of scope for v1 — see `extension_api_version`.
 //!
-//! Panic safety: hook impls must not panic. A panic in a hook will propagate
-//! through the agent turn. (TODO: add `catch_unwind` isolation once the
-//! `futures` crate is in the tree.)
+//! Panic safety: hook handlers should not panic, but if one does the
+//! `ExtensionHub::fire_*` paths wrap each handler invocation in
+//! `FutureExt::catch_unwind`. A panic is logged with the offending
+//! extension's name and hook kind, and the firing loop continues with
+//! a per-hook default (empty injection list, `Continue`, untransformed
+//! tool result, etc.). A panic in handler `A` will not skip handler
+//! `B` or tear down the agent turn.
 
 pub mod agent_state;
 pub mod caps;
@@ -34,9 +38,11 @@ use crate::tool::Tool;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
 use eidetica::store::{DocStore, Table};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -526,6 +532,19 @@ struct RegisteredCommand {
 struct RegisteredTool {
     owner: &'static str,
     tool: Arc<dyn Tool>,
+}
+
+/// Record that an extension hook handler panicked. Called from the
+/// `Err` arm of every fire_* `catch_unwind` site. Free function (rather
+/// than a closure) so the same shape is reused across all six hook
+/// kinds; the payload is dropped (the unwinding allocator is fine to
+/// release it here) to keep the fire path `Send`.
+fn log_hook_panic(owner: &'static str, hook: &'static str) {
+    tracing::error!(
+        extension = owner,
+        hook = hook,
+        "extension hook handler panicked; continuing with default"
+    );
 }
 
 /// Central registry for hook handlers, extension commands, and the
@@ -1180,6 +1199,10 @@ impl ExtensionHub {
     // whose owner extension isn't in the session's active set is skipped.
     // The active set is computed from the session's `extensions` event log
     // and cached on `Server`; see `Server::active_extensions`.
+    //
+    // Each handler invocation is wrapped in `FutureExt::catch_unwind`.
+    // A panicking handler is logged via `log_hook_panic` and the firing
+    // loop continues with a per-hook default.
 
     /// Fire `before_agent_start` for every active handler. Each handler
     /// may append messages, which are flattened into a single vector
@@ -1190,7 +1213,11 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            out.extend(reg.hook.on_before_agent_start(ctx).await);
+            let fut = AssertUnwindSafe(reg.hook.on_before_agent_start(ctx));
+            match fut.catch_unwind().await {
+                Ok(msgs) => out.extend(msgs),
+                Err(_) => log_hook_panic(reg.owner, "before_agent_start"),
+            }
         }
         out
     }
@@ -1207,9 +1234,13 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            match reg.hook.on_tool_call(ctx, tool_name, args).await {
-                ToolCallDecision::Continue => {}
-                ToolCallDecision::Block { reason } => return ToolCallDecision::Block { reason },
+            let fut = AssertUnwindSafe(reg.hook.on_tool_call(ctx, tool_name, args));
+            match fut.catch_unwind().await {
+                Ok(ToolCallDecision::Continue) => {}
+                Ok(ToolCallDecision::Block { reason }) => {
+                    return ToolCallDecision::Block { reason };
+                }
+                Err(_) => log_hook_panic(reg.owner, "tool_call"),
             }
         }
         ToolCallDecision::Continue
@@ -1228,7 +1259,17 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            acc = reg.hook.on_tool_result(ctx, tool_name, acc).await;
+            // Clone for the call so a panic leaves the prior `acc`
+            // intact (the input was moved into the future).
+            let prev = acc.clone();
+            let fut = AssertUnwindSafe(reg.hook.on_tool_result(ctx, tool_name, acc));
+            acc = match fut.catch_unwind().await {
+                Ok(s) => s,
+                Err(_) => {
+                    log_hook_panic(reg.owner, "tool_result");
+                    prev
+                }
+            };
         }
         acc
     }
@@ -1238,7 +1279,10 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            reg.hook.on_agent_end(ctx).await;
+            let fut = AssertUnwindSafe(reg.hook.on_agent_end(ctx));
+            if fut.catch_unwind().await.is_err() {
+                log_hook_panic(reg.owner, "agent_end");
+            }
         }
     }
 
@@ -1247,7 +1291,10 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            reg.hook.on_session_start(ctx).await;
+            let fut = AssertUnwindSafe(reg.hook.on_session_start(ctx));
+            if fut.catch_unwind().await.is_err() {
+                log_hook_panic(reg.owner, "session_start");
+            }
         }
     }
 
@@ -1256,7 +1303,10 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            reg.hook.on_session_shutdown(ctx).await;
+            let fut = AssertUnwindSafe(reg.hook.on_session_shutdown(ctx));
+            if fut.catch_unwind().await.is_err() {
+                log_hook_panic(reg.owner, "session_shutdown");
+            }
         }
     }
 
@@ -2451,6 +2501,37 @@ mod tests {
                 ToolCallDecision::Continue
             })
         }
+    }
+
+    struct PanickingBeforeAgentStartHook;
+    impl handler::HookHandlerBeforeAgentStart for PanickingBeforeAgentStartHook {
+        fn on_before_agent_start<'a>(&'a self) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
+            Box::pin(async move { panic!("intentional panic for catch_unwind test") })
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_hook_is_isolated_and_subsequent_hooks_still_run() {
+        let mut hub = test_hub().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        hub.install_all(vec![
+            Arc::new(
+                TestExt::new("boom").before_agent_start(Arc::new(PanickingBeforeAgentStartHook)),
+            ),
+            counting_ext("after", calls.clone()),
+        ])
+        .await
+        .unwrap();
+        let ctx = fixture_ctx_with_active(all_active(&["boom", "after"])).await;
+
+        // Must not panic-propagate out of `fire_*` — that's the whole
+        // point of the catch_unwind wrap.
+        let injected = hub.fire_before_agent_start(&ctx).await;
+
+        // The second handler still ran (one message injected, counter
+        // incremented). The panicking handler contributed nothing.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(injected.len(), 1);
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ clap.workspace = true
 cron.workspace = true
 dirs.workspace = true
 eidetica.workspace = true
+futures.workspace = true
 headjack.workspace = true
 lazy_static.workspace = true
 matrix-sdk.workspace = true
