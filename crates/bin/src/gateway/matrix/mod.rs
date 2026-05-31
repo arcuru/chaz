@@ -599,7 +599,7 @@ impl Gateway for MatrixGateway {
         // the extension-command loop further down. Built-in name
         // reservations no longer list "memory".
 
-        // --- Bootstrap-queue surface (Co-owned Stage 11) ---
+        // --- Bootstrap-queue surface ---
         register_shared!(
             "sharing",
             "status | requests | approve <id> | reject <id>".to_string(),

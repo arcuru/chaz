@@ -1,4 +1,4 @@
-//! Agent DB primitive — Stage 1 of the Living Agents plan.
+//! Agent DB primitive.
 //!
 //! An `AgentDb` is an eidetica `Database` owned by a per-agent `PrivateKey`.
 //! Chaz creates one such DB per agent at startup (bootstrapped from yaml).
@@ -10,17 +10,13 @@
 //! - `meta`    (DocStore) — display name, description, capabilities, avatar
 //! - `history` (Table<SessionHistoryEntry>) — sessions this agent participated in
 //!
-//! Stage 1 materializes the DBs and populates `config`/`meta` from yaml.
-//! Session routing and memory migration arrive in Stages 3+.
-//!
 //! **Config/meta encoding note:** both stores hold a single JSON-serialized
 //! blob under key `"value"`. This keeps the schema tractable for nested
 //! types (presets, grants, tool lists). Per-field storage may be revisited
 //! later if partial CRDT merges become important.
 
-// Stage 1 defines read-side API surface (read_config, read_meta, database
-// handle) that is exercised by tests but not yet consumed by runtime. Stages
-// 3+ will wire these in; until then the warnings are noise.
+// Some read-side helpers are only exercised by tests / external integrations;
+// allow dead_code to keep the API surface stable.
 #![allow(dead_code)]
 
 use crate::config::{AgentConfig, AgentPreset, Config};
@@ -59,7 +55,7 @@ pub struct AgentMeta {
 
 /// Serializable agent definition. Mirrors the runtime-relevant fields of
 /// [`AgentConfig`]. What used to live in yaml will live here once yaml is
-/// downgraded to bootstrap sugar (Stage 6).
+/// downgraded to bootstrap sugar.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentDbConfig {
     /// System prompt string (the LLM's system message).
@@ -112,8 +108,7 @@ impl AgentDbConfig {
     }
 }
 
-/// A single memory fact. Stage 1 just declares the schema; memory-tool
-/// migration into this store happens later.
+/// A single memory fact stored in the agent's `memory` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub key: String,
@@ -382,7 +377,7 @@ impl AgentDb {
     }
 
     // -----------------------------------------------------------------
-    // Agent-owned schedules (Agent-Owned Schedules — Stage 1)
+    // Agent-owned schedules
     // -----------------------------------------------------------------
 
     /// List every schedule owned by this agent.
@@ -453,7 +448,7 @@ impl AgentDb {
     }
 
     // -----------------------------------------------------------------
-    // Memory bank references (Memory Banks Stage 9.B)
+    // Memory bank references
     // -----------------------------------------------------------------
 
     /// List every external memory bank this agent has been granted access
@@ -607,7 +602,7 @@ where
     Ok(())
 }
 
-/// DB name used in eidetica settings — `find_database` idempotency key in Stage 1.
+/// DB name used in eidetica settings — `find_database` idempotency key.
 pub fn agent_db_name(display_name: &str) -> String {
     format!("agent:{display_name}")
 }
@@ -676,11 +671,11 @@ pub struct BootstrappedAgent {
 /// Ensure the given agent has an AgentDb on this peer. Creates one with
 /// default config/meta if it doesn't exist. Idempotent.
 ///
-/// Stage 7 (memory migration) relies on every `AgentRegistry` entry having a
-/// matching DB so the `remember`/`recall` tools can write to
-/// `AgentDb::memory`. The default `chaz` agent isn't in yaml `agents:`, so
-/// `bootstrap_from_config` alone doesn't cover it — `main.rs` calls this
-/// for every registry entry after bootstrap.
+/// The `remember`/`recall` tools rely on every `AgentRegistry` entry
+/// having a matching DB so they can write to `AgentDb::memory`. The
+/// default `chaz` agent isn't in yaml `agents:`, so `bootstrap_from_config`
+/// alone doesn't cover it — `main.rs` calls this for every registry entry
+/// after bootstrap.
 pub async fn ensure_agent_db(
     user: &mut User,
     display_name: &str,
@@ -704,7 +699,7 @@ pub async fn ensure_agent_db(
 /// overwrite existing ones. On a re-run with a pre-existing DB, this
 /// function reuses the DB as-is; any `/agent set` edits or synced config
 /// from other peers survive restarts. AgentDb is the source of truth
-/// post-bootstrap (Stage 8 hydration reads live config per-message).
+/// post-bootstrap (live hydration reads config per-message).
 pub async fn bootstrap_from_config(
     user: &mut User,
     config: &Config,
@@ -929,7 +924,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Memory bank references (Stage 9.B)
+    // Memory bank references
     // -------------------------------------------------------------------------
 
     /// Helper: build a fresh peer + create one AgentDb. Returns `(user,
@@ -1044,7 +1039,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Agent-owned schedules (Stage 1)
+    // Agent-owned schedules
     // -------------------------------------------------------------------------
 
     #[test]

@@ -1,4 +1,4 @@
-//! Bootstrap-queue handlers (Co-owned Stage 11). Single transport-neutral
+//! Bootstrap-queue handlers. Single transport-neutral
 //! `/sharing` namespace covering the request queue across every resource
 //! kind (agents, memory banks, sessions). Eidetica stores all bootstrap
 //! requests in the one `_sync` DB regardless of what kind of tree they

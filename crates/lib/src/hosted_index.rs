@@ -1,12 +1,9 @@
 //! In-memory peer-local indices of hosted Agent and Memory Bank DBs.
 //!
-//! Stage 3 of the Database Layout Refactor. Replaces the persistent
-//! `db_registry::DbRegistry` (a chaz_group DocStore mirror) with a derived
-//! in-memory cache built once at startup by walking
-//! `eidetica::user::User::databases()` — which is eidetica's authoritative
-//! list of every DB the user holds keys for. Each entry's `meta.kind`
-//! marker (Stage 4 — see [`crate::db_kind`]) tells the walker which bucket
-//! the entry belongs in.
+//! Derived in-memory cache built once at startup by walking
+//! `eidetica::user::User::databases()` — eidetica's authoritative list of
+//! every DB the user holds keys for. Each entry's `meta.kind` marker (see
+//! [`crate::db_kind`]) tells the walker which bucket the entry belongs in.
 //!
 //! Why in-memory: routing reads hit this on every session entry, and
 //! "ownership = key possession" means the source of truth is already

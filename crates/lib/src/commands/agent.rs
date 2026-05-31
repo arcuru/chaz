@@ -31,7 +31,7 @@ pub(super) async fn resolve_agent_ref(
 }
 
 // -----------------------------------------------------------------------------
-// Participation (Living Agents Stage 3d)
+// Participation
 // -----------------------------------------------------------------------------
 
 pub(super) async fn agent_add(agent_ref: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
@@ -191,7 +191,7 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
 }
 
 // -----------------------------------------------------------------------------
-// Lifecycle (Living Agents Stage 6): /agent new | share | import | hosted | delete
+// Lifecycle: /agent new | share | import | hosted | delete
 // -----------------------------------------------------------------------------
 
 /// Supported `/agent new` and `/agent set` keys. Nested-structure fields
@@ -515,8 +515,8 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
     ))
 }
 
-/// Edit one field on a Living Agent's DB config. Stage 8 live hydration
-/// picks up the change on the next message — no restart. We also upsert
+/// Edit one field on a Living Agent's DB config. Live hydration picks
+/// up the change on the next message — no restart. We also upsert
 /// the runtime `AgentRegistry` snapshot so the current session sees the
 /// edit immediately (hydration rebuilds on message, upsert is belt-and-
 /// suspenders for code paths that read registry state between messages).
@@ -573,7 +573,7 @@ pub(super) async fn agent_set(
 }
 
 // -----------------------------------------------------------------------------
-// Co-owned Agents (Stage 10): /pubkey + /agent invite + /agent revoke-peer
+// Co-owned Agents: /pubkey + /agent invite + /agent revoke-peer
 // -----------------------------------------------------------------------------
 
 pub(super) async fn pubkey(ctx: &CommandContext<'_>) -> CommandOutcome {
@@ -1315,7 +1315,7 @@ mod tests {
             Some("opus")
         );
 
-        // DB reflects it too — Stage 8 hydration will read this on next message.
+        // DB reflects it too — live hydration will read this on next message.
         let user = registry.user_for_tests().await;
         let (db, _pk) = find_agent_db(&user, "alpha").await.unwrap();
         drop(user);
@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Co-owned Agents (Stage 10): /pubkey + /agent invite + /agent revoke-peer
+    // Co-owned Agents: /pubkey + /agent invite + /agent revoke-peer
     // -------------------------------------------------------------------------
 
     use super::super::CoOwnerPermission;

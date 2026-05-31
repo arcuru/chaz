@@ -53,7 +53,7 @@ pub struct ExtensionManifest {
 
 /// Per-manifest validation failure. Cross-manifest checks
 /// (collision across the extension set, required-cap satisfiability)
-/// surface a different error type on the hub in step 5.
+/// surface a different error type on the hub.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ManifestError {
     #[error("extension manifest name must be non-empty")]
@@ -117,8 +117,7 @@ impl ExtensionManifest {
     ///
     /// Cross-manifest checks (`(kind, name)` collision across providers,
     /// required-cap satisfiability against the full provider set) are
-    /// the hub's responsibility — they happen during `install_all`
-    /// (refactor step 5).
+    /// the hub's responsibility — they happen during `install_all`.
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.name.is_empty() {
             return Err(ManifestError::EmptyName);

@@ -51,8 +51,7 @@ pub struct Config {
     /// to reach you via that address even without iroh connectivity.
     pub sync_listen: Option<String>,
     /// Embedding backend used to populate `embeddings:<model-id>` subtrees
-    /// alongside memory writes (Searchable Memory Stage 2). Omit to run
-    /// lexical-only recall.
+    /// alongside memory writes. Omit to run lexical-only recall.
     pub embedding: Option<EmbeddingConfig>,
     /// CLI-specific configuration (single-shot --cli mode)
     pub cli: Option<CliConfig>,

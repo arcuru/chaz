@@ -1,24 +1,14 @@
-// Step 7 of the cap refactor — engine skeleton + storage. The
-// `run` loop is here but the dispatch path is a no-op TODO that step
-// 8 fills in by calling `ExtensionHub::dispatch_routine`.
 #![allow(dead_code)]
 
 //! Routine engine — sleep-until-next driver, persistence, and the
 //! in-memory min-heap that drives fire ordering.
 //!
-//! Replaces today's poll-based `HeartbeatRunner` (per-30s tick) and
-//! `Scheduler` (separate cron driver) with one engine handling both
+//! Replaced the poll-based `HeartbeatRunner` (per-30s tick) and the
+//! separate `Scheduler` cron driver with one engine handling both
 //! recurring cron rules and one-shot schedules, scoped globally
-//! (`chaz_peer.routines`) or per-session (`session_db.rules`).
-//!
-//! # Phasing
-//!
-//! Step 7 (this file) covers types, storage, in-memory state,
-//! mutators, the sleep-until-next loop, and a dispatch hook that
-//! today just records the fire in the failure-handling fields.
-//! Step 8 plugs `ExtensionHub::dispatch_routine` into [`fire_due`]'s
-//! TODO. Step 9 ports the heartbeat extension. Step 10 deletes
-//! `scheduler.rs` + `heartbeat.rs`.
+//! (`chaz_peer.routines`) or per-session (`session_db.rules`). Fires
+//! dispatch through [`ExtensionHub::dispatch_routine`] from
+//! [`Engine::fire_due`].
 //!
 //! # Cross-peer (out of scope — D10)
 //!
@@ -334,8 +324,8 @@ impl RoutineEngine {
 
     /// Resync one agent's schedules from its DB into the heap: drop the
     /// in-memory entries for the agent, then reload the enabled rows.
-    /// This is how a schedule add/remove (Stage 5 tool) takes effect
-    /// without a restart — same contract as [`Self::reload_session`].
+    /// This is how a schedule add/remove takes effect without a restart —
+    /// same contract as [`Self::reload_session`].
     pub async fn reload_agent(
         self: &Arc<Self>,
         agent_db_id: &str,
@@ -422,7 +412,7 @@ impl RoutineEngine {
             }
             // Agent-owned: the in-memory entry is already gone; the
             // authoritative `schedules` row is deleted via AgentDb by the
-            // caller (Stage 5 tool / one-shot cleanup), not the engine.
+            // caller (schedule tool / one-shot cleanup), not the engine.
             RoutineScope::Agent(_) => {
                 self.notify.notify_one();
                 return Ok(());
@@ -483,17 +473,16 @@ impl RoutineEngine {
 
     /// Long-running task: tick forever until the spawning task is
     /// dropped or aborted. Wire this onto a `tokio::spawn` at chaz
-    /// startup (step 10).
+    /// startup.
     pub async fn run(self: Arc<Self>) {
         loop {
             self.tick().await;
         }
     }
 
-    /// Fire every routine whose `next_fire` is `<= now`. Today this
-    /// records the fire and either reschedules (Cron) or removes
-    /// (OneShot); step 8 wires the actual dispatch through
-    /// `ExtensionHub::dispatch_routine`.
+    /// Fire every routine whose `next_fire` is `<= now`. Records the
+    /// fire, dispatches through `ExtensionHub::dispatch_routine`, and
+    /// either reschedules (Cron) or removes (OneShot).
     async fn fire_due(self: &Arc<Self>) {
         let now = Utc::now();
         let mut to_fire: Vec<RoutineId> = Vec::new();
@@ -589,7 +578,8 @@ impl RoutineEngine {
                 }
                 // Session-scoped one-shot row deletion needs the
                 // session DB handle — engine doesn't hold one here.
-                // Step 8/9 wires that via the hub's session registry.
+                // Cleanup is driven by the hub's session registry on
+                // its own deregister path.
                 let mut state = self.state.lock().await;
                 state.routines.remove(id);
             }
@@ -1147,7 +1137,7 @@ mod tests {
         assert!(out.ends_with("..."));
     }
 
-    // ---- Agent-owned schedules (Stage 2) -----------------------------------
+    // ---- Agent-owned schedules ---------------------------------------------
 
     #[test]
     fn schedule_to_routine_namespaces_id_and_carries_payload() {

@@ -13,11 +13,11 @@ use crate::security::SecurityContext;
 
 /// Delegate a task to a Living Agent in a new child session.
 ///
-/// Living Agents Stage 5: resolves `agent_ref` (display name or eidetica DB
-/// ID) via the agent index, creates a child session with parent→child
-/// delegation wired in (parent admins inherit admin on the child), attaches
-/// the agent's stable pubkey to the child session with Write(10), writes a
-/// Directive, and waits for the agent to respond.
+/// Resolves `agent_ref` (display name or eidetica DB ID) via the agent
+/// index, creates a child session with parent→child delegation wired in
+/// (parent admins inherit admin on the child), attaches the agent's
+/// stable pubkey to the child session with Write(10), writes a Directive,
+/// and waits for the agent to respond.
 ///
 /// Use for delegating focused work to a persistent agent whose memory and
 /// config survive across runs. For one-shot, ephemeral work with no
@@ -139,8 +139,8 @@ impl Tool for SpawnAgent {
 
             // Permission check against yaml-backed AgentRegistry (can_spawn uses
             // display names). Living Agents without a yaml entry are not
-            // spawnable via this tool yet — Stage 6 will revisit once agent
-            // definitions can live entirely in DBs.
+            // spawnable via this tool yet — revisit once agent definitions
+            // can live entirely in DBs.
             if !server.agents().can_spawn(&ctx.agent_name, &agent_display) {
                 return Err(format!(
                     "Agent '{}' is not allowed to spawn '{}'",
@@ -189,9 +189,9 @@ impl Tool for SpawnAgent {
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;
 
-            // Attach the Living Agent's stable pubkey to the child session.
-            // This is the Stage 3b path: AuthSettings gets Write(10), SessionMeta
-            // gets the AgentRef, and the agent's history store records the join.
+            // Attach the Living Agent's stable pubkey to the child session:
+            // AuthSettings gets Write(10), SessionMeta gets the AgentRef, and
+            // the agent's history store records the join.
             server
                 .registry()
                 .attach_agent_to_session(&conversation_id.0, &index_entry)

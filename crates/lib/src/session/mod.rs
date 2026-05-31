@@ -105,12 +105,12 @@ pub struct AgentRef {
 ///
 /// `agents` is the Living-Agents list of participating Agent DBs. The legacy
 /// `agent_name` is still read for backward compatibility and as a fallback
-/// when `agents` is empty — Stage 3 keeps both; later stages remove
-/// `agent_name` once all sessions are migrated.
+/// when `agents` is empty; `agent_name` will be removed once all sessions
+/// are migrated.
 ///
 /// `host_agent_db_id` designates which agent answers when no @mention
-/// pins the turn (Stage 4 turn-taking). Must be the `db_id` of an entry
-/// in `agents`; set via `/agent host <ref>`.
+/// pins the turn. Must be the `db_id` of an entry in `agents`; set via
+/// `/agent host <ref>`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub name: Option<String>,

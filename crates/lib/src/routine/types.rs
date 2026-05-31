@@ -1,6 +1,3 @@
-// Step 7 of the cap refactor — types are pure additions; nothing else
-// in chaz uses these yet. Step 9 ports heartbeat onto them; step 10
-// decommissions the legacy `scheduler.rs` / `heartbeat.rs`.
 #![allow(dead_code)]
 
 //! Routine types — the engine-agnostic data model.
@@ -49,9 +46,7 @@ pub fn generate_id(prefix: &str) -> RoutineId {
 ///
 /// `Cron` re-parses on load — `expr` is stored verbatim and a fresh
 /// [`cron::Schedule`] is built each time the engine needs the next
-/// fire time. Matches today's `HeartbeatRule` shape; adopting the
-/// same storage shape lets the heartbeat migration in step 9 be a
-/// renaming operation rather than a re-derivation.
+/// fire time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
@@ -68,8 +63,8 @@ impl Trigger {
 
 /// Which extension handles this routine, plus the opaque payload the
 /// engine passes through verbatim. `extension` is the extension's
-/// name as it appears in its manifest — the routine dispatcher (step
-/// 8) looks up the installed routine handler under that key.
+/// name as it appears in its manifest — the routine dispatcher looks
+/// up the installed routine handler under that key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutineTarget {
     pub extension: String,
@@ -86,10 +81,9 @@ fn default_max_failures() -> u32 {
 
 /// One routine — work to fire on a schedule against an extension.
 ///
-/// `consecutive_failures` and `last_error` exist for the engine's
-/// failure-handling pass (auto-disable after `max_failures` strikes,
-/// step 8 wires the dispatch). `max_failures == 0` opts out of the
-/// auto-disable behavior.
+/// `consecutive_failures` and `last_error` drive the engine's
+/// failure-handling pass (auto-disable after `max_failures` strikes).
+/// `max_failures == 0` opts out of the auto-disable behavior.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Routine {
     pub id: RoutineId,

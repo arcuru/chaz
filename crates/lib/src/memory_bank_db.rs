@@ -1,15 +1,15 @@
-//! Memory Bank DB primitive — Stage 9.A of the Memory Banks plan.
+//! Memory Bank DB primitive.
 //!
 //! A `MemoryBankDb` is a standalone eidetica `Database` owned by a
 //! per-bank `PrivateKey`, holding a single `memory` Table store. Agents
 //! gain access to a bank by having their pubkey added to the bank's
 //! `AuthSettings` with `Read` or `Write`; access shows up as a reference
-//! entry in the agent's own DB's `memory_banks` subtree (Stage 9.B).
+//! entry in the agent's own DB's `memory_banks` subtree.
 //!
 //! Shape is deliberately minimal vs. [`AgentDb`]:
 //! - `memory` (Table<MemoryEntry>) — the bank's entries. Same subtree
 //!   name and schema as an agent's own memory, so read/write code paths
-//!   are uniform (Stage 9.C).
+//!   are uniform across own-memory and bank-memory.
 //! - `meta`   (DocStore) — display name + description. Kept small.
 //!
 //! Because an Agent DB *also* carries a `memory` subtree with the same

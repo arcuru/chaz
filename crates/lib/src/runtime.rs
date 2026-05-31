@@ -5,7 +5,7 @@
 //! them, it runs a ReAct loop (Reason → Act → Observe → repeat).
 //! Otherwise it falls back to a single-shot LLM call.
 //!
-//! Security controls (Phase 3.8):
+//! Security controls:
 //! - Tool calls are checked against approval requirements before execution
 //! - Tool outputs are scanned for secret leaks before entering the conversation
 //! - Tool execution is wrapped in a timeout

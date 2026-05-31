@@ -24,9 +24,9 @@ pub enum BootstrapOutcome {
 }
 
 impl SessionRegistry {
-    /// Create a new Agent DB for the Living Agents lifecycle (Stage 6
-    /// `/agent new`). Wraps `agent_db::create_agent_db` with the registry's
-    /// user mutex and rejects duplicate display names up front.
+    /// Create a new Agent DB. Backs `/agent new`. Wraps
+    /// `agent_db::create_agent_db` with the registry's user mutex and
+    /// rejects duplicate display names up front.
     pub async fn create_new_agent_db(
         &self,
         display_name: &str,
@@ -149,7 +149,7 @@ impl SessionRegistry {
     }
 
     /// Generate a fresh ephemeral keypair on this peer's `User` and return the
-    /// pubkey. Used by Living Agents Stage 5 `spawn_task` for one-shot runs:
+    /// pubkey. Used by `spawn_task` for one-shot runs:
     /// the new key is authorized on a child session, runs the task, then
     /// revoked. The DB retains the revoked key's signatures as an audit
     /// record but no new writes can be made under that key.
@@ -186,7 +186,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Authorize a pubkey on a Memory Bank DB (Stage 9.D.2). Used by
+    /// Authorize a pubkey on a Memory Bank DB. Used by
     /// `/memory grant` to give an agent's key `Read` or `Write` on the
     /// bank's AuthSettings. `power` matters for `Write` (higher power
     /// can revoke lower); `Read` ignores it.
@@ -220,7 +220,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Revoke a pubkey on a Memory Bank DB (Stage 9.D.2). Used by
+    /// Revoke a pubkey on a Memory Bank DB. Used by
     /// `/memory revoke` to withdraw an agent's access. Historical
     /// entries signed by the key remain verifiable; no new writes.
     pub async fn revoke_on_memory_bank(
@@ -344,7 +344,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Authorize a pubkey on an Agent DB (Co-owned Agents Stage 10).
+    /// Authorize a pubkey on an Agent DB (co-owned agents).
     /// Used by `/agent invite` to give another peer's pubkey admin/write/
     /// read permission on the agent DB's AuthSettings. Fails if this peer
     /// holds no key for the agent — you can't invite someone to an agent
@@ -375,7 +375,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Revoke a pubkey on an Agent DB (Co-owned Agents Stage 10).
+    /// Revoke a pubkey on an Agent DB (co-owned agents).
     /// Used by `/agent revoke-peer`. Historical entries signed by the key
     /// remain verifiable; no new writes.
     pub async fn revoke_on_agent_db(

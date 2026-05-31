@@ -9,8 +9,7 @@
 //! already iterates at fire time.
 //!
 //! The adapters ignore the legacy [`crate::extension::HookContext`] —
-//! the handler traits take no context argument. Stays small on purpose:
-//! the legacy hooks module is on a deletion path.
+//! the handler traits take no context argument. Stays small on purpose.
 
 use crate::extension::HookContext;
 use crate::extension::ToolCallDecision;

@@ -32,11 +32,11 @@ mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
 
-/// User-visible permission level for co-ownership grants on an Agent DB
-/// (Co-owned Agents Stage 10). Stays separate from eidetica's `Permission`
-/// so the CLI grammar is stable if eidetica's type evolves (e.g. more
-/// Admin tiers). `Admin` grants `Permission::Admin(1)` — the creator's
-/// `Admin(0)` remains exclusive and ungrantable via `/agent invite`.
+/// User-visible permission level for co-ownership grants on an Agent DB.
+/// Stays separate from eidetica's `Permission` so the CLI grammar is
+/// stable if eidetica's type evolves (e.g. more Admin tiers). `Admin`
+/// grants `Permission::Admin(1)` — the creator's `Admin(0)` remains
+/// exclusive and ungrantable via `/agent invite`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoOwnerPermission {
     Admin,
@@ -112,7 +112,7 @@ pub enum Command {
     /// `Some(ref)` sets it; `None` clears it.
     AgentSetHost(Option<String>),
 
-    // --- Agent lifecycle (Living Agents Stage 6) ---
+    // --- Agent lifecycle ---
     /// Create a new Living Agent DB. Optional `overrides` apply to the
     /// `AgentDbConfig` before the DB is written — e.g. `role`, `model`,
     /// `max_iterations`, `tools`.
@@ -141,14 +141,14 @@ pub enum Command {
     /// it. Does not revoke any keys held by peers who already imported it.
     AgentUnshare(String),
     /// Edit a single field on a Living Agent's DB config. Takes effect on
-    /// the next message via Stage 8 hydration — no restart needed.
+    /// the next message via live hydration — no restart needed.
     AgentSet {
         agent_ref: String,
         field: String,
         value: String,
     },
     /// Print this peer's default pubkey so an agent owner can paste it
-    /// into `/agent invite` on their peer (Co-owned Agents Stage 10).
+    /// into `/agent invite` on their peer.
     Pubkey,
     /// Grant a remote peer's pubkey access to an agent DB — admin (default),
     /// write, or read. Owner stays Admin(0); co-owner becomes Admin(1) and
@@ -183,7 +183,7 @@ pub enum Command {
     /// agent.
     AgentHomeStatus(Option<String>),
 
-    // --- Sharing queue (Co-owned Stage 11) ---
+    // --- Sharing queue ---
     /// List bootstrap requests on this peer's `_sync` DB that are still
     /// pending an admin's approval. Owner-side surface for `/sharing
     /// requests`. The output lists each request with the resource kind

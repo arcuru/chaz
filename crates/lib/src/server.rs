@@ -308,7 +308,7 @@ impl Server {
     }
 
     /// Rebuild the runtime snapshot for `agent` from its Living Agent DB's
-    /// `config` store (Stage 8). Returns the input unchanged if the agent
+    /// `config` store. Returns the input unchanged if the agent
     /// isn't in the peer-local agent index or the DB isn't readable on this
     /// peer — preserves behavior for legacy agents without a DB.
     ///
@@ -504,7 +504,7 @@ impl Server {
     /// If `parent_session_db_id` is provided, wires a `DelegatedTreeRef`
     /// (max = Admin(0)) from the child's auth settings back to the parent —
     /// any key with Admin on the parent inherits Admin on the child
-    /// transparently. Stage 5 `spawn_agent`/`spawn_task` rely on this so the
+    /// transparently. `spawn_agent`/`spawn_task` rely on this so the
     /// invoking session's supervisor authority carries into the child.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_child_session(
@@ -581,7 +581,7 @@ impl Server {
     }
 
     // -----------------------------------------------------------------
-    // Agent-Owned Schedule fire path (Stage 3)
+    // Agent-Owned Schedule fire path
     // -----------------------------------------------------------------
 
     /// Standalone execution path for agent-owned schedule fires.
@@ -953,7 +953,7 @@ impl Server {
                     .build_from_db_config(agent_name, &crate::agent_db::AgentDbConfig::default())
             }
         };
-        // Hydrate from the Living Agent DB (Stage 8 refresh).
+        // Hydrate from the Living Agent DB (live refresh).
         agent = self.hydrate_agent_from_db(agent).await;
 
         let default_model = agent.default_model.clone();
@@ -1366,7 +1366,7 @@ impl Server {
             }
         };
 
-        // Stage 8 live hydration: if the resolved agent has a Living Agent DB
+        // Live hydration: if the resolved agent has a Living Agent DB
         // on this peer, rebuild its runtime snapshot from the DB's `config`
         // store so edits to the DB (local or synced from origin peer)
         // propagate to the next run without a restart.
@@ -1801,7 +1801,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Agent-Owned Schedule integration tests (Stage 3)
+    // Agent-Owned Schedule integration tests
     // -----------------------------------------------------------------
     //
     // These tests exercise `fire_agent_schedule` through the full plumbing

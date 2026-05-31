@@ -228,10 +228,10 @@ async fn main() -> anyhow::Result<()> {
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
     let chaz_peer = registry.chaz_peer().clone();
 
-    // Stage 3 of the Database Layout Refactor: build the peer-local Agent
-    // and Memory Bank indices in-memory by walking eidetica's tracked-DBs
-    // list. `meta.kind` (Stage 4) classifies each entry. `/agent new`,
-    // `/memory new`, `/agent delete`, etc. mutate these caches at runtime.
+    // Build the peer-local Agent and Memory Bank indices in-memory by
+    // walking eidetica's tracked-DBs list. Each entry's `meta.kind` marker
+    // classifies it. `/agent new`, `/memory new`, `/agent delete`, etc.
+    // mutate these caches at runtime.
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
         hosted_index::build_from_user(&user).await?

@@ -68,8 +68,7 @@ use tracing::warn;
 /// [`ExtensionHub`] (for hook kinds) or surfaces through the
 /// tool/command registries (for `Tool` / `Command`). Scheduled work no
 /// longer flows through hooks — it goes through the
-/// [`crate::routine::RoutineEngine`] introduced in steps 7–8 of the
-/// cap refactor.
+/// [`crate::routine::RoutineEngine`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {

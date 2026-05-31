@@ -177,15 +177,15 @@ impl SessionRegistry {
     ///
     /// Priority:
     /// 1. Explicit name override (used by `!chaz run` / scheduled one-shots).
-    /// 2. Key-possession routing (Stage 3c): walk the session's AuthSettings;
+    /// 2. Key-possession routing: walk the session's AuthSettings;
     ///    the first Active+Write pubkey we find in `agent_index` wins and we
     ///    resolve its display_name against the in-memory `AgentRegistry`.
     /// 3. Legacy `SessionMeta.agent_name` fallback — preserved so existing
     ///    sessions keep working until migrated.
     /// 4. Default agent.
     ///
-    /// Turn-taking in multi-agent sessions (mention-based + host fallback)
-    /// is Stage 4; v1 takes the first matching authorized agent.
+    /// Mention-aware turn-taking lives in [`Self::resolve_agent_for_entry`];
+    /// this method just picks the first matching authorized agent.
     pub async fn resolve_agent(
         &self,
         session_db_id: &str,
@@ -267,12 +267,12 @@ impl SessionRegistry {
         out
     }
 
-    /// Mention-aware routing (Stage 4a). Turn precedence:
+    /// Mention-aware turn routing. Turn precedence:
     /// 1. Explicit name override (scheduler / `/run`).
     /// 2. First `@<display_name>` token in `trigger_text` that matches an
     ///    agent authorized on the session.
     /// 3. `SessionMeta.host_agent_db_id` if it points at an authorized agent.
-    /// 4. First authorized agent on the session (Stage 3c behavior).
+    /// 4. First authorized agent on the session (key-possession routing).
     /// 5. Legacy `SessionMeta.agent_name`.
     /// 6. Default agent.
     pub async fn resolve_agent_for_entry(

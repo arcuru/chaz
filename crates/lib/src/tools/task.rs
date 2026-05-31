@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 /// Spawn a one-shot ephemeral Task in a fresh child session.
 ///
-/// Living Agents Stage 5: generates a fresh keypair on this peer, creates a
+/// Generates a fresh keypair on this peer, creates a
 /// child session with parent→child delegation wired in, grants the fresh
 /// pubkey Write(100) on the child session, runs the ReAct loop, then
 /// **revokes** the key on completion. The session DB persists as a permanent

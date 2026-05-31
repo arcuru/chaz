@@ -1,4 +1,4 @@
-//! Memory tools — Memory Banks model (Stage 9).
+//! Memory tools — Memory Banks model.
 //!
 //! Two tools: `remember` / `recall`. Each takes an optional `bank`
 //! argument. When absent, operates on the running agent's own
@@ -7,10 +7,10 @@
 //! subtree and operates on that bank's `memory` store; access is
 //! gated by eidetica AuthSettings on the bank DB, authoritatively.
 //!
-//! There is no "global" scope. The older `MemoryGrant` capability
-//! type, `global_remember`/`global_recall` tools, and the
-//! `chaz_group.global_memory` store all went away in Stage 9.E —
-//! anything cross-agent is now a shared bank DB.
+//! There is no "global" scope. The older `MemoryGrant` capability type,
+//! `global_remember`/`global_recall` tools, and the
+//! `chaz_group.global_memory` store have been retired — anything
+//! cross-agent is now a shared bank DB.
 
 use crate::agent_db::MemoryEntry;
 use crate::embedding::{Embedder, EmbeddingEntry, cosine_similarity, embeddings_store_name};
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Stage 9.C — memory banks via optional `bank` param
+    // Memory banks via optional `bank` param
     // -------------------------------------------------------------------------
 
     /// Helper: create a memory bank DB on the peer, attach it to the agent
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Stage 2 — embedding subtree + hybrid recall
+    // Embedding subtree + hybrid recall
     // -------------------------------------------------------------------------
 
     use crate::embedding::test_support::MockEmbedder;
@@ -1450,8 +1450,9 @@ mod tests {
 
     #[tokio::test]
     async fn recall_semantic_match_when_keywords_dont_overlap() {
-        // The whole point of Stage 2: a query with no shared tokens with
-        // the value but with shared embedding axes still surfaces it.
+        // The whole point of embedding-backed recall: a query with no
+        // shared tokens with the value but with shared embedding axes
+        // still surfaces it.
         // MockEmbedder's "shared axis" is literally "shared token", so we
         // construct a setup where the query "friday" tokenizes to a token
         // that overlaps an axis in the entry but is not present in the

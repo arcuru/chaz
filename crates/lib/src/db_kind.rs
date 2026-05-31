@@ -1,7 +1,7 @@
-//! Stage 4 of the Database Layout Refactor: explicit `kind` + `display_name`
-//! markers on every entity DB's `meta` store so the in-memory cache (Stage 3)
-//! can classify a tracked database without inferring from `_settings.name`
-//! or deserializing entity-specific JSON blobs.
+//! Explicit `kind` + `display_name` markers on every entity DB's `meta`
+//! store so the in-memory `HostedIndex` can classify a tracked database
+//! without inferring from `_settings.name` or deserializing entity-specific
+//! JSON blobs.
 //!
 //! Written once at DB creation (`create_agent_db`, `create_memory_bank`,
 //! `create_session`). Read by the cache builder when walking
@@ -50,7 +50,8 @@ pub async fn write_marker(
 
 /// Read the (`kind`, `display_name`) marker pair from a database's `meta`
 /// store. Returns `None` if either field is missing — i.e. the database was
-/// created before Stage 4 or isn't a chaz entity DB (chaz_group / chaz_peer).
+/// created without `kind` markers or isn't a chaz entity DB (chaz_group /
+/// chaz_peer).
 pub async fn read_marker(database: &Database) -> Option<(String, String)> {
     let txn = database.new_transaction().await.ok()?;
     let store = txn.get_store::<DocStore>(META_STORE).await.ok()?;

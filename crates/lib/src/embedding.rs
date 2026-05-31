@@ -1,4 +1,4 @@
-//! Embedder abstraction — Searchable Memory Stage 2.
+//! Embedder abstraction.
 //!
 //! Chaz writes embeddings into per-DB subtrees named `embeddings:<model_id>`,
 //! where `<model_id>` is the canonical token returned by [`Embedder::model_id`]

@@ -810,7 +810,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     // to `extensions::memory::MemoryCommand`. Completion hints for these
     // subcommands live in the help table above.
 
-    // Bootstrap-queue surface (Co-owned Stage 11). Single namespace
+    // Bootstrap-queue surface. Single namespace
     // covering pending requests across every kind of resource.
     if text == "/sharing" || text == "/sharing status" {
         return Some(ChatAction::Dispatch(Command::SharingStatus));

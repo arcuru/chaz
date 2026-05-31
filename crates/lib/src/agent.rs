@@ -67,8 +67,8 @@ impl Agent {
         }
     }
 
-    /// Build a runtime Agent from a Living Agent's DB config (Stage 6
-    /// `/agent new` and `/agent import`).
+    /// Build a runtime Agent from a Living Agent's DB config. Used by
+    /// `/agent new` and `/agent import`.
     pub fn from_db_config(name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Self {
         Agent {
             name: name.to_string(),
@@ -311,8 +311,8 @@ impl AgentRegistry {
     }
 
     /// Replace the runtime entry for `name` — or insert if absent. Used by
-    /// Stage 8 live hydration so edits to `AgentDb::config` propagate into
-    /// the in-memory registry at resolution time.
+    /// live hydration so edits to `AgentDb::config` propagate into the
+    /// in-memory registry at resolution time.
     pub fn upsert(&self, agent: Agent) {
         let mut agents = self.agents.write().unwrap();
         if let Some(existing) = agents.iter_mut().find(|a| a.name == agent.name) {
@@ -495,7 +495,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 6: runtime registration + from_db_config
+    // Runtime registration + from_db_config
     // -----------------------------------------------------------------------
 
     #[test]
@@ -555,7 +555,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 8: live hydration from AgentDb config
+    // Live hydration from AgentDb config
     // -----------------------------------------------------------------------
 
     #[test]
