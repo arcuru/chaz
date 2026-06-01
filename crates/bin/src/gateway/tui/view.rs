@@ -108,6 +108,7 @@ pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     match app.mode {
         TuiMode::Chat => ui_chat(f, app),
         TuiMode::SessionPicker => ui_picker(f, app),
+        TuiMode::ModelPicker => ui_model_picker(f, app),
     }
 
     if app.overlay.is_some() {
@@ -1158,6 +1159,268 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(help, chunks[1]);
 }
 
+/// Format a price (input $/Mtok) for the picker. `—` when missing so all
+/// rows align even if pricing isn't populated.
+fn format_price(price: Option<f64>) -> String {
+    match price {
+        Some(p) if p < 1.0 => format!("${p:.2}"),
+        Some(p) => format!("${p:.1}"),
+        None => "—".to_string(),
+    }
+}
+
+/// Fixed column widths for the picker price/caps columns. ID is dynamic.
+const COL_W_PRICE: usize = 8;
+const COL_W_CAPS: usize = 6;
+
+fn ui_model_picker(f: &mut ratatui::Frame, app: &mut App) {
+    // search bar | list | help — search is its own block so it has its own
+    // border + title. List block houses the column header on its first
+    // interior row, then the scroll window of model rows.
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(f.area());
+
+    render_model_search_bar(f, chunks[0], app);
+    render_model_list_block(f, chunks[1], app);
+    render_model_help_bar(f, chunks[2], app);
+}
+
+fn render_model_search_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+    let total = app.model_list.len();
+    let shown = app.model_picker_filtered.len();
+    let counter = if app.model_search.is_empty() {
+        format!("{total} models")
+    } else {
+        format!("{shown}/{total}")
+    };
+    let title = format!(" Search models ({counter}) ");
+    let bar = Paragraph::new(Line::from(vec![
+        Span::styled("  > ", Style::default().fg(COLOR_DIM)),
+        Span::styled(
+            app.model_search.clone(),
+            Style::default().fg(COLOR_USER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "▎",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ]))
+    .block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_DIM))
+            .title(Span::styled(title, Style::default().fg(COLOR_ACCENT))),
+    );
+    f.render_widget(bar, area);
+}
+
+fn render_model_list_block(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    app: &mut App,
+) {
+    let inner_x = area.x + 1;
+    let inner_y = area.y + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Errors and empty-state shortcuts.
+    if let Some(err) = app.model_picker_error.as_ref() {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  Catalog fetch failed: {err}"),
+            Style::default().fg(Color::Red),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            "  Press Ctrl+R to retry.",
+            Style::default().fg(COLOR_DIM),
+        )]));
+    }
+
+    if app.model_picker_filtered.is_empty() {
+        let msg = if app.model_picker_loading && app.model_list.is_empty() {
+            "  Loading OpenRouter catalog…"
+        } else if app.model_list.is_empty() {
+            "  No models known — populate `models:` under a backend or press Ctrl+R."
+        } else {
+            "  No models match the search."
+        };
+        lines.push(Line::from(vec![Span::styled(
+            msg,
+            Style::default().fg(COLOR_DIM),
+        )]));
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_DIM))
+            .title(Span::styled(
+                " Select model ",
+                Style::default().fg(COLOR_ACCENT),
+            ));
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+            area,
+        );
+        return;
+    }
+
+    // Dynamic id-column width: longest id among visible rows, capped so a
+    // pathological 80-char id doesn't push the price columns off-screen.
+    let id_w = app
+        .model_picker_filtered
+        .iter()
+        .filter_map(|&i| app.model_list.get(i))
+        .map(|m| m.id.chars().count())
+        .max()
+        .unwrap_or(24)
+        .clamp(24, 56);
+
+    // Column header — dim, single line at the top of the interior.
+    lines.push(model_picker_header_line(id_w));
+
+    // Adjust scroll so the selected row is visible. `inner_h` includes
+    // the header line we just pushed; rows get `inner_h - 1`.
+    let visible_rows = inner_h.saturating_sub(1).max(1) as usize;
+    let sel = app.model_picker_index;
+    let mut scroll = app.model_picker_scroll as usize;
+    if sel < scroll {
+        scroll = sel;
+    } else if sel >= scroll + visible_rows {
+        scroll = sel + 1 - visible_rows;
+    }
+    let max_scroll = app.model_picker_filtered.len().saturating_sub(visible_rows);
+    scroll = scroll.min(max_scroll);
+    app.model_picker_scroll = scroll as u16;
+
+    let current = app.active().effective_model.clone();
+    let end = (scroll + visible_rows).min(app.model_picker_filtered.len());
+    // Header occupies y_off=1 (after the top border at 0); rows start at 2.
+    let mut y_off: u16 = 2;
+    for filtered_i in scroll..end {
+        let model_idx = app.model_picker_filtered[filtered_i];
+        let Some(info) = app.model_list.get(model_idx) else {
+            continue;
+        };
+        let is_selected = filtered_i == sel;
+        let is_current = info.id == current;
+
+        let marker = if is_selected { "▸ " } else { "  " };
+        let current_suffix = if is_current { "  (current)" } else { "" };
+        let id_disp = if info.id.chars().count() > id_w {
+            let truncated: String = info.id.chars().take(id_w.saturating_sub(1)).collect();
+            format!("{truncated}…")
+        } else {
+            info.id.clone()
+        };
+        let caps = super::model_caps_badge(info);
+        let row = format!(
+            "{marker}{id:<id_w$}  {pin:>pw$}  {pout:>pw$}  {pcache:>pw$}  {caps:<cw$}{current_suffix}",
+            id = id_disp,
+            id_w = id_w,
+            pin = format_price(info.price_input),
+            pout = format_price(info.price_output),
+            pcache = format_price(info.price_cache_read),
+            pw = COL_W_PRICE,
+            caps = caps,
+            cw = COL_W_CAPS,
+        );
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(COLOR_ACCENT)
+        } else {
+            Style::default().fg(COLOR_USER)
+        };
+
+        // Register click region against the row's screen y. `filtered_i`
+        // is what the click handler expects (it indexes into
+        // `model_picker_filtered`, not `model_list`).
+        if y_off < inner_h {
+            app.click_regions.push(ClickRegion {
+                x: inner_x,
+                y: inner_y + y_off,
+                w: inner_w,
+                h: 1,
+                target: ClickTarget::ModelPickerSelect(filtered_i),
+            });
+        }
+        lines.push(Line::from(vec![Span::styled(row, style)]));
+        y_off = y_off.saturating_add(1);
+    }
+
+    // Scroll indicators in the title so the user knows there's more.
+    let scroll_hint = scroll_indicator(scroll, end, app.model_picker_filtered.len());
+    let title_text = format!(" Select model{scroll_hint} ");
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_DIM))
+        .title(Span::styled(title_text, Style::default().fg(COLOR_ACCENT)));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        area,
+    );
+}
+
+fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+    let help_text = if app.model_picker_loading {
+        " type to filter | ↑↓ PgUp/Dn Home/End | Enter select | Esc cancel | fetching catalog…"
+    } else {
+        " type to filter | ↑↓ PgUp/Dn Home/End | Enter select | Ctrl+R refresh | Ctrl+U clear | Esc cancel"
+    };
+    let help = Paragraph::new(help_text).style(
+        Style::default()
+            .bg(Color::Rgb(0x1a, 0x1d, 0x26))
+            .fg(Color::White),
+    );
+    f.render_widget(help, area);
+}
+
+fn model_picker_header_line(id_w: usize) -> Line<'static> {
+    // Match the spacing in the row format string so columns line up.
+    let header = format!(
+        "  {id:<id_w$}  {pin:>pw$}  {pout:>pw$}  {pcache:>pw$}  {caps:<cw$}",
+        id = "MODEL",
+        id_w = id_w,
+        pin = "IN",
+        pout = "OUT",
+        pcache = "CACHE",
+        pw = COL_W_PRICE,
+        caps = "CAPS",
+        cw = COL_W_CAPS,
+    );
+    Line::from(vec![Span::styled(
+        header,
+        Style::default()
+            .fg(COLOR_DIM)
+            .add_modifier(Modifier::BOLD),
+    )])
+}
+
+fn scroll_indicator(scroll: usize, end: usize, total: usize) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let above = scroll > 0;
+    let below = end < total;
+    match (above, below) {
+        (false, false) => String::new(),
+        (true, false) => " ▲".to_string(),
+        (false, true) => " ▼".to_string(),
+        (true, true) => " ▲▼".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,5 +1478,24 @@ mod tests {
             model_slug("provider/family/qwen-2.5-coder:free"),
             "qwen-2.5-coder:free"
         );
+    }
+
+    #[test]
+    fn format_price_renders_dash_for_missing() {
+        assert_eq!(format_price(None), "—");
+    }
+
+    #[test]
+    fn format_price_uses_two_decimals_for_cents() {
+        // Sub-dollar prices keep two decimals so $0.04 ≠ $0.15.
+        assert_eq!(format_price(Some(0.04)), "$0.04");
+        assert_eq!(format_price(Some(0.15)), "$0.15");
+        assert_eq!(format_price(Some(0.80)), "$0.80");
+    }
+
+    #[test]
+    fn format_price_uses_one_decimal_for_dollars() {
+        assert_eq!(format_price(Some(3.0)), "$3.0");
+        assert_eq!(format_price(Some(15.0)), "$15.0");
     }
 }

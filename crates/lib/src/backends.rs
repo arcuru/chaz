@@ -83,6 +83,23 @@ pub trait BackendDispatch: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>>;
 }
 
+/// Display-oriented info about a single known model, surfaced to the
+/// TUI model picker. `id` is the full name the backend expects (e.g.
+/// `anthropic/claude-opus-4-7` for OpenRouter, or `openrouter:gpt-5-mini`
+/// for multi-backend setups). Prices are USD per million tokens.
+/// Modalities are the raw OpenRouter `architecture.input_modalities` /
+/// `output_modalities` strings (`text`, `image`, `audio`, `video`, …) —
+/// the picker derives capability badges from them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub price_input: Option<f64>,
+    pub price_output: Option<f64>,
+    pub price_cache_read: Option<f64>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct BackendManager {
     backends: Vec<Backend>,
@@ -189,6 +206,53 @@ impl BackendManager {
                 })
                 .collect()
         }
+    }
+
+    /// Like `list_known_models`, but yields each model's pricing alongside
+    /// its id so the TUI picker can render a price column. Pricing is `None`
+    /// when the backend config doesn't declare it.
+    pub fn list_known_models_with_info(&self) -> Vec<ModelInfo> {
+        if self.backends.len() == 1 {
+            OpenAI::new(&self.backends[0], &self.secrets).list_models_with_info()
+        } else {
+            self.backends
+                .iter()
+                .flat_map(|backend| {
+                    let prefix = backend.get_name();
+                    OpenAI::new(backend, &self.secrets)
+                        .list_models_with_info()
+                        .into_iter()
+                        .map(move |info| ModelInfo {
+                            id: format!("{}:{}", prefix, info.id),
+                            ..info
+                        })
+                })
+                .collect()
+        }
+    }
+
+    /// Live-fetch the full model catalog from each backend's `/models`
+    /// endpoint. Multi-backend setups prefix ids with the backend name to
+    /// match `list_known_models`. A failure in any backend is propagated;
+    /// callers decide whether to fall back to the YAML-configured list.
+    pub async fn fetch_models_with_info(&self) -> Result<Vec<ModelInfo>, crate::error::LlmError> {
+        if self.backends.len() == 1 {
+            return OpenAI::new(&self.backends[0], &self.secrets)
+                .fetch_models_from_api()
+                .await;
+        }
+        let mut out = Vec::new();
+        for backend in &self.backends {
+            let prefix = backend.get_name();
+            let models = OpenAI::new(backend, &self.secrets)
+                .fetch_models_from_api()
+                .await?;
+            out.extend(models.into_iter().map(|info| ModelInfo {
+                id: format!("{prefix}:{}", info.id),
+                ..info
+            }));
+        }
+        Ok(out)
     }
 
     /// Returns true if the model is known
@@ -349,6 +413,9 @@ mod tests {
                 .iter()
                 .map(|m| Model {
                     name: m.to_string(),
+                    price_input: None,
+                    price_output: None,
+                    price_cache_read: None,
                 })
                 .collect(),
         );

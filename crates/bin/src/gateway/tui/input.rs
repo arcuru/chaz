@@ -5,7 +5,7 @@
 use chaz_core::commands::{Command, ExtensionsAction, RehostScope, parse_permission_token};
 use chaz_core::gateway::ApprovalDecision;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
     App, ChatAction, ClickTarget, Completion, Overlay, TuiMode, show_error, show_system_msg,
@@ -93,6 +93,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/schedule add ", "<id> <cron 6 fields> <agent> <task...>"),
         ("/schedule remove ", "remove a schedule by id"),
         ("# LLM config", ""),
+        ("/models", "open the model picker"),
         ("/model ", "show or set the model for this session"),
         ("/role ", "show, select, or define a role"),
         ("/backend ", "add a custom backend (<name> <url> <key>)"),
@@ -308,6 +309,9 @@ pub(super) enum MouseOutcome {
     TabActivate(usize),
     /// Close tab at the given index.
     TabClose(usize),
+    /// Apply the currently selected model picker row — equivalent to
+    /// pressing Enter in the model picker.
+    ModelPickerOpenSelected,
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
@@ -395,6 +399,17 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             let set = &mut app.active_mut().expanded_entries;
             if !set.remove(&i) {
                 set.insert(i);
+            }
+        }
+        ClickTarget::ModelPickerSelect(i) => {
+            // Same dance as the session picker: first click selects, second
+            // click on the same row commits. `i` indexes the filtered
+            // (post-search) list — view sets it that way.
+            if i < app.model_picker_filtered.len() {
+                if app.model_picker_index == i {
+                    return Some(MouseOutcome::ModelPickerOpenSelected);
+                }
+                app.model_picker_index = i;
             }
         }
     }
@@ -562,6 +577,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     match text {
         "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
+        "/models" => return Some(ChatAction::OpenModelPicker),
         "/share" => return Some(ChatAction::Dispatch(Command::Share)),
         "/unshare" => return Some(ChatAction::Dispatch(Command::SessionUnshare)),
         "/compact" => return Some(ChatAction::Dispatch(Command::Compact)),
@@ -1011,6 +1027,95 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     }
 
     Some(ChatAction::SendMessage(text.to_string()))
+}
+
+/// What a key in the model picker meant.
+pub(super) enum ModelPickerKey {
+    /// User confirmed a selection — caller switches to the chosen model.
+    Select(String),
+    /// User asked to refetch the catalog (skip cache).
+    Refresh,
+    /// Navigation / typing / dismiss / unhandled — nothing for the caller
+    /// to do beyond the in-place mutations already applied to `app`.
+    None,
+}
+
+/// Key handler for `TuiMode::ModelPicker`. Typing is fuzzy-search input;
+/// arrow keys navigate the filtered list; Ctrl+R refreshes; Enter
+/// commits; Esc dismisses. The picker is opened from chat mode via
+/// the `/models` slash command (no global keybinding — Ctrl+M is
+/// ambiguous with Enter on terminals without keyboard-enhancement
+/// support, which makes a key binding unreliable through tmux + ssh).
+pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPickerKey {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        // Refresh — Ctrl+R, disabled while a fetch is already running so
+        // we don't pile up duplicate requests.
+        KeyCode::Char('r') if ctrl && !app.model_picker_loading => ModelPickerKey::Refresh,
+        // Clear search — Ctrl+U mirrors readline.
+        KeyCode::Char('u') if ctrl => {
+            app.model_search.clear();
+            app.recompute_model_filter();
+            ModelPickerKey::None
+        }
+
+        KeyCode::Up => {
+            if app.model_picker_index > 0 {
+                app.model_picker_index -= 1;
+            }
+            ModelPickerKey::None
+        }
+        KeyCode::Down => {
+            if app.model_picker_index + 1 < app.model_picker_filtered.len() {
+                app.model_picker_index += 1;
+            }
+            ModelPickerKey::None
+        }
+        KeyCode::PageUp => {
+            app.model_picker_index = app.model_picker_index.saturating_sub(10);
+            ModelPickerKey::None
+        }
+        KeyCode::PageDown => {
+            let last = app.model_picker_filtered.len().saturating_sub(1);
+            app.model_picker_index = (app.model_picker_index + 10).min(last);
+            ModelPickerKey::None
+        }
+        KeyCode::Home => {
+            app.model_picker_index = 0;
+            ModelPickerKey::None
+        }
+        KeyCode::End => {
+            app.model_picker_index = app.model_picker_filtered.len().saturating_sub(1);
+            ModelPickerKey::None
+        }
+
+        KeyCode::Enter => app
+            .model_picker_selection()
+            .map(ModelPickerKey::Select)
+            .unwrap_or(ModelPickerKey::None),
+        KeyCode::Esc => {
+            app.mode = TuiMode::Chat;
+            ModelPickerKey::None
+        }
+
+        KeyCode::Backspace => {
+            if app.model_search.pop().is_some() {
+                app.recompute_model_filter();
+            }
+            ModelPickerKey::None
+        }
+        // Typed character — append to search query. Skip control/alt
+        // modifiers so e.g. Ctrl+T doesn't smuggle a 't' into the query.
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.model_search.push(c);
+            app.recompute_model_filter();
+            ModelPickerKey::None
+        }
+
+        _ => ModelPickerKey::None,
+    }
 }
 
 pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {

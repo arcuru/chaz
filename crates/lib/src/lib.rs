@@ -23,6 +23,7 @@ pub mod grants;
 pub mod hosted_index;
 pub mod mcp;
 pub mod memory_bank_db;
+pub mod model_catalog_cache;
 pub mod openai;
 pub mod routine;
 pub mod runtime;

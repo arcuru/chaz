@@ -10,10 +10,11 @@
 //! - `input` — KeyEvent / MouseEvent handling, slash-command parsing
 //! - `view`  — ratatui rendering
 
-use chaz_core::backends::BackendManager;
+use chaz_core::backends::{BackendManager, ModelInfo};
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
 use chaz_core::gateway::{ApprovalExchange, Gateway};
+use chaz_core::model_catalog_cache::ModelCatalogCache;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{EntryType, Session, SessionEntry};
@@ -59,16 +60,21 @@ enum Action {
     /// session_db_id so we can refresh the right tab.
     SessionChanged(String),
     ApprovalRequest(TaggedApproval),
+    /// A background catalog fetch finished. `Ok` carries the live model
+    /// list (already merged with cache); `Err` carries a display message.
+    ModelsFetched(Result<Vec<ModelInfo>, String>),
 }
 
 pub(super) enum TuiMode {
     Chat,
     SessionPicker,
+    ModelPicker,
 }
 
 pub(super) enum ChatAction {
     Dispatch(Command),
     OpenPicker,
+    OpenModelPicker,
     SendMessage(String),
 }
 
@@ -119,6 +125,8 @@ pub(super) enum ClickTarget {
     /// given index. Inverts against `App::expand_all`, so the click always
     /// produces the opposite of whatever's currently rendered.
     ToggleEntryExpanded(usize),
+    /// Select model picker row `i` (index into `App::model_list`).
+    ModelPickerSelect(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +225,41 @@ pub(super) struct App {
     /// user can re-open the picker to refresh.
     pub(super) session_list_fresh: bool,
     pub(super) picker_index: usize,
+    /// Sorted snapshot of the model picker's contents — favorites
+    /// (YAML-configured) followed by the live OpenRouter catalog when
+    /// available. Repopulated when the picker opens. Sort order: current
+    /// effective model first, then favorites alphabetical, then catalog
+    /// alphabetical (catalog entries that duplicate a favorite id are
+    /// dropped).
+    pub(super) model_list: Vec<ModelInfo>,
+    /// Index into `model_picker_filtered`, NOT into `model_list`. Resolved
+    /// to a `ModelInfo` via `model_list[model_picker_filtered[idx]]`.
+    pub(super) model_picker_index: usize,
+    /// Indices into `model_list` that survive the current `model_search`
+    /// filter, ordered by fuzzy-match score (best first) when there's a
+    /// query, or in `model_list` order when the query is empty.
+    pub(super) model_picker_filtered: Vec<usize>,
+    /// Top row of the visible scroll window into `model_picker_filtered`.
+    /// Clamped each frame to keep the selected row visible.
+    pub(super) model_picker_scroll: u16,
+    /// Live fuzzy-search query. Edited in place by typing in the picker;
+    /// matched against the searchable text of each model (id + capability
+    /// labels like "vision audio image-gen").
+    pub(super) model_search: String,
+    /// Reusable nucleo matcher — keeps internal scratch buffers across
+    /// keystrokes so per-character recompute stays cheap.
+    pub(super) model_picker_matcher: nucleo_matcher::Matcher,
+    /// YAML-configured models held aside so a force-refresh doesn't
+    /// briefly drop them from the visible list while the network call is
+    /// in flight. Catalog enrichment patches missing prices/capabilities
+    /// on these favorites by id-matching against the live catalog before
+    /// the merged `model_list` is rebuilt.
+    pub(super) model_picker_favorites: Vec<ModelInfo>,
+    /// True while a background `/models` fetch is in flight. Picker shows
+    /// a "Loading…" hint and the catalog rows haven't arrived yet.
+    pub(super) model_picker_loading: bool,
+    /// Set when the last fetch failed; cleared on a successful retry.
+    pub(super) model_picker_error: Option<String>,
 }
 
 impl App {
@@ -238,6 +281,17 @@ impl App {
             session_list: Vec::new(),
             session_list_fresh: false,
             picker_index: 0,
+            model_list: Vec::new(),
+            model_picker_index: 0,
+            model_picker_filtered: Vec::new(),
+            model_picker_scroll: 0,
+            model_search: String::new(),
+            model_picker_matcher: nucleo_matcher::Matcher::new(
+                nucleo_matcher::Config::DEFAULT,
+            ),
+            model_picker_favorites: Vec::new(),
+            model_picker_loading: false,
+            model_picker_error: None,
         }
     }
 
@@ -273,6 +327,143 @@ impl App {
                 .map(|s| s.session_db_id.clone())
                 .unwrap_or_else(|| "__new__".to_string()),
         }
+    }
+
+    /// Seed the picker with YAML-configured "favorites". Called when the
+    /// picker is first opened; the catalog rows are loaded asynchronously
+    /// from the cache + live `/models` and arrive via `Action::ModelsFetched`.
+    pub(super) fn seed_model_picker_favorites(&mut self, backend: &BackendManager) {
+        self.model_picker_favorites = backend.list_known_models_with_info();
+        self.model_picker_error = None;
+        self.model_search.clear();
+        self.model_picker_scroll = 0;
+        self.rebuild_model_list(Vec::new());
+    }
+
+    /// Merge favorites with a catalog list. Favorites pinned at top;
+    /// catalog entries duplicating a favorite id are dropped (but the
+    /// catalog row's pricing/capabilities are folded into the favorite
+    /// first so YAML-declared models still show full prices). Current
+    /// effective model floats to the very top regardless of which list
+    /// it came from.
+    pub(super) fn rebuild_model_list(&mut self, catalog: Vec<ModelInfo>) {
+        let current = self.active().effective_model.clone();
+
+        let catalog_by_id: std::collections::HashMap<String, &ModelInfo> =
+            catalog.iter().map(|m| (m.id.clone(), m)).collect();
+
+        // Enrich each favorite with catalog data for whichever fields the
+        // YAML left blank. Catalog pricing/capability data wins on absent
+        // fields; YAML keeps precedence where set so user-overrides hold.
+        let mut favs: Vec<ModelInfo> = self
+            .model_picker_favorites
+            .iter()
+            .map(|fav| match catalog_by_id.get(&fav.id) {
+                None => fav.clone(),
+                Some(cat) => ModelInfo {
+                    id: fav.id.clone(),
+                    price_input: fav.price_input.or(cat.price_input),
+                    price_output: fav.price_output.or(cat.price_output),
+                    price_cache_read: fav.price_cache_read.or(cat.price_cache_read),
+                    input_modalities: if fav.input_modalities.is_empty() {
+                        cat.input_modalities.clone()
+                    } else {
+                        fav.input_modalities.clone()
+                    },
+                    output_modalities: if fav.output_modalities.is_empty() {
+                        cat.output_modalities.clone()
+                    } else {
+                        fav.output_modalities.clone()
+                    },
+                },
+            })
+            .collect();
+        favs.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let fav_ids: std::collections::HashSet<String> =
+            favs.iter().map(|m| m.id.clone()).collect();
+        let mut catalog_only: Vec<ModelInfo> = catalog
+            .into_iter()
+            .filter(|m| !fav_ids.contains(&m.id))
+            .collect();
+        catalog_only.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut out: Vec<ModelInfo> = Vec::new();
+        out.extend(favs);
+        out.extend(catalog_only);
+
+        // Floating-active sort applied after merge so the current model
+        // appears at the top whether it lives in favorites or catalog.
+        out.sort_by(|a, b| {
+            let a_active = a.id == current;
+            let b_active = b.id == current;
+            match (a_active, b_active) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        self.model_list = out;
+        self.recompute_model_filter();
+    }
+
+    /// Recompute `model_picker_filtered` from `model_search` against
+    /// `model_list`. Empty query keeps `model_list` order verbatim;
+    /// non-empty query keeps only rows the matcher scores positively,
+    /// sorted by descending score.
+    pub(super) fn recompute_model_filter(&mut self) {
+        use nucleo_matcher::Utf32String;
+        use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+
+        let prev_selected_idx = self
+            .model_picker_filtered
+            .get(self.model_picker_index)
+            .copied();
+
+        if self.model_search.is_empty() {
+            self.model_picker_filtered = (0..self.model_list.len()).collect();
+        } else {
+            let pattern = Pattern::parse(
+                &self.model_search,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+            );
+            // Trick: parse_into uses `AtomKind::Fuzzy` by default which is
+            // exactly what we want — same scoring fzf uses. No retyping
+            // needed unless we want exact/prefix modes later.
+            let _ = AtomKind::Fuzzy;
+
+            let mut scored: Vec<(usize, u32)> = self
+                .model_list
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    let haystack = Utf32String::from(model_searchable(m));
+                    pattern
+                        .score(haystack.slice(..), &mut self.model_picker_matcher)
+                        .map(|score| (i, score))
+                })
+                .collect();
+            // Higher score first; break ties by original list order so the
+            // current/favorites pinning stays stable.
+            scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            self.model_picker_filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
+
+        // Preserve cursor on the same model where possible, else snap to top.
+        self.model_picker_index = prev_selected_idx
+            .and_then(|orig| self.model_picker_filtered.iter().position(|&i| i == orig))
+            .unwrap_or(0);
+        self.model_picker_scroll = 0;
+    }
+
+    /// Resolve the currently highlighted picker row to its model id, if any.
+    pub(super) fn model_picker_selection(&self) -> Option<String> {
+        self.model_picker_filtered
+            .get(self.model_picker_index)
+            .and_then(|&i| self.model_list.get(i))
+            .map(|m| m.id.clone())
     }
 
     /// Point the picker cursor at `session_db_id` (offset past the New
@@ -368,6 +559,117 @@ async fn default_tui_session(
     Ok((conv_id, db))
 }
 
+/// 24-hour cache TTL for the live model catalog. Refresh on demand with
+/// the picker's Ctrl+R binding.
+const MODEL_CATALOG_TTL: chrono::Duration = chrono::Duration::hours(24);
+
+/// Compose the haystack the fuzzy matcher scores against for a given
+/// model. The id is the primary key, but we also fold in capability
+/// labels (`vision`, `audio`, `video`, `image-gen`, `audio-gen`) so
+/// typing `vision` in the picker filters down to vision-capable
+/// models without a separate filter UI.
+pub(super) fn model_searchable(m: &ModelInfo) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(6);
+    parts.push(&m.id);
+    if m.input_modalities.iter().any(|s| s == "image") {
+        parts.push("vision");
+    }
+    if m.input_modalities.iter().any(|s| s == "audio") {
+        parts.push("audio");
+    }
+    if m.input_modalities.iter().any(|s| s == "video") {
+        parts.push("video");
+    }
+    if m.output_modalities.iter().any(|s| s == "image") {
+        parts.push("image-gen");
+    }
+    if m.output_modalities.iter().any(|s| s == "audio") {
+        parts.push("audio-gen");
+    }
+    parts.join(" ")
+}
+
+/// Compact capability badge string for the picker's Caps column. One
+/// uppercase letter per capability (text omitted — it's the baseline):
+/// `V` vision, `A` audio in, `M` movie/video, `I` image-gen, `S` speech.
+/// Empty when only text/text.
+pub(super) fn model_caps_badge(m: &ModelInfo) -> String {
+    let mut badge = String::new();
+    if m.input_modalities.iter().any(|s| s == "image") {
+        badge.push('V');
+    }
+    if m.input_modalities.iter().any(|s| s == "audio") {
+        badge.push('A');
+    }
+    if m.input_modalities.iter().any(|s| s == "video") {
+        badge.push('M');
+    }
+    if m.output_modalities.iter().any(|s| s == "image") {
+        badge.push('I');
+    }
+    if m.output_modalities.iter().any(|s| s == "audio") {
+        badge.push('S');
+    }
+    badge
+}
+
+/// Compose the cache key for this `BackendManager` instance. Including the
+/// backend names means changing the configured backends gives the picker a
+/// fresh cache slot rather than serving the previous config's catalog.
+fn model_cache_key(backend: &BackendManager) -> String {
+    let mut names: Vec<String> = backend.list_known_backends();
+    names.sort();
+    if names.is_empty() {
+        "backends-v2:".to_string()
+    } else {
+        format!("backends-v2:{}", names.join(","))
+    }
+}
+
+/// Set the picker into "loading" and spawn a background task to populate
+/// the catalog. The task hits the cache first (unless `force_refresh`),
+/// then falls through to a live `/models` fetch; results arrive on the UI
+/// thread as `Action::ModelsFetched`.
+fn spawn_catalog_load(
+    app: &mut App,
+    backend: BackendManager,
+    cache: ModelCatalogCache,
+    cache_key: String,
+    models_tx: mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+    force_refresh: bool,
+) {
+    app.model_picker_loading = true;
+    app.model_picker_error = None;
+    tokio::spawn(async move {
+        if !force_refresh
+            && let Some(cached) = cache.get(&cache_key).await
+            && cached.is_fresh(MODEL_CATALOG_TTL)
+        {
+            let _ = models_tx.send(Ok(cached.into_models())).await;
+            return;
+        }
+        match backend.fetch_models_with_info().await {
+            Ok(models) => {
+                if let Err(e) = cache.put(&cache_key, models.clone()).await {
+                    tracing::warn!("model catalog cache write failed: {e}");
+                }
+                let _ = models_tx.send(Ok(models)).await;
+            }
+            Err(e) => {
+                // Fetch failed — fall back to any cached copy, even a stale
+                // one, so the picker still shows the OpenRouter catalog the
+                // user pulled earlier. Surface the error only when there's
+                // nothing to fall back to.
+                if let Some(cached) = cache.get(&cache_key).await {
+                    let _ = models_tx.send(Ok(cached.into_models())).await;
+                } else {
+                    let _ = models_tx.send(Err(e.to_string())).await;
+                }
+            }
+        }
+    });
+}
+
 /// Build a `Tab` for an already-registered session DB.
 async fn build_tab(
     server: &Server,
@@ -410,11 +712,17 @@ impl Gateway for TuiGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let (approval_tx, mut approval_rx) = mpsc::channel::<TaggedApproval>(8);
         let (notify_tx, mut notify_rx) = mpsc::channel::<String>(64);
+        // One-shot-style delivery of background model catalog fetches.
+        // Buffered so a force-refresh kicked off mid-render doesn't block.
+        let (models_tx, mut models_rx) =
+            mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
 
         let (_conv_id, session_db) = default_tui_session(&server).await?;
         let session_db_id = session_db.root_id().to_string();
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        let catalog_cache = ModelCatalogCache::new(server.registry().chaz_peer().clone());
+        let catalog_cache_key = model_cache_key(&backend);
 
         setup_session(
             &server,
@@ -495,6 +803,7 @@ impl Gateway for TuiGateway {
                 }
                 Some(id) = notify_rx.recv() => Action::SessionChanged(id),
                 Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
+                Some(res) = models_rx.recv() => Action::ModelsFetched(res),
             };
 
             match action {
@@ -530,10 +839,16 @@ impl Gateway for TuiGateway {
                                     &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
+                                    &catalog_cache,
+                                    &catalog_cache_key,
+                                    &models_tx,
                                 )
                                 .await;
                             }
                             TuiMode::SessionPicker => {
+                                app.mode = TuiMode::Chat;
+                            }
+                            TuiMode::ModelPicker => {
                                 app.mode = TuiMode::Chat;
                             }
                         }
@@ -578,6 +893,9 @@ impl Gateway for TuiGateway {
                                         &self.secrets,
                                         &approval_tx,
                                         &notify_tx,
+                                        &catalog_cache,
+                                        &catalog_cache_key,
+                                        &models_tx,
                                     )
                                     .await;
                                 }
@@ -594,6 +912,33 @@ impl Gateway for TuiGateway {
                                         &notify_tx,
                                     )
                                     .await;
+                                }
+                            }
+                            TuiMode::ModelPicker => {
+                                match input::handle_model_picker_key(&mut app, key) {
+                                    input::ModelPickerKey::Select(model_id) => {
+                                        dispatch_model_selection(
+                                            model_id,
+                                            &mut app,
+                                            &server,
+                                            &backend,
+                                            &self.secrets,
+                                            &approval_tx,
+                                            &notify_tx,
+                                        )
+                                        .await;
+                                    }
+                                    input::ModelPickerKey::Refresh => {
+                                        spawn_catalog_load(
+                                            &mut app,
+                                            backend.clone(),
+                                            catalog_cache.clone(),
+                                            catalog_cache_key.clone(),
+                                            models_tx.clone(),
+                                            true,
+                                        );
+                                    }
+                                    input::ModelPickerKey::None => {}
                                 }
                             }
                         }
@@ -622,6 +967,20 @@ impl Gateway for TuiGateway {
                             }
                             input::MouseOutcome::TabClose(i) => {
                                 close_tab_at(&mut app, i);
+                            }
+                            input::MouseOutcome::ModelPickerOpenSelected => {
+                                if let Some(model_id) = app.model_picker_selection() {
+                                    dispatch_model_selection(
+                                        model_id,
+                                        &mut app,
+                                        &server,
+                                        &backend,
+                                        &self.secrets,
+                                        &approval_tx,
+                                        &notify_tx,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -697,6 +1056,18 @@ impl Gateway for TuiGateway {
                             .send(chaz_core::gateway::ApprovalDecision::Deny);
                     }
                 }
+                Action::ModelsFetched(res) => {
+                    app.model_picker_loading = false;
+                    match res {
+                        Ok(catalog) => {
+                            app.model_picker_error = None;
+                            app.rebuild_model_list(catalog);
+                        }
+                        Err(msg) => {
+                            app.model_picker_error = Some(msg);
+                        }
+                    }
+                }
             }
 
             if app.should_quit {
@@ -745,6 +1116,9 @@ async fn handle_chat_action(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
+    catalog_cache: &ModelCatalogCache,
+    catalog_cache_key: &str,
+    models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
 ) {
     match action {
         ChatAction::SendMessage(text) => {
@@ -763,6 +1137,18 @@ async fn handle_chat_action(
                 })
                 .await;
             tab.waiting = true;
+        }
+        ChatAction::OpenModelPicker => {
+            app.seed_model_picker_favorites(backend);
+            spawn_catalog_load(
+                app,
+                backend.clone(),
+                catalog_cache.clone(),
+                catalog_cache_key.to_string(),
+                models_tx.clone(),
+                false,
+            );
+            app.mode = TuiMode::ModelPicker;
         }
         ChatAction::OpenPicker => {
             let tab = app.active();
@@ -937,6 +1323,39 @@ async fn dispatch_picker_selection(
     if invalidates_cache {
         app.session_list_fresh = false;
     }
+    render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
+    app.mode = TuiMode::Chat;
+}
+
+/// Apply the model selected in the model picker by dispatching
+/// `Command::Model { value: Some(id) }`. SessionMeta.model is written
+/// inside the command, fires `on_write` → `SessionChanged`, which
+/// refreshes `Tab::effective_model` so the status bar moves in step.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_model_selection(
+    model_id: String,
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    secrets: &SecretStore,
+    approval_tx: &mpsc::Sender<TaggedApproval>,
+    notify_tx: &mpsc::Sender<String>,
+) {
+    let tab = app.active();
+    let session_db_id = tab.session_db_id.clone();
+    let session_db = tab.session_db.clone();
+    let current_agent = tab.current_agent.clone();
+    let session_name = tab.session_name.clone();
+    let ctx = CommandContext {
+        server,
+        secrets,
+        backend,
+        session_db_id: &session_db_id,
+        session_db: &session_db,
+        current_agent: &current_agent,
+        session_name: session_name.as_deref(),
+    };
+    let outcome = commands::dispatch(Command::Model(Some(model_id)), &ctx).await;
     render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
     app.mode = TuiMode::Chat;
 }

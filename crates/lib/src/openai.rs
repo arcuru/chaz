@@ -464,6 +464,149 @@ impl OpenAI {
     }
 }
 
+impl OpenAI {
+    /// Models for this backend with the optional pricing carried over from
+    /// the YAML config. Separate from the `LLMBackend::list_models` trait
+    /// method because the trait keeps a string-only surface that the rest
+    /// of the system uses.
+    pub fn list_models_with_info(&self) -> Vec<crate::backends::ModelInfo> {
+        self.backend
+            .models
+            .as_ref()
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|m| crate::backends::ModelInfo {
+                        id: m.name.clone(),
+                        price_input: m.price_input,
+                        price_output: m.price_output,
+                        price_cache_read: m.price_cache_read,
+                        input_modalities: Vec::new(),
+                        output_modalities: Vec::new(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Live-fetch the backend's model catalog via `GET {api_base}/models`.
+    /// OpenAI-compatible providers (OpenRouter, vanilla OpenAI, DeepSeek)
+    /// expose this endpoint with the shape `{ data: [{ id, pricing? }] }`.
+    /// Pricing is optional and read in OpenRouter's $/token format, converted
+    /// to $/Mtok to match the YAML-config convention on `ModelInfo`.
+    pub async fn fetch_models_from_api(&self) -> Result<Vec<crate::backends::ModelInfo>, LlmError> {
+        let api_key = self
+            .backend
+            .api_key_ref
+            .as_ref()
+            .and_then(|r| self.secrets.get(r))
+            .or_else(|| self.backend.api_key.clone())
+            .ok_or_else(|| LlmError::Configuration {
+                message: "API key not configured".to_string(),
+            })?;
+        let api_base =
+            self.backend
+                .api_base
+                .clone()
+                .ok_or_else(|| LlmError::Configuration {
+                    message: "API base URL not configured".to_string(),
+                })?;
+
+        let url = format!("{}/models", api_base.trim_end_matches('/'));
+        let timeout = self.backend.request_timeout();
+
+        let client = reqwest::Client::builder().timeout(timeout).build().map_err(
+            |e| LlmError::NetworkError {
+                message: format!("client build failed: {e}"),
+            },
+        )?;
+
+        let resp = client
+            .get(&url)
+            .bearer_auth(&api_key)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    LlmError::Timeout
+                } else {
+                    LlmError::NetworkError {
+                        message: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::ServerError {
+                status: status.as_u16(),
+                message: format!("GET {url} returned {status}: {body}"),
+            });
+        }
+
+        let payload: ModelsResponse = resp.json().await.map_err(|e| LlmError::InvalidRequest {
+            message: format!("decode /models response: {e}"),
+        })?;
+
+        // OpenRouter quotes prices as $/token (decimal string). ModelInfo
+        // carries $/Mtok so the picker can display "$2.50".
+        fn parse_per_mtok(s: Option<String>) -> Option<f64> {
+            s.and_then(|s| s.parse::<f64>().ok())
+                .map(|per_token| per_token * 1_000_000.0)
+        }
+
+        Ok(payload
+            .data
+            .into_iter()
+            .map(|m| {
+                let pricing = m.pricing.unwrap_or_default();
+                let arch = m.architecture.unwrap_or_default();
+                crate::backends::ModelInfo {
+                    id: m.id,
+                    price_input: parse_per_mtok(pricing.prompt),
+                    price_output: parse_per_mtok(pricing.completion),
+                    price_cache_read: parse_per_mtok(pricing.input_cache_read),
+                    input_modalities: arch.input_modalities,
+                    output_modalities: arch.output_modalities,
+                }
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    pricing: Option<ModelPricing>,
+    #[serde(default)]
+    architecture: Option<ModelArchitecture>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelPricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelArchitecture {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    output_modalities: Vec<String>,
+}
+
 impl LLMBackend for OpenAI {
     /// List the models available to this backend
     fn list_models(&self) -> Vec<String> {

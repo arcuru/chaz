@@ -25,6 +25,7 @@ dirs.workspace = true
 eidetica.workspace = true
 headjack.workspace = true
 matrix-sdk.workspace = true
+nucleo-matcher.workspace = true
 ratatui.workspace = true
 regex.workspace = true
 serde_json.workspace = true

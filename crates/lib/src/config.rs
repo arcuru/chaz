@@ -333,6 +333,21 @@ impl Backend {
 pub struct Model {
     /// The name of the model
     pub name: String,
+    /// Input token price in USD per million tokens, if known. Surfaced in
+    /// the TUI model picker; optional because backends typically don't
+    /// publish pricing in a standard machine-readable form. Populate
+    /// manually in YAML for backends that matter, or leave blank and let
+    /// the picker enrich from the live `/models` catalog.
+    #[serde(default)]
+    pub price_input: Option<f64>,
+    /// Output token price in USD per million tokens.
+    #[serde(default)]
+    pub price_output: Option<f64>,
+    /// Cache-read token price in USD per million tokens (Anthropic-style
+    /// prompt cache hit cost). Many backends don't report this; treated as
+    /// "not applicable" rather than zero when absent.
+    #[serde(default)]
+    pub price_cache_read: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
