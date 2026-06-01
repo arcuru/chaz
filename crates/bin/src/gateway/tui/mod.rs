@@ -147,6 +147,13 @@ pub(super) struct Tab {
     pub waiting: bool,
     pub current_agent: String,
     pub session_name: Option<String>,
+    /// The model the runtime would actually use for this session's next
+    /// turn, as resolved by `BackendManager::resolve_model_name` from the
+    /// agent's `default_model`. Empty string when no backends are configured.
+    /// Resolved at tab construction; if the agent or backend default
+    /// changes mid-session the displayed value goes stale until the next
+    /// tab open.
+    pub effective_model: String,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
@@ -362,7 +369,12 @@ async fn default_tui_session(
 }
 
 /// Build a `Tab` for an already-registered session DB.
-async fn build_tab(server: &Server, session_db: eidetica::Database, session_db_id: String) -> Tab {
+async fn build_tab(
+    server: &Server,
+    backend: &BackendManager,
+    session_db: eidetica::Database,
+    session_db_id: String,
+) -> Tab {
     let agent = server
         .registry()
         .resolve_agent(&session_db_id, None, server.agent_index())
@@ -372,7 +384,13 @@ async fn build_tab(server: &Server, session_db: eidetica::Database, session_db_i
         session_db.clone(),
     )
     .await;
-    let session_name = session.read_meta().await.name;
+    let meta = session.read_meta().await;
+    let session_name = meta.name;
+    // Mirror the runtime's resolution: the live turn passes
+    // `agent.default_model` into `runtime::execute`, which calls
+    // `BackendManager::resolve_model_name` to strip the backend prefix
+    // and fall back to the backend default when None.
+    let effective_model = backend.resolve_model_name(agent.default_model.as_deref());
     let entries = session.entries().to_vec();
     Tab {
         session_db_id,
@@ -383,6 +401,7 @@ async fn build_tab(server: &Server, session_db: eidetica::Database, session_db_i
         waiting: false,
         current_agent: agent.name.clone(),
         session_name,
+        effective_model,
         expanded_entries: HashSet::new(),
     }
 }
@@ -413,7 +432,7 @@ impl Gateway for TuiGateway {
             .map(|s| s.to_string())
             .collect();
 
-        let initial_tab = build_tab(&server, session_db, session_db_id).await;
+        let initial_tab = build_tab(&server, &backend, session_db, session_db_id).await;
         let mut app = App::new(agent_names, initial_tab);
 
         let original_hook = std::panic::take_hook();
@@ -984,6 +1003,13 @@ async fn render_outcome(
             }
             let session = Session::new(conv_id, db.clone()).await;
             let entries = session.entries().to_vec();
+            // Mirror `build_tab` — resolve through the backend so the status
+            // bar reflects what the runtime would actually use.
+            let agent_default_model = server
+                .agents()
+                .get(&agent_name)
+                .and_then(|a| a.default_model.clone());
+            let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
             app.tabs.push(Tab {
                 session_db_id,
                 session_db: db,
@@ -993,6 +1019,7 @@ async fn render_outcome(
                 waiting: false,
                 current_agent: agent_name,
                 session_name,
+                effective_model,
                 expanded_entries: HashSet::new(),
             });
             app.active_tab = app.tabs.len() - 1;

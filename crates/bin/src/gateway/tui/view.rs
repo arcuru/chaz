@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
 use super::App;
 use super::ClickRegion;
@@ -18,13 +18,33 @@ use super::Overlay;
 use super::TuiMode;
 use super::short_session_id;
 
+// Cyberpunk netrunner palette. All colors used in the chat view route
+// through these constants so swapping the theme is a one-place edit.
+const COLOR_USER: Color = Color::Rgb(0x5c, 0xf0, 0xff); // bright cyan
+const COLOR_ASSISTANT: Color = Color::Rgb(0xff, 0x7a, 0xd6); // magenta
+const COLOR_SYSTEM: Color = Color::Rgb(0xe6, 0xd9, 0x7a); // muted yellow
+const COLOR_TOOL: Color = Color::Rgb(0x4d, 0xd0, 0xff); // tool cyan
+const COLOR_ERROR: Color = Color::Rgb(0xff, 0x5a, 0x6e); // red
+const COLOR_ACCENT: Color = Color::Rgb(0x6a, 0xff, 0xa3); // electric green
+const COLOR_DIM: Color = Color::Rgb(0x70, 0x74, 0x82); // gray
+
+/// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
+/// `claude-opus-4-7`). Bare ids without `/` are returned as-is. Used for the
+/// status bar so the slug stays readable without the provider prefix.
+fn model_slug(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
 /// One-line preview of a ToolCall entry's content. Server writes ToolCall
 /// content as `{name}({json_args})` (see `server.rs`). Returns
 /// `(tool_name, args_preview)` — args collapsed to single line, truncated.
 fn summarize_tool_call(content: &str) -> (String, String) {
     let (name, rest) = content.split_once('(').unwrap_or((content, ""));
     let args = rest.strip_suffix(')').unwrap_or(rest);
-    let oneline: String = args.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let oneline: String = args
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     let trimmed = oneline.split_whitespace().collect::<Vec<_>>().join(" ");
     (name.trim().to_string(), trimmed)
 }
@@ -145,10 +165,12 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
     f.render_widget(Clear, popup);
 
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_ACCENT))
         .title(" Help — Esc to close · ↑↓/PgUp/PgDn/wheel scroll · click a row to insert ")
         .title_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(COLOR_SYSTEM)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -165,9 +187,7 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
             let header = cmd.trim_start_matches('#').trim();
             lines.push(Line::from(vec![Span::styled(
                 format!("  {header}"),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(COLOR_TOOL).add_modifier(Modifier::BOLD),
             )]));
         } else {
             // Only register hit-tests for rows that are visible inside the
@@ -182,9 +202,9 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
                 });
             }
             lines.push(Line::from(vec![
-                Span::styled(format!("  {cmd}"), Style::default().fg(Color::Green)),
+                Span::styled(format!("  {cmd}"), Style::default().fg(COLOR_ACCENT)),
                 Span::raw(" "),
-                Span::styled(*desc, Style::default().fg(Color::Gray)),
+                Span::styled(*desc, Style::default().fg(COLOR_DIM)),
             ]));
         }
     }
@@ -238,11 +258,15 @@ fn ui_rename_overlay(f: &mut ratatui::Frame, app: &mut App) {
 
     f.render_widget(Clear, popup);
 
-    let block = Block::bordered().title(format!(" {title} ")).title_style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_ACCENT))
+        .title(format!(" {title} "))
+        .title_style(
+            Style::default()
+                .fg(COLOR_SYSTEM)
+                .add_modifier(Modifier::BOLD),
+        );
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -252,7 +276,7 @@ fn ui_rename_overlay(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(input_widget, chunks[0]);
 
     let help = Paragraph::new(" [Enter] save · empty = clear · [Esc] cancel")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(COLOR_DIM));
     f.render_widget(help, chunks[1]);
 
     let cursor_x = chunks[0].x + cursor as u16;
@@ -277,6 +301,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
 
     render_tab_bar(f, app, chunks[0]);
 
+    let messages_area = chunks[1];
+    let inner_x = messages_area.x.saturating_add(1);
+    let inner_y = messages_area.y.saturating_add(1);
+    let inner_width = messages_area.width.saturating_sub(2);
+    let messages_height = messages_area.height.saturating_sub(2);
+
     let mut lines: Vec<Line> = Vec::new();
     // (logical line idx, x col offset from inner messages area, target).
     // Translated to absolute ClickRegions after wrap math below.
@@ -291,7 +321,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         } else {
             String::new()
         };
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(COLOR_DIM);
 
         match entry.entry_type {
             EntryType::Message => {
@@ -299,17 +329,23 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                 let is_system = entry.sender == "system";
                 let sender_style = if is_system {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(COLOR_SYSTEM)
                         .add_modifier(Modifier::BOLD)
                 } else if is_agent {
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(COLOR_ASSISTANT)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(COLOR_USER).add_modifier(Modifier::BOLD)
                 };
+
+                // Horizontal separator above each user turn so blocks of
+                // tool work / agent replies group visually. Skip for the
+                // very first entry — no preceding turn to separate from.
+                if !is_agent && !is_system && !lines.is_empty() {
+                    let rule: String = "─".repeat(inner_width as usize);
+                    lines.push(Line::from(vec![Span::styled(rule, dim)]));
+                }
 
                 let label = format!("{}{}:", debug_prefix, entry.sender);
 
@@ -362,7 +398,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
             }
             EntryType::ToolCall => {
                 let (name, args) = summarize_tool_call(&entry.content);
-                let tool_style = Style::default().fg(Color::Cyan);
+                let tool_style = Style::default().fg(COLOR_TOOL);
                 let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if expanded { "▾" } else { "▸" };
                 let icon_col = debug_prefix.chars().count() as u16 + 2;
@@ -397,7 +433,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
             }
             EntryType::ToolResult => {
                 let (name, summary, is_error) = summarize_tool_result(&entry.content);
-                let tool_style = Style::default().fg(Color::Cyan);
+                let tool_style = Style::default().fg(COLOR_TOOL);
                 let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if is_error {
                     "✗"
@@ -407,7 +443,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                     "▸"
                 };
                 let icon_style = if is_error {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(COLOR_ERROR)
                 } else {
                     dim
                 };
@@ -447,7 +483,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                 }
             }
             EntryType::Error => {
-                let red = Style::default().fg(Color::Red);
+                let red = Style::default().fg(COLOR_ERROR);
                 for (i, l) in display_lines(&entry.content, None).into_iter().enumerate() {
                     let text = if i == 0 {
                         format!("{debug_prefix}  ERROR {}: {l}", entry.sender)
@@ -463,13 +499,13 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                 lines.push(Line::from(vec![Span::styled(
                     label,
                     Style::default()
-                        .fg(Color::Magenta)
+                        .fg(COLOR_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )]));
                 for content_line in entry.content.lines() {
                     lines.push(Line::from(vec![Span::styled(
                         format!("  {content_line}"),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(COLOR_ACCENT),
                     )]));
                 }
                 lines.push(Line::from(""));
@@ -480,7 +516,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     if tab.waiting {
         lines.push(Line::from(vec![Span::styled(
             "  thinking...",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_DIM),
         )]));
     }
 
@@ -495,6 +531,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         None => short_session_id(&tab.session_db_id),
     };
     let current_agent = tab.current_agent.clone();
+    let effective_model = tab.effective_model.clone();
     let msg_count = tab
         .entries
         .iter()
@@ -549,12 +586,6 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     });
     let _ = tab;
 
-    let messages_area = chunks[1];
-    let inner_x = messages_area.x.saturating_add(1);
-    let inner_y = messages_area.y.saturating_add(1);
-    let inner_width = messages_area.width.saturating_sub(2);
-    let messages_height = messages_area.height.saturating_sub(2);
-
     // Per-line visual heights, accumulated. Used to translate
     // logical-line positions of pending click regions into screen rows that
     // account for wrap. Mirrors ratatui's word-wrap by running each line
@@ -598,7 +629,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     let messages = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
-        .block(Block::bordered().title(" Chaz "));
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(COLOR_DIM))
+                .title(Span::styled(" Chaz ", Style::default().fg(COLOR_ACCENT))),
+        );
     f.render_widget(messages, messages_area);
 
     if let Some((tool_name, risk, args)) = approval_info {
@@ -612,17 +648,36 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         );
     }
 
+    let model_segment = if effective_model.is_empty() {
+        " | model: —".to_string()
+    } else {
+        format!(" | model: {}", model_slug(&effective_model))
+    };
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let expand_indicator = if app.expand_all { " | EXP" } else { "" };
     let status_text = format!(
-        " {} | agent: {} | messages: {}{}{}{} | /help",
-        session_label, current_agent, msg_count, usage_segment, debug_indicator, expand_indicator
+        " {} | agent: {}{} | messages: {}{}{}{} | /help",
+        session_label,
+        current_agent,
+        model_segment,
+        msg_count,
+        usage_segment,
+        debug_indicator,
+        expand_indicator
     );
-    let status =
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let status = Paragraph::new(status_text).style(
+        Style::default()
+            .bg(Color::Rgb(0x1a, 0x1d, 0x26))
+            .fg(Color::White),
+    );
     f.render_widget(status, chunks[3]);
 
-    let input = Paragraph::new(app.input.as_str()).block(Block::bordered().title(" > "));
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_DIM))
+            .title(Span::styled(" > ", Style::default().fg(COLOR_ACCENT))),
+    );
     f.render_widget(input, chunks[4]);
 
     // Completion popup floats just above the input box, over the bottom of
@@ -681,8 +736,10 @@ fn render_completion_popup(
 
     f.render_widget(Clear, popup);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_DIM))
         .title(" commands — ↑↓ select · Tab insert · Esc dismiss ")
-        .title_style(Style::default().fg(Color::Yellow));
+        .title_style(Style::default().fg(COLOR_SYSTEM));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -700,15 +757,15 @@ fn render_completion_popup(
         let cmd_style = if is_sel {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(COLOR_ACCENT)
         };
         let desc_style = if is_sel {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default().fg(Color::Black).bg(COLOR_ACCENT)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(COLOR_DIM)
         };
         lines.push(Line::from(vec![
             Span::styled(marker, cmd_style),
@@ -741,27 +798,29 @@ fn render_completion_popup(
 fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let n = app.tabs.len();
     let show_close = n > 1;
+    let bar_bg = Color::Rgb(0x1a, 0x1d, 0x26); // status-bar dark
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
     let row_y = area.y;
     for (i, tab) in app.tabs.iter().enumerate() {
         let is_active = i == app.active_tab;
         let title = tab.title();
-        // Visual: " <title> " active inverted, others dim, + optional " × ".
+        // Active tab: bright accent; inactive: dim. Single bar separator
+        // between adjacent tabs instead of a bg switch.
         let title_label = format!(" {title} ");
-        let close_label = if show_close { " × " } else { "" };
+        let close_label = if show_close { "× " } else { "" };
         let title_style = if is_active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
+                .fg(COLOR_ACCENT)
+                .bg(bar_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray).bg(Color::DarkGray)
+            Style::default().fg(COLOR_DIM).bg(bar_bg)
         };
         let close_style = if is_active {
-            Style::default().fg(Color::Red).bg(Color::White)
+            Style::default().fg(COLOR_ERROR).bg(bar_bg)
         } else {
-            Style::default().fg(Color::DarkGray).bg(Color::DarkGray)
+            Style::default().fg(COLOR_DIM).bg(bar_bg)
         };
         spans.push(Span::styled(title_label.clone(), title_style));
         if show_close {
@@ -792,9 +851,11 @@ fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
             x = x.saturating_add(close_w);
         }
-        // Small spacer gap between tabs.
-        spans.push(Span::raw(" "));
-        x = x.saturating_add(1);
+        // Divider between adjacent tabs (skipped after the last).
+        if i + 1 < n {
+            spans.push(Span::styled("│", Style::default().fg(COLOR_DIM).bg(bar_bg)));
+            x = x.saturating_add(1);
+        }
     }
     // Hint text at the right side if space allows.
     let hint = " Ctrl+PgUp/PgDn · Ctrl+W";
@@ -802,15 +863,14 @@ fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let remaining = area.width.saturating_sub(used);
     if remaining as usize >= hint.len() {
         let pad = remaining as usize - hint.len();
-        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)));
         spans.push(Span::styled(
             hint.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_DIM).bg(bar_bg),
         ));
     }
     let line = Line::from(spans);
-    let paragraph =
-        Paragraph::new(vec![line]).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let paragraph = Paragraph::new(vec![line]).style(Style::default().bg(bar_bg).fg(Color::White));
     f.render_widget(paragraph, area);
 }
 
@@ -825,10 +885,12 @@ fn render_approval_panel(
     args: &str,
 ) {
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_SYSTEM))
         .title(format!(" Tool approval — {tool_name} ({risk}) "))
         .title_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(COLOR_SYSTEM)
                 .add_modifier(Modifier::BOLD),
         );
     let inner = block.inner(area);
@@ -837,7 +899,7 @@ fn render_approval_panel(
     // Two rows: args preview, then button row.
     let args_preview = truncate_chars(args, inner.width as usize * 2);
     let args_line = Line::from(vec![
-        Span::styled("args: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("args: ", Style::default().fg(COLOR_DIM)),
         Span::raw(args_preview.replace('\n', " ")),
     ]);
     let buttons = Line::from(vec![
@@ -845,7 +907,7 @@ fn render_approval_panel(
             " [y] approve ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Green)
+                .bg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
@@ -853,7 +915,7 @@ fn render_approval_panel(
             " [n] deny ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Red)
+                .bg(COLOR_ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
@@ -861,7 +923,7 @@ fn render_approval_panel(
             " [a] approve all ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Yellow)
+                .bg(COLOR_SYSTEM)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -962,11 +1024,11 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         let style = if is_selected {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD)
         };
         if y_off < inner_h {
@@ -992,7 +1054,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     if app.session_list.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  No saved sessions yet — select \"New session\" above.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_DIM),
         )]));
     } else {
         let current_session_db_id = app.active().session_db_id.clone();
@@ -1035,11 +1097,11 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             } else if is_closed {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(COLOR_DIM)
             } else if is_current {
-                Style::default().fg(Color::Green)
+                Style::default().fg(COLOR_ACCENT)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(COLOR_USER)
             };
 
             // One click region per session spanning its header + optional
@@ -1065,7 +1127,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             if let Some(ref preview) = info.last_message {
                 lines.push(Line::from(vec![Span::styled(
                     format!("    {preview}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(COLOR_DIM),
                 )]));
             }
 
@@ -1074,15 +1136,25 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    let list = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(" Sessions "));
+    let list = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_DIM))
+            .title(Span::styled(
+                " Sessions ",
+                Style::default().fg(COLOR_ACCENT),
+            )),
+    );
     f.render_widget(list, chunks[0]);
 
     let help = Paragraph::new(
         " [Up/Down] navigate | [Enter] open/new | [n] new | [r] rename | [Esc/Ctrl+P] cancel",
     )
-    .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    .style(
+        Style::default()
+            .bg(Color::Rgb(0x1a, 0x1d, 0x26))
+            .fg(Color::White),
+    );
     f.render_widget(help, chunks[1]);
 }
 
@@ -1122,5 +1194,26 @@ mod tests {
     fn display_lines_truncates_before_splitting() {
         let out = display_lines("aaaa\nbbbb\ncccc", Some(5));
         assert_eq!(out, vec!["aaaa".to_string(), "…".to_string()]);
+    }
+
+    #[test]
+    fn model_slug_strips_provider_prefix() {
+        assert_eq!(model_slug("anthropic/claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(model_slug("openai/gpt-5-mini"), "gpt-5-mini");
+    }
+
+    #[test]
+    fn model_slug_passes_through_bare_id() {
+        assert_eq!(model_slug("gpt-5-mini"), "gpt-5-mini");
+        assert_eq!(model_slug(""), "");
+    }
+
+    #[test]
+    fn model_slug_uses_last_segment_for_nested_ids() {
+        // OpenRouter free tier appends `:free` etc.; we want the leaf.
+        assert_eq!(
+            model_slug("provider/family/qwen-2.5-coder:free"),
+            "qwen-2.5-coder:free"
+        );
     }
 }
