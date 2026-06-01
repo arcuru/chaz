@@ -101,6 +101,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/clear", "clear display (entries still in DB)"),
         ("/raw", "dump raw entry data for debugging"),
         ("/debug", "toggle debug mode (Ctrl+D)"),
+        ("/expand", "toggle expand/collapse tool calls (Ctrl+T)"),
         ("/help", "this help"),
         ("/quit", "exit"),
     ]
@@ -390,6 +391,12 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         }
         ClickTarget::TabActivate(i) => return Some(MouseOutcome::TabActivate(i)),
         ClickTarget::TabClose(i) => return Some(MouseOutcome::TabClose(i)),
+        ClickTarget::ToggleEntryExpanded(i) => {
+            let set = &mut app.active_mut().expanded_entries;
+            if !set.remove(&i) {
+                set.insert(i);
+            }
+        }
     }
     None
 }
@@ -951,10 +958,15 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             let tab = app.active_mut();
             tab.entries.clear();
             tab.scroll_offset = 0;
+            tab.expanded_entries.clear();
             return None;
         }
         "/debug" => {
             app.debug_mode = !app.debug_mode;
+            return None;
+        }
+        "/expand" => {
+            app.expand_all = !app.expand_all;
             return None;
         }
         "/raw" => {

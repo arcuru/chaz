@@ -18,6 +18,41 @@ use super::Overlay;
 use super::TuiMode;
 use super::short_session_id;
 
+/// One-line preview of a ToolCall entry's content. Server writes ToolCall
+/// content as `{name}({json_args})` (see `server.rs`). Returns
+/// `(tool_name, args_preview)` — args collapsed to single line, truncated.
+fn summarize_tool_call(content: &str) -> (String, String) {
+    let (name, rest) = content.split_once('(').unwrap_or((content, ""));
+    let args = rest.strip_suffix(')').unwrap_or(rest);
+    let oneline: String = args.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let trimmed = oneline.split_whitespace().collect::<Vec<_>>().join(" ");
+    (name.trim().to_string(), trimmed)
+}
+
+/// One-line preview of a ToolResult entry's content. Server writes
+/// `{name}: {output}` or `{name}: ERROR: {output}`. Returns
+/// `(tool_name, summary, is_error)`.
+fn summarize_tool_result(content: &str) -> (String, String, bool) {
+    let (name, rest) = content.split_once(": ").unwrap_or((content, ""));
+    let (is_error, body) = match rest.strip_prefix("ERROR: ") {
+        Some(b) => (true, b),
+        None => (false, rest),
+    };
+    let first = body.lines().next().unwrap_or("");
+    let oneline = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    (name.trim().to_string(), oneline, is_error)
+}
+
+/// Truncate a String to at most `n` chars, appending `…` if shortened.
+fn ellipsize(s: &str, n: usize) -> String {
+    let t = truncate_chars(s, n);
+    if t.len() < s.len() {
+        format!("{t}…")
+    } else {
+        t.to_string()
+    }
+}
+
 /// Prepare arbitrary content for rendering as ratatui `Line`s. Truncates
 /// char-wise if requested (appending `…`), then splits on `\n`. A `Line`
 /// must not contain embedded newlines — `WordWrapper` treats `\n` as
@@ -243,9 +278,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     render_tab_bar(f, app, chunks[0]);
 
     let mut lines: Vec<Line> = Vec::new();
+    // (logical line idx, x col offset from inner messages area, target).
+    // Translated to absolute ClickRegions after wrap math below.
+    let mut pending_clicks: Vec<(usize, u16, ClickTarget)> = Vec::new();
 
     let tab = app.active();
-    for entry in &tab.entries {
+    for (entry_idx, entry) in tab.entries.iter().enumerate() {
         let debug_prefix = if app.debug_mode {
             let ts = entry.timestamp.format("%H:%M:%S");
             let typ = format!("{:?}", entry.entry_type);
@@ -282,22 +320,38 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                 }
                 lines.push(Line::from(""));
             }
-            // Directives are inputs to the agent (heartbeat, spawn_agent,
-            // spawn_task, explicit user directive) — render with ToolResult
-            // formatting so they group with tool output for future collapse UX.
+            // Directives, ToolCall, ToolResult are collapsible. Per-entry
+            // override flips the global default (`app.expand_all`).
             EntryType::Directive => {
-                let max_chars = if app.debug_mode { 500 } else { 120 };
-                let head = format!("{} (directive): ", entry.sender);
-                for (i, l) in display_lines(&entry.content, Some(max_chars))
-                    .into_iter()
-                    .enumerate()
-                {
-                    let text = if i == 0 {
-                        format!("{debug_prefix}  < {head}{l}")
-                    } else {
-                        format!("    {l}")
-                    };
-                    lines.push(Line::from(vec![Span::styled(text, dim)]));
+                let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
+                let icon = if expanded { "▾" } else { "▸" };
+                let icon_col = debug_prefix.chars().count() as u16 + 2; // "  " before icon
+                let first = entry.content.lines().next().unwrap_or("");
+                let head_label = format!("{} (directive)", entry.sender);
+                let header_spans: Vec<Span> = if expanded {
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(format!(" {head_label}"), dim),
+                    ]
+                } else {
+                    let preview = ellipsize(&first.replace('\t', " "), 80);
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(format!(" {head_label}: {preview}"), dim),
+                    ]
+                };
+                lines.push(Line::from(header_spans));
+                pending_clicks.push((
+                    lines.len() - 1,
+                    icon_col,
+                    ClickTarget::ToggleEntryExpanded(entry_idx),
+                ));
+                if expanded {
+                    for l in display_lines(&entry.content, None) {
+                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
+                    }
                 }
             }
             EntryType::Ack => {
@@ -307,25 +361,89 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
                 )]));
             }
             EntryType::ToolCall => {
-                for (i, l) in display_lines(&entry.content, None).into_iter().enumerate() {
-                    let prefix = if i == 0 { "  > " } else { "    " };
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("{debug_prefix}{prefix}{l}"),
-                        dim,
-                    )]));
+                let (name, args) = summarize_tool_call(&entry.content);
+                let tool_style = Style::default().fg(Color::Cyan);
+                let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
+                let icon = if expanded { "▾" } else { "▸" };
+                let icon_col = debug_prefix.chars().count() as u16 + 2;
+                let header_spans: Vec<Span> = if expanded {
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                    ]
+                } else {
+                    let preview = ellipsize(&args, 90);
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                        Span::styled(format!(" {preview}"), dim),
+                    ]
+                };
+                lines.push(Line::from(header_spans));
+                pending_clicks.push((
+                    lines.len() - 1,
+                    icon_col,
+                    ClickTarget::ToggleEntryExpanded(entry_idx),
+                ));
+                if expanded {
+                    for l in display_lines(&args, None) {
+                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
+                    }
                 }
             }
             EntryType::ToolResult => {
-                let max_chars = if app.debug_mode { 500 } else { 120 };
-                for (i, l) in display_lines(&entry.content, Some(max_chars))
-                    .into_iter()
-                    .enumerate()
-                {
-                    let prefix = if i == 0 { "  < " } else { "    " };
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("{debug_prefix}{prefix}{l}"),
-                        dim,
-                    )]));
+                let (name, summary, is_error) = summarize_tool_result(&entry.content);
+                let tool_style = Style::default().fg(Color::Cyan);
+                let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
+                let icon = if is_error {
+                    "✗"
+                } else if expanded {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let icon_style = if is_error {
+                    Style::default().fg(Color::Red)
+                } else {
+                    dim
+                };
+                let icon_col = debug_prefix.chars().count() as u16 + 2;
+                let header_spans: Vec<Span> = if expanded {
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, icon_style),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                    ]
+                } else {
+                    let preview = ellipsize(&summary, 90);
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, icon_style),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                        Span::styled(format!(" {preview}"), dim),
+                    ]
+                };
+                lines.push(Line::from(header_spans));
+                pending_clicks.push((
+                    lines.len() - 1,
+                    icon_col,
+                    ClickTarget::ToggleEntryExpanded(entry_idx),
+                ));
+                if expanded {
+                    let body = entry
+                        .content
+                        .split_once(": ")
+                        .map(|(_, b)| b)
+                        .unwrap_or(&entry.content);
+                    for l in display_lines(body, None) {
+                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
+                    }
                 }
             }
             EntryType::Error => {
@@ -432,11 +550,23 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     let _ = tab;
 
     let messages_area = chunks[1];
+    let inner_x = messages_area.x.saturating_add(1);
+    let inner_y = messages_area.y.saturating_add(1);
     let inner_width = messages_area.width.saturating_sub(2);
     let messages_height = messages_area.height.saturating_sub(2);
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let content_height = paragraph.line_count(inner_width).min(u16::MAX as usize) as u16;
+    // Per-line visual heights, accumulated. Used to translate
+    // logical-line positions of pending click regions into screen rows that
+    // account for wrap. Mirrors ratatui's word-wrap by running each line
+    // through its own line_count probe.
+    let mut visual_offsets: Vec<u16> = Vec::with_capacity(lines.len() + 1);
+    visual_offsets.push(0);
+    for l in &lines {
+        let probe = Paragraph::new(l.clone()).wrap(Wrap { trim: false });
+        let h = probe.line_count(inner_width).min(u16::MAX as usize) as u16;
+        visual_offsets.push(visual_offsets.last().unwrap().saturating_add(h.max(1)));
+    }
+    let content_height = *visual_offsets.last().unwrap();
     let scroll = if content_height > messages_height {
         content_height
             .saturating_sub(messages_height)
@@ -445,7 +575,28 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         0
     };
 
-    let messages = paragraph
+    // Translate pending header clicks into absolute screen regions, skipping
+    // any whose line is currently scrolled out of view.
+    for (logical_idx, x_offset, target) in pending_clicks {
+        let visual_row = visual_offsets[logical_idx];
+        if visual_row < scroll {
+            continue;
+        }
+        let row_relative = visual_row - scroll;
+        if row_relative >= messages_height {
+            continue;
+        }
+        app.click_regions.push(ClickRegion {
+            x: inner_x.saturating_add(x_offset),
+            y: inner_y.saturating_add(row_relative),
+            w: 1,
+            h: 1,
+            target,
+        });
+    }
+
+    let messages = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
         .block(Block::bordered().title(" Chaz "));
     f.render_widget(messages, messages_area);
@@ -462,9 +613,10 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
+    let expand_indicator = if app.expand_all { " | EXP" } else { "" };
     let status_text = format!(
-        " {} | agent: {} | messages: {}{}{} | /help",
-        session_label, current_agent, msg_count, usage_segment, debug_indicator
+        " {} | agent: {} | messages: {}{}{}{} | /help",
+        session_label, current_agent, msg_count, usage_segment, debug_indicator, expand_indicator
     );
     let status =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));

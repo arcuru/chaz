@@ -115,6 +115,10 @@ pub(super) enum ClickTarget {
     TabActivate(usize),
     /// Close tab at the given index.
     TabClose(usize),
+    /// Flip the per-entry expand override on the active tab's entry at the
+    /// given index. Inverts against `App::expand_all`, so the click always
+    /// produces the opposite of whatever's currently rendered.
+    ToggleEntryExpanded(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +147,9 @@ pub(super) struct Tab {
     pub waiting: bool,
     pub current_agent: String,
     pub session_name: Option<String>,
+    /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
+    /// Empty by default; click on an entry's icon toggles its presence here.
+    pub expanded_entries: HashSet<usize>,
 }
 
 /// Short, human-distinguishable form of a session DB id, used for tab
@@ -188,6 +195,10 @@ pub(super) struct App {
     pub(super) agent_names: HashSet<String>,
     pub(super) should_quit: bool,
     pub(super) debug_mode: bool,
+    /// When true, tool calls / tool results / directives render their full
+    /// content. When false (default), they collapse to a one-line summary.
+    /// Toggled by Ctrl+T or `/expand`.
+    pub(super) expand_all: bool,
     pub(super) session_list: Vec<SessionInfo>,
     /// Lazy cache of `session_list`. The cold-list walk
     /// (`Command::ListSessions`) opens every session DB and folds entries —
@@ -216,6 +227,7 @@ impl App {
             agent_names,
             should_quit: false,
             debug_mode: false,
+            expand_all: false,
             session_list: Vec::new(),
             session_list_fresh: false,
             picker_index: 0,
@@ -371,6 +383,7 @@ async fn build_tab(server: &Server, session_db: eidetica::Database, session_db_i
         waiting: false,
         current_agent: agent.name.clone(),
         session_name,
+        expanded_entries: HashSet::new(),
     }
 }
 
@@ -475,6 +488,10 @@ impl Gateway for TuiGateway {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         app.debug_mode = !app.debug_mode;
+                    } else if key.code == KeyCode::Char('t')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        app.expand_all = !app.expand_all;
                     } else if key.code == KeyCode::Char('w')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -976,6 +993,7 @@ async fn render_outcome(
                 waiting: false,
                 current_agent: agent_name,
                 session_name,
+                expanded_entries: HashSet::new(),
             });
             app.active_tab = app.tabs.len() - 1;
         }
