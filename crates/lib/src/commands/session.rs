@@ -471,13 +471,29 @@ pub(super) async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> Comm
     .await;
     match arg {
         None => {
+            // Mirror the runtime: per-session pin → agent default → backend
+            // resolution. Matches what `runtime::execute` will actually
+            // route to so display and reality agree.
             let meta = session.read_meta().await;
-            let current = meta
-                .model
-                .or_else(|| ctx.backend.default_model())
-                .unwrap_or_else(|| "unknown".to_string());
+            let agent_default = ctx
+                .server
+                .agents()
+                .get(ctx.current_agent)
+                .and_then(|a| a.default_model.clone());
+            let effective = meta.model.clone().or(agent_default);
+            let resolved = ctx.backend.resolve_model_name(effective.as_deref());
+            let current = if resolved.is_empty() {
+                "unknown".to_string()
+            } else {
+                resolved
+            };
+            let source = match (&meta.model, &effective) {
+                (Some(_), _) => " (session pin)",
+                (None, Some(_)) => " (agent default)",
+                _ => " (backend default)",
+            };
             let mut msg = format!(
-                "Current Model: {current}\n\nKnown Backends:\n{}",
+                "Current Model: {current}{source}\n\nKnown Backends:\n{}",
                 ctx.backend.list_known_backends().join("\n")
             );
             msg.push_str("\n\nKnown Models:\n");

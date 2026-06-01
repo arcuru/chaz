@@ -644,9 +644,22 @@ impl Gateway for TuiGateway {
                                 && latest.entry_type == EntryType::Message
                         });
 
+                        // Refresh effective_model from the fresh meta: if
+                        // `/model X` ran on this session (or a remote peer
+                        // pinned a model), the resolved value moves.
+                        let agent_default = app
+                            .tabs
+                            .get(idx)
+                            .map(|t| t.current_agent.clone())
+                            .and_then(|name| server.agents().get(&name))
+                            .and_then(|a| a.default_model.clone());
+                        let effective_model = backend
+                            .resolve_model_name(meta.model.as_deref().or(agent_default.as_deref()));
+
                         let tab = &mut app.tabs[idx];
                         tab.entries = entries;
                         tab.session_name = meta.name.clone();
+                        tab.effective_model = effective_model;
                         if clear_waiting {
                             tab.waiting = false;
                         }

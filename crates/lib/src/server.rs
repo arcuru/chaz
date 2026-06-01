@@ -996,16 +996,12 @@ impl Server {
         };
 
         let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
-        let mut assembled = {
+        let (session_model, mut assembled) = {
             let s = session.lock().await;
-            let roster: Vec<String> = s
-                .read_meta()
-                .await
-                .agents
-                .iter()
-                .map(|a| a.display_name.clone())
-                .collect();
-            ContextBuilder::new(
+            let meta = s.read_meta().await;
+            let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
+            let session_model = meta.model.clone();
+            let assembled = ContextBuilder::new(
                 s.entries(),
                 agent_name,
                 &agent.system_prompt,
@@ -1017,8 +1013,15 @@ impl Server {
             .with_extension_hub(self.extensions.clone())
             .with_session_db(session_db)
             .build()
-            .await
+            .await;
+            (session_model, assembled)
         };
+        // Effective model resolution: per-session pin (`/model X`,
+        // `SessionMeta.model`) wins over the agent's configured default.
+        // `runtime::execute` will then call `BackendManager::resolve_model_name`
+        // to strip the backend prefix and fall back to the backend default
+        // when both are None.
+        let effective_model = session_model.or(default_model);
 
         // Prepend the wake-prompt as a private System message. This is
         // invocation-scoped — it never appears as a session entry.
@@ -1095,7 +1098,7 @@ impl Server {
         };
 
         let result = crate::runtime::execute(
-            default_model.as_deref(),
+            effective_model.as_deref(),
             assembled.messages,
             &self.default_backend,
             &request_security,
@@ -1488,24 +1491,27 @@ impl Server {
             };
 
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
-            let assembled = {
+            let (session_model, assembled) = {
                 let s = session.lock().await;
-                let roster: Vec<String> = s
-                    .read_meta()
-                    .await
-                    .agents
-                    .into_iter()
-                    .map(|a| a.display_name)
-                    .collect();
-                ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
-                    .with_tools(&tool_defs)
-                    .with_max_tokens_override(max_context_tokens)
-                    .with_room_participants(&roster)
-                    .with_extension_hub(spawn_extensions.clone())
-                    .with_session_db(s.database())
-                    .build()
-                    .await
+                let meta = s.read_meta().await;
+                let roster: Vec<String> =
+                    meta.agents.iter().map(|a| a.display_name.clone()).collect();
+                let session_model = meta.model.clone();
+                let assembled =
+                    ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
+                        .with_tools(&tool_defs)
+                        .with_max_tokens_override(max_context_tokens)
+                        .with_room_participants(&roster)
+                        .with_extension_hub(spawn_extensions.clone())
+                        .with_session_db(s.database())
+                        .build()
+                        .await;
+                (session_model, assembled)
             };
+            // Per-session pin (`/model X` → `SessionMeta.model`) wins over
+            // the agent's configured default. See run_schedule_turn for the
+            // matching path on scheduled fires.
+            let effective_model = session_model.or(default_model);
 
             if assembled.truncated {
                 info!(
@@ -1564,7 +1570,7 @@ impl Server {
             });
 
             let result = runtime::execute(
-                default_model.as_deref(),
+                effective_model.as_deref(),
                 assembled.messages,
                 &backend,
                 &request_security,
