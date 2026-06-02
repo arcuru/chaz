@@ -216,6 +216,10 @@ pub(super) enum SettingsPromptIntent {
     /// Add an agent (by display name or DB id) to the active session.
     /// Translates to `Command::AgentAdd` on submit.
     AddSessionAgent,
+    /// Append an agent name to the persisted `default_agents` list.
+    /// Validated against the registered agent names; rejected entries
+    /// surface in `settings_status`.
+    AddPeerDefault,
 }
 
 /// Frozen view of an active session's meta + a few cached derivatives, taken
@@ -456,6 +460,14 @@ pub(super) struct App {
     /// Peer→Agents view and the input handler both index into this so
     /// the cursor row always points at the same agent in both places.
     pub(super) peer_agents_names: Vec<String>,
+    /// Snapshot of `server.default_agents()` for the Peer→Defaults
+    /// editor. Refreshed at the top of each frame so DB writes /
+    /// `set_default_agents` calls show up live. Order is the persisted
+    /// order — first entry is the routing host.
+    pub(super) peer_defaults: Vec<String>,
+    /// Sub-cursor inside the Peer → Defaults list. Clamped to live
+    /// length each render; persists across category switches.
+    pub(super) peer_defaults_cursor: usize,
     /// Sub-cursor inside the Session → Agents list (`meta.agents`). Same
     /// semantics as `peer_agents_cursor`.
     pub(super) session_agents_cursor: usize,
@@ -532,6 +544,8 @@ impl App {
             session_settings_index: 0,
             peer_agents_cursor: 0,
             peer_agents_names: Vec::new(),
+            peer_defaults: Vec::new(),
+            peer_defaults_cursor: 0,
             session_agents_cursor: 0,
             settings_prompt: None,
             settings_status: None,
@@ -1880,23 +1894,74 @@ async fn handle_settings_outcome(
             )
             .await;
         }
-        input::SettingsKey::PromptSubmit { intent, value } => {
-            let cmd = match intent {
-                SettingsPromptIntent::AddSessionAgent => Command::AgentAdd(value),
-            };
-            dispatch_settings_command(
-                cmd,
-                app,
-                server,
-                backend,
-                secrets,
-                approval_tx,
-                notify_tx,
-            )
-            .await;
-        }
+        input::SettingsKey::PromptSubmit { intent, value } => match intent {
+            SettingsPromptIntent::AddSessionAgent => {
+                dispatch_settings_command(
+                    Command::AgentAdd(value),
+                    app,
+                    server,
+                    backend,
+                    secrets,
+                    approval_tx,
+                    notify_tx,
+                )
+                .await;
+            }
+            SettingsPromptIntent::AddPeerDefault => {
+                add_peer_default(app, server, value).await;
+            }
+        },
         input::SettingsKey::ReloadPeerAgent { name } => {
             reload_peer_agent_from_yaml(app, server, &name).await;
+        }
+        input::SettingsKey::WritePeerDefaults(names) => {
+            write_peer_defaults(app, server, names).await;
+        }
+    }
+}
+
+/// Validate `name` against the live agent registry, append it to the
+/// persisted defaults list, then call through `write_peer_defaults` so
+/// runtime + DB stay in lockstep. Duplicate-name nudges land in
+/// `settings_status` rather than silently failing.
+async fn add_peer_default(app: &mut App, server: &Arc<Server>, name: String) {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    let known: std::collections::HashSet<String> = server.agents().names().into_iter().collect();
+    if !known.contains(&name) {
+        app.settings_status = Some(format!("No agent named '{name}' — not added"));
+        return;
+    }
+    let mut next = server.default_agents();
+    if next.iter().any(|n| n == &name) {
+        app.settings_status = Some(format!("'{name}' already in defaults"));
+        return;
+    }
+    next.push(name.clone());
+    write_peer_defaults(app, server, next).await;
+    app.settings_status = Some(format!("Added '{name}' to defaults"));
+}
+
+/// Apply a new `default_agents` list — set it on the running Server so
+/// future session creates use it, persist to `chaz_peer` so the
+/// override survives restart. Failures land in `settings_status`; the
+/// in-memory value still applies even if the persist fails (better
+/// debounced UX than silently dropping).
+async fn write_peer_defaults(app: &mut App, server: &Arc<Server>, names: Vec<String>) {
+    server.set_default_agents(names.clone());
+    match server.registry().save_peer_default_agents(&names).await {
+        Ok(()) => {
+            // settings_status set by the caller for context-specific
+            // messages (added, removed, reordered); a generic "Saved"
+            // overrides only if nothing more specific applies.
+            if app.settings_status.is_none() {
+                app.settings_status = Some("Defaults saved".to_string());
+            }
+        }
+        Err(e) => {
+            app.settings_status = Some(format!("Saved in-memory; persist failed: {e}"));
         }
     }
 }

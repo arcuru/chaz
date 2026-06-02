@@ -121,14 +121,15 @@ pub(super) fn ui(
     // what the user is currently seeing.
     app.click_regions.clear();
 
-    // Refresh the Peer→Agents name cache whenever Peer Settings is up.
-    // Both the input handler and the renderer index into this; keeping
-    // it fresh-per-frame ensures `[r]` reloads the agent the user can
-    // see at the cursor.
+    // Refresh peer-side caches whenever Peer Settings is up. Both the
+    // input handler and the renderer index into these; keeping them
+    // fresh-per-frame ensures action keys ([r] reload, [d] remove,
+    // Ctrl+↑↓ reorder) target the row the user sees at the cursor.
     if matches!(app.mode, TuiMode::Settings(super::SettingsScope::Peer)) {
         let mut names = server.agents().names();
         names.sort();
         app.peer_agents_names = names;
+        app.peer_defaults = server.default_agents();
     }
 
     match app.mode {
@@ -1540,6 +1541,9 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
             Some(PeerSettingsCategory::Agents) => {
                 " Tab category · ↑↓ select · [r] reload yaml · Esc back "
             }
+            Some(PeerSettingsCategory::Defaults) => {
+                " Tab category · ↑↓ select · [a]/[d] · Ctrl+↑↓ reorder · Esc back "
+            }
             _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
         },
     }
@@ -1562,8 +1566,84 @@ fn render_peer_category(
         PeerSettingsCategory::Agents => render_peer_agents(f, area, app, server, backend),
         PeerSettingsCategory::Backends => render_peer_backends(f, area, backend, config),
         PeerSettingsCategory::Bridges => render_peer_bridges(f, area, config),
+        PeerSettingsCategory::Defaults => render_peer_defaults(f, area, app, server),
         _ => render_settings_detail_placeholder(f, area, category.label()),
     }
+}
+
+/// Peer → Defaults — ordered editable list of agents auto-attached to
+/// every new session. First entry is the routing host. Edits persist
+/// to chaz_peer; reads come from the live `peer_defaults` cache that
+/// `ui()` refreshes each frame.
+fn render_peer_defaults(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    server: &Arc<Server>,
+) {
+    let known: std::collections::HashSet<String> =
+        server.agents().names().into_iter().collect();
+    let cursor = app
+        .peer_defaults_cursor
+        .min(app.peer_defaults.len().saturating_sub(1));
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Default agents", theme::accent_bold()),
+            Span::styled(
+                format!("    {} configured", app.peer_defaults.len()),
+                Style::default().fg(theme::DIM),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
+        Line::from(""),
+    ];
+
+    if app.peer_defaults.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (none — falls back to first registered agent on new sessions)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else {
+        for (i, name) in app.peer_defaults.iter().enumerate() {
+            let is_selected = i == cursor;
+            let is_host = i == 0;
+            let marker = if is_selected { "> " } else { "  " };
+            let host_tag = if is_host { "  [host]" } else { "" };
+            let missing_tag = if known.contains(name) {
+                ""
+            } else {
+                "  (unregistered)"
+            };
+            let style = if is_selected {
+                theme::selected()
+            } else if !known.contains(name) {
+                theme::error()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{marker}{i:>2}. {name}{host_tag}{missing_tag}"),
+                style,
+            )]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  [a] add · [d] remove · Ctrl+↑↓ reorder",
+        Style::default().fg(theme::DIM),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "  Persisted to chaz_peer; survives restart.",
+        Style::default().fg(theme::DIM),
+    )]));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 /// Peer → Backends (read-only). One row per configured backend: name,

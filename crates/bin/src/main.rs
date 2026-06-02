@@ -549,10 +549,21 @@ async fn main() -> anyhow::Result<()> {
     // Apply default_agents list: which agents auto-attach to new
     // sessions. First entry is the routing host. Set before any
     // session-creation path runs.
-    if let Some(default_agents) = config.default_agents.clone() {
+    //
+    // Precedence: peer-DB override (Settings → Defaults) beats yaml so
+    // runtime edits survive restart. Falling back to yaml when the DB
+    // hasn't been written keeps fresh installs honouring config.
+    let db_defaults = server.registry().load_peer_default_agents().await;
+    if let Some(default_agents) = db_defaults {
         info!(
             agents = ?default_agents,
-            "Applied default_agents — these will auto-attach to new sessions"
+            "Applied default_agents (peer DB override) — these will auto-attach to new sessions"
+        );
+        server.set_default_agents(default_agents);
+    } else if let Some(default_agents) = config.default_agents.clone() {
+        info!(
+            agents = ?default_agents,
+            "Applied default_agents (yaml) — these will auto-attach to new sessions"
         );
         server.set_default_agents(default_agents);
     }

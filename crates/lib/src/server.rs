@@ -233,6 +233,15 @@ impl Server {
         *self.default_agents.write().expect("default_agents lock poisoned") = names;
     }
 
+    /// Read the current `default_agents` list. Cloned snapshot — caller
+    /// doesn't hold the lock past the call.
+    pub fn default_agents(&self) -> Vec<String> {
+        self.default_agents
+            .read()
+            .expect("default_agents lock poisoned")
+            .clone()
+    }
+
     /// Best-effort attach of the configured default agents to a
     /// freshly-created session so `SessionMeta.agents` mirrors what
     /// message routing will actually pick. Without this, fresh sessions

@@ -61,6 +61,13 @@ pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// per-session metadata (gateway, created_at, status) as JSON.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 
+/// Peer-runtime overrides that survive restart. v1 holds one key
+/// (`default_agents`) edited by the Peer Settings page; the slot is
+/// shared with future peer-scoped configuration overrides. Stored on
+/// `chaz_peer` (per-machine), not the cross-peer `chaz_group`.
+const STORE_PEER_DEFAULTS: &str = "peer_defaults";
+const KEY_DEFAULT_AGENTS: &str = "default_agents";
+
 impl SessionRegistry {
     pub async fn new(
         instance: eidetica::Instance,
@@ -393,6 +400,44 @@ impl SessionRegistry {
             txn.commit().await?;
         }
         update_meta_on_db(&db, |m| m.name = None).await?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Peer-runtime overrides (chaz_peer)
+    // -------------------------------------------------------------------------
+
+    /// Read the persisted peer-level `default_agents` list, if one has
+    /// ever been written. `None` means no override exists and callers
+    /// should fall back to the yaml `default_agents:` block. An empty
+    /// vec is an explicit "no defaults" override.
+    pub async fn load_peer_default_agents(&self) -> Option<Vec<String>> {
+        let txn = self.chaz_peer.new_transaction().await.ok()?;
+        let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await.ok()?;
+        let raw = store.get_string(KEY_DEFAULT_AGENTS).await.ok()?;
+        serde_json::from_str::<Vec<String>>(&raw).ok()
+    }
+
+    /// Persist a new peer-level `default_agents` list, overwriting any
+    /// previous value. The empty slice is allowed and means "no
+    /// defaults — use the legacy single-agent fallback even if yaml
+    /// has entries."
+    pub async fn save_peer_default_agents(&self, names: &[String]) -> anyhow::Result<()> {
+        let txn = self.chaz_peer.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await?;
+        let json = serde_json::to_string(names)?;
+        store.set_string(KEY_DEFAULT_AGENTS, &json).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Forget the persisted peer-level `default_agents`, falling back
+    /// to yaml on next startup. UI affordance for reverting.
+    pub async fn clear_peer_default_agents(&self) -> anyhow::Result<()> {
+        let txn = self.chaz_peer.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await?;
+        let _ = store.delete(KEY_DEFAULT_AGENTS).await;
+        txn.commit().await?;
         Ok(())
     }
 }

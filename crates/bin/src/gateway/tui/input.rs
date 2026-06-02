@@ -1191,6 +1191,11 @@ pub(super) enum SettingsKey {
     /// name. Main loop re-reads the config file, builds an `Agent` from
     /// the matching yaml entry, and upserts into the registry.
     ReloadPeerAgent { name: String },
+    /// Replace the persisted peer-level `default_agents` list. Triggered
+    /// by [d] / Ctrl+↑↓ / submitted [a] prompt on Peer→Defaults. Main
+    /// loop applies via Server::set_default_agents and persists to
+    /// `chaz_peer`.
+    WritePeerDefaults(Vec<String>),
 }
 
 /// Key handler for `TuiMode::Settings`. `Tab`/`BackTab` always cycle the
@@ -1263,6 +1268,49 @@ pub(super) fn handle_settings_key(
             return SettingsKey::ReloadPeerAgent { name };
         }
         return SettingsKey::None;
+    }
+    if matches!(scope, SettingsScope::Peer)
+        && matches!(
+            super::PeerSettingsCategory::ALL.get(cur),
+            Some(super::PeerSettingsCategory::Defaults)
+        )
+    {
+        let len = app.peer_defaults.len();
+        let cursor = app.peer_defaults_cursor.min(len.saturating_sub(1));
+        match key.code {
+            KeyCode::Char('a') => {
+                app.settings_prompt = Some(SettingsPrompt {
+                    label: "add default agent".to_string(),
+                    input: String::new(),
+                    cursor: 0,
+                    intent: SettingsPromptIntent::AddPeerDefault,
+                });
+                return SettingsKey::None;
+            }
+            KeyCode::Char('d') if len > 0 => {
+                let mut next = app.peer_defaults.clone();
+                next.remove(cursor);
+                return SettingsKey::WritePeerDefaults(next);
+            }
+            // Ctrl+Up / Ctrl+Down reorder the selected row. No-op at the
+            // ends — the routing host is first, so users almost always
+            // want to bump items toward the top.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && cursor > 0 => {
+                let mut next = app.peer_defaults.clone();
+                next.swap(cursor, cursor - 1);
+                app.peer_defaults_cursor = cursor - 1;
+                return SettingsKey::WritePeerDefaults(next);
+            }
+            KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL) && cursor + 1 < len =>
+            {
+                let mut next = app.peer_defaults.clone();
+                next.swap(cursor, cursor + 1);
+                app.peer_defaults_cursor = cursor + 1;
+                return SettingsKey::WritePeerDefaults(next);
+            }
+            _ => {}
+        }
     }
 
     // Any navigation key clears a leftover one-shot status message
@@ -1420,6 +1468,7 @@ fn settings_inner_list_len(
     match scope {
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx)? {
             PeerSettingsCategory::Agents => Some(peer_agent_count(app)),
+            PeerSettingsCategory::Defaults => Some(app.peer_defaults.len()),
             _ => None,
         },
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx)? {
@@ -1453,6 +1502,7 @@ fn bump_inner_cursor(
     let cursor_ref: &mut usize = match scope {
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx) {
             Some(PeerSettingsCategory::Agents) => &mut app.peer_agents_cursor,
+            Some(PeerSettingsCategory::Defaults) => &mut app.peer_defaults_cursor,
             _ => return,
         },
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx) {
