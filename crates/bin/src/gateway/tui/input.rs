@@ -8,7 +8,8 @@ use chaz_core::gateway::ApprovalDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
-    App, ChatAction, ClickTarget, Completion, Overlay, TuiMode, show_error, show_system_msg,
+    App, ChatAction, ClickTarget, Completion, Overlay, SettingsScope, TuiMode, show_error,
+    show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -102,6 +103,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/backend ", "add a custom backend (<name> <url> <key>)"),
         ("/backends", "list known backends and models"),
         ("# TUI", ""),
+        ("/settings", "open Session Settings (Peer Settings from session list)"),
         ("/clear", "clear display (entries still in DB)"),
         ("/raw", "dump raw entry data for debugging"),
         ("/debug", "toggle debug mode (Ctrl+D)"),
@@ -581,6 +583,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
         "/models" => return Some(ChatAction::OpenModelPicker),
+        "/settings" => return Some(ChatAction::OpenSettings(SettingsScope::Session)),
         "/share" => return Some(ChatAction::Dispatch(Command::Share)),
         "/unshare" => return Some(ChatAction::Dispatch(Command::SessionUnshare)),
         "/compact" => return Some(ChatAction::Dispatch(Command::Compact)),
@@ -1160,6 +1163,39 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
     }
 }
 
+/// Key handler for `TuiMode::Settings`. Stage 1 ships category navigation
+/// only — the detail panes are placeholders, so there's nothing to dispatch
+/// out. `Tab`/`BackTab`/`↑`/`↓` cycle the sidebar; `Esc` returns to the mode
+/// that opened Settings (chat or session picker).
+pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, scope: SettingsScope) {
+    let n = app.settings_category_count(scope);
+    if n == 0 {
+        return;
+    }
+    let cur = app.settings_index(scope);
+    match key.code {
+        KeyCode::Esc => app.close_settings(),
+        KeyCode::Tab | KeyCode::Down => {
+            app.set_settings_index(scope, (cur + 1) % n);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.set_settings_index(scope, (cur + n - 1) % n);
+        }
+        KeyCode::Home => app.set_settings_index(scope, 0),
+        KeyCode::End => app.set_settings_index(scope, n - 1),
+        // Number keys 1..=9 jump straight to that category (only when the
+        // index exists). Saves a stab at Tab when you know where you want
+        // to be.
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let idx = (c as usize) - ('1' as usize);
+            if idx < n {
+                app.set_settings_index(scope, idx);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
     match key.code {
         KeyCode::Up => {
@@ -1176,6 +1212,13 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
         }
         KeyCode::Enter => Some(app.picker_selection()),
         KeyCode::Char('n') => Some("__new__".to_string()),
+        KeyCode::Char('s') => {
+            // `s` opens Peer Settings — the session list view doubles as
+            // the "peer landing page", so its settings surface is the peer
+            // scope. Esc inside Settings returns here.
+            app.open_settings(super::SettingsScope::Peer, TuiMode::SessionPicker);
+            None
+        }
         KeyCode::Char('r') => {
             // Row 0 is "New session" — nothing to rename there.
             if let Some(info) = app

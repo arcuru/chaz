@@ -69,10 +69,95 @@ enum Action {
     ModelsFetched(Result<Vec<ModelInfo>, String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TuiMode {
     Chat,
     SessionPicker,
     ModelPicker,
+    Settings(SettingsScope),
+}
+
+/// Which DB / domain a Settings page is editing. Two distinct surfaces:
+/// `Peer` edits `chaz_peer` + config-derived globals; `Session` edits the
+/// active tab's `SessionMeta`. See `~/brain/ava/proposals/chaz-settings-pages-plan.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsScope {
+    Peer,
+    Session,
+}
+
+/// Categories listed in the Peer Settings sidebar. Ordering here is the
+/// display order. Stage 1 leaves every category as a `(coming soon)`
+/// placeholder; subsequent stages fill in the detail panes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PeerSettingsCategory {
+    Agents,
+    Backends,
+    Defaults,
+    Bridges,
+    Extensions,
+    Groups,
+    Identity,
+    About,
+}
+
+impl PeerSettingsCategory {
+    pub(super) const ALL: &'static [Self] = &[
+        Self::Agents,
+        Self::Backends,
+        Self::Defaults,
+        Self::Bridges,
+        Self::Extensions,
+        Self::Groups,
+        Self::Identity,
+        Self::About,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Agents => "Agents",
+            Self::Backends => "Backends",
+            Self::Defaults => "Defaults",
+            Self::Bridges => "Bridges",
+            Self::Extensions => "Extensions",
+            Self::Groups => "Groups",
+            Self::Identity => "Identity",
+            Self::About => "About",
+        }
+    }
+}
+
+/// Categories listed in the Session Settings sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SessionSettingsCategory {
+    Overview,
+    Agents,
+    Models,
+    Routing,
+    History,
+    Sharing,
+}
+
+impl SessionSettingsCategory {
+    pub(super) const ALL: &'static [Self] = &[
+        Self::Overview,
+        Self::Agents,
+        Self::Models,
+        Self::Routing,
+        Self::History,
+        Self::Sharing,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Agents => "Agents",
+            Self::Models => "Models",
+            Self::Routing => "Routing",
+            Self::History => "History",
+            Self::Sharing => "Sharing",
+        }
+    }
 }
 
 /// A scope tab in the model picker. The active scope decides where the
@@ -99,6 +184,9 @@ pub(super) enum ChatAction {
     Dispatch(Command),
     OpenPicker,
     OpenModelPicker,
+    /// Open the Settings page in the given scope. From chat this is always
+    /// `Session`; the `/settings` command in chat dispatches it that way.
+    OpenSettings(SettingsScope),
     SendMessage(String),
 }
 
@@ -300,6 +388,17 @@ pub(super) struct App {
     /// Per-agent override snapshot taken when the picker opened — drives
     /// the `(current)` annotation per agent scope.
     pub(super) model_picker_agent_pins: HashMap<String, String>,
+    /// Mode to restore when the user hits Esc inside a Settings page.
+    /// Set on entry to Settings; cleared on exit. One step deep — Settings
+    /// pages don't nest into other modes that would need a real stack.
+    pub(super) settings_return: Option<TuiMode>,
+    /// Index into `PeerSettingsCategory::ALL` of the active category in
+    /// Peer Settings. Persists across enter/exit so the user lands where
+    /// they last were.
+    pub(super) peer_settings_index: usize,
+    /// Index into `SessionSettingsCategory::ALL` of the active category in
+    /// Session Settings.
+    pub(super) session_settings_index: usize,
 }
 
 impl App {
@@ -336,6 +435,53 @@ impl App {
             model_picker_scope_idx: 0,
             model_picker_session_pin: None,
             model_picker_agent_pins: HashMap::new(),
+            settings_return: None,
+            peer_settings_index: 0,
+            session_settings_index: 0,
+        }
+    }
+
+    /// Enter Settings in `scope`, remembering `from` so Esc returns there.
+    /// No-op when already in Settings (avoids clobbering the return-to mode
+    /// if `Ctrl+,` is hit twice).
+    pub(super) fn open_settings(&mut self, scope: SettingsScope, from: TuiMode) {
+        if matches!(self.mode, TuiMode::Settings(_)) {
+            return;
+        }
+        self.settings_return = Some(from);
+        self.mode = TuiMode::Settings(scope);
+    }
+
+    /// Exit Settings, returning to whichever mode opened it (defaulting to
+    /// Chat if the return-to slot was somehow empty).
+    pub(super) fn close_settings(&mut self) {
+        let back = self.settings_return.take().unwrap_or(TuiMode::Chat);
+        self.mode = back;
+    }
+
+    pub(super) fn settings_category_count(&self, scope: SettingsScope) -> usize {
+        match scope {
+            SettingsScope::Peer => PeerSettingsCategory::ALL.len(),
+            SettingsScope::Session => SessionSettingsCategory::ALL.len(),
+        }
+    }
+
+    pub(super) fn settings_index(&self, scope: SettingsScope) -> usize {
+        match scope {
+            SettingsScope::Peer => self.peer_settings_index,
+            SettingsScope::Session => self.session_settings_index,
+        }
+    }
+
+    pub(super) fn set_settings_index(&mut self, scope: SettingsScope, idx: usize) {
+        let n = self.settings_category_count(scope);
+        if n == 0 {
+            return;
+        }
+        let clamped = idx.min(n - 1);
+        match scope {
+            SettingsScope::Peer => self.peer_settings_index = clamped,
+            SettingsScope::Session => self.session_settings_index = clamped,
         }
     }
 
@@ -935,6 +1081,25 @@ impl Gateway for TuiGateway {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         close_active_tab(&mut app);
+                    } else if key.code == KeyCode::Char(',')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        // Ctrl+, opens Settings, picking scope from the
+                        // current mode. From chat → Session (the active
+                        // tab); from the session picker → Peer. Already in
+                        // Settings? No-op — Esc is the exit key.
+                        match app.mode {
+                            TuiMode::Chat => {
+                                app.open_settings(SettingsScope::Session, TuiMode::Chat);
+                            }
+                            TuiMode::SessionPicker => {
+                                app.open_settings(
+                                    SettingsScope::Peer,
+                                    TuiMode::SessionPicker,
+                                );
+                            }
+                            TuiMode::ModelPicker | TuiMode::Settings(_) => {}
+                        }
                     } else if key.code == KeyCode::Char('p')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -962,6 +1127,10 @@ impl Gateway for TuiGateway {
                             TuiMode::ModelPicker => {
                                 app.mode = TuiMode::Chat;
                             }
+                            // Settings users get out via Esc; Ctrl+P is a
+                            // no-op here so it doesn't compete with the
+                            // category navigation flow.
+                            TuiMode::Settings(_) => {}
                         }
                     } else if key.code == KeyCode::PageUp
                         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1051,6 +1220,9 @@ impl Gateway for TuiGateway {
                                     }
                                     input::ModelPickerKey::None => {}
                                 }
+                            }
+                            TuiMode::Settings(scope) => {
+                                input::handle_settings_key(&mut app, key, scope);
                             }
                         }
                     }
@@ -1259,6 +1431,13 @@ async fn handle_chat_action(
                 })
                 .await;
             tab.waiting = true;
+        }
+        ChatAction::OpenSettings(scope) => {
+            // From a chat-action context the caller mode is always Chat —
+            // the picker doesn't go through ChatAction. `Ctrl+,` from the
+            // picker takes a different path that sets the return-to slot
+            // correctly.
+            app.open_settings(scope, TuiMode::Chat);
         }
         ChatAction::OpenModelPicker => {
             // Read meta synchronously so we can seed scope tabs (Session +

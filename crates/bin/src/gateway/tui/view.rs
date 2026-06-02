@@ -15,6 +15,9 @@ use super::App;
 use super::ClickRegion;
 use super::ClickTarget;
 use super::Overlay;
+use super::PeerSettingsCategory;
+use super::SessionSettingsCategory;
+use super::SettingsScope;
 use super::TuiMode;
 use super::short_session_id;
 use super::theme;
@@ -111,6 +114,7 @@ pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
         TuiMode::Chat => ui_chat(f, app),
         TuiMode::SessionPicker => ui_picker(f, app),
         TuiMode::ModelPicker => ui_model_picker(f, app),
+        TuiMode::Settings(scope) => ui_settings(f, app, scope),
     }
 
     if app.overlay.is_some() {
@@ -861,7 +865,7 @@ fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
     }
     // Hint text at the right side if space allows.
-    let hint = " Ctrl+PgUp/PgDn · Ctrl+W";
+    let hint = " Ctrl+, settings · Ctrl+PgUp/PgDn · Ctrl+W";
     let used = x.saturating_sub(area.x);
     let remaining = area.width.saturating_sub(used);
     if remaining as usize >= hint.len() {
@@ -1151,7 +1155,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(list, chunks[0]);
 
     let help = Paragraph::new(
-        " [Up/Down] navigate | [Enter] open/new | [n] new | [r] rename | [Esc/Ctrl+P] cancel",
+        " [Up/Down] navigate | [Enter] open/new | [n] new | [r] rename | [s] settings | [Esc/Ctrl+P] cancel",
     )
     .style(
         Style::default()
@@ -1415,6 +1419,75 @@ fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ap
         format!(" type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Ctrl+R refresh | Ctrl+U clear | Esc cancel")
     };
     widgets::status_strip(f, area, &help_text);
+}
+
+/// Stage 1 Settings page — sidebar of categories + placeholder detail.
+/// Composition style A (pure functions over the shared widget primitives).
+/// Each category's content lands in later stages (see the implementation
+/// plan in `~/brain/ava/proposals/chaz-settings-pages-plan.md`).
+fn ui_settings(f: &mut ratatui::Frame, app: &mut App, scope: SettingsScope) {
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Min(1),    // sidebar + detail
+        Constraint::Length(1), // status strip
+    ])
+    .split(f.area());
+
+    let (title, subtitle): (&str, Option<String>) = match scope {
+        SettingsScope::Peer => ("Peer Settings", None),
+        SettingsScope::Session => ("Session Settings", Some(app.active().title())),
+    };
+
+    widgets::header(
+        f,
+        chunks[0],
+        title,
+        subtitle.as_deref(),
+        Some("[Esc back]"),
+    );
+
+    let (sidebar_area, detail_area) = widgets::sidebar_detail_layout(chunks[1], 16);
+    let selected = app.settings_index(scope);
+    let labels: Vec<&str> = match scope {
+        SettingsScope::Peer => PeerSettingsCategory::ALL.iter().map(|c| c.label()).collect(),
+        SettingsScope::Session => SessionSettingsCategory::ALL
+            .iter()
+            .map(|c| c.label())
+            .collect(),
+    };
+    widgets::sidebar(f, sidebar_area, &labels, selected);
+
+    let category_label = labels.get(selected).copied().unwrap_or("");
+    render_settings_detail_placeholder(f, detail_area, category_label);
+
+    widgets::status_strip(
+        f,
+        chunks[2],
+        " Tab/↑↓ category · 1-9 jump · ? help · Esc back ",
+    );
+}
+
+/// Placeholder right-pane: shows the active category's name and a
+/// `(coming soon)` line. Replaced category-by-category in subsequent
+/// stages.
+fn render_settings_detail_placeholder(f: &mut ratatui::Frame, area: Rect, category: &str) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("  {category}"),
+            theme::accent_bold(),
+        )]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  (coming soon)",
+            Style::default().fg(theme::DIM),
+        )]),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn model_picker_header_line(id_w: usize) -> Line<'static> {
