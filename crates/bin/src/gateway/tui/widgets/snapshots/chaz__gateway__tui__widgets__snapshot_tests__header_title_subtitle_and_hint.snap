@@ -1,0 +1,6 @@
+---
+source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+assertion_line: 66
+expression: s
+---
+ Peer Settings  —  carbon.peer                   [Esc back]

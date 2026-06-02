@@ -1,0 +1,6 @@
+---
+source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+assertion_line: 58
+expression: s
+---
+ ↑↓ select · Enter open · Esc back

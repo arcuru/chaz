@@ -17,16 +17,18 @@ use super::ClickTarget;
 use super::Overlay;
 use super::TuiMode;
 use super::short_session_id;
+use super::theme;
+use super::widgets;
 
-// Cyberpunk netrunner palette. All colors used in the chat view route
-// through these constants so swapping the theme is a one-place edit.
-const COLOR_USER: Color = Color::Rgb(0x5c, 0xf0, 0xff); // bright cyan
-const COLOR_ASSISTANT: Color = Color::Rgb(0xff, 0x7a, 0xd6); // magenta
-const COLOR_SYSTEM: Color = Color::Rgb(0xe6, 0xd9, 0x7a); // muted yellow
-const COLOR_TOOL: Color = Color::Rgb(0x4d, 0xd0, 0xff); // tool cyan
-const COLOR_ERROR: Color = Color::Rgb(0xff, 0x5a, 0x6e); // red
-const COLOR_ACCENT: Color = Color::Rgb(0x6a, 0xff, 0xa3); // electric green
-const COLOR_DIM: Color = Color::Rgb(0x70, 0x74, 0x82); // gray
+// Palette lives in `theme.rs`. Local aliases here keep the existing render
+// code terse (`COLOR_USER` → `theme::USER`) without churn at every call site.
+use theme::ACCENT as COLOR_ACCENT;
+use theme::ASSISTANT as COLOR_ASSISTANT;
+use theme::DIM as COLOR_DIM;
+use theme::ERROR as COLOR_ERROR;
+use theme::SYSTEM as COLOR_SYSTEM;
+use theme::TOOL as COLOR_TOOL;
+use theme::USER as COLOR_USER;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
 /// `claude-opus-4-7`). Bare ids without `/` are returned as-is. Used for the
@@ -1203,27 +1205,13 @@ fn ui_model_picker(f: &mut ratatui::Frame, app: &mut App) {
 /// scope highlighted; inactive tabs dimmed. Renders nothing when only
 /// the Session scope exists (no agents attached).
 fn render_model_scope_strip(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let bar_bg = Color::Rgb(0x1a, 0x1d, 0x26);
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(" scope: ", Style::default().fg(COLOR_DIM).bg(bar_bg)));
-    for (i, scope) in app.model_picker_scopes.iter().enumerate() {
-        let is_active = i == app.model_picker_scope_idx;
-        let label = format!(" {} ", scope.label());
-        let style = if is_active {
-            Style::default()
-                .fg(Color::Black)
-                .bg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(COLOR_DIM).bg(bar_bg)
-        };
-        spans.push(Span::styled(label, style));
-        if i + 1 < app.model_picker_scopes.len() {
-            spans.push(Span::styled(" · ", Style::default().fg(COLOR_DIM).bg(bar_bg)));
-        }
-    }
-    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
-    f.render_widget(para, area);
+    let labels: Vec<String> = app
+        .model_picker_scopes
+        .iter()
+        .map(|s| s.label().to_string())
+        .collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    widgets::scope_strip(f, area, " scope: ", &label_refs, app.model_picker_scope_idx);
 }
 
 fn render_model_search_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1426,12 +1414,7 @@ fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ap
     } else {
         format!(" type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Ctrl+R refresh | Ctrl+U clear | Esc cancel")
     };
-    let help = Paragraph::new(help_text).style(
-        Style::default()
-            .bg(Color::Rgb(0x1a, 0x1d, 0x26))
-            .fg(Color::White),
-    );
-    f.render_widget(help, area);
+    widgets::status_strip(f, area, &help_text);
 }
 
 fn model_picker_header_line(id_w: usize) -> Line<'static> {

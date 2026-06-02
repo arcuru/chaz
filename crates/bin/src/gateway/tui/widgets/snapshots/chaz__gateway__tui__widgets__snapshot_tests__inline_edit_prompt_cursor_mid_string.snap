@@ -1,0 +1,6 @@
+---
+source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+assertion_line: 95
+expression: s
+---
+ name: av▎a

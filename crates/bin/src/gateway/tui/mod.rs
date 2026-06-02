@@ -34,7 +34,9 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 mod input;
+mod theme;
 mod view;
+mod widgets;
 
 /// Name used for the TUI's default/home session. Created on first TUI launch,
 /// reopened on subsequent launches.

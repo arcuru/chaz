@@ -1,0 +1,10 @@
+---
+source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+assertion_line: 87
+expression: s
+---
+  Agents        
+  Backends      
+> Defaults      
+  Bridges       
+  About

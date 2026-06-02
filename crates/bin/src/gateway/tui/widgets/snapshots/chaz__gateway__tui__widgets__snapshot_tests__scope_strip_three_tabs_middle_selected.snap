@@ -1,0 +1,6 @@
+---
+source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+assertion_line: 42
+expression: s
+---
+ scope:  Session  ·  ava  ·  chaz
