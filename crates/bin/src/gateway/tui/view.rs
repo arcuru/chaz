@@ -1,8 +1,13 @@
 //! Ratatui rendering for the two TUI modes (chat + session picker).
 //! Pure view functions — no mutation, no async.
 
+use chaz_core::backends::BackendManager;
+use chaz_core::config::Config;
+use chaz_core::server::Server;
 use chaz_core::session::EntryType;
 use chaz_core::util::truncate_chars;
+
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -105,7 +110,13 @@ fn display_lines(content: &str, max_chars: Option<usize>) -> Vec<String> {
     }
 }
 
-pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
+pub(super) fn ui(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    config: &Config,
+) {
     // Click regions are rebuilt from scratch each frame so coordinates match
     // what the user is currently seeing.
     app.click_regions.clear();
@@ -114,7 +125,7 @@ pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
         TuiMode::Chat => ui_chat(f, app),
         TuiMode::SessionPicker => ui_picker(f, app),
         TuiMode::ModelPicker => ui_model_picker(f, app),
-        TuiMode::Settings(scope) => ui_settings(f, app, scope),
+        TuiMode::Settings(scope) => ui_settings(f, app, scope, server, backend, config),
     }
 
     if app.overlay.is_some() {
@@ -1421,11 +1432,18 @@ fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ap
     widgets::status_strip(f, area, &help_text);
 }
 
-/// Stage 1 Settings page — sidebar of categories + placeholder detail.
+/// Stage 1+ Settings page — sidebar of categories + per-category detail.
 /// Composition style A (pure functions over the shared widget primitives).
-/// Each category's content lands in later stages (see the implementation
-/// plan in `~/brain/ava/proposals/chaz-settings-pages-plan.md`).
-fn ui_settings(f: &mut ratatui::Frame, app: &mut App, scope: SettingsScope) {
+/// Each category routes to its own renderer; categories that haven't been
+/// implemented yet fall through to the `(coming soon)` placeholder.
+fn ui_settings(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    scope: SettingsScope,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    config: &Config,
+) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Min(1),    // sidebar + detail
@@ -1457,14 +1475,121 @@ fn ui_settings(f: &mut ratatui::Frame, app: &mut App, scope: SettingsScope) {
     };
     widgets::sidebar(f, sidebar_area, &labels, selected);
 
-    let category_label = labels.get(selected).copied().unwrap_or("");
-    render_settings_detail_placeholder(f, detail_area, category_label);
+    match scope {
+        SettingsScope::Peer => {
+            let category = PeerSettingsCategory::ALL
+                .get(selected)
+                .copied()
+                .unwrap_or(PeerSettingsCategory::About);
+            render_peer_category(f, detail_area, app, category, server, backend, config);
+        }
+        SettingsScope::Session => {
+            let category = SessionSettingsCategory::ALL
+                .get(selected)
+                .copied()
+                .unwrap_or(SessionSettingsCategory::Overview);
+            render_session_category(f, detail_area, app, category, server, backend);
+        }
+    }
 
     widgets::status_strip(
         f,
         chunks[2],
         " Tab/↑↓ category · 1-9 jump · ? help · Esc back ",
     );
+}
+
+/// Right-pane router for Peer categories. Categories without a real
+/// renderer fall through to the `(coming soon)` placeholder so navigation
+/// stays linear even on partially-implemented stages.
+fn render_peer_category(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    _app: &App,
+    category: PeerSettingsCategory,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    config: &Config,
+) {
+    match category {
+        PeerSettingsCategory::About => render_peer_about(f, area, server, backend, config),
+        _ => render_settings_detail_placeholder(f, area, category.label()),
+    }
+}
+
+/// Static peer info — version, paths, env summary. Pure read; refresh is
+/// implicit per-frame.
+fn render_peer_about(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    config: &Config,
+) {
+    let version = env!("CARGO_PKG_VERSION");
+    let state_dir = config
+        .state_dir
+        .as_deref()
+        .unwrap_or("~/.local/share/chaz (default)");
+
+    let agent_count = server.agents().names().len();
+    let backend_count = backend.list_known_backends().len();
+    let model_count = backend.list_known_models().len();
+    let default_agents = config
+        .default_agents
+        .as_ref()
+        .map(|v| v.join(", "))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(none — falls back to first agent)".to_string());
+
+    // Matrix is "enabled" when a homeserver_url has been configured. Other
+    // bridges (CLI, TUI) are always wired in chaz.
+    let matrix_enabled = !config.homeserver_url.is_empty();
+    let bridges = if matrix_enabled {
+        "tui, cli, matrix"
+    } else {
+        "tui, cli"
+    };
+
+    let agent_count_s = agent_count.to_string();
+    let backend_s = format!("{backend_count} ({model_count} known models)");
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  About", theme::accent_bold())]),
+        Line::from(vec![Span::styled("  ─────", Style::default().fg(theme::DIM))]),
+        Line::from(""),
+        about_kv("  version", version),
+        about_kv("  state dir", state_dir),
+        about_kv("  bridges", bridges),
+        Line::from(""),
+        about_kv("  agents", &agent_count_s),
+        about_kv("  backends", &backend_s),
+        about_kv("  default agents", &default_agents),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Single labelled row used by the About pane. Label dim, value white.
+fn about_kv<'a>(label: &'a str, value: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!("{label:<18}"), Style::default().fg(theme::DIM)),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+    ])
+}
+
+/// Right-pane router for Session categories. Reads the seeded snapshot
+/// from `app.session_settings_snapshot`; falls through to placeholder when
+/// no snapshot is present (shouldn't happen in normal flow — page is only
+/// reachable after seed_session_settings_snapshot ran).
+fn render_session_category(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    _app: &App,
+    category: SessionSettingsCategory,
+    _server: &Arc<Server>,
+    _backend: &BackendManager,
+) {
+    render_settings_detail_placeholder(f, area, category.label());
 }
 
 /// Placeholder right-pane: shows the active category's name and a

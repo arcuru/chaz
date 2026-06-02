@@ -17,7 +17,7 @@ use chaz_core::gateway::{ApprovalExchange, Gateway};
 use chaz_core::model_catalog_cache::ModelCatalogCache;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
-use chaz_core::session::{EntryType, Session, SessionEntry, SessionMeta};
+use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
 
 use std::collections::HashMap;
 
@@ -178,6 +178,21 @@ impl ModelPickerScope {
             ModelPickerScope::Agent(name) => name,
         }
     }
+}
+
+/// Frozen view of an active session's meta + a few cached derivatives, taken
+/// at the moment Session Settings opens. Keeps render code synchronous —
+/// reading `SessionMeta` requires an `async` round-trip into the session DB.
+/// Refreshed on `Action::SessionChanged` for the active tab so edits made
+/// elsewhere (or via the Models passthrough) propagate without manual reload.
+pub(super) struct SessionMetaSnapshot {
+    pub session_db_id: String,
+    pub model_pin: Option<String>,
+    pub agent_models: HashMap<String, String>,
+    pub agents: Vec<AgentRef>,
+    pub host_agent_db_id: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub entry_count: usize,
 }
 
 pub(super) enum ChatAction {
@@ -388,6 +403,11 @@ pub(super) struct App {
     /// Per-agent override snapshot taken when the picker opened — drives
     /// the `(current)` annotation per agent scope.
     pub(super) model_picker_agent_pins: HashMap<String, String>,
+    /// Snapshot of the active session's `SessionMeta` taken when Session
+    /// Settings opens (and refreshed on `Action::SessionChanged` for the
+    /// active tab). Lets the Session-side category renderers read the meta
+    /// without doing async work mid-frame. `None` outside Session Settings.
+    pub(super) session_settings_snapshot: Option<SessionMetaSnapshot>,
     /// Mode to restore when the user hits Esc inside a Settings page.
     /// Set on entry to Settings; cleared on exit. One step deep — Settings
     /// pages don't nest into other modes that would need a real stack.
@@ -435,6 +455,7 @@ impl App {
             model_picker_scope_idx: 0,
             model_picker_session_pin: None,
             model_picker_agent_pins: HashMap::new(),
+            session_settings_snapshot: None,
             settings_return: None,
             peer_settings_index: 0,
             session_settings_index: 0,
@@ -1048,7 +1069,7 @@ impl Gateway for TuiGateway {
         }
 
         loop {
-            terminal.draw(|f| view::ui(f, &mut app))?;
+            terminal.draw(|f| view::ui(f, &mut app, &server, &backend, &self.config))?;
 
             let action = tokio::select! {
                 Some(Ok(event)) = events.next() => {
@@ -1085,12 +1106,25 @@ impl Gateway for TuiGateway {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         // Ctrl+, opens Settings, picking scope from the
-                        // current mode. From chat → Session (the active
-                        // tab); from the session picker → Peer. Already in
-                        // Settings? No-op — Esc is the exit key.
+                        // current mode. Chat → Session (routed through
+                        // ChatAction so the meta snapshot gets seeded);
+                        // picker → Peer (no snapshot needed). Already in
+                        // Settings or the model picker? No-op — Esc exits.
                         match app.mode {
                             TuiMode::Chat => {
-                                app.open_settings(SettingsScope::Session, TuiMode::Chat);
+                                handle_chat_action(
+                                    ChatAction::OpenSettings(SettingsScope::Session),
+                                    &mut app,
+                                    &server,
+                                    &backend,
+                                    &self.secrets,
+                                    &approval_tx,
+                                    &notify_tx,
+                                    &catalog_cache,
+                                    &catalog_cache_key,
+                                    &models_tx,
+                                )
+                                .await;
                             }
                             TuiMode::SessionPicker => {
                                 app.open_settings(
@@ -1317,6 +1351,18 @@ impl Gateway for TuiGateway {
                             tab.waiting = false;
                         }
 
+                        // If Settings(Session) is up on the same tab,
+                        // refresh the snapshot so meta edits (model pin,
+                        // agent attach/detach) propagate immediately.
+                        if matches!(app.mode, TuiMode::Settings(SettingsScope::Session))
+                            && app
+                                .session_settings_snapshot
+                                .as_ref()
+                                .is_some_and(|s| s.session_db_id == db_id)
+                        {
+                            seed_session_settings_snapshot(&mut app, &server).await;
+                        }
+
                         // Keep the picker cache in lock-step with this tab's
                         // entries so the next picker open doesn't show stale
                         // counts / cost / name.
@@ -1437,6 +1483,9 @@ async fn handle_chat_action(
             // the picker doesn't go through ChatAction. `Ctrl+,` from the
             // picker takes a different path that sets the return-to slot
             // correctly.
+            if let SettingsScope::Session = scope {
+                seed_session_settings_snapshot(app, server).await;
+            }
             app.open_settings(scope, TuiMode::Chat);
         }
         ChatAction::OpenModelPicker => {
@@ -1685,6 +1734,48 @@ async fn dispatch_model_selection(
     let outcome = commands::dispatch(cmd, &ctx).await;
     render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
     app.mode = TuiMode::Chat;
+}
+
+/// Read the active session's meta + index row and stash a frozen snapshot
+/// on `App` for the Session Settings page. Called when Session Settings
+/// opens and when the active tab fires `SessionChanged` while that page is
+/// up. Silent on failure — the snapshot stays whatever it was so the page
+/// still renders something coherent.
+async fn seed_session_settings_snapshot(app: &mut App, server: &Arc<Server>) {
+    let (session_db_id, session_db, entry_count) = {
+        let tab = app.active();
+        (
+            tab.session_db_id.clone(),
+            tab.session_db.clone(),
+            tab.entries.len(),
+        )
+    };
+    let session = Session::new(
+        chaz_core::types::ConversationId(session_db_id.clone()),
+        session_db,
+    )
+    .await;
+    let meta = session.read_meta().await;
+    let created_at = server
+        .registry()
+        .list_sessions()
+        .await
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.session_db_id == session_db_id)
+                .and_then(|r| r.created_at)
+        });
+
+    app.session_settings_snapshot = Some(SessionMetaSnapshot {
+        session_db_id,
+        model_pin: meta.model.clone(),
+        agent_models: meta.agent_models.clone(),
+        agents: meta.agents.clone(),
+        host_agent_db_id: meta.host_agent_db_id.clone(),
+        created_at,
+        entry_count,
+    });
 }
 
 async fn render_outcome(
