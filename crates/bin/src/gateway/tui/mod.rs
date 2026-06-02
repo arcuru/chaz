@@ -180,6 +180,28 @@ impl ModelPickerScope {
     }
 }
 
+/// Bottom-strip inline edit prompt active inside a Settings page. When
+/// `Some`, the status strip slot is replaced by the edit widget and
+/// keystrokes route to the prompt instead of category navigation. On
+/// Enter the main loop dispatches the appropriate command based on
+/// `intent` and clears the slot.
+pub(super) struct SettingsPrompt {
+    pub label: String,
+    pub input: String,
+    pub cursor: usize,
+    pub intent: SettingsPromptIntent,
+}
+
+/// What the active settings prompt is collecting. Each variant is a
+/// distinct edit operation; the main loop dispatches on this when the
+/// user hits Enter.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SettingsPromptIntent {
+    /// Add an agent (by display name or DB id) to the active session.
+    /// Translates to `Command::AgentAdd` on submit.
+    AddSessionAgent,
+}
+
 /// Frozen view of an active session's meta + a few cached derivatives, taken
 /// at the moment Session Settings opens. Keeps render code synchronous —
 /// reading `SessionMeta` requires an `async` round-trip into the session DB.
@@ -416,6 +438,10 @@ pub(super) struct App {
     /// Sub-cursor inside the Session → Agents list (`meta.agents`). Same
     /// semantics as `peer_agents_cursor`.
     pub(super) session_agents_cursor: usize,
+    /// Bottom-strip inline prompt active in the current Settings page.
+    /// `Some` while the user is typing; `None` otherwise. Keys route to
+    /// the prompt instead of category navigation when set.
+    pub(super) settings_prompt: Option<SettingsPrompt>,
     /// Mode to restore when the model picker closes (Esc or selection).
     /// Set when the picker opens; used so opening the picker from inside
     /// Session Settings returns there rather than dumping the user back
@@ -475,6 +501,7 @@ impl App {
             session_settings_index: 0,
             peer_agents_cursor: 0,
             session_agents_cursor: 0,
+            settings_prompt: None,
             model_picker_caller: TuiMode::Chat,
         }
     }
@@ -1273,24 +1300,20 @@ impl Gateway for TuiGateway {
                                 }
                             }
                             TuiMode::Settings(scope) => {
-                                match input::handle_settings_key(&mut app, key, scope) {
-                                    input::SettingsKey::None => {}
-                                    input::SettingsKey::OpenModelPicker => {
-                                        handle_chat_action(
-                                            ChatAction::OpenModelPicker,
-                                            &mut app,
-                                            &server,
-                                            &backend,
-                                            &self.secrets,
-                                            &approval_tx,
-                                            &notify_tx,
-                                            &catalog_cache,
-                                            &catalog_cache_key,
-                                            &models_tx,
-                                        )
-                                        .await;
-                                    }
-                                }
+                                let outcome = input::handle_settings_key(&mut app, key, scope);
+                                handle_settings_outcome(
+                                    outcome,
+                                    &mut app,
+                                    &server,
+                                    &backend,
+                                    &self.secrets,
+                                    &approval_tx,
+                                    &notify_tx,
+                                    &catalog_cache,
+                                    &catalog_cache_key,
+                                    &models_tx,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1775,6 +1798,107 @@ async fn dispatch_model_selection(
     // Return to whoever opened the picker — chat by default; Session
     // Settings when the picker was invoked from there.
     app.mode = app.model_picker_caller;
+}
+
+/// Route a `SettingsKey` outcome through the right async backend path.
+/// Extracted so the per-mode match arm in `run()` doesn't balloon every
+/// time Settings grows a new action verb.
+#[allow(clippy::too_many_arguments)]
+async fn handle_settings_outcome(
+    outcome: input::SettingsKey,
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    secrets: &SecretStore,
+    approval_tx: &mpsc::Sender<TaggedApproval>,
+    notify_tx: &mpsc::Sender<String>,
+    catalog_cache: &ModelCatalogCache,
+    catalog_cache_key: &str,
+    models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+) {
+    match outcome {
+        input::SettingsKey::None => {}
+        input::SettingsKey::OpenModelPicker => {
+            handle_chat_action(
+                ChatAction::OpenModelPicker,
+                app,
+                server,
+                backend,
+                secrets,
+                approval_tx,
+                notify_tx,
+                catalog_cache,
+                catalog_cache_key,
+                models_tx,
+            )
+            .await;
+        }
+        input::SettingsKey::DispatchCommand(cmd) => {
+            dispatch_settings_command(
+                cmd,
+                app,
+                server,
+                backend,
+                secrets,
+                approval_tx,
+                notify_tx,
+            )
+            .await;
+        }
+        input::SettingsKey::PromptSubmit { intent, value } => {
+            let cmd = match intent {
+                SettingsPromptIntent::AddSessionAgent => Command::AgentAdd(value),
+            };
+            dispatch_settings_command(
+                cmd,
+                app,
+                server,
+                backend,
+                secrets,
+                approval_tx,
+                notify_tx,
+            )
+            .await;
+        }
+    }
+}
+
+/// Dispatch a backend command initiated from the Settings page. Shared
+/// path between `[d]` direct-action keys and submitted prompts. After
+/// the command runs we re-seed the session settings snapshot so the
+/// page reflects the new state without waiting for `SessionChanged`
+/// (which fires async — the page would briefly show stale data).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_settings_command(
+    cmd: Command,
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    secrets: &SecretStore,
+    approval_tx: &mpsc::Sender<TaggedApproval>,
+    notify_tx: &mpsc::Sender<String>,
+) {
+    let tab = app.active();
+    let session_db_id = tab.session_db_id.clone();
+    let session_db = tab.session_db.clone();
+    let current_agent = tab.current_agent.clone();
+    let session_name = tab.session_name.clone();
+    let ctx = CommandContext {
+        server,
+        secrets,
+        backend,
+        session_db_id: &session_db_id,
+        session_db: &session_db,
+        current_agent: &current_agent,
+        session_name: session_name.as_deref(),
+    };
+    let outcome = commands::dispatch(cmd, &ctx).await;
+    // Show errors as system messages — they're surfaced next time the
+    // user leaves Settings and sees the chat. (A future stage may add a
+    // dedicated error strip on the settings page itself.)
+    render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
+    // Re-seed so the page reflects the command's effect immediately.
+    seed_session_settings_snapshot(app, server).await;
 }
 
 /// Read the active session's meta + index row and stash a frozen snapshot

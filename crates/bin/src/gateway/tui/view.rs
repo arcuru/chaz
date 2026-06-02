@@ -1492,11 +1492,43 @@ fn ui_settings(
         }
     }
 
-    widgets::status_strip(
-        f,
-        chunks[2],
-        " Tab/↑↓ category · 1-9 jump · ? help · Esc back ",
-    );
+    // Bottom strip is normally the status hints; when an inline prompt
+    // is active it takes over the row instead.
+    match &app.settings_prompt {
+        Some(prompt) => widgets::inline_edit_prompt(
+            f,
+            chunks[2],
+            &prompt.label,
+            &prompt.input,
+            prompt.cursor,
+        ),
+        None => {
+            let hint = settings_status_hint(app, scope);
+            widgets::status_strip(f, chunks[2], hint);
+        }
+    }
+}
+
+/// Per-category status hint shown at the bottom of the Settings page.
+/// Categories that own action keys advertise them here so users don't
+/// have to remember which page exposes which actions.
+fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
+    let cur = app.settings_index(scope);
+    match scope {
+        SettingsScope::Session => match SessionSettingsCategory::ALL.get(cur) {
+            Some(SessionSettingsCategory::Agents) => {
+                " Tab category · ↑↓ select · [a] add · [d] remove · Esc back "
+            }
+            Some(SessionSettingsCategory::Models) => {
+                " Tab category · Enter open picker · Esc back "
+            }
+            _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
+        },
+        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cur) {
+            Some(PeerSettingsCategory::Agents) => " Tab category · ↑↓ select · Esc back ",
+            _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
+        },
+    }
 }
 
 /// Right-pane router for Peer categories. Categories without a real
@@ -1731,8 +1763,90 @@ fn render_session_category(
     match category {
         SessionSettingsCategory::Overview => render_session_overview(f, area, app),
         SessionSettingsCategory::Models => render_session_models(f, area, app, backend),
+        SessionSettingsCategory::Agents => render_session_agents(f, area, app, backend),
         _ => render_settings_detail_placeholder(f, area, category.label()),
     }
+}
+
+/// Session → Agents — `meta.agents` list with [a]/[d] add/remove via the
+/// bottom-strip prompt and direct dispatch respectively.
+fn render_session_agents(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    backend: &BackendManager,
+) {
+    let snapshot = match app.session_settings_snapshot.as_ref() {
+        Some(s) => s,
+        None => {
+            render_settings_detail_placeholder(f, area, "Agents");
+            return;
+        }
+    };
+    let cursor = app
+        .session_agents_cursor
+        .min(snapshot.agents.len().saturating_sub(1));
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Agents", theme::accent_bold()),
+            Span::styled(
+                format!("    {} attached", snapshot.agents.len()),
+                Style::default().fg(theme::DIM),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
+        Line::from(""),
+    ];
+
+    if snapshot.agents.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (no agents attached — press [a] to add)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else {
+        for (i, agent) in snapshot.agents.iter().enumerate() {
+            let resolved_override = snapshot
+                .agent_models
+                .get(&agent.display_name)
+                .cloned()
+                .or_else(|| snapshot.model_pin.clone())
+                .map(|m| backend.resolve_model_name(Some(m.as_str())))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(no model)".to_string());
+            let is_selected = i == cursor;
+            let marker = if is_selected { "> " } else { "  " };
+            let style = if is_selected {
+                theme::selected()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let is_host = snapshot
+                .host_agent_db_id
+                .as_deref()
+                .is_some_and(|h| h == agent.db_id);
+            let host_tag = if is_host { "  [host]" } else { "" };
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "{marker}{name:<14}  {resolved_override}{host_tag}",
+                    name = agent.display_name,
+                ),
+                style,
+            )]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  [a] add agent · [d] remove selected",
+        Style::default().fg(theme::DIM),
+    )]));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 /// Static snapshot of the active session — name, id, created_at, message

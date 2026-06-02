@@ -8,8 +8,8 @@ use chaz_core::gateway::ApprovalDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
-    App, ChatAction, ClickTarget, Completion, Overlay, SettingsScope, TuiMode, show_error,
-    show_system_msg,
+    App, ChatAction, ClickTarget, Completion, Overlay, SettingsPrompt, SettingsPromptIntent,
+    SettingsScope, TuiMode, show_error, show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -1175,23 +1175,77 @@ pub(super) enum SettingsKey {
     /// loop opens the model picker, seeding it from the active session's
     /// meta and remembering Settings as the return mode.
     OpenModelPicker,
+    /// Dispatch a backend command on behalf of the Settings page. Used
+    /// for direct-action keys like `[d]` remove on the session-agents
+    /// list — no prompt, just fire and refresh.
+    DispatchCommand(chaz_core::commands::Command),
+    /// User submitted a bottom-strip prompt with the given intent and
+    /// payload (already trimmed). Main loop turns this into the right
+    /// `Command::…` and dispatches.
+    PromptSubmit {
+        intent: SettingsPromptIntent,
+        value: String,
+    },
 }
 
 /// Key handler for `TuiMode::Settings`. `Tab`/`BackTab` always cycle the
 /// sidebar; `↑`/`↓` route into the active category's inner list when one
 /// exists (Peer→Agents, Session→Agents), otherwise fall through to the
-/// sidebar. `Esc` returns to the mode that opened Settings.
+/// sidebar. `Esc` returns to the mode that opened Settings (or, when a
+/// prompt is active, dismisses the prompt first).
 pub(super) fn handle_settings_key(
     app: &mut App,
     key: KeyEvent,
     scope: SettingsScope,
 ) -> SettingsKey {
+    // When a bottom-strip prompt is active, route keys to it instead of
+    // category navigation. Submit returns a PromptSubmit; Esc cancels.
+    if app.settings_prompt.is_some() {
+        return handle_settings_prompt_key(app, key);
+    }
+
     let n = app.settings_category_count(scope);
     if n == 0 {
         return SettingsKey::None;
     }
     let cur = app.settings_index(scope);
     let inner_list_len = settings_inner_list_len(app, scope, cur);
+
+    // Per-category direct-action keys ([a]/[d] on the Session Agents
+    // list). Check before falling through to general navigation so
+    // typing one of these doesn't move the sidebar.
+    if matches!(scope, SettingsScope::Session)
+        && matches!(
+            super::SessionSettingsCategory::ALL.get(cur),
+            Some(super::SessionSettingsCategory::Agents)
+        )
+    {
+        match key.code {
+            KeyCode::Char('a') => {
+                app.settings_prompt = Some(SettingsPrompt {
+                    label: "add agent".to_string(),
+                    input: String::new(),
+                    cursor: 0,
+                    intent: SettingsPromptIntent::AddSessionAgent,
+                });
+                return SettingsKey::None;
+            }
+            KeyCode::Char('d') => {
+                if let Some(name) = app
+                    .session_settings_snapshot
+                    .as_ref()
+                    .and_then(|s| s.agents.get(app.session_agents_cursor))
+                    .map(|a| a.display_name.clone())
+                {
+                    return SettingsKey::DispatchCommand(
+                        chaz_core::commands::Command::AgentRemove(name),
+                    );
+                }
+                return SettingsKey::None;
+            }
+            _ => {}
+        }
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -1254,6 +1308,66 @@ pub(super) fn handle_settings_key(
         }
         _ => SettingsKey::None,
     }
+}
+
+/// Route a key to the active bottom-strip prompt. Mirrors the rename
+/// overlay's input handling — typing inserts at cursor, Backspace deletes
+/// the previous char, arrows move the cursor, Enter submits (trimmed),
+/// Esc cancels and clears the prompt.
+fn handle_settings_prompt_key(app: &mut App, key: KeyEvent) -> SettingsKey {
+    let Some(prompt) = app.settings_prompt.as_mut() else {
+        return SettingsKey::None;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.settings_prompt = None;
+        }
+        KeyCode::Enter => {
+            let value = prompt.input.trim().to_string();
+            let intent = prompt.intent;
+            app.settings_prompt = None;
+            if !value.is_empty() {
+                return SettingsKey::PromptSubmit { intent, value };
+            }
+        }
+        KeyCode::Char(c) => {
+            prompt.input.insert(prompt.cursor, c);
+            prompt.cursor += c.len_utf8();
+        }
+        KeyCode::Backspace => {
+            if prompt.cursor > 0 {
+                let prev = prompt.input[..prompt.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                prompt.input.drain(prev..prompt.cursor);
+                prompt.cursor = prev;
+            }
+        }
+        KeyCode::Left => {
+            if prompt.cursor > 0 {
+                prompt.cursor = prompt.input[..prompt.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            }
+        }
+        KeyCode::Right => {
+            if prompt.cursor < prompt.input.len() {
+                prompt.cursor = prompt.input[prompt.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| prompt.cursor + i)
+                    .unwrap_or(prompt.input.len());
+            }
+        }
+        KeyCode::Home => prompt.cursor = 0,
+        KeyCode::End => prompt.cursor = prompt.input.len(),
+        _ => {}
+    }
+    SettingsKey::None
 }
 
 /// Returns the length of the inner-list owned by the active category, or
