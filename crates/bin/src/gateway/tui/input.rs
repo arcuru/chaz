@@ -1141,7 +1141,9 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
             .map(ModelPickerKey::Select)
             .unwrap_or(ModelPickerKey::None),
         KeyCode::Esc => {
-            app.mode = TuiMode::Chat;
+            // Bounce back to whoever opened the picker — chat by default;
+            // Session Settings when invoked from there.
+            app.mode = app.model_picker_caller;
             ModelPickerKey::None
         }
 
@@ -1163,28 +1165,54 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
     }
 }
 
+/// Result of routing a key through the Settings page. Most operations
+/// mutate `App` in place and return `None`; the variants here capture the
+/// few actions that need a roundtrip through the main loop (async DB
+/// reads, command dispatch).
+pub(super) enum SettingsKey {
+    None,
+    /// User pressed Enter on the Session → Models category — the main
+    /// loop opens the model picker, seeding it from the active session's
+    /// meta and remembering Settings as the return mode.
+    OpenModelPicker,
+}
+
 /// Key handler for `TuiMode::Settings`. `Tab`/`BackTab` always cycle the
 /// sidebar; `↑`/`↓` route into the active category's inner list when one
 /// exists (Peer→Agents, Session→Agents), otherwise fall through to the
 /// sidebar. `Esc` returns to the mode that opened Settings.
-pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, scope: SettingsScope) {
+pub(super) fn handle_settings_key(
+    app: &mut App,
+    key: KeyEvent,
+    scope: SettingsScope,
+) -> SettingsKey {
     let n = app.settings_category_count(scope);
     if n == 0 {
-        return;
+        return SettingsKey::None;
     }
     let cur = app.settings_index(scope);
     let inner_list_len = settings_inner_list_len(app, scope, cur);
 
     match key.code {
-        KeyCode::Esc => app.close_settings(),
-        KeyCode::Tab => app.set_settings_index(scope, (cur + 1) % n),
-        KeyCode::BackTab => app.set_settings_index(scope, (cur + n - 1) % n),
+        KeyCode::Esc => {
+            app.close_settings();
+            SettingsKey::None
+        }
+        KeyCode::Tab => {
+            app.set_settings_index(scope, (cur + 1) % n);
+            SettingsKey::None
+        }
+        KeyCode::BackTab => {
+            app.set_settings_index(scope, (cur + n - 1) % n);
+            SettingsKey::None
+        }
         KeyCode::Down => {
             if let Some(len) = inner_list_len {
                 bump_inner_cursor(app, scope, cur, 1, len);
             } else {
                 app.set_settings_index(scope, (cur + 1) % n);
             }
+            SettingsKey::None
         }
         KeyCode::Up => {
             if let Some(len) = inner_list_len {
@@ -1192,9 +1220,16 @@ pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, scope: SettingsS
             } else {
                 app.set_settings_index(scope, (cur + n - 1) % n);
             }
+            SettingsKey::None
         }
-        KeyCode::Home => app.set_settings_index(scope, 0),
-        KeyCode::End => app.set_settings_index(scope, n - 1),
+        KeyCode::Home => {
+            app.set_settings_index(scope, 0);
+            SettingsKey::None
+        }
+        KeyCode::End => {
+            app.set_settings_index(scope, n - 1);
+            SettingsKey::None
+        }
         // Number keys 1..=9 jump straight to that category (only when the
         // index exists). Saves a stab at Tab when you know where you want
         // to be.
@@ -1203,8 +1238,21 @@ pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, scope: SettingsS
             if idx < n {
                 app.set_settings_index(scope, idx);
             }
+            SettingsKey::None
         }
-        _ => {}
+        KeyCode::Enter => {
+            if matches!(scope, SettingsScope::Session)
+                && matches!(
+                    super::SessionSettingsCategory::ALL.get(cur),
+                    Some(super::SessionSettingsCategory::Models)
+                )
+            {
+                SettingsKey::OpenModelPicker
+            } else {
+                SettingsKey::None
+            }
+        }
+        _ => SettingsKey::None,
     }
 }
 

@@ -1723,12 +1723,146 @@ fn about_kv(label: &str, value: &str) -> Line<'static> {
 fn render_session_category(
     f: &mut ratatui::Frame,
     area: Rect,
-    _app: &App,
+    app: &App,
     category: SessionSettingsCategory,
     _server: &Arc<Server>,
-    _backend: &BackendManager,
+    backend: &BackendManager,
 ) {
-    render_settings_detail_placeholder(f, area, category.label());
+    match category {
+        SessionSettingsCategory::Overview => render_session_overview(f, area, app),
+        SessionSettingsCategory::Models => render_session_models(f, area, app, backend),
+        _ => render_settings_detail_placeholder(f, area, category.label()),
+    }
+}
+
+/// Static snapshot of the active session — name, id, created_at, message
+/// count, attached agents, current agent + effective model. All values
+/// come from the per-tab `Tab` plus the seeded session meta snapshot.
+fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let tab = app.active();
+    let snapshot = app.session_settings_snapshot.as_ref();
+
+    let id_short = super::short_session_id(&tab.session_db_id);
+    let name = tab.session_name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+    let created = snapshot
+        .and_then(|s| s.created_at)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let message_count = snapshot
+        .map(|s| s.entry_count.to_string())
+        .unwrap_or_else(|| tab.entries.len().to_string());
+    let attached_agents = snapshot.map(|s| s.agents.len()).unwrap_or(0).to_string();
+    let host_agent = snapshot
+        .and_then(|s| s.host_agent_db_id.as_deref())
+        .unwrap_or("(routes to first attached agent)")
+        .to_string();
+    let current_agent = if tab.current_agent.is_empty() {
+        "(none)".to_string()
+    } else {
+        tab.current_agent.clone()
+    };
+    let effective_model = if tab.effective_model.is_empty() {
+        "(no model configured)".to_string()
+    } else {
+        tab.effective_model.clone()
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  Overview", theme::accent_bold())]),
+        Line::from(vec![Span::styled("  ─────", Style::default().fg(theme::DIM))]),
+        Line::from(""),
+        about_kv("  name", &name),
+        about_kv("  id", &id_short),
+        about_kv("  created", &created),
+        about_kv("  messages", &message_count),
+        Line::from(""),
+        about_kv("  attached agents", &attached_agents),
+        about_kv("  current agent", &current_agent),
+        about_kv("  effective model", &effective_model),
+        about_kv("  host agent", &host_agent),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Session pin + per-agent overrides. Press Enter (handled upstream) to
+/// open the model picker for the active scope. v1 picker doesn't pre-
+/// select the scope based on this row; user picks via the picker's own
+/// scope strip.
+fn render_session_models(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    backend: &BackendManager,
+) {
+    let snapshot = match app.session_settings_snapshot.as_ref() {
+        Some(s) => s,
+        None => {
+            render_settings_detail_placeholder(f, area, "Models");
+            return;
+        }
+    };
+
+    let session_pin_label = snapshot
+        .model_pin
+        .clone()
+        .unwrap_or_else(|| "(unset — agents fall through to their own defaults)".to_string());
+    let effective = backend.resolve_model_name(snapshot.model_pin.as_deref());
+    let session_resolved = if effective.is_empty() {
+        "(no backend default)".to_string()
+    } else {
+        effective
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  Models", theme::accent_bold())]),
+        Line::from(vec![Span::styled("  ─────", Style::default().fg(theme::DIM))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Session pin    ", Style::default().fg(theme::DIM)),
+            Span::styled(session_pin_label, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  resolves to    ", Style::default().fg(theme::DIM)),
+            Span::styled(session_resolved, theme::accent()),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Per-agent overrides",
+            Style::default().fg(theme::DIM),
+        )]),
+    ];
+
+    if snapshot.agents.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "    (no agents attached)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else {
+        for agent in &snapshot.agents {
+            let override_value = snapshot
+                .agent_models
+                .get(&agent.display_name)
+                .cloned()
+                .unwrap_or_else(|| "(uses session pin)".to_string());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {:<14}", agent.display_name),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(override_value, Style::default().fg(theme::DIM)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Press Enter to open the model picker.",
+        Style::default().fg(theme::DIM),
+    )]));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 /// Placeholder right-pane: shows the active category's name and a

@@ -416,6 +416,12 @@ pub(super) struct App {
     /// Sub-cursor inside the Session → Agents list (`meta.agents`). Same
     /// semantics as `peer_agents_cursor`.
     pub(super) session_agents_cursor: usize,
+    /// Mode to restore when the model picker closes (Esc or selection).
+    /// Set when the picker opens; used so opening the picker from inside
+    /// Session Settings returns there rather than dumping the user back
+    /// to Chat. Defaults to Chat — the historical behavior — when the
+    /// picker is opened from chat-mode.
+    pub(super) model_picker_caller: TuiMode,
     /// Mode to restore when the user hits Esc inside a Settings page.
     /// Set on entry to Settings; cleared on exit. One step deep — Settings
     /// pages don't nest into other modes that would need a real stack.
@@ -469,6 +475,7 @@ impl App {
             session_settings_index: 0,
             peer_agents_cursor: 0,
             session_agents_cursor: 0,
+            model_picker_caller: TuiMode::Chat,
         }
     }
 
@@ -1169,7 +1176,7 @@ impl Gateway for TuiGateway {
                                 app.mode = TuiMode::Chat;
                             }
                             TuiMode::ModelPicker => {
-                                app.mode = TuiMode::Chat;
+                                app.mode = app.model_picker_caller;
                             }
                             // Settings users get out via Esc; Ctrl+P is a
                             // no-op here so it doesn't compete with the
@@ -1266,7 +1273,24 @@ impl Gateway for TuiGateway {
                                 }
                             }
                             TuiMode::Settings(scope) => {
-                                input::handle_settings_key(&mut app, key, scope);
+                                match input::handle_settings_key(&mut app, key, scope) {
+                                    input::SettingsKey::None => {}
+                                    input::SettingsKey::OpenModelPicker => {
+                                        handle_chat_action(
+                                            ChatAction::OpenModelPicker,
+                                            &mut app,
+                                            &server,
+                                            &backend,
+                                            &self.secrets,
+                                            &approval_tx,
+                                            &notify_tx,
+                                            &catalog_cache,
+                                            &catalog_cache_key,
+                                            &models_tx,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1519,6 +1543,11 @@ async fn handle_chat_action(
                 models_tx.clone(),
                 false,
             );
+            // Remember which mode opened the picker so Esc / selection
+            // return there instead of dropping back to chat. From chat
+            // this no-ops (caller == Chat); from Settings(Session) it
+            // bounces back into the page where the user pressed Enter.
+            app.model_picker_caller = app.mode;
             app.mode = TuiMode::ModelPicker;
         }
         ChatAction::OpenPicker => {
@@ -1743,7 +1772,9 @@ async fn dispatch_model_selection(
     };
     let outcome = commands::dispatch(cmd, &ctx).await;
     render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
-    app.mode = TuiMode::Chat;
+    // Return to whoever opened the picker — chat by default; Session
+    // Settings when the picker was invoked from there.
+    app.mode = app.model_picker_caller;
 }
 
 /// Read the active session's meta + index row and stash a frozen snapshot
