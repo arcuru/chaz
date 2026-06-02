@@ -71,12 +71,16 @@ async fn resolve_cli_session(
         {
             warn!("Failed to name CLI session '{name}': {e}");
         }
+        let _ = server.auto_attach_default_agent(&session_db_id).await;
         Ok((conv_id, db))
     } else {
         // Ephemeral: create a fresh session every invocation, leave it
         // unnamed. Tagged with source "cli" for debug visibility in session
         // listings.
-        server.registry().create_session(Some("cli")).await
+        let (conv_id, db) = server.registry().create_session(Some("cli")).await?;
+        let session_db_id = db.root_id().to_string();
+        let _ = server.auto_attach_default_agent(&session_db_id).await;
+        Ok((conv_id, db))
     }
 }
 

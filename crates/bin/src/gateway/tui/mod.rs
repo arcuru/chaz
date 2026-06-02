@@ -662,6 +662,9 @@ async fn default_tui_session(
     {
         tracing::warn!("Failed to name default TUI session: {e}");
     }
+    // Mirror routing reality in `meta.agents` so `/agents` and the
+    // per-agent model picker reflect the agent that will actually answer.
+    let _ = server.auto_attach_default_agent(&session_db_id).await;
     Ok((conv_id, db))
 }
 

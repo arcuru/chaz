@@ -84,6 +84,9 @@ pub(super) async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
         Err(e) => return CommandOutcome::Error(format!("Failed to create session: {e}")),
     };
     let session_db_id = db.root_id().to_string();
+    // Mirror routing reality in `meta.agents` so `/agents` and the
+    // per-agent model picker reflect the agent that will actually answer.
+    let _ = ctx.server.auto_attach_default_agent(&session_db_id).await;
     let agent = ctx
         .server
         .registry()

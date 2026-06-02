@@ -75,9 +75,21 @@ pub(super) async fn agent_remove(agent_ref: &str, ctx: &CommandContext<'_>) -> C
 pub(super) async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
     let meta = crate::session::read_meta_from_db(ctx.session_db).await;
     if meta.agents.is_empty() {
-        let fallback = meta.agent_name.unwrap_or_else(|| "<default>".to_string());
+        // Pre-auto-attach session: name what actually routes so the user
+        // isn't misled by "none attached" when messages clearly resolve.
+        // `current_agent` mirrors the routing resolution chain.
+        let routing = ctx.current_agent;
+        let legacy = meta
+            .agent_name
+            .as_deref()
+            .map(|n| format!(", legacy agent_name: {n}"))
+            .unwrap_or_default();
         return CommandOutcome::Text(format!(
-            "No Living Agents attached to this session. Legacy agent: {fallback}"
+            "No Living Agents attached to this session.\n\
+             Routing falls back to: {routing} (default){legacy}\n\
+             \n\
+             Run `/agent add {routing}` to make this explicit — required for\n\
+             per-agent model overrides and other agent-scoped features."
         ));
     }
     let host = meta.host_agent_db_id.as_deref();

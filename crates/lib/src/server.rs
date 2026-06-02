@@ -218,6 +218,52 @@ impl Server {
         &self.agent_index
     }
 
+    /// Best-effort attach of the default agent to a freshly-created
+    /// session so `SessionMeta.agents` mirrors what message routing will
+    /// actually pick. Without this, fresh sessions resolve through the
+    /// legacy default-fallback chain — routing works, but `/agents`
+    /// reports "none attached" and the per-agent model picker has no
+    /// agent scopes. Called from user-facing creation paths (TUI `/new`,
+    /// CLI session create, TUI startup default). Not called from
+    /// `create_child_session` — spawned children are agent-driven and
+    /// shouldn't inherit the default unconditionally.
+    ///
+    /// Silently no-ops when the agent registry is empty or the default
+    /// agent isn't in the hosted index (e.g. it was configured in YAML
+    /// but its Living Agent DB hasn't been created yet). Returns the
+    /// attached agent's name on success.
+    pub async fn auto_attach_default_agent(&self, session_db_id: &str) -> Option<String> {
+        if self.agents.is_empty() {
+            return None;
+        }
+        let default = self.agents.default_agent();
+        let entry = match self.agent_index.find_by_name(&default.name) {
+            Some(e) => e,
+            None => {
+                tracing::debug!(
+                    agent = %default.name,
+                    "Default agent has no hosted DB entry — skipping auto-attach on new session"
+                );
+                return None;
+            }
+        };
+        match self
+            .registry
+            .attach_agent_to_session(session_db_id, &entry)
+            .await
+        {
+            Ok(()) => Some(default.name),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %default.name,
+                    session_db_id,
+                    "Auto-attach of default agent failed (session created anyway): {e}"
+                );
+                None
+            }
+        }
+    }
+
     /// Decide whether this peer is the home for running `agent_name` in
     /// `session_db_id`. The home-peer gate that prevents two peers from
     /// both running the ReAct loop on the same human message when they
