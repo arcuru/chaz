@@ -1546,8 +1546,129 @@ fn render_peer_category(
     match category {
         PeerSettingsCategory::About => render_peer_about(f, area, server, backend, config),
         PeerSettingsCategory::Agents => render_peer_agents(f, area, app, server, backend),
+        PeerSettingsCategory::Backends => render_peer_backends(f, area, backend, config),
+        PeerSettingsCategory::Bridges => render_peer_bridges(f, area, config),
         _ => render_settings_detail_placeholder(f, area, category.label()),
     }
+}
+
+/// Peer → Backends (read-only). One row per configured backend: name,
+/// api_base, configured-model count, known-model count from the manager.
+fn render_peer_backends(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    backend: &BackendManager,
+    config: &Config,
+) {
+    let known = backend.list_known_backends();
+    let known_models = backend.list_known_models();
+    let configured = config.backends.as_deref().unwrap_or(&[]);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Backends", theme::accent_bold()),
+            Span::styled(
+                format!("    {} configured", configured.len()),
+                Style::default().fg(theme::DIM),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
+        Line::from(""),
+    ];
+
+    if configured.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (no backends configured)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else {
+        for b in configured {
+            let name = b.name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+            let api_base = b
+                .api_base
+                .clone()
+                .unwrap_or_else(|| "(backend default)".to_string());
+            let configured_models = b.models.as_ref().map(|m| m.len()).unwrap_or(0);
+            // Live count: models the BackendManager reports for this backend
+            // name. In multi-backend setups the manager prefixes ids; in
+            // single-backend setups it doesn't.
+            let live_count = if known.len() <= 1 {
+                known_models.len()
+            } else {
+                let prefix = format!("{name}:");
+                known_models
+                    .iter()
+                    .filter(|m| m.starts_with(&prefix))
+                    .count()
+            };
+
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {name}"),
+                theme::accent(),
+            )]));
+            lines.push(about_kv("    api_base", &api_base));
+            lines.push(about_kv(
+                "    models",
+                &format!("{configured_models} configured · {live_count} known"),
+            ));
+            lines.push(Line::from(""));
+        }
+    }
+
+    lines.push(Line::from(vec![Span::styled(
+        "  (view-only in v1)",
+        Style::default().fg(theme::DIM),
+    )]));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Peer → Bridges (read-only). v1: tui + cli are always-on; matrix is
+/// enabled when a homeserver_url is set in config.
+fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, config: &Config) {
+    let matrix_active = !config.homeserver_url.is_empty();
+    let matrix_status = if matrix_active {
+        format!("active ({})", config.homeserver_url)
+    } else {
+        "(homeserver_url unset)".to_string()
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  Bridges", theme::accent_bold())]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
+        Line::from(""),
+        bridge_row("tui", "active"),
+        bridge_row("cli", "available (`chaz --cli`)"),
+        bridge_row("matrix", &matrix_status),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  (view-only in v1)",
+            Style::default().fg(theme::DIM),
+        )]),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// One row in the bridges list: name in accent, status in white.
+fn bridge_row(name: &str, status: &str) -> Line<'static> {
+    let active = status == "active" || status.starts_with("active ");
+    let status_style = if active {
+        theme::accent()
+    } else {
+        Style::default().fg(theme::DIM)
+    };
+    Line::from(vec![
+        Span::styled(format!("  {name:<10}"), Style::default().fg(Color::White)),
+        Span::styled(status.to_string(), status_style),
+    ])
 }
 
 /// Peer → Agents (read-only). Top half is a one-line-per-agent list with
