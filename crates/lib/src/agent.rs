@@ -338,6 +338,21 @@ impl AgentRegistry {
         Agent::from_db_config(name, cfg)
     }
 
+    /// Build a runtime `Agent` by looking up `name` in `config.agents`.
+    /// Public reload path — used by the TUI's Peer→Agents `[r]` action so
+    /// edits to system_prompt / default_model / tools / etc. in the yaml
+    /// can be applied to one agent without restarting chaz. DB-side
+    /// state for Living Agents is left alone; yaml only owns the
+    /// declarative fields. Returns `None` when no yaml entry matches.
+    pub fn build_from_yaml(&self, name: &str, config: &Config) -> Option<Agent> {
+        config
+            .agents
+            .as_deref()?
+            .iter()
+            .find(|a| a.name == name)
+            .map(|ac| Agent::from_agent_config(ac, config))
+    }
+
     /// Validate that all names in can_spawn and allowed_callers reference existing agents.
     fn validate_references(&self) {
         let agents = self.agents.read().unwrap();

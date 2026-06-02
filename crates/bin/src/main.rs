@@ -738,7 +738,8 @@ async fn main() -> anyhow::Result<()> {
         let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt, args.session);
         gateway.run(server).await
     } else if args.tui {
-        let gateway = gateway::tui::TuiGateway::new(config, secret_store);
+        let gateway = gateway::tui::TuiGateway::new(config, secret_store)
+            .with_config_path(args.config.clone());
         gateway.run(server).await
     } else {
         let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;

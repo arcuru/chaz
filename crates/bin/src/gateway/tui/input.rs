@@ -1186,6 +1186,11 @@ pub(super) enum SettingsKey {
         intent: SettingsPromptIntent,
         value: String,
     },
+    /// Reload one agent's declarative fields from chaz yaml. Triggered by
+    /// `[r]` on the Peer→Agents detail. Payload is the agent display
+    /// name. Main loop re-reads the config file, builds an `Agent` from
+    /// the matching yaml entry, and upserts into the registry.
+    ReloadPeerAgent { name: String },
 }
 
 /// Key handler for `TuiMode::Settings`. `Tab`/`BackTab` always cycle the
@@ -1212,8 +1217,9 @@ pub(super) fn handle_settings_key(
     let inner_list_len = settings_inner_list_len(app, scope, cur);
 
     // Per-category direct-action keys ([a]/[d] on the Session Agents
-    // list). Check before falling through to general navigation so
-    // typing one of these doesn't move the sidebar.
+    // list, [r] on the Peer Agents list). Check before falling through
+    // to general navigation so typing one of these doesn't move the
+    // sidebar.
     if matches!(scope, SettingsScope::Session)
         && matches!(
             super::SessionSettingsCategory::ALL.get(cur),
@@ -1245,6 +1251,37 @@ pub(super) fn handle_settings_key(
             }
             _ => {}
         }
+    }
+    if matches!(scope, SettingsScope::Peer)
+        && matches!(
+            super::PeerSettingsCategory::ALL.get(cur),
+            Some(super::PeerSettingsCategory::Agents)
+        )
+        && let KeyCode::Char('r') = key.code
+    {
+        if let Some(name) = app.peer_agents_names.get(app.peer_agents_cursor).cloned() {
+            return SettingsKey::ReloadPeerAgent { name };
+        }
+        return SettingsKey::None;
+    }
+
+    // Any navigation key clears a leftover one-shot status message
+    // (`settings_status`). Action keys above set it; nav keys below
+    // sweep it. Done before the per-key dispatch so the state machine
+    // is uniform.
+    if matches!(
+        key.code,
+        KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Enter
+            | KeyCode::Esc
+            | KeyCode::Char(_)
+    ) {
+        app.settings_status = None;
     }
 
     match key.code {
@@ -1396,10 +1433,10 @@ fn settings_inner_list_len(
 }
 
 fn peer_agent_count(app: &App) -> usize {
-    // Set from outside via `App::set_peer_agent_count_hint`; for now we
-    // approximate from `agent_names`, which holds every agent registered
-    // on this peer's chaz_peer.
-    app.agent_names.len()
+    // Refreshed at the top of every render frame while Peer Settings is
+    // up — see `view::ui`. Reading from this cache keeps the input
+    // handler and the renderer indexing the same list.
+    app.peer_agents_names.len()
 }
 
 fn bump_inner_cursor(

@@ -121,6 +121,16 @@ pub(super) fn ui(
     // what the user is currently seeing.
     app.click_regions.clear();
 
+    // Refresh the Peer→Agents name cache whenever Peer Settings is up.
+    // Both the input handler and the renderer index into this; keeping
+    // it fresh-per-frame ensures `[r]` reloads the agent the user can
+    // see at the cursor.
+    if matches!(app.mode, TuiMode::Settings(super::SettingsScope::Peer)) {
+        let mut names = server.agents().names();
+        names.sort();
+        app.peer_agents_names = names;
+    }
+
     match app.mode {
         TuiMode::Chat => ui_chat(f, app),
         TuiMode::SessionPicker => ui_picker(f, app),
@@ -1492,17 +1502,19 @@ fn ui_settings(
         }
     }
 
-    // Bottom strip is normally the status hints; when an inline prompt
-    // is active it takes over the row instead.
-    match &app.settings_prompt {
-        Some(prompt) => widgets::inline_edit_prompt(
+    // Bottom strip is normally the status hints; an inline prompt
+    // takes over while typing, and a one-shot status message wins over
+    // hints when set (until the next nav keypress clears it).
+    match (&app.settings_prompt, &app.settings_status) {
+        (Some(prompt), _) => widgets::inline_edit_prompt(
             f,
             chunks[2],
             &prompt.label,
             &prompt.input,
             prompt.cursor,
         ),
-        None => {
+        (None, Some(msg)) => widgets::status_strip(f, chunks[2], msg),
+        (None, None) => {
             let hint = settings_status_hint(app, scope);
             widgets::status_strip(f, chunks[2], hint);
         }
@@ -1525,7 +1537,9 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
             _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
         },
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cur) {
-            Some(PeerSettingsCategory::Agents) => " Tab category · ↑↓ select · Esc back ",
+            Some(PeerSettingsCategory::Agents) => {
+                " Tab category · ↑↓ select · [r] reload yaml · Esc back "
+            }
             _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
         },
     }
@@ -1681,8 +1695,9 @@ fn render_peer_agents(
     server: &Arc<Server>,
     backend: &BackendManager,
 ) {
-    let mut names = server.agents().names();
-    names.sort();
+    // Use the per-frame cache populated by `ui()` so this matches what
+    // the input handler indexed when computing `[r]`.
+    let names = app.peer_agents_names.clone();
 
     let cursor = app.peer_agents_cursor.min(names.len().saturating_sub(1));
 
@@ -1742,7 +1757,7 @@ fn render_peer_agents(
     f.render_widget(Paragraph::new(lines), chunks[0]);
 
     // Detail pane — selected agent's fields, or a hint when no agents.
-    let detail = names
+    let mut detail = names
         .get(cursor)
         .and_then(|n| server.agents().get(n))
         .map(|a| agent_detail_lines(&a))
@@ -1752,6 +1767,11 @@ fn render_peer_agents(
                 Style::default().fg(theme::DIM),
             )])]
         });
+    detail.push(Line::from(""));
+    detail.push(Line::from(vec![Span::styled(
+        "  [r] reload this agent from yaml",
+        Style::default().fg(theme::DIM),
+    )]));
     f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);
 }
 
