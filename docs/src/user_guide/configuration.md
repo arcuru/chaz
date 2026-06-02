@@ -303,6 +303,34 @@ Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in t
 | `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                     |
 | `presets`              | map<name, AgentPreset> | Named override bundles selectable at spawn time (model / iters / tools / role suffix / tool_profile).  |
 
+### `default_agents`
+
+Names of agents auto-attached to every freshly-created session, in
+order. The first entry effectively becomes the routing host — when an
+incoming message has no `@mention` and no explicit `/agent host`, the
+resolution chain picks the first authorized agent on the session.
+
+```yaml
+agents:
+  - name: ava
+  - name: researcher
+
+default_agents: [ava, researcher]
+```
+
+Each name must match an entry in `agents:`. Names that don't have a
+hosted Agent DB yet (configured in YAML but not yet bootstrapped) are
+skipped silently with a debug log — the rest still attach. Per-agent
+attach failures are logged but don't unwind the rest, so session
+creation never fails because of `default_agents`.
+
+Absent or empty `default_agents:` falls back to the legacy
+single-default behavior: attach only `agents.first()`. Existing
+sessions are unaffected — auto-attach is a creation-time mechanism, so
+sessions created before this field was set keep their current
+participant list. Bring them up to date by re-running `/agent add
+<name>` manually.
+
 ## Security
 
 Security settings control tool approval, network access, shell sandboxing, secret leak detection, and tool rate limiting. See [Security](security.md) for details.

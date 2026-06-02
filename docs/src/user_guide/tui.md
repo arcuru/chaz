@@ -131,12 +131,25 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 
 ### LLM config
 
-| Command                       | Description                           |
-| ----------------------------- | ------------------------------------- |
-| `/model [<model>]`            | Show or set the model for the session |
-| `/role [<name> [<prompt>]]`   | Show, select, or define a role        |
-| `/backend <name> <url> <key>` | Add a custom backend for the session  |
-| `/backends`                   | List known backends and models        |
+| Command                       | Description                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `/models`                     | Open the [model picker](#model-picker)                                       |
+| `/model`                      | Show the model resolved for the current agent + every override on this session |
+| `/model <id>`                 | Set the session-wide model pin (every agent unless per-agent override wins)  |
+| `/model <agent> <id>`         | Set a per-agent override scoped to this session                              |
+| `/model <agent> clear`        | Clear that agent's per-agent override                                        |
+| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                               |
+| `/backend <name> <url> <key>` | Add a custom backend for the session                                         |
+| `/backends`                   | List known backends and models                                               |
+
+**Model resolution order** for any given turn (highest priority first):
+
+1. Per-agent session override — `SessionMeta.agent_models[agent_name]`
+2. Session-wide pin — `SessionMeta.model`
+3. The agent's `default_model` from its DB config (seeded from YAML `agents[].model`)
+4. The backend's default model
+
+`/model` (no args) names which source wins for the *current agent*, so the display always matches what the next message will actually run.
 
 ### TUI utilities
 
@@ -222,6 +235,52 @@ Named sessions can be referenced anywhere a session identifier is accepted:
 ```
 
 The name appears in the status bar, session picker, and `/info` output. Names must be unique across all sessions. Use `/name` (with no argument) to clear the name.
+
+## Model Picker
+
+Open with `/models`:
+
+```text
++ scope: [ Session ] · ava · researcher · chaz                  +
++--[ Search models (143) ]----------------------------------------+
+|   > _                                                          |
++-----------------------------------------------------------------+
++--[ Select model ▼ ]--------------------------------------------+
+|   MODEL                              IN     OUT   CACHE   CAPS |
+|   ▸ anthropic/claude-opus-4.7      $15.0  $75.0    $1.5   V    |
+|     openai/gpt-5-mini               $0.40  $1.6     —     V    |
+|     ...                                                        |
++-----------------------------------------------------------------+
+| type to filter | ↑↓ PgUp/Dn Home/End | Enter | Tab scope | ... |
++-----------------------------------------------------------------+
+```
+
+The picker pulls the live OpenRouter catalog (cached 24 h, refresh with `Ctrl+R`) and merges it with the models declared in your YAML `backends:` so favorites stay pinned at the top. Each row shows input / output / cache-read prices in $/Mtok plus a capability badge: `V`ision (image input), `A`udio (audio input), `M`ovie (video input), `I`mage-gen (image output), `S`peech (audio output).
+
+Typing in the search box does fzf-style fuzzy matching across model ids and capability labels — `vision` filters to vision-capable models without a separate UI; `claude opus` finds Anthropic's top tier across providers.
+
+### Scope tabs
+
+The strip above the search bar names the scope that Enter writes to:
+
+- **`Session`** — Enter pins the model session-wide (`SessionMeta.model`, what `/model <id>` does). Default scope.
+- **`<agent>`** — Enter sets the per-agent override for that agent (`SessionMeta.agent_models[name]`, what `/model <agent> <id>` does).
+
+`Tab` / `Shift+Tab` cycles scope. The `(current)` annotation and the floating-active sort follow the active scope's pin, so switching to an agent's tab puts that agent's pinned model at row 0. When only the Session scope exists (no agents attached to the session yet), the strip suppresses itself to keep the chrome out of the way.
+
+| Key                   | Action                                              |
+| --------------------- | --------------------------------------------------- |
+| (typing)              | Append to fuzzy-search query                        |
+| `↑` / `↓`             | Move cursor in the filtered list                    |
+| `PageUp` / `PageDown` | Jump 10 rows                                        |
+| `Home` / `End`        | Jump to first / last row                            |
+| `Tab` / `Shift+Tab`   | Cycle scope tab (Session ↔ per-agent)               |
+| `Enter`               | Apply the highlighted model to the active scope     |
+| `Ctrl+R`              | Force-refresh the catalog (bypass the 24 h cache)   |
+| `Ctrl+U`              | Clear the search query                              |
+| `Esc`                 | Dismiss without changing anything                   |
+
+There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open.
 
 ## Entry Types
 

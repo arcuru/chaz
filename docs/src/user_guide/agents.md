@@ -97,6 +97,36 @@ The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — o
 
 A session's _authoritative_ participant list is its eidetica AuthSettings. Adding an agent to a session grants its pubkey `Permission::Write` on the session DB; revoking removes it. The `SessionMeta.agents: Vec<AgentRef>` field is a readable cache that stays in sync.
 
+### Auto-attach on new sessions
+
+Freshly-created sessions auto-attach a configured roster so `/agents` and the model picker reflect routing reality on the very first message. The list is `Config.default_agents` (see [`configuration.md`](configuration.md#default_agents)) — typically the same agent(s) you message most often. Without that config, just the first agent in `agents:` is attached.
+
+This runs at session-creation time only (TUI `/new`, the picker's "New session" row, CLI `--session`, TUI startup default). It does **not** mutate existing sessions — those keep whatever participant list they already have. Spawned child sessions (`spawn_agent` / `spawn_task`) also skip auto-attach since they're agent-driven and inherit context from the parent rather than the default.
+
+Names in `default_agents` that don't have a hosted Agent DB are skipped with a debug log; the rest still attach. Per-agent attach failures are logged but don't unwind the rest. Session creation never fails because of `default_agents`.
+
+### Per-agent model overrides
+
+Each agent on a session can have its own session-scoped model pin, independent of the session-wide `/model` pin. This lets `researcher` stay on Ring-1T while `ava` runs on Opus inside the same session.
+
+| Command                  | What                                                              |
+| ------------------------ | ----------------------------------------------------------------- |
+| `/model`                 | Show the model resolved for the current agent + every override on this session |
+| `/model <id>`            | Set the session-wide pin (`SessionMeta.model`)                    |
+| `/model <agent> <id>`    | Set a per-agent override (`SessionMeta.agent_models[agent]`)      |
+| `/model <agent> clear`   | Clear that agent's override                                       |
+
+The picker exposes the same controls graphically — see [Model Picker / Scope tabs](tui.md#scope-tabs).
+
+Resolution order on every turn:
+
+1. Per-agent override — `meta.agent_models[agent_name]`
+2. Session-wide pin — `meta.model`
+3. Agent's own `default_model` from its DB config
+4. Backend default
+
+The same chain runs whether the agent turn was kicked off by a human message, an `@mention` chain, or a scheduled fire — `run_schedule_turn` and `spawn_agent_task` both resolve through `SessionMeta::resolve_model_for_agent(name)`. The Matrix gateway's legacy `!chaz` direct-chat path doesn't run through the agent runtime and so isn't agent-scoped; live Matrix agent turns are.
+
 ### `/agent` commands
 
 Every transport uses the same set of commands. TUI: `/agent <sub>`. Matrix: `!chaz agent <sub>`.
