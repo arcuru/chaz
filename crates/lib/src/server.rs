@@ -156,6 +156,12 @@ pub struct Server {
     /// `multi_agent.burst_budget` (applied once at startup before the
     /// gateway begins delivering messages).
     agent_burst_budget: AtomicUsize,
+    /// Names of agents auto-attached to every freshly-created session, in
+    /// order. Set once at startup from `Config.default_agents` via
+    /// `set_default_agents`. Empty falls back to single-default attach
+    /// (whatever `AgentRegistry::default_agent()` returns). The first
+    /// entry effectively becomes the routing host on new sessions.
+    default_agents: std::sync::RwLock<Vec<String>>,
 }
 
 impl Server {
@@ -199,6 +205,7 @@ impl Server {
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
+            default_agents: std::sync::RwLock::new(Vec::new()),
         });
 
         let server_clone = server.clone();
@@ -218,50 +225,75 @@ impl Server {
         &self.agent_index
     }
 
-    /// Best-effort attach of the default agent to a freshly-created
-    /// session so `SessionMeta.agents` mirrors what message routing will
-    /// actually pick. Without this, fresh sessions resolve through the
-    /// legacy default-fallback chain — routing works, but `/agents`
-    /// reports "none attached" and the per-agent model picker has no
-    /// agent scopes. Called from user-facing creation paths (TUI `/new`,
-    /// CLI session create, TUI startup default). Not called from
+    /// Set the list of agents auto-attached to new sessions. Applied
+    /// once at startup from `Config.default_agents`. Order is meaningful:
+    /// the first entry effectively becomes the routing host (resolution
+    /// chain picks the first authorized agent when no @mention applies).
+    pub fn set_default_agents(&self, names: Vec<String>) {
+        *self.default_agents.write().expect("default_agents lock poisoned") = names;
+    }
+
+    /// Best-effort attach of the configured default agents to a
+    /// freshly-created session so `SessionMeta.agents` mirrors what
+    /// message routing will actually pick. Without this, fresh sessions
+    /// resolve through the legacy default-fallback chain — routing
+    /// works, but `/agents` reports "none attached" and the per-agent
+    /// model picker has no agent scopes.
+    ///
+    /// Source of truth is `Config.default_agents` (set via
+    /// `set_default_agents`). When that list is empty, falls back to
+    /// attaching `AgentRegistry::default_agent()` — the first agent in
+    /// `agents:`.
+    ///
+    /// Called from user-facing creation paths (TUI `/new`, CLI session
+    /// create, TUI startup default). Not called from
     /// `create_child_session` — spawned children are agent-driven and
     /// shouldn't inherit the default unconditionally.
     ///
-    /// Silently no-ops when the agent registry is empty or the default
-    /// agent isn't in the hosted index (e.g. it was configured in YAML
-    /// but its Living Agent DB hasn't been created yet). Returns the
-    /// attached agent's name on success.
-    pub async fn auto_attach_default_agent(&self, session_db_id: &str) -> Option<String> {
-        if self.agents.is_empty() {
-            return None;
-        }
-        let default = self.agents.default_agent();
-        let entry = match self.agent_index.find_by_name(&default.name) {
-            Some(e) => e,
-            None => {
-                tracing::debug!(
-                    agent = %default.name,
-                    "Default agent has no hosted DB entry — skipping auto-attach on new session"
-                );
-                return None;
-            }
+    /// Skips silently when an agent isn't in the hosted index (e.g.
+    /// configured in YAML but its Living Agent DB hasn't been created
+    /// yet). Per-agent attach failures are logged but don't unwind the
+    /// rest. Returns the list of successfully-attached names in order.
+    pub async fn auto_attach_default_agent(&self, session_db_id: &str) -> Vec<String> {
+        // Snapshot the configured list; if empty, fall back to a
+        // single-default attach so behavior is sane without a
+        // `default_agents:` config entry.
+        let configured: Vec<String> = self
+            .default_agents
+            .read()
+            .expect("default_agents lock poisoned")
+            .clone();
+        let names: Vec<String> = if !configured.is_empty() {
+            configured
+        } else if !self.agents.is_empty() {
+            vec![self.agents.default_agent().name]
+        } else {
+            return Vec::new();
         };
-        match self
-            .registry
-            .attach_agent_to_session(session_db_id, &entry)
-            .await
-        {
-            Ok(()) => Some(default.name),
-            Err(e) => {
-                tracing::warn!(
-                    agent = %default.name,
-                    session_db_id,
-                    "Auto-attach of default agent failed (session created anyway): {e}"
+
+        let mut attached = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(entry) = self.agent_index.find_by_name(&name) else {
+                tracing::debug!(
+                    agent = %name,
+                    "Configured default agent has no hosted DB entry — skipping auto-attach"
                 );
-                None
+                continue;
+            };
+            match self
+                .registry
+                .attach_agent_to_session(session_db_id, &entry)
+                .await
+            {
+                Ok(()) => attached.push(name),
+                Err(e) => tracing::warn!(
+                    agent = %name,
+                    session_db_id,
+                    "Auto-attach of default agent failed (continuing with rest): {e}"
+                ),
             }
         }
+        attached
     }
 
     /// Decide whether this peer is the home for running `agent_name` in

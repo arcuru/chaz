@@ -546,6 +546,17 @@ async fn main() -> anyhow::Result<()> {
         info!(burst_budget = mc.burst_budget, "Applied multi_agent config");
     }
 
+    // Apply default_agents list: which agents auto-attach to new
+    // sessions. First entry is the routing host. Set before any
+    // session-creation path runs.
+    if let Some(default_agents) = config.default_agents.clone() {
+        info!(
+            agents = ?default_agents,
+            "Applied default_agents — these will auto-attach to new sessions"
+        );
+        server.set_default_agents(default_agents);
+    }
+
     // Translate YAML `schedules:` into agent-owned Schedules. Each
     // ScheduleConfig becomes one cron Schedule in the owning agent's DB,
     // Pinned to the resolved session. The routine engine picks these up

@@ -27,6 +27,14 @@ pub struct Config {
     pub backends: Option<Vec<Backend>>,
     /// Agent definitions
     pub agents: Option<Vec<AgentConfig>>,
+    /// Names of agents auto-attached to every freshly-created session, in
+    /// order. Names must match an entry in `agents:`. Absent or empty
+    /// falls back to attaching just the first agent in `agents:` (legacy
+    /// single-default behavior). The first entry effectively becomes the
+    /// routing host — when an incoming message has no `@mention` and no
+    /// explicit `host_agent_db_id`, resolution picks the first authorized
+    /// agent on the session, which is whichever appears first here.
+    pub default_agents: Option<Vec<String>>,
     /// Security settings
     pub security: Option<SecurityConfig>,
     /// Scheduled tasks
