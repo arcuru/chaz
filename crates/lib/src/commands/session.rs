@@ -471,31 +471,54 @@ pub(super) async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> Comm
     .await;
     match arg {
         None => {
-            // Mirror the runtime: per-session pin → agent default → backend
-            // resolution. Matches what `runtime::execute` will actually
-            // route to so display and reality agree.
+            // Mirror the runtime: per-agent override → per-session pin →
+            // agent default → backend default. Matches what `runtime::execute`
+            // routes to so the display agrees with reality.
             let meta = session.read_meta().await;
             let agent_default = ctx
                 .server
                 .agents()
                 .get(ctx.current_agent)
                 .and_then(|a| a.default_model.clone());
-            let effective = meta.model.clone().or(agent_default);
+            let per_agent = meta
+                .agent_models
+                .get(ctx.current_agent)
+                .cloned();
+            let effective = per_agent
+                .clone()
+                .or_else(|| meta.model.clone())
+                .or(agent_default);
             let resolved = ctx.backend.resolve_model_name(effective.as_deref());
             let current = if resolved.is_empty() {
                 "unknown".to_string()
             } else {
                 resolved
             };
-            let source = match (&meta.model, &effective) {
-                (Some(_), _) => " (session pin)",
-                (None, Some(_)) => " (agent default)",
-                _ => " (backend default)",
+            let source = if per_agent.is_some() {
+                format!(" (per-agent override on {})", ctx.current_agent)
+            } else if meta.model.is_some() {
+                " (session pin)".to_string()
+            } else if effective.is_some() {
+                " (agent default)".to_string()
+            } else {
+                " (backend default)".to_string()
             };
-            let mut msg = format!(
-                "Current Model: {current}{source}\n\nKnown Backends:\n{}",
+            let mut msg = format!("Current Model: {current}{source}");
+            if let Some(pin) = &meta.model {
+                msg.push_str(&format!("\nSession pin: {pin}"));
+            }
+            if !meta.agent_models.is_empty() {
+                msg.push_str("\nPer-agent overrides:");
+                let mut entries: Vec<(&String, &String)> = meta.agent_models.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (agent, model_id) in entries {
+                    msg.push_str(&format!("\n  {agent}: {model_id}"));
+                }
+            }
+            msg.push_str(&format!(
+                "\n\nKnown Backends:\n{}",
                 ctx.backend.list_known_backends().join("\n")
-            );
+            ));
             msg.push_str("\n\nKnown Models:\n");
             msg.push_str(&ctx.backend.list_known_models().join("\n"));
             CommandOutcome::Text(msg)
@@ -516,6 +539,86 @@ pub(super) async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> Comm
                 return CommandOutcome::Error(format!("Failed to set model: {e}"));
             }
             CommandOutcome::Text(note)
+        }
+    }
+}
+
+/// Set or clear a per-agent model override for the current session.
+/// `Some(id)` pins that agent to the given model; `None` clears the
+/// override so the agent falls back to the session pin / its own default.
+/// `agent` is matched case-sensitively against `AgentRef.display_name`
+/// on the session meta; agents that aren't currently attached produce a
+/// warning but the override is written anyway (so you can pre-pin before
+/// attaching).
+pub(super) async fn agent_model(
+    agent: &str,
+    model_arg: Option<String>,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    if agent.is_empty() {
+        return CommandOutcome::Error(
+            "Agent name required. Usage: /model <agent> <model-id> | /model <agent> clear".into(),
+        );
+    }
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
+    let meta = session.read_meta().await;
+    let known_agent = meta
+        .agents
+        .iter()
+        .any(|a| a.display_name == agent);
+
+    match model_arg {
+        Some(m) => {
+            // Validate the model before writing, same surface as `/model <id>`.
+            let note = if ctx.backend.is_known_model(&m) {
+                format!("Model for {agent} set to \"{m}\"")
+            } else {
+                match ctx.backend.validate_model(&m) {
+                    Ok(()) => format!(
+                        "Model for {agent} set to \"{m}\" (not in known list — verify your backend supports it)"
+                    ),
+                    Err(e) => return CommandOutcome::Error(e),
+                }
+            };
+            let agent_owned = agent.to_string();
+            let m_owned = m.clone();
+            if let Err(e) = session
+                .update_meta(|meta| {
+                    meta.agent_models.insert(agent_owned, m_owned);
+                })
+                .await
+            {
+                return CommandOutcome::Error(format!("Failed to set per-agent model: {e}"));
+            }
+            let suffix = if known_agent {
+                String::new()
+            } else {
+                format!(
+                    " (note: {agent} is not currently attached to this session — override saved anyway)"
+                )
+            };
+            CommandOutcome::Text(format!("{note}{suffix}"))
+        }
+        None => {
+            let agent_owned = agent.to_string();
+            let mut had_override = false;
+            if let Err(e) = session
+                .update_meta(|meta| {
+                    had_override = meta.agent_models.remove(&agent_owned).is_some();
+                })
+                .await
+            {
+                return CommandOutcome::Error(format!("Failed to clear per-agent model: {e}"));
+            }
+            if had_override {
+                CommandOutcome::Text(format!("Cleared per-agent model override for {agent}"))
+            } else {
+                CommandOutcome::Text(format!("No per-agent override was set for {agent}"))
+            }
         }
     }
 }

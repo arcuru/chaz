@@ -94,7 +94,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/schedule remove ", "remove a schedule by id"),
         ("# LLM config", ""),
         ("/models", "open the model picker"),
-        ("/model ", "show or set the model for this session"),
+        (
+            "/model ",
+            "show, or set <id> | <agent> <id> | <agent> clear",
+        ),
         ("/role ", "show, select, or define a role"),
         ("/backend ", "add a custom backend (<name> <url> <key>)"),
         ("/backends", "list known backends and models"),
@@ -937,11 +940,39 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         return None;
     }
     if let Some(arg) = text.strip_prefix("/model ") {
-        let model = arg.trim().to_string();
-        if !model.is_empty() {
-            return Some(ChatAction::Dispatch(Command::Model(Some(model))));
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            return None;
         }
-        return None;
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        match tokens.as_slice() {
+            // Single token — session-wide pin (legacy `/model <id>`).
+            [id] => {
+                return Some(ChatAction::Dispatch(Command::Model(Some(
+                    (*id).to_string(),
+                ))));
+            }
+            // Two tokens — per-agent override. `clear` (case-insensitive)
+            // as the second token wipes the override.
+            [agent, second] => {
+                let model = if second.eq_ignore_ascii_case("clear") {
+                    None
+                } else {
+                    Some((*second).to_string())
+                };
+                return Some(ChatAction::Dispatch(Command::AgentModel {
+                    agent: (*agent).to_string(),
+                    model,
+                }));
+            }
+            _ => {
+                show_error(
+                    app,
+                    "Usage: /model [<id> | <agent> <id> | <agent> clear]".to_string(),
+                );
+                return None;
+            }
+        }
     }
     if let Some(arg) = text.strip_prefix("/role ") {
         let rest = arg.trim();
@@ -1058,6 +1089,17 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
         KeyCode::Char('u') if ctrl => {
             app.model_search.clear();
             app.recompute_model_filter();
+            ModelPickerKey::None
+        }
+
+        // Tab / BackTab — cycle scope (Session ↔ per-agent). No-op when
+        // only the Session scope exists (no agents attached).
+        KeyCode::Tab => {
+            app.cycle_model_picker_scope(1);
+            ModelPickerKey::None
+        }
+        KeyCode::BackTab => {
+            app.cycle_model_picker_scope(-1);
             ModelPickerKey::None
         }
 

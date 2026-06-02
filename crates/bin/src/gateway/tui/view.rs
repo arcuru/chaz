@@ -1174,19 +1174,56 @@ const COL_W_PRICE: usize = 8;
 const COL_W_CAPS: usize = 6;
 
 fn ui_model_picker(f: &mut ratatui::Frame, app: &mut App) {
-    // search bar | list | help — search is its own block so it has its own
-    // border + title. List block houses the column header on its first
-    // interior row, then the scroll window of model rows.
+    // scope strip | search bar | list | help. Scope strip suppresses
+    // itself to height 0 when only the Session scope exists — keeps the
+    // chrome out of the way on solo-agent sessions. List block houses the
+    // column header on its first interior row, then the scroll window.
+    let scope_h: u16 = if app.model_picker_scopes.len() > 1 {
+        1
+    } else {
+        0
+    };
     let chunks = Layout::vertical([
+        Constraint::Length(scope_h),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .split(f.area());
 
-    render_model_search_bar(f, chunks[0], app);
-    render_model_list_block(f, chunks[1], app);
-    render_model_help_bar(f, chunks[2], app);
+    if scope_h > 0 {
+        render_model_scope_strip(f, chunks[0], app);
+    }
+    render_model_search_bar(f, chunks[1], app);
+    render_model_list_block(f, chunks[2], app);
+    render_model_help_bar(f, chunks[3], app);
+}
+
+/// One-line tab strip showing scope tabs above the search bar. Active
+/// scope highlighted; inactive tabs dimmed. Renders nothing when only
+/// the Session scope exists (no agents attached).
+fn render_model_scope_strip(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
+    let bar_bg = Color::Rgb(0x1a, 0x1d, 0x26);
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::styled(" scope: ", Style::default().fg(COLOR_DIM).bg(bar_bg)));
+    for (i, scope) in app.model_picker_scopes.iter().enumerate() {
+        let is_active = i == app.model_picker_scope_idx;
+        let label = format!(" {} ", scope.label());
+        let style = if is_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_DIM).bg(bar_bg)
+        };
+        spans.push(Span::styled(label, style));
+        if i + 1 < app.model_picker_scopes.len() {
+            spans.push(Span::styled(" · ", Style::default().fg(COLOR_DIM).bg(bar_bg)));
+        }
+    }
+    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
+    f.render_widget(para, area);
 }
 
 fn render_model_search_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1298,7 +1335,13 @@ fn render_model_list_block(
     scroll = scroll.min(max_scroll);
     app.model_picker_scroll = scroll as u16;
 
-    let current = app.active().effective_model.clone();
+    // Highlight whichever model is pinned in the active scope. Falls
+    // back to the tab's resolved effective model so the picker still
+    // surfaces something useful when the Session scope has no pin.
+    let current = app
+        .active_scope_pin()
+        .map(str::to_string)
+        .unwrap_or_else(|| app.active().effective_model.clone());
     let end = (scroll + visible_rows).min(app.model_picker_filtered.len());
     // Header occupies y_off=1 (after the top border at 0); rows start at 2.
     let mut y_off: u16 = 2;
@@ -1373,10 +1416,15 @@ fn render_model_list_block(
 }
 
 fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let help_text = if app.model_picker_loading {
-        " type to filter | ↑↓ PgUp/Dn Home/End | Enter select | Esc cancel | fetching catalog…"
+    let scope_hint = if app.model_picker_scopes.len() > 1 {
+        " | Tab scope"
     } else {
-        " type to filter | ↑↓ PgUp/Dn Home/End | Enter select | Ctrl+R refresh | Ctrl+U clear | Esc cancel"
+        ""
+    };
+    let help_text = if app.model_picker_loading {
+        format!(" type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Esc cancel | fetching catalog…")
+    } else {
+        format!(" type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Ctrl+R refresh | Ctrl+U clear | Esc cancel")
     };
     let help = Paragraph::new(help_text).style(
         Style::default()

@@ -1000,7 +1000,10 @@ impl Server {
             let s = session.lock().await;
             let meta = s.read_meta().await;
             let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
-            let session_model = meta.model.clone();
+            // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
+            let session_model = meta
+                .resolve_model_for_agent(agent_name)
+                .map(str::to_string);
             let assembled = ContextBuilder::new(
                 s.entries(),
                 agent_name,
@@ -1016,11 +1019,11 @@ impl Server {
             .await;
             (session_model, assembled)
         };
-        // Effective model resolution: per-session pin (`/model X`,
-        // `SessionMeta.model`) wins over the agent's configured default.
-        // `runtime::execute` will then call `BackendManager::resolve_model_name`
+        // Effective model resolution: per-agent override (new) > session pin
+        // (`/model X`, `SessionMeta.model`) > agent's configured default.
+        // `runtime::execute` then calls `BackendManager::resolve_model_name`
         // to strip the backend prefix and fall back to the backend default
-        // when both are None.
+        // when all three are None.
         let effective_model = session_model.or(default_model);
 
         // Prepend the wake-prompt as a private System message. This is
@@ -1496,7 +1499,10 @@ impl Server {
                 let meta = s.read_meta().await;
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
-                let session_model = meta.model.clone();
+                // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
+                let session_model = meta
+                    .resolve_model_for_agent(&agent_name)
+                    .map(str::to_string);
                 let assembled =
                     ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
                         .with_tools(&tool_defs)
@@ -1508,9 +1514,8 @@ impl Server {
                         .await;
                 (session_model, assembled)
             };
-            // Per-session pin (`/model X` → `SessionMeta.model`) wins over
-            // the agent's configured default. See run_schedule_turn for the
-            // matching path on scheduled fires.
+            // Per-agent override > session pin > agent default. See
+            // `run_schedule_turn` for the matching path on scheduled fires.
             let effective_model = session_model.or(default_model);
 
             if assembled.truncated {

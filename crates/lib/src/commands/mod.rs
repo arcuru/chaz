@@ -213,6 +213,14 @@ pub enum Command {
 
     // --- LLM configuration (per-session) ---
     Model(Option<String>),
+    /// Per-agent model override scoped to the current session. `Some(id)`
+    /// pins that agent to the given model id; `None` clears the override
+    /// so the agent falls back to the session-wide pin / its own default.
+    /// `agent` matches `AgentRef.display_name` on the session meta.
+    AgentModel {
+        agent: String,
+        model: Option<String>,
+    },
     Role(Option<(String, Option<String>)>),
     SetBackend {
         name: String,
@@ -374,6 +382,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SharingStatus => sharing::sharing_status(ctx).await,
         Command::Extensions(action) => extensions::dispatch(action, ctx).await,
         Command::Model(arg) => session::model(arg, ctx).await,
+        Command::AgentModel { agent, model } => session::agent_model(&agent, model, ctx).await,
         Command::Role(arg) => session::role(arg, ctx).await,
         Command::SetBackend { name, url, api_key } => {
             session::set_backend(&name, &url, &api_key, ctx).await

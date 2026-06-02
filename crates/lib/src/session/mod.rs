@@ -22,6 +22,7 @@ use chrono::{DateTime, Utc};
 use eidetica::Database;
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::{error, info, warn};
 
 mod agents;
@@ -119,12 +120,33 @@ pub struct SessionMeta {
     #[serde(default)]
     pub agents: Vec<AgentRef>,
     pub host_agent_db_id: Option<String>,
+    /// Session-wide model pin. Applies to every agent in the session
+    /// unless overridden by an entry in `agent_models`.
     pub model: Option<String>,
+    /// Per-agent session overrides keyed by `AgentRef.display_name`.
+    /// An entry here beats `model` for that one agent; absence falls
+    /// through to the agent's own `default_model` and then the backend.
+    /// Stored as a JSON map in the meta DocStore under `agent_models`.
+    #[serde(default)]
+    pub agent_models: HashMap<String, String>,
     pub role_name: Option<String>,
     pub role_prompt: Option<String>,
     pub backend_name: Option<String>,
     pub backend_url: Option<String>,
     pub backend_key_ref: Option<String>,
+}
+
+impl SessionMeta {
+    /// Resolve which model should run for `agent_name`. Order:
+    /// per-agent override → session-wide pin. Returns `None` when neither
+    /// is set so the caller can fall back to the agent's `default_model`
+    /// and then the backend default.
+    pub fn resolve_model_for_agent(&self, agent_name: &str) -> Option<&str> {
+        self.agent_models
+            .get(agent_name)
+            .map(String::as_str)
+            .or(self.model.as_deref())
+    }
 }
 
 /// Registry index entry — exists for every session known to this instance.
@@ -359,12 +381,21 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         Err(_) => Vec::new(),
     };
 
+    let agent_models: HashMap<String, String> = match store.get_string("agent_models").await {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            warn!("Malformed agent_models map in SessionMeta, ignoring: {e}");
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    };
+
     SessionMeta {
         name: store.get_string("name").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
         agents,
         host_agent_db_id: store.get_string("host_agent_db_id").await.ok(),
         model: store.get_string("model").await.ok(),
+        agent_models,
         role_name: store.get_string("role_name").await.ok(),
         role_prompt: store.get_string("role_prompt").await.ok(),
         backend_name: store.get_string("backend_name").await.ok(),
@@ -399,6 +430,12 @@ where
     )
     .await?;
     write_field(&store, "model", current.model.as_deref()).await?;
+    if current.agent_models.is_empty() {
+        let _ = store.delete("agent_models").await;
+    } else {
+        let json = serde_json::to_string(&current.agent_models)?;
+        store.set_string("agent_models", json).await?;
+    }
     write_field(&store, "role_name", current.role_name.as_deref()).await?;
     write_field(&store, "role_prompt", current.role_prompt.as_deref()).await?;
     write_field(&store, "backend_name", current.backend_name.as_deref()).await?;
@@ -609,6 +646,64 @@ mod tests {
         assert_eq!(meta.agent_name.as_deref(), Some("legacy"));
         assert_eq!(meta.agents.len(), 1);
         assert_eq!(meta.agents[0].display_name, "modern");
+    }
+
+    #[tokio::test]
+    async fn session_meta_agent_models_round_trip() {
+        let (_instance, _user, db) = test_session_db().await;
+
+        update_meta_on_db(&db, |m| {
+            m.model = Some("anthropic/claude-opus-4.7".to_string());
+            m.agent_models
+                .insert("researcher".to_string(), "ring-1t".to_string());
+            m.agent_models
+                .insert("ava".to_string(), "anthropic/claude-opus-4.7".to_string());
+        })
+        .await
+        .unwrap();
+
+        let meta = read_meta_from_db(&db).await;
+        assert_eq!(meta.model.as_deref(), Some("anthropic/claude-opus-4.7"));
+        assert_eq!(meta.agent_models.get("researcher").map(String::as_str), Some("ring-1t"));
+        assert_eq!(meta.agent_models.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_meta_emptied_agent_models_clears_field() {
+        let (_instance, _user, db) = test_session_db().await;
+
+        update_meta_on_db(&db, |m| {
+            m.agent_models
+                .insert("ava".to_string(), "opus".to_string());
+        })
+        .await
+        .unwrap();
+        update_meta_on_db(&db, |m| m.agent_models.clear())
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&db).await;
+        assert!(meta.agent_models.is_empty());
+    }
+
+    #[test]
+    fn resolve_model_for_agent_precedence() {
+        // Per-agent override beats session pin. Absence falls through to
+        // the session pin. Both absent returns None so the runtime can
+        // fall back to the agent default and then the backend.
+        let mut meta = SessionMeta {
+            model: Some("session-pin".to_string()),
+            ..Default::default()
+        };
+        meta.agent_models
+            .insert("researcher".to_string(), "ring-1t".to_string());
+
+        assert_eq!(meta.resolve_model_for_agent("researcher"), Some("ring-1t"));
+        assert_eq!(meta.resolve_model_for_agent("ava"), Some("session-pin"));
+
+        meta.model = None;
+        assert_eq!(meta.resolve_model_for_agent("ava"), None);
+        assert_eq!(meta.resolve_model_for_agent("researcher"), Some("ring-1t"));
     }
 
     #[test]
