@@ -408,6 +408,14 @@ pub(super) struct App {
     /// active tab). Lets the Session-side category renderers read the meta
     /// without doing async work mid-frame. `None` outside Session Settings.
     pub(super) session_settings_snapshot: Option<SessionMetaSnapshot>,
+    /// Sub-cursor inside the Peer → Agents list. Cycles with ↑↓ while
+    /// that category is selected; clamped each frame to the live agent
+    /// count. Persists across category switches so the user lands back
+    /// where they were.
+    pub(super) peer_agents_cursor: usize,
+    /// Sub-cursor inside the Session → Agents list (`meta.agents`). Same
+    /// semantics as `peer_agents_cursor`.
+    pub(super) session_agents_cursor: usize,
     /// Mode to restore when the user hits Esc inside a Settings page.
     /// Set on entry to Settings; cleared on exit. One step deep — Settings
     /// pages don't nest into other modes that would need a real stack.
@@ -459,6 +467,8 @@ impl App {
             settings_return: None,
             peer_settings_index: 0,
             session_settings_index: 0,
+            peer_agents_cursor: 0,
+            session_agents_cursor: 0,
         }
     }
 

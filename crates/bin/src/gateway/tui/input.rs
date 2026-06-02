@@ -1163,23 +1163,35 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
     }
 }
 
-/// Key handler for `TuiMode::Settings`. Stage 1 ships category navigation
-/// only — the detail panes are placeholders, so there's nothing to dispatch
-/// out. `Tab`/`BackTab`/`↑`/`↓` cycle the sidebar; `Esc` returns to the mode
-/// that opened Settings (chat or session picker).
+/// Key handler for `TuiMode::Settings`. `Tab`/`BackTab` always cycle the
+/// sidebar; `↑`/`↓` route into the active category's inner list when one
+/// exists (Peer→Agents, Session→Agents), otherwise fall through to the
+/// sidebar. `Esc` returns to the mode that opened Settings.
 pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, scope: SettingsScope) {
     let n = app.settings_category_count(scope);
     if n == 0 {
         return;
     }
     let cur = app.settings_index(scope);
+    let inner_list_len = settings_inner_list_len(app, scope, cur);
+
     match key.code {
         KeyCode::Esc => app.close_settings(),
-        KeyCode::Tab | KeyCode::Down => {
-            app.set_settings_index(scope, (cur + 1) % n);
+        KeyCode::Tab => app.set_settings_index(scope, (cur + 1) % n),
+        KeyCode::BackTab => app.set_settings_index(scope, (cur + n - 1) % n),
+        KeyCode::Down => {
+            if let Some(len) = inner_list_len {
+                bump_inner_cursor(app, scope, cur, 1, len);
+            } else {
+                app.set_settings_index(scope, (cur + 1) % n);
+            }
         }
-        KeyCode::BackTab | KeyCode::Up => {
-            app.set_settings_index(scope, (cur + n - 1) % n);
+        KeyCode::Up => {
+            if let Some(len) = inner_list_len {
+                bump_inner_cursor(app, scope, cur, -1, len);
+            } else {
+                app.set_settings_index(scope, (cur + n - 1) % n);
+            }
         }
         KeyCode::Home => app.set_settings_index(scope, 0),
         KeyCode::End => app.set_settings_index(scope, n - 1),
@@ -1194,6 +1206,64 @@ pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, scope: SettingsS
         }
         _ => {}
     }
+}
+
+/// Returns the length of the inner-list owned by the active category, or
+/// `None` when no list is present (the category is static content or a
+/// placeholder). Drives whether `↑`/`↓` navigate the right pane or the
+/// sidebar.
+fn settings_inner_list_len(
+    app: &App,
+    scope: SettingsScope,
+    category_idx: usize,
+) -> Option<usize> {
+    use super::{PeerSettingsCategory, SessionSettingsCategory};
+    match scope {
+        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx)? {
+            PeerSettingsCategory::Agents => Some(peer_agent_count(app)),
+            _ => None,
+        },
+        SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx)? {
+            SessionSettingsCategory::Agents => app
+                .session_settings_snapshot
+                .as_ref()
+                .map(|s| s.agents.len()),
+            _ => None,
+        },
+    }
+}
+
+fn peer_agent_count(app: &App) -> usize {
+    // Set from outside via `App::set_peer_agent_count_hint`; for now we
+    // approximate from `agent_names`, which holds every agent registered
+    // on this peer's chaz_peer.
+    app.agent_names.len()
+}
+
+fn bump_inner_cursor(
+    app: &mut App,
+    scope: SettingsScope,
+    category_idx: usize,
+    delta: i32,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
+    use super::{PeerSettingsCategory, SessionSettingsCategory};
+    let cursor_ref: &mut usize = match scope {
+        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx) {
+            Some(PeerSettingsCategory::Agents) => &mut app.peer_agents_cursor,
+            _ => return,
+        },
+        SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx) {
+            Some(SessionSettingsCategory::Agents) => &mut app.session_agents_cursor,
+            _ => return,
+        },
+    };
+    let cur = (*cursor_ref).min(len.saturating_sub(1));
+    let n = len as i32;
+    *cursor_ref = (cur as i32 + delta).rem_euclid(n) as usize;
 }
 
 pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {

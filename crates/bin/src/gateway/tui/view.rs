@@ -1505,7 +1505,7 @@ fn ui_settings(
 fn render_peer_category(
     f: &mut ratatui::Frame,
     area: Rect,
-    _app: &App,
+    app: &App,
     category: PeerSettingsCategory,
     server: &Arc<Server>,
     backend: &BackendManager,
@@ -1513,8 +1513,145 @@ fn render_peer_category(
 ) {
     match category {
         PeerSettingsCategory::About => render_peer_about(f, area, server, backend, config),
+        PeerSettingsCategory::Agents => render_peer_agents(f, area, app, server, backend),
         _ => render_settings_detail_placeholder(f, area, category.label()),
     }
+}
+
+/// Peer → Agents (read-only). Top half is a one-line-per-agent list with
+/// a selection marker; bottom half is the expanded detail of the selected
+/// agent. ↑↓ moves the cursor (see `input::handle_settings_key`).
+fn render_peer_agents(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+) {
+    let mut names = server.agents().names();
+    names.sort();
+
+    let cursor = app.peer_agents_cursor.min(names.len().saturating_sub(1));
+
+    // List rows take ~1/3 of the right pane, detail gets the rest.
+    let list_h = ((area.height as usize / 3).max(3) as u16).min(area.height.saturating_sub(2));
+    let chunks = Layout::vertical([
+        Constraint::Length(list_h.max(1)),
+        Constraint::Min(1),
+    ])
+    .split(area);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(names.len() + 3);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Agents", theme::accent_bold()),
+        Span::styled(
+            format!("    {} known", names.len()),
+            Style::default().fg(theme::DIM),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ─────",
+        Style::default().fg(theme::DIM),
+    )]));
+
+    if names.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (no agents configured)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else {
+        for (i, name) in names.iter().enumerate() {
+            let agent = server.agents().get(name);
+            let resolved = agent
+                .as_ref()
+                .map(|a| backend.resolve_model_name(a.default_model.as_deref()))
+                .unwrap_or_default();
+            let model_label = if resolved.is_empty() {
+                "(no model)".to_string()
+            } else {
+                resolved
+            };
+            let is_selected = i == cursor;
+            let marker = if is_selected { "> " } else { "  " };
+            let style = if is_selected {
+                theme::selected()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{marker}{name:<14}  {model_label}"),
+                style,
+            )]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    // Detail pane — selected agent's fields, or a hint when no agents.
+    let detail = names
+        .get(cursor)
+        .and_then(|n| server.agents().get(n))
+        .map(|a| agent_detail_lines(&a))
+        .unwrap_or_else(|| {
+            vec![Line::from(vec![Span::styled(
+                "  (select an agent)",
+                Style::default().fg(theme::DIM),
+            )])]
+        });
+    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);
+}
+
+/// Per-agent detail block — name, default model, system-prompt preview,
+/// tool restrictions, can-spawn list, iteration cap, autonomous flag.
+fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
+    let default_model = a.default_model.as_deref().unwrap_or("(backend default)");
+    let tools = match &a.allowed_tools {
+        None => "all".to_string(),
+        Some(v) if v.is_empty() => "(none)".to_string(),
+        Some(v) => v.join(", "),
+    };
+    let can_spawn = if a.can_spawn.is_empty() {
+        "(none)".to_string()
+    } else {
+        a.can_spawn.join(", ")
+    };
+    let prompt_preview = if a.system_prompt.is_empty() {
+        "(empty)".to_string()
+    } else {
+        // First non-empty line, truncated for the inline view.
+        let first = a
+            .system_prompt
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        ellipsize(first.trim(), 80)
+    };
+    let max_iter = format!("{}", a.max_iterations);
+    let autonomous = if a.autonomous { "yes" } else { "no" };
+
+    vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("  {}", a.name),
+            theme::accent_bold(),
+        )]),
+        Line::from(""),
+        about_kv("  default model", default_model),
+        about_kv("  max iter", &max_iter),
+        about_kv("  autonomous", autonomous),
+        about_kv("  tools", &tools),
+        about_kv("  can spawn", &can_spawn),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  system prompt",
+            Style::default().fg(theme::DIM),
+        )]),
+        Line::from(vec![Span::styled(
+            format!("    {prompt_preview}"),
+            Style::default().fg(Color::White),
+        )]),
+    ]
 }
 
 /// Static peer info — version, paths, env summary. Pure read; refresh is
@@ -1569,8 +1706,10 @@ fn render_peer_about(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Single labelled row used by the About pane. Label dim, value white.
-fn about_kv<'a>(label: &'a str, value: &'a str) -> Line<'a> {
+/// Single labelled row used by the About / agent-detail panes. Owns its
+/// content (returns a `'static` line) so callers can build a vec of these
+/// without lifetime games with their local Strings.
+fn about_kv(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<18}"), Style::default().fg(theme::DIM)),
         Span::styled(value.to_string(), Style::default().fg(Color::White)),
