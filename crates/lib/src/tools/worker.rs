@@ -196,8 +196,13 @@ impl Tool for SpawnWorker {
                 None => ctx.tools.clone(),
             };
 
-            // Resolved values are passed via child session runtime; model and
-            // role_suffix propagation lands when budget propagation does (C.2).
+            // `resolved_model` and `role_suffix` are computed above for
+            // forward-compat but currently unused: propagating spawn-time
+            // overrides into the child's `SessionRuntime` needs a separate
+            // expansion of `register_child_session` (and matching pickup in
+            // `spawn_agent_task`). The budget plumbing handled by
+            // `ctx.iteration_budget` does not cover these — they're a
+            // distinct concern parked for follow-up.
             let _ = resolved_model;
             let _ = role_suffix;
 
