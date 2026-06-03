@@ -241,13 +241,6 @@ pub struct AgentConfig {
     /// `researcher`. A Worker is a configured one-shot LLM call with no
     /// identity of its own; entries it writes are signed by this Agent's key.
     pub workers: Option<Vec<WorkerConfig>>,
-    /// Deprecated — no longer used by the runtime. Will be removed in
-    /// Stage B of the Agent/Worker split. Workers replace the cross-Agent
-    /// spawn permission model: a worker is invocable iff it's listed under
-    /// the calling Agent's [`workers`] field.
-    pub can_spawn: Option<Vec<String>>,
-    /// Deprecated — see [`can_spawn`].
-    pub allowed_callers: Option<Vec<String>>,
     /// Maximum ReAct loop iterations (default: 10)
     pub max_iterations: Option<u32>,
     /// Whether this agent can run without user input (scheduled/schedule)

@@ -1969,7 +1969,7 @@ async fn write_peer_defaults(app: &mut App, server: &Arc<Server>, names: Vec<Str
 /// Stage 4 — re-read the on-disk chaz yaml, locate the named agent
 /// entry, build a fresh runtime `Agent` from it, and upsert into the
 /// in-memory `AgentRegistry`. Yaml owns the declarative fields
-/// (system_prompt, default_model, allowed_tools, can_spawn, presets,
+/// (system_prompt, default_model, allowed_tools, workers, presets,
 /// etc.); DB-side state for Living Agents is untouched — the agent's
 /// per-agent DB lives in its own subtree and is queried separately.
 ///

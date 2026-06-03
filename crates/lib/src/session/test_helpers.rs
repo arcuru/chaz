@@ -36,8 +36,6 @@ pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
         model: None,
         tools: None,
         workers: None,
-        can_spawn: None,
-        allowed_callers: None,
         max_iterations: None,
         autonomous: false,
         presets: None,

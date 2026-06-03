@@ -74,13 +74,6 @@ pub struct AgentDbConfig {
     /// Mirrors [`AgentConfig::workers`].
     #[serde(default)]
     pub workers: Vec<WorkerDbConfig>,
-    /// Deprecated — no longer used by the runtime. Will be removed in
-    /// Stage B of the Agent/Worker split.
-    #[serde(default)]
-    pub can_spawn: Vec<String>,
-    /// Deprecated — see [`Self::can_spawn`].
-    #[serde(default)]
-    pub allowed_callers: Vec<String>,
     pub max_iterations: Option<u32>,
     #[serde(default)]
     pub autonomous: bool,
@@ -142,8 +135,6 @@ impl AgentDbConfig {
                 .as_ref()
                 .map(|ws| ws.iter().map(WorkerDbConfig::from_worker_config).collect())
                 .unwrap_or_default(),
-            can_spawn: cfg.can_spawn.clone().unwrap_or_default(),
-            allowed_callers: cfg.allowed_callers.clone().unwrap_or_default(),
             max_iterations: cfg.max_iterations,
             autonomous: cfg.autonomous,
             presets: cfg.presets.clone().unwrap_or_default(),
@@ -814,8 +805,6 @@ mod tests {
             model: Some("sonnet".to_string()),
             tools: Some(vec!["get_time".into(), "calculate".into()]),
             workers: None,
-            can_spawn: None,
-            allowed_callers: None,
             max_iterations: Some(15),
             autonomous: false,
             presets: None,
@@ -836,8 +825,6 @@ mod tests {
             model: Some("opus".to_string()),
             tools: Some(vec!["web_fetch".into()]),
             workers: vec![],
-            can_spawn: vec!["writer".into()],
-            allowed_callers: vec![],
             max_iterations: Some(40),
             autonomous: true,
             presets: HashMap::new(),

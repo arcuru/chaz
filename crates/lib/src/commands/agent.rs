@@ -209,7 +209,7 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
 /// Supported `/agent new` and `/agent set` keys. Nested-structure fields
 /// (`grants`, `presets`) intentionally omitted — edit yaml template or add
 /// a dedicated command.
-const SUPPORTED_AGENT_FIELDS: &str = "model, tools, can_spawn, allowed_callers, autonomous, max_iterations, tool_profile, max_context_tokens, system_prompt, system_prompt_files";
+const SUPPORTED_AGENT_FIELDS: &str = "model, tools, autonomous, max_iterations, tool_profile, max_context_tokens, system_prompt, system_prompt_files";
 
 /// Apply a single `key=value` override to an `AgentDbConfig`. Used by
 /// `/agent new` (on a fresh config) and `/agent set` (on a DB-loaded one).
@@ -236,8 +236,6 @@ pub(super) fn apply_agent_field(
     match key {
         "model" => cfg.model = Some(value.to_string()),
         "tools" => cfg.tools = Some(comma_split(value)),
-        "can_spawn" => cfg.can_spawn = comma_split(value),
-        "allowed_callers" => cfg.allowed_callers = comma_split(value),
         "autonomous" => cfg.autonomous = parse_bool(value)?,
         "max_iterations" => {
             cfg.max_iterations = Some(
@@ -1231,21 +1229,17 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // /agent new — extended field coverage (can_spawn / allowed_callers / autonomous)
+    // /agent new — extended field coverage (autonomous)
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn agent_new_accepts_can_spawn_allowed_callers_autonomous() {
+    async fn agent_new_accepts_autonomous() {
         let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
 
         let cmd = Command::AgentNew {
             name: "alpha".to_string(),
-            overrides: vec![
-                ("can_spawn".into(), "beta,gamma".into()),
-                ("allowed_callers".into(), "chaz".into()),
-                ("autonomous".into(), "true".into()),
-            ],
+            overrides: vec![("autonomous".into(), "true".into())],
         };
         match dispatch(cmd, &ctx).await {
             CommandOutcome::Text(_) => {}
@@ -1254,11 +1248,6 @@ mod tests {
         }
 
         let agent = server.agents().get("alpha").unwrap();
-        assert_eq!(
-            agent.can_spawn,
-            vec!["beta".to_string(), "gamma".to_string()]
-        );
-        assert_eq!(agent.allowed_callers, vec!["chaz".to_string()]);
         assert!(agent.autonomous);
 
         // And persisted to the DB.
@@ -1266,8 +1255,6 @@ mod tests {
         let (db, _pk) = find_agent_db(&user, "alpha").await.unwrap();
         drop(user);
         let cfg = db.read_config().await.unwrap();
-        assert_eq!(cfg.can_spawn, vec!["beta".to_string(), "gamma".to_string()]);
-        assert_eq!(cfg.allowed_callers, vec!["chaz".to_string()]);
         assert!(cfg.autonomous);
     }
 

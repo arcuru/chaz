@@ -137,18 +137,6 @@ impl Tool for SpawnAgent {
 
             let agent_display = index_entry.display_name.clone();
 
-            // Permission check against yaml-backed AgentRegistry (can_spawn uses
-            // display names). Living Agents without a yaml entry are not
-            // spawnable via this tool yet — revisit once agent definitions
-            // can live entirely in DBs.
-            if !server.agents().can_spawn(&ctx.agent_name, &agent_display) {
-                return Err(format!(
-                    "Agent '{}' is not allowed to spawn '{}'",
-                    ctx.agent_name, agent_display
-                )
-                .into());
-            }
-
             let agent_def = server
                 .agents()
                 .get(&agent_display)

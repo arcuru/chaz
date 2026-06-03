@@ -1856,7 +1856,7 @@ fn render_peer_agents(
 }
 
 /// Per-agent detail block — name, default model, system-prompt preview,
-/// tool restrictions, can-spawn list, iteration cap, autonomous flag.
+/// tool restrictions, workers list, iteration cap, autonomous flag.
 fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
     let default_model = a.default_model.as_deref().unwrap_or("(backend default)");
     let tools = match &a.allowed_tools {
@@ -1864,10 +1864,12 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
         Some(v) if v.is_empty() => "(none)".to_string(),
         Some(v) => v.join(", "),
     };
-    let can_spawn = if a.can_spawn.is_empty() {
+    let workers = if a.workers.is_empty() {
         "(none)".to_string()
     } else {
-        a.can_spawn.join(", ")
+        let mut names: Vec<&str> = a.workers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names.join(", ")
     };
     let prompt_preview = if a.system_prompt.is_empty() {
         "(empty)".to_string()
@@ -1894,7 +1896,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
         about_kv("  max iter", &max_iter),
         about_kv("  autonomous", autonomous),
         about_kv("  tools", &tools),
-        about_kv("  can spawn", &can_spawn),
+        about_kv("  workers", &workers),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  system prompt",

@@ -400,8 +400,7 @@ impl Server {
     /// peer — preserves behavior for legacy agents without a DB.
     ///
     /// The rebuilt Agent is upserted back into the in-memory `AgentRegistry`
-    /// so subsequent `can_spawn` / `default_agent` / legacy lookups see the
-    /// refreshed config too.
+    /// so subsequent `default_agent` / `get` lookups see the refreshed config.
     pub async fn hydrate_agent_from_db(&self, agent: crate::agent::Agent) -> crate::agent::Agent {
         let Some(entry) = self.agent_index.find_by_name(&agent.name) else {
             return agent;
@@ -1821,8 +1820,7 @@ mod tests {
             system_prompt_files: vec![],
             default_model: Some("opus".to_string()),
             allowed_tools: None,
-            can_spawn: vec![],
-            allowed_callers: vec![],
+            workers: HashMap::new(),
             max_iterations: 999,
             autonomous: false,
             presets: HashMap::new(),
@@ -1883,8 +1881,7 @@ mod tests {
             system_prompt_files: vec![],
             default_model: Some("ghost".to_string()),
             allowed_tools: None,
-            can_spawn: vec![],
-            allowed_callers: vec![],
+            workers: HashMap::new(),
             max_iterations: 7,
             autonomous: false,
             presets: HashMap::new(),
@@ -2336,8 +2333,7 @@ mod tests {
             system_prompt_files: vec![],
             default_model: Some("test-model".to_string()),
             allowed_tools: None,
-            can_spawn: vec![],
-            allowed_callers: vec![],
+            workers: HashMap::new(),
             max_iterations: 1,
             autonomous: false,
             presets: HashMap::new(),

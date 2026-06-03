@@ -1,10 +1,13 @@
-use crate::config::{AgentConfig, AgentPreset, Config};
+use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
 use crate::grants::Grants;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::warn;
 
-/// Agent definition — system prompt, model preferences, tool visibility, and spawn permissions.
+/// Agent definition — first-class entity with persistent identity, sessions,
+/// schedules, memory, and a set of Worker templates this Agent can invoke.
+///
+/// See `~/brain/ava/research/chaz-ecosystem/conceptual-model.md` for the
+/// Peer / Agent / Worker / Resource model.
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,
@@ -13,10 +16,10 @@ pub struct Agent {
     pub default_model: Option<String>,
     /// Tool names this agent can use. None = all tools (no filtering).
     pub allowed_tools: Option<Vec<String>>,
-    /// Which agent definitions this agent can spawn.
-    pub can_spawn: Vec<String>,
-    /// Which agents are allowed to spawn this one. Empty = any with can_spawn permission.
-    pub allowed_callers: Vec<String>,
+    /// Worker templates this Agent can invoke via `spawn_worker`. Keyed by
+    /// Worker name (unique within the Agent). Lookup is scoped — Workers
+    /// are NOT in a global registry; each Agent sees only its own.
+    pub workers: HashMap<String, Worker>,
     /// Maximum ReAct loop iterations.
     pub max_iterations: u32,
     /// Whether this agent can run without user input.
@@ -32,6 +35,68 @@ pub struct Agent {
     pub grants: HashMap<String, Grants>,
 }
 
+/// Worker template owned by a single Agent. A Worker is a configured
+/// one-shot LLM call — a tool, from the perspective of the Agent that
+/// invokes it via `spawn_worker`.
+///
+/// Workers have no identity, no keys, and no persistent state of their
+/// own. Entries written during a Worker invocation are signed by the
+/// parent Agent's key. Optional fields fall back to the parent Agent's
+/// defaults at spawn time (Stage C wires the fallback).
+#[derive(Clone, Debug)]
+pub struct Worker {
+    pub name: String,
+    pub system_prompt: String,
+    pub system_prompt_files: Vec<PathBuf>,
+    /// Override the model. None = inherit parent Agent's default_model.
+    pub default_model: Option<String>,
+    /// Tool names this Worker may use. None = inherit parent Agent's
+    /// allowed_tools. When set, narrowed against the parent's list at
+    /// spawn time (intersection).
+    pub allowed_tools: Option<Vec<String>>,
+    /// Override max ReAct iterations. None = inherit parent's max_iterations.
+    pub max_iterations: Option<u32>,
+    /// Named override bundles selectable via the `preset` arg of `spawn_worker`.
+    pub presets: HashMap<String, AgentPreset>,
+}
+
+impl Worker {
+    pub fn from_worker_config(cfg: &WorkerConfig) -> Self {
+        Worker {
+            name: cfg.name.clone(),
+            system_prompt: cfg.system_prompt.clone().unwrap_or_default(),
+            system_prompt_files: cfg
+                .system_prompt_files
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            default_model: cfg.model.clone(),
+            allowed_tools: cfg.tools.clone(),
+            max_iterations: cfg.max_iterations,
+            presets: cfg.presets.clone().unwrap_or_default(),
+        }
+    }
+
+    pub fn from_worker_db_config(cfg: &crate::agent_db::WorkerDbConfig) -> Self {
+        Worker {
+            name: cfg.name.clone(),
+            system_prompt: cfg.system_prompt.clone(),
+            system_prompt_files: cfg
+                .system_prompt_files
+                .clone()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            default_model: cfg.model.clone(),
+            allowed_tools: cfg.tools.clone(),
+            max_iterations: cfg.max_iterations,
+            presets: cfg.presets.clone(),
+        }
+    }
+}
+
 /// Resolved overrides for a spawn_agent call.
 /// All fields are final values after applying: definition defaults → preset → inline overrides.
 pub struct ResolvedOverrides {
@@ -44,6 +109,13 @@ pub struct ResolvedOverrides {
 
 impl Agent {
     fn from_agent_config(agent_config: &AgentConfig, _config: &Config) -> Self {
+        let workers = agent_config
+            .workers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|wc| (wc.name.clone(), Worker::from_worker_config(wc)))
+            .collect();
         Agent {
             name: agent_config.name.clone(),
             system_prompt: agent_config.system_prompt.clone().unwrap_or_default(),
@@ -56,8 +128,7 @@ impl Agent {
                 .collect(),
             default_model: agent_config.model.clone(),
             allowed_tools: agent_config.tools.clone(),
-            can_spawn: agent_config.can_spawn.clone().unwrap_or_default(),
-            allowed_callers: agent_config.allowed_callers.clone().unwrap_or_default(),
+            workers,
             max_iterations: agent_config.max_iterations.unwrap_or(10),
             autonomous: agent_config.autonomous,
             presets: agent_config.presets.clone().unwrap_or_default(),
@@ -70,6 +141,11 @@ impl Agent {
     /// Build a runtime Agent from a Living Agent's DB config. Used by
     /// `/agent new` and `/agent import`.
     pub fn from_db_config(name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Self {
+        let workers = cfg
+            .workers
+            .iter()
+            .map(|wc| (wc.name.clone(), Worker::from_worker_db_config(wc)))
+            .collect();
         Agent {
             name: name.to_string(),
             system_prompt: cfg.system_prompt.clone(),
@@ -81,8 +157,7 @@ impl Agent {
                 .collect(),
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
-            can_spawn: cfg.can_spawn.clone(),
-            allowed_callers: cfg.allowed_callers.clone(),
+            workers,
             max_iterations: cfg.max_iterations.unwrap_or(10),
             autonomous: cfg.autonomous,
             presets: cfg.presets.clone(),
@@ -90,6 +165,13 @@ impl Agent {
             max_context_tokens: cfg.max_context_tokens,
             grants: cfg.grants.clone(),
         }
+    }
+
+    /// Resolve a Worker template by name within this Agent's scope. Returns
+    /// `None` if no Worker with that name is declared on this Agent — there
+    /// is no fallback to other Agents.
+    pub fn find_worker(&self, name: &str) -> Option<&Worker> {
+        self.workers.get(name)
     }
 
     /// Resolve overrides from a preset name and/or inline overrides.
@@ -189,11 +271,9 @@ impl AgentRegistry {
             .map(|ac| Agent::from_agent_config(ac, config))
             .collect();
 
-        let registry = Self {
+        Self {
             agents: std::sync::RwLock::new(agents),
-        };
-        registry.validate_references();
-        registry
+        }
     }
 
     /// Build a registry containing a single bare-bones agent named
@@ -209,8 +289,7 @@ impl AgentRegistry {
                 system_prompt_files: vec![],
                 default_model: None,
                 allowed_tools: None,
-                can_spawn: Vec::new(),
-                allowed_callers: Vec::new(),
+                workers: HashMap::new(),
                 max_iterations: 10,
                 autonomous: false,
                 presets: HashMap::new(),
@@ -231,8 +310,7 @@ impl AgentRegistry {
             system_prompt_files: vec![],
             default_model: None,
             allowed_tools: None,
-            can_spawn: Vec::new(),
-            allowed_callers: Vec::new(),
+            workers: HashMap::new(),
             max_iterations: 10,
             autonomous: false,
             presets: HashMap::new(),
@@ -270,32 +348,6 @@ impl AgentRegistry {
     pub fn names(&self) -> Vec<String> {
         let agents = self.agents.read().unwrap();
         agents.iter().map(|a| a.name.clone()).collect()
-    }
-
-    /// Check if a caller agent is allowed to spawn a target agent.
-    /// Both sides must agree: caller's can_spawn includes target,
-    /// AND target's allowed_callers includes caller (or is empty).
-    pub fn can_spawn(&self, caller_name: &str, target_name: &str) -> bool {
-        let agents = self.agents.read().unwrap();
-        let caller = match agents.iter().find(|a| a.name == caller_name) {
-            Some(a) => a,
-            None => return false,
-        };
-        let target = match agents.iter().find(|a| a.name == target_name) {
-            Some(a) => a,
-            None => return false,
-        };
-
-        // Caller must list target in can_spawn
-        if !caller.can_spawn.contains(&target_name.to_string()) {
-            return false;
-        }
-
-        // Target must list caller in allowed_callers (or have empty list = any)
-        if target.allowed_callers.is_empty() {
-            return true;
-        }
-        target.allowed_callers.contains(&caller_name.to_string())
     }
 
     /// Register a new agent at runtime. Rejects duplicates by display name.
@@ -353,44 +405,20 @@ impl AgentRegistry {
             .map(|ac| Agent::from_agent_config(ac, config))
     }
 
-    /// Validate that all names in can_spawn and allowed_callers reference existing agents.
-    fn validate_references(&self) {
-        let agents = self.agents.read().unwrap();
-        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-        for agent in agents.iter() {
-            for target in &agent.can_spawn {
-                if !names.contains(&target.as_str()) {
-                    warn!(
-                        "Agent '{}' references unknown agent '{}' in can_spawn",
-                        agent.name, target
-                    );
-                }
-            }
-            for caller in &agent.allowed_callers {
-                if !names.contains(&caller.as_str()) {
-                    warn!(
-                        "Agent '{}' references unknown agent '{}' in allowed_callers",
-                        agent.name, caller
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_agent(name: &str, can_spawn: Vec<&str>, allowed_callers: Vec<&str>) -> Agent {
+    fn make_agent(name: &str) -> Agent {
         Agent {
             name: name.to_string(),
             system_prompt: String::new(),
             system_prompt_files: vec![],
             default_model: None,
             allowed_tools: None,
-            can_spawn: can_spawn.into_iter().map(String::from).collect(),
-            allowed_callers: allowed_callers.into_iter().map(String::from).collect(),
+            workers: HashMap::new(),
             max_iterations: 10,
             autonomous: false,
             presets: HashMap::new(),
@@ -401,50 +429,8 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_permission_both_sides() {
-        let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![
-                make_agent("chaz", vec!["researcher"], vec![]),
-                make_agent("researcher", vec![], vec!["chaz"]),
-            ]),
-        };
-        assert!(registry.can_spawn("chaz", "researcher"));
-        assert!(!registry.can_spawn("researcher", "chaz"));
-    }
-
-    #[test]
-    fn test_spawn_permission_open_callers() {
-        let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![
-                make_agent("chaz", vec!["coder"], vec![]),
-                make_agent("coder", vec![], vec![]), // empty = anyone
-            ]),
-        };
-        assert!(registry.can_spawn("chaz", "coder"));
-    }
-
-    #[test]
-    fn test_spawn_permission_denied_by_callers() {
-        let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![
-                make_agent("chaz", vec!["mayor"], vec![]),
-                make_agent("mayor", vec![], vec!["researcher"]), // only researcher can call
-            ]),
-        };
-        assert!(!registry.can_spawn("chaz", "mayor"));
-    }
-
-    #[test]
-    fn test_spawn_unknown_target() {
-        let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec!["nonexistent"], vec![])]),
-        };
-        assert!(!registry.can_spawn("chaz", "nonexistent"));
-    }
-
-    #[test]
     fn test_resolve_overrides_defaults() {
-        let agent = make_agent("test", vec![], vec![]);
+        let agent = make_agent("test");
         let resolved = agent.resolve_overrides(None, None, None, None);
         assert_eq!(resolved.model, None);
         assert_eq!(resolved.max_iterations, 10);
@@ -454,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_resolve_overrides_preset() {
-        let mut agent = make_agent("test", vec![], vec![]);
+        let mut agent = make_agent("test");
         agent.default_model = Some("sonnet".to_string());
         agent.presets.insert(
             "deep".to_string(),
@@ -475,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_resolve_overrides_inline_wins() {
-        let mut agent = make_agent("test", vec![], vec![]);
+        let mut agent = make_agent("test");
         agent.presets.insert(
             "deep".to_string(),
             AgentPreset {
@@ -516,14 +502,14 @@ mod tests {
     #[test]
     fn registry_register_adds_and_rejects_duplicates() {
         let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
+            agents: std::sync::RwLock::new(vec![make_agent("chaz")]),
         };
-        let new_agent = make_agent("researcher", vec![], vec![]);
+        let new_agent = make_agent("researcher");
         registry.register(new_agent).unwrap();
         assert!(registry.get("researcher").is_some());
 
         // Duplicate rejected.
-        let dup = make_agent("researcher", vec![], vec![]);
+        let dup = make_agent("researcher");
         assert!(registry.register(dup).is_err());
 
         // Names list reflects registration.
@@ -537,8 +523,6 @@ mod tests {
         let cfg = crate::agent_db::AgentDbConfig {
             model: Some("opus".to_string()),
             tools: Some(vec!["get_time".into()]),
-            can_spawn: vec!["alpha".into()],
-            allowed_callers: vec!["beta".into()],
             max_iterations: Some(42),
             tool_profile: Some("deep".to_string()),
             max_context_tokens: Some(200_000),
@@ -552,11 +536,10 @@ mod tests {
             agent.allowed_tools.as_deref(),
             Some(&["get_time".to_string()][..])
         );
-        assert_eq!(agent.can_spawn, vec!["alpha".to_string()]);
-        assert_eq!(agent.allowed_callers, vec!["beta".to_string()]);
         assert_eq!(agent.max_iterations, 42);
         assert_eq!(agent.tool_profile.as_deref(), Some("deep"));
         assert_eq!(agent.max_context_tokens, Some(200_000));
+        assert!(agent.workers.is_empty());
     }
 
     #[test]
@@ -566,7 +549,38 @@ mod tests {
         assert_eq!(agent.name, "fresh");
         assert_eq!(agent.max_iterations, 10);
         assert!(agent.allowed_tools.is_none());
-        assert!(agent.can_spawn.is_empty());
+        assert!(agent.workers.is_empty());
+    }
+
+    #[test]
+    fn agent_from_db_config_populates_workers() {
+        let cfg = crate::agent_db::AgentDbConfig {
+            workers: vec![
+                crate::agent_db::WorkerDbConfig {
+                    name: "researcher".into(),
+                    system_prompt: "Cite sources.".into(),
+                    max_iterations: Some(20),
+                    ..Default::default()
+                },
+                crate::agent_db::WorkerDbConfig {
+                    name: "librarian".into(),
+                    model: Some("gpt-4".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let agent = Agent::from_db_config("ava", &cfg);
+        assert_eq!(agent.workers.len(), 2);
+
+        let researcher = agent.find_worker("researcher").expect("researcher");
+        assert_eq!(researcher.system_prompt, "Cite sources.");
+        assert_eq!(researcher.max_iterations, Some(20));
+
+        let librarian = agent.find_worker("librarian").expect("librarian");
+        assert_eq!(librarian.default_model.as_deref(), Some("gpt-4"));
+
+        assert!(agent.find_worker("not-here").is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -576,14 +590,13 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_entry() {
         let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
+            agents: std::sync::RwLock::new(vec![make_agent("chaz")]),
         };
-        let mut updated = make_agent("chaz", vec!["researcher"], vec![]);
+        let mut updated = make_agent("chaz");
         updated.default_model = Some("opus".to_string());
         registry.upsert(updated);
         let got = registry.get("chaz").unwrap();
         assert_eq!(got.default_model.as_deref(), Some("opus"));
-        assert_eq!(got.can_spawn, vec!["researcher".to_string()]);
         // Still one entry total (upsert didn't append a duplicate).
         assert_eq!(registry.names().len(), 1);
     }
@@ -591,9 +604,9 @@ mod tests {
     #[test]
     fn upsert_inserts_when_absent() {
         let registry = AgentRegistry {
-            agents: std::sync::RwLock::new(vec![make_agent("chaz", vec![], vec![])]),
+            agents: std::sync::RwLock::new(vec![make_agent("chaz")]),
         };
-        registry.upsert(make_agent("beta", vec![], vec![]));
+        registry.upsert(make_agent("beta"));
         assert_eq!(registry.names().len(), 2);
         assert!(registry.get("beta").is_some());
     }
