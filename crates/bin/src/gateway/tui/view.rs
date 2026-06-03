@@ -1827,10 +1827,29 @@ fn render_peer_agents(
             } else {
                 Style::default().fg(Color::White)
             };
+            let worker_count = agent.as_ref().map(|a| a.workers.len()).unwrap_or(0);
+            let worker_badge = if worker_count == 0 {
+                String::new()
+            } else {
+                format!("  [{worker_count} workers]")
+            };
             lines.push(Line::from(vec![Span::styled(
-                format!("{marker}{name:<14}  {model_label}"),
+                format!("{marker}{name:<14}  {model_label}{worker_badge}"),
                 style,
             )]));
+            // Render Workers as nested decorative rows. Cursor still indexes
+            // Agents only — these don't move the selection.
+            if let Some(agent) = agent {
+                let mut worker_names: Vec<&str> =
+                    agent.workers.keys().map(String::as_str).collect();
+                worker_names.sort_unstable();
+                for wname in worker_names {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("      └ {wname}"),
+                        Style::default().fg(theme::DIM),
+                    )]));
+                }
+            }
         }
     }
 
@@ -1855,8 +1874,10 @@ fn render_peer_agents(
     f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);
 }
 
-/// Per-agent detail block — name, default model, system-prompt preview,
-/// tool restrictions, workers list, iteration cap, autonomous flag.
+/// Per-agent detail block — Agent fields then a nested sub-block for each
+/// Worker template the Agent owns. Workers inherit the Agent's defaults
+/// where their own fields are unset; "(inherit)" is shown so the
+/// resolution path is visible.
 fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
     let default_model = a.default_model.as_deref().unwrap_or("(backend default)");
     let tools = match &a.allowed_tools {
@@ -1864,17 +1885,9 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
         Some(v) if v.is_empty() => "(none)".to_string(),
         Some(v) => v.join(", "),
     };
-    let workers = if a.workers.is_empty() {
-        "(none)".to_string()
-    } else {
-        let mut names: Vec<&str> = a.workers.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        names.join(", ")
-    };
     let prompt_preview = if a.system_prompt.is_empty() {
         "(empty)".to_string()
     } else {
-        // First non-empty line, truncated for the inline view.
         let first = a
             .system_prompt
             .lines()
@@ -1885,7 +1898,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
     let max_iter = format!("{}", a.max_iterations);
     let autonomous = if a.autonomous { "yes" } else { "no" };
 
-    vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
             format!("  {}", a.name),
@@ -1896,7 +1909,6 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
         about_kv("  max iter", &max_iter),
         about_kv("  autonomous", autonomous),
         about_kv("  tools", &tools),
-        about_kv("  workers", &workers),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  system prompt",
@@ -1906,7 +1918,66 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
             format!("    {prompt_preview}"),
             Style::default().fg(Color::White),
         )]),
-    ]
+    ];
+
+    // Workers sub-block — each Worker rendered as a small indented detail
+    // group. Unset override fields render as "(inherit)" to show the
+    // fallback path to the Agent.
+    lines.push(Line::from(""));
+    let worker_header = if a.workers.is_empty() {
+        "  workers  (none)".to_string()
+    } else {
+        format!("  workers  ({})", a.workers.len())
+    };
+    lines.push(Line::from(vec![Span::styled(
+        worker_header,
+        Style::default().fg(theme::DIM),
+    )]));
+
+    let mut worker_names: Vec<&str> = a.workers.keys().map(String::as_str).collect();
+    worker_names.sort_unstable();
+    for wname in worker_names {
+        let w = match a.workers.get(wname) {
+            Some(w) => w,
+            None => continue,
+        };
+        let w_model = w
+            .default_model
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(inherit)".to_string());
+        let w_tools = match &w.allowed_tools {
+            None => "(inherit)".to_string(),
+            Some(v) if v.is_empty() => "(none)".to_string(),
+            Some(v) => v.join(", "),
+        };
+        let w_max_iter = w
+            .max_iterations
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "(inherit)".to_string());
+        let w_prompt_preview = if w.system_prompt.is_empty() {
+            "(inherit)".to_string()
+        } else {
+            let first = w
+                .system_prompt
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            ellipsize(first.trim(), 76)
+        };
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("    └ {wname}"),
+            theme::accent_bold(),
+        )]));
+        lines.push(about_kv("        model", &w_model));
+        lines.push(about_kv("        max iter", &w_max_iter));
+        lines.push(about_kv("        tools", &w_tools));
+        lines.push(about_kv("        prompt", &w_prompt_preview));
+    }
+
+    lines
 }
 
 /// Static peer info — version, paths, env summary. Pure read; refresh is
