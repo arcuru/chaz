@@ -15,9 +15,11 @@ use tracing::{error, info, warn};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct ChazArgs {
-    /// Path to config file
+    /// Path to config file. When unset, falls back to
+    /// `$XDG_CONFIG_HOME/chaz/config.yaml` (typically
+    /// `~/.config/chaz/config.yaml`).
     #[arg(short, long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     /// Run in TUI mode (stdin/stdout) instead of Matrix
     #[arg(long)]
@@ -64,6 +66,27 @@ struct UsageArgs {
     active_only: bool,
 }
 
+/// Resolve the config path: explicit `--config` wins; otherwise fall back to
+/// `$XDG_CONFIG_HOME/chaz/config.yaml` (typically `~/.config/chaz/config.yaml`).
+/// Errors with a helpful message when neither is available.
+fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    let default = dirs::config_dir()
+        .map(|d| d.join("chaz").join("config.yaml"))
+        .ok_or_else(|| anyhow::anyhow!("could not determine user config directory"))?;
+    if default.exists() {
+        Ok(default)
+    } else {
+        anyhow::bail!(
+            "no --config provided and no default config at {}\n\
+             create that file or pass --config <path>",
+            default.display()
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = ChazArgs::parse();
@@ -72,7 +95,9 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--tui and --cli are mutually exclusive");
     }
 
-    let mut file = File::open(&args.config)?;
+    let config_path = resolve_config_path(args.config.as_deref())?;
+
+    let mut file = File::open(&config_path)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
@@ -146,8 +171,8 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    info!(config = %args.config.display(), tui = args.tui, "Starting chaz");
-    info!("Config loaded from {}", args.config.display());
+    info!(config = %config_path.display(), tui = args.tui, "Starting chaz");
+    info!("Config loaded from {}", config_path.display());
 
     // Initialize eidetica with SQLite backend for persistent storage
     let eidetica_db_path = state_dir
@@ -750,7 +775,7 @@ async fn main() -> anyhow::Result<()> {
         gateway.run(server).await
     } else if args.tui {
         let gateway = gateway::tui::TuiGateway::new(config, secret_store)
-            .with_config_path(args.config.clone());
+            .with_config_path(config_path.clone());
         gateway.run(server).await
     } else {
         let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
@@ -1001,4 +1026,34 @@ async fn run_usage_subcommand(
         print!("{}", session::usage::render_text(&rollup));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_config_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_config_arg_wins() {
+        let p = PathBuf::from("/tmp/whatever.yaml");
+        let resolved = resolve_config_path(Some(&p)).unwrap();
+        assert_eq!(resolved, p);
+    }
+
+    #[test]
+    fn missing_default_errors_with_path_hint() {
+        // Point XDG_CONFIG_HOME at a tmp dir with no chaz/config.yaml so the
+        // fallback misses and we get the structured error.
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test process; `dirs::config_dir` reads
+        // XDG_CONFIG_HOME without caching.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let err = resolve_config_path(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("config.yaml") && msg.contains("--config"),
+            "unhelpful error: {msg}"
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
 }

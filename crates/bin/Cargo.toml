@@ -38,3 +38,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 insta = "1.41"
+tempfile.workspace = true

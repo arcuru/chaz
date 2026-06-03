@@ -26,6 +26,10 @@ chaz --config config.yaml --tui
 chaz --config config.yaml --cli "Summarize today's stand-up."
 ```
 
+`--config` is optional: when omitted, chaz falls back to
+`$XDG_CONFIG_HOME/chaz/config.yaml` (typically `~/.config/chaz/config.yaml`).
+Drop the file there and you can just run `chaz`, `chaz --tui`, etc.
+
 See [Getting Started](user_guide/getting_started.md) for detailed setup instructions.
 
 ## How It Works
