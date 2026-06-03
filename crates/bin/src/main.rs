@@ -413,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
     let mut extension_hub = extension::ExtensionHub::new();
     extension_hub.reserve_builtin_commands(commands::BUILTIN_COMMAND_NAMES.iter().copied());
 
-    // SpawnAgent / SpawnTask route through the server — a single OnceLock
+    // SpawnAgent / SpawnWorker route through the server — a single OnceLock
     // is shared; it's set once after Server::new below. The core extension
     // takes ownership of the cell and constructs the spawn tools.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());

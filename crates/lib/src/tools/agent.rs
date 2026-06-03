@@ -21,7 +21,7 @@ use crate::security::SecurityContext;
 ///
 /// Use for delegating focused work to a persistent agent whose memory and
 /// config survive across runs. For one-shot, ephemeral work with no
-/// persistent identity, use `spawn_task`.
+/// persistent identity, use `spawn_worker`.
 pub struct SpawnAgent {
     pub server: Arc<OnceLock<Arc<Server>>>,
     pub backend: BackendManager,
@@ -32,7 +32,7 @@ impl Tool for SpawnAgent {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "spawn_agent".to_string(),
-            description: "Delegate a task to a persistent agent. Creates a child session, attaches the agent by its stable identity (display name or DB ID), runs it with the given task, and returns the result. Use for agents with long-lived memory and config (e.g. 'researcher', 'coder'). For one-shot ephemeral work, use spawn_task.".to_string(),
+            description: "Delegate a task to a persistent agent. Creates a child session, attaches the agent by its stable identity (display name or DB ID), runs it with the given task, and returns the result. Use for agents with long-lived memory and config (e.g. 'researcher', 'coder'). For one-shot delegated work, use spawn_worker.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

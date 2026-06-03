@@ -590,7 +590,7 @@ impl Server {
     /// If `parent_session_db_id` is provided, wires a `DelegatedTreeRef`
     /// (max = Admin(0)) from the child's auth settings back to the parent —
     /// any key with Admin on the parent inherits Admin on the child
-    /// transparently. `spawn_agent`/`spawn_task` rely on this so the
+    /// transparently. `spawn_agent`/`spawn_worker` rely on this so the
     /// invoking session's supervisor authority carries into the child.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_child_session(

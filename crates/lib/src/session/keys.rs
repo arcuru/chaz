@@ -149,10 +149,11 @@ impl SessionRegistry {
     }
 
     /// Generate a fresh ephemeral keypair on this peer's `User` and return the
-    /// pubkey. Used by `spawn_task` for one-shot runs:
-    /// the new key is authorized on a child session, runs the task, then
-    /// revoked. The DB retains the revoked key's signatures as an audit
-    /// record but no new writes can be made under that key.
+    /// pubkey. Intended for one-shot signers that get authorized on a child
+    /// session, run, then are revoked — the DB retains their signatures as an
+    /// audit record but no new writes can be made under the key. Not currently
+    /// used by the in-tree spawn tools (Workers sign as the parent Agent); kept
+    /// for future tools that need a per-invocation identity.
     pub async fn new_ephemeral_key(
         &self,
         label: &str,
@@ -162,9 +163,9 @@ impl SessionRegistry {
         Ok(pubkey)
     }
 
-    /// Authorize a pubkey with `Permission::Write(power)` on a session. Used
-    /// by `spawn_task` to grant the ephemeral key write access to its child
-    /// session before the ReAct loop runs.
+    /// Authorize a pubkey with `Permission::Write(power)` on a session.
+    /// General-purpose: used wherever a fresh signer needs to be granted
+    /// write access on a session before it can append entries.
     pub async fn grant_write_on_session(
         &self,
         session_db_id: &str,
@@ -584,9 +585,8 @@ impl SessionRegistry {
         Ok((req.tree_id.clone(), req))
     }
 
-    /// Revoke a pubkey on a session. Used by `spawn_task` after the task
-    /// completes — historical entries signed by the key remain verifiable,
-    /// but no new entries can be written.
+    /// Revoke a pubkey on a session. Historical entries signed by the key
+    /// remain verifiable, but no new entries can be written under it.
     pub async fn revoke_key_on_session(
         &self,
         session_db_id: &str,

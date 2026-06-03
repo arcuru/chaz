@@ -204,7 +204,7 @@ impl SessionRegistry {
     /// eidetica's delegation resolver — no key copying, no refresh needed (the
     /// validator reads the parent's live tips at validation time).
     ///
-    /// Used by `spawn_agent` / `spawn_task`: supervisor
+    /// Used by `spawn_agent` / `spawn_worker`: supervisor
     /// authority on the invoking session carries into the spawned child.
     pub async fn create_child_session(
         &self,

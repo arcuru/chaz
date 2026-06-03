@@ -8,9 +8,9 @@ mod memory;
 mod schedule;
 mod search;
 mod shell;
-mod task;
 mod time;
 mod web;
+mod worker;
 
 pub use agent::SpawnAgent;
 pub use calculate::Calculate;
@@ -23,6 +23,6 @@ pub(crate) use memory::{search_memory, search_memory_structured, write_memory_en
 pub use schedule::{ScheduleAdd, ScheduleList, ScheduleModify, ScheduleOnce, ScheduleRemove};
 pub use search::{SearchBackend, WebSearch};
 pub use shell::ShellExec;
-pub use task::SpawnTask;
 pub use time::GetTime;
 pub use web::WebFetch;
+pub use worker::SpawnWorker;

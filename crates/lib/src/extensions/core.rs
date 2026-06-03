@@ -1,8 +1,8 @@
-//! Core-tool bundle — `shell`, `compact`, `spawn_agent`, `spawn_task`.
+//! Core-tool bundle — `shell`, `compact`, `spawn_agent`, `spawn_worker`.
 //!
 //! These are too tightly coupled to the server to live in main.rs as
 //! direct registrations now that everything else flows through extensions
-//! — `SpawnAgent`/`SpawnTask` need a late-bound `Arc<Server>` (filled in
+//! — `SpawnAgent`/`SpawnWorker` need a late-bound `Arc<Server>` (filled in
 //! after `Server::new` returns), and `Compact` / `ShellExec` are the
 //! always-available baseline that no session should ever lose.
 //!
@@ -16,7 +16,7 @@ use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::security::SecurityContext;
 use crate::server::Server;
-use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnTask};
+use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnWorker};
 use std::sync::{Arc, OnceLock};
 
 pub struct CoreExtension {
@@ -96,7 +96,7 @@ impl ExtensionInstance for CoreInstance {
                 backend: self.backend.clone(),
                 security: self.security.clone(),
             }),
-            Arc::new(SpawnTask {
+            Arc::new(SpawnWorker {
                 server: self.spawn_server_cell.clone(),
                 backend: self.backend.clone(),
                 security: self.security.clone(),
