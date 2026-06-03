@@ -1484,7 +1484,19 @@ fn ui_settings(
             .map(|c| c.label())
             .collect(),
     };
-    widgets::sidebar(f, sidebar_area, &labels, selected);
+    let sidebar_focused = matches!(app.settings_focus, super::SettingsFocus::Sidebar);
+    widgets::sidebar(f, sidebar_area, &labels, selected, sidebar_focused);
+    // Click regions for each sidebar row so users can mouse-switch
+    // categories. One terminal line per item, starting at sidebar_area.y.
+    for i in 0..labels.len().min(sidebar_area.height as usize) {
+        app.click_regions.push(ClickRegion {
+            x: sidebar_area.x,
+            y: sidebar_area.y + i as u16,
+            w: sidebar_area.width,
+            h: 1,
+            target: ClickTarget::SettingsSidebarItem(i),
+        });
+    }
 
     match scope {
         SettingsScope::Peer => {
@@ -1524,27 +1536,41 @@ fn ui_settings(
 
 /// Per-category status hint shown at the bottom of the Settings page.
 /// Categories that own action keys advertise them here so users don't
-/// have to remember which page exposes which actions.
+/// have to remember which page exposes which actions. Wording varies
+/// by focus so the user sees which keys are live right now.
 fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
     let cur = app.settings_index(scope);
+    let detail = matches!(app.settings_focus, super::SettingsFocus::Detail);
     match scope {
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(cur) {
             Some(SessionSettingsCategory::Agents) => {
-                " Tab category · ↑↓ select · [a] add · [d] remove · Esc back "
+                if detail {
+                    " ↑↓ select · ← back · [a] add · [d] remove · Esc back "
+                } else {
+                    " ↑↓/Tab category · → list · [a] add · [d] remove · Esc back "
+                }
             }
             Some(SessionSettingsCategory::Models) => {
-                " Tab category · Enter open picker · Esc back "
+                " ↑↓/Tab category · Enter open picker · Esc back "
             }
-            _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
+            _ => " ↑↓/Tab category · 1-9 jump · Esc back ",
         },
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cur) {
             Some(PeerSettingsCategory::Agents) => {
-                " Tab category · ↑↓ select · [r] reload yaml · Esc back "
+                if detail {
+                    " ↑↓ select · ← back · [r] reload yaml · Esc back "
+                } else {
+                    " ↑↓/Tab category · → list · [r] reload yaml · Esc back "
+                }
             }
             Some(PeerSettingsCategory::Defaults) => {
-                " Tab category · ↑↓ select · [a]/[d] · Ctrl+↑↓ reorder · Esc back "
+                if detail {
+                    " ↑↓ select · ← back · [a]/[d] · Ctrl+↑↓ reorder · Esc back "
+                } else {
+                    " ↑↓/Tab category · → list · [a]/[d] · Ctrl+↑↓ reorder · Esc back "
+                }
             }
-            _ => " Tab/↑↓ category · 1-9 jump · Esc back ",
+            _ => " ↑↓/Tab category · 1-9 jump · Esc back ",
         },
     }
 }
@@ -1555,7 +1581,7 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
 fn render_peer_category(
     f: &mut ratatui::Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     category: PeerSettingsCategory,
     server: &Arc<Server>,
     backend: &BackendManager,
@@ -1578,14 +1604,13 @@ fn render_peer_category(
 fn render_peer_defaults(
     f: &mut ratatui::Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     server: &Arc<Server>,
 ) {
     let known: std::collections::HashSet<String> =
         server.agents().names().into_iter().collect();
-    let cursor = app
-        .peer_defaults_cursor
-        .min(app.peer_defaults.len().saturating_sub(1));
+    let defaults_count = app.peer_defaults.len();
+    let cursor = app.peer_defaults_cursor.min(defaults_count.saturating_sub(1));
 
     let mut lines: Vec<Line> = vec![
         Line::from(""),
@@ -1644,6 +1669,23 @@ fn render_peer_defaults(
     )]));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+
+    // Per-row click regions. Header is 4 lines (blank, title, dashes,
+    // blank); each default is one line after that.
+    let rows_y0 = area.y.saturating_add(4);
+    for i in 0..defaults_count {
+        let y = rows_y0.saturating_add(i as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        app.click_regions.push(ClickRegion {
+            x: area.x,
+            y,
+            w: area.width,
+            h: 1,
+            target: ClickTarget::SettingsDetailRow(i),
+        });
+    }
 }
 
 /// Peer → Backends (read-only). One row per configured backend: name,
@@ -1771,7 +1813,7 @@ fn bridge_row(name: &str, status: &str) -> Line<'static> {
 fn render_peer_agents(
     f: &mut ratatui::Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     server: &Arc<Server>,
     backend: &BackendManager,
 ) {
@@ -1803,6 +1845,11 @@ fn render_peer_agents(
         Style::default().fg(theme::DIM),
     )]));
 
+    // Map each agent index to the line offset where its row lands, so
+    // click regions can target the right row even with variable-height
+    // worker nesting.
+    let mut agent_line_offsets: Vec<u16> = Vec::with_capacity(names.len());
+
     if names.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no agents configured)",
@@ -1833,6 +1880,7 @@ fn render_peer_agents(
             } else {
                 format!("  [{worker_count} workers]")
             };
+            agent_line_offsets.push(lines.len() as u16);
             lines.push(Line::from(vec![Span::styled(
                 format!("{marker}{name:<14}  {model_label}{worker_badge}"),
                 style,
@@ -1854,6 +1902,24 @@ fn render_peer_agents(
     }
 
     f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    // Per-agent click regions. Skip rows that fall outside the list pane
+    // (the Paragraph clips them too — no point in a hit region you can't
+    // see).
+    let list_bottom = chunks[0].y.saturating_add(chunks[0].height);
+    for (i, offset) in agent_line_offsets.iter().enumerate() {
+        let y = chunks[0].y.saturating_add(*offset);
+        if y >= list_bottom {
+            break;
+        }
+        app.click_regions.push(ClickRegion {
+            x: chunks[0].x,
+            y,
+            w: chunks[0].width,
+            h: 1,
+            target: ClickTarget::SettingsDetailRow(i),
+        });
+    }
 
     // Detail pane — selected agent's fields, or a hint when no agents.
     let mut detail = names
@@ -2049,7 +2115,7 @@ fn about_kv(label: &str, value: &str) -> Line<'static> {
 fn render_session_category(
     f: &mut ratatui::Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     category: SessionSettingsCategory,
     _server: &Arc<Server>,
     backend: &BackendManager,
@@ -2067,7 +2133,7 @@ fn render_session_category(
 fn render_session_agents(
     f: &mut ratatui::Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     backend: &BackendManager,
 ) {
     let snapshot = match app.session_settings_snapshot.as_ref() {
@@ -2077,9 +2143,8 @@ fn render_session_agents(
             return;
         }
     };
-    let cursor = app
-        .session_agents_cursor
-        .min(snapshot.agents.len().saturating_sub(1));
+    let agent_count = snapshot.agents.len();
+    let cursor = app.session_agents_cursor.min(agent_count.saturating_sub(1));
 
     let mut lines: Vec<Line> = vec![
         Line::from(""),
@@ -2141,6 +2206,23 @@ fn render_session_agents(
     )]));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+
+    // One click region per agent row (header is 4 lines: blank, title,
+    // dashes, blank). Click focuses the detail pane and moves the cursor.
+    let rows_y0 = area.y.saturating_add(4);
+    for i in 0..agent_count {
+        let y = rows_y0.saturating_add(i as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        app.click_regions.push(ClickRegion {
+            x: area.x,
+            y,
+            w: area.width,
+            h: 1,
+            target: ClickTarget::SettingsDetailRow(i),
+        });
+    }
 }
 
 /// Static snapshot of the active session — name, id, created_at, message

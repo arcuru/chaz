@@ -114,6 +114,18 @@ pub(super) enum SettingsScope {
     Session,
 }
 
+/// Which pane in a Settings page currently owns arrow-key input. Sidebar is
+/// the default on entry; Right / Enter / a sidebar click sets it. Detail
+/// takes over after Right / Enter into a category that owns an inner list
+/// (Session→Agents, Peer→Agents, Peer→Defaults) or after a click inside
+/// that list. Tab / BackTab cycle categories regardless of focus and snap
+/// focus back to Sidebar so the user never gets pinned inside the inner list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsFocus {
+    Sidebar,
+    Detail,
+}
+
 /// Categories listed in the Peer Settings sidebar. Ordering here is the
 /// display order. Stage 1 leaves every category as a `(coming soon)`
 /// placeholder; subsequent stages fill in the detail panes.
@@ -308,6 +320,14 @@ pub(super) enum ClickTarget {
     ToggleEntryExpanded(usize),
     /// Select model picker row `i` (index into `App::model_list`).
     ModelPickerSelect(usize),
+    /// Jump to Settings sidebar category `i` and pin focus to the sidebar.
+    /// Index is into `PeerSettingsCategory::ALL` or `SessionSettingsCategory::ALL`
+    /// depending on the active scope.
+    SettingsSidebarItem(usize),
+    /// Click inside the active category's inner list — sets focus to the
+    /// detail pane and moves the per-category cursor to row `i`. Only
+    /// emitted for categories that own an inner list.
+    SettingsDetailRow(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -514,6 +534,10 @@ pub(super) struct App {
     /// Index into `SessionSettingsCategory::ALL` of the active category in
     /// Session Settings.
     pub(super) session_settings_index: usize,
+    /// Which pane in the active Settings page owns ↑↓ / Enter input.
+    /// Reset to `Sidebar` on `open_settings`; flipped by Right / Enter,
+    /// Left, or a click that lands inside the corresponding region.
+    pub(super) settings_focus: SettingsFocus,
 }
 
 impl App {
@@ -563,6 +587,7 @@ impl App {
             settings_status: None,
             settings_config_path: None,
             model_picker_caller: TuiMode::Chat,
+            settings_focus: SettingsFocus::Sidebar,
         }
     }
 
@@ -574,6 +599,7 @@ impl App {
             return;
         }
         self.settings_return = Some(from);
+        self.settings_focus = SettingsFocus::Sidebar;
         self.mode = TuiMode::Settings(scope);
     }
 

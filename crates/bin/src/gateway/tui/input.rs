@@ -8,8 +8,8 @@ use chaz_core::gateway::ApprovalDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
-    App, ChatAction, ClickTarget, Completion, Overlay, SettingsPrompt, SettingsPromptIntent,
-    SettingsScope, TuiMode, show_error, show_system_msg,
+    App, ChatAction, ClickTarget, Completion, Overlay, SettingsFocus, SettingsPrompt,
+    SettingsPromptIntent, SettingsScope, TuiMode, show_error, show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -417,8 +417,56 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 app.model_picker_index = i;
             }
         }
+        ClickTarget::SettingsSidebarItem(i) => {
+            // Mouse-switch a Settings category. Pins focus to the sidebar
+            // so the new category's arrow-key behavior is predictable.
+            if let TuiMode::Settings(scope) = app.mode {
+                let n = app.settings_category_count(scope);
+                if i < n {
+                    app.set_settings_index(scope, i);
+                    app.settings_focus = SettingsFocus::Sidebar;
+                    app.settings_status = None;
+                }
+            }
+        }
+        ClickTarget::SettingsDetailRow(i) => {
+            // Click inside the active category's inner list. Focuses the
+            // detail pane and moves the appropriate per-category cursor.
+            if let TuiMode::Settings(scope) = app.mode {
+                let cat = app.settings_index(scope);
+                set_settings_detail_cursor(app, scope, cat, i);
+                app.settings_focus = SettingsFocus::Detail;
+                app.settings_status = None;
+            }
+        }
     }
     None
+}
+
+/// Move the per-category inner cursor to `row`, clamped to the live list
+/// length. Used by mouse clicks on detail rows; the keyboard path uses
+/// `bump_inner_cursor` instead because it always moves by ±1.
+fn set_settings_detail_cursor(app: &mut App, scope: SettingsScope, cat: usize, row: usize) {
+    let Some(len) = settings_inner_list_len(app, scope, cat) else {
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    let clamped = row.min(len - 1);
+    use super::{PeerSettingsCategory, SessionSettingsCategory};
+    match scope {
+        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cat) {
+            Some(PeerSettingsCategory::Agents) => app.peer_agents_cursor = clamped,
+            Some(PeerSettingsCategory::Defaults) => app.peer_defaults_cursor = clamped,
+            _ => {}
+        },
+        SettingsScope::Session => {
+            if let Some(SessionSettingsCategory::Agents) = SessionSettingsCategory::ALL.get(cat) {
+                app.session_agents_cursor = clamped;
+            }
+        }
+    }
 }
 
 fn apply_approval(app: &mut App, decision: ApprovalDecision) {
@@ -1198,11 +1246,15 @@ pub(super) enum SettingsKey {
     WritePeerDefaults(Vec<String>),
 }
 
-/// Key handler for `TuiMode::Settings`. `Tab`/`BackTab` always cycle the
-/// sidebar; `↑`/`↓` route into the active category's inner list when one
-/// exists (Peer→Agents, Session→Agents), otherwise fall through to the
-/// sidebar. `Esc` returns to the mode that opened Settings (or, when a
-/// prompt is active, dismisses the prompt first).
+/// Key handler for `TuiMode::Settings`. Navigation is focus-aware:
+///   - Sidebar focus (default): `↑`/`↓` cycle categories, `→` / `Enter`
+///     dive into the active category's inner list (only when it owns one),
+///     `Esc` exits Settings.
+///   - Detail focus: `↑`/`↓` move the inner cursor, `←` returns focus to
+///     the sidebar, `Esc` exits Settings.
+///
+/// `Tab`/`BackTab` always cycle categories and snap focus back to the
+/// sidebar — a stable escape hatch from any inner-list state.
 pub(super) fn handle_settings_key(
     app: &mut App,
     key: KeyEvent,
@@ -1323,6 +1375,8 @@ pub(super) fn handle_settings_key(
             | KeyCode::BackTab
             | KeyCode::Up
             | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
             | KeyCode::Home
             | KeyCode::End
             | KeyCode::Enter
@@ -1332,64 +1386,109 @@ pub(super) fn handle_settings_key(
         app.settings_status = None;
     }
 
+    let focus = app.settings_focus;
+
     match key.code {
         KeyCode::Esc => {
             app.close_settings();
             SettingsKey::None
         }
+        // Tab / BackTab always cycle categories and force focus back to
+        // the sidebar, so the user can always get unstuck regardless of
+        // which pane currently owns arrow keys.
         KeyCode::Tab => {
             app.set_settings_index(scope, (cur + 1) % n);
+            app.settings_focus = SettingsFocus::Sidebar;
             SettingsKey::None
         }
         KeyCode::BackTab => {
             app.set_settings_index(scope, (cur + n - 1) % n);
+            app.settings_focus = SettingsFocus::Sidebar;
             SettingsKey::None
         }
-        KeyCode::Down => {
-            if let Some(len) = inner_list_len {
-                bump_inner_cursor(app, scope, cur, 1, len);
-            } else {
+        KeyCode::Down => match focus {
+            SettingsFocus::Sidebar => {
                 app.set_settings_index(scope, (cur + 1) % n);
+                SettingsKey::None
+            }
+            SettingsFocus::Detail => {
+                if let Some(len) = inner_list_len {
+                    bump_inner_cursor(app, scope, cur, 1, len);
+                }
+                SettingsKey::None
+            }
+        },
+        KeyCode::Up => match focus {
+            SettingsFocus::Sidebar => {
+                app.set_settings_index(scope, (cur + n - 1) % n);
+                SettingsKey::None
+            }
+            SettingsFocus::Detail => {
+                if let Some(len) = inner_list_len {
+                    bump_inner_cursor(app, scope, cur, -1, len);
+                }
+                SettingsKey::None
+            }
+        },
+        // Right enters the detail pane when the active category owns an
+        // inner list with at least one row. No-op otherwise — there's
+        // nothing for arrows to land on.
+        KeyCode::Right => {
+            if matches!(focus, SettingsFocus::Sidebar)
+                && inner_list_len.is_some_and(|len| len > 0)
+            {
+                app.settings_focus = SettingsFocus::Detail;
             }
             SettingsKey::None
         }
-        KeyCode::Up => {
-            if let Some(len) = inner_list_len {
-                bump_inner_cursor(app, scope, cur, -1, len);
-            } else {
-                app.set_settings_index(scope, (cur + n - 1) % n);
+        // Left pops focus back to the sidebar from the detail pane.
+        KeyCode::Left => {
+            if matches!(focus, SettingsFocus::Detail) {
+                app.settings_focus = SettingsFocus::Sidebar;
             }
             SettingsKey::None
         }
         KeyCode::Home => {
             app.set_settings_index(scope, 0);
+            app.settings_focus = SettingsFocus::Sidebar;
             SettingsKey::None
         }
         KeyCode::End => {
             app.set_settings_index(scope, n - 1);
+            app.settings_focus = SettingsFocus::Sidebar;
             SettingsKey::None
         }
         // Number keys 1..=9 jump straight to that category (only when the
         // index exists). Saves a stab at Tab when you know where you want
-        // to be.
+        // to be. Snaps focus back to the sidebar so the new category
+        // starts in its default state.
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let idx = (c as usize) - ('1' as usize);
             if idx < n {
                 app.set_settings_index(scope, idx);
+                app.settings_focus = SettingsFocus::Sidebar;
             }
             SettingsKey::None
         }
         KeyCode::Enter => {
+            // Session→Models: Enter opens the picker regardless of focus —
+            // it's the page's primary action.
             if matches!(scope, SettingsScope::Session)
                 && matches!(
                     super::SessionSettingsCategory::ALL.get(cur),
                     Some(super::SessionSettingsCategory::Models)
                 )
             {
-                SettingsKey::OpenModelPicker
-            } else {
-                SettingsKey::None
+                return SettingsKey::OpenModelPicker;
             }
+            // Otherwise Enter on the sidebar dives into the detail pane
+            // when one exists — same effect as Right.
+            if matches!(focus, SettingsFocus::Sidebar)
+                && inner_list_len.is_some_and(|len| len > 0)
+            {
+                app.settings_focus = SettingsFocus::Detail;
+            }
+            SettingsKey::None
         }
         _ => SettingsKey::None,
     }

@@ -75,13 +75,28 @@ fn header_title_only() {
 }
 
 #[test]
-fn sidebar_five_items_third_selected() {
+fn sidebar_five_items_third_selected_unfocused() {
     let s = snapshot(16, 6, |f, area| {
         sidebar(
             f,
             area,
             &["Agents", "Backends", "Defaults", "Bridges", "About"],
             2,
+            false,
+        );
+    });
+    insta::assert_snapshot!(s);
+}
+
+#[test]
+fn sidebar_five_items_third_selected_focused() {
+    let s = snapshot(16, 6, |f, area| {
+        sidebar(
+            f,
+            area,
+            &["Agents", "Backends", "Defaults", "Bridges", "About"],
+            2,
+            true,
         );
     });
     insta::assert_snapshot!(s);
