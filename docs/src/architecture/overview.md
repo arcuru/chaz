@@ -62,7 +62,12 @@ Gateways bridge between a transport (Matrix, terminal) and the session database.
 
 Gateways are transport-specific but the server is transport-agnostic. Adding a new gateway (Slack, Discord, HTTP API) requires implementing the `Gateway` trait and writing/reading session entries.
 
-**Source**: `crates/bin/src/gateway/` (Matrix: `matrix/mod.rs`, TUI: `tui.rs`)
+**Design stance — a gateway is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode." That framing has two consequences:
+
+- The CLI surface picks the *user interface* (TUI default, `-p` one-shot), and gateways activate based on what they actually expose. `--matrix` is the explicit short-term opt-in; the longer-term direction is that Matrix runs alongside the TUI in the same process whenever `matrix:` is configured, so a TUI user and Matrix users can both drive the same hosted session. (Tracked as a follow-up; today they are still mutually exclusive blocking gateways.)
+- Future gateways (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in *that* mode." `chaz` the binary is always a TUI on a terminal first.
+
+**Source**: `crates/bin/src/gateway/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
 
 ### Server
 
