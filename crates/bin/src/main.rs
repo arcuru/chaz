@@ -15,28 +15,31 @@ use tracing::{error, info, warn};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct ChazArgs {
+    /// Print the response and exit — non-interactive one-shot. By default
+    /// each invocation creates a fresh ephemeral session; pass --session
+    /// NAME to reuse one. Without --print, chaz launches the TUI.
+    #[arg(short = 'p', long = "print")]
+    print: bool,
+
+    /// Run the Matrix gateway instead of the TUI. Connects to the
+    /// homeserver configured in `matrix:` and serves sessions to rooms.
+    #[arg(long, conflicts_with = "print")]
+    matrix: bool,
+
     /// Path to config file. When unset, falls back to
     /// `$XDG_CONFIG_HOME/chaz/config.yaml` (typically
     /// `~/.config/chaz/config.yaml`).
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Run in TUI mode (stdin/stdout) instead of Matrix
-    #[arg(long)]
-    tui: bool,
-
-    /// Run a single CLI prompt and exit. By default each invocation creates
-    /// a fresh ephemeral session; pass --session NAME to reuse one.
-    #[arg(long)]
-    cli: bool,
-
-    /// Named session to reuse with --cli (find-or-create). When omitted,
-    /// --cli creates a fresh session per invocation.
-    #[arg(long, requires = "cli", value_name = "NAME")]
+    /// Named session to reuse with --print (find-or-create). When omitted,
+    /// --print creates a fresh session per invocation.
+    #[arg(long, requires = "print", value_name = "NAME")]
     session: Option<String>,
 
-    /// The prompt to send when --cli is used.
-    #[arg(required_if_eq("cli", "true"))]
+    /// Initial prompt. With --print, sent as the one-shot message
+    /// (required). Without --print, pre-fills the TUI input box on launch.
+    #[arg(required_if_eq("print", "true"))]
     prompt: Option<String>,
 
     #[command(subcommand)]
@@ -91,8 +94,11 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
 async fn main() -> anyhow::Result<()> {
     let args = ChazArgs::parse();
 
-    if args.tui && args.cli {
-        anyhow::bail!("--tui and --cli are mutually exclusive");
+    if args.matrix && args.prompt.is_some() {
+        anyhow::bail!(
+            "--matrix does not accept a positional prompt — Matrix gateways receive \
+             input from rooms, not the CLI"
+        );
     }
 
     let config_path = resolve_config_path(args.config.as_deref())?;
@@ -133,20 +139,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
     //
-    // - TUI: stdout belongs to ratatui, so logs go to a rolling file
-    //   (the alt-screen buffer gets corrupted by stray writes).
-    // - CLI: stdout is reserved for the model's reply so it can be piped /
-    //   captured cleanly. Logs go to a rolling file mirroring the TUI path.
-    // - Matrix (default): logs go to stdout, where systemd / docker / etc.
-    //   collect them via their usual mechanisms.
+    // - Matrix: logs go to stdout, where systemd / docker / etc. collect
+    //   them via their usual mechanisms.
+    // - TUI (default): stdout belongs to ratatui, so logs go to a rolling
+    //   file (the alt-screen buffer gets corrupted by stray writes).
+    // - --print: stdout is reserved for the model's reply so it can be piped
+    //   / captured cleanly. Logs go to a rolling file mirroring the TUI path.
     //
     // File-mode rotations: daily, keep the last 7 days. Tail the file in
     // another terminal to follow live.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _file_log_guard = if args.tui || args.cli {
+    let _file_log_guard = if !args.matrix {
         let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-        let prefix = if args.tui { "chaz-tui" } else { "chaz-cli" };
+        let prefix = if args.print { "chaz-cli" } else { "chaz-tui" };
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(prefix)
@@ -161,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
             .init();
         eprintln!(
             "chaz {} logs: {}/{}.log (daily, keeps 7 days)",
-            if args.tui { "TUI" } else { "CLI" },
+            if args.print { "CLI" } else { "TUI" },
             log_dir.display(),
             prefix,
         );
@@ -171,7 +177,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    info!(config = %config_path.display(), tui = args.tui, "Starting chaz");
+    info!(
+        config = %config_path.display(),
+        matrix = args.matrix,
+        print = args.print,
+        "Starting chaz"
+    );
     info!("Config loaded from {}", config_path.display());
 
     // Initialize eidetica with SQLite backend for persistent storage
@@ -194,12 +205,12 @@ async fn main() -> anyhow::Result<()> {
     // by default (stable peer identity, no address config needed). If
     // sync_listen is configured, also bind HTTP for traditional access.
     //
-    // Skipped in --cli mode: starting iroh, registering with the n0 relay,
+    // Skipped in --print mode: starting iroh, registering with the n0 relay,
     // and spinning up the 300s periodic-sync engine all run *after* exit
     // for one-shot CLI invocations. The setup is pure overhead and exposes
     // a public sync endpoint that lives for the lifetime of the process —
     // a few seconds. Long-lived TUI/Matrix modes still get full sync.
-    if !args.cli {
+    if !args.print {
         instance.enable_sync().await?;
         if let Some(sync) = instance.sync() {
             use eidetica::sync::transports::iroh::IrohTransport;
@@ -408,9 +419,9 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .collect();
 
-    // In CLI mode there is no interactive approval; add the configured
+    // In --print mode there is no interactive approval; add the configured
     // (or default) CLI auto-approved tools so shell/write_file work.
-    if args.cli {
+    if args.print {
         let cli_tools = config
             .cli
             .as_ref()
@@ -696,9 +707,9 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the routine engine. Loads global routines from
     // `chaz_peer.routines`, then walks every hosted session and
     // registers its session-scoped routines (heartbeats + scheduler
-    // fires). Skipped in --cli mode: a single ReAct loop doesn't need
+    // fires). Skipped in --print mode: a single ReAct loop doesn't need
     // the engine running.
-    if !args.cli {
+    if !args.print {
         let engine =
             routine::RoutineEngine::new(chaz_peer.clone(), Some(server.extensions().clone()))
                 .await?;
@@ -760,25 +771,30 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Run the selected gateway
-    let mode = if args.cli {
+    // Run the selected gateway. TUI is the default; `--print` runs a
+    // one-shot CLI; `--matrix` runs the matrix daemon. With the TUI, a
+    // positional `prompt` pre-fills the input box on launch.
+    let mode = if args.print {
         "cli"
-    } else if args.tui {
-        "tui"
-    } else {
+    } else if args.matrix {
         "matrix"
+    } else {
+        "tui"
     };
     info!(mode, "Starting gateway");
-    let result = if args.cli {
-        let prompt = args.prompt.clone().expect("--cli requires PROMPT");
+    let result = if args.print {
+        let prompt = args.prompt.clone().expect("--print requires PROMPT");
         let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt, args.session);
         gateway.run(server).await
-    } else if args.tui {
-        let gateway = gateway::tui::TuiGateway::new(config, secret_store)
-            .with_config_path(config_path.clone());
+    } else if args.matrix {
+        let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
         gateway.run(server).await
     } else {
-        let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
+        let mut gateway = gateway::tui::TuiGateway::new(config, secret_store)
+            .with_config_path(config_path.clone());
+        if let Some(prompt) = args.prompt {
+            gateway = gateway.with_initial_prompt(prompt);
+        }
         gateway.run(server).await
     };
 

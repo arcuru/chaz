@@ -50,6 +50,12 @@ pub struct TuiGateway {
     /// guessing at the path. `None` allowed for hosts that don't have a
     /// file-backed config (tests, in-process spawns).
     config_path: Option<std::path::PathBuf>,
+    /// Optional text to pre-fill the input box with on launch. Mirrors
+    /// claude/pi: `chaz "hello"` opens the TUI with "hello" already in the
+    /// composer so the user can review and hit Enter. When set, the
+    /// session-picker auto-open is skipped — the user clearly wants to
+    /// type/send, not navigate.
+    initial_prompt: Option<String>,
 }
 
 impl TuiGateway {
@@ -58,6 +64,7 @@ impl TuiGateway {
             config,
             secrets,
             config_path: None,
+            initial_prompt: None,
         }
     }
 
@@ -65,6 +72,11 @@ impl TuiGateway {
     /// agent yaml at runtime.
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_path = Some(path);
+        self
+    }
+
+    pub fn with_initial_prompt(mut self, prompt: String) -> Self {
+        self.initial_prompt = Some(prompt);
         self
     }
 }
@@ -1113,6 +1125,10 @@ impl Gateway for TuiGateway {
         let initial_tab = build_tab(&server, &backend, session_db, session_db_id).await;
         let mut app = App::new(agent_names, initial_tab);
         app.settings_config_path = self.config_path.clone();
+        if let Some(prompt) = self.initial_prompt.as_ref() {
+            app.input = prompt.clone();
+            app.cursor = app.input.len();
+        }
 
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -1126,8 +1142,10 @@ impl Gateway for TuiGateway {
         // When prior sessions exist, open straight into the picker so the
         // user picks one (or the New session row) instead of always landing
         // in the default session. A fresh install — only the just-created
-        // empty default session — still goes directly to chat.
-        {
+        // empty default session — still goes directly to chat. Also
+        // skipped when an initial prompt was supplied — the user already
+        // signalled "I want to send something now," not "show me sessions."
+        if self.initial_prompt.is_none() {
             let (sid, sdb, agent, sname) = {
                 let t = app.active();
                 (

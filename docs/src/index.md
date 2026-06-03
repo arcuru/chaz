@@ -16,19 +16,22 @@ Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects t
 ## Quick Start
 
 ```bash
-# Matrix bot
+# Local TUI (default)
 chaz --config config.yaml
 
-# Local TUI
-chaz --config config.yaml --tui
+# Pre-fill the TUI input box with a starting prompt
+chaz --config config.yaml "Summarize today's stand-up."
 
-# Single-shot CLI (scriptable; one ReAct turn then exit)
-chaz --config config.yaml --cli "Summarize today's stand-up."
+# Single-shot print mode (scriptable; one ReAct turn then exit)
+chaz --config config.yaml -p "Summarize today's stand-up."
+
+# Matrix bot
+chaz --config config.yaml --matrix
 ```
 
 `--config` is optional: when omitted, chaz falls back to
 `$XDG_CONFIG_HOME/chaz/config.yaml` (typically `~/.config/chaz/config.yaml`).
-Drop the file there and you can just run `chaz`, `chaz --tui`, etc.
+Drop the file there and you can just run `chaz`.
 
 See [Getting Started](user_guide/getting_started.md) for detailed setup instructions.
 

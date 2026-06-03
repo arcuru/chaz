@@ -1,9 +1,15 @@
 # TUI Mode
 
-The TUI (Terminal User Interface) provides a local chat interface for testing, debugging, and session management without Matrix.
+The TUI (Terminal User Interface) is the default surface. It provides a local chat interface for testing, debugging, and session management without Matrix.
 
 ```bash
-chaz --config config.yaml --tui
+chaz --config config.yaml
+```
+
+You can pre-fill the input box with a starting prompt by passing it as a positional argument:
+
+```bash
+chaz --config config.yaml "what's on my plate today?"
 ```
 
 ## Interface Layout

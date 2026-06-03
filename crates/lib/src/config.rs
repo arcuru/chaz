@@ -61,7 +61,7 @@ pub struct Config {
     /// Embedding backend used to populate `embeddings:<model-id>` subtrees
     /// alongside memory writes. Omit to run lexical-only recall.
     pub embedding: Option<EmbeddingConfig>,
-    /// CLI-specific configuration (single-shot --cli mode)
+    /// Print-mode configuration (single-shot `-p` / `--print` mode)
     pub cli: Option<CliConfig>,
     /// Per-extension agent allowlists for the `AgentStateAdmin` cap.
     /// Each entry maps an extension name (e.g. `"schedule"`) to the

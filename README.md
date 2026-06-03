@@ -41,20 +41,39 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 
 ## Running
 
-### Matrix Mode
+### TUI (default)
 
-Connect to Matrix rooms and respond to messages:
+The terminal interface launches when you run `chaz` with no other mode flag:
 
 ```bash
 chaz --config config.yaml
 ```
 
-### TUI Mode
-
-Local terminal interface for testing, debugging, and session management:
+You can pass an initial prompt as a positional argument; it pre-fills the
+input box so you can review and send it:
 
 ```bash
-chaz --config config.yaml --tui
+chaz "summarize today's stand-up"
+```
+
+### One-shot — `-p` / `--print`
+
+Send a single prompt, print the response, and exit. Useful for pipes and
+scripts:
+
+```bash
+chaz -p "summarize today's stand-up"
+```
+
+Each invocation creates a fresh ephemeral session by default. Pass
+`--session NAME` to reuse one across invocations (find-or-create).
+
+### Matrix gateway — `--matrix`
+
+Connect to Matrix rooms and respond to messages:
+
+```bash
+chaz --config config.yaml --matrix
 ```
 
 #### TUI Commands

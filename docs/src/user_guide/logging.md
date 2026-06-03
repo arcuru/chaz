@@ -4,16 +4,16 @@ Chaz uses the [tracing](https://docs.rs/tracing) crate for structured logging. D
 
 ## Where Logs Go
 
-The sink depends on the gateway mode, because the TUI and `--cli` modes need to keep stdout clean for their own output:
+The sink depends on the gateway mode, because the TUI and print modes need to keep stdout clean for their own output:
 
 | Mode               | Default destination                                      |
 | ------------------ | -------------------------------------------------------- |
-| Matrix (default)   | stdout (collected by systemd / docker / your supervisor) |
-| `--tui`            | `<state_dir>/chaz-tui.log` (daily-rotated, keeps 7 days) |
-| `--cli`            | `<state_dir>/chaz-cli.log` (daily-rotated, keeps 7 days) |
+| TUI (default)      | `<state_dir>/chaz-tui.log` (daily-rotated, keeps 7 days) |
+| `-p` / `--print`   | `<state_dir>/chaz-cli.log` (daily-rotated, keeps 7 days) |
+| `--matrix`         | stdout (collected by systemd / docker / your supervisor) |
 | `chaz usage` (CLI) | stderr (stdout is the rollup output)                     |
 
-`state_dir` comes from `state_dir:` in the config or the platform XDG state dir (typically `~/.local/state/chaz`). The startup banner prints the exact log path for the TUI/CLI cases. Tail with `tail -f <state_dir>/chaz-tui.log`.
+`state_dir` comes from `state_dir:` in the config or the platform XDG state dir (typically `~/.local/state/chaz`). The startup banner prints the exact log path for the TUI/print cases. Tail with `tail -f <state_dir>/chaz-tui.log`.
 
 ## Controlling Verbosity
 
@@ -21,16 +21,16 @@ Set the `RUST_LOG` environment variable:
 
 ```bash
 # Default: info level and above
-chaz --config config.yaml --tui
+chaz --config config.yaml
 
 # Debug: detailed operational info (tool results, LLM traffic)
-RUST_LOG=debug chaz --config config.yaml --tui
+RUST_LOG=debug chaz --config config.yaml
 
 # Errors only
-RUST_LOG=error chaz --config config.yaml --tui
+RUST_LOG=error chaz --config config.yaml
 
 # Per-module filtering
-RUST_LOG=chaz_core::runtime=debug,chaz_core::security=warn chaz --config config.yaml --tui
+RUST_LOG=chaz_core::runtime=debug,chaz_core::security=warn chaz --config config.yaml
 ```
 
 ## What Gets Logged
@@ -81,17 +81,17 @@ Verbose output useful for development and troubleshooting:
 
 ## Redirecting to a File
 
-For Matrix mode (logs default to stdout), redirect to capture them:
+For `--matrix` (logs default to stdout), redirect to capture them:
 
 ```bash
 # Background with log file
-RUST_LOG=info nohup chaz --config config.yaml > chaz.log 2>&1 &
+RUST_LOG=info nohup chaz --config config.yaml --matrix > chaz.log 2>&1 &
 
 # Follow logs
 tail -f chaz.log
 ```
 
-TUI and `--cli` modes already log to a daily-rotated file in `state_dir` (see above) — no redirect needed. To follow live, tail that file in another terminal.
+TUI and `-p` / `--print` modes already log to a daily-rotated file in `state_dir` (see above) — no redirect needed. To follow live, tail that file in another terminal.
 
 ## Security Audit Trail
 

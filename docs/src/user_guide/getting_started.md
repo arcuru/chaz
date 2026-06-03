@@ -13,7 +13,7 @@ This guide walks you through setting up and running chaz.
 ### Nix (Recommended)
 
 ```bash
-nix run github:arcuru/chaz -- --config config.yaml --tui
+nix run github:arcuru/chaz -- --config config.yaml
 ```
 
 ### From Source
@@ -77,35 +77,41 @@ export OPENROUTER_API_KEY="sk-or-..."
 
 ## Running the TUI
 
-The TUI is the easiest way to get started:
+The TUI is the default — just run chaz with no other mode flag:
 
 ```bash
-chaz --config config.yaml --tui
+chaz --config config.yaml
 ```
 
 You'll see a terminal interface with an input bar at the bottom and a status bar showing the current session and agent. Type a message and press Enter to chat.
+
+You can also pass an initial prompt as a positional argument; it pre-fills the input box so you can review and send it:
+
+```bash
+chaz --config config.yaml "Summarize the last meeting notes."
+```
 
 Type `/help` to see available commands.
 
 ## Running the Matrix Bot
 
 ```bash
-chaz --config config.yaml
+chaz --config config.yaml --matrix
 ```
 
 The bot will log in to Matrix, accept room invites from allowed users, and respond to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages or messages that @-mention the bot.
 
 See [Matrix Bot](matrix.md) for details.
 
-## Single-shot CLI
+## Single-shot print mode
 
-For scripted use or scheduling, run a single prompt and exit:
+For scripted use or scheduling, run a single prompt and exit with `-p` / `--print`:
 
 ```bash
-chaz --config config.yaml --cli "Summarize the last meeting notes."
+chaz --config config.yaml -p "Summarize the last meeting notes."
 ```
 
-There is no interactive approval — tools requiring approval are auto-denied unless they're in the CLI's auto-approved list (default: `shell`, `write_file`; override with the `cli:` config block). Pass `--session NAME` to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (`chaz-cli.log`); only the agent's reply goes to stdout so the output is pipe-friendly.
+There is no interactive approval — tools requiring approval are auto-denied unless they're in the print-mode auto-approved list (default: `shell`, `write_file`; override with the `cli:` config block). Pass `--session NAME` to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (`chaz-cli.log`); only the agent's reply goes to stdout so the output is pipe-friendly.
 
 ## Aggregated cost / usage
 
@@ -122,7 +128,7 @@ Walks every session in the state directory and aggregates LLM token/cost metadat
 If something isn't working, increase log verbosity:
 
 ```bash
-RUST_LOG=debug chaz --config config.yaml --tui 2> chaz.log
+RUST_LOG=debug chaz --config config.yaml 2> chaz.log
 ```
 
 See [Logging](logging.md) for details on log levels and filtering.

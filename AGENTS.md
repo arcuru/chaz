@@ -79,9 +79,9 @@ test_support/        #[cfg(test)] harness: MockBackend, MockHost, fresh_session,
 
 ```
 main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
-gateway/cli.rs       CliGateway — one-shot --cli prompt runner
-gateway/matrix/      MatrixGateway — matrix-sdk login/sync + session bridging
-gateway/tui/         TuiGateway — ratatui-based local interactive surface
+gateway/cli.rs       CliGateway — one-shot `-p` / `--print` prompt runner
+gateway/matrix/      MatrixGateway — matrix-sdk login/sync + session bridging (`--matrix`)
+gateway/tui/         TuiGateway — ratatui-based local interactive surface (default)
 ```
 
 ## Key Invariants
@@ -112,7 +112,7 @@ After code changes, rebuild (`nix develop .# -c cargo build --release`) and rest
 TUI against the same state dir:
 
 ```bash
-nix develop .# -c cargo run -- --config ~/code/chaz-test/config.yaml --tui
+nix develop .# -c cargo run -- --config ~/code/chaz-test/config.yaml
 ```
 
 ## Conventions

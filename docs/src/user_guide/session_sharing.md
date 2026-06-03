@@ -123,10 +123,10 @@ Two state dirs, two configs:
 
 ```bash
 # Peer A
-chaz --config ~/peer-a.yaml --tui
+chaz --config ~/peer-a.yaml
 
 # Peer B (separate terminal, separate state_dir in its config)
-chaz --config ~/peer-b.yaml --tui
+chaz --config ~/peer-b.yaml
 ```
 
 ### 1. Create and share the agent (Peer A)
@@ -259,7 +259,7 @@ Revoke doesn't block on this — but the warning surfaces what's about to go sil
 2. Start a local TUI:
 
    ```bash
-   chaz --config ~/chaz-local.yaml --tui
+   chaz --config ~/chaz-local.yaml
    ```
 
 3. On the server (via a second TUI or programmatically), get the session ticket:

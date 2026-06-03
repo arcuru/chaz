@@ -27,9 +27,9 @@ use std::sync::{Arc, OnceLock, Weak};
 use tracing::warn;
 
 /// Process-global handle to the running [`RoutineEngine`], set once at
-/// startup (`main.rs`, non-`--cli`). Stored as a `Weak` so the engine's
+/// startup (`main.rs`, non-`--print`). Stored as a `Weak` so the engine's
 /// lifetime stays owned by its run task; the helpers below upgrade on
-/// demand and no-op when there is no engine (`--cli`, tests, shutdown).
+/// demand and no-op when there is no engine (`--print`, tests, shutdown).
 ///
 /// This is the seam that makes scheduling live: every routine mutation
 /// funnels through [`upsert_session_routine`] / [`remove_session_routine`]

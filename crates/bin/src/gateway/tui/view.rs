@@ -1740,7 +1740,7 @@ fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, config: &Config) {
         )]),
         Line::from(""),
         bridge_row("tui", "active"),
-        bridge_row("cli", "available (`chaz --cli`)"),
+        bridge_row("cli", "available (`chaz -p`)"),
         bridge_row("matrix", &matrix_status),
         Line::from(""),
         Line::from(vec![Span::styled(

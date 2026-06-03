@@ -175,9 +175,9 @@ embedding:
   backend: openai
   model: text-embedding-3-small
   api_key: "${OPENAI_API_KEY}"
-# Single-shot CLI mode (--cli) cannot prompt for tool approval interactively,
-# so a curated allowlist of tools is auto-approved instead. Defaults to
-# [shell, write_file]. Override or extend with your own list.
+# Single-shot print mode (-p / --print) cannot prompt for tool approval
+# interactively, so a curated allowlist of tools is auto-approved instead.
+# Defaults to [shell, write_file]. Override or extend with your own list.
 # cli:
 #   auto_approved_tools: [shell, write_file, web_fetch]
 ```
@@ -401,16 +401,16 @@ agent_state_allowlist:
   memory: [chaz]
 ```
 
-## CLI mode
+## Print mode
 
-`chaz --cli "<prompt>"` runs a single ReAct turn and exits. There is no interactive approval surface, so a small set of tools must be pre-approved to make the mode useful. Defaults to `[shell, write_file]`. Override per-deployment:
+`chaz -p "<prompt>"` (alias `--print`) runs a single ReAct turn and exits. There is no interactive approval surface, so a small set of tools must be pre-approved to make the mode useful. Defaults to `[shell, write_file]`. Override per-deployment:
 
 ```yaml
 cli:
   auto_approved_tools: [shell, write_file, web_fetch]
 ```
 
-`--cli --session NAME` reuses a named session across invocations (find-or-create). Without `--session` each invocation creates a fresh ephemeral session.
+`-p --session NAME` reuses a named session across invocations (find-or-create). Without `--session` each invocation creates a fresh ephemeral session.
 
 ## State Directory
 
