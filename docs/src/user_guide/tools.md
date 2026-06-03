@@ -12,8 +12,8 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
 | `describe_tool`     | `system`   | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
 | `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
-| `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Delegates a task to a named sub-agent (persistent identity)            |
-| `spawn_task`        | `core`     | Medium | UnlessAutoApproved | Runs a one-shot task in a fresh child session, then revokes its key    |
+| `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Delegates to a named peer Agent (persistent identity, own keys)        |
+| `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
 | `read_file`         | `fs`       | Low    | Never              | Reads file contents from disk                                          |
 | `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
@@ -168,19 +168,22 @@ Delegates a task to another agent in a child session. The named agent's persiste
 }
 ```
 
-### spawn_task
+### spawn_worker
 
-Runs a one-shot task in a fresh child session under a freshly-generated keypair. When the task finishes the key is **revoked** — the session DB persists as an audit record but can't be extended. Use this for focused work that should not pollute any agent's memory; use `spawn_agent` when you want the named agent's identity and memory to carry forward.
+Invokes a Worker template declared under the calling Agent. Workers are configured one-shot LLM calls — they have no identity, no keys, and no persistent state of their own; entries written to the child session are signed by the parent Agent's key. Use a Worker for focused, delegated work that doesn't need its own continuity; use `spawn_agent` when you want a named peer Agent (Ava, Chaz) with its own keys and persistent memory.
+
+Worker templates are per-Agent (Ava's `researcher` is distinct from Chaz's `researcher`); resolution is scoped to the calling Agent only.
 
 ```json
 {
+  "name": "researcher",
   "task": "Read /tmp/log.json and summarise the error counts by minute",
   "tools": ["read_file", "calculate"],
   "async": false
 }
 ```
 
-`tools` narrows the caller's scope for the child; omit to inherit the full scope. `model` and `max_iterations` are optional overrides.
+`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model`, `max_iterations`, and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults.
 
 ### skill_list / skill_search / skill_show
 

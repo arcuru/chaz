@@ -348,7 +348,7 @@ so it round-trips through eidetica.
 | `crates/lib/src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
 | `crates/lib/src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
 | `crates/lib/src/extensions/mod.rs`               | `all_builtins` + `BuiltinDeps` — wires the built-in set                                                                                                   |
-| `crates/lib/src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `spawn_task`                                                                                                           |
+| `crates/lib/src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `spawn_worker`                                                                                                         |
 | `crates/lib/src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                                                                                                                    |
 | `crates/lib/src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                                                                                                                  |
 | `crates/lib/src/extensions/web.rs`               | `web_fetch`, `web_search`                                                                                                                                 |
@@ -364,7 +364,7 @@ so it round-trips through eidetica.
 
 | Extension           | Scopes                 | Declared hooks    | Routine | What it provides                                           |
 | ------------------- | ---------------------- | ----------------- | ------- | ---------------------------------------------------------- |
-| `core`              | `Global`               | `Tool`            | —       | `shell`, `compact`, `spawn_agent`, `spawn_task`            |
+| `core`              | `Global`               | `Tool`            | —       | `shell`, `compact`, `spawn_agent`, `spawn_worker`          |
 | `fs`                | `Global`               | `Tool`            | —       | `read_file`, `write_file`, `edit_file`                     |
 | `system`            | `Global`               | `Tool`            | —       | `get_time`, `calculate`, `describe_tool`                   |
 | `web`               | `Global`               | `Tool`            | —       | `web_fetch`, `web_search`                                  |

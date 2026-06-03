@@ -44,28 +44,27 @@ backends:
 # (TUI) or `!chaz agent set` (Matrix) to edit a live agent. See
 # `user_guide/agents.md`.
 agents:
-  - name: default
+  - name: chaz
     system_prompt: "You are Chaz, a helpful AI assistant."
     max_iterations: 10
     tools: null # null = all tools
-    can_spawn: ["researcher", "coder"]
-  - name: researcher
-    system_prompt: "You are a research assistant. Use web_fetch to find information."
-    max_iterations: 20
-    tools: ["web_fetch", "calculate", "get_time", "remember", "recall"]
-  - name: coder
-    # Pull repo-level instructions from a file; layer inline guidance on top.
-    system_prompt_files: ["~/code/myproject/AGENTS.md"]
-    system_prompt: "Edit files in-place; never rewrite from scratch."
-    max_iterations: 15
-    tools: ["shell", "read_file", "write_file", "calculate"]
+    # Workers — configured one-shot LLM calls owned by this Agent.
+    # Each is invocable via `spawn_worker(name=…)` from this Agent only.
+    workers:
+      - name: researcher
+        system_prompt: "You are a research assistant. Use web_fetch to find information."
+        max_iterations: 20
+        tools: ["web_fetch", "calculate", "get_time"]
+      - name: coder
+        # Pull repo-level instructions from a file; layer inline guidance on top.
+        system_prompt_files: ["~/code/myproject/AGENTS.md"]
+        system_prompt: "Edit files in-place; never rewrite from scratch."
+        max_iterations: 15
+        tools: ["shell", "read_file", "write_file", "calculate"]
     # Auto-attach memory/skill banks at agent bootstrap. Missing banks are
     # warned and skipped; default_memory_banks auto-creates missing banks.
-    default_memory_banks: ["code-notes"]
+    default_memory_banks: ["chaz-notes"]
     # default_skill_banks: ["coding-skills"]
-    # Optional: who is allowed to spawn this agent (None/empty = any caller
-    # with can_spawn permission)
-    # allowed_callers: ["default"]
     # Allow this agent to run without user input (scheduled wakes)
     # autonomous: false
 
@@ -287,13 +286,12 @@ Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in t
 
 | Field                  | Type                   | Notes                                                                                                  |
 | ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------ |
-| `name`                 | string                 | Required. Display name; also the lookup key for `default_role`, `/agent add`, `can_spawn`, schedules.  |
+| `name`                 | string                 | Required. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.             |
 | `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                  |
 | `system_prompt_files`  | list of paths          | File contents concatenated into the system prompt. `~` expansion supported.                            |
 | `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.   |
 | `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace.*` globs for MCP tools.             |
-| `can_spawn`            | list of agent names    | Which agents this one is allowed to spawn (via `spawn_agent`).                                         |
-| `allowed_callers`      | list of agent names    | Which agents may spawn _this_ one. `null`/empty = anyone with `can_spawn` for it.                      |
+| `workers`              | list of WorkerConfig   | Per-Agent Worker templates invocable via `spawn_worker`. See "Worker fields" below.                    |
 | `max_iterations`       | int                    | ReAct loop cap. Default 10.                                                                            |
 | `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                      |
 | `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                    |
@@ -302,6 +300,24 @@ Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in t
 | `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                           |
 | `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                     |
 | `presets`              | map<name, AgentPreset> | Named override bundles selectable at spawn time (model / iters / tools / role suffix / tool_profile).  |
+
+### Worker fields
+
+A Worker is a configured one-shot LLM call declared under an Agent's
+`workers:` list. Workers have no identity, no keys, and no persistent
+state of their own — entries written during a Worker invocation are
+signed by the parent Agent's key. Lookup is per-Agent; Ava's
+`researcher` is distinct from Chaz's `researcher`.
+
+| Field                 | Type                   | Notes                                                                                              |
+| --------------------- | ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `name`                | string                 | Required. Unique within the parent Agent's `workers:` list. Used as `spawn_worker(name=…)`.        |
+| `system_prompt`       | string                 | Worker's system prompt. Falls back to (inherits) the parent Agent's prompt when omitted.           |
+| `system_prompt_files` | list of paths          | Concatenated into the Worker prompt. `~` expansion supported.                                      |
+| `model`               | string                 | Override the model. Falls back to the parent Agent's `model`.                                      |
+| `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.  |
+| `max_iterations`      | int                    | Override max ReAct iterations. Falls back to the parent Agent's `max_iterations`.                  |
+| `presets`             | map<name, AgentPreset> | Selectable via the `preset` arg of `spawn_worker`.                                                 |
 
 ### `default_agents`
 

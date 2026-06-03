@@ -1,6 +1,6 @@
 # Session Model
 
-Sessions are the core data model in chaz. Every conversation -- whether from a Matrix room, the TUI, or a spawned sub-agent -- is represented as a stream of entries in an eidetica database.
+Sessions are the core data model in chaz. Every conversation -- whether from a Matrix room, the TUI, or a spawned Worker invocation -- is represented as a stream of entries in an eidetica database.
 
 ## Entry Types
 
@@ -127,9 +127,9 @@ Failover is **explicit and operator-driven** in v1. If the home peer's chaz proc
 
 Cross-peer `spawn_agent` works without special handling. The spawner is the attacher, so `attach_agent_to_session` on the child session defaults `home_pubkey` to the spawning peer's key — that peer runs the child turn. If a co-owner later syncs the child session, their gate skips it.
 
-## Child Sessions (spawn_agent)
+## Child Sessions (spawn_agent / spawn_worker)
 
-When an agent spawns a sub-agent:
+When an Agent spawns a child — either a peer Agent (`spawn_agent`) or a Worker template (`spawn_worker`):
 
 1. The server creates a new session DB via `register_child_session`
 2. The parent writes a `Directive` entry to the child session

@@ -34,7 +34,7 @@ The layers in plain words:
 Two more orthogonal layers wrap everything:
 
 - **Secret store** keeps API keys out of LLM context entirely — they're resolved at the HTTP client boundary, never quoted to the model.
-- **Agent-level controls** (`allowed_tools`, `can_spawn`, depth caps) shrink which layers even get a chance to run for a given agent.
+- **Agent-level controls** (`allowed_tools`, per-Agent `workers:` list, depth caps) shrink which layers even get a chance to run for a given Agent.
 
 The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Tools never call OS APIs directly — they request a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host.
 
@@ -199,9 +199,9 @@ API keys are stored in eidetica's SecretStore and resolved at the HTTP client bo
 
 ## Agent-Level Controls
 
-- **Tool narrowing**: Each agent definition can restrict available tools via `tools:` (supports glob patterns like `"filesystem.*"`)
-- **Transitive narrowing**: Child agents can never have more tools than their parent
-- **Spawn permissions**: `can_spawn` controls which agents can be delegated to
+- **Tool narrowing**: Each Agent definition can restrict available tools via `tools:` (supports glob patterns like `"filesystem.*"`)
+- **Transitive narrowing**: Spawned children (peer Agents via `spawn_agent`, Workers via `spawn_worker`) can never have more tools than their parent
+- **Worker scoping**: Workers are declared per-Agent under `workers:`. An Agent can only invoke a Worker that's declared under itself — no global Worker registry
 - **Depth limiting**: Spawn depth is capped to prevent infinite recursion
 - **Concurrency**: Global semaphore limits concurrent LLM calls to 10
 - **Memory isolation**: Each agent's own memory lives in its own Living Agent DB (keyed access, enforced by eidetica). Cross-agent sharing requires an explicit `/memory grant` on a shared bank — there is no peer-wide "global" memory

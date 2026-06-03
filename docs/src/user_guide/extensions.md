@@ -18,7 +18,7 @@ others are runtime hooks that fire around each agent turn.
 
 | Extension           | Provides            | What it gives you                                                                                                                                    |
 | ------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `core`              | Tool                | `shell`, `compact`, `spawn_agent`, `spawn_task`. The always-available baseline; disabling it is a footgun.                                           |
+| `core`              | Tool                | `shell`, `compact`, `spawn_agent`, `spawn_worker`. The always-available baseline; disabling it is a footgun.                                         |
 | `system`            | Tool                | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
 | `fs`                | Tool                | `read_file`, `write_file`, `edit_file`.                                                                                                              |
 | `web`               | Tool                | `web_fetch`, `web_search`.                                                                                                                           |

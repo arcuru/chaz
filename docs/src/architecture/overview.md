@@ -162,7 +162,7 @@ crates/lib/src/
     hooks.rs           Per-kind hook trait definitions + HookKind
   extensions/          Built-in extensions (each declares scopes + caps + endpoints)
     mod.rs             all_builtins, BuiltinDeps
-    core.rs            shell, compact, spawn_agent, spawn_task
+    core.rs            shell, compact, spawn_agent, spawn_worker
     fs.rs              read_file, write_file, edit_file
     system.rs          get_time, calculate, describe_tool
     web.rs             web_fetch, web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
@@ -174,8 +174,8 @@ crates/lib/src/
     path_normalizer.rs tool_call hook stripping trailing `/` from path args
     security_warnings.rs tool_result hook scanning for prompt-injection patterns
   tools/               Built-in tool impls (referenced from extensions/* above)
-    agent.rs           spawn_agent (delegate to a Living Agent)
-    task.rs            spawn_task (ephemeral sub-agent with revocable key)
+    agent.rs           spawn_agent (delegate to a peer Living Agent)
+    worker.rs          spawn_worker (invoke a per-Agent Worker template — no keys, no identity)
     shell.rs           shell execution with allowlist/denylist
     file.rs            read_file, write_file
     edit.rs            edit_file

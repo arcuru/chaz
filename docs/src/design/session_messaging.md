@@ -10,7 +10,7 @@ All agent invocation in chaz goes through a single mechanism: write an entry to 
 
 ## Problem
 
-Originally, `spawn_agent` called `runtime::execute` directly, bypassing the server's callback infrastructure. This created two separate invocation paths with different behavior: gateway messages went through the server, but sub-agent tasks did not. This made it impossible to unify features like audit trails, session sharing, and scheduled runs.
+Originally, `spawn_agent` called `runtime::execute` directly, bypassing the server's callback infrastructure. This created two separate invocation paths with different behavior: gateway messages went through the server, but spawned child invocations did not. This made it impossible to unify features like audit trails, session sharing, and scheduled runs.
 
 ## Design Goals
 

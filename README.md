@@ -16,7 +16,7 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 
 - **ReAct tool-calling loop** — agents reason, act, and observe in a loop with 9 built-in tools
 - **Extension framework** — tools, slash commands, and lifecycle hooks all flow through declared extensions with per-session activation, settings, and an event-log audit trail (see [`docs/`](docs/src/user_guide/extensions.md))
-- **Multi-agent orchestration** — agents can spawn sub-agents with depth limiting and transitive tool narrowing
+- **Multi-agent orchestration** — Agents (peer entities, keys + identity) invoke per-Agent Worker templates (one-shot LLM calls, no identity) with depth limiting and transitive tool narrowing
 - **TUI mode** — local terminal interface for testing and debugging without Matrix
 - **Session sharing** — share sessions between chaz instances via eidetica sync
 - **Security** — leak detection, network controls, shell sandboxing, tool approval gates
@@ -36,7 +36,8 @@ There is a public Matrix room available at [#chaz:jackson.dev](https://matrix.to
 | `remember`          | Store key-value facts (own memory or a granted bank) |
 | `recall`            | Search stored facts                                  |
 | `list_memory_banks` | List shared memory banks this agent can access       |
-| `spawn_agent`       | Delegate to sub-agents                               |
+| `spawn_agent`       | Delegate to a named peer Agent (Ava, Chaz)           |
+| `spawn_worker`      | Invoke a Worker template under the calling Agent     |
 
 ## Running
 
@@ -202,14 +203,15 @@ backends:
 
 # Agent definitions
 agents:
-  - name: default
+  - name: chaz
     system_prompt: "You are Chaz, a helpful Matrix assistant."
     allowed_tools: null # null = all tools
-    can_spawn: ["researcher"]
-  - name: researcher
-    system_prompt: "You are a focused research assistant. Use web_fetch and calculate to answer questions concisely."
-    max_iterations: 20
-    allowed_tools: ["web_fetch", "calculate", "get_time"]
+    # Worker templates — invocable from this Agent via `spawn_worker(name=…)`.
+    workers:
+      - name: researcher
+        system_prompt: "You are a focused research assistant. Use web_fetch and calculate to answer questions concisely."
+        max_iterations: 20
+        tools: ["web_fetch", "calculate", "get_time"]
 
 # Security settings
 security:

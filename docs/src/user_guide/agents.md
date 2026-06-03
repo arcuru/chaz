@@ -1,14 +1,16 @@
 # Agents
 
-Chaz agents have persistent identity as _Living Agents_ — each agent is its own eidetica database signed by a per-agent key. Whoever holds the key hosts the agent. Sessions declare participating agents by listing their pubkeys in the session's AuthSettings; routing follows key possession.
+Chaz Agents have persistent identity as _Living Agents_ — each Agent is its own eidetica database signed by a per-Agent key. Whoever holds the key hosts the Agent. Sessions declare participating Agents by listing their pubkeys in the session's AuthSettings; routing follows key possession.
 
-YAML `agents:` config is the bootstrap path: at startup, chaz materializes one Agent DB per yaml entry (idempotent), populating its `config` and `meta` stores from the yaml. Existing yaml workflows keep working; the DBs are what travel with eidetica sync.
+An **Agent** is a first-class entity (Ava, Chaz). A Worker — declared under an Agent's `workers:` list — is something different: a configured one-shot LLM call with no keys and no persistent identity, invocable from that Agent only via `spawn_worker`. The four-tier conceptual model (Peer / Agent / Worker / Resource) sits behind the names but isn't load-bearing for day-to-day yaml editing.
+
+YAML `agents:` config is the bootstrap path: at startup, chaz materializes one Agent DB per yaml entry (idempotent), populating its `config` and `meta` stores from the yaml. Worker templates declared under an Agent travel with that Agent's DB as part of its config.
 
 ## Defining Agents (bootstrap via YAML)
 
 ```yaml
 agents:
-  - name: default
+  - name: chaz
     # System prompt — `system_prompt_files` are concatenated first, then
     # `system_prompt` is appended.
     system_prompt_files:
@@ -17,34 +19,34 @@ agents:
       Stay terse on Matrix.
     max_iterations: 10 # Max ReAct loop iterations before forced summary
     tools: null # null = all tools, or list specific tools
-    can_spawn: # Which agents this one can delegate to
-      - researcher
-      - coder
+    # Worker templates this Agent can invoke via `spawn_worker(name=…)`.
+    # Workers have no identity of their own; entries written during a
+    # Worker invocation are signed by this Agent's key.
+    workers:
+      - name: researcher
+        system_prompt: "You are a researcher. Cite primary sources."
+        max_iterations: 20
+        tools:
+          - web_fetch
+          - calculate
+          - get_time
+          - remember
+          - recall
 
-  - name: researcher
-    system_prompt: "You are a researcher. Cite primary sources."
-    max_iterations: 20
-    tools:
-      - web_fetch
-      - calculate
-      - get_time
-      - remember
-      - recall
-
-  - name: coder
-    system_prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
-    max_iterations: 15
-    tools:
-      - shell
-      - read_file
-      - write_file
-      - calculate
-      - "filesystem.*" # Glob: all tools from "filesystem" MCP server
-    presets:
-      quick:
-        max_iterations: 5
-      deep:
-        max_iterations: 30
+      - name: coder
+        system_prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
+        max_iterations: 15
+        tools:
+          - shell
+          - read_file
+          - write_file
+          - calculate
+          - "filesystem.*" # Glob: all tools from "filesystem" MCP server
+        presets:
+          quick:
+            max_iterations: 5
+          deep:
+            max_iterations: 30
 ```
 
 At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. On subsequent boots, existing DBs are reused without overwriting their `config` — yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
@@ -101,7 +103,7 @@ A session's _authoritative_ participant list is its eidetica AuthSettings. Addin
 
 Freshly-created sessions auto-attach a configured roster so `/agents` and the model picker reflect routing reality on the very first message. The list is `Config.default_agents` (see [`configuration.md`](configuration.md#default_agents)) — typically the same agent(s) you message most often. Without that config, just the first agent in `agents:` is attached.
 
-This runs at session-creation time only (TUI `/new`, the picker's "New session" row, CLI `--session`, TUI startup default). It does **not** mutate existing sessions — those keep whatever participant list they already have. Spawned child sessions (`spawn_agent` / `spawn_task`) also skip auto-attach since they're agent-driven and inherit context from the parent rather than the default.
+This runs at session-creation time only (TUI `/new`, the picker's "New session" row, CLI `--session`, TUI startup default). It does **not** mutate existing sessions — those keep whatever participant list they already have. Spawned child sessions (`spawn_agent` / `spawn_worker`) also skip auto-attach since they're agent-driven and inherit context from the parent rather than the default.
 
 Names in `default_agents` that don't have a hosted Agent DB are skipped with a debug log; the rest still attach. Per-agent attach failures are logged but don't unwind the rest. Session creation never fails because of `default_agents`.
 
@@ -148,7 +150,7 @@ These aren't session-scoped; they act on the Living Agent itself.
 
 | Command                                             | What                                                                                                                                                                                                                                        |
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `model`/`tools`/`can_spawn`/`allowed_callers`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`/`system_prompt`/`system_prompt_files` (same set accepted by `/agent set`). |
+| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `model`/`tools`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`/`system_prompt`/`system_prompt_files` (same set accepted by `/agent set`). Worker templates are edited via yaml + `/agent reload`, not `/agent set`.            |
 | `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                                                                  |
 | `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                                                                                           |
 | `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                                                            |
@@ -357,26 +359,19 @@ Example — make `researcher` post a morning briefing to the current session wee
 
 Tool access is controlled at two levels:
 
-1. **Agent definition**: the `tools:` field restricts which tools an agent can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace). `tools: null` (or omitted) means "all tools".
-2. **Transitive narrowing**: When agent A spawns agent B, B's tools are the _intersection_ of A's tools and B's `tools:` list.
+1. **Agent / Worker definition**: the `tools:` field restricts which tools an Agent (or a Worker template under it) can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace). `tools: null` (or omitted) means "inherit from parent" on a Worker; on an Agent it means "all tools".
+2. **Transitive narrowing**: When an Agent spawns a child — a peer Agent (`spawn_agent`) or a Worker (`spawn_worker`) — the child's resolved tools are the _intersection_ of the parent's tools and the child's `tools:` list.
 
-This means a child agent can never have more tools than its parent, even if its definition allows them.
-
-```mermaid
-graph TD
-    D[default<br/>all 9 tools] -->|spawn| R[researcher<br/>5 tools]
-    D -->|spawn| C[coder<br/>4 tools]
-    R -.->|"cannot spawn<br/>(not in can_spawn)"| C
-```
+A child can never have more tools than its parent, even if its definition allows them.
 
 ## Spawn Permissions
 
-The `can_spawn` field controls which agents can be delegated to. Permissions are checked bidirectionally:
+Worker scoping replaces the previous cross-Agent `can_spawn` permission system:
 
-- The calling agent must list the target in `can_spawn`.
-- The target agent must exist in the registry.
+- A Worker is invocable iff it's declared under the calling Agent's `workers:` list. There is no global Worker registry.
+- A peer Agent is invocable via `spawn_agent` iff it's hosted on the local peer's agent index. There is no `allowed_callers` gate any more.
 
-Spawn depth is limited by `max_iterations` to prevent infinite recursion.
+Spawn depth is bounded by the call-depth cap (a hard recursion limit). The top-level Agent's `max_iterations` budget is intended to descend through nested Worker invocations; the propagation mechanism is in flight.
 
 ## Presets
 
@@ -504,14 +499,29 @@ If there's only one agent attached, every message goes to it. Attach a second ag
 
 Unmentioned messages fall through: host agent → first attached → default.
 
-### 5. Delegate via `spawn_agent`
+### 5. Delegate via `spawn_agent` or `spawn_worker`
 
-Once `coder` lists `researcher` in its `can_spawn`, `coder` can call the `spawn_agent` tool mid-ReAct:
+Two delegation paths from inside an Agent's ReAct loop:
+
+- `spawn_agent` — invoke a peer Agent (with its own keys and persistent memory). The target must be hosted on this peer.
+- `spawn_worker` — invoke a Worker template declared under the calling Agent's `workers:` list. No identity, no keys; entries are signed by the parent Agent.
+
+Worker invocation (most common case for delegated work):
 
 ```json
 {
-  "agent": "researcher",
+  "name": "researcher",
   "task": "find the canonical reference",
+  "preset": "deep"
+}
+```
+
+Peer-Agent invocation:
+
+```json
+{
+  "agent": "ava",
+  "task": "context-check this rewrite",
   "preset": "deep"
 }
 ```
