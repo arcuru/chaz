@@ -19,7 +19,7 @@
 // allow dead_code to keep the API surface stable.
 #![allow(dead_code)]
 
-use crate::config::{AgentConfig, AgentPreset, Config};
+use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
 use crate::grants::Grants;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
@@ -56,6 +56,10 @@ pub struct AgentMeta {
 /// Serializable agent definition. Mirrors the runtime-relevant fields of
 /// [`AgentConfig`]. What used to live in yaml will live here once yaml is
 /// downgraded to bootstrap sugar.
+///
+/// Workers declared under an Agent are mirrored into [`Self::workers`].
+/// Workers do NOT get their own AgentDb rows; they're configured tools
+/// belonging to this Agent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentDbConfig {
     /// System prompt string (the LLM's system message).
@@ -66,8 +70,15 @@ pub struct AgentDbConfig {
     pub system_prompt_files: Vec<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
+    /// Worker templates this Agent can invoke via `spawn_worker`.
+    /// Mirrors [`AgentConfig::workers`].
+    #[serde(default)]
+    pub workers: Vec<WorkerDbConfig>,
+    /// Deprecated — no longer used by the runtime. Will be removed in
+    /// Stage B of the Agent/Worker split.
     #[serde(default)]
     pub can_spawn: Vec<String>,
+    /// Deprecated — see [`Self::can_spawn`].
     #[serde(default)]
     pub allowed_callers: Vec<String>,
     pub max_iterations: Option<u32>,
@@ -87,6 +98,38 @@ pub struct AgentDbConfig {
     pub default_skill_banks: Vec<String>,
 }
 
+/// Serializable Worker template. Mirrors [`WorkerConfig`].
+///
+/// Workers are persisted inline under the owning [`AgentDbConfig::workers`]
+/// list — they have no DB row of their own and no key of their own.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkerDbConfig {
+    pub name: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub system_prompt_files: Vec<String>,
+    pub model: Option<String>,
+    pub tools: Option<Vec<String>>,
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub presets: HashMap<String, AgentPreset>,
+}
+
+impl WorkerDbConfig {
+    pub fn from_worker_config(cfg: &WorkerConfig) -> Self {
+        Self {
+            name: cfg.name.clone(),
+            system_prompt: cfg.system_prompt.clone().unwrap_or_default(),
+            system_prompt_files: cfg.system_prompt_files.clone().unwrap_or_default(),
+            model: cfg.model.clone(),
+            tools: cfg.tools.clone(),
+            max_iterations: cfg.max_iterations,
+            presets: cfg.presets.clone().unwrap_or_default(),
+        }
+    }
+}
+
 impl AgentDbConfig {
     pub fn from_agent_config(cfg: &AgentConfig) -> Self {
         Self {
@@ -94,6 +137,11 @@ impl AgentDbConfig {
             system_prompt_files: cfg.system_prompt_files.clone().unwrap_or_default(),
             model: cfg.model.clone(),
             tools: cfg.tools.clone(),
+            workers: cfg
+                .workers
+                .as_ref()
+                .map(|ws| ws.iter().map(WorkerDbConfig::from_worker_config).collect())
+                .unwrap_or_default(),
             can_spawn: cfg.can_spawn.clone().unwrap_or_default(),
             allowed_callers: cfg.allowed_callers.clone().unwrap_or_default(),
             max_iterations: cfg.max_iterations,
@@ -765,6 +813,7 @@ mod tests {
             system_prompt_files: None,
             model: Some("sonnet".to_string()),
             tools: Some(vec!["get_time".into(), "calculate".into()]),
+            workers: None,
             can_spawn: None,
             allowed_callers: None,
             max_iterations: Some(15),
@@ -786,6 +835,7 @@ mod tests {
             system_prompt_files: vec![],
             model: Some("opus".to_string()),
             tools: Some(vec!["web_fetch".into()]),
+            workers: vec![],
             can_spawn: vec!["writer".into()],
             allowed_callers: vec![],
             max_iterations: Some(40),

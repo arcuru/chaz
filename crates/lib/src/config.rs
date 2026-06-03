@@ -212,7 +212,16 @@ pub enum WebSearchBackendKind {
     DuckDuckGo,
 }
 
-/// Configuration for an agent
+/// Configuration for an agent.
+///
+/// An **Agent** is a first-class entity (Ava, Chaz) — it has keys,
+/// persistent identity, sessions, schedules, memory bank attachments,
+/// and a list of Worker templates it can invoke. Workers are configured
+/// one-shot LLM calls; they have no identity of their own and are
+/// declared per-Agent in [`AgentConfig::workers`].
+///
+/// See `~/brain/ava/research/chaz-ecosystem/conceptual-model.md` for the
+/// four-tier model (Peer / Agent / Worker / Resource).
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     /// Name of the agent
@@ -227,9 +236,17 @@ pub struct AgentConfig {
     pub model: Option<String>,
     /// List of tool names this agent is allowed to use (None = all tools)
     pub tools: Option<Vec<String>>,
-    /// Which agent definitions this agent can spawn
+    /// Worker templates this Agent can invoke via `spawn_worker`. Lookup
+    /// is per-Agent — Ava's `researcher` is distinct from Chaz's
+    /// `researcher`. A Worker is a configured one-shot LLM call with no
+    /// identity of its own; entries it writes are signed by this Agent's key.
+    pub workers: Option<Vec<WorkerConfig>>,
+    /// Deprecated — no longer used by the runtime. Will be removed in
+    /// Stage B of the Agent/Worker split. Workers replace the cross-Agent
+    /// spawn permission model: a worker is invocable iff it's listed under
+    /// the calling Agent's [`workers`] field.
     pub can_spawn: Option<Vec<String>>,
-    /// Which agents are allowed to spawn this one (None/empty = any with can_spawn permission)
+    /// Deprecated — see [`can_spawn`].
     pub allowed_callers: Option<Vec<String>>,
     /// Maximum ReAct loop iterations (default: 10)
     pub max_iterations: Option<u32>,
@@ -256,6 +273,45 @@ pub struct AgentConfig {
     /// `default_memory_banks` — missing banks are logged at warn and
     /// skipped, auto-created on first reference if appropriate.
     pub default_skill_banks: Option<Vec<String>>,
+}
+
+/// Configuration for a Worker template under an Agent.
+///
+/// A **Worker** is a configured one-shot LLM call — a tool, from the
+/// perspective of the Agent that invokes it. Workers have no identity,
+/// no keys, and no persistent state of their own; entries written
+/// during a Worker invocation are signed by the parent Agent's key.
+///
+/// Workers are declared per-Agent under [`AgentConfig::workers`]. Lookup
+/// is scoped to the calling Agent — there is no global Worker registry.
+/// To invoke a Worker, the calling Agent uses the `spawn_worker` tool
+/// with the Worker's `name`.
+///
+/// All optional override fields fall back to the parent Agent's defaults
+/// when unset. `tools`, when set, must be a subset of the parent Agent's
+/// tool list (intersection enforced at spawn time).
+#[derive(Debug, Deserialize, Clone)]
+pub struct WorkerConfig {
+    /// Name of the Worker template. Unique within the parent Agent's
+    /// `workers:` list. This is the name used as `spawn_worker(name=…)`.
+    pub name: String,
+    /// System prompt string for this Worker's one-shot invocation.
+    pub system_prompt: Option<String>,
+    /// Paths to files whose content is concatenated into the system prompt.
+    pub system_prompt_files: Option<Vec<String>>,
+    /// Override the model for this Worker. Falls back to the parent
+    /// Agent's `model` when unset.
+    pub model: Option<String>,
+    /// Tool names this Worker may use. Narrows the parent Agent's tool
+    /// list (intersection). May include other Workers; recursion is
+    /// bounded by depth + budget propagation on the calling Agent.
+    pub tools: Option<Vec<String>>,
+    /// Override max ReAct iterations for this Worker. Falls back to the
+    /// parent Agent's `max_iterations` when unset.
+    pub max_iterations: Option<u32>,
+    /// Named override bundles selectable at spawn time via the `preset`
+    /// argument of `spawn_worker`.
+    pub presets: Option<HashMap<String, AgentPreset>>,
 }
 
 /// A named bundle of overrides that can be selected at spawn time.
@@ -551,6 +607,72 @@ agents:
         assert_eq!(agents[0].tools.as_ref().unwrap().len(), 2);
         // `autonomous` defaults to false when unset
         assert!(!agents[1].autonomous);
+    }
+
+    #[test]
+    fn parse_agents_with_nested_workers() {
+        // New nested form: top-level agents hold a `workers:` list of
+        // Worker templates. Worker fields are optional overrides of the
+        // parent Agent's defaults.
+        let yaml = r#"
+agents:
+  - name: ava
+    system_prompt: "You are Ava."
+    model: claude-opus-4-7
+    tools: [web_fetch, calculate, spawn_worker]
+    workers:
+      - name: researcher
+        system_prompt: "Cite primary sources."
+        max_iterations: 20
+      - name: librarian
+        system_prompt: "Locate references."
+        model: gpt-4
+        tools: [web_fetch]
+  - name: chaz
+    system_prompt: "You are Chaz."
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let agents = cfg.agents.unwrap();
+        assert_eq!(agents.len(), 2);
+
+        let ava = &agents[0];
+        assert_eq!(ava.name, "ava");
+        let workers = ava.workers.as_ref().expect("ava has workers");
+        assert_eq!(workers.len(), 2);
+
+        let researcher = &workers[0];
+        assert_eq!(researcher.name, "researcher");
+        assert_eq!(
+            researcher.system_prompt.as_deref(),
+            Some("Cite primary sources.")
+        );
+        assert_eq!(researcher.max_iterations, Some(20));
+        // Model + tools fall back to the parent Agent's defaults when unset.
+        assert!(researcher.model.is_none());
+        assert!(researcher.tools.is_none());
+
+        let librarian = &workers[1];
+        assert_eq!(librarian.name, "librarian");
+        assert_eq!(librarian.model.as_deref(), Some("gpt-4"));
+        assert_eq!(librarian.tools.as_ref().unwrap().len(), 1);
+
+        // Chaz has no workers: deserializes as None.
+        let chaz = &agents[1];
+        assert!(chaz.workers.is_none());
+    }
+
+    #[test]
+    fn parse_agent_without_workers_field_omits_cleanly() {
+        // Agents that don't declare workers: omit the field entirely;
+        // `workers` deserializes to None, not Some(vec![]).
+        let yaml = r#"
+agents:
+  - name: ava
+    system_prompt: "no workers here"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let agents = cfg.agents.unwrap();
+        assert!(agents[0].workers.is_none());
     }
 
     #[test]
