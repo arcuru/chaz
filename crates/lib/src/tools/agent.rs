@@ -164,6 +164,10 @@ impl Tool for SpawnAgent {
 
             // Register a child session with the server (with parent→child
             // delegation so parent admins inherit admin on the child).
+            // `iteration_budget: None` — a spawned peer Agent runs its
+            // own ReAct loop on its own freshly-allocated budget; only
+            // anonymous Workers (`spawn_worker`) share the caller's
+            // budget.
             let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session(
                     &agent_display,
@@ -173,6 +177,7 @@ impl Tool for SpawnAgent {
                     child_max_depth,
                     ctx.tools.clone(),
                     Some(&parent_session_db_id),
+                    None,
                 )
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;

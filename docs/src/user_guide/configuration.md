@@ -316,7 +316,7 @@ signed by the parent Agent's key. Lookup is per-Agent; Ava's
 | `system_prompt_files` | list of paths          | Concatenated into the Worker prompt. `~` expansion supported.                                      |
 | `model`               | string                 | Override the model. Falls back to the parent Agent's `model`.                                      |
 | `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.  |
-| `max_iterations`      | int                    | Override max ReAct iterations. Falls back to the parent Agent's `max_iterations`.                  |
+| `max_iterations`      | int                    | Configured per-Worker for completeness, but **ignored when invoked under a parent Agent's iteration budget** — nested Workers share the top-level Agent's pool rather than getting a fresh quota. The field still applies when a Worker is invoked outside a running budget (rare; primarily testing paths). |
 | `presets`             | map<name, AgentPreset> | Selectable via the `preset` arg of `spawn_worker`.                                                 |
 
 ### `default_agents`

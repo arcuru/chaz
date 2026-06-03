@@ -727,6 +727,7 @@ mod tests {
             agent_grants: std::collections::HashMap::new(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
+            iteration_budget: None,
         }
     }
 

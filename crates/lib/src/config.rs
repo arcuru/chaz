@@ -299,8 +299,11 @@ pub struct WorkerConfig {
     /// list (intersection). May include other Workers; recursion is
     /// bounded by depth + budget propagation on the calling Agent.
     pub tools: Option<Vec<String>>,
-    /// Override max ReAct iterations for this Worker. Falls back to the
-    /// parent Agent's `max_iterations` when unset.
+    /// Configured for completeness, but ignored when this Worker is
+    /// invoked under a parent Agent's iteration budget — nested Workers
+    /// share the top-level Agent's pool rather than getting a fresh
+    /// quota. Effective only when there is no parent budget (rare;
+    /// primarily test paths).
     pub max_iterations: Option<u32>,
     /// Named override bundles selectable at spawn time via the `preset`
     /// argument of `spawn_worker`.

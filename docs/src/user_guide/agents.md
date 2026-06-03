@@ -371,7 +371,7 @@ Worker scoping replaces the previous cross-Agent `can_spawn` permission system:
 - A Worker is invocable iff it's declared under the calling Agent's `workers:` list. There is no global Worker registry.
 - A peer Agent is invocable via `spawn_agent` iff it's hosted on the local peer's agent index. There is no `allowed_callers` gate any more.
 
-Spawn depth is bounded by the call-depth cap (a hard recursion limit). The top-level Agent's `max_iterations` budget is intended to descend through nested Worker invocations; the propagation mechanism is in flight.
+Spawn depth is bounded by the call-depth cap (a hard recursion limit). The top-level Agent's `max_iterations` seeds a shared iteration budget — a single atomic counter that descends through `spawn_worker` invocations. Each ReAct turn in the Agent or in any nested Worker consumes one unit; when the pool reaches zero, force-summary kicks in at whichever level drained it. Worker `max_iterations` overrides are ignored once a parent budget is in scope: nested Workers share, they don't reset. Delegating to a peer Agent via `spawn_agent` is the opposite — that target gets its own freshly-seeded budget because it's running on its own identity.
 
 ## Presets
 

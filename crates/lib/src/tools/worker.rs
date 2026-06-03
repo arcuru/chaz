@@ -63,7 +63,7 @@ impl Tool for SpawnWorker {
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Override max ReAct iterations for this invocation."
+                        "description": "Accepted for compatibility; the Worker invocation shares the calling Agent's iteration budget rather than starting fresh, so this override has no practical effect under normal use."
                     },
                     "async": {
                         "type": "boolean",
@@ -216,7 +216,10 @@ impl Tool for SpawnWorker {
 
             // Register child session with parent→child delegation wired in.
             // No ephemeral keypair: entries on the child are signed by the
-            // parent Agent's key via the delegation chain.
+            // parent Agent's key via the delegation chain. The shared
+            // iteration budget descends from the parent so nested
+            // Worker invocations draw from the top-level Agent's pool
+            // rather than each level getting its own.
             let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session(
                     &ctx.agent_name,
@@ -226,6 +229,7 @@ impl Tool for SpawnWorker {
                     resolved_max_iterations as usize,
                     child_tools,
                     Some(&parent_session_db_id),
+                    ctx.iteration_budget.clone(),
                 )
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;

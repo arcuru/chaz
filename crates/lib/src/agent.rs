@@ -54,7 +54,12 @@ pub struct Worker {
     /// allowed_tools. When set, narrowed against the parent's list at
     /// spawn time (intersection).
     pub allowed_tools: Option<Vec<String>>,
-    /// Override max ReAct iterations. None = inherit parent's max_iterations.
+    /// Worker-level cap on ReAct iterations. **Ignored when invoked
+    /// under a parent Agent's iteration budget** — nested Workers share
+    /// the top-level Agent's atomic counter (see
+    /// `ToolContext::iteration_budget`) rather than each level getting a
+    /// fresh allotment. Used only when no parent budget is in scope
+    /// (test paths via direct `runtime::execute` calls).
     pub max_iterations: Option<u32>,
     /// Named override bundles selectable via the `preset` arg of `spawn_worker`.
     pub presets: HashMap<String, AgentPreset>,

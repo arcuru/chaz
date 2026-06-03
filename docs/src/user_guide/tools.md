@@ -183,7 +183,7 @@ Worker templates are per-Agent (Ava's `researcher` is distinct from Chaz's `rese
 }
 ```
 
-`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model`, `max_iterations`, and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults.
+`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_iterations` is accepted for compatibility but does **not** carve out a separate ReAct budget — every Worker invocation shares the calling Agent's iteration pool, so a nested Worker draws from whatever budget remains rather than starting fresh. See [Spawn Permissions](agents.md#spawn-permissions) for the budget semantics.
 
 ### skill_list / skill_search / skill_show
 

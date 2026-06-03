@@ -29,7 +29,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, error, info};
 
@@ -85,6 +85,10 @@ struct SessionRuntime {
     max_call_depth: usize,
     /// Parent's tool scope for transitive narrowing (None = use agent defaults)
     parent_tools: Option<ScopedTools>,
+    /// Shared ReAct iteration budget inherited from the spawning parent
+    /// (set by `register_child_session`). `None` on gateway-originated
+    /// sessions — the task builder allocates a fresh budget then.
+    iteration_budget: Option<Arc<AtomicU32>>,
     /// Signaled when the agent task completes (for synchronous spawn_agent)
     completion_tx: Option<mpsc::Sender<()>>,
 }
@@ -94,6 +98,9 @@ struct SpawnContext {
     call_depth: usize,
     max_call_depth: usize,
     parent_tools: Option<ScopedTools>,
+    /// Budget inherited from the parent spawn site, or `None` for a
+    /// fresh top-level run (the task builder allocates one).
+    iteration_budget: Option<Arc<AtomicU32>>,
     completion_tx: Option<mpsc::Sender<()>>,
     /// Per-session processing lock — cleared when the task completes
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -547,6 +554,7 @@ impl Server {
                     call_depth: 0,
                     max_call_depth: 0,
                     parent_tools: None,
+                    iteration_budget: None,
                     completion_tx: None,
                 },
             );
@@ -602,6 +610,7 @@ impl Server {
         max_call_depth: usize,
         parent_tools: ScopedTools,
         parent_session_db_id: Option<&str>,
+        iteration_budget: Option<Arc<AtomicU32>>,
     ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
         let source = format!("spawn:{}", uuid::Uuid::new_v4());
         let (conversation_id, session_db) = match parent_session_db_id {
@@ -627,6 +636,7 @@ impl Server {
                     call_depth,
                     max_call_depth,
                     parent_tools: Some(parent_tools),
+                    iteration_budget,
                     completion_tx: Some(completion_tx),
                 },
             );
@@ -1079,6 +1089,9 @@ impl Server {
             agent_grants,
             host: self.host.clone(),
             active_extensions: active_extensions.clone(),
+            iteration_budget: Some(std::sync::Arc::new(
+                std::sync::atomic::AtomicU32::new(agent.max_iterations),
+            )),
         };
 
         let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
@@ -1429,6 +1442,7 @@ impl Server {
                         call_depth: m.call_depth,
                         max_call_depth: m.max_call_depth,
                         parent_tools: m.parent_tools.clone(),
+                        iteration_budget: m.iteration_budget.clone(),
                         completion_tx: m.completion_tx.clone(),
                         processing: self.processing.clone(),
                     },
@@ -1566,6 +1580,14 @@ impl Server {
             }
             .with_active_extensions(Some(active_extensions.clone()));
 
+            // Inherit the parent's budget if a spawning Worker passed one
+            // in; otherwise this is a top-level run (gateway / schedule
+            // wake) and we allocate a fresh budget seeded from the
+            // agent's `max_iterations`.
+            let iteration_budget = spawn.iteration_budget.clone().unwrap_or_else(|| {
+                Arc::new(AtomicU32::new(agent.max_iterations))
+            });
+
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
                 call_depth: spawn.call_depth,
@@ -1577,6 +1599,7 @@ impl Server {
                 agent_grants,
                 host: host.clone(),
                 active_extensions: active_extensions.clone(),
+                iteration_budget: Some(iteration_budget),
             };
 
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);

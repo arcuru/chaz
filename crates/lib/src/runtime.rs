@@ -20,6 +20,8 @@ use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -39,7 +41,32 @@ pub enum RuntimeEvent {
     },
 }
 
+/// Fallback per-call ReAct cap used when `ToolContext::iteration_budget`
+/// is `None` (direct `runtime::execute` callers without the spawn
+/// machinery; primarily tests). Top-level Agent calls populate the
+/// budget so this value is unused under normal operation.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Atomically consume one unit from a shared iteration budget.
+/// Returns `true` if a unit was claimed; `false` when the budget is
+/// already at zero (exhaustion).
+fn consume_budget(budget: &Arc<AtomicU32>) -> bool {
+    let mut current = budget.load(Ordering::SeqCst);
+    loop {
+        if current == 0 {
+            return false;
+        }
+        match budget.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Number of times a tool call fingerprint can repeat before loop detection triggers.
 const LOOP_DETECTION_THRESHOLD: u32 = 3;
@@ -450,7 +477,20 @@ pub async fn execute(
     let mut rate_limiter = RateLimiter::new();
     let mut loop_detector = LoopDetector::new();
 
-    for iteration in 0..MAX_TOOL_ITERATIONS {
+    let mut iteration: usize = 0;
+    loop {
+        // Budget gate: top-level Agents and inherited Workers share a
+        // single `Arc<AtomicU32>` so nested invocations draw from one
+        // pool. When no budget is plumbed in (test contexts), fall back
+        // to the built-in cap.
+        let budget_exhausted = match tool_ctx.iteration_budget.as_ref() {
+            Some(budget) => !consume_budget(budget),
+            None => iteration >= MAX_TOOL_ITERATIONS,
+        };
+        if budget_exhausted {
+            break;
+        }
+
         let response = match llm_call_with_retry(
             backend,
             model,
@@ -778,6 +818,8 @@ pub async fn execute(
                 }
             }
         }
+
+        iteration += 1;
     }
 
     // Hit the cap or loop detected — make one final call without tools to force a text summary
@@ -1053,6 +1095,42 @@ mod tests {
     }
 
     // ================================================================
+    // iteration budget
+    // ================================================================
+
+    #[test]
+    fn consume_budget_decrements_and_signals_exhaustion() {
+        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(3));
+        assert!(consume_budget(&budget));
+        assert!(consume_budget(&budget));
+        assert!(consume_budget(&budget));
+        // 4th attempt — pool drained.
+        assert!(!consume_budget(&budget));
+        // Still drained on subsequent attempts (doesn't underflow).
+        assert!(!consume_budget(&budget));
+        assert_eq!(budget.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn consume_budget_starting_at_zero_is_immediately_exhausted() {
+        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        assert!(!consume_budget(&budget));
+    }
+
+    #[test]
+    fn consume_budget_is_shared_across_clones() {
+        // Two clones of the same Arc see the same underlying counter —
+        // the property that lets nested Worker invocations drain the
+        // top-level Agent's pool rather than each getting a fresh one.
+        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(5));
+        let alias = budget.clone();
+        assert!(consume_budget(&budget));
+        assert!(consume_budget(&alias));
+        assert!(consume_budget(&budget));
+        assert_eq!(alias.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // ================================================================
     // execute_with_retry
     // ================================================================
 
@@ -1155,6 +1233,7 @@ mod tests {
             agent_grants: Default::default(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
+            iteration_budget: None,
         }
     }
 
