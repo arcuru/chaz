@@ -218,7 +218,7 @@ Open with `/sessions` or `/s`:
 +-----------------------------------------------------+
 ```
 
-Sessions are listed by their eidetica DB root ID; any attached Matrix rooms or human-friendly names appear alongside. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+Sessions are listed by their eidetica DB root ID; any attached Matrix rooms or human-friendly names appear alongside. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
 
 ## Named Sessions
 
@@ -289,7 +289,7 @@ The TUI renders different entry types with distinct styles:
 | Type       | Appearance                             | Description                                     |
 | ---------- | -------------------------------------- | ----------------------------------------------- |
 | Message    | **Bold colored sender** + content      | Chat messages from users and agents             |
-| Directive  | **Bold sender (directive):** + content | Task instructions (from spawn_agent, scheduler) |
+| Directive  | **Bold sender (directive):** + content | Task instructions (from spawn_agent / spawn_worker, scheduler) |
 | Ack        | Dimmed "_agent_ thinking..."           | Agent is processing                             |
 | ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                            |
 | ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                          |
