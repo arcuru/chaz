@@ -11,17 +11,29 @@ use tracing::info;
 use crate::backends::BackendManager;
 use crate::security::SecurityContext;
 
-/// Delegate a task to a Living Agent in a new child session.
+/// Delegate a one-shot task to another Agent hosted on this same Peer.
 ///
-/// Resolves `agent_ref` (display name or eidetica DB ID) via the agent
-/// index, creates a child session with parent→child delegation wired in
-/// (parent admins inherit admin on the child), attaches the agent's
-/// stable pubkey to the child session with Write(10), writes a Directive,
-/// and waits for the agent to respond.
+/// Resolves `agent_ref` (display name or eidetica DB ID) against this
+/// Peer's local agent index, creates a child session with parent→child
+/// delegation wired in (parent admins inherit admin on the child),
+/// attaches the target Agent's stable pubkey to the child session with
+/// Write(10), writes a Directive entry, and (unless `async: true`) waits
+/// for the target to respond.
 ///
-/// Use for delegating focused work to a persistent agent whose memory and
-/// config survive across runs. For one-shot, ephemeral work with no
-/// persistent identity, use `spawn_worker`.
+/// **Scope:** local-Peer only. Reaches Agents whose runtime lives in this
+/// process via [`Server::agent_index`]; there is no remote-Peer path. A
+/// cross-Peer Agent-to-Agent messaging primitive (sealed-box knocks into
+/// a per-Agent inbox tree, conversation in a private session DB) is being
+/// designed separately and will eventually supersede this tool.
+///
+/// **Override args (`preset`, `model`, `max_iterations`) are transitional.**
+/// The calling Agent does not own the target Agent's config — those
+/// fields live in the target's own repo and config. The overrides work
+/// today via [`AgentConfig::resolve_overrides`] but are slated for
+/// removal once the messaging surface lands.
+///
+/// For work owned by the calling Agent (no separate identity, anonymous
+/// one-shot LLM call signed by the parent), use `spawn_worker`.
 pub struct SpawnAgent {
     pub server: Arc<OnceLock<Arc<Server>>>,
     pub backend: BackendManager,
@@ -32,37 +44,37 @@ impl Tool for SpawnAgent {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "spawn_agent".to_string(),
-            description: "Delegate a task to a persistent agent. Creates a child session, attaches the agent by its stable identity (display name or DB ID), runs it with the given task, and returns the result. Use for agents with long-lived memory and config (e.g. 'researcher', 'coder'). For one-shot delegated work, use spawn_worker.".to_string(),
+            description: "Delegate a one-shot task to another Agent on this same Peer. Resolves the target by display name or DB ID, creates a child session, attaches the target Agent's pubkey, writes a Directive, and (unless async) waits for the response. Local-Peer only — cross-Peer Agent messaging is a separate primitive in design. For ephemeral work owned by the calling Agent, use spawn_worker.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "agent_ref": {
                         "type": "string",
-                        "description": "Agent display name (e.g. 'researcher') or eidetica DB ID"
+                        "description": "Target Agent display name (e.g. 'researcher') or eidetica DB ID. Must be hosted on this Peer."
                     },
                     "task": {
                         "type": "string",
-                        "description": "What the agent should accomplish"
+                        "description": "What the target Agent should accomplish."
                     },
                     "context": {
                         "type": "string",
-                        "description": "Optional background info appended to the task as additional context"
+                        "description": "Optional background info appended to the task."
                     },
                     "preset": {
                         "type": "string",
-                        "description": "Named preset from the agent definition (e.g. 'deep', 'quick', 'max')"
+                        "description": "Named preset from the target Agent's config (e.g. 'deep', 'quick'). Transitional — caller does not own target's config."
                     },
                     "model": {
                         "type": "string",
-                        "description": "Override the model"
+                        "description": "Override the target Agent's model. Transitional — slated for removal; target's config should be authoritative."
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Override max ReAct iterations"
+                        "description": "Override the target Agent's max ReAct iterations. Transitional — slated for removal."
                     },
                     "async": {
                         "type": "boolean",
-                        "description": "If true, spawn and return immediately without waiting for the result."
+                        "description": "If true, return immediately after seeding the directive without waiting for the response."
                     }
                 },
                 "required": ["agent_ref", "task"]
