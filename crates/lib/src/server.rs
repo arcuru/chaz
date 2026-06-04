@@ -290,6 +290,14 @@ impl Server {
         &self.mcp_registry
     }
 
+    /// True iff `session_db_id` is currently registered (between
+    /// `register_session` and `deregister_session`). Scheduled work
+    /// targeting a closed session should self-skip rather than reopen
+    /// an orphan DB.
+    pub async fn is_session_open(&self, session_db_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_db_id)
+    }
+
     /// Best-effort attach of the configured default agents to a
     /// freshly-created session so `SessionMeta.agents` mirrors what
     /// message routing will actually pick. Without this, fresh sessions
@@ -858,6 +866,35 @@ impl Server {
                 (db, true, sid)
             }
             ScheduleTarget::Pinned { session_db_id } => {
+                // Closed-session retirement. If the pinned session has been
+                // deregistered, soft-disable the schedule rather than reopen
+                // a dead DB. Mirrors the lifecycle-bound retirement pattern
+                // above: the in-memory routine keeps ticking until the next
+                // agent reload, but every tick now early-returns here.
+                if !self.is_session_open(session_db_id).await {
+                    if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
+                        && let Ok(Some(mut schedule)) =
+                            adb.find_schedule(&payload.schedule_id).await
+                        && schedule.enabled
+                    {
+                        schedule.enabled = false;
+                        if let Err(e) = adb.upsert_schedule(schedule).await {
+                            tracing::error!(
+                                agent = %agent_name,
+                                schedule = %payload.schedule_id,
+                                "Failed to persist Pinned-target retirement: {e}"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        session = %session_db_id,
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        "Pinned target session closed; retiring schedule"
+                    );
+                    return Ok(());
+                }
+
                 let (_conv, db) = self.registry.open_session(session_db_id).await?;
                 let sid = session_db_id.clone();
 
@@ -2179,11 +2216,21 @@ mod tests {
         // Seed an agent.
         let (entry, adb) = seed_agent(&server, &registry, "beta").await;
 
-        // Create a session and attach the agent.
+        // Create a session, register it with the server, attach the agent.
+        // register_session is what real callers (gateways) do; without it
+        // the closed-session retirement check at fire time would self-skip.
         let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
         registry
             .attach_agent_to_session(&session_db_id, &entry)
+            .await
+            .unwrap();
+        let backend = crate::backends::BackendManager::new(
+            &None,
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .register_session(&session_db, backend, Some("beta".to_string()), None)
             .await
             .unwrap();
 
@@ -2227,6 +2274,73 @@ mod tests {
         assert_eq!(fires.len(), 1);
         assert!(!fires[0].fresh, "should NOT be marked as fresh");
         assert_eq!(fires[0].session_db_id, session_db_id);
+    }
+
+    #[tokio::test]
+    async fn agent_schedule_pinned_closed_session_self_disables() {
+        let (_instance, server, registry) = server_fixture().await;
+        let (entry, adb) = seed_agent(&server, &registry, "epsilon").await;
+
+        // Create + register the session, attach the agent.
+        let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
+        let session_db_id = session_db.root_id().to_string();
+        registry
+            .attach_agent_to_session(&session_db_id, &entry)
+            .await
+            .unwrap();
+        let backend = crate::backends::BackendManager::new(
+            &None,
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .register_session(&session_db, backend, Some("epsilon".to_string()), None)
+            .await
+            .unwrap();
+
+        // Add a Pinned schedule targeting this session.
+        adb.upsert_schedule(Schedule::new(
+            "checkin".to_string(),
+            Trigger::OneShot {
+                fire_at: chrono::Utc::now(),
+            },
+            "checking in".to_string(),
+            crate::agent_db::ScheduleTarget::Pinned {
+                session_db_id: session_db_id.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        // Close the session.
+        server.deregister_session(&session_db_id).await;
+        assert!(!server.is_session_open(&session_db_id).await);
+
+        // Fire the schedule — should self-skip cleanly (no LLM call, no
+        // ScheduleFire), and the schedule row should be persistently disabled.
+        let payload = pinned_schedule_payload(
+            &entry.db_id.to_string(),
+            "checkin",
+            "checking in",
+            &session_db_id,
+        );
+        server.fire_agent_schedule(payload).await.unwrap();
+
+        let fires = adb.list_schedule_fires().await.unwrap();
+        assert!(
+            fires.is_empty(),
+            "closed-session fire should be skipped, got {} fires",
+            fires.len()
+        );
+
+        let schedule = adb
+            .find_schedule("checkin")
+            .await
+            .unwrap()
+            .expect("schedule row should still exist (soft-disabled, not deleted)");
+        assert!(
+            !schedule.enabled,
+            "Pinned schedule targeting closed session should self-disable"
+        );
     }
 
     #[tokio::test]
