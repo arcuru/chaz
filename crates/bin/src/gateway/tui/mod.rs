@@ -2096,10 +2096,12 @@ async fn reload_peer_agent_from_yaml(app: &mut App, server: &Arc<Server>, name: 
 }
 
 /// Dispatch a backend command initiated from the Settings page. Shared
-/// path between `[d]` direct-action keys and submitted prompts. After
-/// the command runs we re-seed the session settings snapshot so the
-/// page reflects the new state without waiting for `SessionChanged`
-/// (which fires async — the page would briefly show stale data).
+/// path between `[d]` direct-action keys and submitted prompts. The
+/// command's write fires eidetica's `on_write` callback, which posts
+/// to `notify_rx` and refreshes the snapshot via `Action::SessionChanged`
+/// — same path every other write uses. There's no explicit re-seed
+/// here; the next frame may briefly render stale data before the
+/// callback lands, matching the picker's behavior.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_settings_command(
     cmd: Command,
@@ -2129,11 +2131,8 @@ async fn dispatch_settings_command(
     // user leaves Settings and sees the chat. (A future stage may add a
     // dedicated error strip on the settings page itself.)
     render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
-    // Re-seed so the page reflects the command's effect immediately.
-    seed_session_settings_snapshot(app, server).await;
 }
 
-/// Read the active session's meta + index row and stash a frozen snapshot
 /// Translate the Models page row cursor into the picker scope.
 /// Row 0 = `Session`; rows 1..=n map to `meta.agents[row - 1]`. Falls
 /// back to `Session` when the snapshot is missing or the cursor lands
@@ -2152,6 +2151,7 @@ fn models_scope_from_cursor(app: &App) -> ModelPickerScope {
     }
 }
 
+/// Read the active session's meta + index row and stash a frozen snapshot
 /// on `App` for the Session Settings page. Called when Session Settings
 /// opens and when the active tab fires `SessionChanged` while that page is
 /// up. Silent on failure — the snapshot stays whatever it was so the page

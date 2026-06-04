@@ -95,7 +95,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/schedule add ", "<id> <cron 6 fields> <agent> <task...>"),
         ("/schedule remove ", "remove a schedule by id"),
         ("# LLM config", ""),
-        ("/models", "open the model picker"),
+        ("/models", "open the Models settings page"),
         (
             "/model ",
             "show, or set <id> | <agent> <id> | <agent> clear",
