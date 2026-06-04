@@ -139,7 +139,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 
 | Command                       | Description                                                                  |
 | ----------------------------- | ---------------------------------------------------------------------------- |
-| `/models`                     | Open the [model picker](#model-picker)                                       |
+| `/models`                     | Open Session Settings → [Models](#model-picker)                              |
 | `/model`                      | Show the model resolved for the current agent + every override on this session |
 | `/model <id>`                 | Set the session-wide model pin (every agent unless per-agent override wins)  |
 | `/model <agent> <id>`         | Set a per-agent override scoped to this session                              |
@@ -244,35 +244,46 @@ The name appears in the status bar, session picker, and `/info` output. Names mu
 
 ## Model Picker
 
-Open with `/models`:
+Pick a model for a specific scope — the whole session, or one agent in this session. `/models` opens Session Settings → Models, where each row is a scope you can edit:
 
 ```text
-+ scope: [ Session ] · ava · researcher · chaz                  +
++--[ Models ]----------------------------------------------------+
+|                                                                |
+| > Session         claude-opus-4-7                              |
+|       resolves to claude-opus-4-7                              |
+|                                                                |
+|   Per-agent overrides                                          |
+|   ava             (uses session pin)                           |
+|   researcher      openai/gpt-5-mini                            |
+|                                                                |
+|   Enter — open picker for selected scope                       |
++----------------------------------------------------------------+
+```
+
+- **`Session`** (row 0) — the session-wide pin (`SessionMeta.model`, what `/model <id>` writes). Every agent uses this unless its own row sets an override.
+- **`<agent>`** — per-agent override for that agent (`SessionMeta.agent_models[name]`, what `/model <agent> <id>` writes). Falls back to the session pin when unset.
+
+`↑` / `↓` (or click) selects a row. `Enter` opens the picker locked to that row's scope:
+
+```text
 +--[ Search models (143) ]----------------------------------------+
 |   > _                                                          |
 +-----------------------------------------------------------------+
-+--[ Select model ▼ ]--------------------------------------------+
++--[ Pick model — researcher ▼ ]---------------------------------+
 |   MODEL                              IN     OUT   CACHE   CAPS |
 |   ▸ anthropic/claude-opus-4.7      $15.0  $75.0    $1.5   V    |
 |     openai/gpt-5-mini               $0.40  $1.6     —     V    |
 |     ...                                                        |
 +-----------------------------------------------------------------+
-| type to filter | ↑↓ PgUp/Dn Home/End | Enter | Tab scope | ... |
+| type to filter | ↑↓ PgUp/Dn Home/End | Enter select | ...      |
 +-----------------------------------------------------------------+
 ```
 
-The picker pulls the live OpenRouter catalog (cached 24 h, refresh with `Ctrl+R`) and merges it with the models declared in your YAML `backends:` so favorites stay pinned at the top. Each row shows input / output / cache-read prices in $/Mtok plus a capability badge: `V`ision (image input), `A`udio (audio input), `M`ovie (video input), `I`mage-gen (image output), `S`peech (audio output).
+The title names the scope you're editing. The picker pulls the live OpenRouter catalog (cached 24 h, refresh with `Ctrl+R`) and merges it with the models declared in your YAML `backends:` so favorites stay pinned at the top. Each row shows input / output / cache-read prices in $/Mtok plus a capability badge: `V`ision (image input), `A`udio (audio input), `M`ovie (video input), `I`mage-gen (image output), `S`peech (audio output).
 
 Typing in the search box does fzf-style fuzzy matching across model ids and capability labels — `vision` filters to vision-capable models without a separate UI; `claude opus` finds Anthropic's top tier across providers.
 
-### Scope tabs
-
-The strip above the search bar names the scope that Enter writes to:
-
-- **`Session`** — Enter pins the model session-wide (`SessionMeta.model`, what `/model <id>` does). Default scope.
-- **`<agent>`** — Enter sets the per-agent override for that agent (`SessionMeta.agent_models[name]`, what `/model <agent> <id>` does).
-
-`Tab` / `Shift+Tab` cycles scope. The `(current)` annotation and the floating-active sort follow the active scope's pin, so switching to an agent's tab puts that agent's pinned model at row 0. When only the Session scope exists (no agents attached to the session yet), the strip suppresses itself to keep the chrome out of the way.
+`Enter` writes the highlighted model to whichever scope the picker is locked to and returns you to the Models page. The scope is set when you open the picker — there's no in-picker scope switching; pick a different row to edit a different scope.
 
 | Key                   | Action                                              |
 | --------------------- | --------------------------------------------------- |
@@ -280,11 +291,10 @@ The strip above the search bar names the scope that Enter writes to:
 | `↑` / `↓`             | Move cursor in the filtered list                    |
 | `PageUp` / `PageDown` | Jump 10 rows                                        |
 | `Home` / `End`        | Jump to first / last row                            |
-| `Tab` / `Shift+Tab`   | Cycle scope tab (Session ↔ per-agent)               |
-| `Enter`               | Apply the highlighted model to the active scope     |
+| `Enter`               | Apply the highlighted model to the picker's scope   |
 | `Ctrl+R`              | Force-refresh the catalog (bypass the 24 h cache)   |
 | `Ctrl+U`              | Clear the search query                              |
-| `Esc`                 | Dismiss without changing anything                   |
+| `Esc`                 | Dismiss without changing anything; return to Models |
 
 There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open.
 
