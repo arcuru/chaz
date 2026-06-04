@@ -1599,4 +1599,221 @@ while True:
             "Expected process death error, got: {err}"
         );
     }
+
+    // ================================================================
+    // Streamable HTTP transport — protocol version header + session
+    // recovery. Wiremock acts as a fake MCP server so we can assert
+    // exact wire-level behavior without depending on a real remote.
+    // ================================================================
+
+    /// JSON for a successful `InitializeResult` body, echoing the
+    /// protocol version the caller wants the fake server to claim.
+    fn fake_initialize_result(protocol_version: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": protocol_version,
+                "serverInfo": {"name": "wiremock-mcp", "version": "0.0"},
+                "capabilities": {}
+            }
+        })
+    }
+
+    /// Build an `McpServerConfig` pointing at the given HTTP URL.
+    fn http_config(url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: "test".into(),
+            command: String::new(),
+            args: None,
+            env: None,
+            url: Some(url.to_string()),
+            default_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_post_init_carries_mcp_protocol_version_header() {
+        use wiremock::matchers::{body_partial_json, header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // initialize POST: no version header expected yet (we don't
+        // know the negotiated version at this point in the dance).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_result("2025-11-25")),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // notifications/initialized POST: MUST carry the negotiated
+        // version. This is the first request after initialize that
+        // should include the header.
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .and(header("MCP-Protocol-Version", "2025-11-25"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Any other POST without the header is a failure — fail loudly
+        // by responding with a sentinel 500 so the assertion is clear.
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let _server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        // wiremock's Drop verifies each Mock's `.expect(1)`.
+
+        // Also confirm chaz actually sent some `MCP-Protocol-Version`
+        // header on the initialized notification — orthogonal check
+        // against a hypothetical regression that sets the header to
+        // an empty string.
+        let received = mock.received_requests().await.unwrap();
+        let init_ack = received
+            .iter()
+            .find(|r| {
+                String::from_utf8_lossy(&r.body).contains("notifications/initialized")
+            })
+            .expect("should have seen the initialized notification");
+        assert!(
+            init_ack.headers.contains_key("mcp-protocol-version"),
+            "initialized notification missing protocol-version header"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_404_on_tool_call_triggers_reinit_and_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Two initialize calls expected: one at start, one after the
+        // 404-triggered re-init.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_result("2025-11-25")),
+            )
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        // Two notifications/initialized expected (one per initialize).
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        // First tools/call → 404 (carries a session ID, mimicking an
+        // expired session). Second tools/call → success.
+        struct ToolCallResponder {
+            calls: AtomicUsize,
+        }
+        impl Respond for ToolCallResponder {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                let n = self.calls.fetch_add(1, AOrd::SeqCst);
+                if n == 0 {
+                    // Spec: server returns 404 on a request whose
+                    // session has been terminated. No body required.
+                    ResponseTemplate::new(404)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "isError": false
+                        }
+                    }))
+                }
+            }
+        }
+
+        let responder = ToolCallResponder {
+            calls: AtomicUsize::new(0),
+        };
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+
+        // Seed a session ID so the 404 path triggers (drop-session
+        // logic only fires when a session was previously cached;
+        // without one a 404 is just an HTTP error).
+        if let Transport::Http(h) = &server.transport {
+            *h.session_id.lock().await = Some("seeded-session".to_string());
+        }
+
+        // call_tool should: try → 404 → re-init → retry → success.
+        let out = server.call_tool("echo", json!({})).await.unwrap();
+        assert_eq!(out, "ok");
+        // wiremock Drop verifies the `.expect(N)` counts.
+    }
+
+    #[tokio::test]
+    async fn http_404_without_session_propagates_as_plain_error() {
+        // Regression guard: a 404 from a server that never issued a
+        // session ID isn't "session expired" — it's just a 404.
+        // Confirm we don't loop or eat the error.
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_result("2025-11-25")),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // tools/call → 404 (only once expected — no retry path).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        // No session seeding — should NOT recover from this 404.
+        let err = server.call_tool("echo", json!({})).await.unwrap_err();
+        assert!(
+            err.to_string().contains("404"),
+            "expected raw 404 error, got: {err}"
+        );
+    }
 }

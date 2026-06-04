@@ -44,7 +44,10 @@ pub(super) struct HttpTransport {
     url: String,
     client: reqwest::Client,
     /// MCP session ID returned by the server (tracked across requests).
-    session_id: Mutex<Option<String>>,
+    /// Exposed at `super` visibility so integration tests can seed it
+    /// without bouncing through a real initialize handshake — there's
+    /// no other lever for "pretend we have a session" against a fake.
+    pub(super) session_id: Mutex<Option<String>>,
     /// Protocol version negotiated during the initialize handshake.
     /// `None` before initialize completes; `Some(version)` after, at
     /// which point every subsequent request carries an

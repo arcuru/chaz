@@ -43,3 +43,4 @@ wasmtime.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 wat.workspace = true
+wiremock = "0.6"
