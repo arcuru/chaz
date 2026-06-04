@@ -77,7 +77,17 @@ Both transports honour the spec's `notifications/tools/list_changed`: when a ser
 
 ## Policy
 
-MCP tools default to Medium risk / UnlessAutoApproved / 60s timeout. Override per server:
+Each MCP tool resolves to a `ToolPolicy` in this precedence order:
+
+1. **`security.tool_policies.<namespaced_name>`** — per-tool override in chaz config; wins unconditionally.
+2. **`mcp_servers[*].default_policy`** — per-server pin in chaz config.
+3. **Annotations from `tools/list`** — the server self-reports its behavior via the MCP 2025-06 `annotations` field. Chaz maps:
+   - `destructiveHint: true` → `risk: high`, `approval: always`
+   - `readOnlyHint: true` → `risk: low`, `approval: never`
+   - (`destructive` wins if both are set; misconfigured servers fail closed)
+4. **chaz default** — `risk: medium`, `approval: unless_auto_approved`, `timeout: 60`.
+
+A well-behaved MCP server can therefore ship without any chaz-side policy boilerplate; chaz trusts the server's self-declaration unless you pin a different value:
 
 ```yaml
 mcp_servers:
@@ -88,15 +98,15 @@ mcp_servers:
       timeout: 120
 ```
 
-Or override individual tools via `security.tool_policies`:
+Per-tool override via `security.tool_policies` (uses the namespaced name):
 
 ```yaml
 security:
   tool_policies:
-    filesystem.write_file:
+    filesystem__write_file:
       approval: always
       risk: medium
-    filesystem.read_file:
+    filesystem__read_file:
       approval: never
       risk: low
 ```

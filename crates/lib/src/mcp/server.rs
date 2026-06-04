@@ -118,11 +118,15 @@ impl McpServer {
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let annotations = tool_val
+                .get("annotations")
+                .and_then(McpToolAnnotations::from_json);
 
             tools.push(McpToolInfo {
                 name,
                 description,
                 input_schema,
+                annotations,
             });
         }
 
@@ -156,11 +160,10 @@ impl McpServer {
             let new_meta = McpToolMetadata {
                 description: info.description.clone(),
                 input_schema: info.input_schema.clone(),
+                annotations: info.annotations.clone(),
             };
             if let Some(existing) = metadata.get_mut(&info.name) {
-                if existing.description != new_meta.description
-                    || existing.input_schema != new_meta.input_schema
-                {
+                if *existing != new_meta {
                     *existing = new_meta;
                     updated += 1;
                 }
@@ -300,6 +303,7 @@ impl McpServer {
                     McpToolMetadata {
                         description: info.description.clone(),
                         input_schema: info.input_schema.clone(),
+                        annotations: info.annotations.clone(),
                     },
                 );
             }
@@ -339,14 +343,96 @@ pub(super) struct McpToolInfo {
     pub(super) name: String,
     pub(super) description: String,
     pub(super) input_schema: Value,
+    pub(super) annotations: Option<McpToolAnnotations>,
 }
 
 /// Shared, updatable metadata for a tool. Read by McpTool::descriptor(),
 /// written by McpServer::refresh_tools().
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct McpToolMetadata {
     pub(super) description: String,
     pub(super) input_schema: Value,
+    pub(super) annotations: Option<McpToolAnnotations>,
+}
+
+/// Behavioral hints an MCP server may attach to a tool definition
+/// (`tools/list` response, per the MCP 2025-06 spec §Tool). All fields
+/// are optional and advisory — chaz uses them to seed `default_policy`
+/// when the server's yaml block doesn't pin one explicitly.
+///
+/// Spec note: these are *hints*, not guarantees. A server claiming
+/// `readOnlyHint: true` and then mutating state is misbehaving; we
+/// trust the hint at policy-derivation time but the policy layer
+/// (timeouts, leak detection, approval) still runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct McpToolAnnotations {
+    /// Tool reads but does not modify its environment.
+    pub(super) read_only_hint: Option<bool>,
+    /// Tool may perform destructive (irreversible) updates.
+    pub(super) destructive_hint: Option<bool>,
+    /// Repeated calls with identical args have no additional effect.
+    pub(super) idempotent_hint: Option<bool>,
+    /// Tool interacts with entities outside its immediate environment.
+    pub(super) open_world_hint: Option<bool>,
+}
+
+impl McpToolAnnotations {
+    /// Parse the `annotations` object from a `tools/list` tool entry.
+    /// Returns `None` when the field is absent or malformed; the caller
+    /// then falls back to chaz's Medium default.
+    fn from_json(v: &Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let read_bool = |k: &str| obj.get(k).and_then(|x| x.as_bool());
+        Some(Self {
+            read_only_hint: read_bool("readOnlyHint"),
+            destructive_hint: read_bool("destructiveHint"),
+            idempotent_hint: read_bool("idempotentHint"),
+            open_world_hint: read_bool("openWorldHint"),
+        })
+    }
+
+    /// Map hints to a default `ToolPolicy`. Conservative ordering:
+    /// `destructiveHint` wins over `readOnlyHint` if both are somehow
+    /// set, because dropping approval on a destructive tool is worse
+    /// than requiring approval on a read-only one.
+    fn to_policy(&self) -> ToolPolicy {
+        if self.destructive_hint == Some(true) {
+            return ToolPolicy {
+                risk: RiskLevel::High,
+                approval: ApprovalRequirement::Always,
+                timeout: 60,
+                sensitive_params: Vec::new(),
+                rate_limit: None,
+                grants: Default::default(),
+            };
+        }
+        if self.read_only_hint == Some(true) {
+            return ToolPolicy {
+                risk: RiskLevel::Low,
+                approval: ApprovalRequirement::Never,
+                timeout: 60,
+                sensitive_params: Vec::new(),
+                rate_limit: None,
+                grants: Default::default(),
+            };
+        }
+        // No useful hints — fall through to chaz's historical default.
+        mcp_default_policy()
+    }
+}
+
+/// chaz's pre-annotations default for any MCP tool that didn't ship
+/// behavioral hints and whose server has no explicit `default_policy`
+/// block in yaml.
+fn mcp_default_policy() -> ToolPolicy {
+    ToolPolicy {
+        risk: RiskLevel::Medium,
+        approval: ApprovalRequirement::UnlessAutoApproved,
+        timeout: 60,
+        sensitive_params: Vec::new(),
+        rate_limit: None,
+        grants: Default::default(),
+    }
 }
 
 /// Wraps a single MCP tool as a `Tool` trait implementation.
@@ -390,14 +476,22 @@ impl Tool for McpTool {
     }
 
     fn default_policy(&self) -> ToolPolicy {
-        self.server.default_policy.clone().unwrap_or(ToolPolicy {
-            risk: RiskLevel::Medium,
-            approval: ApprovalRequirement::UnlessAutoApproved,
-            timeout: 60,
-            sensitive_params: Vec::new(),
-            rate_limit: None,
-            grants: Default::default(),
-        })
+        // Precedence:
+        //  1. `default_policy` set explicitly on the server in yaml — wins
+        //     unconditionally so users can always pin behavior they care about
+        //  2. Annotations from `tools/list` — `destructiveHint` / `readOnlyHint`
+        //     map to High+Always / Low+Never respectively
+        //  3. Otherwise: Medium + UnlessAutoApproved, chaz's historical default
+        if let Some(p) = self.server.default_policy.clone() {
+            return p;
+        }
+        let metadata = self.server.tool_metadata.read().unwrap();
+        if let Some(meta) = metadata.get(&self.raw_name)
+            && let Some(ann) = &meta.annotations
+        {
+            return ann.to_policy();
+        }
+        mcp_default_policy()
     }
 }
 
@@ -586,6 +680,7 @@ mod tests {
             McpToolMetadata {
                 description: "Does things".to_string(),
                 input_schema: json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+                annotations: None,
             },
         );
         let server = Arc::new(server);
@@ -627,6 +722,7 @@ mod tests {
             McpToolMetadata {
                 description: "v1".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
+                annotations: None,
             },
         );
         let server = Arc::new(server);
@@ -644,6 +740,7 @@ mod tests {
             McpToolMetadata {
                 description: "v2 with new params".to_string(),
                 input_schema: json!({"type": "object", "properties": {"new_param": {"type": "number"}}}),
+                annotations: None,
             },
         );
 
@@ -694,6 +791,168 @@ mod tests {
     fn test_tools_changed_flag_default_false() {
         let server = make_test_server("srv");
         assert!(!server.tools_changed.load(Ordering::Relaxed));
+    }
+
+    // ================================================================
+    // Tool annotations → default_policy
+    // ================================================================
+
+    /// Helper: insert a tool with annotations and return its wrapper.
+    fn tool_with_annotations(
+        server_name: &str,
+        raw_name: &str,
+        ann: McpToolAnnotations,
+    ) -> (Arc<McpServer>, McpTool) {
+        let server = make_test_server(server_name);
+        server.tool_metadata.write().unwrap().insert(
+            raw_name.to_string(),
+            McpToolMetadata {
+                description: String::new(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                annotations: Some(ann),
+            },
+        );
+        let server = Arc::new(server);
+        let tool = McpTool {
+            server: server.clone(),
+            raw_name: raw_name.to_string(),
+            namespaced_name: format!("{server_name}__{raw_name}"),
+        };
+        (server, tool)
+    }
+
+    #[test]
+    fn annotations_from_json_parses_all_four_hints() {
+        let v = json!({
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        });
+        let ann = McpToolAnnotations::from_json(&v).expect("should parse");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.destructive_hint, Some(false));
+        assert_eq!(ann.idempotent_hint, Some(true));
+        assert_eq!(ann.open_world_hint, Some(false));
+    }
+
+    #[test]
+    fn annotations_from_json_treats_missing_fields_as_none() {
+        let v = json!({"readOnlyHint": true}); // only one set
+        let ann = McpToolAnnotations::from_json(&v).expect("should parse");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.destructive_hint, None);
+        assert_eq!(ann.idempotent_hint, None);
+        assert_eq!(ann.open_world_hint, None);
+    }
+
+    #[test]
+    fn annotations_from_json_returns_none_for_non_object() {
+        assert!(McpToolAnnotations::from_json(&json!(null)).is_none());
+        assert!(McpToolAnnotations::from_json(&json!("string")).is_none());
+        assert!(McpToolAnnotations::from_json(&json!([1, 2, 3])).is_none());
+    }
+
+    #[test]
+    fn read_only_hint_maps_to_low_never() {
+        let (_, tool) = tool_with_annotations(
+            "srv",
+            "list",
+            McpToolAnnotations {
+                read_only_hint: Some(true),
+                ..Default::default()
+            },
+        );
+        let p = tool.default_policy();
+        assert_eq!(p.risk, RiskLevel::Low);
+        assert_eq!(p.approval, ApprovalRequirement::Never);
+    }
+
+    #[test]
+    fn destructive_hint_maps_to_high_always() {
+        let (_, tool) = tool_with_annotations(
+            "srv",
+            "drop_table",
+            McpToolAnnotations {
+                destructive_hint: Some(true),
+                ..Default::default()
+            },
+        );
+        let p = tool.default_policy();
+        assert_eq!(p.risk, RiskLevel::High);
+        assert_eq!(p.approval, ApprovalRequirement::Always);
+    }
+
+    #[test]
+    fn destructive_hint_wins_over_read_only_hint_if_both_set() {
+        // Misconfigured server claims both — conservative choice is to
+        // require approval (treat as destructive).
+        let (_, tool) = tool_with_annotations(
+            "srv",
+            "weird",
+            McpToolAnnotations {
+                read_only_hint: Some(true),
+                destructive_hint: Some(true),
+                ..Default::default()
+            },
+        );
+        let p = tool.default_policy();
+        assert_eq!(p.risk, RiskLevel::High);
+        assert_eq!(p.approval, ApprovalRequirement::Always);
+    }
+
+    #[test]
+    fn no_useful_hints_falls_back_to_medium() {
+        // Annotations present but only carry idempotent/openWorld — neither
+        // currently maps to a risk tier; expect chaz's default.
+        let (_, tool) = tool_with_annotations(
+            "srv",
+            "unknown",
+            McpToolAnnotations {
+                idempotent_hint: Some(true),
+                open_world_hint: Some(true),
+                ..Default::default()
+            },
+        );
+        let p = tool.default_policy();
+        assert_eq!(p.risk, RiskLevel::Medium);
+        assert_eq!(p.approval, ApprovalRequirement::UnlessAutoApproved);
+    }
+
+    #[test]
+    fn server_yaml_policy_overrides_annotations() {
+        // destructiveHint would derive High+Always, but the yaml-pinned
+        // policy is Low+Never — yaml wins.
+        let mut server = make_test_server("srv");
+        server.default_policy = Some(ToolPolicy {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            timeout: 30,
+            sensitive_params: Vec::new(),
+            rate_limit: None,
+            grants: Default::default(),
+        });
+        server.tool_metadata.write().unwrap().insert(
+            "drop_table".to_string(),
+            McpToolMetadata {
+                description: String::new(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                annotations: Some(McpToolAnnotations {
+                    destructive_hint: Some(true),
+                    ..Default::default()
+                }),
+            },
+        );
+        let server = Arc::new(server);
+        let tool = McpTool {
+            server,
+            raw_name: "drop_table".to_string(),
+            namespaced_name: "srv__drop_table".to_string(),
+        };
+        let p = tool.default_policy();
+        assert_eq!(p.risk, RiskLevel::Low);
+        assert_eq!(p.approval, ApprovalRequirement::Never);
+        assert_eq!(p.timeout, 30);
     }
 
     // ================================================================
@@ -865,6 +1124,7 @@ mod tests {
             let new_meta = McpToolMetadata {
                 description: desc.to_string(),
                 input_schema: schema.clone(),
+                annotations: None,
             };
             if let Some(existing) = metadata.get_mut(*name) {
                 if existing.description != new_meta.description
@@ -889,6 +1149,7 @@ mod tests {
             McpToolMetadata {
                 description: "desc a".to_string(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             },
         );
 
@@ -911,6 +1172,7 @@ mod tests {
             McpToolMetadata {
                 description: "old desc".to_string(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             },
         );
 
@@ -937,6 +1199,7 @@ mod tests {
             McpToolMetadata {
                 description: "a".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
 
@@ -960,6 +1223,7 @@ mod tests {
             McpToolMetadata {
                 description: "a".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
         metadata.insert(
@@ -967,6 +1231,7 @@ mod tests {
             McpToolMetadata {
                 description: "b".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
 
@@ -989,6 +1254,7 @@ mod tests {
             McpToolMetadata {
                 description: "a".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
 
@@ -1009,6 +1275,7 @@ mod tests {
             McpToolMetadata {
                 description: "same".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
         metadata.insert(
@@ -1016,6 +1283,7 @@ mod tests {
             McpToolMetadata {
                 description: "old".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
         metadata.insert(
@@ -1023,6 +1291,7 @@ mod tests {
             McpToolMetadata {
                 description: "doomed".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
 
@@ -1065,6 +1334,7 @@ mod tests {
             McpToolMetadata {
                 description: "exists".to_string(),
                 input_schema: json!({"type": "object"}),
+                annotations: None,
             },
         );
         assert_eq!(tool.descriptor().description, "exists");
@@ -1241,6 +1511,7 @@ while True:
             McpToolMetadata {
                 description: "Always fails".to_string(),
                 input_schema: json!({}),
+                annotations: None,
             },
         );
         let err = server.call_tool("fail", json!({})).await.unwrap_err();
