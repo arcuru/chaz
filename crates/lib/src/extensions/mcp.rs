@@ -12,7 +12,7 @@ use crate::config::McpServerConfig;
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
-use crate::mcp::server::McpServer;
+use crate::mcp::server::{McpServer, build_capability_tools};
 use crate::tool::Tool;
 use std::sync::Arc;
 use tracing::warn;
@@ -63,17 +63,23 @@ impl Extension for McpExtension {
             let tools: Vec<Arc<dyn Tool>> = match McpServer::start(&config).await {
                 Ok(server) => {
                     let server = Arc::new(server);
+                    let capability_tools = build_capability_tools(server.clone(), &config.name);
                     match server.discover_and_wrap_tools(&config.name).await {
                         Ok(t) => {
                             let count = t.len();
+                            let cap_count = capability_tools.len();
                             tracing::info!(
                                 server = %config.name,
-                                count,
+                                tools = count,
+                                capability_tools = cap_count,
                                 "MCP server registered as extension"
                             );
-                            t.into_iter()
+                            let mut all: Vec<Arc<dyn Tool>> = t
+                                .into_iter()
                                 .map(|tool| Arc::new(tool) as Arc<dyn Tool>)
-                                .collect()
+                                .collect();
+                            all.extend(capability_tools);
+                            all
                         }
                         Err(e) => {
                             warn!(
@@ -81,7 +87,9 @@ impl Extension for McpExtension {
                                 error = %e,
                                 "MCP server tool discovery failed — skipping"
                             );
-                            Vec::new()
+                            // Resources/prompts wrappers can still work
+                            // even if tools/list failed.
+                            capability_tools
                         }
                     }
                 }

@@ -56,11 +56,33 @@ Set exactly one of `command` (stdio) or `url` (HTTP) per server. You can also dr
 At startup, chaz:
 
 1. Spawns each MCP server subprocess
-2. Performs the MCP `initialize` handshake
-3. Calls `tools/list` to discover available tools
-4. Registers each tool as `server_name.tool_name` (e.g., `filesystem.read_file`)
+2. Performs the MCP `initialize` handshake — records which primitives (tools, resources, prompts) the server advertises
+3. Calls `tools/list` to discover available tools (only when the server claims the `tools` capability)
+4. Registers each tool as `server_name__tool_name` (e.g., `filesystem__read_file`)
+5. Adds capability wrapper tools for any other primitives the server claimed (see [Resources and Prompts](#resources-and-prompts))
 
 Failed servers are logged and skipped — they don't block startup. Name collisions across servers are detected and duplicates are skipped with a warning.
+
+## Resources and Prompts
+
+The MCP spec defines three primitives a server can expose: **Tools**, **Resources**, and **Prompts**. Chaz consumes all three. Whichever primitives a server advertises in its `initialize` response light up the corresponding wrapper tools:
+
+| Server advertises | Wrapper tools added                                         |
+| ----------------- | ----------------------------------------------------------- |
+| `resources`       | `<server>__list_resources`, `<server>__read_resource(uri)`  |
+| `prompts`         | `<server>__list_prompts`, `<server>__get_prompt(name, ...)` |
+
+The model uses these like any other tool: `list_resources` returns URIs + metadata, `read_resource` fetches one by URI. For prompts, `list_prompts` shows declared argument shapes (required args marked with `*`) and `get_prompt` renders the template into a single assistant-readable block.
+
+If a server only advertises `tools`, none of these wrappers appear. There's no per-server config knob to disable them — they follow what the server claims.
+
+### Resource contents
+
+`read_resource` concatenates every text content block the server returns. Binary blobs are summarized inline as `[binary <mime>: ~N bytes]` rather than dumped — chaz never spills decoded binary into the model's context. The same 100 KB truncation that bounds tool output bounds resource reads.
+
+### Prompts as tool results
+
+`get_prompt` returns the rendered template as a tool result (each message tagged `[role] body`). It does NOT replace the agent's system prompt — the model decides what to do with the content. Use this for parameterized prompt libraries the server exposes (`summarize`, `explain-code`, etc.).
 
 ## Auto-Restart (stdio only)
 

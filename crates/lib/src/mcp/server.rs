@@ -42,6 +42,21 @@ pub struct McpServer {
     tools_changed: AtomicBool,
     /// Shared metadata for each tool, keyed by raw tool name.
     pub(super) tool_metadata: RwLock<HashMap<String, McpToolMetadata>>,
+    /// Server-advertised capabilities, captured during `initialize`. Tells
+    /// chaz which primitives (tools, resources, prompts) the server
+    /// supports — used by [`McpExtension`] to gate which wrapper tools
+    /// it adds to the registry.
+    capabilities: RwLock<McpServerCapabilities>,
+}
+
+/// Which MCP primitives a server advertised support for in its
+/// `initialize` response. Servers omit absent capabilities entirely;
+/// chaz reads each as "supported" iff the object is present.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct McpServerCapabilities {
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
 }
 
 impl McpServer {
@@ -64,10 +79,17 @@ impl McpServer {
             default_policy: config.default_policy.clone(),
             tools_changed: AtomicBool::new(false),
             tool_metadata: RwLock::new(HashMap::new()),
+            capabilities: RwLock::new(McpServerCapabilities::default()),
         };
 
         server.initialize().await?;
         Ok(server)
+    }
+
+    /// Snapshot the server-advertised capabilities. Caller decides
+    /// which wrapper tools to register.
+    pub fn capabilities(&self) -> McpServerCapabilities {
+        *self.capabilities.read().unwrap()
     }
 
     /// Perform the MCP initialize handshake.
@@ -101,6 +123,17 @@ impl McpServer {
             );
         }
 
+        // Capture which primitives the server advertises. Absent
+        // sub-objects mean "not supported" — chaz won't register
+        // wrapper tools for capabilities the server didn't claim.
+        let caps_obj = result.get("capabilities");
+        let caps = McpServerCapabilities {
+            tools: caps_obj.is_some_and(|c| c.get("tools").is_some()),
+            resources: caps_obj.is_some_and(|c| c.get("resources").is_some()),
+            prompts: caps_obj.is_some_and(|c| c.get("prompts").is_some()),
+        };
+        *self.capabilities.write().unwrap() = caps;
+
         // Negotiated version: spec says the client SHOULD use what came
         // back, not what it sent. Fall back to what we advertised when
         // the server didn't echo a version (older or sloppy servers).
@@ -115,6 +148,204 @@ impl McpServer {
             .await?;
 
         Ok(())
+    }
+
+    /// Discover resources from the MCP server (spec: `resources/list`).
+    /// Returns the raw `resources` array — each entry is `{ uri, name?,
+    /// description?, mimeType? }`. Caller formats for display or hands a
+    /// URI to [`Self::read_resource`].
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>, String> {
+        let result = self.send_request("resources/list", json!({})).await?;
+        let arr = result
+            .get("resources")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "MCP server '{}': invalid resources/list response",
+                    self.name
+                )
+            })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let uri = v
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| {
+                    format!("MCP server '{}': resource missing uri field", self.name)
+                })?
+                .to_string();
+            out.push(McpResource {
+                uri,
+                name: v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string),
+                description: v
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_string),
+                mime_type: v
+                    .get("mimeType")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read a single resource by URI (spec: `resources/read`).
+    /// Returns the concatenated text contents across every `contents`
+    /// entry the server emits; binary entries are described inline as
+    /// `[binary <mime>: N bytes]` rather than dumped raw. Subject to the
+    /// same `MAX_OUTPUT_BYTES` truncation as tool calls.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let result = self
+            .send_request("resources/read", json!({ "uri": uri }))
+            .await?;
+        let contents = result
+            .get("contents")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "MCP server '{}': invalid resources/read response (no contents array)",
+                    self.name
+                )
+            })?;
+        let mut parts = Vec::new();
+        for item in contents {
+            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                parts.push(text.to_string());
+            } else if let Some(blob) = item.get("blob").and_then(|b| b.as_str()) {
+                let mime = item
+                    .get("mimeType")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("application/octet-stream");
+                // base64-encoded bytes — count the encoded length, decoded
+                // size is roughly 3/4 of that. Don't decode; we don't want
+                // to spill binary into the LLM context.
+                let approx_bytes = blob.len().saturating_mul(3) / 4;
+                parts.push(format!("[binary {mime}: ~{approx_bytes} bytes]"));
+            }
+        }
+        let joined = parts.join("\n");
+        if joined.len() > MAX_OUTPUT_BYTES {
+            Ok(format!(
+                "{}\n\n[output truncated at {} bytes]",
+                &joined[..MAX_OUTPUT_BYTES],
+                MAX_OUTPUT_BYTES
+            ))
+        } else {
+            Ok(joined)
+        }
+    }
+
+    /// Discover prompts from the MCP server (spec: `prompts/list`).
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, String> {
+        let result = self.send_request("prompts/list", json!({})).await?;
+        let arr = result
+            .get("prompts")
+            .and_then(|p| p.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "MCP server '{}': invalid prompts/list response",
+                    self.name
+                )
+            })?;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| {
+                    format!("MCP server '{}': prompt missing name field", self.name)
+                })?
+                .to_string();
+            let arguments = v
+                .get("arguments")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|arg| {
+                            Some(McpPromptArgument {
+                                name: arg.get("name").and_then(|n| n.as_str())?.to_string(),
+                                description: arg
+                                    .get("description")
+                                    .and_then(|d| d.as_str())
+                                    .map(str::to_string),
+                                required: arg
+                                    .get("required")
+                                    .and_then(|r| r.as_bool())
+                                    .unwrap_or(false),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(McpPrompt {
+                name,
+                description: v
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_string),
+                arguments,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Render a prompt template with the given arguments (spec:
+    /// `prompts/get`). Returns the concatenated message text — chaz
+    /// surfaces this as a tool result the LLM can consume directly.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> Result<String, String> {
+        let result = self
+            .send_request(
+                "prompts/get",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        let messages = result
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "MCP server '{}': invalid prompts/get response (no messages array)",
+                    self.name
+                )
+            })?;
+        let mut parts = Vec::new();
+        for msg in messages {
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("user");
+            let content = msg.get("content");
+            if let Some(text) = content
+                .and_then(|c| c.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                parts.push(format!("[{role}] {text}"));
+            } else if let Some(content_arr) = content.and_then(|c| c.as_array()) {
+                for item in content_arr {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        parts.push(format!("[{role}] {text}"));
+                    }
+                }
+            }
+        }
+        let joined = parts.join("\n\n");
+        if joined.len() > MAX_OUTPUT_BYTES {
+            Ok(format!(
+                "{}\n\n[output truncated at {} bytes]",
+                &joined[..MAX_OUTPUT_BYTES],
+                MAX_OUTPUT_BYTES
+            ))
+        } else {
+            Ok(joined)
+        }
     }
 
     /// Discover tools from the MCP server.
@@ -530,6 +761,340 @@ impl Tool for McpTool {
     }
 }
 
+/// A single resource the MCP server exposes via `resources/list`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+/// A prompt template the MCP server exposes via `prompts/list`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpPrompt {
+    pub name: String,
+    pub description: Option<String>,
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// One declared argument on a prompt template.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpPromptArgument {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: bool,
+}
+
+/// Built-in tool: list every resource exposed by one MCP server.
+/// Registered by `McpExtension` only when the server advertises the
+/// `resources` capability during initialize. Namespaced as
+/// `{server}__list_resources`.
+pub struct McpListResourcesTool {
+    pub(super) server: Arc<McpServer>,
+    pub(super) namespaced_name: String,
+}
+
+impl Tool for McpListResourcesTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: self.namespaced_name.clone(),
+            description: format!(
+                "List every resource exposed by the '{}' MCP server. \
+                 Returns URIs the model can hand to {}__read_resource.",
+                self.server.name, self.server.name
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _arguments: Value,
+        _ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let resources = self
+                .server
+                .list_resources()
+                .await
+                .map_err(classify_mcp_error)?;
+            if resources.is_empty() {
+                return Ok(format!("(no resources on '{}')", self.server.name));
+            }
+            let mut lines = Vec::with_capacity(resources.len());
+            for r in &resources {
+                let label = r.name.as_deref().unwrap_or(&r.uri);
+                let mime = r
+                    .mime_type
+                    .as_deref()
+                    .map(|m| format!(" ({m})"))
+                    .unwrap_or_default();
+                let desc = r
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
+                lines.push(format!("- {label} <{}>{}{}", r.uri, mime, desc));
+            }
+            Ok(lines.join("\n"))
+        })
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            ..ToolPolicy::default()
+        }
+    }
+}
+
+/// Built-in tool: read one resource from one MCP server by URI.
+/// Namespaced as `{server}__read_resource`.
+pub struct McpReadResourceTool {
+    pub(super) server: Arc<McpServer>,
+    pub(super) namespaced_name: String,
+}
+
+impl Tool for McpReadResourceTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: self.namespaced_name.clone(),
+            description: format!(
+                "Read the contents of one resource on the '{}' MCP server. \
+                 Pass a URI returned by {}__list_resources.",
+                self.server.name, self.server.name
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "description": "Resource URI"
+                    }
+                },
+                "required": ["uri"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: Value,
+        _ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        use crate::tool::ToolError;
+        Box::pin(async move {
+            let uri = arguments
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgument("Missing 'uri' argument".into()))?;
+            self.server
+                .read_resource(uri)
+                .await
+                .map_err(classify_mcp_error)
+        })
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        // Reading is read-only by definition; same shape as list_resources.
+        ToolPolicy {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            ..ToolPolicy::default()
+        }
+    }
+}
+
+/// Built-in tool: list every prompt template exposed by one MCP server.
+/// Registered only when the server advertises the `prompts` capability.
+/// Namespaced as `{server}__list_prompts`.
+pub struct McpListPromptsTool {
+    pub(super) server: Arc<McpServer>,
+    pub(super) namespaced_name: String,
+}
+
+impl Tool for McpListPromptsTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: self.namespaced_name.clone(),
+            description: format!(
+                "List every prompt template exposed by the '{}' MCP server.",
+                self.server.name
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _arguments: Value,
+        _ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let prompts = self.server.list_prompts().await.map_err(classify_mcp_error)?;
+            if prompts.is_empty() {
+                return Ok(format!("(no prompts on '{}')", self.server.name));
+            }
+            let mut lines = Vec::with_capacity(prompts.len());
+            for p in &prompts {
+                let desc = p
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
+                let args = if p.arguments.is_empty() {
+                    String::new()
+                } else {
+                    let parts: Vec<String> = p
+                        .arguments
+                        .iter()
+                        .map(|a| {
+                            if a.required {
+                                format!("{}*", a.name)
+                            } else {
+                                a.name.clone()
+                            }
+                        })
+                        .collect();
+                    format!(" [args: {}]", parts.join(", "))
+                };
+                lines.push(format!("- {}{}{}", p.name, args, desc));
+            }
+            Ok(lines.join("\n"))
+        })
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            ..ToolPolicy::default()
+        }
+    }
+}
+
+/// Built-in tool: render one prompt template on one MCP server.
+/// Namespaced as `{server}__get_prompt`.
+pub struct McpGetPromptTool {
+    pub(super) server: Arc<McpServer>,
+    pub(super) namespaced_name: String,
+}
+
+impl Tool for McpGetPromptTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: self.namespaced_name.clone(),
+            description: format!(
+                "Render a prompt template on the '{}' MCP server. \
+                 `arguments` is the free-form object the template expects \
+                 (see {}__list_prompts for declared args).",
+                self.server.name, self.server.name
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Prompt template name"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Template arguments"
+                    }
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: Value,
+        _ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        use crate::tool::ToolError;
+        Box::pin(async move {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgument("Missing 'name' argument".into()))?;
+            let args = arguments
+                .get("arguments")
+                .and_then(|a| a.as_object())
+                .cloned()
+                .unwrap_or_default();
+            self.server
+                .get_prompt(name, args)
+                .await
+                .map_err(classify_mcp_error)
+        })
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            ..ToolPolicy::default()
+        }
+    }
+}
+
+/// Build the four wrapper tools for the primitives the server advertised.
+/// Names are namespaced `{server}__{verb}` so they collide with neither
+/// each other nor a server tool of the same name (the same `__`
+/// convention `discover_and_wrap_tools` uses).
+pub fn build_capability_tools(
+    server: Arc<McpServer>,
+    server_name: &str,
+) -> Vec<Arc<dyn Tool>> {
+    let caps = server.capabilities();
+    let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+    if caps.resources {
+        out.push(Arc::new(McpListResourcesTool {
+            server: server.clone(),
+            namespaced_name: format!("{server_name}__list_resources"),
+        }));
+        out.push(Arc::new(McpReadResourceTool {
+            server: server.clone(),
+            namespaced_name: format!("{server_name}__read_resource"),
+        }));
+    }
+    if caps.prompts {
+        out.push(Arc::new(McpListPromptsTool {
+            server: server.clone(),
+            namespaced_name: format!("{server_name}__list_prompts"),
+        }));
+        out.push(Arc::new(McpGetPromptTool {
+            server,
+            namespaced_name: format!("{server_name}__get_prompt"),
+        }));
+    }
+    out
+}
+
 /// Classify a stringly-typed MCP error into a typed `ToolError`.
 ///
 /// The transport layer still returns `Result<_, String>` (MCP-internal
@@ -704,6 +1269,7 @@ mod tests {
             default_policy: None,
             tools_changed: AtomicBool::new(false),
             tool_metadata: RwLock::new(HashMap::new()),
+            capabilities: RwLock::new(McpServerCapabilities::default()),
         }
     }
 
@@ -1815,5 +2381,370 @@ while True:
             err.to_string().contains("404"),
             "expected raw 404 error, got: {err}"
         );
+    }
+
+    // ================================================================
+    // Resources + Prompts — wire-level behavior
+    // ================================================================
+
+    /// `InitializeResult` that advertises the given primitives. The
+    /// presence of each sub-object is what counts; values are ignored.
+    fn fake_initialize_with_caps(
+        protocol_version: &str,
+        tools: bool,
+        resources: bool,
+        prompts: bool,
+    ) -> Value {
+        let mut caps = serde_json::Map::new();
+        if tools {
+            caps.insert("tools".into(), json!({}));
+        }
+        if resources {
+            caps.insert("resources".into(), json!({}));
+        }
+        if prompts {
+            caps.insert("prompts".into(), json!({}));
+        }
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": protocol_version,
+                "serverInfo": {"name": "wiremock-mcp", "version": "0.0"},
+                "capabilities": caps
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn http_initialize_captures_advertised_capabilities() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    true,
+                    true,
+                    false,
+                )),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        let caps = server.capabilities();
+        assert!(caps.tools, "server advertised tools");
+        assert!(caps.resources, "server advertised resources");
+        assert!(!caps.prompts, "server did not advertise prompts");
+    }
+
+    #[tokio::test]
+    async fn http_resources_list_parses_server_response() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    false,
+                    true,
+                    false,
+                )),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "resources/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "file:///etc/hosts",
+                            "name": "hosts",
+                            "description": "system hosts file",
+                            "mimeType": "text/plain"
+                        },
+                        { "uri": "db://row/42" }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        let got = server.list_resources().await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].uri, "file:///etc/hosts");
+        assert_eq!(got[0].name.as_deref(), Some("hosts"));
+        assert_eq!(got[0].mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(got[1].uri, "db://row/42");
+        assert!(got[1].name.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_resources_read_concatenates_text_and_describes_blobs() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    false,
+                    true,
+                    false,
+                )),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "resources/read"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "contents": [
+                        { "uri": "file:///a", "text": "first line" },
+                        { "uri": "file:///a", "text": "second line" },
+                        { "uri": "file:///a", "blob": "AAECAwQFBgcICQ==", "mimeType": "image/png" }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        let out = server.read_resource("file:///a").await.unwrap();
+        assert!(out.contains("first line"));
+        assert!(out.contains("second line"));
+        assert!(
+            out.contains("[binary image/png:"),
+            "expected blob to be summarized, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_prompts_list_parses_arguments() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    false,
+                    false,
+                    true,
+                )),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "prompts/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "prompts": [
+                        {
+                            "name": "summarize",
+                            "description": "Summarize a topic",
+                            "arguments": [
+                                { "name": "topic", "required": true },
+                                { "name": "style", "description": "tone" }
+                            ]
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        let got = server.list_prompts().await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "summarize");
+        assert_eq!(got[0].arguments.len(), 2);
+        assert!(got[0].arguments[0].required);
+        assert!(!got[0].arguments[1].required);
+        assert_eq!(got[0].arguments[1].description.as_deref(), Some("tone"));
+    }
+
+    #[tokio::test]
+    async fn http_prompts_get_renders_messages() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    false,
+                    false,
+                    true,
+                )),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "prompts/get"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": { "type": "text", "text": "You are a helper." }
+                        },
+                        {
+                            "role": "user",
+                            "content": { "type": "text", "text": "Summarize: Rust." }
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+        let out = server
+            .get_prompt("summarize", serde_json::Map::new())
+            .await
+            .unwrap();
+        assert!(out.contains("[system] You are a helper."));
+        assert!(out.contains("[user] Summarize: Rust."));
+    }
+
+    #[tokio::test]
+    async fn http_build_capability_tools_skips_unavailable_primitives() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    true,
+                    false,
+                    false,
+                )),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock)
+            .await;
+
+        let server =
+            Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
+        let extras = build_capability_tools(server, "fakefs");
+        assert!(
+            extras.is_empty(),
+            "expected no capability tools when only `tools` is advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_build_capability_tools_adds_resource_and_prompt_wrappers() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fake_initialize_with_caps(
+                    "2025-11-25",
+                    true,
+                    true,
+                    true,
+                )),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&mock)
+            .await;
+
+        let server =
+            Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
+        let extras = build_capability_tools(server, "fakefs");
+        let names: Vec<String> =
+            extras.iter().map(|t| t.descriptor().name).collect();
+        assert!(names.contains(&"fakefs__list_resources".to_string()));
+        assert!(names.contains(&"fakefs__read_resource".to_string()));
+        assert!(names.contains(&"fakefs__list_prompts".to_string()));
+        assert!(names.contains(&"fakefs__get_prompt".to_string()));
     }
 }
