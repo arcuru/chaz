@@ -56,12 +56,8 @@ fn consume_budget(budget: &Arc<AtomicU32>) -> bool {
         if current == 0 {
             return false;
         }
-        match budget.compare_exchange_weak(
-            current,
-            current - 1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        match budget.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
             Ok(_) => return true,
             Err(actual) => current = actual,
         }
@@ -423,6 +419,7 @@ pub async fn execute(
         call_depth: tool_ctx.call_depth,
         session: tool_ctx.session.clone(),
         active_extensions: tool_ctx.active_extensions.clone(),
+        routine_engine: tool_ctx.routine_engine.clone(),
     });
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
@@ -1234,6 +1231,7 @@ mod tests {
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
             iteration_budget: None,
+            routine_engine: None,
         }
     }
 

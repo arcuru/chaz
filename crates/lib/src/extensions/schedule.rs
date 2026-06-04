@@ -13,7 +13,7 @@ use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
 };
-use crate::routine::{Trigger, notify_agent_schedules_changed};
+use crate::routine::Trigger;
 use crate::tools::{ScheduleAdd, ScheduleList, ScheduleModify, ScheduleOnce, ScheduleRemove};
 use cron::Schedule as CronSchedule;
 use std::future::Future;
@@ -270,7 +270,11 @@ async fn remove_cmd(
     };
     match adb.remove_schedule(schedule_id).await {
         Ok(true) => {
-            notify_agent_schedules_changed(&adb.id().to_string(), &adb).await;
+            if let Some(engine) = ctx.routine_engine.as_ref()
+                && let Err(e) = engine.reload_agent(&adb.id().to_string(), &adb).await
+            {
+                tracing::warn!(agent = %adb.id(), "engine.reload_agent after remove failed: {e}");
+            }
             ExtensionCommandOutcome::Text(format!("Removed schedule '{schedule_id}'"))
         }
         Ok(false) => ExtensionCommandOutcome::Error(format!("No schedule with id '{schedule_id}'")),
@@ -337,7 +341,11 @@ async fn add_cmd(
     );
     match adb.upsert_schedule(schedule).await {
         Ok(()) => {
-            notify_agent_schedules_changed(&entry.db_id.to_string(), &adb).await;
+            if let Some(engine) = ctx.routine_engine.as_ref()
+                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
+            {
+                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after add failed: {e}");
+            }
             ExtensionCommandOutcome::Text(format!(
                 "Schedule '{id}' on agent '{}': cron='{cron}' → this session — {task}",
                 entry.display_name
@@ -402,6 +410,7 @@ mod tests {
             call_depth: 0,
             session: Arc::new(Mutex::new(session)),
             active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
         };
         (instance, index, registry, ctx)
     }

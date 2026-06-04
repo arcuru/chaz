@@ -21,7 +21,7 @@
 use crate::agent_db::{AgentDb, Schedule, ScheduleTarget};
 use crate::extension::caps::AgentStateAdmin;
 use crate::hosted_index::DbEntry;
-use crate::routine::{Trigger, notify_agent_schedules_changed};
+use crate::routine::Trigger;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use cron::Schedule as CronSchedule;
 use serde_json::Value;
@@ -223,7 +223,11 @@ impl Tool for ScheduleAdd {
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
-            notify_agent_schedules_changed(&entry.db_id.to_string(), &adb).await;
+            if let Some(engine) = ctx.routine_engine.as_ref()
+                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
+            {
+                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+            }
 
             let target_label = match opt_str(&arguments, "target") {
                 Some("fresh") => "fresh session".to_string(),
@@ -354,7 +358,11 @@ impl Tool for ScheduleModify {
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
-            notify_agent_schedules_changed(&entry.db_id.to_string(), &adb).await;
+            if let Some(engine) = ctx.routine_engine.as_ref()
+                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
+            {
+                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+            }
 
             let mut parts = vec![format!(
                 "Modified schedule '{id}' on '{}':",
@@ -433,7 +441,11 @@ impl Tool for ScheduleRemove {
 
             match adb.remove_schedule(id).await {
                 Ok(true) => {
-                    notify_agent_schedules_changed(&entry.db_id.to_string(), &adb).await;
+                    if let Some(engine) = ctx.routine_engine.as_ref()
+                        && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
+                    {
+                        tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+                    }
                     Ok(format!(
                         "Removed schedule '{id}' from agent '{}'",
                         entry.display_name
@@ -634,7 +646,11 @@ impl Tool for ScheduleOnce {
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save wakeup: {e}"))?;
-            notify_agent_schedules_changed(&entry.db_id.to_string(), &adb).await;
+            if let Some(engine) = ctx.routine_engine.as_ref()
+                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
+            {
+                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+            }
 
             Ok(format!(
                 "Wakeup '{id}' scheduled for {} ({}s from now)",
@@ -728,6 +744,7 @@ mod tests {
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
             iteration_budget: None,
+            routine_engine: None,
         }
     }
 

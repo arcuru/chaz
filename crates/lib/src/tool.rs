@@ -293,6 +293,11 @@ pub struct ToolContext {
     /// direct `runtime::execute` callers that don't go through the
     /// spawn machinery).
     pub iteration_budget: Option<Arc<AtomicU32>>,
+    /// Handle to the running `RoutineEngine`, threaded from `Server` at
+    /// context construction. Tools that mutate schedules resync the live
+    /// heap through this after a committed write. `None` under `--print`
+    /// (no engine running) and in tests.
+    pub routine_engine: Option<Arc<crate::routine::RoutineEngine>>,
 }
 
 impl ToolContext {

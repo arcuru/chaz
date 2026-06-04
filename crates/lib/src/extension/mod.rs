@@ -353,6 +353,11 @@ pub struct HookContext {
     pub call_depth: usize,
     pub session: Arc<Mutex<Session>>,
     pub active_extensions: HashSet<String>,
+    /// Handle to the running `RoutineEngine`, threaded from `Server` at
+    /// context construction. Scheduling extensions resync the live heap
+    /// through this after a committed schedule mutation. `None` under
+    /// `--print` (no engine running) and in tests.
+    pub routine_engine: Option<Arc<crate::routine::RoutineEngine>>,
 }
 
 impl HookContext {
@@ -2084,6 +2089,7 @@ mod tests {
             call_depth: 0,
             session: Arc::new(Mutex::new(session)),
             active_extensions: HashSet::new(),
+            routine_engine: None,
         };
         ctx.set_settings("heartbeat", serde_json::json!({"poll_secs": 60}))
             .await
@@ -2411,6 +2417,7 @@ mod tests {
             call_depth: 0,
             session: Arc::new(Mutex::new(session)),
             active_extensions: HashSet::new(),
+            routine_engine: None,
         }
     }
 

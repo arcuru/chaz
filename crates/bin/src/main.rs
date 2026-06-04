@@ -713,10 +713,11 @@ async fn main() -> anyhow::Result<()> {
         let engine =
             routine::RoutineEngine::new(chaz_peer.clone(), Some(server.extensions().clone()))
                 .await?;
-        // Make the engine reachable to the session-storage helpers so
-        // `/schedule add|remove`, `schedule_once`, and `agent_delete`'s
-        // sweep resync the live schedule without a restart.
-        routine::set_engine(&engine);
+        // Hand the engine to the server so each `HookContext` / `ToolContext`
+        // built for a session can resync the live schedule after a committed
+        // mutation (the `/schedule` command, `schedule_*` tools, `schedule_once`,
+        // and `agent_delete`'s sweep).
+        server.set_routine_engine(engine.clone());
         // Pick up every session's routines + ensure the server is
         // watching those sessions so directive writes from fires drive
         // an agent turn.

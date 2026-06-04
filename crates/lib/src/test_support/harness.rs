@@ -130,5 +130,6 @@ pub(crate) fn tool_context_with_host(
         agent_grants: Default::default(),
         host,
         iteration_budget: None,
+        routine_engine: None,
     }
 }

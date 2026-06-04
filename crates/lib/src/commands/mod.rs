@@ -429,6 +429,7 @@ async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) ->
         call_depth: 0,
         session: Arc::new(Mutex::new(session)),
         active_extensions,
+        routine_engine: ctx.server.routine_engine().cloned(),
     };
 
     match hub.try_dispatch_command(name, args, &hook_ctx).await {

@@ -29,6 +29,7 @@ use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, error, info};
@@ -169,6 +170,12 @@ pub struct Server {
     /// (whatever `AgentRegistry::default_agent()` returns). The first
     /// entry effectively becomes the routing host on new sessions.
     default_agents: std::sync::RwLock<Vec<String>>,
+    /// Running `RoutineEngine`, set once at startup via
+    /// `set_routine_engine` (skipped under `--print`). Threaded into the
+    /// `HookContext` / `ToolContext` built for each session so that
+    /// scheduling extensions and tools resync the live heap after a
+    /// committed mutation. `None` in `--print` mode and in tests.
+    routine_engine: OnceLock<Arc<crate::routine::RoutineEngine>>,
 }
 
 impl Server {
@@ -213,6 +220,7 @@ impl Server {
             notify_tx,
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
+            routine_engine: OnceLock::new(),
         });
 
         let server_clone = server.clone();
@@ -237,7 +245,10 @@ impl Server {
     /// the first entry effectively becomes the routing host (resolution
     /// chain picks the first authorized agent when no @mention applies).
     pub fn set_default_agents(&self, names: Vec<String>) {
-        *self.default_agents.write().expect("default_agents lock poisoned") = names;
+        *self
+            .default_agents
+            .write()
+            .expect("default_agents lock poisoned") = names;
     }
 
     /// Read the current `default_agents` list. Cloned snapshot — caller
@@ -247,6 +258,20 @@ impl Server {
             .read()
             .expect("default_agents lock poisoned")
             .clone()
+    }
+
+    /// Register the running `RoutineEngine` so contexts built from this
+    /// server can resync the live schedule after a committed routine /
+    /// schedule mutation. First call wins (one engine per process);
+    /// subsequent calls are ignored.
+    pub fn set_routine_engine(&self, engine: Arc<crate::routine::RoutineEngine>) {
+        let _ = self.routine_engine.set(engine);
+    }
+
+    /// The running `RoutineEngine`, if one has been registered. `None`
+    /// under `--print` and in tests.
+    pub fn routine_engine(&self) -> Option<&Arc<crate::routine::RoutineEngine>> {
+        self.routine_engine.get()
     }
 
     /// Best-effort attach of the configured default agents to a
@@ -1089,9 +1114,10 @@ impl Server {
             agent_grants,
             host: self.host.clone(),
             active_extensions: active_extensions.clone(),
-            iteration_budget: Some(std::sync::Arc::new(
-                std::sync::atomic::AtomicU32::new(agent.max_iterations),
-            )),
+            iteration_budget: Some(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                agent.max_iterations,
+            ))),
+            routine_engine: self.routine_engine().cloned(),
         };
 
         let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
@@ -1100,9 +1126,7 @@ impl Server {
             let meta = s.read_meta().await;
             let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
             // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
-            let session_model = meta
-                .resolve_model_for_agent(agent_name)
-                .map(str::to_string);
+            let session_model = meta.resolve_model_for_agent(agent_name).map(str::to_string);
             let assembled = ContextBuilder::new(
                 s.entries(),
                 agent_name,
@@ -1280,6 +1304,7 @@ impl Server {
             call_depth,
             session: Arc::new(Mutex::new(session)),
             active_extensions,
+            routine_engine: self.routine_engine().cloned(),
         };
         self.extensions.fire_session_start(&ctx).await;
     }
@@ -1309,6 +1334,7 @@ impl Server {
                 call_depth: 0,
                 session: Arc::new(Mutex::new(session)),
                 active_extensions,
+                routine_engine: self.routine_engine().cloned(),
             };
             self.extensions.fire_session_shutdown(&ctx).await;
         }
@@ -1320,7 +1346,9 @@ impl Server {
 
         // Prune this session's routines from the running engine's heap
         // so a closed session stops firing scheduled wakes.
-        crate::routine::notify_session_closed(session_db_id).await;
+        if let Some(engine) = self.routine_engine() {
+            engine.deregister_session(session_db_id).await;
+        }
 
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_db_id);
@@ -1542,6 +1570,7 @@ impl Server {
         let context_config = self.context_config.clone();
         let host = self.host.clone();
         let spawn_extensions = self.extensions.clone();
+        let routine_engine = self.routine_engine().cloned();
         let max_context_tokens = agent.max_context_tokens;
         let active_extensions = self
             .active_extensions_for_agent(&session_db_id, &agent_name)
@@ -1584,9 +1613,10 @@ impl Server {
             // in; otherwise this is a top-level run (gateway / schedule
             // wake) and we allocate a fresh budget seeded from the
             // agent's `max_iterations`.
-            let iteration_budget = spawn.iteration_budget.clone().unwrap_or_else(|| {
-                Arc::new(AtomicU32::new(agent.max_iterations))
-            });
+            let iteration_budget = spawn
+                .iteration_budget
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicU32::new(agent.max_iterations)));
 
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
@@ -1600,6 +1630,7 @@ impl Server {
                 host: host.clone(),
                 active_extensions: active_extensions.clone(),
                 iteration_budget: Some(iteration_budget),
+                routine_engine: routine_engine.clone(),
             };
 
             let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);

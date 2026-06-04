@@ -1765,6 +1765,7 @@ mod tests {
             call_depth: 0,
             session,
             active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
         };
         cmd.attach_cmd(arg, &ctx).await
     }
@@ -1831,6 +1832,7 @@ mod tests {
             call_depth: 0,
             session,
             active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
         };
         cmd.attach_cmd("patrick", &ctx).await;
         match cmd.attach_cmd("patrick", &ctx).await {
