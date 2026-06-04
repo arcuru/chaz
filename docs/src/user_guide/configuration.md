@@ -290,7 +290,7 @@ Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in t
 | `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                  |
 | `system_prompt_files`  | list of paths          | File contents concatenated into the system prompt. `~` expansion supported.                            |
 | `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.   |
-| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace.*` globs for MCP tools.             |
+| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace__*` globs for MCP tools.            |
 | `workers`              | list of WorkerConfig   | Per-Agent Worker templates invocable via `spawn_worker`. See "Worker fields" below.                    |
 | `max_iterations`       | int                    | ReAct loop cap. Default 10.                                                                            |
 | `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                      |

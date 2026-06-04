@@ -279,8 +279,14 @@ impl McpServer {
     /// `Arc`. The caller is responsible for holding the `Arc<McpServer>`
     /// alive — the tools' `execute()` calls route back through it.
     ///
-    /// Namespaced names are `{server_name}.{tool_name}` (e.g.
-    /// `filesystem.read_file`).
+    /// Namespaced names are `{server_name}__{tool_name}` (e.g.
+    /// `filesystem__read_file`). Double-underscore matches the convention
+    /// used by Anthropic's Agent SDK / Claude Code (`mcp__server__tool`)
+    /// and Docker's MCP Gateway, and stays within the
+    /// `^[a-zA-Z0-9_-]{1,64}$` shape that OpenAI / OpenRouter / DeepSeek /
+    /// Groq / Together require for function names. Tools whose namespaced
+    /// name would exceed `MAX_TOOL_NAME_LEN` (64) are dropped with a
+    /// warning — every common provider 400s on longer names.
     pub async fn discover_and_wrap_tools(
         self: &Arc<Self>,
         server_name: &str,
@@ -300,18 +306,33 @@ impl McpServer {
         }
         Ok(tool_infos
             .into_iter()
-            .map(|info| {
+            .filter_map(|info| {
                 let raw = info.name;
-                let namespaced = format!("{}.{}", server_name, raw);
-                McpTool {
+                let namespaced = format!("{server_name}__{raw}");
+                if namespaced.len() > MAX_TOOL_NAME_LEN {
+                    tracing::warn!(
+                        server = %server_name,
+                        tool = %raw,
+                        len = namespaced.len(),
+                        max = MAX_TOOL_NAME_LEN,
+                        "MCP tool namespaced name exceeds provider limit; skipping",
+                    );
+                    return None;
+                }
+                Some(McpTool {
                     server: self.clone(),
                     raw_name: raw,
                     namespaced_name: namespaced,
-                }
+                })
             })
             .collect())
     }
 }
+
+/// Maximum length for a tool name accepted by the major LLM providers.
+/// OpenAI, Anthropic, and the MCP spec all converge on 64. Names longer
+/// than this 400 on the wire (see `claude-code#23149` for a real case).
+pub(super) const MAX_TOOL_NAME_LEN: usize = 64;
 
 /// Metadata for a single tool discovered from an MCP server.
 pub(super) struct McpToolInfo {
@@ -571,10 +592,10 @@ mod tests {
         let tool = McpTool {
             server: server.clone(),
             raw_name: "my_tool".to_string(),
-            namespaced_name: "srv.my_tool".to_string(),
+            namespaced_name: "srv__my_tool".to_string(),
         };
         let desc = tool.descriptor();
-        assert_eq!(desc.name, "srv.my_tool");
+        assert_eq!(desc.name, "srv__my_tool");
         assert_eq!(desc.description, "Does things");
         assert_eq!(
             desc.parameters,
@@ -589,11 +610,11 @@ mod tests {
         let tool = McpTool {
             server: server.clone(),
             raw_name: "gone_tool".to_string(),
-            namespaced_name: "srv.gone_tool".to_string(),
+            namespaced_name: "srv__gone_tool".to_string(),
         };
 
         let desc = tool.descriptor();
-        assert_eq!(desc.name, "srv.gone_tool");
+        assert_eq!(desc.name, "srv__gone_tool");
         assert_eq!(desc.description, "");
         assert_eq!(desc.parameters, json!({"type": "object", "properties": {}}));
     }
@@ -612,7 +633,7 @@ mod tests {
         let tool = McpTool {
             server: server.clone(),
             raw_name: "evolving".to_string(),
-            namespaced_name: "srv.evolving".to_string(),
+            namespaced_name: "srv__evolving".to_string(),
         };
 
         assert_eq!(tool.descriptor().description, "v1");
@@ -637,7 +658,7 @@ mod tests {
         let tool = McpTool {
             server,
             raw_name: "t".to_string(),
-            namespaced_name: "srv.t".to_string(),
+            namespaced_name: "srv__t".to_string(),
         };
         let policy = tool.default_policy();
         assert_eq!(policy.risk, RiskLevel::Medium);
@@ -660,7 +681,7 @@ mod tests {
         let tool = McpTool {
             server,
             raw_name: "t".to_string(),
-            namespaced_name: "srv.t".to_string(),
+            namespaced_name: "srv__t".to_string(),
         };
         let policy = tool.default_policy();
         assert_eq!(policy.risk, RiskLevel::High);
@@ -1031,7 +1052,7 @@ mod tests {
         let tool = McpTool {
             server: server.clone(),
             raw_name: "removed".to_string(),
-            namespaced_name: "srv.removed".to_string(),
+            namespaced_name: "srv__removed".to_string(),
         };
 
         // Initially no metadata — descriptor returns empty

@@ -475,7 +475,7 @@ pub struct SecurityConfig {
 pub struct ToolProfileConfig {
     /// Default presentation mode for tools not explicitly listed
     pub default: Option<PresentationMode>,
-    /// Per-tool presentation mode overrides (supports "namespace.*" glob patterns)
+    /// Per-tool presentation mode overrides (supports "namespace__*" glob patterns)
     pub tools: Option<HashMap<String, PresentationMode>>,
 }
 
@@ -488,7 +488,7 @@ pub struct ToolProfileConfig {
 /// At least one of `command` or `url` must be set.
 #[derive(Debug, Deserialize, Clone)]
 pub struct McpServerConfig {
-    /// Name used as namespace prefix for tools (e.g., "filesystem" → "filesystem.read_file")
+    /// Name used as namespace prefix for tools (e.g., "filesystem" → "filesystem__read_file")
     pub name: String,
     /// Command to spawn the MCP server subprocess (stdio transport)
     #[serde(default)]

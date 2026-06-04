@@ -110,14 +110,14 @@ tool_profiles:
   compact:
     default: full
     tools:
-      "filesystem.*": brief
-      "github.*": summary
+      "filesystem__*": brief
+      "github__*": summary
 ```
 
 Use `describe_tool` for on-demand discovery when tools are in Brief or Summary mode:
 
 ```json
-{ "tool": "filesystem.read_file" }
+{ "tool": "filesystem__read_file" }
 ```
 
 ## Agent Tool Allowlists
@@ -131,7 +131,7 @@ agents:
       - shell
       - read_file
       - write_file
-      - "filesystem.*" # All filesystem MCP tools
+      - "filesystem__*" # All filesystem MCP tools
 ```
 
 See [Agents](agents.md) for details on tool narrowing.
@@ -154,7 +154,7 @@ The shortest "agent reads a file through MCP" path:
    In a session you can ask the agent itself:
 
    ```
-   What MCP tools are registered? Use describe_tool on any filesystem.* tool you find.
+   What MCP tools are registered? Use describe_tool on any filesystem__* tool you find.
    ```
 
    `describe_tool` returns the full schema and is what the LLM uses to discover details about tools hidden by [tool profiles](tools.md#tool-profiles).
@@ -165,7 +165,7 @@ The shortest "agent reads a file through MCP" path:
    List the files in /home/me/notes and read the first .md file.
    ```
 
-   The agent calls `filesystem.list_directory` then `filesystem.read_file`. Each call runs under chaz's policy layer — risk tier, approval, leak detection, timeout.
+   The agent calls `filesystem__list_directory` then `filesystem__read_file`. Each call runs under chaz's policy layer — risk tier, approval, leak detection, timeout.
 
 4. **If something fails**: chaz logs the handshake failure and skips the server (it does not block startup). Check the log for `MCP '<name>'` lines. For stdio servers, fix the command/args and restart; for HTTP, verify the URL and reachability.
 
@@ -174,10 +174,10 @@ The shortest "agent reads a file through MCP" path:
    ```yaml
    agents:
      - name: notetaker
-       allowed_tools: ["read_file", "filesystem.*"]
+       allowed_tools: ["read_file", "filesystem__*"]
    ```
 
-   `filesystem.*` matches every tool that namespace exposes — present or future. The same glob form works in [tool profiles](tools.md#tool-profiles) for controlling how the LLM sees the tool definitions.
+   `filesystem__*` matches every tool that namespace exposes — present or future. The same glob form works in [tool profiles](tools.md#tool-profiles) for controlling how the LLM sees the tool definitions.
 
 ## Limitations
 

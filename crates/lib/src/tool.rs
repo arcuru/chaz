@@ -188,17 +188,17 @@ impl Default for ToolProfile {
 
 impl ToolProfile {
     /// Resolve the presentation mode for a tool by name.
-    /// Priority: exact match → glob prefix match (e.g., "filesystem.*") → default.
+    /// Priority: exact match → glob prefix match (e.g., `"filesystem__*"`) → default.
     pub fn resolve_mode(&self, tool_name: &str) -> &PresentationMode {
         // Exact match
         if let Some(mode) = self.tool_modes.get(tool_name) {
             return mode;
         }
-        // Glob prefix match: "namespace.*" matches "namespace.anything"
+        // Glob prefix match: "namespace__*" matches "namespace__anything"
         for (pattern, mode) in &self.tool_modes {
-            if let Some(prefix) = pattern.strip_suffix(".*")
+            if let Some(prefix) = pattern.strip_suffix("__*")
                 && tool_name.starts_with(prefix)
-                && tool_name[prefix.len()..].starts_with('.')
+                && tool_name[prefix.len()..].starts_with("__")
             {
                 return mode;
             }
@@ -512,11 +512,14 @@ impl ToolRegistry {
 
 /// Check if a tool name matches an allowlist pattern.
 ///
-/// Supports exact matches and glob-style `prefix.*` patterns.
-/// `"filesystem.*"` matches `"filesystem.read_file"` but not `"filesystemx"`.
+/// Supports exact matches and glob-style `prefix__*` patterns.
+/// `"filesystem__*"` matches `"filesystem__read_file"` but not
+/// `"filesystemx"`. The `__` separator mirrors the MCP namespacing used
+/// in `mcp::server::discover_and_wrap_tools` and the Anthropic Agent SDK
+/// convention (`mcp__server__tool`).
 fn pattern_matches(pattern: &str, tool_name: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix(".*") {
-        tool_name.starts_with(prefix) && tool_name[prefix.len()..].starts_with('.')
+    if let Some(prefix) = pattern.strip_suffix("__*") {
+        tool_name.starts_with(prefix) && tool_name[prefix.len()..].starts_with("__")
     } else {
         pattern == tool_name
     }
@@ -530,7 +533,7 @@ fn is_allowed_by(allowed: &[String], tool_name: &str) -> bool {
 /// Owned, narrowable view of the tool registry.
 ///
 /// Carries an Arc to the full registry plus an optional allowlist.
-/// Allowlist entries can be exact names or glob patterns (`"filesystem.*"`).
+/// Allowlist entries can be exact names or glob patterns (`"filesystem__*"`).
 /// Narrowing via `narrow()` produces a new ScopedTools with a tighter allowlist,
 /// enabling transitive tool restriction down the agent spawn tree.
 ///
@@ -593,7 +596,7 @@ impl ScopedTools {
                 // concrete tool names, then intersect with parent.
                 let mut result: Vec<String> = Vec::new();
                 for child_pattern in child {
-                    if child_pattern.ends_with(".*") {
+                    if child_pattern.ends_with("__*") {
                         // Child glob: expand to matching registry tools, keep if parent allows
                         for entry in &self.registry.tools {
                             let name = entry.descriptor().name;
@@ -686,19 +689,19 @@ mod tests {
     fn test_profile_resolve_glob_prefix() {
         let profile = ToolProfile {
             default_mode: PresentationMode::Full,
-            tool_modes: HashMap::from([("filesystem.*".to_string(), PresentationMode::Summary)]),
+            tool_modes: HashMap::from([("filesystem__*".to_string(), PresentationMode::Summary)]),
         };
         assert_eq!(
-            profile.resolve_mode("filesystem.read_file"),
+            profile.resolve_mode("filesystem__read_file"),
             &PresentationMode::Summary
         );
         assert_eq!(
-            profile.resolve_mode("filesystem.write_file"),
+            profile.resolve_mode("filesystem__write_file"),
             &PresentationMode::Summary
         );
-        // Not matching — no dot after prefix
+        // Not matching — no `__` separator after prefix
         assert_eq!(profile.resolve_mode("filesystemx"), &PresentationMode::Full);
-        assert_eq!(profile.resolve_mode("github.pr"), &PresentationMode::Full);
+        assert_eq!(profile.resolve_mode("github__pr"), &PresentationMode::Full);
     }
 
     #[test]
@@ -789,21 +792,21 @@ mod tests {
 
     #[test]
     fn test_pattern_matches_glob() {
-        assert!(pattern_matches("filesystem.*", "filesystem.read_file"));
-        assert!(pattern_matches("filesystem.*", "filesystem.write"));
-        // Must have a dot after the prefix
-        assert!(!pattern_matches("filesystem.*", "filesystemx"));
-        assert!(!pattern_matches("filesystem.*", "filesystem"));
+        assert!(pattern_matches("filesystem__*", "filesystem__read_file"));
+        assert!(pattern_matches("filesystem__*", "filesystem__write"));
+        // Must have `__` separator after the prefix
+        assert!(!pattern_matches("filesystem__*", "filesystemx"));
+        assert!(!pattern_matches("filesystem__*", "filesystem"));
         // Different namespace
-        assert!(!pattern_matches("filesystem.*", "github.pr"));
+        assert!(!pattern_matches("filesystem__*", "github__pr"));
     }
 
     #[test]
     fn test_is_allowed_by() {
-        let allowed = vec!["shell".to_string(), "filesystem.*".to_string()];
+        let allowed = vec!["shell".to_string(), "filesystem__*".to_string()];
         assert!(is_allowed_by(&allowed, "shell"));
-        assert!(is_allowed_by(&allowed, "filesystem.read_file"));
-        assert!(is_allowed_by(&allowed, "filesystem.write"));
+        assert!(is_allowed_by(&allowed, "filesystem__read_file"));
+        assert!(is_allowed_by(&allowed, "filesystem__write"));
         assert!(!is_allowed_by(&allowed, "web_fetch"));
         assert!(!is_allowed_by(&allowed, "filesystemx"));
     }

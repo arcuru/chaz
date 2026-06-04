@@ -32,7 +32,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `schedule_list`     | `schedule` | Low    | Never              | List an agent's schedules                                              |
 | `schedule_once`     | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
 
-That's 23 tools across 7 extensions today. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>.<tool>`.
+That's 23 tools across 7 extensions today. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
 
 ## Risk Levels
 
@@ -149,7 +149,7 @@ Lists the memory banks this agent has been granted access to, with the permissio
 Returns the full description and JSON Schema for any registered tool. Useful when tool profiles hide details (Brief or Summary mode) and the agent needs the full specification.
 
 ```json
-{ "tool": "filesystem.read_file" }
+{ "tool": "filesystem__read_file" }
 ```
 
 ### compact

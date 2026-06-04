@@ -199,7 +199,7 @@ API keys are stored in eidetica's SecretStore and resolved at the HTTP client bo
 
 ## Agent-Level Controls
 
-- **Tool narrowing**: Each Agent definition can restrict available tools via `tools:` (supports glob patterns like `"filesystem.*"`)
+- **Tool narrowing**: Each Agent definition can restrict available tools via `tools:` (supports glob patterns like `"filesystem__*"`)
 - **Transitive narrowing**: Spawned children (peer Agents via `spawn_agent`, Workers via `spawn_worker`) can never have more tools than their parent
 - **Worker scoping**: Workers are declared per-Agent under `workers:`. An Agent can only invoke a Worker that's declared under itself — no global Worker registry
 - **Depth limiting**: Spawn depth is capped to prevent infinite recursion

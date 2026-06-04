@@ -359,7 +359,7 @@ Example — make `researcher` post a morning briefing to the current session wee
 
 Tool access is controlled at two levels:
 
-1. **Agent / Worker definition**: the `tools:` field restricts which tools an Agent (or a Worker template under it) can see. Supports exact names and glob patterns (`"filesystem.*"` matches all tools from that MCP server namespace). `tools: null` (or omitted) means "inherit from parent" on a Worker; on an Agent it means "all tools".
+1. **Agent / Worker definition**: the `tools:` field restricts which tools an Agent (or a Worker template under it) can see. Supports exact names and glob patterns (`"filesystem__*"` matches all tools from that MCP server namespace — the `__` separator matches the namespacing chaz uses for discovered MCP tools). `tools: null` (or omitted) means "inherit from parent" on a Worker; on an Agent it means "all tools".
 2. **Transitive narrowing**: When an Agent spawns a child — a peer Agent (`spawn_agent`) or a Worker (`spawn_worker`) — the child's resolved tools are the _intersection_ of the parent's tools and the child's `tools:` list.
 
 A child can never have more tools than its parent, even if its definition allows them.
