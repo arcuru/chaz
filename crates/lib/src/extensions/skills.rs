@@ -596,7 +596,10 @@ impl Tool for SkillListTool {
         ToolDescriptor {
             name: "skill_list".into(),
             description: "List available skills with name and description".into(),
-            parameters: serde_json::json!({}),
+            // Explicit empty-object schema — bare `{}` is technically valid
+            // JSON Schema but OpenRouter (and likely others) reject it as
+            // "schema must be a JSON schema... got type null".
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
     }
 
