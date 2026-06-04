@@ -459,12 +459,38 @@ impl Default for ToolRegistry {
     }
 }
 
+/// Debug-only sanity check on a `ToolDescriptor.parameters` value at
+/// registration time. Catches the class of bug where a tool ships with
+/// `parameters: json!({})` — technically a valid JSON Schema but
+/// OpenRouter and likely others 400 with "schema must be a JSON
+/// schema… got type null". A parameter-less tool should use
+/// `{"type": "object", "properties": {}}` instead.
+///
+/// Off in release builds — the wire still rejects bad schemas, this
+/// is just a louder failure mode in tests.
+fn debug_assert_valid_parameters(desc: &ToolDescriptor) {
+    debug_assert!(
+        desc.parameters.is_object(),
+        "tool {:?} registered with non-object parameters: {:?}",
+        desc.name,
+        desc.parameters,
+    );
+    debug_assert!(
+        desc.parameters.get("type").is_some(),
+        "tool {:?} registered with a parameters schema missing the `type` field: {} \
+         — use `{{\"type\": \"object\", \"properties\": {{}}}}` for parameter-less tools",
+        desc.name,
+        desc.parameters,
+    );
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self { tools: Vec::new() }
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
+        debug_assert_valid_parameters(&tool.descriptor());
         self.tools.push(RegistryEntry {
             tool: std::sync::Arc::new(tool),
             owner: None,
@@ -472,6 +498,7 @@ impl ToolRegistry {
     }
 
     pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
+        debug_assert_valid_parameters(&tool.descriptor());
         self.tools.push(RegistryEntry {
             tool: std::sync::Arc::from(tool),
             owner: None,
@@ -486,6 +513,7 @@ impl ToolRegistry {
         tool: std::sync::Arc<dyn Tool>,
         owner: Option<&'static str>,
     ) {
+        debug_assert_valid_parameters(&tool.descriptor());
         self.tools.push(RegistryEntry { tool, owner });
     }
 
