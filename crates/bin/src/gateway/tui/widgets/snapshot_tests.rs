@@ -10,7 +10,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 
-use super::{header, inline_edit_prompt, scope_strip, sidebar, status_strip};
+use super::{header, inline_edit_prompt, picker, scope_strip, sidebar, status_strip};
 
 /// Render a single-widget frame and return the buffer as a multi-line
 /// string (one row per line, leading/trailing spaces preserved).
@@ -61,7 +61,13 @@ fn status_strip_simple_hint() {
 #[test]
 fn header_title_subtitle_and_hint() {
     let s = snapshot(60, 1, |f, area| {
-        header(f, area, "Peer Settings", Some("carbon.peer"), Some("[Esc back]"));
+        header(
+            f,
+            area,
+            "Peer Settings",
+            Some("carbon.peer"),
+            Some("[Esc back]"),
+        );
     });
     insta::assert_snapshot!(s);
 }
@@ -114,6 +120,38 @@ fn inline_edit_prompt_cursor_mid_string() {
 fn inline_edit_prompt_cursor_at_end() {
     let s = snapshot(40, 1, |f, area| {
         inline_edit_prompt(f, area, "model", "deepseek/v4", 11);
+    });
+    insta::assert_snapshot!(s);
+}
+
+#[test]
+fn picker_populated_list_second_selected() {
+    let s = snapshot(40, 6, |f, area| {
+        picker(
+            f,
+            area,
+            "add agent",
+            "",
+            0,
+            &["chaz", "ava", "researcher"],
+            1,
+        );
+    });
+    insta::assert_snapshot!(s);
+}
+
+#[test]
+fn picker_empty_list_no_matches() {
+    let s = snapshot(40, 4, |f, area| {
+        picker(f, area, "add agent", "xyz", 3, &[], 0);
+    });
+    insta::assert_snapshot!(s);
+}
+
+#[test]
+fn picker_filter_typed_one_match() {
+    let s = snapshot(40, 5, |f, area| {
+        picker(f, area, "add agent", "av", 2, &["ava"], 0);
     });
     insta::assert_snapshot!(s);
 }

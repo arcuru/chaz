@@ -13,6 +13,7 @@
 
 mod header;
 mod inline_edit;
+mod picker;
 mod scope_strip;
 mod sidebar;
 mod status_strip;
@@ -22,6 +23,7 @@ mod snapshot_tests;
 
 pub(super) use header::header;
 pub(super) use inline_edit::inline_edit_prompt;
+pub(super) use picker::picker;
 pub(super) use scope_strip::scope_strip;
 pub(super) use sidebar::{sidebar, sidebar_detail_layout};
 pub(super) use status_strip::status_strip;

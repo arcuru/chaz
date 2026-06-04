@@ -246,6 +246,57 @@ pub(super) enum SettingsPromptIntent {
     AddPeerDefault,
 }
 
+/// Bottom-strip filter-as-you-type picker active inside a Settings page.
+/// `Some` while the user is choosing an item from a known list; mutually
+/// exclusive with `settings_prompt`. On Enter the highlighted candidate
+/// dispatches the same `PromptSubmit` arm as the freeform prompt, keyed
+/// by `intent`.
+pub(super) struct SettingsPicker {
+    pub label: String,
+    pub filter: String,
+    pub cursor: usize,
+    pub candidates: Vec<String>,
+    pub selected: usize,
+    pub intent: SettingsPickerIntent,
+}
+
+/// What the active settings picker is collecting. Same shape as
+/// `SettingsPromptIntent` but separate so the type system enforces that
+/// only intents with a known candidate list reach the picker path.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SettingsPickerIntent {
+    /// Pick an agent from the peer registry to add to the active session.
+    /// Translates to `Command::AgentAdd` on submit, via the shared
+    /// `PromptSubmit { AddSessionAgent }` arm.
+    AddSessionAgent,
+}
+
+impl SettingsPicker {
+    /// Indices into `candidates` whose entries case-insensitively contain
+    /// `filter`. With empty filter this is `0..candidates.len()`.
+    pub fn filtered(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.candidates.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Currently highlighted candidate name, if any.
+    pub fn selected_name(&self) -> Option<&str> {
+        let filtered = self.filtered();
+        filtered
+            .get(self.selected)
+            .and_then(|i| self.candidates.get(*i))
+            .map(|s| s.as_str())
+    }
+}
+
 /// Frozen view of an active session's meta + a few cached derivatives, taken
 /// at the moment Session Settings opens. Keeps render code synchronous —
 /// reading `SessionMeta` requires an `async` round-trip into the session DB.
@@ -507,6 +558,10 @@ pub(super) struct App {
     /// `Some` while the user is typing; `None` otherwise. Keys route to
     /// the prompt instead of category navigation when set.
     pub(super) settings_prompt: Option<SettingsPrompt>,
+    /// Bottom-strip picker active in the current Settings page. Mutually
+    /// exclusive with `settings_prompt` — opening one clears the other.
+    /// Keys route to the picker (filter typing + ↑↓ + Enter) when set.
+    pub(super) settings_picker: Option<SettingsPicker>,
     /// One-shot status line shown in the Settings status strip in place
     /// of the regular hints. Set by action keys (`[r]` reload, `[d]`
     /// remove, etc.) to confirm what just happened; cleared on the next
@@ -564,9 +619,7 @@ impl App {
             model_picker_filtered: Vec::new(),
             model_picker_scroll: 0,
             model_search: String::new(),
-            model_picker_matcher: nucleo_matcher::Matcher::new(
-                nucleo_matcher::Config::DEFAULT,
-            ),
+            model_picker_matcher: nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT),
             model_picker_favorites: Vec::new(),
             model_picker_loading: false,
             model_picker_error: None,
@@ -584,6 +637,7 @@ impl App {
             peer_defaults_cursor: 0,
             session_agents_cursor: 0,
             settings_prompt: None,
+            settings_picker: None,
             settings_status: None,
             settings_config_path: None,
             model_picker_caller: TuiMode::Chat,
@@ -730,8 +784,11 @@ impl App {
         // Pull catalog-only rows (favorites are reapplied inside
         // rebuild_model_list, so we only need to surface non-favorite
         // catalog entries).
-        let fav_ids: std::collections::HashSet<String> =
-            self.model_picker_favorites.iter().map(|m| m.id.clone()).collect();
+        let fav_ids: std::collections::HashSet<String> = self
+            .model_picker_favorites
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
         let catalog: Vec<ModelInfo> = self
             .model_list
             .iter()
@@ -1122,8 +1179,7 @@ impl Gateway for TuiGateway {
         let (notify_tx, mut notify_rx) = mpsc::channel::<String>(64);
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
-        let (models_tx, mut models_rx) =
-            mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
+        let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
 
         let (_conv_id, session_db) = default_tui_session(&server).await?;
         let session_db_id = session_db.root_id().to_string();
@@ -1264,10 +1320,7 @@ impl Gateway for TuiGateway {
                                 .await;
                             }
                             TuiMode::SessionPicker => {
-                                app.open_settings(
-                                    SettingsScope::Peer,
-                                    TuiMode::SessionPicker,
-                                );
+                                app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
                             }
                             TuiMode::ModelPicker | TuiMode::Settings(_) => {}
                         }
@@ -1475,10 +1528,7 @@ impl Gateway for TuiGateway {
                         // session (or a remote peer pinned a model), the
                         // resolved value moves. Per-agent override beats
                         // the session pin for the tab's current agent.
-                        let current_agent = app
-                            .tabs
-                            .get(idx)
-                            .map(|t| t.current_agent.clone());
+                        let current_agent = app.tabs.get(idx).map(|t| t.current_agent.clone());
                         let agent_default = current_agent
                             .as_deref()
                             .and_then(|name| server.agents().get(name))
@@ -1488,9 +1538,7 @@ impl Gateway for TuiGateway {
                             .and_then(|name| meta.resolve_model_for_agent(name))
                             .map(str::to_string);
                         let effective_model = backend.resolve_model_name(
-                            session_model
-                                .as_deref()
-                                .or(agent_default.as_deref()),
+                            session_model.as_deref().or(agent_default.as_deref()),
                         );
 
                         let tab = &mut app.tabs[idx];
@@ -1644,11 +1692,8 @@ async fn handle_chat_action(
             // before the picker mounts.
             let session_db = app.active().session_db.clone();
             let session_db_id = app.active().session_db_id.clone();
-            let session = Session::new(
-                chaz_core::types::ConversationId(session_db_id),
-                session_db,
-            )
-            .await;
+            let session =
+                Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
             let meta = session.read_meta().await;
             app.seed_model_picker(backend, &meta);
             spawn_catalog_load(
@@ -1927,16 +1972,8 @@ async fn handle_settings_outcome(
             .await;
         }
         input::SettingsKey::DispatchCommand(cmd) => {
-            dispatch_settings_command(
-                cmd,
-                app,
-                server,
-                backend,
-                secrets,
-                approval_tx,
-                notify_tx,
-            )
-            .await;
+            dispatch_settings_command(cmd, app, server, backend, secrets, approval_tx, notify_tx)
+                .await;
         }
         input::SettingsKey::PromptSubmit { intent, value } => match intent {
             SettingsPromptIntent::AddSessionAgent => {

@@ -1,0 +1,11 @@
+---
+source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+assertion_line: 134
+expression: s
+---
+ add agent: ▎                           
+    chaz                                
+  > ava                                 
+    researcher                          
+                                        
+  ↑↓ select · enter add · esc cancel

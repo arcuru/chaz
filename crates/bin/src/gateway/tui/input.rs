@@ -8,8 +8,9 @@ use chaz_core::gateway::ApprovalDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
-    App, ChatAction, ClickTarget, Completion, Overlay, SettingsFocus, SettingsPrompt,
-    SettingsPromptIntent, SettingsScope, TuiMode, show_error, show_system_msg,
+    App, ChatAction, ClickTarget, Completion, Overlay, SettingsFocus, SettingsPicker,
+    SettingsPickerIntent, SettingsPrompt, SettingsPromptIntent, SettingsScope, TuiMode, show_error,
+    show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -103,7 +104,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/backend ", "add a custom backend (<name> <url> <key>)"),
         ("/backends", "list known backends and models"),
         ("# TUI", ""),
-        ("/settings", "open Session Settings (Peer Settings from session list)"),
+        (
+            "/settings",
+            "open Session Settings (Peer Settings from session list)",
+        ),
         ("/clear", "clear display (entries still in DB)"),
         ("/raw", "dump raw entry data for debugging"),
         ("/debug", "toggle debug mode (Ctrl+D)"),
@@ -1238,7 +1242,9 @@ pub(super) enum SettingsKey {
     /// `[r]` on the Peer→Agents detail. Payload is the agent display
     /// name. Main loop re-reads the config file, builds an `Agent` from
     /// the matching yaml entry, and upserts into the registry.
-    ReloadPeerAgent { name: String },
+    ReloadPeerAgent {
+        name: String,
+    },
     /// Replace the persisted peer-level `default_agents` list. Triggered
     /// by [d] / Ctrl+↑↓ / submitted [a] prompt on Peer→Defaults. Main
     /// loop applies via Server::set_default_agents and persists to
@@ -1265,6 +1271,10 @@ pub(super) fn handle_settings_key(
     if app.settings_prompt.is_some() {
         return handle_settings_prompt_key(app, key);
     }
+    // Same gate for the picker — mutually exclusive with the prompt.
+    if app.settings_picker.is_some() {
+        return handle_settings_picker_key(app, key);
+    }
 
     let n = app.settings_category_count(scope);
     if n == 0 {
@@ -1285,11 +1295,29 @@ pub(super) fn handle_settings_key(
     {
         match key.code {
             KeyCode::Char('a') => {
-                app.settings_prompt = Some(SettingsPrompt {
+                // Source candidates from the peer-registry list — already
+                // refreshed at the top of every Settings frame in
+                // `view::ui`. Filter out anything attached to this session
+                // so the picker only shows actionable adds.
+                let attached: std::collections::HashSet<String> = app
+                    .session_settings_snapshot
+                    .as_ref()
+                    .map(|s| s.agents.iter().map(|a| a.display_name.clone()).collect())
+                    .unwrap_or_default();
+                let candidates: Vec<String> = app
+                    .peer_agents_names
+                    .iter()
+                    .filter(|n| !attached.contains(*n))
+                    .cloned()
+                    .collect();
+                app.settings_prompt = None;
+                app.settings_picker = Some(SettingsPicker {
                     label: "add agent".to_string(),
-                    input: String::new(),
+                    filter: String::new(),
                     cursor: 0,
-                    intent: SettingsPromptIntent::AddSessionAgent,
+                    candidates,
+                    selected: 0,
+                    intent: SettingsPickerIntent::AddSessionAgent,
                 });
                 return SettingsKey::None;
             }
@@ -1353,9 +1381,7 @@ pub(super) fn handle_settings_key(
                 app.peer_defaults_cursor = cursor - 1;
                 return SettingsKey::WritePeerDefaults(next);
             }
-            KeyCode::Down
-                if key.modifiers.contains(KeyModifiers::CONTROL) && cursor + 1 < len =>
-            {
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && cursor + 1 < len => {
                 let mut next = app.peer_defaults.clone();
                 next.swap(cursor, cursor + 1);
                 app.peer_defaults_cursor = cursor + 1;
@@ -1434,8 +1460,7 @@ pub(super) fn handle_settings_key(
         // inner list with at least one row. No-op otherwise — there's
         // nothing for arrows to land on.
         KeyCode::Right => {
-            if matches!(focus, SettingsFocus::Sidebar)
-                && inner_list_len.is_some_and(|len| len > 0)
+            if matches!(focus, SettingsFocus::Sidebar) && inner_list_len.is_some_and(|len| len > 0)
             {
                 app.settings_focus = SettingsFocus::Detail;
             }
@@ -1483,8 +1508,7 @@ pub(super) fn handle_settings_key(
             }
             // Otherwise Enter on the sidebar dives into the detail pane
             // when one exists — same effect as Right.
-            if matches!(focus, SettingsFocus::Sidebar)
-                && inner_list_len.is_some_and(|len| len > 0)
+            if matches!(focus, SettingsFocus::Sidebar) && inner_list_len.is_some_and(|len| len > 0)
             {
                 app.settings_focus = SettingsFocus::Detail;
             }
@@ -1498,6 +1522,84 @@ pub(super) fn handle_settings_key(
 /// overlay's input handling — typing inserts at cursor, Backspace deletes
 /// the previous char, arrows move the cursor, Enter submits (trimmed),
 /// Esc cancels and clears the prompt.
+/// Route a key to the active `settings_picker`. Returns
+/// `SettingsKey::PromptSubmit` on Enter with a selected candidate (reusing
+/// the existing prompt-submit dispatch path), `None` for all other keys.
+fn handle_settings_picker_key(app: &mut App, key: KeyEvent) -> SettingsKey {
+    let Some(picker) = app.settings_picker.as_mut() else {
+        return SettingsKey::None;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.settings_picker = None;
+        }
+        KeyCode::Enter => {
+            let chosen = picker.selected_name().map(|s| s.to_string());
+            let intent = picker.intent;
+            app.settings_picker = None;
+            if let Some(value) = chosen {
+                let prompt_intent = match intent {
+                    SettingsPickerIntent::AddSessionAgent => SettingsPromptIntent::AddSessionAgent,
+                };
+                return SettingsKey::PromptSubmit {
+                    intent: prompt_intent,
+                    value,
+                };
+            }
+        }
+        KeyCode::Up => {
+            if picker.selected > 0 {
+                picker.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            let filtered_len = picker.filtered().len();
+            if filtered_len > 0 && picker.selected + 1 < filtered_len {
+                picker.selected += 1;
+            }
+        }
+        KeyCode::Char(c) => {
+            picker.filter.insert(picker.cursor, c);
+            picker.cursor += c.len_utf8();
+            picker.selected = 0;
+        }
+        KeyCode::Backspace => {
+            if picker.cursor > 0 {
+                let prev = picker.filter[..picker.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                picker.filter.drain(prev..picker.cursor);
+                picker.cursor = prev;
+                picker.selected = 0;
+            }
+        }
+        KeyCode::Left => {
+            if picker.cursor > 0 {
+                picker.cursor = picker.filter[..picker.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            }
+        }
+        KeyCode::Right => {
+            if picker.cursor < picker.filter.len() {
+                picker.cursor = picker.filter[picker.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| picker.cursor + i)
+                    .unwrap_or(picker.filter.len());
+            }
+        }
+        KeyCode::Home => picker.cursor = 0,
+        KeyCode::End => picker.cursor = picker.filter.len(),
+        _ => {}
+    }
+    SettingsKey::None
+}
+
 fn handle_settings_prompt_key(app: &mut App, key: KeyEvent) -> SettingsKey {
     let Some(prompt) = app.settings_prompt.as_mut() else {
         return SettingsKey::None;
@@ -1558,11 +1660,7 @@ fn handle_settings_prompt_key(app: &mut App, key: KeyEvent) -> SettingsKey {
 /// `None` when no list is present (the category is static content or a
 /// placeholder). Drives whether `↑`/`↓` navigate the right pane or the
 /// sidebar.
-fn settings_inner_list_len(
-    app: &App,
-    scope: SettingsScope,
-    category_idx: usize,
-) -> Option<usize> {
+fn settings_inner_list_len(app: &App, scope: SettingsScope, category_idx: usize) -> Option<usize> {
     use super::{PeerSettingsCategory, SessionSettingsCategory};
     match scope {
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx)? {

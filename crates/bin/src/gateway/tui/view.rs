@@ -121,11 +121,12 @@ pub(super) fn ui(
     // what the user is currently seeing.
     app.click_regions.clear();
 
-    // Refresh peer-side caches whenever Peer Settings is up. Both the
-    // input handler and the renderer index into these; keeping them
-    // fresh-per-frame ensures action keys ([r] reload, [d] remove,
-    // Ctrl+↑↓ reorder) target the row the user sees at the cursor.
-    if matches!(app.mode, TuiMode::Settings(super::SettingsScope::Peer)) {
+    // Refresh peer-side caches whenever any Settings page is up. The Peer
+    // Settings views index into these directly for action keys ([r]
+    // reload, [d] remove, Ctrl+↑↓ reorder); the Session→Agents picker
+    // also reads `peer_agents_names` to populate its candidate list, so
+    // it has to stay fresh in Session scope too.
+    if matches!(app.mode, TuiMode::Settings(_)) {
         let mut names = server.agents().names();
         names.sort();
         app.peer_agents_names = names;
@@ -1271,11 +1272,7 @@ fn render_model_search_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, 
     f.render_widget(bar, area);
 }
 
-fn render_model_list_block(
-    f: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    app: &mut App,
-) {
+fn render_model_list_block(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
     let inner_x = area.x + 1;
     let inner_y = area.y + 1;
     let inner_w = area.width.saturating_sub(2);
@@ -1315,7 +1312,9 @@ fn render_model_list_block(
                 Style::default().fg(COLOR_ACCENT),
             ));
         f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(block),
             area,
         );
         return;
@@ -1424,7 +1423,9 @@ fn render_model_list_block(
         .border_style(Style::default().fg(COLOR_DIM))
         .title(Span::styled(title_text, Style::default().fg(COLOR_ACCENT)));
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
         area,
     );
 }
@@ -1436,9 +1437,13 @@ fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, ap
         ""
     };
     let help_text = if app.model_picker_loading {
-        format!(" type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Esc cancel | fetching catalog…")
+        format!(
+            " type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Esc cancel | fetching catalog…"
+        )
     } else {
-        format!(" type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Ctrl+R refresh | Ctrl+U clear | Esc cancel")
+        format!(
+            " type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Ctrl+R refresh | Ctrl+U clear | Esc cancel"
+        )
     };
     widgets::status_strip(f, area, &help_text);
 }
@@ -1467,18 +1472,15 @@ fn ui_settings(
         SettingsScope::Session => ("Session Settings", Some(app.active().title())),
     };
 
-    widgets::header(
-        f,
-        chunks[0],
-        title,
-        subtitle.as_deref(),
-        Some("[Esc back]"),
-    );
+    widgets::header(f, chunks[0], title, subtitle.as_deref(), Some("[Esc back]"));
 
     let (sidebar_area, detail_area) = widgets::sidebar_detail_layout(chunks[1], 16);
     let selected = app.settings_index(scope);
     let labels: Vec<&str> = match scope {
-        SettingsScope::Peer => PeerSettingsCategory::ALL.iter().map(|c| c.label()).collect(),
+        SettingsScope::Peer => PeerSettingsCategory::ALL
+            .iter()
+            .map(|c| c.label())
+            .collect(),
         SettingsScope::Session => SessionSettingsCategory::ALL
             .iter()
             .map(|c| c.label())
@@ -1517,17 +1519,26 @@ fn ui_settings(
 
     // Bottom strip is normally the status hints; an inline prompt
     // takes over while typing, and a one-shot status message wins over
-    // hints when set (until the next nav keypress clears it).
-    match (&app.settings_prompt, &app.settings_status) {
-        (Some(prompt), _) => widgets::inline_edit_prompt(
-            f,
-            chunks[2],
-            &prompt.label,
-            &prompt.input,
-            prompt.cursor,
-        ),
-        (None, Some(msg)) => widgets::status_strip(f, chunks[2], msg),
-        (None, None) => {
+    // hints when set (until the next nav keypress clears it). When a
+    // picker is open (multi-line, rendered inside the detail area), the
+    // strip degrades to a static hint reminder.
+    match (
+        &app.settings_prompt,
+        app.settings_picker.is_some(),
+        &app.settings_status,
+    ) {
+        (Some(prompt), _, _) => {
+            widgets::inline_edit_prompt(f, chunks[2], &prompt.label, &prompt.input, prompt.cursor)
+        }
+        (None, true, _) => {
+            widgets::status_strip(
+                f,
+                chunks[2],
+                " type to filter · ↑↓ select · enter add · esc cancel ",
+            );
+        }
+        (None, false, Some(msg)) => widgets::status_strip(f, chunks[2], msg),
+        (None, false, None) => {
             let hint = settings_status_hint(app, scope);
             widgets::status_strip(f, chunks[2], hint);
         }
@@ -1601,16 +1612,12 @@ fn render_peer_category(
 /// every new session. First entry is the routing host. Edits persist
 /// to chaz_peer; reads come from the live `peer_defaults` cache that
 /// `ui()` refreshes each frame.
-fn render_peer_defaults(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    app: &mut App,
-    server: &Arc<Server>,
-) {
-    let known: std::collections::HashSet<String> =
-        server.agents().names().into_iter().collect();
+fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, server: &Arc<Server>) {
+    let known: std::collections::HashSet<String> = server.agents().names().into_iter().collect();
     let defaults_count = app.peer_defaults.len();
-    let cursor = app.peer_defaults_cursor.min(defaults_count.saturating_sub(1));
+    let cursor = app
+        .peer_defaults_cursor
+        .min(defaults_count.saturating_sub(1));
 
     let mut lines: Vec<Line> = vec![
         Line::from(""),
@@ -1825,11 +1832,8 @@ fn render_peer_agents(
 
     // List rows take ~1/3 of the right pane, detail gets the rest.
     let list_h = ((area.height as usize / 3).max(3) as u16).min(area.height.saturating_sub(2));
-    let chunks = Layout::vertical([
-        Constraint::Length(list_h.max(1)),
-        Constraint::Min(1),
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Length(list_h.max(1)), Constraint::Min(1)]).split(area);
 
     let mut lines: Vec<Line> = Vec::with_capacity(names.len() + 3);
     lines.push(Line::from(""));
@@ -2085,7 +2089,10 @@ fn render_peer_about(
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  About", theme::accent_bold())]),
-        Line::from(vec![Span::styled("  ─────", Style::default().fg(theme::DIM))]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
         Line::from(""),
         about_kv("  version", version),
         about_kv("  state dir", state_dir),
@@ -2136,10 +2143,37 @@ fn render_session_agents(
     app: &mut App,
     backend: &BackendManager,
 ) {
+    // If a picker is open, carve the bottom of the detail area for it.
+    // The agents list renders into the top region.
+    let (list_area, picker_area) = if app.settings_picker.is_some() {
+        let picker_h = 8u16.min(area.height.saturating_sub(1)).max(3);
+        let list_h = area.height.saturating_sub(picker_h);
+        (
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: list_h,
+            },
+            Some(Rect {
+                x: area.x,
+                y: area.y.saturating_add(list_h),
+                width: area.width,
+                height: picker_h,
+            }),
+        )
+    } else {
+        (area, None)
+    };
+    let area = list_area;
+
     let snapshot = match app.session_settings_snapshot.as_ref() {
         Some(s) => s,
         None => {
             render_settings_detail_placeholder(f, area, "Agents");
+            if let Some(p_area) = picker_area {
+                render_session_agents_picker(f, p_area, app);
+            }
             return;
         }
     };
@@ -2223,6 +2257,34 @@ fn render_session_agents(
             target: ClickTarget::SettingsDetailRow(i),
         });
     }
+
+    if let Some(p_area) = picker_area {
+        render_session_agents_picker(f, p_area, app);
+    }
+}
+
+/// Render the "add agent" picker into the carved-out bottom of the
+/// Session→Agents detail area. Sources the visible candidate slice from
+/// the live filter so the displayed list always matches what Enter would
+/// commit.
+fn render_session_agents_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(picker) = app.settings_picker.as_ref() else {
+        return;
+    };
+    let filtered_indices = picker.filtered();
+    let items: Vec<&str> = filtered_indices
+        .iter()
+        .filter_map(|i| picker.candidates.get(*i).map(|s| s.as_str()))
+        .collect();
+    widgets::picker(
+        f,
+        area,
+        &picker.label,
+        &picker.filter,
+        picker.cursor,
+        &items,
+        picker.selected,
+    );
 }
 
 /// Static snapshot of the active session — name, id, created_at, message
@@ -2233,7 +2295,10 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let snapshot = app.session_settings_snapshot.as_ref();
 
     let id_short = super::short_session_id(&tab.session_db_id);
-    let name = tab.session_name.clone().unwrap_or_else(|| "(unnamed)".to_string());
+    let name = tab
+        .session_name
+        .clone()
+        .unwrap_or_else(|| "(unnamed)".to_string());
     let created = snapshot
         .and_then(|s| s.created_at)
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -2260,7 +2325,10 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  Overview", theme::accent_bold())]),
-        Line::from(vec![Span::styled("  ─────", Style::default().fg(theme::DIM))]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
         Line::from(""),
         about_kv("  name", &name),
         about_kv("  id", &id_short),
@@ -2279,12 +2347,7 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
 /// open the model picker for the active scope. v1 picker doesn't pre-
 /// select the scope based on this row; user picks via the picker's own
 /// scope strip.
-fn render_session_models(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    app: &App,
-    backend: &BackendManager,
-) {
+fn render_session_models(f: &mut ratatui::Frame, area: Rect, app: &App, backend: &BackendManager) {
     let snapshot = match app.session_settings_snapshot.as_ref() {
         Some(s) => s,
         None => {
@@ -2307,7 +2370,10 @@ fn render_session_models(
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  Models", theme::accent_bold())]),
-        Line::from(vec![Span::styled("  ─────", Style::default().fg(theme::DIM))]),
+        Line::from(vec![Span::styled(
+            "  ─────",
+            Style::default().fg(theme::DIM),
+        )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Session pin    ", Style::default().fg(theme::DIM)),
@@ -2393,9 +2459,7 @@ fn model_picker_header_line(id_w: usize) -> Line<'static> {
     );
     Line::from(vec![Span::styled(
         header,
-        Style::default()
-            .fg(COLOR_DIM)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(COLOR_DIM).add_modifier(Modifier::BOLD),
     )])
 }
 
