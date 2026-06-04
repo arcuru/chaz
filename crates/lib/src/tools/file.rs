@@ -24,9 +24,14 @@ impl Tool for ReadFile {
                         "description": "The file path to read"
                     }
                 },
-                "required": ["path"]
+                "required": ["path"],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(
@@ -99,7 +104,8 @@ impl Tool for WriteFile {
                         "description": "The content to write to the file"
                     }
                 },
-                "required": ["path", "content"]
+                "required": ["path", "content"],
+                "additionalProperties": false
             }),
         }
     }
@@ -110,6 +116,10 @@ impl Tool for WriteFile {
             approval: ApprovalRequirement::UnlessAutoApproved,
             ..ToolPolicy::default()
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(

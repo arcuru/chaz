@@ -421,12 +421,20 @@ impl Tool for ListMemoryBanks {
         ToolDescriptor {
             name: "list_memory_banks".to_string(),
             description: "List every shared memory bank this agent has been granted access to, with permission level. Always shows 'self' (your own memory). Use the names with remember/recall's optional `bank` argument.".to_string(),
-            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
         }
     }
 
     fn default_policy(&self) -> ToolPolicy {
         ToolPolicy::default()
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(

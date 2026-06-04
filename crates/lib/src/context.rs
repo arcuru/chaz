@@ -508,6 +508,7 @@ mod tests {
                     "arg2": {"type": "number", "description": "Another long description ".repeat(20)}
                 }
             }),
+            strict: false,
         }];
         let result_with_tools = ContextBuilder::new(&entries, "agent", "", &config)
             .with_tools(&tools)

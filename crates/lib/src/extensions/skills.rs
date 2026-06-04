@@ -599,8 +599,16 @@ impl Tool for SkillListTool {
             // Explicit empty-object schema — bare `{}` is technically valid
             // JSON Schema but OpenRouter (and likely others) reject it as
             // "schema must be a JSON schema... got type null".
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(
@@ -656,9 +664,14 @@ impl Tool for SkillSearchTool {
                 "properties": {
                     "query": { "type": "string", "description": "Search term" }
                 },
-                "required": ["query"]
+                "required": ["query"],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(
@@ -714,9 +727,14 @@ impl Tool for SkillShowTool {
                 "properties": {
                     "name": { "type": "string", "description": "Skill name" }
                 },
-                "required": ["name"]
+                "required": ["name"],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(

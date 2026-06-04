@@ -19,9 +19,14 @@ impl Tool for Calculate {
                         "description": "The mathematical expression to evaluate, e.g. '2 + 3 * 4' or 'sqrt(16)'"
                     }
                 },
-                "required": ["expression"]
+                "required": ["expression"],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute(

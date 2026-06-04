@@ -26,9 +26,14 @@ impl Tool for Compact {
                         "description": "A thorough summary of the conversation so far. Include: key facts discussed, decisions made, tasks in progress, and any state needed to continue."
                     }
                 },
-                "required": ["summary"]
+                "required": ["summary"],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(

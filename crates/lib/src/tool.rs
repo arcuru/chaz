@@ -215,11 +215,15 @@ impl ToolProfile {
                 name: def.name.clone(),
                 description: first_sentence(&def.description),
                 parameters: strip_param_descriptions(&def.parameters),
+                strict: def.strict,
             }),
             PresentationMode::Summary => Some(ToolDefinition {
                 name: def.name.clone(),
                 description: String::new(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
+                // Summary collapses the schema; strict has nothing left
+                // to constrain, so drop the flag.
+                strict: false,
             }),
             PresentationMode::Hidden => None,
         }
@@ -386,6 +390,16 @@ pub trait Tool: Send + Sync {
     fn default_policy(&self) -> ToolPolicy {
         ToolPolicy::default()
     }
+
+    /// Whether this tool's parameter schema satisfies OpenAI strict-mode
+    /// rules: every declared property listed in `required`, every nested
+    /// object closed with `additionalProperties: false`, no unsupported
+    /// keywords. Default false. Override to true on tools whose schemas
+    /// already match. MCP tools never opt in — third-party schemas can't be
+    /// assumed strict-compatible.
+    fn strict_schema(&self) -> bool {
+        false
+    }
 }
 
 /// Information about a tool call presented to the user for approval.
@@ -403,6 +417,11 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// True when the schema is OpenAI-strict-compatible and the wire
+    /// format should set `strict: true`. Sourced from [`Tool::strict_schema`].
+    /// Reset to false by [`ToolProfile::apply`] for Summary/Hidden modes
+    /// where the params are stripped.
+    pub strict: bool,
 }
 
 /// Resolves effective policy for tools: config overrides > tool defaults.
@@ -484,13 +503,83 @@ fn debug_assert_valid_parameters(desc: &ToolDescriptor) {
     );
 }
 
+/// Debug-only check that a tool which opts into strict mode (via
+/// [`Tool::strict_schema`]) actually has a strict-compatible schema:
+/// root is `type: object`, every declared property listed in `required`,
+/// `additionalProperties: false`, no unsupported keywords. Recurses
+/// into nested object properties. Returns `Err(reason)` on violation.
+///
+/// Kept private; called from `register*` under `debug_assert!`.
+fn validate_strict_schema(name: &str, params: &Value) -> Result<(), String> {
+    fn check_object(path: &str, obj: &Value) -> Result<(), String> {
+        let map = obj
+            .as_object()
+            .ok_or_else(|| format!("{path}: not an object"))?;
+        let ty = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty != "object" {
+            return Err(format!("{path}: expected type=object, got {ty:?}"));
+        }
+        match map.get("additionalProperties") {
+            Some(Value::Bool(false)) => {}
+            _ => {
+                return Err(format!(
+                    "{path}: strict mode requires `additionalProperties: false`"
+                ));
+            }
+        }
+        let empty_map = serde_json::Map::new();
+        let props = map
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or(&empty_map);
+        let required: Vec<&str> = map
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for key in props.keys() {
+            if !required.iter().any(|r| r == key) {
+                return Err(format!(
+                    "{path}: property {key:?} missing from `required` \
+                     (strict mode forbids optional properties)"
+                ));
+            }
+        }
+        // Recurse into nested object properties — array items get the
+        // same treatment when they're objects.
+        for (key, sub) in props.iter() {
+            let sub_path = format!("{path}.{key}");
+            let sub_type = sub.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if sub_type == "object" {
+                check_object(&sub_path, sub)?;
+            } else if sub_type == "array"
+                && let Some(items) = sub.get("items")
+                && items.get("type").and_then(|v| v.as_str()) == Some("object")
+            {
+                check_object(&format!("{sub_path}[]"), items)?;
+            }
+        }
+        Ok(())
+    }
+    check_object(name, params)
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self { tools: Vec::new() }
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        debug_assert_valid_parameters(&tool.descriptor());
+        let desc = tool.descriptor();
+        debug_assert_valid_parameters(&desc);
+        if tool.strict_schema() {
+            debug_assert!(
+                validate_strict_schema(&desc.name, &desc.parameters).is_ok(),
+                "tool {:?} opts into strict_schema but its parameters violate strict rules: {}",
+                desc.name,
+                validate_strict_schema(&desc.name, &desc.parameters).unwrap_err()
+            );
+        }
         self.tools.push(RegistryEntry {
             tool: std::sync::Arc::new(tool),
             owner: None,
@@ -498,7 +587,16 @@ impl ToolRegistry {
     }
 
     pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
-        debug_assert_valid_parameters(&tool.descriptor());
+        let desc = tool.descriptor();
+        debug_assert_valid_parameters(&desc);
+        if tool.strict_schema() {
+            debug_assert!(
+                validate_strict_schema(&desc.name, &desc.parameters).is_ok(),
+                "tool {:?} opts into strict_schema but its parameters violate strict rules: {}",
+                desc.name,
+                validate_strict_schema(&desc.name, &desc.parameters).unwrap_err()
+            );
+        }
         self.tools.push(RegistryEntry {
             tool: std::sync::Arc::from(tool),
             owner: None,
@@ -513,7 +611,16 @@ impl ToolRegistry {
         tool: std::sync::Arc<dyn Tool>,
         owner: Option<&'static str>,
     ) {
-        debug_assert_valid_parameters(&tool.descriptor());
+        let desc = tool.descriptor();
+        debug_assert_valid_parameters(&desc);
+        if tool.strict_schema() {
+            debug_assert!(
+                validate_strict_schema(&desc.name, &desc.parameters).is_ok(),
+                "tool {:?} opts into strict_schema but its parameters violate strict rules: {}",
+                desc.name,
+                validate_strict_schema(&desc.name, &desc.parameters).unwrap_err()
+            );
+        }
         self.tools.push(RegistryEntry { tool, owner });
     }
 
@@ -680,6 +787,7 @@ impl ScopedTools {
                     name: desc.name,
                     description: desc.description,
                     parameters: desc.parameters,
+                    strict: e.tool.strict_schema(),
                 };
                 profile.apply(&def)
             })
@@ -739,6 +847,7 @@ mod tests {
             name: "shell".to_string(),
             description: "Execute a shell command. Dangerous.".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "The command"}}}),
+            strict: false,
         };
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.description, def.description);
@@ -755,6 +864,7 @@ mod tests {
             description: "Execute a shell command. This is dangerous and should be used carefully."
                 .to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "The command to run"}}}),
+            strict: false,
         };
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.description, "Execute a shell command.");
@@ -778,6 +888,7 @@ mod tests {
             name: "shell".to_string(),
             description: "Execute a command".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+            strict: false,
         };
         let result = profile.apply(&def).unwrap();
         assert_eq!(result.name, "shell");
@@ -800,6 +911,7 @@ mod tests {
             name: "shell".to_string(),
             description: "Execute a command".to_string(),
             parameters: serde_json::json!({}),
+            strict: false,
         };
         assert!(profile.apply(&def).is_none());
     }

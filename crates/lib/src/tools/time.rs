@@ -14,9 +14,14 @@ impl Tool for GetTime {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {},
-                "required": []
+                "required": [],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute(

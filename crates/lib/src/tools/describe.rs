@@ -22,9 +22,14 @@ impl Tool for DescribeTool {
                         "description": "Name of the tool to describe"
                     }
                 },
-                "required": ["name"]
+                "required": ["name"],
+                "additionalProperties": false
             }),
         }
+    }
+
+    fn strict_schema(&self) -> bool {
+        true
     }
 
     fn execute<'a>(

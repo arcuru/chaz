@@ -183,6 +183,13 @@ struct ChatToolFunction {
     name: String,
     description: String,
     parameters: Value,
+    /// OpenAI strict-mode flag. When `Some(true)`, the model is constrained
+    /// to emit arguments matching the schema exactly: every property in
+    /// `required`, every nested object closed with `additionalProperties:
+    /// false`. Only set on tools that have audited their schema; left
+    /// `None` (and thus omitted from the wire) by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -504,22 +511,23 @@ impl OpenAI {
             .ok_or_else(|| LlmError::Configuration {
                 message: "API key not configured".to_string(),
             })?;
-        let api_base =
-            self.backend
-                .api_base
-                .clone()
-                .ok_or_else(|| LlmError::Configuration {
-                    message: "API base URL not configured".to_string(),
-                })?;
+        let api_base = self
+            .backend
+            .api_base
+            .clone()
+            .ok_or_else(|| LlmError::Configuration {
+                message: "API base URL not configured".to_string(),
+            })?;
 
         let url = format!("{}/models", api_base.trim_end_matches('/'));
         let timeout = self.backend.request_timeout();
 
-        let client = reqwest::Client::builder().timeout(timeout).build().map_err(
-            |e| LlmError::NetworkError {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| LlmError::NetworkError {
                 message: format!("client build failed: {e}"),
-            },
-        )?;
+            })?;
 
         let resp = client
             .get(&url)
@@ -755,6 +763,7 @@ fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<ChatTool> {
                 name: td.name.clone(),
                 description: td.description.clone(),
                 parameters: td.parameters.clone(),
+                strict: td.strict.then_some(true),
             },
             cache_control: None,
         })
@@ -993,6 +1002,7 @@ mod tests {
                 name: name.to_string(),
                 description: String::new(),
                 parameters: Value::Null,
+                strict: None,
             },
             cache_control: None,
         }
@@ -1123,5 +1133,41 @@ mod tests {
         let t = u.into_token_usage();
         assert_eq!(t.cached_tokens, Some(50));
         assert_eq!(t.cache_creation_tokens, Some(10));
+    }
+
+    // --- tool definitions: strict-mode opt-in ---
+
+    #[test]
+    fn convert_tool_definitions_omits_strict_when_false() {
+        let defs = vec![ToolDefinition {
+            name: "loose".into(),
+            description: "loose tool".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            strict: false,
+        }];
+        let wire = convert_tool_definitions(&defs);
+        let json = serde_json::to_value(&wire[0]).unwrap();
+        assert!(
+            json["function"].get("strict").is_none(),
+            "expected `strict` to be omitted when ToolDefinition.strict=false, got: {json}"
+        );
+    }
+
+    #[test]
+    fn convert_tool_definitions_sets_strict_when_opted_in() {
+        let defs = vec![ToolDefinition {
+            name: "tight".into(),
+            description: "tight tool".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        }];
+        let wire = convert_tool_definitions(&defs);
+        let json = serde_json::to_value(&wire[0]).unwrap();
+        assert_eq!(json["function"]["strict"], serde_json::Value::Bool(true));
     }
 }
