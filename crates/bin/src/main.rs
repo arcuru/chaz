@@ -454,6 +454,10 @@ async fn main() -> anyhow::Result<()> {
     // takes ownership of the cell and constructs the spawn tools.
     let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
 
+    // Shared MCP server directory — populated by McpExtension::instantiate
+    // below, exposed to readers (TUI Peer→MCP settings) via Server.
+    let mcp_registry = Arc::new(mcp::McpRegistry::new());
+
     // Default backend used for schedule-fired Fresh sessions and as a
     // fallback when a Pinned session has no registered SessionRuntime.
     let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
@@ -472,6 +476,7 @@ async fn main() -> anyhow::Result<()> {
         embedder: embedder.clone(),
         secrets: Some(Arc::new(secret_store.clone())),
         server_cell: spawn_server_cell.clone(),
+        mcp_registry: mcp_registry.clone(),
         agent_state_allowlist: config.agent_state_allowlist.clone(),
     }));
 
@@ -568,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
         tool_host,
         extension_hub,
         default_backend.clone(),
+        mcp_registry.clone(),
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),

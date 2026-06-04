@@ -3,6 +3,7 @@
 
 use chaz_core::backends::BackendManager;
 use chaz_core::config::Config;
+use chaz_core::mcp::{McpRegistryEntry, McpServerStatus};
 use chaz_core::server::Server;
 use chaz_core::session::EntryType;
 use chaz_core::util::truncate_chars;
@@ -131,6 +132,7 @@ pub(super) fn ui(
         names.sort();
         app.peer_agents_names = names;
         app.peer_defaults = server.default_agents();
+        app.peer_mcp_servers = server.mcp_registry().snapshot();
     }
 
     match app.mode {
@@ -1604,6 +1606,7 @@ fn render_peer_category(
         PeerSettingsCategory::Backends => render_peer_backends(f, area, backend, config),
         PeerSettingsCategory::Bridges => render_peer_bridges(f, area, config),
         PeerSettingsCategory::Defaults => render_peer_defaults(f, area, app, server),
+        PeerSettingsCategory::Mcp => render_peer_mcp(f, area, app),
         _ => render_settings_detail_placeholder(f, area, category.label()),
     }
 }
@@ -2045,6 +2048,201 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
         lines.push(about_kv("        max iter", &w_max_iter));
         lines.push(about_kv("        tools", &w_tools));
         lines.push(about_kv("        prompt", &w_prompt_preview));
+    }
+
+    lines
+}
+
+/// Peer → MCP (read-only). Top half is a one-line-per-server list with
+/// a selection marker; bottom half is the expanded detail of the
+/// selected server. Mirrors the Peer → Agents structure. Failed servers
+/// surface in red so operators can spot a misconfigured server without
+/// digging through logs.
+fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let servers = app.peer_mcp_servers.clone();
+    let cursor = app.peer_mcp_cursor.min(servers.len().saturating_sub(1));
+
+    let list_h = ((area.height as usize / 3).max(3) as u16).min(area.height.saturating_sub(2));
+    let chunks =
+        Layout::vertical([Constraint::Length(list_h.max(1)), Constraint::Min(1)]).split(area);
+
+    let running = servers
+        .iter()
+        .filter(|e| matches!(e.status, McpServerStatus::Running { .. }))
+        .count();
+    let failed = servers.len() - running;
+    let header_count = if failed == 0 {
+        format!("    {running} running")
+    } else {
+        format!("    {running} running · {failed} failed")
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(servers.len() + 3);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  MCP servers", theme::accent_bold()),
+        Span::styled(header_count, Style::default().fg(theme::DIM)),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ─────",
+        Style::default().fg(theme::DIM),
+    )]));
+
+    let mut row_offsets: Vec<u16> = Vec::with_capacity(servers.len());
+
+    if servers.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (no MCP servers configured)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else {
+        for (i, entry) in servers.iter().enumerate() {
+            let is_selected = i == cursor;
+            let marker = if is_selected { "> " } else { "  " };
+            let style = if is_selected {
+                theme::selected()
+            } else if matches!(entry.status, McpServerStatus::Failed { .. }) {
+                theme::error()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let suffix = match &entry.status {
+                McpServerStatus::Running { server } => mcp_row_suffix(server),
+                McpServerStatus::Failed { .. } => "  failed".to_string(),
+            };
+            row_offsets.push(lines.len() as u16);
+            lines.push(Line::from(vec![Span::styled(
+                format!("{marker}{name:<14}{suffix}", name = entry.name),
+                style,
+            )]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    // Per-server click regions; same clamp pattern as Peer → Agents.
+    let list_bottom = chunks[0].y.saturating_add(chunks[0].height);
+    for (i, offset) in row_offsets.iter().enumerate() {
+        let y = chunks[0].y.saturating_add(*offset);
+        if y >= list_bottom {
+            break;
+        }
+        app.click_regions.push(ClickRegion {
+            x: chunks[0].x,
+            y,
+            w: chunks[0].width,
+            h: 1,
+            target: ClickTarget::SettingsDetailRow(i),
+        });
+    }
+
+    // Detail pane — selected server's status + capabilities + tools.
+    let mut detail = if let Some(entry) = servers.get(cursor) {
+        mcp_detail_lines(entry)
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "  No MCP servers configured. Add servers via `mcp_servers:` in chaz.yaml \
+                 or drop manifests in the directory pointed at by `mcp_server_dir:`.",
+                Style::default().fg(theme::DIM),
+            )]),
+        ]
+    };
+    detail.push(Line::from(""));
+    detail.push(Line::from(vec![Span::styled(
+        "  (view-only in v1)",
+        Style::default().fg(theme::DIM),
+    )]));
+    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);
+}
+
+/// One-line capability summary for a running server's list row.
+/// Tool count comes from the live cache; resources/prompts are shown as
+/// presence badges (live counts would need an async call we don't run
+/// from a render frame).
+fn mcp_row_suffix(server: &chaz_core::mcp::server::McpServer) -> String {
+    let caps = server.capabilities();
+    let mut badges: Vec<String> = Vec::new();
+    if caps.tools {
+        badges.push(format!("tools:{}", server.tool_count()));
+    }
+    if caps.resources {
+        badges.push("resources".to_string());
+    }
+    if caps.prompts {
+        badges.push("prompts".to_string());
+    }
+    if badges.is_empty() {
+        "  (no capabilities advertised)".to_string()
+    } else {
+        format!("  [{}]", badges.join(", "))
+    }
+}
+
+/// Detail block for a selected MCP server. Running servers show advertised
+/// capabilities + cached tool names; failed servers show the start error
+/// so operators can act on it without grepping logs.
+fn mcp_detail_lines(entry: &McpRegistryEntry) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        format!("  {}", entry.name),
+        theme::accent_bold(),
+    )]));
+    lines.push(Line::from(""));
+
+    match &entry.status {
+        McpServerStatus::Running { server } => {
+            let caps = server.capabilities();
+            let tool_count = server.tool_count();
+            let tools_value = if caps.tools {
+                format!("supported · {tool_count} cached")
+            } else {
+                "not supported".to_string()
+            };
+            let resources_value = if caps.resources {
+                "supported"
+            } else {
+                "not supported"
+            };
+            let prompts_value = if caps.prompts {
+                "supported"
+            } else {
+                "not supported"
+            };
+            lines.push(about_kv("    status", "running"));
+            lines.push(about_kv("    tools", &tools_value));
+            lines.push(about_kv("    resources", resources_value));
+            lines.push(about_kv("    prompts", prompts_value));
+
+            let names = server.tool_names();
+            if !names.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    "    Tools",
+                    Style::default().fg(theme::DIM),
+                )]));
+                for n in names {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("      · {n}"),
+                        Style::default().fg(Color::White),
+                    )]));
+                }
+            }
+        }
+        McpServerStatus::Failed { error } => {
+            lines.push(about_kv("    status", "failed"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "    Error",
+                Style::default().fg(theme::DIM),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("      {error}"),
+                theme::error(),
+            )]));
+        }
     }
 
     lines

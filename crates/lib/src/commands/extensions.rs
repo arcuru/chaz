@@ -418,6 +418,7 @@ mod tests {
             embedder: None,
             secrets: None,
             server_cell: spawn_cell.clone(),
+            mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
         }));
         let secrets = SecretStore::new(chaz_peer).await;
@@ -456,6 +457,7 @@ mod tests {
             Arc::new(NativeToolHost::new()),
             hub,
             backend_mgr.clone(),
+            Arc::new(crate::mcp::McpRegistry::new()),
         );
         let _ = spawn_cell.set(server.clone());
 

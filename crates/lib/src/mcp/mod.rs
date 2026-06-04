@@ -13,8 +13,11 @@
 //! the extension constructors handle the rest.
 
 mod parse;
-pub(crate) mod server;
+pub mod registry;
+pub mod server;
 mod transport;
+
+pub use registry::{McpRegistry, McpRegistryEntry, McpServerStatus};
 
 use crate::config::McpServerConfig;
 use tracing::{info, warn};

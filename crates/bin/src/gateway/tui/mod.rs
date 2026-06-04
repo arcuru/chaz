@@ -136,6 +136,7 @@ pub(super) enum PeerSettingsCategory {
     Defaults,
     Bridges,
     Extensions,
+    Mcp,
     Groups,
     Identity,
     About,
@@ -148,6 +149,7 @@ impl PeerSettingsCategory {
         Self::Defaults,
         Self::Bridges,
         Self::Extensions,
+        Self::Mcp,
         Self::Groups,
         Self::Identity,
         Self::About,
@@ -160,6 +162,7 @@ impl PeerSettingsCategory {
             Self::Defaults => "Defaults",
             Self::Bridges => "Bridges",
             Self::Extensions => "Extensions",
+            Self::Mcp => "MCP",
             Self::Groups => "Groups",
             Self::Identity => "Identity",
             Self::About => "About",
@@ -551,6 +554,15 @@ pub(super) struct App {
     /// Sub-cursor inside the Peer → Defaults list. Clamped to live
     /// length each render; persists across category switches.
     pub(super) peer_defaults_cursor: usize,
+    /// Snapshot of `server.mcp_registry().snapshot()` refreshed at the
+    /// top of each frame while Peer Settings is up. Sorted by server
+    /// name. The Peer→MCP view and input handler both index into this
+    /// so the cursor row always points at the same server in both
+    /// places.
+    pub(super) peer_mcp_servers: Vec<chaz_core::mcp::McpRegistryEntry>,
+    /// Sub-cursor inside the Peer → MCP list. Clamped to live length
+    /// each render; persists across category switches.
+    pub(super) peer_mcp_cursor: usize,
     /// Sub-cursor inside the Session → Agents list (`meta.agents`). Same
     /// semantics as `peer_agents_cursor`.
     pub(super) session_agents_cursor: usize,
@@ -635,6 +647,8 @@ impl App {
             peer_agents_names: Vec::new(),
             peer_defaults: Vec::new(),
             peer_defaults_cursor: 0,
+            peer_mcp_servers: Vec::new(),
+            peer_mcp_cursor: 0,
             session_agents_cursor: 0,
             settings_prompt: None,
             settings_picker: None,

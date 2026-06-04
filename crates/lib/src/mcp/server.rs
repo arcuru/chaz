@@ -92,6 +92,26 @@ impl McpServer {
         *self.capabilities.read().unwrap()
     }
 
+    /// Configured server name (matches `McpServerConfig.name`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Number of tools currently in this server's metadata cache.
+    /// Reflects whatever the last successful `tools/list` returned.
+    pub fn tool_count(&self) -> usize {
+        self.tool_metadata.read().unwrap().len()
+    }
+
+    /// Sorted list of cached tool names. Used by the TUI Peer→MCP
+    /// settings page; cheap snapshot.
+    pub fn tool_names(&self) -> Vec<String> {
+        let metadata = self.tool_metadata.read().unwrap();
+        let mut names: Vec<String> = metadata.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Perform the MCP initialize handshake.
     ///
     /// Capture the server's negotiated `protocolVersion` from the response

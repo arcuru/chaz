@@ -85,6 +85,13 @@ pub struct PeerHandles {
     /// sessions / fire agent turns) close over the `Arc<OnceLock>` and
     /// dereference at fire time.
     pub server_cell: Arc<std::sync::OnceLock<Arc<crate::server::Server>>>,
+    /// Per-process directory of started MCP servers. Populated by
+    /// [`crate::extensions::mcp::McpExtension::instantiate`] at
+    /// install time and exposed to readers (TUI Peer→MCP settings)
+    /// via [`crate::server::Server::mcp_registry`]. Shared `Arc` —
+    /// one registry instance is wired into both the peer handles and
+    /// the running `Server`.
+    pub mcp_registry: Arc<crate::mcp::McpRegistry>,
     /// Operator-configured `agent_state` allowlist, keyed by extension
     /// name. Mirrors the field on the hub — instances that build a
     /// `ScopedAgentStateAdmin` apply this map themselves rather than

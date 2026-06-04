@@ -176,6 +176,13 @@ pub struct Server {
     /// scheduling extensions and tools resync the live heap after a
     /// committed mutation. `None` in `--print` mode and in tests.
     routine_engine: OnceLock<Arc<crate::routine::RoutineEngine>>,
+    /// Per-process MCP server directory. Populated by
+    /// [`crate::extensions::mcp::McpExtension`] during install and
+    /// exposed via [`Server::mcp_registry`] for read-only callers
+    /// (today: the TUI Peer→MCP settings page). Shared `Arc` — the
+    /// same registry is wired into [`crate::extension::PeerHandles`]
+    /// so the install path and the readers see the same data.
+    mcp_registry: Arc<crate::mcp::McpRegistry>,
 }
 
 impl Server {
@@ -194,6 +201,7 @@ impl Server {
         host: Arc<dyn ToolHost>,
         extensions: Arc<ExtensionHub>,
         default_backend: BackendManager,
+        mcp_registry: Arc<crate::mcp::McpRegistry>,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
@@ -221,6 +229,7 @@ impl Server {
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
             routine_engine: OnceLock::new(),
+            mcp_registry,
         });
 
         let server_clone = server.clone();
@@ -272,6 +281,13 @@ impl Server {
     /// under `--print` and in tests.
     pub fn routine_engine(&self) -> Option<&Arc<crate::routine::RoutineEngine>> {
         self.routine_engine.get()
+    }
+
+    /// The per-process MCP server directory. Populated by
+    /// [`crate::extensions::mcp::McpExtension`] during install; read
+    /// by the TUI Peer→MCP settings page.
+    pub fn mcp_registry(&self) -> &Arc<crate::mcp::McpRegistry> {
+        &self.mcp_registry
     }
 
     /// Best-effort attach of the configured default agents to a
@@ -1832,6 +1848,7 @@ mod tests {
             Arc::new(crate::tool_host::NativeToolHost::new()),
             Arc::new(crate::extension::ExtensionHub::new()),
             default_backend,
+            Arc::new(crate::mcp::McpRegistry::new()),
         );
         (instance, server, registry)
     }

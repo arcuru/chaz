@@ -1095,6 +1095,7 @@ mod tests {
             embedder: None,
             secrets: None,
             server_cell: Arc::new(std::sync::OnceLock::new()),
+            mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
         }));
         hub.install_all(vec![Arc::new(EchoExt { seen: seen.clone() })])

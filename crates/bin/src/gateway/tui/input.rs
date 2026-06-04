@@ -463,6 +463,7 @@ fn set_settings_detail_cursor(app: &mut App, scope: SettingsScope, cat: usize, r
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cat) {
             Some(PeerSettingsCategory::Agents) => app.peer_agents_cursor = clamped,
             Some(PeerSettingsCategory::Defaults) => app.peer_defaults_cursor = clamped,
+            Some(PeerSettingsCategory::Mcp) => app.peer_mcp_cursor = clamped,
             _ => {}
         },
         SettingsScope::Session => {
@@ -1666,6 +1667,7 @@ fn settings_inner_list_len(app: &App, scope: SettingsScope, category_idx: usize)
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx)? {
             PeerSettingsCategory::Agents => Some(peer_agent_count(app)),
             PeerSettingsCategory::Defaults => Some(app.peer_defaults.len()),
+            PeerSettingsCategory::Mcp => Some(app.peer_mcp_servers.len()),
             _ => None,
         },
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx)? {
@@ -1700,6 +1702,7 @@ fn bump_inner_cursor(
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx) {
             Some(PeerSettingsCategory::Agents) => &mut app.peer_agents_cursor,
             Some(PeerSettingsCategory::Defaults) => &mut app.peer_defaults_cursor,
+            Some(PeerSettingsCategory::Mcp) => &mut app.peer_mcp_cursor,
             _ => return,
         },
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx) {

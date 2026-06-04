@@ -53,16 +53,21 @@ impl Extension for McpExtension {
         }
     }
 
-    fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+    fn instantiate<'a>(&'a self, scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
         let config = self.config.clone();
         let name = self.name;
+        let mcp_registry = scope_ctx.peer().mcp_registry.clone();
         Box::pin(async move {
             // Start the MCP server. If it fails, log and produce an
             // empty instance — matching the legacy resilience contract.
+            // Either way, register the outcome in `mcp_registry` so the
+            // TUI Peer→MCP settings page can surface failed servers
+            // alongside running ones.
             let tools: Vec<Arc<dyn Tool>> = match McpServer::start(&config).await {
                 Ok(server) => {
                     let server = Arc::new(server);
+                    mcp_registry.insert_running(config.name.clone(), server.clone());
                     let capability_tools = build_capability_tools(server.clone(), &config.name);
                     match server.discover_and_wrap_tools(&config.name).await {
                         Ok(t) => {
@@ -99,6 +104,7 @@ impl Extension for McpExtension {
                         error = %e,
                         "MCP server failed to start — skipping its tools"
                     );
+                    mcp_registry.insert_failed(config.name.clone(), e);
                     Vec::new()
                 }
             };
