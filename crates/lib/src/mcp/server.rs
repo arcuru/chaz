@@ -18,8 +18,17 @@ use super::transport::Transport;
 /// Maximum tool output size (100 KB).
 const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 
-/// MCP protocol version we advertise.
-const PROTOCOL_VERSION: &str = "2025-03-26";
+/// MCP protocol version we advertise on the `InitializeRequest`. Servers
+/// negotiate down via the spec's lifecycle — they respond with whatever
+/// version they actually support, and chaz uses that on the wire from
+/// then on (see `HttpTransport::set_protocol_version`).
+///
+/// `2025-11-25` is the current published spec — see
+/// `modelcontextprotocol/specification/spec/2025-11-25/schema.ts`. We
+/// previously advertised `2025-03-26`, which predated the `annotations`
+/// field (now consumed in `McpToolAnnotations`); bumping was correct
+/// once that support landed.
+const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Manages a single MCP server connection and its tool metadata.
 ///
@@ -62,6 +71,11 @@ impl McpServer {
     }
 
     /// Perform the MCP initialize handshake.
+    ///
+    /// Capture the server's negotiated `protocolVersion` from the response
+    /// and hand it to the transport so subsequent HTTP requests carry the
+    /// `MCP-Protocol-Version` header the spec requires (Streamable HTTP
+    /// §Protocol Version Header). Stdio transport ignores the value.
     async fn initialize(&self) -> Result<(), String> {
         let result = self
             .send_request(
@@ -86,6 +100,16 @@ impl McpServer {
                     .unwrap_or("unknown")
             );
         }
+
+        // Negotiated version: spec says the client SHOULD use what came
+        // back, not what it sent. Fall back to what we advertised when
+        // the server didn't echo a version (older or sloppy servers).
+        let negotiated = result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or(PROTOCOL_VERSION)
+            .to_string();
+        self.transport.set_protocol_version(&negotiated).await;
 
         self.send_notification("notifications/initialized", json!({}))
             .await?;
@@ -221,6 +245,17 @@ impl McpServer {
                 self.transport.restart(&self.name).await?;
                 self.initialize().await?;
                 info!("MCP server '{}' restarted successfully", self.name);
+                self.send_request("tools/call", params).await?
+            }
+            Err(e) if self.transport.is_session_expired_error(&e) => {
+                // HTTP server told us our session is gone (spec
+                // §Session Management — client MUST start a new
+                // session on 404). Re-initialize and retry once.
+                self.initialize().await?;
+                info!(
+                    "MCP server '{}' session re-initialized after expiry",
+                    self.name
+                );
                 self.send_request("tools/call", params).await?
             }
             Err(e) => return Err(e),

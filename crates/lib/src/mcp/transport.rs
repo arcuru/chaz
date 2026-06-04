@@ -45,6 +45,11 @@ pub(super) struct HttpTransport {
     client: reqwest::Client,
     /// MCP session ID returned by the server (tracked across requests).
     session_id: Mutex<Option<String>>,
+    /// Protocol version negotiated during the initialize handshake.
+    /// `None` before initialize completes; `Some(version)` after, at
+    /// which point every subsequent request carries an
+    /// `MCP-Protocol-Version` header per the Streamable HTTP spec.
+    protocol_version: Mutex<Option<String>>,
 }
 
 impl Transport {
@@ -59,7 +64,16 @@ impl Transport {
             url: url.to_string(),
             client: reqwest::Client::new(),
             session_id: Mutex::new(None),
+            protocol_version: Mutex::new(None),
         })
+    }
+
+    /// Store the negotiated MCP protocol version. Called once per session
+    /// after the `initialize` handshake completes. No-op for stdio.
+    pub(super) async fn set_protocol_version(&self, version: &str) {
+        if let Transport::Http(h) = self {
+            *h.protocol_version.lock().await = Some(version.to_string());
+        }
     }
 
     /// Dispatch a JSON-RPC request to the concrete transport.
@@ -98,6 +112,14 @@ impl Transport {
                 || error.contains("write error")
                 || error.contains("read error")
                 || error.contains("Broken pipe"))
+    }
+
+    /// Check if an error indicates the MCP session has been terminated by
+    /// the server (HTTP only). When this fires the transport has already
+    /// dropped its cached session ID; the caller re-initializes and
+    /// retries.
+    pub(super) fn is_session_expired_error(&self, error: &str) -> bool {
+        matches!(self, Transport::Http(_)) && error.contains("session expired (HTTP 404)")
     }
 
     /// Attempt to restart the subprocess (stdio only). No-op for HTTP.
@@ -287,7 +309,14 @@ impl StdioTransport {
 }
 
 impl HttpTransport {
-    /// Build a POST request carrying a JSON-RPC payload + the optional session header.
+    /// Build a POST request carrying a JSON-RPC payload + the optional
+    /// session header + the negotiated `MCP-Protocol-Version` (post-init).
+    ///
+    /// The protocol version header is required on every request after
+    /// the initialize handshake — see Streamable HTTP §Protocol Version
+    /// Header. Before initialize completes the field is None and the
+    /// header is omitted; older servers fall back to assuming
+    /// `2025-03-26` per spec, which is harmless.
     async fn build_post(&self, payload_str: String) -> reqwest::RequestBuilder {
         let mut req = self
             .client
@@ -298,6 +327,9 @@ impl HttpTransport {
 
         if let Some(sid) = self.session_id.lock().await.as_ref() {
             req = req.header("Mcp-Session-Id", sid);
+        }
+        if let Some(ver) = self.protocol_version.lock().await.as_ref() {
+            req = req.header("MCP-Protocol-Version", ver);
         }
         req
     }
@@ -320,6 +352,20 @@ impl HttpTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            // 404 on a request that carried a session ID means the
+            // server has terminated the session (spec §Session
+            // Management). Drop the stale session/version so the
+            // McpServer-level retry can re-initialize cleanly.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                let had_session = self.session_id.lock().await.is_some();
+                if had_session {
+                    *self.session_id.lock().await = None;
+                    *self.protocol_version.lock().await = None;
+                    return Err(format!(
+                        "MCP '{server_name}' session expired (HTTP 404)"
+                    ));
+                }
+            }
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("MCP '{server_name}' HTTP {status}: {body}"));
         }
