@@ -318,10 +318,21 @@ pub(super) struct SessionMetaSnapshot {
 pub(super) enum ChatAction {
     Dispatch(Command),
     OpenPicker,
-    OpenModelPicker,
+    /// Open the model picker scoped to `scope`. From `/models` and
+    /// Session Settings → Models row Enter; the scope is decided by
+    /// the caller and locked for the picker's lifetime.
+    OpenModelPicker {
+        scope: ModelPickerScope,
+    },
     /// Open the Settings page in the given scope. From chat this is always
     /// `Session`; the `/settings` command in chat dispatches it that way.
     OpenSettings(SettingsScope),
+    /// Open Session Settings landed on the Models page. Distinct from
+    /// `OpenSettings(Session)` because `/models` shouldn't disturb
+    /// `session_settings_index` for someone who navigated away from
+    /// Models on a previous trip — it always jumps to the Models
+    /// category.
+    OpenModelsSettings,
     SendMessage(String),
 }
 
@@ -515,22 +526,17 @@ pub(super) struct App {
     pub(super) model_picker_loading: bool,
     /// Set when the last fetch failed; cleared on a successful retry.
     pub(super) model_picker_error: Option<String>,
-    /// Scope tabs above the search bar. `Session` is always first; agents
-    /// attached to the current session follow in `meta.agents` order.
-    /// Cycled with Tab / BackTab while the picker is open. Recomputed each
-    /// time the picker opens so newly-attached agents show up.
-    pub(super) model_picker_scopes: Vec<ModelPickerScope>,
-    /// Index into `model_picker_scopes` for the active scope. Decides
-    /// whether Enter dispatches `Command::Model` (session-wide pin) or
-    /// `Command::AgentModel` (per-agent override).
-    pub(super) model_picker_scope_idx: usize,
-    /// Session pin snapshot taken when the picker opened — drives the
-    /// `(current)` annotation on the Session scope without re-reading
-    /// meta on every keystroke.
-    pub(super) model_picker_session_pin: Option<String>,
-    /// Per-agent override snapshot taken when the picker opened — drives
-    /// the `(current)` annotation per agent scope.
-    pub(super) model_picker_agent_pins: HashMap<String, String>,
+    /// Scope the picker is editing. Set at open time from the caller
+    /// (`/models` → Models page → row cursor). Decides whether Enter
+    /// dispatches `Command::Model` (session-wide pin) or
+    /// `Command::AgentModel` (per-agent override). Defaults to
+    /// `Session` outside an open picker.
+    pub(super) model_picker_scope: ModelPickerScope,
+    /// Pin snapshot for the active scope, taken when the picker opened.
+    /// Drives the `(current)` annotation on the matching list row
+    /// without re-reading meta on every keystroke. `None` when the
+    /// scope has no pin.
+    pub(super) model_picker_current_pin: Option<String>,
     /// Snapshot of the active session's `SessionMeta` taken when Session
     /// Settings opens (and refreshed on `Action::SessionChanged` for the
     /// active tab). Lets the Session-side category renderers read the meta
@@ -560,6 +566,11 @@ pub(super) struct App {
     /// so the cursor row always points at the same server in both
     /// places.
     pub(super) peer_mcp_servers: Vec<chaz_core::mcp::McpRegistryEntry>,
+    /// Sub-cursor inside the Session → Models row list (row 0 =
+    /// Session pin, rows 1..n = each attached agent). Drives which
+    /// scope `Enter` opens the picker for. Clamped to live length
+    /// each render.
+    pub(super) session_models_cursor: usize,
     /// Sub-cursor inside the Peer → MCP list. Clamped to live length
     /// each render; persists across category switches.
     pub(super) peer_mcp_cursor: usize,
@@ -635,10 +646,8 @@ impl App {
             model_picker_favorites: Vec::new(),
             model_picker_loading: false,
             model_picker_error: None,
-            model_picker_scopes: vec![ModelPickerScope::Session],
-            model_picker_scope_idx: 0,
-            model_picker_session_pin: None,
-            model_picker_agent_pins: HashMap::new(),
+            model_picker_scope: ModelPickerScope::Session,
+            model_picker_current_pin: None,
             session_settings_snapshot: None,
             settings_return: None,
             peer_settings_index: 0,
@@ -649,6 +658,7 @@ impl App {
             peer_defaults_cursor: 0,
             peer_mcp_servers: Vec::new(),
             peer_mcp_cursor: 0,
+            session_models_cursor: 0,
             session_agents_cursor: 0,
             settings_prompt: None,
             settings_picker: None,
@@ -738,78 +748,41 @@ impl App {
         }
     }
 
-    /// Seed the picker with YAML-configured "favorites" plus the scope
-    /// strip (Session + per-agent tabs) and the per-scope pin snapshot.
-    /// Called when the picker opens; catalog rows arrive asynchronously
-    /// via `Action::ModelsFetched`.
-    pub(super) fn seed_model_picker(&mut self, backend: &BackendManager, meta: &SessionMeta) {
+    /// Seed the picker with YAML-configured "favorites" and the pin
+    /// snapshot for the caller-selected scope. Called when the picker
+    /// opens; catalog rows arrive asynchronously via
+    /// `Action::ModelsFetched`. The scope is locked at open time —
+    /// users pick which scope to edit before the picker mounts (via
+    /// the Models settings row list), so there's no in-picker scope
+    /// cycling.
+    pub(super) fn seed_model_picker(
+        &mut self,
+        backend: &BackendManager,
+        meta: &SessionMeta,
+        scope: ModelPickerScope,
+    ) {
         self.model_picker_favorites = backend.list_known_models_with_info();
         self.model_picker_error = None;
         self.model_search.clear();
         self.model_picker_scroll = 0;
 
-        // Scopes: always Session first, then one per attached agent (in
-        // meta.agents order) so the tab strip mirrors the session roster.
-        let mut scopes = vec![ModelPickerScope::Session];
-        for agent in &meta.agents {
-            scopes.push(ModelPickerScope::Agent(agent.display_name.clone()));
-        }
-        self.model_picker_scopes = scopes;
-        self.model_picker_scope_idx = 0;
-        self.model_picker_session_pin = meta.model.clone();
-        self.model_picker_agent_pins = meta.agent_models.clone();
+        // Compute the pin for just the active scope. Used for the
+        // `(current)` annotation and floating-active sort.
+        self.model_picker_current_pin = match &scope {
+            ModelPickerScope::Session => meta.model.clone(),
+            ModelPickerScope::Agent(name) => meta.agent_models.get(name).cloned(),
+        };
+        self.model_picker_scope = scope;
 
         self.rebuild_model_list(Vec::new());
     }
 
-    /// Active scope's pin: the model id currently set in that scope.
-    /// `None` when no model is pinned in that scope. Used to render the
-    /// `(current)` indicator and to compute the floating-active sort.
+    /// Active scope's pin: the model id currently set in the scope
+    /// the picker is editing. `None` when no model is pinned in that
+    /// scope. Used to render the `(current)` indicator and the
+    /// floating-active sort.
     pub(super) fn active_scope_pin(&self) -> Option<&str> {
-        self.model_picker_scopes
-            .get(self.model_picker_scope_idx)
-            .and_then(|scope| match scope {
-                ModelPickerScope::Session => self.model_picker_session_pin.as_deref(),
-                ModelPickerScope::Agent(name) => {
-                    self.model_picker_agent_pins.get(name).map(String::as_str)
-                }
-            })
-    }
-
-    /// Cycle the active scope by `delta` (wraps). No-op when only the
-    /// Session scope exists (no agents attached). Doesn't touch the
-    /// model list or search query — only the scope index changes.
-    pub(super) fn cycle_model_picker_scope(&mut self, delta: i32) {
-        let n = self.model_picker_scopes.len() as i32;
-        if n <= 1 {
-            return;
-        }
-        let next = (self.model_picker_scope_idx as i32 + delta).rem_euclid(n);
-        self.model_picker_scope_idx = next as usize;
-        // Floating-active sort uses the scope's pin, so the list order
-        // shifts when the scope changes.
-        self.rebuild_model_list_preserving_catalog();
-    }
-
-    /// Rebuild the list from current favorites without re-fetching the
-    /// catalog (favorites already carry catalog enrichment). Used after a
-    /// scope change so the floating-active sort picks up the new pin.
-    fn rebuild_model_list_preserving_catalog(&mut self) {
-        // Pull catalog-only rows (favorites are reapplied inside
-        // rebuild_model_list, so we only need to surface non-favorite
-        // catalog entries).
-        let fav_ids: std::collections::HashSet<String> = self
-            .model_picker_favorites
-            .iter()
-            .map(|m| m.id.clone())
-            .collect();
-        let catalog: Vec<ModelInfo> = self
-            .model_list
-            .iter()
-            .filter(|m| !fav_ids.contains(&m.id))
-            .cloned()
-            .collect();
-        self.rebuild_model_list(catalog);
+        self.model_picker_current_pin.as_deref()
     }
 
     /// Merge favorites with a catalog list. Favorites pinned at top;
@@ -1700,16 +1673,15 @@ async fn handle_chat_action(
             }
             app.open_settings(scope, TuiMode::Chat);
         }
-        ChatAction::OpenModelPicker => {
-            // Read meta synchronously so we can seed scope tabs (Session +
-            // one per attached agent) and the per-scope pin snapshot
-            // before the picker mounts.
+        ChatAction::OpenModelPicker { scope } => {
+            // Read meta synchronously so we can snapshot the pin for the
+            // caller-selected scope before the picker mounts.
             let session_db = app.active().session_db.clone();
             let session_db_id = app.active().session_db_id.clone();
             let session =
                 Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
             let meta = session.read_meta().await;
-            app.seed_model_picker(backend, &meta);
+            app.seed_model_picker(backend, &meta, scope);
             spawn_catalog_load(
                 app,
                 backend.clone(),
@@ -1724,6 +1696,21 @@ async fn handle_chat_action(
             // bounces back into the page where the user pressed Enter.
             app.model_picker_caller = app.mode;
             app.mode = TuiMode::ModelPicker;
+        }
+        ChatAction::OpenModelsSettings => {
+            // /models lands on the Models page regardless of what was
+            // last open in Session Settings, then leaves the user there
+            // to pick a row (Session or per-agent) and Enter into the
+            // picker.
+            seed_session_settings_snapshot(app, server).await;
+            let models_idx = SessionSettingsCategory::ALL
+                .iter()
+                .position(|c| matches!(c, SessionSettingsCategory::Models))
+                .unwrap_or(0);
+            app.set_settings_index(SettingsScope::Session, models_idx);
+            app.session_models_cursor = 0;
+            app.open_settings(SettingsScope::Session, TuiMode::Chat);
+            app.settings_focus = SettingsFocus::Detail;
         }
         ChatAction::OpenPicker => {
             let tab = app.active();
@@ -1922,13 +1909,10 @@ async fn dispatch_model_selection(
     let session_db = tab.session_db.clone();
     let current_agent = tab.current_agent.clone();
     let session_name = tab.session_name.clone();
-    // Capture the active scope before we drop the borrow — used to pick
-    // between the session-wide Command::Model and per-agent Command::AgentModel.
-    let scope = app
-        .model_picker_scopes
-        .get(app.model_picker_scope_idx)
-        .cloned()
-        .unwrap_or(ModelPickerScope::Session);
+    // Scope was locked when the picker opened; read it back here to
+    // pick between the session-wide Command::Model and per-agent
+    // Command::AgentModel.
+    let scope = app.model_picker_scope.clone();
     let ctx = CommandContext {
         server,
         secrets,
@@ -1971,8 +1955,13 @@ async fn handle_settings_outcome(
     match outcome {
         input::SettingsKey::None => {}
         input::SettingsKey::OpenModelPicker => {
+            // Row 0 in the Models page is the session pin; rows 1..n
+            // are per-agent overrides indexed against the session
+            // settings snapshot. Translate cursor → scope here so the
+            // picker mounts pre-scoped.
+            let scope = models_scope_from_cursor(app);
             handle_chat_action(
-                ChatAction::OpenModelPicker,
+                ChatAction::OpenModelPicker { scope },
                 app,
                 server,
                 backend,
@@ -2145,6 +2134,24 @@ async fn dispatch_settings_command(
 }
 
 /// Read the active session's meta + index row and stash a frozen snapshot
+/// Translate the Models page row cursor into the picker scope.
+/// Row 0 = `Session`; rows 1..=n map to `meta.agents[row - 1]`. Falls
+/// back to `Session` when the snapshot is missing or the cursor lands
+/// past the agent list.
+fn models_scope_from_cursor(app: &App) -> ModelPickerScope {
+    let Some(snapshot) = app.session_settings_snapshot.as_ref() else {
+        return ModelPickerScope::Session;
+    };
+    if app.session_models_cursor == 0 {
+        return ModelPickerScope::Session;
+    }
+    let agent_idx = app.session_models_cursor - 1;
+    match snapshot.agents.get(agent_idx) {
+        Some(agent) => ModelPickerScope::Agent(agent.display_name.clone()),
+        None => ModelPickerScope::Session,
+    }
+}
+
 /// on `App` for the Session Settings page. Called when Session Settings
 /// opens and when the active tab fires `SessionChanged` while that page is
 /// up. Silent on failure — the snapshot stays whatever it was so the page

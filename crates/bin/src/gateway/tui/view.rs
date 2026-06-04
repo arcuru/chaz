@@ -1205,42 +1205,19 @@ const COL_W_PRICE: usize = 8;
 const COL_W_CAPS: usize = 6;
 
 fn ui_model_picker(f: &mut ratatui::Frame, app: &mut App) {
-    // scope strip | search bar | list | help. Scope strip suppresses
-    // itself to height 0 when only the Session scope exists — keeps the
-    // chrome out of the way on solo-agent sessions. List block houses the
-    // column header on its first interior row, then the scroll window.
-    let scope_h: u16 = if app.model_picker_scopes.len() > 1 {
-        1
-    } else {
-        0
-    };
+    // search bar | list | help. The picker mounts pre-scoped from its
+    // caller (Models settings row) so there's no in-picker scope
+    // switching — the scope shows in the list block's title instead.
     let chunks = Layout::vertical([
-        Constraint::Length(scope_h),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .split(f.area());
 
-    if scope_h > 0 {
-        render_model_scope_strip(f, chunks[0], app);
-    }
-    render_model_search_bar(f, chunks[1], app);
-    render_model_list_block(f, chunks[2], app);
-    render_model_help_bar(f, chunks[3], app);
-}
-
-/// One-line tab strip showing scope tabs above the search bar. Active
-/// scope highlighted; inactive tabs dimmed. Renders nothing when only
-/// the Session scope exists (no agents attached).
-fn render_model_scope_strip(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let labels: Vec<String> = app
-        .model_picker_scopes
-        .iter()
-        .map(|s| s.label().to_string())
-        .collect();
-    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    widgets::scope_strip(f, area, " scope: ", &label_refs, app.model_picker_scope_idx);
+    render_model_search_bar(f, chunks[0], app);
+    render_model_list_block(f, chunks[1], app);
+    render_model_help_bar(f, chunks[2], app);
 }
 
 fn render_model_search_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1417,8 +1394,11 @@ fn render_model_list_block(f: &mut ratatui::Frame, area: ratatui::layout::Rect, 
     }
 
     // Scroll indicators in the title so the user knows there's more.
+    // Scope label is part of the title so the user always sees which
+    // scope they're editing — no separate strip needed.
     let scroll_hint = scroll_indicator(scroll, end, app.model_picker_filtered.len());
-    let title_text = format!(" Select model{scroll_hint} ");
+    let scope_label = app.model_picker_scope.label();
+    let title_text = format!(" Pick model — {scope_label}{scroll_hint} ");
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1433,19 +1413,12 @@ fn render_model_list_block(f: &mut ratatui::Frame, area: ratatui::layout::Rect, 
 }
 
 fn render_model_help_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let scope_hint = if app.model_picker_scopes.len() > 1 {
-        " | Tab scope"
-    } else {
-        ""
-    };
     let help_text = if app.model_picker_loading {
-        format!(
-            " type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Esc cancel | fetching catalog…"
-        )
+        " type to filter | ↑↓ PgUp/Dn Home/End | Enter select | Esc cancel | fetching catalog…"
+            .to_string()
     } else {
-        format!(
-            " type to filter | ↑↓ PgUp/Dn Home/End | Enter select{scope_hint} | Ctrl+R refresh | Ctrl+U clear | Esc cancel"
-        )
+        " type to filter | ↑↓ PgUp/Dn Home/End | Enter select | Ctrl+R refresh | Ctrl+U clear | Esc cancel"
+            .to_string()
     };
     widgets::status_strip(f, area, &help_text);
 }
@@ -2545,7 +2518,15 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
 /// open the model picker for the active scope. v1 picker doesn't pre-
 /// select the scope based on this row; user picks via the picker's own
 /// scope strip.
-fn render_session_models(f: &mut ratatui::Frame, area: Rect, app: &App, backend: &BackendManager) {
+/// Session → Models — cursor list of scopes (row 0 = Session pin,
+/// rows 1..n = each attached agent). The selected row's scope is what
+/// Enter opens the picker for.
+fn render_session_models(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut App,
+    backend: &BackendManager,
+) {
     let snapshot = match app.session_settings_snapshot.as_ref() {
         Some(s) => s,
         None => {
@@ -2554,15 +2535,20 @@ fn render_session_models(f: &mut ratatui::Frame, area: Rect, app: &App, backend:
         }
     };
 
+    let total_rows = 1 + snapshot.agents.len();
+    let cursor = app.session_models_cursor.min(total_rows.saturating_sub(1));
+
     let session_pin_label = snapshot
         .model_pin
         .clone()
-        .unwrap_or_else(|| "(unset — agents fall through to their own defaults)".to_string());
-    let effective = backend.resolve_model_name(snapshot.model_pin.as_deref());
-    let session_resolved = if effective.is_empty() {
-        "(no backend default)".to_string()
-    } else {
-        effective
+        .unwrap_or_else(|| "(unset)".to_string());
+    let session_resolved = {
+        let effective = backend.resolve_model_name(snapshot.model_pin.as_deref());
+        if effective.is_empty() {
+            "(no backend default)".to_string()
+        } else {
+            effective
+        }
     };
 
     let mut lines: Vec<Line> = vec![
@@ -2573,50 +2559,104 @@ fn render_session_models(f: &mut ratatui::Frame, area: Rect, app: &App, backend:
             Style::default().fg(theme::DIM),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  Session pin    ", Style::default().fg(theme::DIM)),
-            Span::styled(session_pin_label, Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  resolves to    ", Style::default().fg(theme::DIM)),
-            Span::styled(session_resolved, theme::accent()),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Per-agent overrides",
-            Style::default().fg(theme::DIM),
-        )]),
     ];
 
+    // Row 0 — Session pin. Selection marker + resolved-to suffix so the
+    // user sees what the pin maps to without flipping to /agents.
+    let row_offsets_start = lines.len() as u16;
+
+    let session_marker = if cursor == 0 { "> " } else { "  " };
+    let session_style = if cursor == 0 {
+        theme::selected()
+    } else {
+        Style::default().fg(Color::White)
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "{session_marker}{name:<14}  {pin}",
+            name = "Session",
+            pin = session_pin_label
+        ),
+        session_style,
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("      resolves to {session_resolved}"),
+        Style::default().fg(theme::DIM),
+    )]));
+    lines.push(Line::from(""));
+
+    // Rows 1..n — per-agent overrides. Display the override id when set
+    // or "(uses session pin)" otherwise.
     if snapshot.agents.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "    (no agents attached)",
+            "  (no agents attached — only Session is editable)",
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        for agent in &snapshot.agents {
-            let override_value = snapshot
+        lines.push(Line::from(vec![Span::styled(
+            "  Per-agent overrides",
+            Style::default().fg(theme::DIM),
+        )]));
+        for (i, agent) in snapshot.agents.iter().enumerate() {
+            let row = i + 1;
+            let is_selected = row == cursor;
+            let marker = if is_selected { "> " } else { "  " };
+            let style = if is_selected {
+                theme::selected()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let pin_label = snapshot
                 .agent_models
                 .get(&agent.display_name)
                 .cloned()
                 .unwrap_or_else(|| "(uses session pin)".to_string());
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("    {:<14}", agent.display_name),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(override_value, Style::default().fg(theme::DIM)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("{marker}{name:<14}  {pin_label}", name = agent.display_name),
+                style,
+            )]));
         }
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Press Enter to open the model picker.",
+        "  Enter — open picker for selected scope",
         Style::default().fg(theme::DIM),
     )]));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+
+    // Click regions — one row per scope. Row 0 (Session) takes 1 line;
+    // each agent row takes 1 line further down. Row 0 sits at
+    // `row_offsets_start`; agents sit at offset + 3 + i (Session row +
+    // resolved-to subline + blank line + per-agent header line).
+    let area_bottom = area.y.saturating_add(area.height);
+    let session_y = area.y.saturating_add(row_offsets_start);
+    if session_y < area_bottom {
+        app.click_regions.push(ClickRegion {
+            x: area.x,
+            y: session_y,
+            w: area.width,
+            h: 1,
+            target: ClickTarget::SettingsDetailRow(0),
+        });
+    }
+    if !snapshot.agents.is_empty() {
+        let agents_start = row_offsets_start + 4;
+        for (i, _) in snapshot.agents.iter().enumerate() {
+            let y = area.y.saturating_add(agents_start + i as u16);
+            if y >= area_bottom {
+                break;
+            }
+            app.click_regions.push(ClickRegion {
+                x: area.x,
+                y,
+                w: area.width,
+                h: 1,
+                target: ClickTarget::SettingsDetailRow(i + 1),
+            });
+        }
+    }
 }
 
 /// Placeholder right-pane: shows the active category's name and a

@@ -466,11 +466,11 @@ fn set_settings_detail_cursor(app: &mut App, scope: SettingsScope, cat: usize, r
             Some(PeerSettingsCategory::Mcp) => app.peer_mcp_cursor = clamped,
             _ => {}
         },
-        SettingsScope::Session => {
-            if let Some(SessionSettingsCategory::Agents) = SessionSettingsCategory::ALL.get(cat) {
-                app.session_agents_cursor = clamped;
-            }
-        }
+        SettingsScope::Session => match SessionSettingsCategory::ALL.get(cat) {
+            Some(SessionSettingsCategory::Agents) => app.session_agents_cursor = clamped,
+            Some(SessionSettingsCategory::Models) => app.session_models_cursor = clamped,
+            _ => {}
+        },
     }
 }
 
@@ -635,7 +635,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     match text {
         "/quit" | "/exit" | "/q" => return Some(ChatAction::Dispatch(Command::Quit)),
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
-        "/models" => return Some(ChatAction::OpenModelPicker),
+        "/models" => return Some(ChatAction::OpenModelsSettings),
         "/settings" => return Some(ChatAction::OpenSettings(SettingsScope::Session)),
         "/share" => return Some(ChatAction::Dispatch(Command::Share)),
         "/unshare" => return Some(ChatAction::Dispatch(Command::SessionUnshare)),
@@ -1145,17 +1145,6 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
         KeyCode::Char('u') if ctrl => {
             app.model_search.clear();
             app.recompute_model_filter();
-            ModelPickerKey::None
-        }
-
-        // Tab / BackTab — cycle scope (Session ↔ per-agent). No-op when
-        // only the Session scope exists (no agents attached).
-        KeyCode::Tab => {
-            app.cycle_model_picker_scope(1);
-            ModelPickerKey::None
-        }
-        KeyCode::BackTab => {
-            app.cycle_model_picker_scope(-1);
             ModelPickerKey::None
         }
 
@@ -1675,6 +1664,10 @@ fn settings_inner_list_len(app: &App, scope: SettingsScope, category_idx: usize)
                 .session_settings_snapshot
                 .as_ref()
                 .map(|s| s.agents.len()),
+            SessionSettingsCategory::Models => app
+                .session_settings_snapshot
+                .as_ref()
+                .map(|s| 1 + s.agents.len()),
             _ => None,
         },
     }
@@ -1707,6 +1700,7 @@ fn bump_inner_cursor(
         },
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx) {
             Some(SessionSettingsCategory::Agents) => &mut app.session_agents_cursor,
+            Some(SessionSettingsCategory::Models) => &mut app.session_models_cursor,
             _ => return,
         },
     };
