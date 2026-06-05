@@ -25,9 +25,13 @@ chaz --config config.yaml "Summarize today's stand-up."
 # Single-shot print mode (scriptable; one ReAct turn then exit)
 chaz --config config.yaml -p "Summarize today's stand-up."
 
-# Matrix bot
-chaz --config config.yaml --matrix
+# Headless Matrix bot (no TUI; for daemons / containers)
+chaz --config config.yaml --no-tui
 ```
+
+When `matrix:` is configured, the Matrix gateway also runs in the
+background alongside the TUI by default. Pass `--no-matrix` to suppress it
+for a single run.
 
 `--config` is optional: when omitted, chaz falls back to
 `$XDG_CONFIG_HOME/chaz/config.yaml` (typically `~/.config/chaz/config.yaml`).

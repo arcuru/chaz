@@ -10,8 +10,12 @@ The sink depends on the gateway mode, because the TUI and print modes need to ke
 | ------------------ | -------------------------------------------------------- |
 | TUI (default)      | `<state_dir>/chaz-tui.log` (daily-rotated, keeps 7 days) |
 | `-p` / `--print`   | `<state_dir>/chaz-cli.log` (daily-rotated, keeps 7 days) |
-| `--matrix`         | stdout (collected by systemd / docker / your supervisor) |
+| `--no-tui`         | stdout (collected by systemd / docker / your supervisor) |
 | `chaz usage` (CLI) | stderr (stdout is the rollup output)                     |
+
+Background gateways (today: Matrix when configured alongside the TUI) log
+to the same destination as the foreground TUI — the TUI grabs stdout, so
+everything in-process goes to the rotated file.
 
 `state_dir` comes from `state_dir:` in the config or the platform XDG state dir (typically `~/.local/state/chaz`). The startup banner prints the exact log path for the TUI/print cases. Tail with `tail -f <state_dir>/chaz-tui.log`.
 
@@ -81,11 +85,11 @@ Verbose output useful for development and troubleshooting:
 
 ## Redirecting to a File
 
-For `--matrix` (logs default to stdout), redirect to capture them:
+For `--no-tui` (logs default to stdout), redirect to capture them:
 
 ```bash
 # Background with log file
-RUST_LOG=info nohup chaz --config config.yaml --matrix > chaz.log 2>&1 &
+RUST_LOG=info nohup chaz --config config.yaml --no-tui > chaz.log 2>&1 &
 
 # Follow logs
 tail -f chaz.log
@@ -98,8 +102,8 @@ TUI and `-p` / `--print` modes already log to a daily-rotated file in `state_dir
 For security auditing, `warn` level captures all enforcement actions. The exact pipeline depends on where the logs land for your gateway:
 
 ```bash
-# Matrix mode — logs are on stdout/stderr, filter live
-RUST_LOG=chaz_core::security=info,chaz_core::runtime=warn chaz --config config.yaml 2>&1 | \
+# Headless mode (`--no-tui`) — logs are on stdout/stderr, filter live
+RUST_LOG=chaz_core::security=info,chaz_core::runtime=warn chaz --config config.yaml --no-tui 2>&1 | \
   grep -E "WARN|denied|blocked|SSRF|leak|Approval"
 
 # TUI / CLI mode — logs are in a rolling file, tail and filter

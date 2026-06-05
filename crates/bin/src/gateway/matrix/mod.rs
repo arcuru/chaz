@@ -18,7 +18,7 @@ use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{error, info};
 
 use commands::{get_backend, rate_limit};
@@ -52,17 +52,29 @@ fn make_room_approval_tx(
 pub struct MatrixGateway {
     config: Config,
     secrets: SecretStore,
+    /// Cooperative shutdown signal. When the parent (typically `main` after
+    /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
+    /// instead of looping on `bot.run()`.
+    shutdown: Arc<Notify>,
 }
 
 impl MatrixGateway {
-    pub fn new(config: Config, secrets: SecretStore) -> anyhow::Result<Self> {
+    pub fn new(
+        config: Config,
+        secrets: SecretStore,
+        shutdown: Arc<Notify>,
+    ) -> anyhow::Result<Self> {
         if config.homeserver_url.is_empty() {
             anyhow::bail!("homeserver_url is required for Matrix gateway");
         }
         if config.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
-        Ok(Self { config, secrets })
+        Ok(Self {
+            config,
+            secrets,
+            shutdown,
+        })
     }
 }
 
@@ -1138,13 +1150,28 @@ impl Gateway for MatrixGateway {
             });
         }
 
-        // Retry loop for transient sync errors
+        // Retry loop for transient sync errors. Returns Ok(()) on a clean
+        // shutdown signal so the parent can drain background gateways
+        // without surfacing a spurious error.
         loop {
-            match bot.run().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    error!("Matrix sync error (retrying in 5s): {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::select! {
+                biased;
+                _ = self.shutdown.notified() => {
+                    info!("Matrix gateway received shutdown signal");
+                    return Ok(());
+                }
+                res = bot.run() => match res {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        error!("Matrix sync error (retrying in 5s): {e}");
+                        tokio::select! {
+                            _ = self.shutdown.notified() => {
+                                info!("Matrix gateway received shutdown signal during backoff");
+                                return Ok(());
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        }
+                    }
                 }
             }
         }

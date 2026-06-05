@@ -64,8 +64,8 @@ Gateways are transport-specific but the server is transport-agnostic. Adding a n
 
 **Design stance — a gateway is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode." That framing has two consequences:
 
-- The CLI surface picks the *user interface* (TUI default, `-p` one-shot), and gateways activate based on what they actually expose. `--matrix` is the explicit short-term opt-in; the longer-term direction is that Matrix runs alongside the TUI in the same process whenever `matrix:` is configured, so a TUI user and Matrix users can both drive the same hosted session. (Tracked as a follow-up; today they are still mutually exclusive blocking gateways.)
-- Future gateways (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in *that* mode." `chaz` the binary is always a TUI on a terminal first.
+- The CLI surface picks the _user interface_ (TUI default, `-p` one-shot), and gateways activate based on what they actually expose. Background gateways auto-spawn alongside the TUI whenever they're configured: Matrix runs in the background when `matrix:` is populated, so a TUI user and Matrix room users drive the same hosted session concurrently. `--no-matrix` suppresses the background spawn for a single run; `--no-tui` flips Matrix to the foreground for headless / daemon use. `main.rs` collects background handles into a `Vec<JoinHandle>` and drains them via an `Arc<tokio::sync::Notify>` on TUI exit — the plural shape is deliberate so the eventual per-agent matrix logins (one gateway per agent with a `matrix:` block on its AgentDb) drop in as a loop body, not a dispatch rewrite.
+- Future gateways (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in _that_ mode." `chaz` the binary is always a TUI on a terminal first.
 
 **Source**: `crates/bin/src/gateway/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
 

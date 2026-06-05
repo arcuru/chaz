@@ -68,12 +68,22 @@ chaz -p "summarize today's stand-up"
 Each invocation creates a fresh ephemeral session by default. Pass
 `--session NAME` to reuse one across invocations (find-or-create).
 
-### Matrix gateway — `--matrix`
+### Matrix gateway
 
-Connect to Matrix rooms and respond to messages:
+When the `matrix:` block in your config is populated, the Matrix gateway
+spawns automatically in the background alongside the TUI — a TUI user and
+Matrix room users can drive the same hosted session at the same time. To
+opt out of the background gateway for a single run:
 
 ```bash
-chaz --config config.yaml --matrix
+chaz --config config.yaml --no-matrix
+```
+
+To run Matrix as the only gateway (headless, no TUI — for daemons /
+containers):
+
+```bash
+chaz --config config.yaml --no-tui
 ```
 
 #### TUI Commands
@@ -249,6 +259,7 @@ security:
           endpoints:
             - host: "api.example.com"
           allow_private: false # SSRF blocking (default)
+
 
 # Per-agent grant overlays are merged per-kind over the config above:
 # agents:

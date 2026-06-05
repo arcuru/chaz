@@ -8,13 +8,19 @@ All notable changes to this project will be documented in this file.
 
 - CLI arguments now follow `claude` / `pi` conventions. The TUI is the default
   when no other mode is selected; `--tui` and `--cli` are removed.
-  - `chaz` → TUI (previously launched the Matrix gateway)
+  - `chaz` → TUI (previously launched the Matrix gateway). When the
+    `matrix:` block is configured, the Matrix gateway also runs in the
+    background alongside the TUI — a TUI user and Matrix room users can
+    drive the same hosted session concurrently.
   - `chaz "<prompt>"` → TUI with the input box pre-filled
   - `chaz -p "<prompt>"` (alias `--print`) → one-shot CLI; replaces `--cli`
-  - `chaz --matrix` → Matrix gateway; previously this was the implicit default
+  - `chaz --no-tui` → headless: Matrix is the only gateway, no TUI.
+    Replaces the prior `--matrix` flag.
+  - `chaz --no-matrix` → TUI only; suppresses the background Matrix gateway
+    even when configured.
   - `--session NAME` still pairs with `-p` for find-or-create session reuse
-- `chaz --matrix` now rejects a positional prompt rather than silently
-  ignoring it.
+- `chaz --no-tui` rejects a positional prompt rather than silently ignoring
+  it (background gateways take input from their transport, not the CLI).
 
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 

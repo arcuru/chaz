@@ -21,10 +21,17 @@ struct ChazArgs {
     #[arg(short = 'p', long = "print")]
     print: bool,
 
-    /// Run the Matrix gateway instead of the TUI. Connects to the
-    /// homeserver configured in `matrix:` and serves sessions to rooms.
+    /// Run headless: skip the TUI, run only background gateways (Matrix).
+    /// Requires Matrix to be configured. Stdout receives logs in this mode
+    /// (no TUI to grab it).
     #[arg(long, conflicts_with = "print")]
-    matrix: bool,
+    no_tui: bool,
+
+    /// Don't spawn the Matrix gateway in the background, even when Matrix is
+    /// configured. Useful for local TUI sessions where you don't want
+    /// rooms answered. Ignored under `--print`.
+    #[arg(long, conflicts_with_all = ["print", "no_tui"])]
+    no_matrix: bool,
 
     /// Path to config file. When unset, falls back to
     /// `$XDG_CONFIG_HOME/chaz/config.yaml` (typically
@@ -94,10 +101,10 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
 async fn main() -> anyhow::Result<()> {
     let args = ChazArgs::parse();
 
-    if args.matrix && args.prompt.is_some() {
+    if args.no_tui && args.prompt.is_some() {
         anyhow::bail!(
-            "--matrix does not accept a positional prompt — Matrix gateways receive \
-             input from rooms, not the CLI"
+            "--no-tui does not accept a positional prompt — background gateways receive \
+             input from their transport, not the CLI"
         );
     }
 
@@ -139,10 +146,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
     //
-    // - Matrix: logs go to stdout, where systemd / docker / etc. collect
-    //   them via their usual mechanisms.
-    // - TUI (default): stdout belongs to ratatui, so logs go to a rolling
-    //   file (the alt-screen buffer gets corrupted by stray writes).
+    // - --no-tui (headless): logs go to stdout, where systemd / docker / etc.
+    //   collect them via their usual mechanisms.
+    // - TUI (default, including TUI + background Matrix): stdout belongs to
+    //   ratatui, so logs go to a rolling file (the alt-screen buffer gets
+    //   corrupted by stray writes).
     // - --print: stdout is reserved for the model's reply so it can be piped
     //   / captured cleanly. Logs go to a rolling file mirroring the TUI path.
     //
@@ -150,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
     // another terminal to follow live.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _file_log_guard = if !args.matrix {
+    let _file_log_guard = if !args.no_tui {
         let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
         let prefix = if args.print { "chaz-cli" } else { "chaz-tui" };
         let appender = tracing_appender::rolling::Builder::new()
@@ -179,7 +187,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         config = %config_path.display(),
-        matrix = args.matrix,
+        no_tui = args.no_tui,
+        no_matrix = args.no_matrix,
         print = args.print,
         "Starting chaz"
     );
@@ -778,31 +787,111 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Run the selected gateway. TUI is the default; `--print` runs a
-    // one-shot CLI; `--matrix` runs the matrix daemon. With the TUI, a
-    // positional `prompt` pre-fills the input box on launch.
+    // Gateway dispatch.
+    //
+    // - `--print`           : one-shot CLI, no background gateways
+    // - `--no-tui`          : Matrix is the foreground; required to be configured
+    // - default             : TUI is the foreground; Matrix spawns in the background
+    //                         iff configured and `!--no-matrix`
+    //
+    // Cooperative shutdown: when the foreground gateway returns, `shutdown`
+    // is notified and background handles are awaited with a timeout so the
+    // process doesn't hang on a stuck sync loop.
     let mode = if args.print {
         "cli"
-    } else if args.matrix {
-        "matrix"
+    } else if args.no_tui {
+        "matrix-headless"
     } else {
         "tui"
     };
     info!(mode, "Starting gateway");
+
     let result = if args.print {
+        // One-shot: no background gateways, no shutdown plumbing needed.
         let prompt = args.prompt.clone().expect("--print requires PROMPT");
         let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt, args.session);
         gateway.run(server).await
-    } else if args.matrix {
-        let gateway = gateway::matrix::MatrixGateway::new(config, secret_store)?;
-        gateway.run(server).await
     } else {
-        let mut gateway = gateway::tui::TuiGateway::new(config, secret_store)
-            .with_config_path(config_path.clone());
-        if let Some(prompt) = args.prompt {
-            gateway = gateway.with_initial_prompt(prompt);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
+        // Background gateway handles. Today this vector holds at most one
+        // Matrix handle (process-level `homeserver_url` / `username` / `password`).
+        // The Agent/Worker refactor will replace this with one entry per
+        // matrix-configured agent, iterated the same way — keep the spawn
+        // shape plural so the future change is a loop body, not a rewrite.
+        let mut background_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+        let matrix_configured = !config.homeserver_url.is_empty() && !config.username.is_empty();
+
+        if matrix_configured {
+            if args.no_matrix {
+                info!("Matrix configured but --no-matrix supplied; not spawning");
+            } else {
+                // NOTE: today we read the matrix identity (homeserver_url /
+                // username / password) off the process-level `Config`. When
+                // Matrix logins move per-agent, build the per-identity view
+                // here and push one handle per agent.
+                let matrix_gateway = gateway::matrix::MatrixGateway::new(
+                    config.clone(),
+                    secret_store.clone(),
+                    shutdown.clone(),
+                )?;
+                let server_for_matrix = server.clone();
+                background_handles.push(tokio::spawn(async move {
+                    matrix_gateway.run(server_for_matrix).await
+                }));
+                info!("Matrix gateway spawned in background");
+            }
         }
-        gateway.run(server).await
+
+        let fg_result = if args.no_tui {
+            if !matrix_configured {
+                anyhow::bail!(
+                    "--no-tui requires Matrix to be configured (homeserver_url + username)"
+                );
+            }
+            // Headless: the only foreground "work" is waiting on the Matrix
+            // task we just spawned. Pop it off and await directly so its
+            // result becomes the foreground result. (`--no-tui` already
+            // conflicts with `--no-matrix` at the clap layer, so a handle
+            // is guaranteed to be present here.)
+            let matrix_handle = background_handles
+                .pop()
+                .expect("matrix gateway was spawned above");
+            match matrix_handle.await {
+                Ok(res) => res,
+                Err(join_err) => Err(anyhow::anyhow!("matrix gateway task panicked: {join_err}")),
+            }
+        } else {
+            let mut tui_gateway = gateway::tui::TuiGateway::new(config, secret_store)
+                .with_config_path(config_path.clone());
+            if let Some(prompt) = args.prompt {
+                tui_gateway = tui_gateway.with_initial_prompt(prompt);
+            }
+            tui_gateway.run(server).await
+        };
+
+        // TUI (or headless main) exited — drain background gateways.
+        if !background_handles.is_empty() {
+            shutdown.notify_waiters();
+            let drain = async {
+                for handle in background_handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => error!("Background gateway error: {e}"),
+                        Err(join_err) => error!("Background gateway task panicked: {join_err}"),
+                    }
+                }
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+                .await
+                .is_err()
+            {
+                warn!("Background gateways did not drain within 5s; exiting anyway");
+            }
+        }
+
+        fg_result
     };
 
     if let Err(e) = result {
