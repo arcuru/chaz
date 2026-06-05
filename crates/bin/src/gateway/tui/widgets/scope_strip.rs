@@ -5,10 +5,10 @@
 //! Used by the model picker (`scope: Session · ava · chaz`) and the
 //! settings pages (`category: Agents · Backends · Defaults · …`).
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::super::theme;
 

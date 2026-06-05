@@ -483,10 +483,7 @@ pub(super) async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> Comm
                 .agents()
                 .get(ctx.current_agent)
                 .and_then(|a| a.default_model.clone());
-            let per_agent = meta
-                .agent_models
-                .get(ctx.current_agent)
-                .cloned();
+            let per_agent = meta.agent_models.get(ctx.current_agent).cloned();
             let effective = per_agent
                 .clone()
                 .or_else(|| meta.model.clone())
@@ -569,10 +566,7 @@ pub(super) async fn agent_model(
     )
     .await;
     let meta = session.read_meta().await;
-    let known_agent = meta
-        .agents
-        .iter()
-        .any(|a| a.display_name == agent);
+    let known_agent = meta.agents.iter().any(|a| a.display_name == agent);
 
     match model_arg {
         Some(m) => {

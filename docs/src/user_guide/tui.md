@@ -137,16 +137,16 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 
 ### LLM config
 
-| Command                       | Description                                                                  |
-| ----------------------------- | ---------------------------------------------------------------------------- |
-| `/models`                     | Open Session Settings → [Models](#model-picker)                              |
+| Command                       | Description                                                                    |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `/models`                     | Open Session Settings → [Models](#model-picker)                                |
 | `/model`                      | Show the model resolved for the current agent + every override on this session |
-| `/model <id>`                 | Set the session-wide model pin (every agent unless per-agent override wins)  |
-| `/model <agent> <id>`         | Set a per-agent override scoped to this session                              |
-| `/model <agent> clear`        | Clear that agent's per-agent override                                        |
-| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                               |
-| `/backend <name> <url> <key>` | Add a custom backend for the session                                         |
-| `/backends`                   | List known backends and models                                               |
+| `/model <id>`                 | Set the session-wide model pin (every agent unless per-agent override wins)    |
+| `/model <agent> <id>`         | Set a per-agent override scoped to this session                                |
+| `/model <agent> clear`        | Clear that agent's per-agent override                                          |
+| `/role [<name> [<prompt>]]`   | Show, select, or define a role                                                 |
+| `/backend <name> <url> <key>` | Add a custom backend for the session                                           |
+| `/backends`                   | List known backends and models                                                 |
 
 **Model resolution order** for any given turn (highest priority first):
 
@@ -155,7 +155,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 3. The agent's `default_model` from its DB config (seeded from YAML `agents[].model`)
 4. The backend's default model
 
-`/model` (no args) names which source wins for the *current agent*, so the display always matches what the next message will actually run.
+`/model` (no args) names which source wins for the _current agent_, so the display always matches what the next message will actually run.
 
 ### TUI utilities
 
@@ -302,14 +302,14 @@ There is no global key binding for `/models` — terminals without the keyboard-
 
 The TUI renders different entry types with distinct styles:
 
-| Type       | Appearance                             | Description                                     |
-| ---------- | -------------------------------------- | ----------------------------------------------- |
-| Message    | **Bold colored sender** + content      | Chat messages from users and agents             |
+| Type       | Appearance                             | Description                                                    |
+| ---------- | -------------------------------------- | -------------------------------------------------------------- |
+| Message    | **Bold colored sender** + content      | Chat messages from users and agents                            |
 | Directive  | **Bold sender (directive):** + content | Task instructions (from spawn_agent / spawn_worker, scheduler) |
-| Ack        | Dimmed "_agent_ thinking..."           | Agent is processing                             |
-| ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                            |
-| ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                          |
-| Error      | Red `ERROR sender: message`            | An error occurred                               |
+| Ack        | Dimmed "_agent_ thinking..."           | Agent is processing                                            |
+| ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                                           |
+| ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                                         |
+| Error      | Red `ERROR sender: message`            | An error occurred                                              |
 
 Senders are color-coded: agents in green, users in cyan, system in yellow.
 

@@ -364,9 +364,7 @@ impl HttpTransport {
                 if had_session {
                     *self.session_id.lock().await = None;
                     *self.protocol_version.lock().await = None;
-                    return Err(format!(
-                        "MCP '{server_name}' session expired (HTTP 404)"
-                    ));
+                    return Err(format!("MCP '{server_name}' session expired (HTTP 404)"));
                 }
             }
             let body = resp.text().await.unwrap_or_default();

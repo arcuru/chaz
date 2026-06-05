@@ -4,9 +4,9 @@
 //! Caller passes a 1-row `Rect` and a pre-formatted hint string. Page is
 //! responsible for the hint content (e.g. `" ↑↓ select · Enter open · Esc back "`).
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::super::theme;
 

@@ -362,8 +362,8 @@ extensions, not new abstractions.
 
 ## Implementation Touch Points
 
-| File                       | Change                                                                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| File                                  | Change                                                                                                                                                       |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `crates/lib/src/role.rs`              | **Delete**                                                                                                                                                   |
 | `crates/lib/src/persona.rs`           | **Delete**                                                                                                                                                   |
 | `crates/lib/src/agent.rs`             | Drop `persona`, `default_role`; add `system_prompt`, `system_prompt_files`; drop `migrate_role_to_persona()`                                                 |
@@ -380,7 +380,7 @@ extensions, not new abstractions.
 | `crates/lib/src/commands/agent.rs`    | Remove `persona` sub-commands; add `/agent reload <ref>`                                                                                                     |
 | `crates/lib/src/types.rs`             | Entry type: `PersonaSnapshot` → `SystemPromptSnapshot`; `SnapshotReason` stays                                                                               |
 | `crates/lib/src/defaults.rs`          | Built-in agent defs: `persona` → `system_prompt` + `system_prompt_files`                                                                                     |
-| `docs/src/`                | User guide: skills directory, SKILL.md format, `/agent reload`; architecture: PromptAugmentation cap                                                         |
+| `docs/src/`                           | User guide: skills directory, SKILL.md format, `/agent reload`; architecture: PromptAugmentation cap                                                         |
 
 ## Testing
 

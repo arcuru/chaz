@@ -5,10 +5,10 @@
 //! Caller passes cursor byte offset; the cursor is drawn as a block
 //! character. Blinking will come with a stateful variant later.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::super::theme;
 

@@ -190,16 +190,11 @@ impl McpServer {
             let uri = v
                 .get("uri")
                 .and_then(|u| u.as_str())
-                .ok_or_else(|| {
-                    format!("MCP server '{}': resource missing uri field", self.name)
-                })?
+                .ok_or_else(|| format!("MCP server '{}': resource missing uri field", self.name))?
                 .to_string();
             out.push(McpResource {
                 uri,
-                name: v
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .map(str::to_string),
+                name: v.get("name").and_then(|n| n.as_str()).map(str::to_string),
                 description: v
                     .get("description")
                     .and_then(|d| d.as_str())
@@ -265,20 +260,13 @@ impl McpServer {
         let arr = result
             .get("prompts")
             .and_then(|p| p.as_array())
-            .ok_or_else(|| {
-                format!(
-                    "MCP server '{}': invalid prompts/list response",
-                    self.name
-                )
-            })?;
+            .ok_or_else(|| format!("MCP server '{}': invalid prompts/list response", self.name))?;
         let mut out = Vec::with_capacity(arr.len());
         for v in arr {
             let name = v
                 .get("name")
                 .and_then(|n| n.as_str())
-                .ok_or_else(|| {
-                    format!("MCP server '{}': prompt missing name field", self.name)
-                })?
+                .ok_or_else(|| format!("MCP server '{}': prompt missing name field", self.name))?
                 .to_string();
             let arguments = v
                 .get("arguments")
@@ -338,15 +326,9 @@ impl McpServer {
             })?;
         let mut parts = Vec::new();
         for msg in messages {
-            let role = msg
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("user");
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = msg.get("content");
-            if let Some(text) = content
-                .and_then(|c| c.get("text"))
-                .and_then(|t| t.as_str())
-            {
+            if let Some(text) = content.and_then(|c| c.get("text")).and_then(|t| t.as_str()) {
                 parts.push(format!("[{role}] {text}"));
             } else if let Some(content_arr) = content.and_then(|c| c.as_array()) {
                 for item in content_arr {
@@ -974,7 +956,11 @@ impl Tool for McpListPromptsTool {
         _ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let prompts = self.server.list_prompts().await.map_err(classify_mcp_error)?;
+            let prompts = self
+                .server
+                .list_prompts()
+                .await
+                .map_err(classify_mcp_error)?;
             if prompts.is_empty() {
                 return Ok(format!("(no prompts on '{}')", self.server.name));
             }
@@ -1086,10 +1072,7 @@ impl Tool for McpGetPromptTool {
 /// Names are namespaced `{server}__{verb}` so they collide with neither
 /// each other nor a server tool of the same name (the same `__`
 /// convention `discover_and_wrap_tools` uses).
-pub fn build_capability_tools(
-    server: Arc<McpServer>,
-    server_name: &str,
-) -> Vec<Arc<dyn Tool>> {
+pub fn build_capability_tools(server: Arc<McpServer>, server_name: &str) -> Vec<Arc<dyn Tool>> {
     let caps = server.capabilities();
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
     if caps.resources {
@@ -2269,9 +2252,7 @@ while True:
         let received = mock.received_requests().await.unwrap();
         let init_ack = received
             .iter()
-            .find(|r| {
-                String::from_utf8_lossy(&r.body).contains("notifications/initialized")
-            })
+            .find(|r| String::from_utf8_lossy(&r.body).contains("notifications/initialized"))
             .expect("should have seen the initialized notification");
         assert!(
             init_ack.headers.contains_key("mcp-protocol-version"),
@@ -2722,8 +2703,7 @@ while True:
             .mount(&mock)
             .await;
 
-        let server =
-            Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
+        let server = Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
         let extras = build_capability_tools(server, "fakefs");
         assert!(
             extras.is_empty(),
@@ -2757,11 +2737,9 @@ while True:
             .mount(&mock)
             .await;
 
-        let server =
-            Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
+        let server = Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
         let extras = build_capability_tools(server, "fakefs");
-        let names: Vec<String> =
-            extras.iter().map(|t| t.descriptor().name).collect();
+        let names: Vec<String> = extras.iter().map(|t| t.descriptor().name).collect();
         assert!(names.contains(&"fakefs__list_resources".to_string()));
         assert!(names.contains(&"fakefs__read_resource".to_string()));
         assert!(names.contains(&"fakefs__list_prompts".to_string()));

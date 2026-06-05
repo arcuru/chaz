@@ -155,9 +155,8 @@ impl Tool for SpawnWorker {
                 .default_model
                 .clone()
                 .or_else(|| caller_agent.default_model.clone());
-            let mut resolved_max_iterations = worker
-                .max_iterations
-                .unwrap_or(caller_agent.max_iterations);
+            let mut resolved_max_iterations =
+                worker.max_iterations.unwrap_or(caller_agent.max_iterations);
             let mut resolved_tools = worker
                 .allowed_tools
                 .clone()
@@ -322,7 +321,10 @@ mod tests {
         let tool = worker_tool().await;
         let p = tool.default_policy();
         assert!(matches!(p.risk, RiskLevel::Medium));
-        assert!(matches!(p.approval, ApprovalRequirement::UnlessAutoApproved));
+        assert!(matches!(
+            p.approval,
+            ApprovalRequirement::UnlessAutoApproved
+        ));
         assert_eq!(p.timeout, 300, "spawn_worker gets a 5-minute timeout");
     }
 

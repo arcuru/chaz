@@ -664,7 +664,10 @@ mod tests {
 
         let meta = read_meta_from_db(&db).await;
         assert_eq!(meta.model.as_deref(), Some("anthropic/claude-opus-4.7"));
-        assert_eq!(meta.agent_models.get("researcher").map(String::as_str), Some("ring-1t"));
+        assert_eq!(
+            meta.agent_models.get("researcher").map(String::as_str),
+            Some("ring-1t")
+        );
         assert_eq!(meta.agent_models.len(), 2);
     }
 
@@ -673,8 +676,7 @@ mod tests {
         let (_instance, _user, db) = test_session_db().await;
 
         update_meta_on_db(&db, |m| {
-            m.agent_models
-                .insert("ava".to_string(), "opus".to_string());
+            m.agent_models.insert("ava".to_string(), "opus".to_string());
         })
         .await
         .unwrap();

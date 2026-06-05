@@ -4,10 +4,10 @@
 //! Caller passes a 1-row `Rect`. No top/bottom border is drawn; the page
 //! is free to draw its own separator below if it wants one.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::super::theme;
 

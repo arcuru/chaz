@@ -7,10 +7,10 @@
 //! the active one highlighted. Pages that want a fancier sidebar (icons,
 //! groups, dividers) are free to render their own from the rect.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::super::theme;
 
@@ -20,7 +20,8 @@ use super::super::theme;
 /// for choosing it (typically max-label-width + a couple of cells of
 /// padding). The detail rect gets everything to the right.
 pub(in super::super) fn sidebar_detail_layout(area: Rect, sidebar_w: u16) -> (Rect, Rect) {
-    let chunks = Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(0)]).split(area);
+    let chunks =
+        Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(0)]).split(area);
     (chunks[0], chunks[1])
 }
 

@@ -179,14 +179,14 @@ context-build time_, not baked into the agent's stored system prompt:
 
 ## Failure Modes & Mitigations
 
-| Failure                     | Mitigation                                                                    |
-| --------------------------- | ----------------------------------------------------------------------------- |
+| Failure                    | Mitigation                                                                    |
+| -------------------------- | ----------------------------------------------------------------------------- |
 | Infinite agent↔agent loop  | Burst budget; resets only on human/Directive                                  |
 | `@alpha`↔`@beta` ping-pong | Burst budget (counts the run regardless of which agents)                      |
-| Cost blowup                 | Serialized turns (kept) × bounded burst length                                |
-| Self-wake via self-mention  | Resolution excludes `display_name == sender`                                  |
-| Stray `@name` in prose      | Mention must resolve to an _attached, authorized_ agent                       |
-| Human-path regression       | Human-sender branch of `should_process`/resolution is byte-for-byte unchanged |
+| Cost blowup                | Serialized turns (kept) × bounded burst length                                |
+| Self-wake via self-mention | Resolution excludes `display_name == sender`                                  |
+| Stray `@name` in prose     | Mention must resolve to an _attached, authorized_ agent                       |
+| Human-path regression      | Human-sender branch of `should_process`/resolution is byte-for-byte unchanged |
 
 ## Open Questions
 

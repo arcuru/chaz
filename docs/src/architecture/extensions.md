@@ -337,8 +337,8 @@ so it round-trips through eidetica.
 
 ## Module layout
 
-| Path                                  | Purpose                                                                                                                                                   |
-| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Path                                             | Purpose                                                                                                                                                   |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/lib/src/extension/mod.rs`                | Framework: `Extension` trait, `ExtensionHub`, `install_all`, dispatch, activation log                                                                     |
 | `crates/lib/src/extension/instance.rs`           | `ExtensionInstance`, `Scope`, `ScopeCtx`, `PeerHandles`, `CapResolver`                                                                                    |
 | `crates/lib/src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `PromptAugmentation`, `ContextTail`, `AgentStateAdmin`) + `CapabilityKind`/`CapabilityRequest` declaration vocab |

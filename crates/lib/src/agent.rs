@@ -409,7 +409,6 @@ impl AgentRegistry {
             .find(|a| a.name == name)
             .map(|ac| Agent::from_agent_config(ac, config))
     }
-
 }
 
 #[cfg(test)]
