@@ -176,6 +176,15 @@ pub struct ResponseMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     pub usage: TokenUsage,
+    /// Context-window occupancy: the input (prompt) token count of the
+    /// **final** LLM call in the turn — i.e. how full the window was when the
+    /// turn ended. Unlike `usage.prompt_tokens` (which the accumulator *sums*
+    /// across ReAct iterations, so a multi-tool-call turn far exceeds the real
+    /// window), this is a point-in-time high-water mark suitable for a "ctx
+    /// N%" gauge. Set by [`MetadataAccumulator::finalize`]; `None` on raw
+    /// per-call metadata that hasn't been through the accumulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
     /// Backend-specific fields preserved but not normalized (OpenRouter
     /// `cost_details`, `is_byok`, future provider extensions). Same escape
     /// hatch pattern as `provider_extra` on assistant messages.
@@ -221,6 +230,9 @@ struct MetadataAccumulator {
     last_response_id: Option<String>,
     last_extra: serde_json::Map<String, serde_json::Value>,
     usage: TokenUsage,
+    /// Prompt tokens of the most recent call (overwritten, not summed) — the
+    /// context-window high-water mark surfaced as `ResponseMetadata::context_tokens`.
+    last_prompt_tokens: u32,
 }
 
 impl MetadataAccumulator {
@@ -230,6 +242,7 @@ impl MetadataAccumulator {
         self.last_provider = m.provider;
         self.last_response_id = m.response_id;
         self.last_extra = m.extra;
+        self.last_prompt_tokens = m.usage.prompt_tokens;
         self.usage.prompt_tokens = self
             .usage
             .prompt_tokens
@@ -269,6 +282,7 @@ impl MetadataAccumulator {
             provider: self.last_provider,
             response_id: self.last_response_id,
             usage: self.usage,
+            context_tokens: Some(self.last_prompt_tokens),
             extra: self.last_extra,
         })
     }
@@ -999,6 +1013,7 @@ mod tests {
                 reasoning_tokens: Some(5),
                 cost_usd: Some(0.001),
             },
+            context_tokens: None,
             extra: Default::default(),
         });
         acc.record(ResponseMetadata {
@@ -1014,6 +1029,7 @@ mod tests {
                 reasoning_tokens: None,
                 cost_usd: Some(0.002),
             },
+            context_tokens: None,
             extra: Default::default(),
         });
         let m = acc.finalize().expect("two records → Some");
@@ -1030,6 +1046,13 @@ mod tests {
         );
         assert_eq!(m.usage.reasoning_tokens, Some(5));
         assert!((m.usage.cost_usd.unwrap() - 0.003).abs() < 1e-9);
+        // context_tokens is the LAST call's prompt (200), not the sum (300) —
+        // this is the context-window high-water mark the `ctx N%` gauge uses.
+        assert_eq!(
+            m.context_tokens,
+            Some(200),
+            "context_tokens tracks the final call's prompt, not the accumulated sum"
+        );
     }
 
     fn make_tool_call(name: &str, args: &str) -> ToolCallRequest {

@@ -371,6 +371,7 @@ mod tests {
                     reasoning_tokens: None,
                     cost_usd: cost,
                 },
+                context_tokens: None,
                 extra: Default::default(),
             }),
         }

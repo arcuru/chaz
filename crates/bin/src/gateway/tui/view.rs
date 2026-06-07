@@ -618,17 +618,18 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         }
     };
     // Current context occupancy — distinct from `usage_segment`'s lifetime
-    // totals. Numerator is the most recent turn's prompt tokens (how full the
-    // window was when last packed); denominator is the budget the runtime
-    // targets for this session's model. Hidden until a turn with usage
-    // metadata exists, or when no budget is known.
+    // totals. Numerator is the most recent turn's `context_tokens` (the input
+    // size of that turn's final LLM call = how full the window was), NOT
+    // `usage.prompt_tokens`, which sums every ReAct iteration and so overshoots
+    // the window on multi-tool-call turns. Hidden until a turn carries it, or
+    // when no budget is known.
     let ctx_segment = {
-        let last_prompt = tab
+        let last_ctx = tab
             .entries
             .iter()
             .rev()
-            .find_map(|e| e.metadata.as_ref().map(|m| m.usage.prompt_tokens));
-        match last_prompt.and_then(|p| ctx_pct(p, tab.context_budget)) {
+            .find_map(|e| e.metadata.as_ref().and_then(|m| m.context_tokens));
+        match last_ctx.and_then(|p| ctx_pct(p, tab.context_budget)) {
             Some(pct) => format!(" | ctx {pct}%"),
             None => String::new(),
         }
