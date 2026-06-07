@@ -428,9 +428,53 @@ pub(super) struct Tab {
     /// changes mid-session the displayed value goes stale until the next
     /// tab open.
     pub effective_model: String,
+    /// Full roster of agents attached to this session, each with its
+    /// resolved effective model and whether it is the designated host.
+    /// Drives the multi-agent status-bar segment; for a single-agent
+    /// session the bar falls back to `current_agent`/`effective_model` so
+    /// its rendering stays byte-identical. Refreshed wherever
+    /// `effective_model` is.
+    pub roster: Vec<RosterAgent>,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
+}
+
+/// One attached agent as shown in the multi-agent status bar: its display
+/// name, the model the runtime would actually use for it (per-agent pin →
+/// session pin → agent default → backend default), and whether it is the
+/// session's host agent (the un-mentioned-message responder).
+#[derive(Clone)]
+pub(super) struct RosterAgent {
+    pub name: String,
+    pub model: String,
+    pub is_host: bool,
+}
+
+/// Build the status-bar roster for a session from its `SessionMeta`,
+/// resolving each attached agent's effective model the same way the live
+/// turn does (`SessionMeta::resolve_model_for_agent` → agent `default_model`
+/// → `BackendManager::resolve_model_name`).
+fn build_roster(server: &Server, backend: &BackendManager, meta: &SessionMeta) -> Vec<RosterAgent> {
+    meta.agents
+        .iter()
+        .map(|a| {
+            let agent_default = server
+                .agents()
+                .get(&a.display_name)
+                .and_then(|ag| ag.default_model.clone());
+            let session_model = meta
+                .resolve_model_for_agent(&a.display_name)
+                .map(str::to_string);
+            let model =
+                backend.resolve_model_name(session_model.as_deref().or(agent_default.as_deref()));
+            RosterAgent {
+                name: a.display_name.clone(),
+                model,
+                is_host: meta.host_agent_db_id.as_deref() == Some(a.db_id.as_str()),
+            }
+        })
+        .collect()
 }
 
 /// Short, human-distinguishable form of a session DB id, used for tab
@@ -1139,6 +1183,7 @@ async fn build_tab(
     )
     .await;
     let meta = session.read_meta().await;
+    let roster = build_roster(server, backend, &meta);
     let session_name = meta.name;
     // Mirror the runtime's resolution: the live turn passes
     // `agent.default_model` into `runtime::execute`, which calls
@@ -1156,6 +1201,7 @@ async fn build_tab(
         current_agent: agent.name.clone(),
         session_name,
         effective_model,
+        roster,
         expanded_entries: HashSet::new(),
     }
 }
@@ -1527,11 +1573,15 @@ impl Gateway for TuiGateway {
                         let effective_model = backend.resolve_model_name(
                             session_model.as_deref().or(agent_default.as_deref()),
                         );
+                        // Refresh the full roster too: attach/detach, host
+                        // changes, and per-agent model pins all move here.
+                        let roster = build_roster(&server, &backend, &meta);
 
                         let tab = &mut app.tabs[idx];
                         tab.entries = entries;
                         tab.session_name = meta.name.clone();
                         tab.effective_model = effective_model;
+                        tab.roster = roster;
                         if clear_waiting {
                             tab.waiting = false;
                         }
@@ -2275,6 +2325,7 @@ async fn render_outcome(
                 .get(&agent_name)
                 .and_then(|a| a.default_model.clone());
             let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
+            let roster = build_roster(server, &backend, &session.read_meta().await);
             app.tabs.push(Tab {
                 session_db_id,
                 session_db: db,
@@ -2285,6 +2336,7 @@ async fn render_outcome(
                 current_agent: agent_name,
                 session_name,
                 effective_model,
+                roster,
                 expanded_entries: HashSet::new(),
             });
             app.active_tab = app.tabs.len() - 1;

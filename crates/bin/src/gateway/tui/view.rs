@@ -564,11 +564,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     };
     let current_agent = tab.current_agent.clone();
     let effective_model = tab.effective_model.clone();
-    let msg_count = tab
-        .entries
-        .iter()
-        .filter(|e| e.entry_type == EntryType::Message)
-        .count();
+    let roster = tab.roster.clone();
     // Aggregate this session's LLM usage for the status bar. Mirrors
     // `commands::session::format_usage_summary`: only entries carrying
     // response metadata count, and `cached` is the cache-read subset of
@@ -680,23 +676,57 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         );
     }
 
-    let model_segment = if effective_model.is_empty() {
-        " | model: —".to_string()
-    } else {
-        format!(" | model: {}", model_slug(&effective_model))
-    };
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let expand_indicator = if app.expand_all { " | EXP" } else { "" };
-    let status_text = format!(
-        " {} | agent: {}{} | messages: {}{}{}{} | /help",
-        session_label,
-        current_agent,
-        model_segment,
-        msg_count,
-        usage_segment,
-        debug_indicator,
-        expand_indicator
-    );
+
+    // Agent/model segment. Single-agent (or roster-less) sessions render the
+    // original ` | agent: X | model: Y` so their bar stays byte-identical;
+    // multi-agent sessions list the whole roster with the host marked (`*`)
+    // and each agent's effective model.
+    let multi_agent = roster.len() > 1;
+    let agent_segment = if multi_agent {
+        let list = roster
+            .iter()
+            .map(|r| {
+                let host = if r.is_host { "*" } else { "" };
+                if r.model.is_empty() {
+                    format!("{}{host}", r.name)
+                } else {
+                    format!("{}{host}→{}", r.name, model_slug(&r.model))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" | agents: {list}")
+    } else {
+        let model_segment = if effective_model.is_empty() {
+            " | model: —".to_string()
+        } else {
+            format!(" | model: {}", model_slug(&effective_model))
+        };
+        format!(" | agent: {current_agent}{model_segment}")
+    };
+
+    let make_status = |agent_segment: &str| {
+        format!(" {session_label}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}")
+    };
+    let mut status_text = make_status(&agent_segment);
+
+    // If the full roster would overflow the status line, collapse it to a
+    // count plus the host, leaving the per-agent detail to the Settings page.
+    if multi_agent && status_text.chars().count() > chunks[3].width as usize {
+        let collapsed = match roster.iter().find(|r| r.is_host) {
+            Some(h) if !h.model.is_empty() => format!(
+                " | agents: {} · host {}→{}",
+                roster.len(),
+                h.name,
+                model_slug(&h.model)
+            ),
+            Some(h) => format!(" | agents: {} · host {}", roster.len(), h.name),
+            None => format!(" | agents: {}", roster.len()),
+        };
+        status_text = make_status(&collapsed);
+    }
     let status = Paragraph::new(status_text).style(
         Style::default()
             .bg(Color::Rgb(0x1a, 0x1d, 0x26))
