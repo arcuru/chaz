@@ -44,11 +44,6 @@ const TUI_DEFAULT_NAME: &str = "tui";
 pub struct TuiGateway {
     config: Config,
     secrets: SecretStore,
-    /// Path the running `Config` was loaded from. Stashed so the
-    /// Peer→Agents `[r]` reload action can re-parse the yaml without
-    /// guessing at the path. `None` allowed for hosts that don't have a
-    /// file-backed config (tests, in-process spawns).
-    config_path: Option<std::path::PathBuf>,
     /// Optional text to pre-fill the input box with on launch. Mirrors
     /// claude/pi: `chaz "hello"` opens the TUI with "hello" already in the
     /// composer so the user can review and hit Enter. When set, the
@@ -62,16 +57,8 @@ impl TuiGateway {
         Self {
             config,
             secrets,
-            config_path: None,
             initial_prompt: None,
         }
-    }
-
-    /// Set the path the loaded `Config` came from so Settings can reload
-    /// agent yaml at runtime.
-    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
-        self.config_path = Some(path);
-        self
     }
 
     pub fn with_initial_prompt(mut self, prompt: String) -> Self {
@@ -645,11 +632,6 @@ pub(super) struct App {
     /// remove, etc.) to confirm what just happened; cleared on the next
     /// navigation keypress.
     pub(super) settings_status: Option<String>,
-    /// Path the running config was loaded from. Propagated from
-    /// `TuiGateway::config_path` into `App` at startup so Stage 4's
-    /// yaml reload can re-read the same file the user is editing.
-    /// `None` when chaz wasn't booted with a file-backed config.
-    pub(super) settings_config_path: Option<std::path::PathBuf>,
     /// Mode to restore when the model picker closes (Esc or selection).
     /// Set when the picker opens; used so opening the picker from inside
     /// Session Settings returns there rather than dumping the user back
@@ -719,7 +701,6 @@ impl App {
             settings_prompt: None,
             settings_picker: None,
             settings_status: None,
-            settings_config_path: None,
             model_picker_caller: TuiMode::Chat,
             settings_focus: SettingsFocus::Sidebar,
         }
@@ -1213,7 +1194,6 @@ impl Gateway for TuiGateway {
 
         let initial_tab = build_tab(&server, &backend, session_db, session_db_id).await;
         let mut app = App::new(agent_names, initial_tab);
-        app.settings_config_path = self.config_path.clone();
         if let Some(prompt) = self.initial_prompt.as_ref() {
             app.input = prompt.clone();
             app.cursor = app.input.len();
@@ -2081,47 +2061,35 @@ async fn write_peer_defaults(app: &mut App, server: &Arc<Server>, names: Vec<Str
     }
 }
 
-/// Stage 4 — re-read the on-disk chaz yaml, locate the named agent
-/// entry, build a fresh runtime `Agent` from it, and upsert into the
-/// in-memory `AgentRegistry`. Yaml owns the declarative fields
-/// (system_prompt, default_model, allowed_tools, workers, presets,
-/// etc.); DB-side state for Living Agents is untouched — the agent's
-/// per-agent DB lives in its own subtree and is queried separately.
+/// `[r]` on the Settings agent row — re-read the on-disk chaz yaml and
+/// re-run the server-side hash-gated reconcile for the named agent. This
+/// is the same path as the `/agent reload` command and the startup
+/// reconcile: yaml-declared fields and the resolved system prompt refresh
+/// into the agent's DB (the blob store), and a live `/agent set` edit
+/// survives when the yaml block and prompt files are unchanged. The change
+/// takes effect on the agent's next message via live hydration.
 ///
-/// Feedback lands in `app.settings_status` so the result shows on the
-/// Settings status strip until the user navigates. Failure modes:
-/// missing config path, file IO failure, yaml parse error, missing
-/// entry. Each gets a distinct status message.
+/// Earlier this only `build_from_yaml`+`upsert`'d the in-memory registry,
+/// which hydration overwrote on the next message — a no-op for DB-backed
+/// agents. Delegating to the server makes the edit durable.
+///
+/// Feedback lands in `app.settings_status`. `reload_config_for` owns the
+/// config-path / read / parse error reporting.
 async fn reload_peer_agent_from_yaml(app: &mut App, server: &Arc<Server>, name: &str) {
-    let Some(path) = app.settings_config_path.clone() else {
-        app.settings_status = Some("Reload unavailable — no config path".to_string());
-        return;
-    };
-
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            app.settings_status = Some(format!("Reload failed — read {}: {e}", path.display()));
-            return;
+    match server.reload_config_for(Some(name)).await {
+        Ok(report) if report.considered == 0 => {
+            app.settings_status = Some(format!("No yaml entry for {name} — nothing to reload"));
         }
-    };
-    let config: Config = match serde_yaml::from_str(&contents) {
-        Ok(c) => c,
-        Err(e) => {
-            app.settings_status = Some(format!("Reload failed — parse: {e}"));
-            return;
+        Ok(report) if report.changed.is_empty() => {
+            app.settings_status = Some(format!("{name} already matched yaml — no change"));
         }
-    };
-
-    match server.agents().build_from_yaml(name, &config) {
-        Some(agent) => {
-            server.agents().upsert(agent);
-            app.settings_status = Some(format!("Reloaded {name} from yaml"));
-        }
-        None => {
+        Ok(_) => {
             app.settings_status = Some(format!(
-                "No yaml entry for {name} — edit in place coming in Stage 4.5"
+                "Reloaded {name} from yaml (effective next message)"
             ));
+        }
+        Err(e) => {
+            app.settings_status = Some(format!("Reload failed — {e}"));
         }
     }
 }

@@ -566,6 +566,15 @@ pub(super) async fn agent_set(
         return CommandOutcome::Error(msg);
     }
 
+    // A prompt edit must refresh the blob pointer, else a stale
+    // `system_prompt_ref` would mask the new inline text / files at hydration.
+    // Other fields leave the ref untouched.
+    if matches!(field, "system_prompt" | "system_prompt_files")
+        && let Err(e) = ctx.server.refresh_prompt_ref(&mut cfg).await
+    {
+        return CommandOutcome::Error(format!("Failed to resolve system prompt: {e}"));
+    }
+
     if let Err(e) = agent_db.write_config(&cfg).await {
         return CommandOutcome::Error(format!("Failed to write agent config: {e}"));
     }
@@ -580,6 +589,39 @@ pub(super) async fn agent_set(
         "Set {field}={value} on agent '{}' (takes effect next message)",
         entry.display_name
     ))
+}
+
+/// `/agent reload [ref]` — re-read the on-disk chaz yaml and re-run the
+/// hash-gated reconcile, for one named agent or (with no ref) every agent.
+/// This is the on-demand twin of the startup reconcile: yaml-declared fields
+/// and the resolved system prompt refresh into each agent's DB, while a live
+/// `/agent set` edit survives when the yaml block and prompt files are
+/// unchanged. Changes take effect on the next message via live hydration.
+pub(super) async fn agent_reload(
+    agent_ref: Option<&str>,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    match ctx.server.reload_config_for(agent_ref).await {
+        Ok(report) => {
+            if let Some(name) = agent_ref
+                && report.considered == 0
+            {
+                return CommandOutcome::Error(format!(
+                    "No agent '{name}' declared in the chaz config — nothing to reload"
+                ));
+            }
+            match report.changed.as_slice() {
+                [] => CommandOutcome::Text(
+                    "Reload: every agent already matched its yaml — no change".to_string(),
+                ),
+                names => CommandOutcome::Text(format!(
+                    "Reloaded from yaml: {} (effective next message)",
+                    names.join(", ")
+                )),
+            }
+        }
+        Err(e) => CommandOutcome::Error(format!("Reload failed: {e}")),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1323,6 +1365,73 @@ mod tests {
             db.read_config().await.unwrap().model.as_deref(),
             Some("opus")
         );
+    }
+
+    #[tokio::test]
+    async fn agent_set_system_prompt_refreshes_blob_ref_and_hydrates() {
+        // Setting `system_prompt` must store the resolved text in the blob and
+        // point `system_prompt_ref` at it, so hydration reflects the edit
+        // instead of resolving an empty/stale prompt.
+        let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+        dispatch(
+            Command::AgentNew {
+                name: "alpha".to_string(),
+                overrides: vec![],
+            },
+            &ctx,
+        )
+        .await;
+
+        let cmd = Command::AgentSet {
+            agent_ref: "alpha".to_string(),
+            field: "system_prompt".to_string(),
+            value: "You are Alpha.".to_string(),
+        };
+        match dispatch(cmd, &ctx).await {
+            CommandOutcome::Text(_) => {}
+            CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+            _ => panic!("expected Text"),
+        }
+
+        // DB now carries a prompt ref (the blob pointer), not just inline text.
+        let user = registry.user_for_tests().await;
+        let (db, _pk) = find_agent_db(&user, "alpha").await.unwrap();
+        drop(user);
+        let cfg = db.read_config().await.unwrap();
+        assert_eq!(cfg.system_prompt, "You are Alpha.");
+        assert!(cfg.system_prompt_ref.is_some(), "ref set after prompt edit");
+
+        // And hydration resolves that prompt through the blob.
+        let input = crate::agent::Agent {
+            name: "alpha".to_string(),
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
+            default_model: None,
+            allowed_tools: None,
+            workers: std::collections::HashMap::new(),
+            max_iterations: 10,
+            autonomous: false,
+            presets: std::collections::HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: std::collections::HashMap::new(),
+        };
+        let hydrated = server.hydrate_agent_from_db(input).await;
+        assert_eq!(hydrated.system_prompt, "You are Alpha.");
+    }
+
+    #[tokio::test]
+    async fn agent_reload_unknown_agent_errors() {
+        let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        // No config path set on the test server → reload surfaces an error
+        // rather than silently succeeding.
+        match dispatch(Command::AgentReload(None), &ctx).await {
+            CommandOutcome::Error(msg) => assert!(msg.contains("Reload failed"), "got {msg}"),
+            _ => panic!("expected Error"),
+        }
     }
 
     #[tokio::test]

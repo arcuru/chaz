@@ -51,6 +51,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
             "/agent set ",
             "edit an agent field; takes effect next message",
         ),
+        (
+            "/agent reload",
+            "re-read yaml + reconcile agent config(s) [ref]",
+        ),
         ("/agent delete ", "unregister a Living Agent (DB preserved)"),
         ("/agent share ", "generate a share ticket for an agent's DB"),
         (
@@ -862,6 +866,15 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             field: field.to_string(),
             value: value.to_string(),
         }));
+    }
+    if text == "/agent reload" {
+        return Some(ChatAction::Dispatch(Command::AgentReload(None)));
+    }
+    if let Some(arg) = text.strip_prefix("/agent reload ") {
+        let r = arg.trim();
+        return Some(ChatAction::Dispatch(Command::AgentReload(
+            (!r.is_empty()).then(|| r.to_string()),
+        )));
     }
     if text == "/agent hosted" {
         return Some(ChatAction::Dispatch(Command::AgentHosted));

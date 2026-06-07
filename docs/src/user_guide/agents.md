@@ -51,25 +51,30 @@ agents:
 
 At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. On subsequent boots, existing DBs are reused without overwriting their `config` — yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
 
+Because the DB — not the yaml — is authoritative after first boot, a later edit to the yaml block (or to a `system_prompt_files` path) only reaches an already-bootstrapped agent through a **reconcile**. The reconcile runs automatically at startup and on demand via `/agent reload [ref]`; it is hash-gated, so an unchanged yaml block leaves the DB (and any live `/agent set` edits) untouched, while a changed block refreshes the agent's declarative config and re-resolves its system prompt. See [System Prompts](#system-prompts).
+
 ## System Prompts
 
 An agent's system prompt is built from two AgentDbConfig fields, both optional:
 
 | Field                 | Type          | Notes                                                                                                                      |
 | --------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `system_prompt_files` | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. Contents are read when the runtime agent is built — which happens every turn (see below). A path that can't be read is logged at `warn` and skipped, so a bad path degrades the prompt rather than failing the turn. |
+| `system_prompt_files` | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. Resolved (read + folded with `system_prompt`) at **reconcile** time, not every turn. A path that can't be read is logged at `warn` and skipped, so a bad path degrades the prompt rather than failing the turn. |
 | `system_prompt`       | `String`      | Inline text appended after file content. The final prompt the LLM sees is `<concatenated file bodies>\n\n<system_prompt>`. |
 
-The runtime `Agent` holds the assembled text; ContextBuilder injects it as the first chat message. There is no per-session snapshot layer — the prompt is rebuilt fresh from `AgentDbConfig` on every turn, so a `/agent set` edit takes effect on the next message without any explicit refresh step.
+The resolved prompt is stored **off** the agent's primary DB in a content-addressed blob store (a `DocStore` on `chaz_peer`), and `AgentDbConfig.system_prompt_ref` holds an eidetica `Snapshot` pointing at it. Hydration reads the prompt by that ref (memoized — the snapshot is an immutable content address) rather than re-reading the files each turn, so the append-only config never accumulates tens of KB of prompt text and the runtime does no per-turn file IO. ContextBuilder injects the resolved text as the first chat message.
 
-Editing the **contents** of a `system_prompt_files` path needs no refresh step — because the runtime agent is rebuilt from `AgentDbConfig` every turn, the files are re-read each message and edits take effect on the next one. Changing **which** files an agent uses (the path list itself) is stored in the agent DB, so it requires `/agent set <ref> system_prompt_files <paths>` (or re-bootstrapping a fresh DB) rather than only editing the YAML — `bootstrap_from_config` preserves an existing agent DB and treats YAML as a first-boot template.
+Resolution happens at three points, all sharing the same blob-store logic: the **startup reconcile**, **`/agent reload`**, and **`/agent set system_prompt[_files]`**. An unchanged prompt reuses the existing ref (the store grows only with distinct versions).
+
+This is the key behavior change from the per-turn model: editing the **contents** of a `system_prompt_files` path no longer takes effect automatically — the blob is only refreshed by a reconcile. Run `/agent reload <ref>` (or restart) after editing a prompt file. Changing **which** files an agent uses is likewise stored in the DB: edit the yaml and `/agent reload`, or `/agent set <ref> system_prompt_files <paths>` directly.
 
 ### Editing the system prompt
 
-| Command                                                | Effect                                                                                  |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `/agent set <ref> system_prompt <text>`                | Set the inline prompt text. Takes effect on the next message.                           |
-| `/agent set <ref> system_prompt_files <path1>,<path2>` | Replace the file list (comma-separated, supports `~`). Files are re-read on this write. |
+| Command                                                | Effect                                                                                                       |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `/agent set <ref> system_prompt <text>`                | Set the inline prompt text. Re-resolves the blob and updates `system_prompt_ref`. Takes effect next message. |
+| `/agent set <ref> system_prompt_files <path1>,<path2>` | Replace the file list (comma-separated, supports `~`). Re-reads + re-resolves the blob on this write.         |
+| `/agent reload [ref]`                                  | Re-read the yaml from disk and reconcile one agent (or all). Picks up edited prompt-file **contents**.        |
 
 The `skills` extension can additionally append text to the system prompt at context-assembly time via the `PromptAugmentation` capability — see the design note in [`design/skills_and_prompts.md`](../design/skills_and_prompts.md). A dedicated user-guide page for Skills is not written yet.
 
@@ -152,6 +157,7 @@ These aren't session-scoped; they act on the Living Agent itself.
 | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `model`/`tools`/`autonomous`/`max_iterations`/`tool_profile`/`max_context_tokens`/`system_prompt`/`system_prompt_files` (same set accepted by `/agent set`). Worker templates are edited via yaml + `/agent reload`, not `/agent set`. |
 | `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                                                                                                              |
+| `/agent reload [ref]`                               | Re-read the chaz yaml from disk and re-run the hash-gated reconcile for one agent (or all). Refreshes yaml-declared fields and re-resolves the system prompt; live `/agent set` edits survive when the yaml block is unchanged. Same path as the startup reconcile.                       |
 | `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                                                                                                                                       |
 | `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                                                                                                        |
 | `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                                                                                                        |

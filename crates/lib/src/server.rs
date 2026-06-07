@@ -162,6 +162,17 @@ fn config_gate_hash(cfg: &crate::agent_db::AgentDbConfig) -> anyhow::Result<Stri
     Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
 }
 
+/// Outcome of [`Server::reload_config_for`]. `considered` counts the yaml agent
+/// entries that passed the optional name filter — `considered == 0` with a name
+/// filter means "no such agent in yaml", distinct from "matched but unchanged".
+#[derive(Debug, Default, Clone)]
+pub struct ReloadReport {
+    /// Names of agents whose DB config was rewritten.
+    pub changed: Vec<String>,
+    /// Number of yaml agent entries considered after the name filter.
+    pub considered: usize,
+}
+
 /// Background half of "learn a model's context window on first use", shared by
 /// the schedule and worker turn paths (the latter runs inside a spawned task
 /// with no `&self`). No-op when `model` is empty, already has a known window,
@@ -268,6 +279,12 @@ pub struct Server {
     /// (whatever `AgentRegistry::default_agent()` returns). The first
     /// entry effectively becomes the routing host on new sessions.
     default_agents: std::sync::RwLock<Vec<String>>,
+    /// Path to the on-disk chaz yaml, set once at startup via
+    /// [`Server::set_config_path`]. Lets `/agent reload` and the TUI `[r]`
+    /// action re-read the config and re-run the agent reconcile without
+    /// threading the path through every call site. `None` in `--print` and
+    /// tests, where reload is unavailable.
+    config_path: std::sync::RwLock<Option<std::path::PathBuf>>,
     /// Running `RoutineEngine`, set once at startup via
     /// `set_routine_engine` (skipped under `--print`). Threaded into the
     /// `HookContext` / `ToolContext` built for each session so that
@@ -328,6 +345,7 @@ impl Server {
             notify_tx,
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
+            config_path: std::sync::RwLock::new(None),
             routine_engine: OnceLock::new(),
             mcp_registry,
         });
@@ -614,6 +632,103 @@ impl Server {
         Some(text)
     }
 
+    /// Resolve an inline-plus-files prompt into the blob store and return the
+    /// pointer to store in an agent's config. Reuses `current_ref` when the
+    /// resolved text is byte-identical to what that snapshot holds (so an
+    /// unchanged prompt never churns the store); returns `None` for an empty
+    /// prompt. Shared by the yaml reconcile and the `/agent set` re-resolve so
+    /// both produce identical refs for identical inputs.
+    async fn resolve_prompt_ref(
+        &self,
+        inline: &str,
+        files: &[std::path::PathBuf],
+        current_ref: Option<&eidetica::Snapshot>,
+    ) -> anyhow::Result<Option<eidetica::Snapshot>> {
+        let resolved = crate::agent::resolve_system_prompt(inline, files);
+        if resolved.is_empty() {
+            return Ok(None);
+        }
+        let unchanged = match current_ref {
+            Some(snap) => self.prompt_store().get(snap).await.as_deref() == Some(&resolved),
+            None => false,
+        };
+        if unchanged {
+            Ok(current_ref.cloned())
+        } else {
+            Ok(Some(self.prompt_store().put(&resolved).await?))
+        }
+    }
+
+    /// Re-resolve `cfg`'s prompt (inline `system_prompt` + `system_prompt_files`)
+    /// into the blob store and update `cfg.system_prompt_ref` in place. Used by
+    /// `/agent set` so a manual prompt edit refreshes the blob the same way a
+    /// yaml reconcile does — without it, a stale ref would mask the new files.
+    /// Leaves `applied_config_hash` untouched: a live edit intentionally keeps
+    /// the yaml gate so it survives the next startup reconcile when yaml is
+    /// unchanged.
+    pub async fn refresh_prompt_ref(
+        &self,
+        cfg: &mut crate::agent_db::AgentDbConfig,
+    ) -> anyhow::Result<()> {
+        let files: Vec<std::path::PathBuf> = cfg
+            .system_prompt_files
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        cfg.system_prompt_ref = self
+            .resolve_prompt_ref(&cfg.system_prompt, &files, cfg.system_prompt_ref.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Record the on-disk chaz yaml path so `/agent reload` and the TUI `[r]`
+    /// action can re-read it. Called once at startup.
+    pub fn set_config_path(&self, path: std::path::PathBuf) {
+        *self.config_path.write().expect("config_path lock poisoned") = Some(path);
+    }
+
+    /// Re-read the on-disk chaz yaml and re-run the agent reconcile, optionally
+    /// scoped to a single agent name (`only`). Returns the names of agents
+    /// whose DB config changed plus how many yaml entries were considered (so a
+    /// caller can distinguish "no change" from "no such agent in yaml"). Errors
+    /// when no config path is set, or the file can't be read or parsed. Shares
+    /// [`Server::reconcile_agent_from_yaml`] with the startup path, so an
+    /// on-demand reload behaves identically to a restart.
+    pub async fn reload_config_for(&self, only: Option<&str>) -> anyhow::Result<ReloadReport> {
+        let path = self
+            .config_path
+            .read()
+            .expect("config_path lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no config path set — reload unavailable"))?;
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+        let config: crate::config::Config = serde_yaml::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+
+        let Some(agents) = config.agents.as_ref() else {
+            return Ok(ReloadReport::default());
+        };
+        let mut report = ReloadReport::default();
+        for ac in agents {
+            if let Some(name) = only
+                && ac.name != name
+            {
+                continue;
+            }
+            report.considered += 1;
+            match self.reconcile_agent_from_yaml(ac).await {
+                Ok(true) => {
+                    report.changed.push(ac.name.clone());
+                    tracing::info!(agent = %ac.name, "reloaded agent config from yaml");
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(agent = %ac.name, error = %e, "agent reload failed"),
+            }
+        }
+        Ok(report)
+    }
+
     /// Reconcile one agent's DB config from its yaml definition: resolve the
     /// prompt (reading `system_prompt_files`), store it in the blob store, and —
     /// only when the yaml-derived config differs from what was last applied (the
@@ -640,7 +755,8 @@ impl Server {
         };
         let current = db.read_config().await.unwrap_or_default();
 
-        // Resolve the prompt from yaml's declared sources.
+        // Resolve the prompt from yaml's declared sources into the blob store,
+        // reusing `current`'s pointer when the text is unchanged.
         let files: Vec<std::path::PathBuf> = ac
             .system_prompt_files
             .clone()
@@ -649,23 +765,9 @@ impl Server {
             .map(std::path::PathBuf::from)
             .collect();
         let inline = ac.system_prompt.clone().unwrap_or_default();
-        let resolved = crate::agent::resolve_system_prompt(&inline, &files);
-
-        // Reuse the existing pointer when the resolved text is unchanged;
-        // otherwise append a new immutable version. Empty prompt → no ref.
-        let prompt_ref = if resolved.is_empty() {
-            None
-        } else {
-            let unchanged = match current.system_prompt_ref.as_ref() {
-                Some(snap) => self.prompt_store().get(snap).await.as_deref() == Some(&resolved),
-                None => false,
-            };
-            if unchanged {
-                current.system_prompt_ref.clone()
-            } else {
-                Some(self.prompt_store().put(&resolved).await?)
-            }
-        };
+        let prompt_ref = self
+            .resolve_prompt_ref(&inline, &files, current.system_prompt_ref.as_ref())
+            .await?;
 
         // Build the intended declarative config and gate on its hash.
         let mut intended = crate::agent_db::AgentDbConfig::from_agent_config(ac);
@@ -2427,6 +2529,100 @@ mod tests {
         assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
         let hydrated2 = server.hydrate_agent_from_db(input).await;
         assert_eq!(hydrated2.system_prompt, "You are Ava. Operating manual v2!");
+    }
+
+    #[tokio::test]
+    async fn reload_config_for_rereads_yaml_from_disk() {
+        // `/agent reload` path: a config file on disk drives the reconcile via
+        // the server-held config path, not a pre-parsed Config in hand.
+        let (_instance, server, registry) = server_fixture().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("AGENTS.md");
+        std::fs::write(&prompt_path, "Ava manual v1.").unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let write_config = |body: &str| {
+            std::fs::write(
+                &config_path,
+                format!(
+                    "homeserver_url: http://localhost\nusername: test\nagents:\n  - name: ava\n    system_prompt_files: [\"{}\"]\n{}",
+                    prompt_path.display(),
+                    body
+                ),
+            )
+            .unwrap();
+        };
+        write_config("");
+        server.set_config_path(config_path.clone());
+
+        // Bootstrap the agent DB the way startup would.
+        let ac: crate::config::AgentConfig = serde_yaml::from_str(&format!(
+            "name: ava\nsystem_prompt_files: [\"{}\"]\n",
+            prompt_path.display()
+        ))
+        .unwrap();
+        let (db, pubkey) = {
+            let mut user = registry.user_for_tests().await;
+            create_agent_db(
+                &mut user,
+                "ava",
+                &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
+                &AgentMeta {
+                    display_name: Some("ava".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        };
+        server.agent_index().register(DbEntry {
+            db_id: db.id(),
+            display_name: "ava".to_string(),
+            pubkey,
+        });
+
+        // Scoped reload applies and reports the change.
+        let report = server.reload_config_for(Some("ava")).await.unwrap();
+        assert_eq!(report.changed, vec!["ava".to_string()]);
+        assert_eq!(report.considered, 1);
+
+        // A second reload with the file unchanged is a gated no-op.
+        let report2 = server.reload_config_for(Some("ava")).await.unwrap();
+        assert!(report2.changed.is_empty());
+        assert_eq!(report2.considered, 1);
+
+        // Editing the prompt file and reloading reaches hydration.
+        std::fs::write(&prompt_path, "Ava manual v2!").unwrap();
+        let report3 = server.reload_config_for(None).await.unwrap();
+        assert_eq!(report3.changed, vec!["ava".to_string()]);
+        let input = crate::agent::Agent {
+            name: "ava".to_string(),
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
+            default_model: None,
+            allowed_tools: None,
+            workers: HashMap::new(),
+            max_iterations: 10,
+            autonomous: false,
+            presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: HashMap::new(),
+        };
+        let hydrated = server.hydrate_agent_from_db(input).await;
+        assert_eq!(hydrated.system_prompt, "Ava manual v2!");
+
+        // A name that isn't in the yaml is considered zero times.
+        let missing = server.reload_config_for(Some("ghost")).await.unwrap();
+        assert_eq!(missing.considered, 0);
+        assert!(missing.changed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_config_for_errors_without_config_path() {
+        let (_instance, server, _registry) = server_fixture().await;
+        // No set_config_path call → reload is unavailable.
+        assert!(server.reload_config_for(None).await.is_err());
     }
 
     // -----------------------------------------------------------------

@@ -147,6 +147,12 @@ pub enum Command {
         field: String,
         value: String,
     },
+    /// Re-read the on-disk chaz yaml and re-run the hash-gated agent
+    /// reconcile. `Some(ref)` scopes to one agent; `None` reloads every
+    /// declared agent. Same semantics as the startup reconcile — yaml fields
+    /// and the resolved system prompt refresh into the DB, live `/agent set`
+    /// edits survive when yaml is unchanged.
+    AgentReload(Option<String>),
     /// Print this peer's default pubkey so an agent owner can paste it
     /// into `/agent invite` on their peer.
     Pubkey,
@@ -360,6 +366,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             field,
             value,
         } => agent::agent_set(&agent_ref, &field, &value, ctx).await,
+        Command::AgentReload(agent_ref) => agent::agent_reload(agent_ref.as_deref(), ctx).await,
         Command::Pubkey => agent::pubkey(ctx).await,
         Command::AgentInvite {
             agent_ref,

@@ -609,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
     // what makes a yaml prompt-path edit reach an already-bootstrapped agent,
     // since `bootstrap_from_config` reuses an existing DB and treats yaml as a
     // first-boot template. `/agent reload` runs the same path on demand.
+    server.set_config_path(config_path.clone());
     server.reconcile_agents_from_config(&config).await;
 
     // Apply default_agents list: which agents auto-attach to new
@@ -877,8 +878,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(join_err) => Err(anyhow::anyhow!("matrix gateway task panicked: {join_err}")),
             }
         } else {
-            let mut tui_gateway = gateway::tui::TuiGateway::new(config, secret_store)
-                .with_config_path(config_path.clone());
+            let mut tui_gateway = gateway::tui::TuiGateway::new(config, secret_store);
             if let Some(prompt) = args.prompt {
                 tui_gateway = tui_gateway.with_initial_prompt(prompt);
             }
