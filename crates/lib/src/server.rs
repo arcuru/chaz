@@ -14,7 +14,7 @@
 //! to the same session are skipped while an agent is running.
 
 use crate::agent::AgentRegistry;
-use crate::backends::BackendManager;
+use crate::backends::{BackendManager, ModelInfo};
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
 use crate::extension::{ExtensionHub, HookContext};
@@ -150,6 +150,49 @@ fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Op
     }
 }
 
+/// Background half of "learn a model's context window on first use", shared by
+/// the schedule and worker turn paths (the latter runs inside a spawned task
+/// with no `&self`). No-op when `model` is empty, already has a known window,
+/// or a fetch for it is already in flight. Otherwise spawns one fetch of the
+/// backend's live catalog, slots the window into the live overlay (so the next
+/// turn budgets correctly without a restart), and persists the model to the
+/// in-use [`ModelInfoStore`](crate::model_info_store::ModelInfoStore).
+fn spawn_model_window_fetch(
+    chaz_peer: eidetica::Database,
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    backend: BackendManager,
+    model: String,
+) {
+    if model.is_empty() || backend.context_window(&model).is_some() {
+        return;
+    }
+    {
+        let mut guard = inflight.lock().unwrap();
+        if !guard.insert(model.clone()) {
+            return; // already being fetched
+        }
+    }
+    let store = crate::model_info_store::ModelInfoStore::new(chaz_peer);
+    tokio::spawn(async move {
+        match backend.fetch_models_with_info().await {
+            Ok(models) => {
+                if let Some(info) = models.into_iter().find(|m| m.id == model) {
+                    if let Some(w) = info.context_window {
+                        backend.insert_model_window(info.id.clone(), w);
+                    }
+                    if let Err(e) = store.put(&info).await {
+                        tracing::warn!(model = %model, "model info store write failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(model = %model, "background model info fetch failed: {e}");
+            }
+        }
+        inflight.lock().unwrap().remove(&model);
+    });
+}
+
 /// Callback-driven agent server.
 pub struct Server {
     registry: Arc<SessionRegistry>,
@@ -174,6 +217,10 @@ pub struct Server {
     /// Default backend used for schedule-fired Fresh sessions and fallback
     /// when a Pinned session has no registered SessionRuntime.
     default_backend: BackendManager,
+    /// Model ids with a background "learn this model's context window" fetch
+    /// in flight, so concurrent turns on a not-yet-seen model trigger exactly
+    /// one fetch. See [`Server::ensure_model_window_cached`].
+    model_fetch_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-session runtime state keyed by session_db_id
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     /// Track which session DBs have server callbacks registered
@@ -254,6 +301,7 @@ impl Server {
             host,
             extensions,
             default_backend,
+            model_fetch_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -514,28 +562,46 @@ impl Server {
         &self.registry
     }
 
-    /// Load context windows from the persisted live-catalog cache into the
-    /// default backend's overlay, so window-aware budgeting works with zero
-    /// config (no `context_window:` hand-edited into YAML). Idempotent and
-    /// cheap — one DB read of the `chaz_peer` `model_catalog` store. Call once
-    /// at startup, before the gateway delivers messages. A miss (no catalog
-    /// fetched yet on this machine) is a no-op: the runtime keeps falling back
-    /// to the static budget until the picker populates the cache.
+    /// Load context windows for in-use models from the persisted
+    /// `model_info_store` into the default backend's overlay, so window-aware
+    /// budgeting works with zero config (no `context_window:` hand-edited into
+    /// YAML). Idempotent and cheap — one DB read of the `chaz_peer`
+    /// `model_info` store. Call once at startup, before the gateway delivers
+    /// messages. A miss (no model used on this machine yet) is a no-op: the
+    /// runtime falls back to the static budget until a model is used or picked,
+    /// at which point [`ensure_model_window_cached`](Self::ensure_model_window_cached)
+    /// populates the store for next time.
     ///
     /// Because the overlay is shared via `Arc`, this also reaches every
     /// per-session worker backend cloned from `default_backend`.
-    pub async fn warm_catalog_windows(&self) {
-        let cache =
-            crate::model_catalog_cache::ModelCatalogCache::new(self.registry.chaz_peer().clone());
-        let windows = cache.context_windows(&self.default_backend).await;
+    pub async fn warm_model_windows(&self) {
+        let store = crate::model_info_store::ModelInfoStore::new(self.registry.chaz_peer().clone());
+        let windows = store.context_windows().await;
         let n = windows.len();
-        self.default_backend.set_catalog_windows(windows);
+        self.default_backend.set_model_windows(windows);
         if n > 0 {
-            tracing::info!(
-                models = n,
-                "Warmed context-window overlay from catalog cache"
-            );
+            tracing::info!(models = n, "Warmed context-window overlay from model store");
         }
+    }
+
+    /// If `model`'s context window isn't known yet, fetch its info from the
+    /// backend's live catalog in the background, persist it to the in-use
+    /// `model_info_store`, and slot the window into the live overlay so the
+    /// *next* turn budgets correctly. Non-blocking: the current turn proceeds
+    /// model-blind. Deduped per model id (an in-flight or already-known model
+    /// is a no-op), so a burst of turns on a new model triggers one fetch.
+    ///
+    /// This is the "first runtime use" half of how the store gets populated;
+    /// the picker covers the "on switch" half by persisting the model you
+    /// select. `model` is the id as resolved for budgeting (backend-prefixed
+    /// in multi-backend setups), matching `BackendManager::context_window`.
+    pub fn ensure_model_window_cached(&self, backend: &BackendManager, model: &str) {
+        spawn_model_window_fetch(
+            self.registry.chaz_peer().clone(),
+            self.model_fetch_inflight.clone(),
+            backend.clone(),
+            model.to_string(),
+        );
     }
 
     /// The concrete per-turn context budget (in tokens) the runtime would
@@ -544,14 +610,29 @@ impl Server {
     /// ([`resolve_context_max_tokens`]), with the static configured default
     /// applied when neither a window nor a cap narrows it. Surfaced so the
     /// TUI can render `ctx N%` against the exact denominator the runtime uses.
-    pub fn effective_context_budget(
-        &self,
-        backend: &BackendManager,
-        model: &str,
-        agent_cap: Option<usize>,
-    ) -> usize {
-        resolve_context_max_tokens(backend, Some(model), agent_cap)
+    ///
+    /// Resolves windows through the server's own `default_backend`, which is
+    /// the manager whose overlay gets warmed at startup and updated by the
+    /// background first-use fetch — a caller's freshly-built `BackendManager`
+    /// (e.g. the TUI's) carries an empty overlay and would miss learned
+    /// windows.
+    pub fn effective_context_budget(&self, model: &str, agent_cap: Option<usize>) -> usize {
+        resolve_context_max_tokens(&self.default_backend, Some(model), agent_cap)
             .unwrap_or(self.context_config.max_context_tokens)
+    }
+
+    /// Persist a model's pulled info into the in-use [`ModelInfoStore`] and
+    /// slot its window (if any) into the live overlay. Called when the user
+    /// selects a model in the picker — the "on switch" half of populating the
+    /// store (the background first-use fetch is the other half).
+    pub async fn cache_model_info(&self, info: &ModelInfo) {
+        if let Some(w) = info.context_window {
+            self.default_backend.insert_model_window(info.id.clone(), w);
+        }
+        let store = crate::model_info_store::ModelInfoStore::new(self.registry.chaz_peer().clone());
+        if let Err(e) = store.put(info).await {
+            tracing::warn!(model = %info.id, "model info store write failed: {e}");
+        }
     }
 
     pub fn registry_arc(&self) -> Arc<SessionRegistry> {
@@ -1254,11 +1335,14 @@ impl Server {
             let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
             // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
             let session_model = meta.resolve_model_for_agent(agent_name).map(str::to_string);
-            let max_tokens_override = resolve_context_max_tokens(
-                &self.default_backend,
-                session_model.as_deref().or(default_model.as_deref()),
-                max_context_tokens,
-            );
+            let budget_model = session_model.as_deref().or(default_model.as_deref());
+            // First use of a model we don't have a window for yet: learn it in
+            // the background so the next turn budgets window-aware.
+            if let Some(m) = budget_model {
+                self.ensure_model_window_cached(&self.default_backend, m);
+            }
+            let max_tokens_override =
+                resolve_context_max_tokens(&self.default_backend, budget_model, max_context_tokens);
             let assembled = ContextBuilder::new(
                 s.entries(),
                 agent_name,
@@ -1704,6 +1788,10 @@ impl Server {
         let spawn_extensions = self.extensions.clone();
         let routine_engine = self.routine_engine().cloned();
         let max_context_tokens = agent.max_context_tokens;
+        // Captured for the background "learn this model's window" path, since
+        // the spawned task below has no `&self`.
+        let chaz_peer = self.registry.chaz_peer().clone();
+        let model_fetch_inflight = self.model_fetch_inflight.clone();
         let active_extensions = self
             .active_extensions_for_agent(&session_db_id, &agent_name)
             .await;
@@ -1775,11 +1863,19 @@ impl Server {
                 let session_model = meta
                     .resolve_model_for_agent(&agent_name)
                     .map(str::to_string);
-                let max_tokens_override = resolve_context_max_tokens(
-                    &backend,
-                    session_model.as_deref().or(default_model.as_deref()),
-                    max_context_tokens,
-                );
+                let budget_model = session_model.as_deref().or(default_model.as_deref());
+                // First use of a model we don't have a window for yet: learn it
+                // in the background so the next turn budgets window-aware.
+                if let Some(m) = budget_model {
+                    spawn_model_window_fetch(
+                        chaz_peer.clone(),
+                        model_fetch_inflight.clone(),
+                        backend.clone(),
+                        m.to_string(),
+                    );
+                }
+                let max_tokens_override =
+                    resolve_context_max_tokens(&backend, budget_model, max_context_tokens);
                 let assembled =
                     ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
                         .with_tools(&tool_defs)

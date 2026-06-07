@@ -14,7 +14,6 @@ use chaz_core::backends::{BackendManager, ModelInfo};
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
 use chaz_core::gateway::{ApprovalExchange, Gateway};
-use chaz_core::model_catalog_cache::{ModelCatalogCache, cache_key as model_cache_key};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
@@ -548,6 +547,12 @@ pub(super) struct App {
     /// alphabetical (catalog entries that duplicate a favorite id are
     /// dropped).
     pub(super) model_list: Vec<ModelInfo>,
+    /// In-memory cache of the live provider catalog for this session, set the
+    /// first time the picker pulls it and reused on subsequent opens (instant,
+    /// no re-fetch). Never persisted — that's the whole point of the in-use
+    /// model store. Cleared by the picker's refresh binding to force a re-pull;
+    /// gone entirely on restart, where the next open re-fetches.
+    pub(super) session_catalog: Option<Vec<ModelInfo>>,
     /// Index into `model_picker_filtered`, NOT into `model_list`. Resolved
     /// to a `ModelInfo` via `model_list[model_picker_filtered[idx]]`.
     pub(super) model_picker_index: usize,
@@ -688,6 +693,7 @@ impl App {
             session_list_fresh: false,
             picker_index: 0,
             model_list: Vec::new(),
+            session_catalog: None,
             model_picker_index: 0,
             model_picker_filtered: Vec::new(),
             model_picker_scroll: 0,
@@ -1062,10 +1068,6 @@ async fn default_tui_session(
     Ok((conv_id, db))
 }
 
-/// 24-hour cache TTL for the live model catalog. Refresh on demand with
-/// the picker's Ctrl+R binding.
-const MODEL_CATALOG_TTL: chrono::Duration = chrono::Duration::hours(24);
-
 /// Compose the haystack the fuzzy matcher scores against for a given
 /// model. The id is the primary key, but we also fold in capability
 /// labels (`vision`, `audio`, `video`, `image-gen`, `audio-gen`) so
@@ -1116,47 +1118,24 @@ pub(super) fn model_caps_badge(m: &ModelInfo) -> String {
     badge
 }
 
-/// Set the picker into "loading" and spawn a background task to populate
-/// the catalog. The task hits the cache first (unless `force_refresh`),
-/// then falls through to a live `/models` fetch; results arrive on the UI
-/// thread as `Action::ModelsFetched`.
+/// Set the picker into "loading" and spawn a background task to pull the live
+/// `/models` catalog; the result arrives on the UI thread as
+/// `Action::ModelsFetched`, which caches it in memory for the session. The
+/// catalog is intentionally never persisted — only the model you actually
+/// switch to or use is (see `model_info_store`).
 fn spawn_catalog_load(
     app: &mut App,
     backend: BackendManager,
-    cache: ModelCatalogCache,
-    cache_key: String,
     models_tx: mpsc::Sender<Result<Vec<ModelInfo>, String>>,
-    force_refresh: bool,
 ) {
     app.model_picker_loading = true;
     app.model_picker_error = None;
     tokio::spawn(async move {
-        if !force_refresh
-            && let Some(cached) = cache.get(&cache_key).await
-            && cached.is_fresh(MODEL_CATALOG_TTL)
-        {
-            let _ = models_tx.send(Ok(cached.into_models())).await;
-            return;
-        }
-        match backend.fetch_models_with_info().await {
-            Ok(models) => {
-                if let Err(e) = cache.put(&cache_key, models.clone()).await {
-                    tracing::warn!("model catalog cache write failed: {e}");
-                }
-                let _ = models_tx.send(Ok(models)).await;
-            }
-            Err(e) => {
-                // Fetch failed — fall back to any cached copy, even a stale
-                // one, so the picker still shows the OpenRouter catalog the
-                // user pulled earlier. Surface the error only when there's
-                // nothing to fall back to.
-                if let Some(cached) = cache.get(&cache_key).await {
-                    let _ = models_tx.send(Ok(cached.into_models())).await;
-                } else {
-                    let _ = models_tx.send(Err(e.to_string())).await;
-                }
-            }
-        }
+        let res = backend
+            .fetch_models_with_info()
+            .await
+            .map_err(|e| e.to_string());
+        let _ = models_tx.send(res).await;
     });
 }
 
@@ -1185,7 +1164,7 @@ async fn build_tab(
     // and fall back to the backend default when None.
     let effective_model = backend.resolve_model_name(agent.default_model.as_deref());
     let context_budget =
-        server.effective_context_budget(backend, &effective_model, agent.max_context_tokens);
+        server.effective_context_budget(&effective_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
     Tab {
         session_db_id,
@@ -1215,8 +1194,6 @@ impl Gateway for TuiGateway {
         let session_db_id = session_db.root_id().to_string();
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
-        let catalog_cache = ModelCatalogCache::new(server.registry().chaz_peer().clone());
-        let catalog_cache_key = model_cache_key(&backend);
 
         setup_session(
             &server,
@@ -1343,8 +1320,6 @@ impl Gateway for TuiGateway {
                                     &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
-                                    &catalog_cache,
-                                    &catalog_cache_key,
                                     &models_tx,
                                 )
                                 .await;
@@ -1369,8 +1344,6 @@ impl Gateway for TuiGateway {
                                     &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
-                                    &catalog_cache,
-                                    &catalog_cache_key,
                                     &models_tx,
                                 )
                                 .await;
@@ -1427,8 +1400,6 @@ impl Gateway for TuiGateway {
                                         &self.secrets,
                                         &approval_tx,
                                         &notify_tx,
-                                        &catalog_cache,
-                                        &catalog_cache_key,
                                         &models_tx,
                                     )
                                     .await;
@@ -1463,13 +1434,14 @@ impl Gateway for TuiGateway {
                                         .await;
                                     }
                                     input::ModelPickerKey::Refresh => {
+                                        // Force a live re-pull: drop the
+                                        // in-memory session catalog so the
+                                        // fetch can't short-circuit.
+                                        app.session_catalog = None;
                                         spawn_catalog_load(
                                             &mut app,
                                             backend.clone(),
-                                            catalog_cache.clone(),
-                                            catalog_cache_key.clone(),
                                             models_tx.clone(),
-                                            true,
                                         );
                                     }
                                     input::ModelPickerKey::None => {}
@@ -1485,8 +1457,6 @@ impl Gateway for TuiGateway {
                                     &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
-                                    &catalog_cache,
-                                    &catalog_cache_key,
                                     &models_tx,
                                 )
                                 .await;
@@ -1577,7 +1547,7 @@ impl Gateway for TuiGateway {
                             .and_then(|name| server.agents().get(name))
                             .and_then(|a| a.max_context_tokens);
                         let context_budget =
-                            server.effective_context_budget(&backend, &effective_model, agent_cap);
+                            server.effective_context_budget(&effective_model, agent_cap);
                         // Refresh the full roster too: attach/detach, host
                         // changes, and per-agent model pins all move here.
                         let roster = build_roster(&server, &backend, &meta);
@@ -1642,6 +1612,9 @@ impl Gateway for TuiGateway {
                     match res {
                         Ok(catalog) => {
                             app.model_picker_error = None;
+                            // Hold the pulled catalog in memory so reopening the
+                            // picker this session is instant (no re-fetch).
+                            app.session_catalog = Some(catalog.clone());
                             app.rebuild_model_list(catalog);
                         }
                         Err(msg) => {
@@ -1697,8 +1670,6 @@ async fn handle_chat_action(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-    catalog_cache: &ModelCatalogCache,
-    catalog_cache_key: &str,
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
 ) {
     match action {
@@ -1738,14 +1709,13 @@ async fn handle_chat_action(
                 Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
             let meta = session.read_meta().await;
             app.seed_model_picker(backend, &meta, scope);
-            spawn_catalog_load(
-                app,
-                backend.clone(),
-                catalog_cache.clone(),
-                catalog_cache_key.to_string(),
-                models_tx.clone(),
-                false,
-            );
+            // Reuse the session's in-memory catalog if we've already pulled it;
+            // otherwise kick off a live fetch. Browsing never persists — only
+            // the model the user selects does (see `dispatch_model_selection`).
+            match app.session_catalog.clone() {
+                Some(catalog) => app.rebuild_model_list(catalog),
+                None => spawn_catalog_load(app, backend.clone(), models_tx.clone()),
+            }
             // Remember which mode opened the picker so Esc / selection
             // return there instead of dropping back to chat. From chat
             // this no-ops (caller == Chat); from Settings(Session) it
@@ -1965,6 +1935,10 @@ async fn dispatch_model_selection(
     let session_db = tab.session_db.clone();
     let current_agent = tab.current_agent.clone();
     let session_name = tab.session_name.clone();
+    // Snapshot the picked model's info (pricing/window/modalities, as merged
+    // from the live catalog) before `model_id` is consumed below, so we can
+    // persist it as an in-use model once the selection commits.
+    let selected_info = app.model_list.iter().find(|m| m.id == model_id).cloned();
     // Scope was locked when the picker opened; read it back here to
     // pick between the session-wide Command::Model and per-agent
     // Command::AgentModel.
@@ -1986,6 +1960,11 @@ async fn dispatch_model_selection(
         },
     };
     let outcome = commands::dispatch(cmd, &ctx).await;
+    // Record the now-in-use model so the runtime budgets its window (this
+    // turn's overlay + next startup's warm) without anyone editing YAML.
+    if let Some(info) = selected_info {
+        server.cache_model_info(&info).await;
+    }
     render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
     // Return to whoever opened the picker — chat by default; Session
     // Settings when the picker was invoked from there.
@@ -2004,8 +1983,6 @@ async fn handle_settings_outcome(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-    catalog_cache: &ModelCatalogCache,
-    catalog_cache_key: &str,
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
 ) {
     match outcome {
@@ -2024,8 +2001,6 @@ async fn handle_settings_outcome(
                 secrets,
                 approval_tx,
                 notify_tx,
-                catalog_cache,
-                catalog_cache_key,
                 models_tx,
             )
             .await;
@@ -2330,8 +2305,7 @@ async fn render_outcome(
             let agent_default_model = agent.as_ref().and_then(|a| a.default_model.clone());
             let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
             let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
-            let context_budget =
-                server.effective_context_budget(backend, &effective_model, agent_cap);
+            let context_budget = server.effective_context_budget(&effective_model, agent_cap);
             let roster = build_roster(server, backend, &session.read_meta().await);
             app.tabs.push(Tab {
                 session_db_id,

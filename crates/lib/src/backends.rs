@@ -92,14 +92,14 @@ pub trait BackendDispatch: Send + Sync {
 /// `output_modalities` strings (`text`, `image`, `audio`, `video`, …) —
 /// the picker derives capability badges from them.
 ///
-/// Derives `Serialize`/`Deserialize` so it doubles as the persisted
-/// catalog-cache shape (`model_catalog_cache`). Every optional field pairs
-/// `#[serde(default)]` (older entries / providers that omit a field load
-/// cleanly) with `skip_serializing_if` (absent values aren't written at all).
-/// The latter matters because the cache lives in an append-only eidetica DB:
-/// keeping the on-disk JSON to just the fields a model actually has holds
-/// down the bytes that accumulate there forever. See
-/// `docs/src/design/model_catalog_cache.md`.
+/// Derives `Serialize`/`Deserialize` so it doubles as the persisted shape in
+/// `model_info_store`. Every optional field pairs `#[serde(default)]` (older
+/// entries / providers that omit a field load cleanly) with
+/// `skip_serializing_if` (absent values aren't written at all). The latter
+/// matters because the store lives in an append-only eidetica DB: keeping the
+/// on-disk JSON to just the fields a model actually has holds down the bytes
+/// that accumulate there forever. See
+/// `docs/src/design/model_info_store.md`.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -131,15 +131,16 @@ pub struct BackendManager {
     /// the backend config. Production code never sets this; constructed only
     /// via `BackendManager::with_mock`.
     mock: Option<Arc<dyn BackendDispatch>>,
-    /// Context windows sourced from the persisted live-catalog cache
-    /// (`model_catalog_cache`), keyed by the same model id space as
+    /// Context windows for in-use models, sourced from the persisted
+    /// `model_info_store`, keyed by the same model id space as
     /// `list_known_models_with_info`. Consulted by `context_window` as a
     /// fallback when the YAML-declared model carries no window — this is what
     /// makes window-aware budgeting work with zero config. Shared via `Arc`
     /// so per-session worker backends (cloned from the server's default
-    /// backend) observe the same overlay; `RwLock` so a startup warm — or a
-    /// later live `/models` refetch — can refresh it in place.
-    catalog_windows: Arc<RwLock<HashMap<String, u32>>>,
+    /// backend) observe the same overlay; `RwLock` so the startup warm — or a
+    /// background fetch when a not-yet-seen model is first used — can refresh
+    /// it in place.
+    model_windows: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 /// A generic Message
@@ -198,7 +199,7 @@ impl BackendManager {
             backends: backends.as_ref().cloned().unwrap_or_default(),
             secrets,
             mock: None,
-            catalog_windows: Arc::new(RwLock::new(HashMap::new())),
+            model_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -211,7 +212,7 @@ impl BackendManager {
             backends: Vec::new(),
             secrets,
             mock: Some(mock),
-            catalog_windows: Arc::new(RwLock::new(HashMap::new())),
+            model_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -297,10 +298,10 @@ impl BackendManager {
     /// Resolution order:
     /// 1. The YAML-declared catalog (`list_known_models_with_info`) — an
     ///    explicit `context_window:` in config is operator intent and wins.
-    /// 2. The live-catalog overlay loaded from `model_catalog_cache` via
-    ///    [`set_catalog_windows`] — the zero-config path, so a model whose
-    ///    window chaz learned from a `/models` fetch budgets correctly
-    ///    without anyone hand-editing config.
+    /// 2. The in-use-model overlay loaded from `model_info_store` via
+    ///    [`set_model_windows`] / [`insert_model_window`] — the zero-config
+    ///    path, so a model whose window chaz learned from a `/models` fetch
+    ///    budgets correctly without anyone hand-editing config.
     ///
     /// Both use the same id space, so multi-backend prefixed ids
     /// (`backend:model`) match in either tier. `None` when neither source
@@ -315,21 +316,28 @@ impl BackendManager {
         {
             return Some(w as usize);
         }
-        self.catalog_windows
+        self.model_windows
             .read()
             .unwrap()
             .get(model)
             .map(|&w| w as usize)
     }
 
-    /// Replace the live-catalog window overlay consulted by
+    /// Replace the whole in-use-model window overlay consulted by
     /// [`context_window`]. Called once at startup (server warm) from the
-    /// persisted `model_catalog_cache`, and may be called again after a live
-    /// `/models` refetch. Because the overlay lives behind a shared `Arc`,
-    /// updates are visible to every clone of this manager — including the
-    /// per-session worker backends cloned at `register_session`.
-    pub fn set_catalog_windows(&self, windows: HashMap<String, u32>) {
-        *self.catalog_windows.write().unwrap() = windows;
+    /// persisted `model_info_store`. Because the overlay lives behind a shared
+    /// `Arc`, updates are visible to every clone of this manager — including
+    /// the per-session worker backends cloned at `register_session`.
+    pub fn set_model_windows(&self, windows: HashMap<String, u32>) {
+        *self.model_windows.write().unwrap() = windows;
+    }
+
+    /// Insert (or update) a single model's window into the overlay, leaving
+    /// the rest intact. Used by the background "first use of a not-yet-seen
+    /// model" path so the very next turn budgets window-aware without waiting
+    /// for a restart. Shares the same `Arc`, so all clones see it.
+    pub fn insert_model_window(&self, model: String, window: u32) {
+        self.model_windows.write().unwrap().insert(model, window);
     }
 
     /// Validate that the model name is valid
@@ -581,7 +589,7 @@ mod tests {
         let mut overlay = HashMap::new();
         overlay.insert("gpt-4".to_string(), 999_000);
         overlay.insert("gpt-3.5".to_string(), 128_000);
-        mgr.set_catalog_windows(overlay);
+        mgr.set_model_windows(overlay);
 
         // YAML wins over the overlay (explicit operator intent).
         assert_eq!(mgr.context_window("gpt-4"), Some(64_000));
