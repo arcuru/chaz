@@ -150,6 +150,32 @@ fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Op
     }
 }
 
+/// The model id used for context-window budgeting and the learn-on-first-use
+/// window fetch: the session/agent pin when present, else the backend's
+/// resolved default. The fallback mirrors the model the actual LLM call lands
+/// on — `chat_with_tools_for_model` resolves an absent model to the backend
+/// default — so budgeting and the call always agree on which model's window to
+/// charge against. Without it, an agent that pins no model (relying on the
+/// backend default, e.g. a default-routed agent like Ava) budgets against the
+/// static `max_context_tokens` and never triggers the fetch that would learn
+/// its real window, so a 1M-window model silently truncates at the 128k
+/// default.
+///
+/// Unlike [`BackendManager::resolve_model_name`] this preserves any `backend:`
+/// prefix, because the window overlay and YAML catalog are keyed by the
+/// prefixed id; [`BackendManager::default_model`] already returns the prefixed
+/// form in multi-backend setups.
+fn budget_model_id(
+    backend: &BackendManager,
+    session_model: Option<&str>,
+    agent_default: Option<&str>,
+) -> Option<String> {
+    session_model
+        .or(agent_default)
+        .map(str::to_string)
+        .or_else(|| backend.default_model())
+}
+
 /// Stable hash of an agent's intended (yaml-derived) DB config, the gate that
 /// keeps reconcile from clobbering live `/agent set` edits when the yaml block
 /// and prompt files are unchanged. Routed through `serde_json::Value` so the
@@ -1583,16 +1609,25 @@ impl Server {
             let s = session.lock().await;
             let meta = s.read_meta().await;
             let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
-            // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
+            // Per-agent override > session pin > backend default. The backend-
+            // default fallback mirrors the actual call, so an agent that pins no
+            // model still budgets against its real window.
             let session_model = meta.resolve_model_for_agent(agent_name).map(str::to_string);
-            let budget_model = session_model.as_deref().or(default_model.as_deref());
+            let budget_model = budget_model_id(
+                &self.default_backend,
+                session_model.as_deref(),
+                default_model.as_deref(),
+            );
             // First use of a model we don't have a window for yet: learn it in
             // the background so the next turn budgets window-aware.
-            if let Some(m) = budget_model {
+            if let Some(m) = budget_model.as_deref() {
                 self.ensure_model_window_cached(&self.default_backend, m);
             }
-            let max_tokens_override =
-                resolve_context_max_tokens(&self.default_backend, budget_model, max_context_tokens);
+            let max_tokens_override = resolve_context_max_tokens(
+                &self.default_backend,
+                budget_model.as_deref(),
+                max_context_tokens,
+            );
             let assembled = ContextBuilder::new(
                 s.entries(),
                 agent_name,
@@ -2109,14 +2144,17 @@ impl Server {
                 let meta = s.read_meta().await;
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
-                // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
+                // Per-agent override > session pin > backend default. The
+                // backend-default fallback mirrors the actual call, so an agent
+                // that pins no model still budgets against its real window.
                 let session_model = meta
                     .resolve_model_for_agent(&agent_name)
                     .map(str::to_string);
-                let budget_model = session_model.as_deref().or(default_model.as_deref());
+                let budget_model =
+                    budget_model_id(&backend, session_model.as_deref(), default_model.as_deref());
                 // First use of a model we don't have a window for yet: learn it
                 // in the background so the next turn budgets window-aware.
-                if let Some(m) = budget_model {
+                if let Some(m) = budget_model.as_deref() {
                     spawn_model_window_fetch(
                         chaz_peer.clone(),
                         model_fetch_inflight.clone(),
@@ -2124,8 +2162,11 @@ impl Server {
                         m.to_string(),
                     );
                 }
-                let max_tokens_override =
-                    resolve_context_max_tokens(&backend, budget_model, max_context_tokens);
+                let max_tokens_override = resolve_context_max_tokens(
+                    &backend,
+                    budget_model.as_deref(),
+                    max_context_tokens,
+                );
                 let assembled =
                     ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
                         .with_tools(&tool_defs)
@@ -2293,6 +2334,45 @@ mod tests {
         // Unknown window: pass the agent cap through untouched (None => builder default).
         assert_eq!(clamp_budget_to_window(None, None), None);
         assert_eq!(clamp_budget_to_window(Some(64_000), None), Some(64_000));
+    }
+
+    #[tokio::test]
+    async fn budget_model_falls_back_to_backend_default() {
+        let (_instance, _server, registry) = server_fixture().await;
+        let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+
+        // Single backend whose first (default) model is flash — the Ava shape.
+        let mut b = crate::config::Backend::new(crate::config::BackendType::OpenAICompatible);
+        b.name = Some("openrouter".to_string());
+        b.models = Some(vec![crate::config::Model {
+            name: "deepseek/deepseek-v4-flash".to_string(),
+            price_input: None,
+            price_output: None,
+            price_cache_read: None,
+            context_window: None,
+        }]);
+        let backend = crate::backends::BackendManager::new(&Some(vec![b]), secrets.clone());
+
+        // No session pin, no agent default → resolve to the backend default
+        // instead of None. This is the fix: previously `None` here meant the
+        // window fetch never fired and budgeting fell to the 128k static default.
+        assert_eq!(
+            budget_model_id(&backend, None, None).as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+        // An agent default still wins over the backend default.
+        assert_eq!(
+            budget_model_id(&backend, None, Some("pinned")).as_deref(),
+            Some("pinned")
+        );
+        // A session pin wins over both.
+        assert_eq!(
+            budget_model_id(&backend, Some("sess"), Some("pinned")).as_deref(),
+            Some("sess")
+        );
+        // No backends configured → nothing to fall back to.
+        let empty = crate::backends::BackendManager::new(&None, secrets);
+        assert_eq!(budget_model_id(&empty, None, None), None);
     }
 
     use crate::agent::AgentRegistry;
