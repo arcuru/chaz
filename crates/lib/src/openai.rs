@@ -490,6 +490,7 @@ impl OpenAI {
                         price_cache_read: m.price_cache_read,
                         input_modalities: Vec::new(),
                         output_modalities: Vec::new(),
+                        context_window: m.context_window,
                     })
                     .collect()
             })
@@ -570,6 +571,12 @@ impl OpenAI {
             .map(|m| {
                 let pricing = m.pricing.unwrap_or_default();
                 let arch = m.architecture.unwrap_or_default();
+                // The routed provider's cap is the operative limit; fall back
+                // to the model's headline window when it isn't reported.
+                let context_window = m
+                    .top_provider
+                    .and_then(|tp| tp.context_length)
+                    .or(m.context_length);
                 crate::backends::ModelInfo {
                     id: m.id,
                     price_input: parse_per_mtok(pricing.prompt),
@@ -577,6 +584,7 @@ impl OpenAI {
                     price_cache_read: parse_per_mtok(pricing.input_cache_read),
                     input_modalities: arch.input_modalities,
                     output_modalities: arch.output_modalities,
+                    context_window,
                 }
             })
             .collect())
@@ -595,6 +603,19 @@ struct ModelEntry {
     pricing: Option<ModelPricing>,
     #[serde(default)]
     architecture: Option<ModelArchitecture>,
+    /// OpenRouter's published context window for the model.
+    #[serde(default)]
+    context_length: Option<u32>,
+    /// The provider OpenRouter actually routes to may cap context lower than
+    /// the headline `context_length`; prefer this when present.
+    #[serde(default)]
+    top_provider: Option<TopProvider>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TopProvider {
+    #[serde(default)]
+    context_length: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]

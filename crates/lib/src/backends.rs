@@ -108,6 +108,12 @@ pub struct ModelInfo {
     pub input_modalities: Vec<String>,
     #[serde(default)]
     pub output_modalities: Vec<String>,
+    /// Maximum context window in tokens, when known. Sourced from the live
+    /// `/models` catalog (OpenRouter-style providers report it) or declared
+    /// in YAML for providers whose catalog omits it. `None` means unknown —
+    /// callers fall back to the configured `max_context_tokens` budget.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -270,6 +276,19 @@ impl BackendManager {
         self.list_known_models().contains(&model.to_string())
     }
 
+    /// The configured context window (in tokens) for `model`, if known.
+    /// Resolves against the same catalog `list_known_models_with_info`
+    /// exposes, so multi-backend prefixed ids (`backend:model`) match.
+    /// `None` when the model is unknown or declares no window — callers fall
+    /// back to the configured `max_context_tokens`.
+    pub fn context_window(&self, model: &str) -> Option<usize> {
+        self.list_known_models_with_info()
+            .into_iter()
+            .find(|info| info.id == model)
+            .and_then(|info| info.context_window)
+            .map(|w| w as usize)
+    }
+
     /// Validate that the model name is valid
     pub fn validate_model(&self, model: &str) -> Result<(), String> {
         if self.is_known_model(model) || self.backends.len() <= 1 {
@@ -426,6 +445,7 @@ mod tests {
                     price_input: None,
                     price_output: None,
                     price_cache_read: None,
+                    context_window: None,
                 })
                 .collect(),
         );
@@ -491,6 +511,18 @@ mod tests {
         assert!(models.contains(&"gpt-4".to_string()));
         assert!(models.contains(&"gpt-3.5".to_string()));
         assert!(mgr.is_known_model("gpt-4"));
+    }
+
+    #[tokio::test]
+    async fn context_window_resolves_from_configured_model() {
+        let secrets = empty_secrets().await;
+        let mut b = backend("openai", &["gpt-4", "gpt-3.5"]);
+        b.models.as_mut().unwrap()[0].context_window = Some(64_000);
+        let mgr = BackendManager::new(&Some(vec![b]), secrets);
+        assert_eq!(mgr.context_window("gpt-4"), Some(64_000));
+        // Model exists but declares no window, and an unknown model: both None.
+        assert_eq!(mgr.context_window("gpt-3.5"), None);
+        assert_eq!(mgr.context_window("nope"), None);
     }
 
     #[tokio::test]

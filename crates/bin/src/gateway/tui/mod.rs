@@ -868,6 +868,7 @@ impl App {
                     } else {
                         fav.output_modalities.clone()
                     },
+                    context_window: fav.context_window.or(cat.context_window),
                 },
             })
             .collect();
@@ -2325,7 +2326,7 @@ async fn render_outcome(
                 .get(&agent_name)
                 .and_then(|a| a.default_model.clone());
             let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
-            let roster = build_roster(server, &backend, &session.read_meta().await);
+            let roster = build_roster(server, backend, &session.read_meta().await);
             app.tabs.push(Tab {
                 session_db_id,
                 session_db: db,

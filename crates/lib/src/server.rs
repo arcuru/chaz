@@ -116,6 +116,40 @@ struct SpawnContext {
 /// `multi_agent.burst_budget` in config.
 const DEFAULT_AGENT_BURST_BUDGET: usize = 6;
 
+/// Resolve the per-turn `max_context_tokens` for the context builder.
+///
+/// A model's real context window is a hard ceiling: the runtime would
+/// otherwise pack up to the static `max_context_tokens` regardless of the
+/// model in use, overflowing small-window models and needlessly truncating
+/// large ones. So when the window is known it bounds the budget — an explicit
+/// agent/config cap may lower it further but never raise it above the window.
+/// When the window is unknown, return the agent cap unchanged (`None` lets the
+/// builder fall back to its configured default), preserving prior behavior.
+fn resolve_context_max_tokens(
+    backend: &BackendManager,
+    model: Option<&str>,
+    agent_cap: Option<usize>,
+) -> Option<usize> {
+    clamp_budget_to_window(agent_cap, model.and_then(|m| backend.context_window(m)))
+}
+
+/// Pure budget decision (split out from [`resolve_context_max_tokens`] for
+/// testing).
+///
+/// When the model's window is known it is the budget ceiling: a model-blind
+/// static `max_context_tokens` must not cap it (that's the very bug being
+/// fixed — a 1M-window model would otherwise truncate at the 128k default).
+/// An explicit per-agent cap may still lower the budget below the window for
+/// cost control, but never raise it above. When the window is unknown, pass
+/// the agent cap through untouched so the builder falls back to its
+/// configured default — preserving today's model-blind behavior.
+fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Option<usize> {
+    match window {
+        Some(w) => Some(agent_cap.map_or(w, |cap| cap.min(w))),
+        None => agent_cap,
+    }
+}
+
 /// Callback-driven agent server.
 pub struct Server {
     registry: Arc<SessionRegistry>,
@@ -1180,6 +1214,11 @@ impl Server {
             let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
             // Per-agent override > session pin (see `SessionMeta::resolve_model_for_agent`).
             let session_model = meta.resolve_model_for_agent(agent_name).map(str::to_string);
+            let max_tokens_override = resolve_context_max_tokens(
+                &self.default_backend,
+                session_model.as_deref().or(default_model.as_deref()),
+                max_context_tokens,
+            );
             let assembled = ContextBuilder::new(
                 s.entries(),
                 agent_name,
@@ -1187,7 +1226,7 @@ impl Server {
                 &self.context_config,
             )
             .with_tools(&tool_defs)
-            .with_max_tokens_override(max_context_tokens)
+            .with_max_tokens_override(max_tokens_override)
             .with_room_participants(&roster)
             .with_extension_hub(self.extensions.clone())
             .with_session_db(session_db)
@@ -1696,10 +1735,15 @@ impl Server {
                 let session_model = meta
                     .resolve_model_for_agent(&agent_name)
                     .map(str::to_string);
+                let max_tokens_override = resolve_context_max_tokens(
+                    &backend,
+                    session_model.as_deref().or(default_model.as_deref()),
+                    max_context_tokens,
+                );
                 let assembled =
                     ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
                         .with_tools(&tool_defs)
-                        .with_max_tokens_override(max_context_tokens)
+                        .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
                         .with_session_db(s.database())
@@ -1839,6 +1883,32 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_clamps_to_model_window() {
+        // Known window drives the budget — no static default caps it. A small
+        // window prevents overflow; a large one is used in full (the 1M model
+        // no longer truncates at 128k).
+        assert_eq!(clamp_budget_to_window(None, Some(32_000)), Some(32_000));
+        assert_eq!(
+            clamp_budget_to_window(None, Some(1_000_000)),
+            Some(1_000_000)
+        );
+        // An explicit agent cap lower than the window holds (cost control).
+        assert_eq!(
+            clamp_budget_to_window(Some(50_000), Some(200_000)),
+            Some(50_000)
+        );
+        // An agent cap above the window cannot raise past it — window is a ceiling.
+        assert_eq!(
+            clamp_budget_to_window(Some(500_000), Some(200_000)),
+            Some(200_000)
+        );
+        // Unknown window: pass the agent cap through untouched (None => builder default).
+        assert_eq!(clamp_budget_to_window(None, None), None);
+        assert_eq!(clamp_budget_to_window(Some(64_000), None), Some(64_000));
+    }
+
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::DbEntry;

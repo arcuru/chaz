@@ -408,6 +408,12 @@ pub struct Model {
     /// "not applicable" rather than zero when absent.
     #[serde(default)]
     pub price_cache_read: Option<f64>,
+    /// Context window in tokens. Declare it for providers whose `/models`
+    /// catalog doesn't report one (vanilla OpenAI, Ollama, …); when set it
+    /// caps the per-turn context budget at this model's real limit instead
+    /// of the global `max_context_tokens` default.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -106,6 +106,7 @@ mod tests {
                         price_cache_read: Some(0.15),
                         input_modalities: vec!["text".into(), "image".into()],
                         output_modalities: vec!["text".into()],
+                        context_window: Some(200_000),
                     },
                     ModelInfo {
                         id: "c/d".into(),
@@ -124,7 +125,9 @@ mod tests {
         assert_eq!(models[0].price_output, Some(7.5));
         assert_eq!(models[0].price_cache_read, Some(0.15));
         assert_eq!(models[0].input_modalities, vec!["text", "image"]);
+        assert_eq!(models[0].context_window, Some(200_000));
         assert_eq!(models[1].price_input, None);
+        assert_eq!(models[1].context_window, None);
         assert!(models[1].input_modalities.is_empty());
     }
 
