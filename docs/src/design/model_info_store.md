@@ -10,13 +10,13 @@
 There are two different needs around model metadata, and they are served
 differently on purpose:
 
-1. **Browsing** (the TUI picker) wants the *whole* provider catalog — hundreds
+1. **Browsing** (the TUI picker) wants the _whole_ provider catalog — hundreds
    of models with pricing and modality badges — but only transiently, while the
    picker is open. This is pulled live from the backend's `/models` endpoint and
    cached **in memory** for the session (`App::session_catalog`). It is never
    written to disk.
 2. **Budgeting** (the runtime) wants the context window for the handful of
-   models a peer actually *uses*, available at startup without a network call.
+   models a peer actually _uses_, available at startup without a network call.
    This — and only this — is persisted, in `ModelInfoStore`.
 
 Splitting them this way keeps the durable footprint tiny and bounded by usage,
@@ -64,7 +64,7 @@ A model lands in the store via **two** triggers (both, by design):
    model whose window it doesn't yet know, `spawn_model_window_fetch` (via
    `Server::ensure_model_window_cached`) fetches that model's info from the
    live catalog **in the background**, slots the window into the overlay so the
-   *next* turn is window-aware, and `put`s it. Non-blocking — the current turn
+   _next_ turn is window-aware, and `put`s it. Non-blocking — the current turn
    proceeds model-blind. Deduped per model id via an in-flight set, so a burst
    of turns on a new model triggers exactly one fetch.
 
@@ -99,8 +99,8 @@ honest:
 
 - **Numerator is a point-in-time high-water mark, not a running sum.** It uses
   `ResponseMetadata.context_tokens` — the input token count of the turn's
-  *final* LLM call — set by `MetadataAccumulator` (it overwrites this per call
-  while it *sums* `usage.prompt_tokens` across ReAct iterations). Dividing the
+  _final_ LLM call — set by `MetadataAccumulator` (it overwrites this per call
+  while it _sums_ `usage.prompt_tokens` across ReAct iterations). Dividing the
   summed `prompt_tokens` would overshoot the window badly on multi-tool-call
   turns; `context_tokens` is how full the window actually was. Entries written
   before this field existed simply lack it, so the gauge hides until the next
@@ -109,7 +109,7 @@ honest:
   recent turn) and the denominator (`tab.context_budget`, the host's window)
   belong to the same agent, so the percentage is coherent even in a multi-agent
   room where other agents run different-window models. The status bar's
-  token/cost totals are the opposite — summed across *all* agents in the
+  token/cost totals are the opposite — summed across _all_ agents in the
   session — because that's a session-wide cost figure, not a per-window gauge.
 
 A fresh machine that has never used or picked a model is a clean no-op: the

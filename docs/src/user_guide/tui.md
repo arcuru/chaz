@@ -44,7 +44,7 @@ The TUI has four main pieces:
    overflow. Then `ctx N%` — how full the **primary (host) agent's** context
    window is, based on its most recent turn — followed by the session's
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
-   • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
+• $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
    when those modes are on.
 4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight.
 
