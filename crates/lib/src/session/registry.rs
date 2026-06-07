@@ -222,7 +222,7 @@ impl SessionRegistry {
             })?;
             user.open_database(&parent_root).await?
         };
-        let parent_tips = parent_db.get_tips().await?;
+        let parent_tips = parent_db.snapshot().await?.into_tips();
 
         let tree_ref = DelegatedTreeRef {
             permission_bounds: PermissionBounds {

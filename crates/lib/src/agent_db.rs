@@ -68,6 +68,24 @@ pub struct AgentDbConfig {
     /// Paths to system-prompt files, concatenated before `system_prompt`.
     #[serde(default)]
     pub system_prompt_files: Vec<String>,
+    /// Pointer to the *resolved* system prompt (files read + inline) in the
+    /// [`crate::prompt_store`] blob store on `chaz_peer`: an eidetica
+    /// [`Snapshot`](eidetica::Snapshot) of the commit that wrote it. Set by
+    /// reconcile; the runtime fetches the resolved text by reading at this
+    /// snapshot rather than re-reading the files each turn. Stored as a tip
+    /// (CID) rather than a recomputed hash so the exact prompt version is
+    /// reproducible. `None` until first reconcile (or for an inline-only agent
+    /// created via `/agent new`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_ref: Option<eidetica::Snapshot>,
+    /// Reconcile gate: hash of the yaml-derived config last applied to this DB
+    /// (including the resolved prompt ref). Startup/`/agent reload` re-applies
+    /// the yaml definition only when this differs from the current yaml's hash,
+    /// so a live `/agent set` edit survives restarts as long as the yaml block
+    /// and prompt files are unchanged. `None` for agents never reconciled from
+    /// yaml (e.g. created purely via `/agent new`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_config_hash: Option<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
     /// Worker templates this Agent can invoke via `spawn_worker`.
@@ -128,6 +146,10 @@ impl AgentDbConfig {
         Self {
             system_prompt: cfg.system_prompt.clone().unwrap_or_default(),
             system_prompt_files: cfg.system_prompt_files.clone().unwrap_or_default(),
+            // Resolved by reconcile (Server::reconcile_agent_from_yaml), which
+            // reads the files, stores the blob, and fills these in.
+            system_prompt_ref: None,
+            applied_config_hash: None,
             model: cfg.model.clone(),
             tools: cfg.tools.clone(),
             workers: cfg
@@ -833,6 +855,7 @@ mod tests {
             grants: HashMap::new(),
             default_memory_banks: vec![],
             default_skill_banks: vec![],
+            ..Default::default()
         };
         let meta = AgentMeta {
             display_name: Some("researcher".to_string()),

@@ -150,6 +150,18 @@ fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Op
     }
 }
 
+/// Stable hash of an agent's intended (yaml-derived) DB config, the gate that
+/// keeps reconcile from clobbering live `/agent set` edits when the yaml block
+/// and prompt files are unchanged. Routed through `serde_json::Value` so the
+/// `HashMap` fields (`presets`, `grants`) serialize with sorted keys —
+/// `preserve_order` is off — making the hash deterministic across processes.
+/// `applied_config_hash` must be cleared on `cfg` before calling, so the hash
+/// doesn't depend on its own prior value.
+fn config_gate_hash(cfg: &crate::agent_db::AgentDbConfig) -> anyhow::Result<String> {
+    let canonical = serde_json::to_string(&serde_json::to_value(cfg)?)?;
+    Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
+}
+
 /// Background half of "learn a model's context window on first use", shared by
 /// the schedule and worker turn paths (the latter runs inside a spawned task
 /// with no `&self`). No-op when `model` is empty, already has a known window,
@@ -221,6 +233,11 @@ pub struct Server {
     /// in flight, so concurrent turns on a not-yet-seen model trigger exactly
     /// one fetch. See [`Server::ensure_model_window_cached`].
     model_fetch_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Cache of resolved system prompts keyed by their serialized
+    /// `system_prompt_ref` snapshot. Snapshots are immutable content addresses,
+    /// so a cached entry never goes stale; this spares a `chaz_peer` read on
+    /// every turn's `hydrate_agent_from_db`. See [`Server::fetch_resolved_prompt`].
+    prompt_cache: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Per-session runtime state keyed by session_db_id
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     /// Track which session DBs have server callbacks registered
@@ -302,6 +319,7 @@ impl Server {
             extensions,
             default_backend,
             model_fetch_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            prompt_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -553,9 +571,139 @@ impl Server {
         let Ok(cfg) = db.read_config().await else {
             return agent;
         };
-        let rebuilt = self.agents.build_from_db_config(&agent.name, &cfg);
+        let mut rebuilt = self.agents.build_from_db_config(&agent.name, &cfg);
+        rebuilt.system_prompt = self.resolve_db_prompt(&cfg).await;
         self.agents.upsert(rebuilt.clone());
         rebuilt
+    }
+
+    /// Resolve the system prompt for a DB-backed agent. The normal path reads
+    /// the resolved text from the prompt blob store by `system_prompt_ref` (no
+    /// per-turn file IO). When no ref is set yet — a freshly bootstrapped agent
+    /// that hasn't been reconciled, or one with paths but no blob — it falls
+    /// back to reading the files directly so the prompt is never silently empty.
+    async fn resolve_db_prompt(&self, cfg: &crate::agent_db::AgentDbConfig) -> String {
+        if let Some(snap) = cfg.system_prompt_ref.as_ref()
+            && let Some(text) = self.fetch_resolved_prompt(snap).await
+        {
+            return text;
+        }
+        let files: Vec<std::path::PathBuf> = cfg
+            .system_prompt_files
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        crate::agent::resolve_system_prompt(&cfg.system_prompt, &files)
+    }
+
+    /// The prompt blob store on `chaz_peer`.
+    fn prompt_store(&self) -> crate::prompt_store::PromptStore {
+        crate::prompt_store::PromptStore::new(self.registry.chaz_peer().clone())
+    }
+
+    /// Read a resolved prompt by its `system_prompt_ref` snapshot, memoized in
+    /// `prompt_cache`. Snapshots are immutable content addresses, so the cache
+    /// never goes stale.
+    async fn fetch_resolved_prompt(&self, snap: &eidetica::Snapshot) -> Option<String> {
+        let key = serde_json::to_string(snap).ok()?;
+        if let Some(hit) = self.prompt_cache.lock().unwrap().get(&key).cloned() {
+            return Some(hit);
+        }
+        let text = self.prompt_store().get(snap).await?;
+        self.prompt_cache.lock().unwrap().insert(key, text.clone());
+        Some(text)
+    }
+
+    /// Reconcile one agent's DB config from its yaml definition: resolve the
+    /// prompt (reading `system_prompt_files`), store it in the blob store, and —
+    /// only when the yaml-derived config differs from what was last applied (the
+    /// `applied_config_hash` gate) — write the refreshed declarative config
+    /// (including the new `system_prompt_ref`) into the agent's DB. A live
+    /// `/agent set` edit survives when the yaml block and prompt files are
+    /// unchanged. The blob is written only when the resolved prompt actually
+    /// changes (an unchanged prompt reuses the existing ref). Returns `Ok(true)`
+    /// when the DB was rewritten, `Ok(false)` when the gate matched or the agent
+    /// isn't bootstrapped yet.
+    pub async fn reconcile_agent_from_yaml(
+        &self,
+        ac: &crate::config::AgentConfig,
+    ) -> anyhow::Result<bool> {
+        let Some(entry) = self.agent_index.find_by_name(&ac.name) else {
+            return Ok(false);
+        };
+        let Some(db) = self
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await?
+        else {
+            return Ok(false);
+        };
+        let current = db.read_config().await.unwrap_or_default();
+
+        // Resolve the prompt from yaml's declared sources.
+        let files: Vec<std::path::PathBuf> = ac
+            .system_prompt_files
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let inline = ac.system_prompt.clone().unwrap_or_default();
+        let resolved = crate::agent::resolve_system_prompt(&inline, &files);
+
+        // Reuse the existing pointer when the resolved text is unchanged;
+        // otherwise append a new immutable version. Empty prompt → no ref.
+        let prompt_ref = if resolved.is_empty() {
+            None
+        } else {
+            let unchanged = match current.system_prompt_ref.as_ref() {
+                Some(snap) => self.prompt_store().get(snap).await.as_deref() == Some(&resolved),
+                None => false,
+            };
+            if unchanged {
+                current.system_prompt_ref.clone()
+            } else {
+                Some(self.prompt_store().put(&resolved).await?)
+            }
+        };
+
+        // Build the intended declarative config and gate on its hash.
+        let mut intended = crate::agent_db::AgentDbConfig::from_agent_config(ac);
+        intended.system_prompt_ref = prompt_ref;
+        intended.applied_config_hash = None;
+        let new_hash = config_gate_hash(&intended)?;
+        if current.applied_config_hash.as_deref() == Some(new_hash.as_str()) {
+            return Ok(false);
+        }
+        intended.applied_config_hash = Some(new_hash);
+        db.write_config(&intended).await?;
+        Ok(true)
+    }
+
+    /// Reconcile every agent declared in `config` from yaml into its DB. Run at
+    /// startup (after bootstrap) and on demand by `/agent reload`; shares the
+    /// hash-gated semantics so both paths behave identically. A per-agent
+    /// failure is logged and skipped — one bad entry doesn't abort the rest.
+    pub async fn reconcile_agents_from_config(&self, config: &crate::config::Config) {
+        let Some(agents) = config.agents.as_ref() else {
+            return;
+        };
+        let mut changed = 0usize;
+        for ac in agents {
+            match self.reconcile_agent_from_yaml(ac).await {
+                Ok(true) => {
+                    changed += 1;
+                    tracing::info!(agent = %ac.name, "reconciled agent config from yaml");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(agent = %ac.name, error = %e, "agent reconcile failed")
+                }
+            }
+        }
+        if changed > 0 {
+            tracing::info!(agents = changed, "reconciled agent configs from yaml");
+        }
     }
 
     pub fn registry(&self) -> &SessionRegistry {
@@ -2207,6 +2355,78 @@ mod tests {
         assert_eq!(result.name, "phantom");
         assert_eq!(result.default_model.as_deref(), Some("ghost"));
         assert_eq!(result.max_iterations, 7);
+    }
+
+    #[tokio::test]
+    async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
+        let (_instance, server, registry) = server_fixture().await;
+
+        // A yaml agent whose entire system prompt comes from a file (no inline
+        // `system_prompt`) — the exact shape of the Ava config.
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("AGENTS.md");
+        std::fs::write(&prompt_path, "You are Ava. Operating manual v1.").unwrap();
+        let ac: crate::config::AgentConfig = serde_yaml::from_str(&format!(
+            "name: ava\nsystem_prompt_files: [\"{}\"]\n",
+            prompt_path.display()
+        ))
+        .unwrap();
+
+        // Bootstrap the agent DB the way startup would: declarative config
+        // (paths), but no resolved-prompt ref yet.
+        let (db, pubkey) = {
+            let mut user = registry.user_for_tests().await;
+            create_agent_db(
+                &mut user,
+                "ava",
+                &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
+                &AgentMeta {
+                    display_name: Some("ava".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        };
+        server.agent_index().register(DbEntry {
+            db_id: db.id(),
+            display_name: "ava".to_string(),
+            pubkey,
+        });
+
+        // First reconcile applies and sets the prompt ref.
+        assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
+        let cfg = db.read_config().await.unwrap();
+        assert!(cfg.system_prompt_ref.is_some(), "ref set after reconcile");
+        assert!(cfg.applied_config_hash.is_some());
+
+        // Hydration resolves the prompt from the blob (config has no inline text).
+        let input = crate::agent::Agent {
+            name: "ava".to_string(),
+            system_prompt: String::new(),
+            system_prompt_files: vec![],
+            default_model: None,
+            allowed_tools: None,
+            workers: HashMap::new(),
+            max_iterations: 10,
+            autonomous: false,
+            presets: HashMap::new(),
+            tool_profile: None,
+            max_context_tokens: None,
+            grants: HashMap::new(),
+        };
+        let hydrated = server.hydrate_agent_from_db(input.clone()).await;
+        assert_eq!(hydrated.system_prompt, "You are Ava. Operating manual v1.");
+
+        // Unchanged yaml + file → gate matches → no-op.
+        assert!(!server.reconcile_agent_from_yaml(&ac).await.unwrap());
+
+        // Editing the file content makes the resolved prompt change, so
+        // reconcile applies again and hydration reflects the new text.
+        std::fs::write(&prompt_path, "You are Ava. Operating manual v2!").unwrap();
+        assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
+        let hydrated2 = server.hydrate_agent_from_db(input).await;
+        assert_eq!(hydrated2.system_prompt, "You are Ava. Operating manual v2!");
     }
 
     // -----------------------------------------------------------------

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// re-read whenever an agent is (re)built — including the per-message
 /// `hydrate_agent_from_db` path — keeping edits to the prompt files live
 /// without a restart.
-fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
+pub(crate) fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(files.len() + 1);
     for path in files {
         let resolved = expand_home(path);
@@ -221,7 +221,12 @@ impl Agent {
             .collect();
         Agent {
             name: name.to_string(),
-            system_prompt: resolve_system_prompt(&cfg.system_prompt, &system_prompt_files),
+            // Inline only here; the resolved prompt (files folded in) is
+            // fetched from the prompt blob store by `system_prompt_ref` in
+            // `Server::hydrate_agent_from_db`, which avoids re-reading the files
+            // each turn. `from_agent_config` (the yaml/registry path for
+            // DB-less agents) still resolves files directly.
+            system_prompt: cfg.system_prompt.clone(),
             system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),

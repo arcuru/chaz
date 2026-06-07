@@ -603,6 +603,14 @@ async fn main() -> anyhow::Result<()> {
     // or picked, which populates the store for next time.
     server.warm_model_windows().await;
 
+    // Reconcile each agent's DB config from yaml: resolve system prompts into
+    // the blob store, refresh declarative fields when the yaml block changed
+    // (hash-gated, so live `/agent set` edits are preserved otherwise). This is
+    // what makes a yaml prompt-path edit reach an already-bootstrapped agent,
+    // since `bootstrap_from_config` reuses an existing DB and treats yaml as a
+    // first-boot template. `/agent reload` runs the same path on demand.
+    server.reconcile_agents_from_config(&config).await;
+
     // Apply default_agents list: which agents auto-attach to new
     // sessions. First entry is the routing host. Set before any
     // session-creation path runs.
