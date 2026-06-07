@@ -538,6 +538,22 @@ impl Server {
         }
     }
 
+    /// The concrete per-turn context budget (in tokens) the runtime would
+    /// target for `model` under an optional per-agent cap — the same
+    /// resolution `run_*_turn` feeds the context builder
+    /// ([`resolve_context_max_tokens`]), with the static configured default
+    /// applied when neither a window nor a cap narrows it. Surfaced so the
+    /// TUI can render `ctx N%` against the exact denominator the runtime uses.
+    pub fn effective_context_budget(
+        &self,
+        backend: &BackendManager,
+        model: &str,
+        agent_cap: Option<usize>,
+    ) -> usize {
+        resolve_context_max_tokens(backend, Some(model), agent_cap)
+            .unwrap_or(self.context_config.max_context_tokens)
+    }
+
     pub fn registry_arc(&self) -> Arc<SessionRegistry> {
         self.registry.clone()
     }

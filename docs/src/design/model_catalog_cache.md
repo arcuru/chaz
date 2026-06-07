@@ -115,6 +115,35 @@ is therefore written only when it must be:
   elapses — a known and accepted staleness, surfaced to the user as catalog
   data, never used to make a silent runtime decision.
 
+### Why `chaz_peer`, given the append-only constraint
+
+A regenerable, disposable, machine-local cache is not an obvious fit for an
+append-only Merkle-DAG store: eidetica (0.2.0, SQLite-backed) exposes no
+entry-level compaction or GC, so every refetch's blob is retained forever and
+the DB file only grows. By the data's semantics the textbook home would be a
+`$XDG_CACHE_HOME/chaz/` file, atomically replaced — one current snapshot, zero
+history, and trivially wipeable.
+
+We keep it in `chaz_peer` anyway, deliberately:
+
+- The growth is bounded in *rate* (lean entries + ~daily writes) and the data
+  is machine-local already (`chaz_peer`, not the synced `chaz_group`), so the
+  practical cost on a personal install is small.
+- Keeping one storage story — everything in eidetica, no second file-IO path
+  with its own atomic-write/XDG-path/error handling — is worth more than
+  reclaiming a few MB/year.
+- The real fix is upstream: the planned eidetica direction is **content-addressed
+  blob storage** — store a large value once, reference it by hash — at which
+  point a re-fetched-but-unchanged catalog dedupes to its existing hash and
+  stops accreting entirely. When that lands, this cache rides it for free; a
+  bespoke cache-file mechanism would just be thrown away.
+
+So the choice is "tolerate modest bounded growth now, inherit the blob-by-hash
+fix later," not "this is the ideal home." If the upstream story stalls and the
+store grows faster than expected, the fallback is the `$XDG_CACHE_HOME` file
+above — the `ModelCatalogCache` surface (`get`/`put`/`context_windows`/
+`cache_key`) is the same either way, so only the backend swaps.
+
 ## Bounding the budget by the window
 
 The runtime reads only one thing out of this cache: context windows.
@@ -142,6 +171,13 @@ The runtime reads only one thing out of this cache: context windows.
 A fresh machine with no catalog yet fetched is a clean no-op: the overlay stays
 empty and the runtime behaves exactly as before until the picker populates the
 cache; the next start warms from it.
+
+The same budget is surfaced in the TUI status bar as `ctx N%` —
+`Server::effective_context_budget` returns the concrete denominator (the
+resolved window, lowered by any per-agent cap, else the configured default) and
+the bar divides the latest turn's prompt tokens by it. Using the runtime's own
+resolver keeps the displayed percentage from drifting from the budget the
+runtime actually enforces.
 
 ## Known limitation / follow-up
 

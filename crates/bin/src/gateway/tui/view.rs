@@ -46,6 +46,18 @@ fn model_slug(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+/// Percent of the context budget occupied by the latest turn's prompt, for
+/// the `ctx N%` status segment. `None` when the budget is unknown (zero) so
+/// the caller hides the segment rather than dividing by zero. Can exceed 100
+/// if a turn was packed past a later-lowered budget — reported honestly, not
+/// clamped, so an over-budget session is visible.
+fn ctx_pct(prompt_tokens: u32, budget: usize) -> Option<u64> {
+    if budget == 0 {
+        return None;
+    }
+    Some((prompt_tokens as f64 / budget as f64 * 100.0).round() as u64)
+}
+
 /// One-line preview of a ToolCall entry's content. Server writes ToolCall
 /// content as `{name}({json_args})` (see `server.rs`). Returns
 /// `(tool_name, args_preview)` — args collapsed to single line, truncated.
@@ -605,6 +617,22 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
             )
         }
     };
+    // Current context occupancy — distinct from `usage_segment`'s lifetime
+    // totals. Numerator is the most recent turn's prompt tokens (how full the
+    // window was when last packed); denominator is the budget the runtime
+    // targets for this session's model. Hidden until a turn with usage
+    // metadata exists, or when no budget is known.
+    let ctx_segment = {
+        let last_prompt = tab
+            .entries
+            .iter()
+            .rev()
+            .find_map(|e| e.metadata.as_ref().map(|m| m.usage.prompt_tokens));
+        match last_prompt.and_then(|p| ctx_pct(p, tab.context_budget)) {
+            Some(pct) => format!(" | ctx {pct}%"),
+            None => String::new(),
+        }
+    };
     let approval_info = tab.pending_approval.as_ref().map(|ex| {
         (
             ex.info.name.clone(),
@@ -708,7 +736,9 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
     };
 
     let make_status = |agent_segment: &str| {
-        format!(" {session_label}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}")
+        format!(
+            " {session_label}{agent_segment}{ctx_segment}{usage_segment}{debug_indicator}{expand_indicator}"
+        )
     };
     let mut status_text = make_status(&agent_segment);
 
@@ -2802,6 +2832,27 @@ mod tests {
             model_slug("provider/family/qwen-2.5-coder:free"),
             "qwen-2.5-coder:free"
         );
+    }
+
+    #[test]
+    fn ctx_pct_basic_and_rounding() {
+        assert_eq!(ctx_pct(64_000, 128_000), Some(50));
+        // Rounds to nearest.
+        assert_eq!(ctx_pct(1, 3), Some(33));
+        assert_eq!(ctx_pct(2, 3), Some(67));
+    }
+
+    #[test]
+    fn ctx_pct_unknown_budget_is_hidden() {
+        // Zero budget -> None so the segment is omitted, never a divide-by-zero.
+        assert_eq!(ctx_pct(1000, 0), None);
+        assert_eq!(ctx_pct(0, 0), None);
+    }
+
+    #[test]
+    fn ctx_pct_reports_over_budget_unclamped() {
+        // A turn packed past a later-lowered budget shows >100, not a clamp.
+        assert_eq!(ctx_pct(200_000, 128_000), Some(156));
     }
 
     #[test]

@@ -435,6 +435,12 @@ pub(super) struct Tab {
     /// its rendering stays byte-identical. Refreshed wherever
     /// `effective_model` is.
     pub roster: Vec<RosterAgent>,
+    /// The per-turn context budget (tokens) the runtime would target for the
+    /// current agent's effective model — the model's resolved window, lowered
+    /// by any per-agent cap, or the configured default when the window is
+    /// unknown. Denominator for the status bar's `ctx N%`. Resolved at tab
+    /// construction alongside `effective_model`; goes stale the same way.
+    pub context_budget: usize,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
@@ -1178,6 +1184,8 @@ async fn build_tab(
     // `BackendManager::resolve_model_name` to strip the backend prefix
     // and fall back to the backend default when None.
     let effective_model = backend.resolve_model_name(agent.default_model.as_deref());
+    let context_budget =
+        server.effective_context_budget(backend, &effective_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
     Tab {
         session_db_id,
@@ -1190,6 +1198,7 @@ async fn build_tab(
         session_name,
         effective_model,
         roster,
+        context_budget,
         expanded_entries: HashSet::new(),
     }
 }
@@ -1561,6 +1570,14 @@ impl Gateway for TuiGateway {
                         let effective_model = backend.resolve_model_name(
                             session_model.as_deref().or(agent_default.as_deref()),
                         );
+                        // Re-resolve the budget too: a `/model` change can move
+                        // the effective model to one with a different window.
+                        let agent_cap = current_agent
+                            .as_deref()
+                            .and_then(|name| server.agents().get(name))
+                            .and_then(|a| a.max_context_tokens);
+                        let context_budget =
+                            server.effective_context_budget(&backend, &effective_model, agent_cap);
                         // Refresh the full roster too: attach/detach, host
                         // changes, and per-agent model pins all move here.
                         let roster = build_roster(&server, &backend, &meta);
@@ -1569,6 +1586,7 @@ impl Gateway for TuiGateway {
                         tab.entries = entries;
                         tab.session_name = meta.name.clone();
                         tab.effective_model = effective_model;
+                        tab.context_budget = context_budget;
                         tab.roster = roster;
                         if clear_waiting {
                             tab.waiting = false;
@@ -2308,11 +2326,12 @@ async fn render_outcome(
             let entries = session.entries().to_vec();
             // Mirror `build_tab` — resolve through the backend so the status
             // bar reflects what the runtime would actually use.
-            let agent_default_model = server
-                .agents()
-                .get(&agent_name)
-                .and_then(|a| a.default_model.clone());
+            let agent = server.agents().get(&agent_name);
+            let agent_default_model = agent.as_ref().and_then(|a| a.default_model.clone());
+            let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
             let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
+            let context_budget =
+                server.effective_context_budget(backend, &effective_model, agent_cap);
             let roster = build_roster(server, backend, &session.read_meta().await);
             app.tabs.push(Tab {
                 session_db_id,
@@ -2325,6 +2344,7 @@ async fn render_outcome(
                 session_name,
                 effective_model,
                 roster,
+                context_budget,
                 expanded_entries: HashSet::new(),
             });
             app.active_tab = app.tabs.len() - 1;
