@@ -34,3 +34,4 @@
 - [Agent-Owned Schedules](design/agent_schedules.md)
 - [Agent State Admin Capability](design/agent_state_admin.md)
 - [Skills & Prompts](design/skills_and_prompts.md)
+- [Model Catalog Cache](design/model_catalog_cache.md)

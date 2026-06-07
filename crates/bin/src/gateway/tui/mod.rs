@@ -14,7 +14,7 @@ use chaz_core::backends::{BackendManager, ModelInfo};
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
 use chaz_core::gateway::{ApprovalExchange, Gateway};
-use chaz_core::model_catalog_cache::ModelCatalogCache;
+use chaz_core::model_catalog_cache::{ModelCatalogCache, cache_key as model_cache_key};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
@@ -1108,19 +1108,6 @@ pub(super) fn model_caps_badge(m: &ModelInfo) -> String {
         badge.push('S');
     }
     badge
-}
-
-/// Compose the cache key for this `BackendManager` instance. Including the
-/// backend names means changing the configured backends gives the picker a
-/// fresh cache slot rather than serving the previous config's catalog.
-fn model_cache_key(backend: &BackendManager) -> String {
-    let mut names: Vec<String> = backend.list_known_backends();
-    names.sort();
-    if names.is_empty() {
-        "backends-v2:".to_string()
-    } else {
-        format!("backends-v2:{}", names.join(","))
-    }
 }
 
 /// Set the picker into "loading" and spawn a background task to populate

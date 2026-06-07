@@ -597,6 +597,12 @@ async fn main() -> anyhow::Result<()> {
         info!(burst_budget = mc.burst_budget, "Applied multi_agent config");
     }
 
+    // Seed the context-window overlay from the persisted catalog cache so the
+    // per-turn budget respects each model's real window without any
+    // `context_window:` in YAML. No-op on a fresh machine until the model
+    // picker fetches a live catalog.
+    server.warm_catalog_windows().await;
+
     // Apply default_agents list: which agents auto-attach to new
     // sessions. First entry is the routing host. Set before any
     // session-creation path runs.

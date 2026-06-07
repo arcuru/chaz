@@ -1,9 +1,10 @@
 /// Manage all the backends for chaz.
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tracing::debug;
 
 use crate::{
@@ -92,27 +93,31 @@ pub trait BackendDispatch: Send + Sync {
 /// the picker derives capability badges from them.
 ///
 /// Derives `Serialize`/`Deserialize` so it doubles as the persisted
-/// catalog-cache shape (`model_catalog_cache`) — `#[serde(default)]` on the
-/// optional fields keeps older cached entries (and providers that omit a
-/// field) loading cleanly.
+/// catalog-cache shape (`model_catalog_cache`). Every optional field pairs
+/// `#[serde(default)]` (older entries / providers that omit a field load
+/// cleanly) with `skip_serializing_if` (absent values aren't written at all).
+/// The latter matters because the cache lives in an append-only eidetica DB:
+/// keeping the on-disk JSON to just the fields a model actually has holds
+/// down the bytes that accumulate there forever. See
+/// `docs/src/design/model_catalog_cache.md`.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_input: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_output: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_cache_read: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modalities: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_modalities: Vec<String>,
     /// Maximum context window in tokens, when known. Sourced from the live
     /// `/models` catalog (OpenRouter-style providers report it) or declared
     /// in YAML for providers whose catalog omits it. `None` means unknown —
     /// callers fall back to the configured `max_context_tokens` budget.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
 }
 
@@ -126,6 +131,15 @@ pub struct BackendManager {
     /// the backend config. Production code never sets this; constructed only
     /// via `BackendManager::with_mock`.
     mock: Option<Arc<dyn BackendDispatch>>,
+    /// Context windows sourced from the persisted live-catalog cache
+    /// (`model_catalog_cache`), keyed by the same model id space as
+    /// `list_known_models_with_info`. Consulted by `context_window` as a
+    /// fallback when the YAML-declared model carries no window — this is what
+    /// makes window-aware budgeting work with zero config. Shared via `Arc`
+    /// so per-session worker backends (cloned from the server's default
+    /// backend) observe the same overlay; `RwLock` so a startup warm — or a
+    /// later live `/models` refetch — can refresh it in place.
+    catalog_windows: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 /// A generic Message
@@ -184,6 +198,7 @@ impl BackendManager {
             backends: backends.as_ref().cloned().unwrap_or_default(),
             secrets,
             mock: None,
+            catalog_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -196,6 +211,7 @@ impl BackendManager {
             backends: Vec::new(),
             secrets,
             mock: Some(mock),
+            catalog_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -276,17 +292,44 @@ impl BackendManager {
         self.list_known_models().contains(&model.to_string())
     }
 
-    /// The configured context window (in tokens) for `model`, if known.
-    /// Resolves against the same catalog `list_known_models_with_info`
-    /// exposes, so multi-backend prefixed ids (`backend:model`) match.
-    /// `None` when the model is unknown or declares no window — callers fall
-    /// back to the configured `max_context_tokens`.
+    /// The context window (in tokens) for `model`, if known.
+    ///
+    /// Resolution order:
+    /// 1. The YAML-declared catalog (`list_known_models_with_info`) — an
+    ///    explicit `context_window:` in config is operator intent and wins.
+    /// 2. The live-catalog overlay loaded from `model_catalog_cache` via
+    ///    [`set_catalog_windows`] — the zero-config path, so a model whose
+    ///    window chaz learned from a `/models` fetch budgets correctly
+    ///    without anyone hand-editing config.
+    ///
+    /// Both use the same id space, so multi-backend prefixed ids
+    /// (`backend:model`) match in either tier. `None` when neither source
+    /// knows the model's window — callers fall back to the configured
+    /// `max_context_tokens`.
     pub fn context_window(&self, model: &str) -> Option<usize> {
-        self.list_known_models_with_info()
+        if let Some(w) = self
+            .list_known_models_with_info()
             .into_iter()
             .find(|info| info.id == model)
             .and_then(|info| info.context_window)
-            .map(|w| w as usize)
+        {
+            return Some(w as usize);
+        }
+        self.catalog_windows
+            .read()
+            .unwrap()
+            .get(model)
+            .map(|&w| w as usize)
+    }
+
+    /// Replace the live-catalog window overlay consulted by
+    /// [`context_window`]. Called once at startup (server warm) from the
+    /// persisted `model_catalog_cache`, and may be called again after a live
+    /// `/models` refetch. Because the overlay lives behind a shared `Arc`,
+    /// updates are visible to every clone of this manager — including the
+    /// per-session worker backends cloned at `register_session`.
+    pub fn set_catalog_windows(&self, windows: HashMap<String, u32>) {
+        *self.catalog_windows.write().unwrap() = windows;
     }
 
     /// Validate that the model name is valid
@@ -522,6 +565,29 @@ mod tests {
         assert_eq!(mgr.context_window("gpt-4"), Some(64_000));
         // Model exists but declares no window, and an unknown model: both None.
         assert_eq!(mgr.context_window("gpt-3.5"), None);
+        assert_eq!(mgr.context_window("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn context_window_falls_back_to_catalog_overlay() {
+        let secrets = empty_secrets().await;
+        let mut b = backend("openai", &["gpt-4", "gpt-3.5"]);
+        // gpt-4 declares a window in YAML; gpt-3.5 does not.
+        b.models.as_mut().unwrap()[0].context_window = Some(64_000);
+        let mgr = BackendManager::new(&Some(vec![b]), secrets);
+
+        // Overlay supplies windows the catalog learned at runtime, including
+        // one that also has a YAML value.
+        let mut overlay = HashMap::new();
+        overlay.insert("gpt-4".to_string(), 999_000);
+        overlay.insert("gpt-3.5".to_string(), 128_000);
+        mgr.set_catalog_windows(overlay);
+
+        // YAML wins over the overlay (explicit operator intent).
+        assert_eq!(mgr.context_window("gpt-4"), Some(64_000));
+        // No YAML window -> overlay fills it in (the zero-config path).
+        assert_eq!(mgr.context_window("gpt-3.5"), Some(128_000));
+        // Still None for a model neither source knows.
         assert_eq!(mgr.context_window("nope"), None);
     }
 

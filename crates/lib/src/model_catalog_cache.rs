@@ -7,13 +7,31 @@
 //! catalog (hundreds of models) without a network round-trip on every open.
 //! TTL is the caller's choice (see `CachedCatalog::is_fresh`).
 
-use crate::backends::ModelInfo;
+use crate::backends::{BackendManager, ModelInfo};
 use chrono::{DateTime, Utc};
 use eidetica::Database;
 use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const STORE: &str = "model_catalog";
+
+/// Canonical cache key for a backend set: `backends-v2:{sorted,names}`.
+///
+/// One key holds that backend-set's entire catalog as a single value, so a
+/// refetch logically overwrites rather than accumulating per-model keys. The
+/// `v2` prefix lets the shape evolve without colliding with older entries.
+/// Both the TUI picker (writer) and the runtime warm (reader) derive the key
+/// here so they always agree on it.
+pub fn cache_key(backend: &BackendManager) -> String {
+    let mut names = backend.list_known_backends();
+    names.sort();
+    if names.is_empty() {
+        "backends-v2:".to_string()
+    } else {
+        format!("backends-v2:{}", names.join(","))
+    }
+}
 
 #[derive(Clone)]
 pub struct ModelCatalogCache {
@@ -55,6 +73,25 @@ impl ModelCatalogCache {
         let store = txn.get_store::<DocStore>(STORE).await.ok()?;
         let raw = store.get_string(backend_id).await.ok()?;
         serde_json::from_str(&raw).ok()
+    }
+
+    /// Extract `(model id → context_window)` for the given backend set from
+    /// whatever catalog was last persisted, keeping only models that declare
+    /// a window. Empty if no catalog has been fetched yet on this machine.
+    ///
+    /// Freshness is deliberately *not* checked: a model's context window is a
+    /// near-static property (unlike pricing), and a slightly-stale window is
+    /// still far better than the model-blind static default it replaces.
+    /// Feeds [`BackendManager::set_catalog_windows`].
+    pub async fn context_windows(&self, backend: &BackendManager) -> HashMap<String, u32> {
+        let Some(catalog) = self.get(&cache_key(backend)).await else {
+            return HashMap::new();
+        };
+        catalog
+            .models
+            .into_iter()
+            .filter_map(|m| m.context_window.map(|w| (m.id, w)))
+            .collect()
     }
 
     /// Persist the catalog under `backend_id`, stamping `fetched_at = now`.
@@ -129,6 +166,48 @@ mod tests {
         assert_eq!(models[1].price_input, None);
         assert_eq!(models[1].context_window, None);
         assert!(models[1].input_modalities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_windows_extracts_declared_windows() {
+        use crate::backends::BackendManager;
+        use crate::config::{Backend, BackendType};
+        use crate::security::SecretStore;
+
+        let (_inst, _user, db) = fresh_db().await;
+        let cache = ModelCatalogCache::new(db.clone());
+
+        let mut b = Backend::new(BackendType::OpenAICompatible);
+        b.name = Some("openai".to_string());
+        let secrets = SecretStore::new(db).await;
+        let backend = BackendManager::new(&Some(vec![b]), secrets);
+
+        // No catalog persisted yet -> empty, never panics.
+        assert!(cache.context_windows(&backend).await.is_empty());
+
+        cache
+            .put(
+                &cache_key(&backend),
+                vec![
+                    ModelInfo {
+                        id: "has/window".into(),
+                        context_window: Some(200_000),
+                        ..Default::default()
+                    },
+                    ModelInfo {
+                        id: "no/window".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let windows = cache.context_windows(&backend).await;
+        // Only the model that declares a window appears.
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows.get("has/window"), Some(&200_000));
+        assert_eq!(windows.get("no/window"), None);
     }
 
     #[tokio::test]

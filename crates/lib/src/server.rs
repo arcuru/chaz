@@ -514,6 +514,30 @@ impl Server {
         &self.registry
     }
 
+    /// Load context windows from the persisted live-catalog cache into the
+    /// default backend's overlay, so window-aware budgeting works with zero
+    /// config (no `context_window:` hand-edited into YAML). Idempotent and
+    /// cheap — one DB read of the `chaz_peer` `model_catalog` store. Call once
+    /// at startup, before the gateway delivers messages. A miss (no catalog
+    /// fetched yet on this machine) is a no-op: the runtime keeps falling back
+    /// to the static budget until the picker populates the cache.
+    ///
+    /// Because the overlay is shared via `Arc`, this also reaches every
+    /// per-session worker backend cloned from `default_backend`.
+    pub async fn warm_catalog_windows(&self) {
+        let cache =
+            crate::model_catalog_cache::ModelCatalogCache::new(self.registry.chaz_peer().clone());
+        let windows = cache.context_windows(&self.default_backend).await;
+        let n = windows.len();
+        self.default_backend.set_catalog_windows(windows);
+        if n > 0 {
+            tracing::info!(
+                models = n,
+                "Warmed context-window overlay from catalog cache"
+            );
+        }
+    }
+
     pub fn registry_arc(&self) -> Arc<SessionRegistry> {
         self.registry.clone()
     }
