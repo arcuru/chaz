@@ -20,25 +20,14 @@ pub struct ModelCatalogCache {
     db: Database,
 }
 
+/// The persisted catalog: `ModelInfo` serializes directly (it derives serde),
+/// so there's no parallel "cached" shape to keep in sync. The on-disk JSON
+/// field names match `ModelInfo`, so entries written by the older
+/// `CachedModel` representation load unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCatalog {
     pub fetched_at: DateTime<Utc>,
-    pub models: Vec<CachedModel>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedModel {
-    pub id: String,
-    #[serde(default)]
-    pub price_input: Option<f64>,
-    #[serde(default)]
-    pub price_output: Option<f64>,
-    #[serde(default)]
-    pub price_cache_read: Option<f64>,
-    #[serde(default)]
-    pub input_modalities: Vec<String>,
-    #[serde(default)]
-    pub output_modalities: Vec<String>,
+    pub models: Vec<ModelInfo>,
 }
 
 impl CachedCatalog {
@@ -48,16 +37,6 @@ impl CachedCatalog {
 
     pub fn into_models(self) -> Vec<ModelInfo> {
         self.models
-            .into_iter()
-            .map(|m| ModelInfo {
-                id: m.id,
-                price_input: m.price_input,
-                price_output: m.price_output,
-                price_cache_read: m.price_cache_read,
-                input_modalities: m.input_modalities,
-                output_modalities: m.output_modalities,
-            })
-            .collect()
     }
 }
 
@@ -82,17 +61,7 @@ impl ModelCatalogCache {
     pub async fn put(&self, backend_id: &str, models: Vec<ModelInfo>) -> anyhow::Result<()> {
         let catalog = CachedCatalog {
             fetched_at: Utc::now(),
-            models: models
-                .into_iter()
-                .map(|m| CachedModel {
-                    id: m.id,
-                    price_input: m.price_input,
-                    price_output: m.price_output,
-                    price_cache_read: m.price_cache_read,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                })
-                .collect(),
+            models,
         };
         let json = serde_json::to_string(&catalog)?;
         let txn = self.db.new_transaction().await?;

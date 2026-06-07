@@ -90,13 +90,23 @@ pub trait BackendDispatch: Send + Sync {
 /// Modalities are the raw OpenRouter `architecture.input_modalities` /
 /// `output_modalities` strings (`text`, `image`, `audio`, `video`, …) —
 /// the picker derives capability badges from them.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// Derives `Serialize`/`Deserialize` so it doubles as the persisted
+/// catalog-cache shape (`model_catalog_cache`) — `#[serde(default)]` on the
+/// optional fields keeps older cached entries (and providers that omit a
+/// field) loading cleanly.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default)]
     pub price_input: Option<f64>,
+    #[serde(default)]
     pub price_output: Option<f64>,
+    #[serde(default)]
     pub price_cache_read: Option<f64>,
+    #[serde(default)]
     pub input_modalities: Vec<String>,
+    #[serde(default)]
     pub output_modalities: Vec<String>,
 }
 
