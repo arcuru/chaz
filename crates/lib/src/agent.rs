@@ -1,7 +1,60 @@
 use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
 use crate::grants::Grants;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Resolve an agent's or worker's effective system prompt: read each
+/// `system_prompt_files` entry in order, concatenate their contents, then
+/// append the inline `system_prompt`. This matches the documented assembly
+/// order — files first, the inline string last. `~` / `~/…` are expanded
+/// against the home directory.
+///
+/// A file that can't be read is logged at `warn` and skipped, so a stale or
+/// missing path degrades the prompt rather than failing agent construction.
+/// Called from the runtime `Agent` / `Worker` constructors, so the files are
+/// re-read whenever an agent is (re)built — including the per-message
+/// `hydrate_agent_from_db` path — keeping edits to the prompt files live
+/// without a restart.
+fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(files.len() + 1);
+    for path in files {
+        let resolved = expand_home(path);
+        match std::fs::read_to_string(&resolved) {
+            Ok(content) => {
+                let trimmed = content.trim_end();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            Err(e) => tracing::warn!(
+                path = %resolved.display(),
+                error = %e,
+                "system_prompt_files: skipping unreadable prompt file"
+            ),
+        }
+    }
+    if !inline.is_empty() {
+        parts.push(inline.to_string());
+    }
+    parts.join("\n\n")
+}
+
+/// Expand a leading `~` / `~/…` in `path` against the home directory.
+/// Returns `path` unchanged when there is no leading tilde or no home dir.
+fn expand_home(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if s == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
 
 /// Agent definition — first-class entity with persistent identity, sessions,
 /// schedules, memory, and a set of Worker templates this Agent can invoke.
@@ -67,16 +120,20 @@ pub struct Worker {
 
 impl Worker {
     pub fn from_worker_config(cfg: &WorkerConfig) -> Self {
+        let system_prompt_files: Vec<PathBuf> = cfg
+            .system_prompt_files
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         Worker {
             name: cfg.name.clone(),
-            system_prompt: cfg.system_prompt.clone().unwrap_or_default(),
-            system_prompt_files: cfg
-                .system_prompt_files
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            system_prompt: resolve_system_prompt(
+                &cfg.system_prompt.clone().unwrap_or_default(),
+                &system_prompt_files,
+            ),
+            system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
             max_iterations: cfg.max_iterations,
@@ -85,15 +142,16 @@ impl Worker {
     }
 
     pub fn from_worker_db_config(cfg: &crate::agent_db::WorkerDbConfig) -> Self {
+        let system_prompt_files: Vec<PathBuf> = cfg
+            .system_prompt_files
+            .clone()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         Worker {
             name: cfg.name.clone(),
-            system_prompt: cfg.system_prompt.clone(),
-            system_prompt_files: cfg
-                .system_prompt_files
-                .clone()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            system_prompt: resolve_system_prompt(&cfg.system_prompt, &system_prompt_files),
+            system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
             max_iterations: cfg.max_iterations,
@@ -121,16 +179,20 @@ impl Agent {
             .iter()
             .map(|wc| (wc.name.clone(), Worker::from_worker_config(wc)))
             .collect();
+        let system_prompt_files: Vec<PathBuf> = agent_config
+            .system_prompt_files
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         Agent {
             name: agent_config.name.clone(),
-            system_prompt: agent_config.system_prompt.clone().unwrap_or_default(),
-            system_prompt_files: agent_config
-                .system_prompt_files
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            system_prompt: resolve_system_prompt(
+                &agent_config.system_prompt.clone().unwrap_or_default(),
+                &system_prompt_files,
+            ),
+            system_prompt_files,
             default_model: agent_config.model.clone(),
             allowed_tools: agent_config.tools.clone(),
             workers,
@@ -151,15 +213,16 @@ impl Agent {
             .iter()
             .map(|wc| (wc.name.clone(), Worker::from_worker_db_config(wc)))
             .collect();
+        let system_prompt_files: Vec<PathBuf> = cfg
+            .system_prompt_files
+            .clone()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         Agent {
             name: name.to_string(),
-            system_prompt: cfg.system_prompt.clone(),
-            system_prompt_files: cfg
-                .system_prompt_files
-                .clone()
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            system_prompt: resolve_system_prompt(&cfg.system_prompt, &system_prompt_files),
+            system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
             workers,
@@ -414,6 +477,62 @@ impl AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn resolve_concatenates_files_then_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "FILE A\n").unwrap();
+        std::fs::write(&b, "FILE B\n").unwrap();
+
+        let out = resolve_system_prompt("INLINE", &[a, b]);
+        // Order: files in declared order, inline last; blank line between parts.
+        assert_eq!(out, "FILE A\n\nFILE B\n\nINLINE");
+    }
+
+    #[test]
+    fn resolve_inline_only_when_no_files() {
+        assert_eq!(resolve_system_prompt("just inline", &[]), "just inline");
+    }
+
+    #[test]
+    fn resolve_files_only_when_inline_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("p.md");
+        let mut fh = std::fs::File::create(&f).unwrap();
+        write!(fh, "ONLY FILE").unwrap();
+        assert_eq!(resolve_system_prompt("", &[f]), "ONLY FILE");
+    }
+
+    #[test]
+    fn resolve_skips_missing_file_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.md");
+        std::fs::write(&present, "PRESENT").unwrap();
+        let missing = dir.path().join("nope.md");
+
+        // Missing file is dropped; the rest still assembles.
+        let out = resolve_system_prompt("INLINE", &[missing, present]);
+        assert_eq!(out, "PRESENT\n\nINLINE");
+    }
+
+    #[test]
+    fn expand_home_rewrites_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir in test env");
+        assert_eq!(
+            expand_home(Path::new("~/brain/x.md")),
+            home.join("brain/x.md")
+        );
+        assert_eq!(expand_home(Path::new("~")), home);
+        // No tilde → untouched; mid-path tilde is not expanded.
+        assert_eq!(
+            expand_home(Path::new("/abs/p.md")),
+            PathBuf::from("/abs/p.md")
+        );
+        assert_eq!(expand_home(Path::new("/a/~/b")), PathBuf::from("/a/~/b"));
+    }
 
     fn make_agent(name: &str) -> Agent {
         Agent {

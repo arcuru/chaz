@@ -57,12 +57,12 @@ An agent's system prompt is built from two AgentDbConfig fields, both optional:
 
 | Field                 | Type          | Notes                                                                                                                      |
 | --------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `system_prompt_files` | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. Files are read at agent construction time, not per-turn.     |
+| `system_prompt_files` | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. Contents are read when the runtime agent is built — which happens every turn (see below). A path that can't be read is logged at `warn` and skipped, so a bad path degrades the prompt rather than failing the turn. |
 | `system_prompt`       | `String`      | Inline text appended after file content. The final prompt the LLM sees is `<concatenated file bodies>\n\n<system_prompt>`. |
 
 The runtime `Agent` holds the assembled text; ContextBuilder injects it as the first chat message. There is no per-session snapshot layer — the prompt is rebuilt fresh from `AgentDbConfig` on every turn, so a `/agent set` edit takes effect on the next message without any explicit refresh step.
 
-To pick up edits to a `system_prompt_files` path on disk, re-write the agent's config (e.g. `/agent set <ref> system_prompt_files <same-paths>`) — that triggers a re-read. A future `/agent reload` is on the roadmap for the no-op case.
+Editing the **contents** of a `system_prompt_files` path needs no refresh step — because the runtime agent is rebuilt from `AgentDbConfig` every turn, the files are re-read each message and edits take effect on the next one. Changing **which** files an agent uses (the path list itself) is stored in the agent DB, so it requires `/agent set <ref> system_prompt_files <paths>` (or re-bootstrapping a fresh DB) rather than only editing the YAML — `bootstrap_from_config` preserves an existing agent DB and treats YAML as a first-boot template.
 
 ### Editing the system prompt
 
