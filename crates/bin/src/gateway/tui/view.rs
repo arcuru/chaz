@@ -617,17 +617,20 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
             )
         }
     };
-    // Current context occupancy — distinct from `usage_segment`'s lifetime
-    // totals. Numerator is the most recent turn's `context_tokens` (the input
-    // size of that turn's final LLM call = how full the window was), NOT
-    // `usage.prompt_tokens`, which sums every ReAct iteration and so overshoots
-    // the window on multi-tool-call turns. Hidden until a turn carries it, or
-    // when no budget is known.
+    // Context occupancy for the *primary* (host) agent only — `tab.context_budget`
+    // is the host's window, and in a multi-agent room another agent's turn may
+    // run a different model/window, so mixing them would be incoherent. The
+    // `usage_segment` above is unaffected: cost/tokens still sum the whole
+    // session. Numerator is the host's most recent turn's `context_tokens` (the
+    // input size of that turn's final LLM call = how full the window was), NOT
+    // `usage.prompt_tokens`, which sums every ReAct iteration and overshoots.
+    // Hidden until the host has taken such a turn, or when no budget is known.
     let ctx_segment = {
         let last_ctx = tab
             .entries
             .iter()
             .rev()
+            .filter(|e| e.sender == current_agent)
             .find_map(|e| e.metadata.as_ref().and_then(|m| m.context_tokens));
         match last_ctx.and_then(|p| ctx_pct(p, tab.context_budget)) {
             Some(pct) => format!(" | ctx {pct}%"),
