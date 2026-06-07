@@ -27,7 +27,7 @@ chaz --config config.yaml "what's on my plate today?"
 |   The current time is 10:30 AM UTC.                 |
 |                                                     |
 +-----------------------------------------------------+
-| tui | agent: default | messages: 2 | /help          |
+| tui | agent: default | model: gpt-5 | ctx 6% | 1.5k/0.2k tok • 0% cached |
 +--[ > ]----------------------------------------------+
 | type here...                                        |
 +-----------------------------------------------------+
@@ -37,7 +37,15 @@ The TUI has four main pieces:
 
 1. **Tab bar** — one tab per open session. Click to switch, `[x]` to close, or use `Ctrl+PageUp`/`Ctrl+PageDown`. Closing the last tab is refused (the TUI always shows at least one session).
 2. **Messages area** — conversation history with all entry types
-3. **Status bar** — current session, agent, message count, `/help` hint
+3. **Status bar** — session name, then the agent and model. A single-agent
+   session shows `agent: <name> | model: <model>`; a multi-agent session lists
+   the whole roster with the host marked `*` and each agent's model
+   (`agents: alpha*→opus, beta→haiku`), collapsing to a count if it would
+   overflow. Then `ctx N%` — how full the **primary (host) agent's** context
+   window is, based on its most recent turn — followed by the session's
+   running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
+   • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
+   when those modes are on.
 4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight.
 
 When prior sessions exist, the TUI opens straight into the session picker on launch so you choose which one to resume (or pick the "New session" row). A truly fresh state directory drops directly into the default `tui` session.

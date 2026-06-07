@@ -92,6 +92,26 @@ ever required in config.
   gets warmed and updated) — not a caller's freshly-built manager, whose overlay
   would be empty.
 
+### The `ctx N%` gauge
+
+The status bar shows context occupancy as `ctx N%`. Two subtleties make it
+honest:
+
+- **Numerator is a point-in-time high-water mark, not a running sum.** It uses
+  `ResponseMetadata.context_tokens` — the input token count of the turn's
+  *final* LLM call — set by `MetadataAccumulator` (it overwrites this per call
+  while it *sums* `usage.prompt_tokens` across ReAct iterations). Dividing the
+  summed `prompt_tokens` would overshoot the window badly on multi-tool-call
+  turns; `context_tokens` is how full the window actually was. Entries written
+  before this field existed simply lack it, so the gauge hides until the next
+  turn.
+- **Scoped to the primary (host) agent.** Both the numerator (the host's most
+  recent turn) and the denominator (`tab.context_budget`, the host's window)
+  belong to the same agent, so the percentage is coherent even in a multi-agent
+  room where other agents run different-window models. The status bar's
+  token/cost totals are the opposite — summed across *all* agents in the
+  session — because that's a session-wide cost figure, not a per-window gauge.
+
 A fresh machine that has never used or picked a model is a clean no-op: the
 overlay stays empty and the runtime uses the static budget until the first use
 or selection populates the store; the next startup warms from it.
