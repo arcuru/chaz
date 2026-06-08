@@ -64,8 +64,15 @@
         # Use the toolchain with the crane helper functions
         craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
 
-        # Source filtering — only Rust-relevant files
-        src = craneLib.cleanCargoSource (craneLib.path ./.);
+        # Source filtering — Rust/Cargo files, plus `.snap` fixtures that
+        # `cleanCargoSource` would otherwise drop. Without the snapshots, insta
+        # has no baseline in the sandbox and every widget snapshot test fails as
+        # a "new snapshot" (only `+new results`, no `-old`).
+        src = lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          filter = path: type:
+            (lib.hasSuffix ".snap" path) || (craneLib.filterCargoSources path type);
+        };
 
         # Common arguments
         commonArgs = {
