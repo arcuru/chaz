@@ -129,13 +129,15 @@ struct ToolContext {
     profile: ToolProfile,                        // how tool defs are presented
     session: Arc<Mutex<Session>>,                // for tools that write entries
     active_extensions: HashSet<String>,          // per-session active-set filter
-    grants: Grants,                              // resolved per-call grants
-    agent_grants: HashMap<String, Grants>,       // per-tool overlays from agent config
+    grants: Grants,                              // resolved per-call grants (output of resolve_call_grants)
+    session_capabilities: Grants,                // session-wide ceiling (from SessionMeta)
+    agent_capabilities: Grants,                  // agent-wide ceiling (from agent config)
+    agent_grants: HashMap<String, Grants>,       // per-tool overrides from agent config
     host: Arc<dyn ToolHost>,                     // sandboxed capability boundary
 }
 ```
 
-Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants()` only for introspection (e.g., `describe_tool` listing available capabilities). `active_extensions` is built by `Server::active_extensions_for` and is what `ScopedTools` consults to hide tools from extensions disabled in this session.
+Before each tool call the runtime calls `ctx.resolve_call_grants(&policy.grants, tool_name)`, which attenuates the tool's policy grant through the session ceiling, the agent-wide cap, and the per-tool override (most-restrictive-wins; see [`Grants::attenuate`](https://github.com/arcuru/chaz/blob/main/crates/lib/src/grants.rs)), and stores the result in `grants`. Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants()` only for introspection (e.g., `describe_tool` listing available capabilities). `active_extensions` is built by `Server::active_extensions_for` and is what `ScopedTools` consults to hide tools from extensions disabled in this session.
 
 ## Adding a New Tool
 

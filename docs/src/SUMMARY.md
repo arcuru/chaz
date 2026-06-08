@@ -29,6 +29,7 @@
 
 # Design Documents
 
+- [Capability Tiers](design/capability_tiers.md)
 - [Session Messaging Primitive](design/session_messaging.md)
 - [Autonomous Agents in Shared Sessions](design/autonomous_agents.md)
 - [Agent-Owned Schedules](design/agent_schedules.md)

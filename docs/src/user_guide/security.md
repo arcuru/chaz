@@ -23,13 +23,13 @@ flowchart TD
 
 The layers in plain words:
 
-| Layer                    | What it guards against                                         | Where it's configured                              |
-| ------------------------ | -------------------------------------------------------------- | -------------------------------------------------- |
-| **Rate limiting**        | Runaway loops, denial-of-wallet on paid tools                  | `tool_policies.<tool>.rate_limit`                  |
-| **Approval**             | A misbehaving model invoking dangerous tools without oversight | `auto_approved_tools` + `tool_policies.*.approval` |
-| **Capability grants**    | A correctly-invoked tool reaching resources it shouldn't       | `tool_policies.<tool>.grants` (shell/network/fs)   |
-| **Leak detector**        | Tool output exfiltrating secrets back into the LLM context     | `leak_policy: redact \| block`                     |
-| **Sanitizer + XML wrap** | Tool output performing prompt-injection against the LLM        | Always-on; logged at `warn`                        |
+| Layer                    | What it guards against                                         | Where it's configured                                                                                                  |
+| ------------------------ | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Rate limiting**        | Runaway loops, denial-of-wallet on paid tools                  | `tool_policies.<tool>.rate_limit`                                                                                      |
+| **Approval**             | A misbehaving model invoking dangerous tools without oversight | `auto_approved_tools` + `tool_policies.*.approval`                                                                     |
+| **Capability grants**    | A correctly-invoked tool reaching resources it shouldn't       | `tool_policies.<tool>.grants`, plus session/agent ceilings (see [Capability tiers](#capability-tiers-and-attenuation)) |
+| **Leak detector**        | Tool output exfiltrating secrets back into the LLM context     | `leak_policy: redact \| block`                                                                                         |
+| **Sanitizer + XML wrap** | Tool output performing prompt-injection against the LLM        | Always-on; logged at `warn`                                                                                            |
 
 Two more orthogonal layers wrap everything:
 
@@ -73,6 +73,25 @@ In the TUI, approval is an inline y/n/a prompt. In Matrix, unapproved tools time
 ## Capability Grants
 
 Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure _what_ each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.
+
+### Capability tiers and attenuation
+
+The same grant shape (`shell` / `network` / `fs`) is set at **four tiers**. They are intersected at every tool call, and **each inner tier can only subtract authority — never widen it** ("most-restrictive-wins"):
+
+```
+effective = tool policy  ∩  session ceiling  ∩  agent capabilities  ∩  per-tool override
+```
+
+| Tier                   | Scope                                                  | Config key                                                  |
+| ---------------------- | ------------------------------------------------------ | ----------------------------------------------------------- |
+| **Tool policy**        | The baseline grant for a tool, across all agents       | `security.tool_policies.<tool>.grants`                      |
+| **Session ceiling**    | Every tool call by every agent in one session          | `SessionMeta.capabilities` (per-session, on the session DB) |
+| **Agent capabilities** | Every tool call this agent makes, across all its tools | `agents[].capabilities` (the agent-wide chokepoint)         |
+| **Per-tool override**  | One tool, for one agent                                | `agents[].grants.<tool>`                                    |
+
+The key property: the **session ceiling** and **agent capabilities** are chokepoints. The filesystem is reachable through both `shell` and `write_file`; the network through both `web_fetch` and `shell` (`curl`). Setting `allow_private: false` on a single tool doesn't stop another tool reaching the resource — but a session or agent ceiling binds _every_ tool that can reach it at once. That is how you express "this agent has no network" (a `private` profile) or "this is a confined session."
+
+Within each grant, attenuation means: **allowlists intersect** (an empty allowlist is permissive, so it narrows to whatever the other tier specifies), **denylists union**, and booleans like `allow_private` are AND-ed. A narrower tier clearing a `deny` entry cannot un-deny it — the union keeps it.
 
 ### Shell grants
 
@@ -126,7 +145,7 @@ Private IP addresses (RFC 1918, loopback, link-local) are always blocked unless 
 
 ### Filesystem grants
 
-File read/write path restrictions are configured but enforcement is a stub (not yet active):
+File read/write paths are bounded to a set of allowed roots. An absent or empty list is permissive; otherwise a path must resolve to a location at or under one of the roots:
 
 ```yaml
 security:
@@ -140,6 +159,30 @@ security:
         fs:
           allow_write: ["/tmp", "/home/user/projects"]
 ```
+
+Paths are normalized lexically before the check — `.`/`..` are resolved and the match is on path boundaries, so `/work` permits `/work/sub/x` but **not** `/workother/x` or `/work/../etc/passwd`.
+
+> This is **advisory** confinement: symlinks are not followed, so a symlink under an allowed root can still point outside it. True confinement (a process that physically cannot see other paths) is the job of a sandboxed host — bubblewrap mounts or WASI preopens — which is planned. Until then, treat fs grants as a guardrail against accidental writes, not a boundary against a hostile tool.
+
+### Agent and session ceilings
+
+Set an agent-wide ceiling with `capabilities` on the agent — it attenuates every tool the agent uses at once. This is how you build a reusable profile like "no network":
+
+```yaml
+agents:
+  - name: private
+    tools: ["shell", "read_file", "remember", "recall"]
+    capabilities:
+      network:
+        endpoints: [] # paired with the session/tool layers; see note
+        allow_private: false
+      fs:
+        allow_write: ["/work"] # binds shell AND write_file at once
+```
+
+The session ceiling lives on the session itself (`SessionMeta.capabilities`) rather than in `config.yaml`, so it travels with the session and applies to whichever agents run in it.
+
+> **Expressing "no network at all":** today an empty endpoint allowlist means _allow-all_ at the enforcement layer (the historical default), so an empty list does **not** yet mean deny-all. A hard "no egress" ceiling is the job of the sandboxed host (a network namespace with no interface) and lands with that work. Until then, restrict egress positively — list only the endpoints an agent may reach — rather than relying on an empty list to deny everything.
 
 ## Leak Detection
 
@@ -200,6 +243,7 @@ API keys are stored in eidetica's SecretStore and resolved at the HTTP client bo
 ## Agent-Level Controls
 
 - **Tool narrowing**: Each Agent definition can restrict available tools via `tools:` (supports glob patterns like `"filesystem__*"`)
+- **Capability ceiling**: `capabilities:` on an Agent attenuates _every_ tool call it makes (see [Agent and session ceilings](#agent-and-session-ceilings)) — the chokepoint for profiles like a no-network `private` agent or a write-confined `researcher`
 - **Transitive narrowing**: Spawned children (peer Agents via `spawn_agent`, Workers via `spawn_worker`) can never have more tools than their parent
 - **Worker scoping**: Workers are declared per-Agent under `workers:`. An Agent can only invoke a Worker that's declared under itself — no global Worker registry
 - **Depth limiting**: Spawn depth is capped to prevent infinite recursion
@@ -264,6 +308,23 @@ What just happened, layer by layer:
 3. If approved, the `ShellGrant` allow/deny lists run; `rm -rf /` is denied even if the user said yes.
 4. `web_fetch` can only hit `https://api.example.com/v1/*` with `GET`. Private IPs are blocked (the default), so the LLM can't reach `169.254.169.254` to scrape cloud metadata.
 5. Any output is scanned for secret patterns; matches are redacted (set `leak_policy: block` to drop the entire result).
+
+### 2b. Add an agent-wide ceiling
+
+The `tool_policies` above bound each tool individually. To guarantee `researcher` can _only_ write under `/work` no matter which tool it reaches the filesystem with — `shell` (via `tee`, `>`) or `write_file` — add an agent-wide ceiling:
+
+```yaml
+agents:
+  - name: researcher
+    # ...as above...
+    capabilities:
+      fs:
+        allow_write: ["/work"]
+```
+
+Now both the `shell` and `write_file` paths are attenuated by `allow_write: ["/work"]` at once. A per-tool `grants.write_file.fs.allow_write: ["/work/out"]` would narrow it _further_ (to `/work/out`), but nothing — not a per-tool grant, not a clever shell redirect — can widen it back beyond `/work`. That is the attenuation guarantee: inner tiers only subtract.
+
+If the same agent runs in a session that carries its own `capabilities` ceiling, that intersects on top — the session can tighten `researcher`, never loosen it.
 
 ### 3. Watch it work
 

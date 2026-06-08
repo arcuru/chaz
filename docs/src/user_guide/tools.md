@@ -271,14 +271,14 @@ Tools access system resources through a **ToolHost** — a sandboxed capability 
 
 Today there are three grant kinds, declared per-tool under `security.tool_policies.<tool>.grants`:
 
-| Grant     | Field                        | What it does                                                                             |
-| --------- | ---------------------------- | ---------------------------------------------------------------------------------------- |
-| `shell`   | `allow` / `deny`             | Command-prefix allowlist + denylist. Empty `allow` = allow-all. `deny` always wins.      |
-| `network` | `endpoints`                  | List of `{ host, path_prefix?, methods? }` patterns. Empty list = allow any public host. |
-| `network` | `allow_private`              | If `false` (default), private IPs and internal hostnames are blocked even when allowed.  |
-| `fs`      | `allow_read` / `allow_write` | Path allowlists. **Schema stub** — accepted in config today, enforcement still pending.  |
+| Grant     | Field                        | What it does                                                                                                               |
+| --------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `shell`   | `allow` / `deny`             | Command-prefix allowlist + denylist. Empty `allow` = allow-all. `deny` always wins.                                        |
+| `network` | `endpoints`                  | List of `{ host, path_prefix?, methods? }` patterns. Empty list = allow any public host.                                   |
+| `network` | `allow_private`              | If `false` (default), private IPs and internal hostnames are blocked even when allowed.                                    |
+| `fs`      | `allow_read` / `allow_write` | Path-prefix allowlists. Empty = allow-all; otherwise paths must resolve at/under a root. Advisory (symlinks not followed). |
 
-Resolution: the tool's `default_policy()` ships baseline grants; `security.tool_policies` overrides per-tool at config load; per-agent grants on `agents:` overlay last, kind-by-kind ([`Grants::merge_over`](https://github.com/arcuru/chaz/blob/vibe/crates/lib/src/grants.rs) — the agent layer replaces a kind only when it explicitly sets one).
+Resolution composes **four tiers** by attenuation (most-restrictive-wins, never widening): the tool policy grant ∩ the session ceiling (`SessionMeta.capabilities`) ∩ the agent-wide cap (`agents[].capabilities`) ∩ the per-tool agent override (`agents[].grants.<tool>`). See [`Grants::attenuate`](https://github.com/arcuru/chaz/blob/main/crates/lib/src/grants.rs) and the [Capability tiers](security.md#capability-tiers-and-attenuation) section: allowlists intersect (empty = permissive), denylists union, booleans AND. An inner tier can only subtract authority.
 
 #### Worked example: lock `shell` down to `git` and `ls`, deny everything else
 
