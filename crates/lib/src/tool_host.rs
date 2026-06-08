@@ -273,27 +273,77 @@ fn extract_command_binaries(command: &str) -> Vec<String> {
     binaries
 }
 
-/// Read a file with optional filesystem grant enforcement.
-async fn exec_file_read(path: &str, _grants: &Grants) -> Result<CapabilityResult, ToolError> {
-    // FsGrant enforcement is a stub — not yet wired in config. The host
-    // boundary is here so we can add it without changing tool code.
+/// Read a file, enforcing the `FsGrant.allow_read` bound if one is configured.
+async fn exec_file_read(path: &str, grants: &Grants) -> Result<CapabilityResult, ToolError> {
+    let allow = grants.fs.as_ref().map(|f| f.allow_read.as_slice());
+    check_fs_path(path, allow, "read")?;
     let content = tokio::fs::read(path)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to read file: {e}")))?;
     Ok(CapabilityResult::FileRead(content))
 }
 
-/// Write a file with optional filesystem grant enforcement.
+/// Write a file, enforcing the `FsGrant.allow_write` bound if one is configured.
 async fn exec_file_write(
     path: &str,
     content: &str,
-    _grants: &Grants,
+    grants: &Grants,
 ) -> Result<CapabilityResult, ToolError> {
-    // FsGrant enforcement is a stub — not yet wired in config.
+    let allow = grants.fs.as_ref().map(|f| f.allow_write.as_slice());
+    check_fs_path(path, allow, "write")?;
     tokio::fs::write(path, content)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to write file: {e}")))?;
     Ok(CapabilityResult::FileWrite)
+}
+
+/// Check a filesystem path against an allowlist of permitted roots.
+///
+/// `None` or an empty allowlist means allow-all (permissive default, matching
+/// the other capability kinds). Otherwise the path must lexically resolve to a
+/// location at or under one of the allowed roots.
+///
+/// This is **advisory** confinement: paths are normalized lexically (resolving
+/// `.`/`..`) but symlinks are not followed, so a symlink under an allowed root
+/// can still point outside it. True confinement is the sandboxed host's job
+/// (mounts / WASI preopens); this is the cheap first pass.
+pub fn check_fs_path(path: &str, allow: Option<&[String]>, op: &str) -> Result<(), String> {
+    let allow = match allow {
+        Some(a) if !a.is_empty() => a,
+        _ => return Ok(()), // no allowlist configured → permissive
+    };
+    let target = normalize_lexical(std::path::Path::new(path));
+    for root in allow {
+        let root_norm = normalize_lexical(std::path::Path::new(root));
+        if target == root_norm || target.starts_with(&root_norm) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "Filesystem {op} of '{path}' is outside the allowed paths"
+    ))
+}
+
+/// Lexically normalize a path: drop `.`, resolve `..` against prior components,
+/// without touching the filesystem. Component-wise so `starts_with` is a true
+/// path-boundary check (`/work` does not match `/workother`).
+fn normalize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop a normal segment; keep `..` only when it can't be resolved
+                // (leading `..` on a relative path).
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Execute an HTTP request with network grant enforcement.
@@ -384,6 +434,39 @@ fn build_network_policy(grant: Option<&NetworkGrant>) -> crate::security::Networ
 mod tests {
     use super::*;
     use crate::grants::{EndpointPattern, ShellGrant};
+
+    // ── Filesystem grant checks ──
+
+    #[test]
+    fn test_fs_no_allowlist_is_permissive() {
+        assert!(check_fs_path("/etc/passwd", None, "read").is_ok());
+        assert!(check_fs_path("/etc/passwd", Some(&[]), "read").is_ok());
+    }
+
+    #[test]
+    fn test_fs_within_allowed_root_ok() {
+        let allow = vec!["/work".to_string()];
+        assert!(check_fs_path("/work/file.txt", Some(&allow), "write").is_ok());
+        assert!(check_fs_path("/work/sub/dir/x", Some(&allow), "write").is_ok());
+        assert!(check_fs_path("/work", Some(&allow), "write").is_ok());
+    }
+
+    #[test]
+    fn test_fs_outside_allowed_root_denied() {
+        let allow = vec!["/work".to_string()];
+        assert!(check_fs_path("/etc/passwd", Some(&allow), "read").is_err());
+        // Prefix-but-not-path-boundary must not match.
+        assert!(check_fs_path("/workother/x", Some(&allow), "read").is_err());
+    }
+
+    #[test]
+    fn test_fs_parent_traversal_resolved() {
+        let allow = vec!["/work".to_string()];
+        // `..` escapes the allowed root → denied.
+        assert!(check_fs_path("/work/../etc/passwd", Some(&allow), "read").is_err());
+        // `..` that stays within is fine.
+        assert!(check_fs_path("/work/sub/../file", Some(&allow), "write").is_ok());
+    }
 
     // ── Shell grant checks ──
 

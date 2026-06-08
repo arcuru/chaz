@@ -83,8 +83,13 @@ pub struct Agent {
     pub tool_profile: Option<String>,
     /// Override context token limit for this agent (None = use global default).
     pub max_context_tokens: Option<usize>,
-    /// Per-tool grant overrides. Merged per-kind over the config-level grants
-    /// at tool-call time (see `Grants::merge_over`).
+    /// Agent-wide capability ceiling. Attenuates every tool call this agent
+    /// makes — the single chokepoint for agent profiles like "no network" or
+    /// "no fs-write", binding all tools that can reach a resource at once.
+    pub capabilities: Grants,
+    /// Per-tool grant overrides. Attenuate the config-level grants and the
+    /// agent-wide `capabilities` at tool-call time — most-restrictive-wins
+    /// (see `Grants::attenuate`).
     pub grants: HashMap<String, Grants>,
 }
 
@@ -201,6 +206,7 @@ impl Agent {
             presets: agent_config.presets.clone().unwrap_or_default(),
             tool_profile: agent_config.tool_profile.clone(),
             max_context_tokens: agent_config.max_context_tokens,
+            capabilities: agent_config.capabilities.clone().unwrap_or_default(),
             grants: agent_config.grants.clone().unwrap_or_default(),
         }
     }
@@ -236,6 +242,7 @@ impl Agent {
             presets: cfg.presets.clone(),
             tool_profile: cfg.tool_profile.clone(),
             max_context_tokens: cfg.max_context_tokens,
+            capabilities: cfg.capabilities.clone(),
             grants: cfg.grants.clone(),
         }
     }
@@ -368,6 +375,7 @@ impl AgentRegistry {
                 presets: HashMap::new(),
                 tool_profile: None,
                 max_context_tokens: None,
+                capabilities: Grants::default(),
                 grants: HashMap::new(),
             }]),
         }
@@ -389,6 +397,7 @@ impl AgentRegistry {
             presets: HashMap::new(),
             tool_profile: None,
             max_context_tokens: None,
+            capabilities: Grants::default(),
             grants: HashMap::new(),
         })
     }
@@ -552,6 +561,7 @@ mod tests {
             presets: HashMap::new(),
             tool_profile: None,
             max_context_tokens: None,
+            capabilities: Grants::default(),
             grants: HashMap::new(),
         }
     }

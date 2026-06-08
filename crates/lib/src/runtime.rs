@@ -739,11 +739,11 @@ pub async fn execute(
 
                             // --- Security: execute with timeout ---
                             let timeout = policy.timeout_duration();
-                            // Build per-call grants: config-level policy grants, with
-                            // per-agent overlay merged on top (per-kind replacement).
-                            let call_grants = policy
-                                .grants
-                                .merge_over(tool_ctx.agent_grants.get(&call.name));
+                            // Build per-call grants by attenuating the tool's
+                            // policy grant through the agent-wide cap and the
+                            // per-tool override (most-restrictive-wins).
+                            let call_grants =
+                                tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             let mut call_ctx = tool_ctx.clone();
                             call_ctx.grants = call_grants;
                             let exec_result =
@@ -1250,6 +1250,8 @@ mod tests {
             profile: ToolProfile::default(),
             session,
             grants: Default::default(),
+            session_capabilities: Default::default(),
+            agent_capabilities: Default::default(),
             agent_grants: Default::default(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),

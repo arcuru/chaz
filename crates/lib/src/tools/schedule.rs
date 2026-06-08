@@ -740,6 +740,8 @@ mod tests {
             profile: ToolProfile::default(),
             session,
             grants: crate::grants::Grants::default(),
+            session_capabilities: crate::grants::Grants::default(),
+            agent_capabilities: crate::grants::Grants::default(),
             agent_grants: std::collections::HashMap::new(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),

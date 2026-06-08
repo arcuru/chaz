@@ -375,6 +375,7 @@ async fn agent_set_system_prompt_refreshes_blob_ref_and_hydrates() {
         presets: std::collections::HashMap::new(),
         tool_profile: None,
         max_context_tokens: None,
+        capabilities: crate::grants::Grants::default(),
         grants: std::collections::HashMap::new(),
     };
     let hydrated = server.hydrate_agent_from_db(input).await;
@@ -1090,7 +1091,10 @@ async fn burst_clear_resets_override_to_none() {
     let cmd = Command::AgentSetBurst(None);
     match dispatch(cmd, &ctx).await {
         CommandOutcome::Text(msg) => {
-            assert!(msg.contains("Cleared") || msg.contains("default"), "got {msg}");
+            assert!(
+                msg.contains("Cleared") || msg.contains("default"),
+                "got {msg}"
+            );
         }
         CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
         _ => panic!("expected Text"),
@@ -1126,7 +1130,10 @@ async fn agent_room_shows_session_override_when_set() {
 
     match dispatch(Command::AgentRoom, &ctx).await {
         CommandOutcome::Text(msg) => {
-            assert!(msg.contains("session override"), "expected session override tag: {msg}");
+            assert!(
+                msg.contains("session override"),
+                "expected session override tag: {msg}"
+            );
             assert!(msg.contains("7"), "expected burst value 7: {msg}");
         }
         CommandOutcome::Error(e) => panic!("unexpected error: {e}"),

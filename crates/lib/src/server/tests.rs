@@ -159,6 +159,7 @@ async fn hydrate_picks_up_db_config_edits() {
         presets: HashMap::new(),
         tool_profile: None,
         max_context_tokens: None,
+        capabilities: crate::grants::Grants::default(),
         grants: HashMap::new(),
     };
     server.agents().upsert(stale.clone());
@@ -220,6 +221,7 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
         presets: HashMap::new(),
         tool_profile: None,
         max_context_tokens: None,
+        capabilities: crate::grants::Grants::default(),
         grants: HashMap::new(),
     };
     let result = server.hydrate_agent_from_db(input.clone()).await;
@@ -284,6 +286,7 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
         presets: HashMap::new(),
         tool_profile: None,
         max_context_tokens: None,
+        capabilities: crate::grants::Grants::default(),
         grants: HashMap::new(),
     };
     let hydrated = server.hydrate_agent_from_db(input.clone()).await;
@@ -376,6 +379,7 @@ async fn reload_config_for_rereads_yaml_from_disk() {
         presets: HashMap::new(),
         tool_profile: None,
         max_context_tokens: None,
+        capabilities: crate::grants::Grants::default(),
         grants: HashMap::new(),
     };
     let hydrated = server.hydrate_agent_from_db(input).await;
@@ -914,6 +918,7 @@ fn register_alpha_agent_runtime(server: &Server) {
         presets: HashMap::new(),
         tool_profile: None,
         max_context_tokens: None,
+        capabilities: crate::grants::Grants::default(),
         grants: HashMap::new(),
     });
 }

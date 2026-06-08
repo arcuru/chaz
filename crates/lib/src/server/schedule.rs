@@ -411,6 +411,7 @@ impl Server {
 
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
+        let agent_capabilities = agent.capabilities.clone();
         let agent_grants = agent.grants.clone();
         let max_call_depth = agent.max_iterations as usize;
         let max_context_tokens = agent.max_context_tokens;
@@ -433,6 +434,7 @@ impl Server {
             session_db.clone(),
         )
         .await;
+        let session_capabilities = session.read_meta().await.capabilities;
         let session = Arc::new(tokio::sync::Mutex::new(session));
 
         let tool_ctx = ToolContext {
@@ -443,6 +445,8 @@ impl Server {
             profile,
             session: session.clone(),
             grants: Default::default(),
+            session_capabilities,
+            agent_capabilities,
             agent_grants,
             host: self.host.clone(),
             active_extensions: active_extensions.clone(),

@@ -1278,9 +1278,7 @@ impl Server {
             if burst >= budget {
                 info!(
                     session_db_id,
-                    burst,
-                    budget,
-                    "Agent turn budget exhausted — suppressing agent→agent wake"
+                    burst, budget, "Agent turn budget exhausted — suppressing agent→agent wake"
                 );
                 None
             } else {
@@ -1403,6 +1401,8 @@ impl Server {
         let system_prompt = agent.system_prompt.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
+        let session_capabilities = session.read_meta().await.capabilities;
+        let agent_capabilities = agent.capabilities.clone();
         let agent_grants = agent.grants.clone();
         let max_call_depth = if spawn.max_call_depth > 0 {
             spawn.max_call_depth
@@ -1484,6 +1484,8 @@ impl Server {
                 profile,
                 session: session.clone(),
                 grants: Default::default(),
+                session_capabilities,
+                agent_capabilities,
                 agent_grants,
                 host: host.clone(),
                 active_extensions: active_extensions.clone(),

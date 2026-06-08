@@ -274,12 +274,20 @@ pub struct ToolContext {
     /// through `runtime::execute` from the calling agent worker.
     pub active_extensions: std::collections::HashSet<String>,
     /// Resolved capability grants for the tool currently executing.
-    /// Populated by the runtime before each call with config grants merged
-    /// with per-agent overlays (see `Grants::merge_over`).
+    /// Populated by the runtime before each call with the config grants
+    /// attenuated by the per-agent grant (see `Grants::attenuate`).
     pub grants: Grants,
+    /// Session-wide capability ceiling from the session's meta. The outermost
+    /// tier: attenuates every tool call by every agent in the session, above
+    /// the agent-wide cap. "Private, no-network session" lives here.
+    pub session_capabilities: Grants,
+    /// Agent-wide capability ceiling from the running agent's config.
+    /// The runtime attenuates *every* tool call by this, regardless of which
+    /// tool reaches the resource — the agent-level chokepoint.
+    pub agent_capabilities: Grants,
     /// Per-tool grant overrides from the running agent's config.
-    /// The runtime merges the grants for the currently-executing tool over
-    /// the tool's resolved policy grants when building each call's `grants`.
+    /// The runtime attenuates the tool's resolved policy grants by the grant
+    /// for the currently-executing tool when building each call's `grants`.
     pub agent_grants: HashMap<String, Grants>,
     /// The execution host for sandboxed capability requests.
     /// Tools go through the host for system access (shell, HTTP, filesystem)
@@ -304,6 +312,19 @@ impl ToolContext {
     /// Read the resolved capability grants for the currently-executing tool.
     pub fn grants(&self) -> &Grants {
         &self.grants
+    }
+
+    /// Resolve the effective grants for a call to `tool_name`, given the tool's
+    /// config-level policy grant. Attenuates through every tier
+    /// (most-restrictive-wins, never widens): the policy grant is the ceiling,
+    /// narrowed by the session-wide ceiling, then the agent-wide capability
+    /// cap, then the per-tool agent override. The runtime calls this before
+    /// each tool invocation.
+    pub fn resolve_call_grants(&self, policy_grants: &Grants, tool_name: &str) -> Grants {
+        policy_grants
+            .attenuate(Some(&self.session_capabilities))
+            .attenuate(Some(&self.agent_capabilities))
+            .attenuate(self.agent_grants.get(tool_name))
     }
 
     /// Access the execution host for sandboxed capability requests.

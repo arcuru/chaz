@@ -252,10 +252,16 @@ pub struct AgentConfig {
     pub tool_profile: Option<String>,
     /// Override context token limit for this agent
     pub max_context_tokens: Option<usize>,
-    /// Per-tool grant overrides for this agent. Merged per-kind over
-    /// `security.tool_policies.<tool>.grants`: if the agent sets `shell`
-    /// grant for a tool, it replaces the config grant; unset kinds fall
-    /// through to the config/default.
+    /// Agent-wide capability ceiling. Attenuates *every* tool call this
+    /// agent makes, regardless of which tool reaches the resource — the
+    /// chokepoint for "this agent has no network" / "no fs-write" profiles.
+    /// Intersected with the config grants and any per-tool override
+    /// (most-restrictive-wins; see `Grants::attenuate`). Absent = no ceiling.
+    pub capabilities: Option<crate::grants::Grants>,
+    /// Per-tool grant overrides for this agent. Attenuate
+    /// `security.tool_policies.<tool>.grants` and the agent-wide
+    /// `capabilities` — each layer can only subtract authority, never widen
+    /// it (most-restrictive-wins; see `Grants::attenuate`).
     pub grants: Option<HashMap<String, crate::grants::Grants>>,
     /// Memory banks to auto-attach at agent bootstrap. Each name must
     /// match a bank created via `/memory new` or listed in the hosted

@@ -137,6 +137,12 @@ pub struct SessionMeta {
     /// Per-session agent→agent burst budget override. `Some(n)` replaces
     /// the global `multi_agent.burst_budget`; `None` falls back to it.
     pub burst_budget_override: Option<usize>,
+    /// Session-wide capability ceiling. Attenuates every tool call by every
+    /// agent in this session — the outermost tier, above the agent-wide cap
+    /// and per-tool grants. "This is a private, no-network session" lives
+    /// here. Default (all-permissive) imposes no ceiling.
+    #[serde(default)]
+    pub capabilities: crate::grants::Grants,
 }
 
 impl SessionMeta {
@@ -392,9 +398,18 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         Err(_) => HashMap::new(),
     };
 
-    let burst_budget_override: Option<usize> = match store.get_string("burst_budget_override").await {
+    let burst_budget_override: Option<usize> = match store.get_string("burst_budget_override").await
+    {
         Ok(s) => s.parse().ok(),
         Err(_) => None,
+    };
+
+    let capabilities: crate::grants::Grants = match store.get_string("capabilities").await {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            warn!("Malformed capabilities in SessionMeta, ignoring: {e}");
+            Default::default()
+        }),
+        Err(_) => Default::default(),
     };
 
     SessionMeta {
@@ -410,6 +425,7 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         backend_url: store.get_string("backend_url").await.ok(),
         backend_key_ref: store.get_string("backend_key_ref").await.ok(),
         burst_budget_override,
+        capabilities,
     }
 }
 
@@ -458,9 +474,18 @@ where
     write_field(
         &store,
         "burst_budget_override",
-        current.burst_budget_override.map(|n| n.to_string()).as_deref(),
+        current
+            .burst_budget_override
+            .map(|n| n.to_string())
+            .as_deref(),
     )
     .await?;
+    if current.capabilities == crate::grants::Grants::default() {
+        let _ = store.delete("capabilities").await;
+    } else {
+        let json = serde_json::to_string(&current.capabilities)?;
+        store.set_string("capabilities", json).await?;
+    }
 
     txn.commit().await?;
     Ok(())
@@ -620,6 +645,45 @@ mod tests {
 
         let read_back = read_meta_from_db(&db).await;
         assert_eq!(read_back.agents, expected);
+    }
+
+    #[tokio::test]
+    async fn session_meta_capabilities_round_trip() {
+        let (_instance, _user, db) = test_session_db().await;
+
+        // Default (permissive) capabilities persist nothing and read back default.
+        let read_back = read_meta_from_db(&db).await;
+        assert_eq!(read_back.capabilities, crate::grants::Grants::default());
+
+        // A session ceiling with no network endpoints round-trips intact.
+        update_meta_on_db(&db, |m| {
+            m.capabilities = crate::grants::Grants {
+                network: Some(crate::grants::NetworkGrant {
+                    endpoints: vec![crate::grants::EndpointPattern {
+                        host: "*.corp.internal".to_string(),
+                        path_prefix: None,
+                        methods: None,
+                    }],
+                    allow_private: true,
+                }),
+                ..Default::default()
+            };
+        })
+        .await
+        .unwrap();
+
+        let read_back = read_meta_from_db(&db).await;
+        let net = read_back.capabilities.network.expect("network ceiling");
+        assert_eq!(net.endpoints.len(), 1);
+        assert_eq!(net.endpoints[0].host, "*.corp.internal");
+        assert!(net.allow_private);
+
+        // Resetting to default clears the stored field.
+        update_meta_on_db(&db, |m| m.capabilities = Default::default())
+            .await
+            .unwrap();
+        let read_back = read_meta_from_db(&db).await;
+        assert_eq!(read_back.capabilities, crate::grants::Grants::default());
     }
 
     #[tokio::test]

@@ -99,6 +99,11 @@ pub struct AgentDbConfig {
     pub presets: HashMap<String, AgentPreset>,
     pub tool_profile: Option<String>,
     pub max_context_tokens: Option<usize>,
+    /// Agent-wide capability ceiling. Attenuates every tool call this agent
+    /// makes — the chokepoint for "no network" / "no fs-write" profiles.
+    /// Mirrors [`AgentConfig::capabilities`].
+    #[serde(default)]
+    pub capabilities: Grants,
     #[serde(default)]
     pub grants: HashMap<String, Grants>,
     /// Memory banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_memory_banks`].
@@ -162,6 +167,7 @@ impl AgentDbConfig {
             presets: cfg.presets.clone().unwrap_or_default(),
             tool_profile: cfg.tool_profile.clone(),
             max_context_tokens: cfg.max_context_tokens,
+            capabilities: cfg.capabilities.clone().unwrap_or_default(),
             grants: cfg.grants.clone().unwrap_or_default(),
             default_memory_banks: cfg.default_memory_banks.clone().unwrap_or_default(),
             default_skill_banks: cfg.default_skill_banks.clone().unwrap_or_default(),
@@ -832,6 +838,7 @@ mod tests {
             presets: None,
             tool_profile: None,
             max_context_tokens: None,
+            capabilities: None,
             grants: None,
             default_memory_banks: None,
             default_skill_banks: None,

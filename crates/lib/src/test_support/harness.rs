@@ -127,6 +127,8 @@ pub(crate) fn tool_context_with_host(
         session,
         active_extensions: Default::default(),
         grants: Default::default(),
+        session_capabilities: Default::default(),
+        agent_capabilities: Default::default(),
         agent_grants: Default::default(),
         host,
         iteration_budget: None,
