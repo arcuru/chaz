@@ -6,6 +6,7 @@
 
 # Nix build files
 /result
+/result-*
 
 # direnv files
 /.direnv
@@ -24,3 +25,4 @@ target-test/
 
 # Coverage reports (lcov + html from `just coverage`)
 /coverage
+/coverage-result
