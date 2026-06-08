@@ -64,7 +64,7 @@ Evaluates a mathematical expression string. Uses the `meval` crate.
 
 ### read_file / write_file
 
-Read or write files on the host filesystem. Both go through the host's `FileRead` / `FileWrite` capabilities; once the [`FsGrant`](#capability-boundary) path enforcement is wired they'll honour `allow_read` / `allow_write` allowlists.
+Read or write files on the host filesystem. Both go through the host's `FileRead` / `FileWrite` capabilities and honour the [`FsGrant`](#capability-boundary) `allow_read` / `allow_write` allowlists (advisory path-prefix confinement; symlinks not followed).
 
 ```json
 {"path": "/tmp/notes.txt"}
@@ -271,14 +271,16 @@ Tools access system resources through a **ToolHost** — a sandboxed capability 
 
 Today there are three grant kinds, declared per-tool under `security.tool_policies.<tool>.grants`:
 
-| Grant     | Field                        | What it does                                                                                                               |
-| --------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `shell`   | `allow` / `deny`             | Command-prefix allowlist + denylist. Empty `allow` = allow-all. `deny` always wins.                                        |
-| `network` | `endpoints`                  | List of `{ host, path_prefix?, methods? }` patterns. Empty list = allow any public host.                                   |
-| `network` | `allow_private`              | If `false` (default), private IPs and internal hostnames are blocked even when allowed.                                    |
-| `fs`      | `allow_read` / `allow_write` | Path-prefix allowlists. Empty = allow-all; otherwise paths must resolve at/under a root. Advisory (symlinks not followed). |
+| Grant     | Field                        | What it does                                                                                  |
+| --------- | ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `shell`   | `allow` / `deny`             | Command-prefix allowlist + denylist. `deny` always wins.                                      |
+| `network` | `endpoints`                  | List of `{ host, path_prefix?, methods? }` patterns.                                          |
+| `network` | `allow_private`              | If `false` (default), private IPs and internal hostnames are blocked even when allowed.       |
+| `fs`      | `allow_read` / `allow_write` | Path-prefix allowlists; paths must resolve at/under a root. Advisory (symlinks not followed). |
 
-Resolution composes **four tiers** by attenuation (most-restrictive-wins, never widening): the tool policy grant ∩ the session ceiling (`SessionMeta.capabilities`) ∩ the agent-wide cap (`agents[].capabilities`) ∩ the per-tool agent override (`agents[].grants.<tool>`). See [`Grants::attenuate`](https://github.com/arcuru/chaz/blob/main/crates/lib/src/grants.rs) and the [Capability tiers](security.md#capability-tiers-and-attenuation) section: allowlists intersect (empty = permissive), denylists union, booleans AND. An inner tier can only subtract authority.
+Every allowlist field (`shell.allow`, `network.endpoints`, `fs.allow_read`/`allow_write`) is three-state: **omitted** = permissive (allow-all), a **populated list** = only matching entries, an **explicit empty `[]`** = deny-all.
+
+Resolution composes **four tiers** by attenuation (most-restrictive-wins, never widening): the tool policy grant ∩ the session ceiling (`SessionMeta.capabilities`) ∩ the agent-wide cap (`agents[].capabilities`) ∩ the per-tool agent override (`agents[].grants.<tool>`). See [`Grants::attenuate`](https://github.com/arcuru/chaz/blob/main/crates/lib/src/grants.rs) and the [Capability tiers](security.md#capability-tiers-and-attenuation) section: allowlists intersect (a permissive/omitted side narrows to the other), denylists union, booleans AND. An inner tier can only subtract authority.
 
 #### Worked example: lock `shell` down to `git` and `ls`, deny everything else
 

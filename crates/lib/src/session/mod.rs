@@ -655,15 +655,17 @@ mod tests {
         let read_back = read_meta_from_db(&db).await;
         assert_eq!(read_back.capabilities, crate::grants::Grants::default());
 
-        // A session ceiling with no network endpoints round-trips intact.
+        // A session ceiling restricting egress to one domain round-trips intact.
         update_meta_on_db(&db, |m| {
             m.capabilities = crate::grants::Grants {
                 network: Some(crate::grants::NetworkGrant {
-                    endpoints: vec![crate::grants::EndpointPattern {
-                        host: "*.corp.internal".to_string(),
-                        path_prefix: None,
-                        methods: None,
-                    }],
+                    endpoints: crate::grants::Allowlist::Only(vec![
+                        crate::grants::EndpointPattern {
+                            host: "*.corp.internal".to_string(),
+                            path_prefix: None,
+                            methods: None,
+                        },
+                    ]),
                     allow_private: true,
                 }),
                 ..Default::default()
@@ -674,8 +676,9 @@ mod tests {
 
         let read_back = read_meta_from_db(&db).await;
         let net = read_back.capabilities.network.expect("network ceiling");
-        assert_eq!(net.endpoints.len(), 1);
-        assert_eq!(net.endpoints[0].host, "*.corp.internal");
+        let endpoints = net.endpoints.entries().expect("not permissive");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].host, "*.corp.internal");
         assert!(net.allow_private);
 
         // Resetting to default clears the stored field.

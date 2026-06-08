@@ -5,6 +5,67 @@
 //! grant struct; tools ignore fields they don't understand.
 use serde::{Deserialize, Serialize};
 
+/// An allowlist with an explicit permissive state, so "allow everything" and
+/// "allow nothing" are distinguishable.
+///
+/// - `Permissive` — no constraint; everything is allowed. The default, and what
+///   an omitted or `null` config field deserializes to.
+/// - `Only(items)` — only entries matching the list are allowed. An **empty**
+///   `Only(vec![])` therefore means **deny-all**. This is the encoding that lets
+///   a session or agent ceiling say "no network" / "no shell at all" — which a
+///   bare `Vec` (empty = allow-all) could not express.
+///
+/// Serializes transparently as `Option<Vec<T>>`: `Permissive` ↔ absent/`null`,
+/// `Only(v)` ↔ the sequence `v` (including the empty sequence `[]`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(
+    from = "Option<Vec<T>>",
+    into = "Option<Vec<T>>",
+    bound(
+        serialize = "T: Clone + Serialize",
+        deserialize = "T: Deserialize<'de>"
+    )
+)]
+pub enum Allowlist<T> {
+    #[default]
+    Permissive,
+    Only(Vec<T>),
+}
+
+impl<T> Allowlist<T> {
+    /// True when the allowlist imposes no constraint (allow-all).
+    pub fn is_permissive(&self) -> bool {
+        matches!(self, Allowlist::Permissive)
+    }
+
+    /// The explicit entries, or `None` when permissive. An empty slice means
+    /// deny-all.
+    pub fn entries(&self) -> Option<&[T]> {
+        match self {
+            Allowlist::Permissive => None,
+            Allowlist::Only(v) => Some(v),
+        }
+    }
+}
+
+impl<T> From<Option<Vec<T>>> for Allowlist<T> {
+    fn from(opt: Option<Vec<T>>) -> Self {
+        match opt {
+            None => Allowlist::Permissive,
+            Some(v) => Allowlist::Only(v),
+        }
+    }
+}
+
+impl<T> From<Allowlist<T>> for Option<Vec<T>> {
+    fn from(a: Allowlist<T>) -> Self {
+        match a {
+            Allowlist::Permissive => None,
+            Allowlist::Only(v) => Some(v),
+        }
+    }
+}
+
 /// Bundle of typed grants attached to a tool's policy.
 ///
 /// Each field is optional. Absence means "no grant configured" — tools decide
@@ -28,9 +89,9 @@ impl Grants {
     /// a naming convention; the result is the same either way.
     ///
     /// Per capability kind:
-    /// - allowlists (shell `allow`, network `endpoints`, fs paths) → intersection,
-    ///   where an *empty* allowlist is the permissive top (allow-all) and so
-    ///   intersects to the other side rather than to deny-all;
+    /// - allowlists (shell `allow`, network `endpoints`, fs paths) → intersection;
+    ///   `Permissive` is the top, so it narrows to whatever the other side says,
+    ///   while two `Only` lists intersect (an empty result is deny-all);
     /// - denylists (shell `deny`) → union;
     /// - booleans (network `allow_private`) → AND.
     ///
@@ -67,20 +128,26 @@ fn attenuate_opt<T: Clone>(
     }
 }
 
-/// Intersect two prefix allowlists where an empty list is the permissive top.
-///
-/// Entries are prefixes (matched via `starts_with` at enforcement time), so the
-/// intersection of two prefix languages is, for each overlapping pair, the more
-/// specific (longer) prefix: if one prefix extends the other, a command must
-/// satisfy the longer one to satisfy both. Non-overlapping prefixes contribute
-/// nothing — two disjoint allowlists intersect to deny-all (empty, non-empty).
-fn intersect_prefix_allow(base: &[String], narrower: &[String]) -> Vec<String> {
-    if base.is_empty() {
-        return narrower.to_vec();
+/// Attenuate two allowlists. `Permissive` is the top, so it yields the other
+/// side; two `Only` lists intersect via `intersect` (an empty result is
+/// deny-all, propagated naturally). Each layer can only ever subtract.
+fn attenuate_allow<T: Clone>(
+    base: &Allowlist<T>,
+    narrower: &Allowlist<T>,
+    intersect: impl Fn(&[T], &[T]) -> Vec<T>,
+) -> Allowlist<T> {
+    match (base, narrower) {
+        (Allowlist::Permissive, other) | (other, Allowlist::Permissive) => other.clone(),
+        (Allowlist::Only(a), Allowlist::Only(b)) => Allowlist::Only(intersect(a, b)),
     }
-    if narrower.is_empty() {
-        return base.to_vec();
-    }
+}
+
+/// Intersect two prefix allowlists. Entries are prefixes (matched via
+/// `starts_with` at enforcement time), so the intersection of two prefix
+/// languages is, for each overlapping pair, the more specific (longer) prefix:
+/// a command must satisfy the longer one to satisfy both. Disjoint prefixes
+/// contribute nothing, so disjoint lists intersect to deny-all.
+fn intersect_prefix(base: &[String], narrower: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for b in base {
         for n in narrower {
@@ -115,7 +182,7 @@ fn union_deny(base: &[String], narrower: &[String]) -> Vec<String> {
 impl ShellGrant {
     fn attenuate(base: &ShellGrant, narrower: &ShellGrant) -> ShellGrant {
         ShellGrant {
-            allow: intersect_prefix_allow(&base.allow, &narrower.allow),
+            allow: attenuate_allow(&base.allow, &narrower.allow, intersect_prefix),
             deny: union_deny(&base.deny, &narrower.deny),
         }
     }
@@ -124,8 +191,12 @@ impl ShellGrant {
 impl FsGrant {
     fn attenuate(base: &FsGrant, narrower: &FsGrant) -> FsGrant {
         FsGrant {
-            allow_read: intersect_prefix_allow(&base.allow_read, &narrower.allow_read),
-            allow_write: intersect_prefix_allow(&base.allow_write, &narrower.allow_write),
+            allow_read: attenuate_allow(&base.allow_read, &narrower.allow_read, intersect_prefix),
+            allow_write: attenuate_allow(
+                &base.allow_write,
+                &narrower.allow_write,
+                intersect_prefix,
+            ),
         }
     }
 }
@@ -133,29 +204,22 @@ impl FsGrant {
 impl NetworkGrant {
     fn attenuate(base: &NetworkGrant, narrower: &NetworkGrant) -> NetworkGrant {
         NetworkGrant {
-            endpoints: intersect_endpoints(&base.endpoints, &narrower.endpoints),
+            endpoints: attenuate_allow(&base.endpoints, &narrower.endpoints, intersect_endpoints),
             // Both layers must permit private access for it to survive.
             allow_private: base.allow_private && narrower.allow_private,
         }
     }
 }
 
-/// Intersect two endpoint allowlists where an empty list is the permissive top.
-///
-/// For each overlapping pair of patterns, emit their intersection (the more
-/// specific host, the longer compatible path prefix, the intersection of
-/// methods). Patterns that don't overlap contribute nothing, so a narrower
-/// pattern reaching beyond the ceiling is dropped rather than widening it.
+/// Intersect two endpoint lists. For each overlapping pair of patterns, emit
+/// their intersection (the more specific host, the longer compatible path
+/// prefix, the intersection of methods). Patterns that don't overlap contribute
+/// nothing, so a narrower pattern reaching beyond the ceiling is dropped rather
+/// than widening it; disjoint lists intersect to deny-all.
 fn intersect_endpoints(
     base: &[EndpointPattern],
     narrower: &[EndpointPattern],
 ) -> Vec<EndpointPattern> {
-    if base.is_empty() {
-        return narrower.to_vec();
-    }
-    if narrower.is_empty() {
-        return base.to_vec();
-    }
     let mut out: Vec<EndpointPattern> = Vec::new();
     for b in base {
         for n in narrower {
@@ -253,9 +317,10 @@ fn intersect_methods(a: Option<&[String]>, b: Option<&[String]>) -> Option<Optio
 /// Shell command capability grant.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShellGrant {
-    /// Command prefixes that are allowed. Empty = allow-all (no allowlist).
-    #[serde(default)]
-    pub allow: Vec<String>,
+    /// Command prefixes that are allowed. `Permissive` (omitted) = allow-all;
+    /// `Only([])` = deny-all.
+    #[serde(default, skip_serializing_if = "Allowlist::is_permissive")]
+    pub allow: Allowlist<String>,
     /// Command prefixes that are denied regardless of allowlist.
     #[serde(default)]
     pub deny: Vec<String>,
@@ -264,21 +329,23 @@ pub struct ShellGrant {
 /// Network capability grant.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkGrant {
-    /// Allowed endpoint patterns. Empty = allow-all (no allowlist).
-    #[serde(default)]
-    pub endpoints: Vec<EndpointPattern>,
+    /// Allowed endpoint patterns. `Permissive` (omitted) = allow-all;
+    /// `Only([])` = deny-all (no egress).
+    #[serde(default, skip_serializing_if = "Allowlist::is_permissive")]
+    pub endpoints: Allowlist<EndpointPattern>,
     /// Allow access to private IP ranges and internal hostnames (off by default).
     #[serde(default)]
     pub allow_private: bool,
 }
 
-/// Filesystem capability grant (schema stub; not enforced yet).
+/// Filesystem capability grant. `Permissive` (omitted) = allow-all paths;
+/// `Only([])` = deny-all; `Only([roots])` = paths under those roots only.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FsGrant {
-    #[serde(default)]
-    pub allow_read: Vec<String>,
-    #[serde(default)]
-    pub allow_write: Vec<String>,
+    #[serde(default, skip_serializing_if = "Allowlist::is_permissive")]
+    pub allow_read: Allowlist<String>,
+    #[serde(default, skip_serializing_if = "Allowlist::is_permissive")]
+    pub allow_write: Allowlist<String>,
 }
 
 /// An allowed endpoint pattern for a network grant.
@@ -327,8 +394,13 @@ pub fn merge_legacy_security(
                     "security.shell_denylist is deprecated — use security.tool_policies.shell.grants.shell.deny"
                 );
             }
+            // Legacy empty allowlist meant allow-all → Permissive.
             entry.grants.shell = Some(ShellGrant {
-                allow: legacy_shell_allow,
+                allow: if legacy_shell_allow.is_empty() {
+                    Allowlist::Permissive
+                } else {
+                    Allowlist::Only(legacy_shell_allow)
+                },
                 deny: legacy_shell_deny,
             });
         }
@@ -340,15 +412,21 @@ pub fn merge_legacy_security(
             warn!(
                 "security.allowed_endpoints is deprecated — use security.tool_policies.web_fetch.grants.network.endpoints"
             );
+            let endpoints: Vec<EndpointPattern> = legacy_endpoints
+                .iter()
+                .map(|e| EndpointPattern {
+                    host: e.host.clone(),
+                    path_prefix: e.path_prefix.clone(),
+                    methods: e.methods.clone(),
+                })
+                .collect();
             entry.grants.network = Some(NetworkGrant {
-                endpoints: legacy_endpoints
-                    .iter()
-                    .map(|e| EndpointPattern {
-                        host: e.host.clone(),
-                        path_prefix: e.path_prefix.clone(),
-                        methods: e.methods.clone(),
-                    })
-                    .collect(),
+                // Legacy empty list meant allow-all → Permissive.
+                endpoints: if endpoints.is_empty() {
+                    Allowlist::Permissive
+                } else {
+                    Allowlist::Only(endpoints)
+                },
                 allow_private: false,
             });
         }
@@ -377,7 +455,10 @@ mod tests {
             .shell
             .as_ref()
             .expect("shell grant synthesized");
-        assert_eq!(grant.allow, vec!["git".to_string(), "ls".to_string()]);
+        assert_eq!(
+            grant.allow,
+            Allowlist::Only(vec!["git".into(), "ls".into()])
+        );
         assert_eq!(grant.deny, vec!["rm".to_string()]);
     }
 
@@ -398,8 +479,9 @@ mod tests {
             .network
             .as_ref()
             .expect("network grant synthesized");
-        assert_eq!(grant.endpoints.len(), 1);
-        assert_eq!(grant.endpoints[0].host, "api.example.com");
+        let endpoints = grant.endpoints.entries().expect("not permissive");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].host, "api.example.com");
         assert!(!grant.allow_private);
     }
 
@@ -412,7 +494,7 @@ mod tests {
             crate::tool::ToolPolicy {
                 grants: Grants {
                     shell: Some(ShellGrant {
-                        allow: vec!["cat".into()],
+                        allow: Allowlist::Only(vec!["cat".into()]),
                         deny: vec![],
                     }),
                     ..Default::default()
@@ -426,7 +508,7 @@ mod tests {
         };
         let merged = merge_legacy_security(existing, &sec);
         let grant = merged["shell"].grants.shell.as_ref().unwrap();
-        assert_eq!(grant.allow, vec!["cat".to_string()]);
+        assert_eq!(grant.allow, Allowlist::Only(vec!["cat".to_string()]));
     }
 
     #[test]
@@ -436,9 +518,16 @@ mod tests {
         assert!(merged.is_empty());
     }
 
+    /// Build a shell grant. An empty `allow` slice means **permissive**
+    /// (preserving the historical allow-all intent of these tests); use
+    /// `Allowlist::Only(vec![])` directly to test deny-all.
     fn shell(allow: &[&str], deny: &[&str]) -> Option<ShellGrant> {
         Some(ShellGrant {
-            allow: allow.iter().map(|s| s.to_string()).collect(),
+            allow: if allow.is_empty() {
+                Allowlist::Permissive
+            } else {
+                Allowlist::Only(allow.iter().map(|s| s.to_string()).collect())
+            },
             deny: deny.iter().map(|s| s.to_string()).collect(),
         })
     }
@@ -451,6 +540,23 @@ mod tests {
         }
     }
 
+    /// Build a network grant. Empty `hosts` slice = permissive.
+    fn net(hosts: &[&str], allow_private: bool) -> Option<NetworkGrant> {
+        Some(NetworkGrant {
+            endpoints: if hosts.is_empty() {
+                Allowlist::Permissive
+            } else {
+                Allowlist::Only(hosts.iter().map(|h| ep(h)).collect())
+            },
+            allow_private,
+        })
+    }
+
+    /// `Allowlist::Only` from string slices, for assertions.
+    fn only(items: &[&str]) -> Allowlist<String> {
+        Allowlist::Only(items.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
     fn test_attenuate_none_returns_self() {
         let base = Grants {
@@ -458,7 +564,7 @@ mod tests {
             ..Default::default()
         };
         let merged = base.attenuate(None);
-        assert_eq!(merged.shell.unwrap().allow, vec!["git".to_string()]);
+        assert_eq!(merged.shell.unwrap().allow, only(&["git"]));
     }
 
     #[test]
@@ -469,15 +575,15 @@ mod tests {
             ..Default::default()
         };
         let narrower = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![ep("api.example.com")],
-                allow_private: false,
-            }),
+            network: net(&["api.example.com"], false),
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower));
-        assert_eq!(merged.shell.unwrap().allow, vec!["git".to_string()]);
-        assert_eq!(merged.network.unwrap().endpoints[0].host, "api.example.com");
+        assert_eq!(merged.shell.unwrap().allow, only(&["git"]));
+        assert_eq!(
+            merged.network.unwrap().endpoints.entries().unwrap()[0].host,
+            "api.example.com"
+        );
     }
 
     #[test]
@@ -491,7 +597,7 @@ mod tests {
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower));
-        let allow = merged.shell.unwrap().allow;
+        let allow = merged.shell.unwrap().allow.entries().unwrap().to_vec();
         // Only the commands both layers permit; `ls` (base-only) and `rm`
         // (narrower-only) are dropped.
         assert!(allow.contains(&"git".to_string()));
@@ -501,8 +607,8 @@ mod tests {
     }
 
     #[test]
-    fn test_attenuate_empty_allowlist_is_top() {
-        // base permissive (empty allow); narrower restricts → narrower wins.
+    fn test_attenuate_permissive_is_top() {
+        // base permissive; narrower restricts → narrower wins.
         let base = Grants {
             shell: shell(&[], &[]),
             ..Default::default()
@@ -512,7 +618,26 @@ mod tests {
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower));
-        assert_eq!(merged.shell.unwrap().allow, vec!["git".to_string()]);
+        assert_eq!(merged.shell.unwrap().allow, only(&["git"]));
+    }
+
+    #[test]
+    fn test_attenuate_deny_all_beats_permissive() {
+        // The new capability: an explicit empty `Only([])` is deny-all, and
+        // attenuating a permissive ceiling by it yields deny-all (not allow-all).
+        let permissive = Grants {
+            shell: shell(&[], &[]),
+            ..Default::default()
+        };
+        let deny_all = Grants {
+            shell: Some(ShellGrant {
+                allow: Allowlist::Only(vec![]),
+                deny: vec![],
+            }),
+            ..Default::default()
+        };
+        let merged = permissive.attenuate(Some(&deny_all));
+        assert_eq!(merged.shell.unwrap().allow, Allowlist::Only(vec![]));
     }
 
     #[test]
@@ -527,7 +652,7 @@ mod tests {
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower));
-        assert_eq!(merged.shell.unwrap().allow, vec!["git log".to_string()]);
+        assert_eq!(merged.shell.unwrap().allow, only(&["git log"]));
     }
 
     #[test]
@@ -565,17 +690,11 @@ mod tests {
     #[test]
     fn test_attenuate_allow_private_is_and() {
         let yes = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![],
-                allow_private: true,
-            }),
+            network: net(&[], true),
             ..Default::default()
         };
         let no = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![],
-                allow_private: false,
-            }),
+            network: net(&[], false),
             ..Default::default()
         };
         // Both must allow → false dominates.
@@ -587,17 +706,11 @@ mod tests {
     fn test_attenuate_endpoints_wildcard_keeps_specific() {
         // Ceiling allows the whole domain; narrower picks one host within it.
         let base = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![ep("*.example.com")],
-                allow_private: false,
-            }),
+            network: net(&["*.example.com"], false),
             ..Default::default()
         };
         let narrower = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![ep("api.example.com"), ep("evil.com")],
-                allow_private: false,
-            }),
+            network: net(&["api.example.com", "evil.com"], false),
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower));
@@ -605,8 +718,10 @@ mod tests {
             .network
             .unwrap()
             .endpoints
-            .into_iter()
-            .map(|e| e.host)
+            .entries()
+            .unwrap()
+            .iter()
+            .map(|e| e.host.clone())
             .collect();
         // api.example.com is within the ceiling; evil.com is dropped (can't widen).
         assert_eq!(hosts, vec!["api.example.com".to_string()]);
@@ -615,45 +730,37 @@ mod tests {
     #[test]
     fn test_attenuate_endpoints_disjoint_is_deny_all() {
         let base = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![ep("a.com")],
-                allow_private: false,
-            }),
+            network: net(&["a.com"], false),
             ..Default::default()
         };
         let narrower = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![ep("b.com")],
-                allow_private: false,
-            }),
+            network: net(&["b.com"], false),
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower));
-        // No overlap → empty allowlist. NOTE: empty means allow-all at the
-        // enforcement layer today; expressing true deny-all is the session-tier
-        // work (see capability-tiers-plan.md). The intersection itself is sound.
-        assert!(merged.network.unwrap().endpoints.is_empty());
+        // No overlap → `Only([])`, which now genuinely means deny-all.
+        assert_eq!(merged.network.unwrap().endpoints, Allowlist::Only(vec![]));
     }
 
     #[test]
     fn test_attenuate_fs_paths_intersect() {
         let base = Grants {
             fs: Some(FsGrant {
-                allow_write: vec!["/work".into()],
-                allow_read: vec![],
+                allow_write: only(&["/work"]),
+                allow_read: Allowlist::Permissive,
             }),
             ..Default::default()
         };
         let narrower = Grants {
             fs: Some(FsGrant {
-                allow_write: vec!["/work/sub".into(), "/etc".into()],
-                allow_read: vec![],
+                allow_write: only(&["/work/sub", "/etc"]),
+                allow_read: Allowlist::Permissive,
             }),
             ..Default::default()
         };
         let merged = base.attenuate(Some(&narrower)).fs.unwrap();
         // /work/sub is within /work; /etc reaches outside the ceiling → dropped.
-        assert_eq!(merged.allow_write, vec!["/work/sub".to_string()]);
+        assert_eq!(merged.allow_write, only(&["/work/sub"]));
     }
 
     #[test]
@@ -685,7 +792,7 @@ mod tests {
             .shell
             .unwrap();
         // Allowlist intersected down to git; both denials accumulate.
-        assert_eq!(effective.allow, vec!["git".to_string()]);
+        assert_eq!(effective.allow, only(&["git"]));
         assert!(effective.deny.contains(&"curl".to_string()));
         assert!(effective.deny.contains(&"rm".to_string()));
     }
@@ -696,16 +803,40 @@ mod tests {
         // override are both permissive — the chokepoint guarantee.
         let policy = Grants::default();
         let agent_wide = Grants {
-            network: Some(NetworkGrant {
-                endpoints: vec![ep("*.corp.internal")],
-                allow_private: true,
-            }),
+            network: net(&["*.corp.internal"], true),
             ..Default::default()
         };
         let effective = policy.attenuate(Some(&agent_wide)).attenuate(None);
         let net = effective.network.unwrap();
-        assert_eq!(net.endpoints, vec![ep("*.corp.internal")]);
+        assert_eq!(net.endpoints, Allowlist::Only(vec![ep("*.corp.internal")]));
         assert!(net.allow_private);
+    }
+
+    #[test]
+    fn test_allowlist_serde_three_states() {
+        // Omitted field → Permissive (allow-all).
+        let g: ShellGrant = serde_json::from_str("{}").unwrap();
+        assert_eq!(g.allow, Allowlist::Permissive);
+        // Explicit empty list → deny-all.
+        let g: ShellGrant = serde_json::from_str(r#"{"allow": []}"#).unwrap();
+        assert_eq!(g.allow, Allowlist::Only(vec![]));
+        // Populated list → Only.
+        let g: ShellGrant = serde_json::from_str(r#"{"allow": ["git"]}"#).unwrap();
+        assert_eq!(g.allow, only(&["git"]));
+        // Permissive round-trips as an omitted field (skipped on serialize).
+        let json = serde_json::to_string(&ShellGrant::default()).unwrap();
+        assert!(
+            !json.contains("allow"),
+            "permissive allow should be omitted: {json}"
+        );
+        // Deny-all round-trips as `[]`.
+        let g = ShellGrant {
+            allow: Allowlist::Only(vec![]),
+            deny: vec![],
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        let back: ShellGrant = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allow, Allowlist::Only(vec![]));
     }
 
     #[test]

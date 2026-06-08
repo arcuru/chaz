@@ -243,8 +243,11 @@ pub fn check_shell_command(command: &str, grant: Option<&ShellGrant>) -> Result<
             }
         }
 
-        // Allowlist if configured (non-empty)
-        if !grant.allow.is_empty() && !grant.allow.iter().any(|a| binary.starts_with(a)) {
+        // Allowlist: Permissive = allow-all; Only(list) requires a prefix match
+        // (an empty list matches nothing → deny-all).
+        if let crate::grants::Allowlist::Only(list) = &grant.allow
+            && !list.iter().any(|a| binary.starts_with(a))
+        {
             return Err(format!(
                 "Command '{binary}' is not in the allowed commands list"
             ));
@@ -275,8 +278,7 @@ fn extract_command_binaries(command: &str) -> Vec<String> {
 
 /// Read a file, enforcing the `FsGrant.allow_read` bound if one is configured.
 async fn exec_file_read(path: &str, grants: &Grants) -> Result<CapabilityResult, ToolError> {
-    let allow = grants.fs.as_ref().map(|f| f.allow_read.as_slice());
-    check_fs_path(path, allow, "read")?;
+    check_fs_path(path, grants.fs.as_ref().map(|f| &f.allow_read), "read")?;
     let content = tokio::fs::read(path)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to read file: {e}")))?;
@@ -289,8 +291,7 @@ async fn exec_file_write(
     content: &str,
     grants: &Grants,
 ) -> Result<CapabilityResult, ToolError> {
-    let allow = grants.fs.as_ref().map(|f| f.allow_write.as_slice());
-    check_fs_path(path, allow, "write")?;
+    check_fs_path(path, grants.fs.as_ref().map(|f| &f.allow_write), "write")?;
     tokio::fs::write(path, content)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to write file: {e}")))?;
@@ -299,21 +300,25 @@ async fn exec_file_write(
 
 /// Check a filesystem path against an allowlist of permitted roots.
 ///
-/// `None` or an empty allowlist means allow-all (permissive default, matching
-/// the other capability kinds). Otherwise the path must lexically resolve to a
-/// location at or under one of the allowed roots.
+/// `None` (no fs grant) or `Permissive` means allow-all; `Only(roots)` requires
+/// the path to lexically resolve to a location at or under one of the roots —
+/// an empty `Only([])` therefore denies everything.
 ///
 /// This is **advisory** confinement: paths are normalized lexically (resolving
 /// `.`/`..`) but symlinks are not followed, so a symlink under an allowed root
 /// can still point outside it. True confinement is the sandboxed host's job
 /// (mounts / WASI preopens); this is the cheap first pass.
-pub fn check_fs_path(path: &str, allow: Option<&[String]>, op: &str) -> Result<(), String> {
-    let allow = match allow {
-        Some(a) if !a.is_empty() => a,
-        _ => return Ok(()), // no allowlist configured → permissive
+pub fn check_fs_path(
+    path: &str,
+    allow: Option<&crate::grants::Allowlist<String>>,
+    op: &str,
+) -> Result<(), String> {
+    let roots = match allow {
+        None | Some(crate::grants::Allowlist::Permissive) => return Ok(()),
+        Some(crate::grants::Allowlist::Only(roots)) => roots,
     };
     let target = normalize_lexical(std::path::Path::new(path));
-    for root in allow {
+    for root in roots {
         let root_norm = normalize_lexical(std::path::Path::new(root));
         if target == root_norm || target.starts_with(&root_norm) {
             return Ok(());
@@ -406,23 +411,32 @@ async fn exec_http(
     }))
 }
 
-/// Build a `NetworkPolicy` from an optional `NetworkGrant`.
+/// Build a `NetworkPolicy` from an optional `NetworkGrant`. `None` (no grant)
+/// and `Permissive` endpoints both mean allow-all (public); `Only([])` means
+/// deny-all (no egress).
 fn build_network_policy(grant: Option<&NetworkGrant>) -> crate::security::NetworkPolicy {
+    use crate::grants::Allowlist;
     use crate::security::network::EndpointPattern as PolicyEndpoint;
 
+    let convert = |list: &[crate::grants::EndpointPattern]| -> Vec<PolicyEndpoint> {
+        list.iter()
+            .map(|e| PolicyEndpoint {
+                host: e.host.clone(),
+                path_prefix: e.path_prefix.clone(),
+                methods: e.methods.clone(),
+            })
+            .collect()
+    };
+
     let (endpoints, allow_private) = match grant {
-        Some(g) => (
-            g.endpoints
-                .iter()
-                .map(|e| PolicyEndpoint {
-                    host: e.host.clone(),
-                    path_prefix: e.path_prefix.clone(),
-                    methods: e.methods.clone(),
-                })
-                .collect(),
-            g.allow_private,
-        ),
-        None => (Vec::new(), false),
+        None => (Allowlist::Permissive, false),
+        Some(g) => {
+            let eps = match &g.endpoints {
+                Allowlist::Permissive => Allowlist::Permissive,
+                Allowlist::Only(list) => Allowlist::Only(convert(list)),
+            };
+            (eps, g.allow_private)
+        }
     };
 
     crate::security::NetworkPolicy::new(endpoints, !allow_private)
@@ -433,19 +447,31 @@ fn build_network_policy(grant: Option<&NetworkGrant>) -> crate::security::Networ
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grants::{EndpointPattern, ShellGrant};
+    use crate::grants::{Allowlist, EndpointPattern, ShellGrant};
+
+    fn only(roots: &[&str]) -> Allowlist<String> {
+        Allowlist::Only(roots.iter().map(|s| s.to_string()).collect())
+    }
 
     // ── Filesystem grant checks ──
 
     #[test]
     fn test_fs_no_allowlist_is_permissive() {
         assert!(check_fs_path("/etc/passwd", None, "read").is_ok());
-        assert!(check_fs_path("/etc/passwd", Some(&[]), "read").is_ok());
+        assert!(check_fs_path("/etc/passwd", Some(&Allowlist::Permissive), "read").is_ok());
+    }
+
+    #[test]
+    fn test_fs_empty_only_is_deny_all() {
+        // The new capability: an explicit empty allowlist denies everything.
+        let deny_all = Allowlist::Only(vec![]);
+        assert!(check_fs_path("/etc/passwd", Some(&deny_all), "read").is_err());
+        assert!(check_fs_path("/work/x", Some(&deny_all), "write").is_err());
     }
 
     #[test]
     fn test_fs_within_allowed_root_ok() {
-        let allow = vec!["/work".to_string()];
+        let allow = only(&["/work"]);
         assert!(check_fs_path("/work/file.txt", Some(&allow), "write").is_ok());
         assert!(check_fs_path("/work/sub/dir/x", Some(&allow), "write").is_ok());
         assert!(check_fs_path("/work", Some(&allow), "write").is_ok());
@@ -453,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_fs_outside_allowed_root_denied() {
-        let allow = vec!["/work".to_string()];
+        let allow = only(&["/work"]);
         assert!(check_fs_path("/etc/passwd", Some(&allow), "read").is_err());
         // Prefix-but-not-path-boundary must not match.
         assert!(check_fs_path("/workother/x", Some(&allow), "read").is_err());
@@ -461,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_fs_parent_traversal_resolved() {
-        let allow = vec!["/work".to_string()];
+        let allow = only(&["/work"]);
         // `..` escapes the allowed root → denied.
         assert!(check_fs_path("/work/../etc/passwd", Some(&allow), "read").is_err());
         // `..` that stays within is fine.
@@ -484,7 +510,7 @@ mod tests {
     #[test]
     fn test_shell_allowlist_restricts() {
         let g = ShellGrant {
-            allow: vec!["git".into(), "ls".into()],
+            allow: only(&["git", "ls"]),
             deny: vec![],
         };
         assert!(check_shell_command("git status", Some(&g)).is_ok());
@@ -493,9 +519,20 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_empty_allowlist_is_deny_all() {
+        // The new capability: an explicit empty allowlist denies everything.
+        let g = ShellGrant {
+            allow: Allowlist::Only(vec![]),
+            deny: vec![],
+        };
+        assert!(check_shell_command("ls", Some(&g)).is_err());
+        assert!(check_shell_command("git status", Some(&g)).is_err());
+    }
+
+    #[test]
     fn test_shell_denylist_blocks() {
         let g = ShellGrant {
-            allow: vec![],
+            allow: Allowlist::Permissive,
             deny: vec!["rm".into()],
         };
         assert!(check_shell_command("ls", Some(&g)).is_ok());
@@ -505,7 +542,7 @@ mod tests {
     #[test]
     fn test_shell_denylist_beats_allowlist() {
         let g = ShellGrant {
-            allow: vec!["rm".into()],
+            allow: only(&["rm"]),
             deny: vec!["rm".into()],
         };
         assert!(check_shell_command("rm foo", Some(&g)).is_err());
@@ -514,7 +551,7 @@ mod tests {
     #[test]
     fn test_shell_pipes_check_every_binary() {
         let g = ShellGrant {
-            allow: vec!["cat".into()],
+            allow: only(&["cat"]),
             deny: vec![],
         };
         assert!(check_shell_command("cat file.txt", Some(&g)).is_ok());
@@ -568,11 +605,11 @@ mod tests {
     #[test]
     fn test_network_grant_endpoint_allowlist() {
         let grant = NetworkGrant {
-            endpoints: vec![EndpointPattern {
+            endpoints: Allowlist::Only(vec![EndpointPattern {
                 host: "api.example.com".into(),
                 path_prefix: None,
                 methods: Some(vec!["GET".into()]),
-            }],
+            }]),
             allow_private: false,
         };
         let p = build_network_policy(Some(&grant));
@@ -582,9 +619,20 @@ mod tests {
     }
 
     #[test]
+    fn test_network_empty_only_is_deny_all() {
+        // The new capability: an empty endpoint allowlist denies all egress.
+        let grant = NetworkGrant {
+            endpoints: Allowlist::Only(vec![]),
+            allow_private: false,
+        };
+        let p = build_network_policy(Some(&grant));
+        assert!(p.check("https://example.com/", "GET").is_err());
+    }
+
+    #[test]
     fn test_network_allow_private_opens_internal_hosts() {
         let grant = NetworkGrant {
-            endpoints: vec![],
+            endpoints: Allowlist::Permissive,
             allow_private: true,
         };
         let p = build_network_policy(Some(&grant));

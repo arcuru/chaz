@@ -1,3 +1,4 @@
+use crate::grants::Allowlist;
 use std::net::IpAddr;
 use tracing::warn;
 use url::Url;
@@ -15,17 +16,18 @@ pub struct EndpointPattern {
 
 /// Network access policy for HTTP tools.
 ///
-/// If `allowed_endpoints` is empty, all endpoints are allowed (backward compat).
-/// If non-empty, only matching endpoints are permitted (deny-all default).
-/// Private IP rejection is always enforced regardless of allowlist.
+/// `allowed_endpoints` is an [`Allowlist`]: `Permissive` allows all endpoints,
+/// `Only(list)` permits only matching endpoints (an empty `Only([])` denies all
+/// egress). Private IP rejection is always enforced regardless of allowlist.
 pub struct NetworkPolicy {
-    allowed_endpoints: Vec<EndpointPattern>,
+    allowed_endpoints: Allowlist<EndpointPattern>,
     deny_private_ips: bool,
 }
 
 impl NetworkPolicy {
-    /// Create a policy with specific allowed endpoints. Empty = allow all.
-    pub fn new(endpoints: Vec<EndpointPattern>, deny_private_ips: bool) -> Self {
+    /// Create a policy with an endpoint allowlist. `Permissive` = allow all;
+    /// `Only([])` = deny all.
+    pub fn new(endpoints: Allowlist<EndpointPattern>, deny_private_ips: bool) -> Self {
         Self {
             allowed_endpoints: endpoints,
             deny_private_ips,
@@ -36,7 +38,7 @@ impl NetworkPolicy {
     #[allow(dead_code)]
     pub fn permissive() -> Self {
         Self {
-            allowed_endpoints: Vec::new(),
+            allowed_endpoints: Allowlist::Permissive,
             deny_private_ips: true,
         }
     }
@@ -50,16 +52,18 @@ impl NetworkPolicy {
             self.reject_private_ip(&url)?;
         }
 
-        // If no allowlist configured, allow everything
-        if self.allowed_endpoints.is_empty() {
-            return Ok(());
-        }
+        // Permissive = allow everything; Only(list) = only matching endpoints
+        // (an empty list matches nothing → deny-all).
+        let endpoints = match &self.allowed_endpoints {
+            Allowlist::Permissive => return Ok(()),
+            Allowlist::Only(list) => list,
+        };
 
         // Check against allowlist
         let host = url.host_str().ok_or("URL has no host")?;
         let path = url.path();
 
-        for endpoint in &self.allowed_endpoints {
+        for endpoint in endpoints {
             if !self.host_matches(&endpoint.host, host) {
                 continue;
             }
@@ -168,11 +172,11 @@ mod tests {
     #[test]
     fn test_allowlist_denies_unlisted() {
         let policy = NetworkPolicy::new(
-            vec![EndpointPattern {
+            Allowlist::Only(vec![EndpointPattern {
                 host: "api.example.com".into(),
                 path_prefix: None,
                 methods: None,
-            }],
+            }]),
             true,
         );
         assert!(policy.check("https://api.example.com/foo", "GET").is_ok());
@@ -182,11 +186,11 @@ mod tests {
     #[test]
     fn test_wildcard_host() {
         let policy = NetworkPolicy::new(
-            vec![EndpointPattern {
+            Allowlist::Only(vec![EndpointPattern {
                 host: "*.wikipedia.org".into(),
                 path_prefix: None,
                 methods: Some(vec!["GET".into()]),
-            }],
+            }]),
             true,
         );
         assert!(
@@ -205,11 +209,11 @@ mod tests {
     #[test]
     fn test_path_prefix() {
         let policy = NetworkPolicy::new(
-            vec![EndpointPattern {
+            Allowlist::Only(vec![EndpointPattern {
                 host: "api.example.com".into(),
                 path_prefix: Some("/api/v1".into()),
                 methods: None,
-            }],
+            }]),
             true,
         );
         assert!(
@@ -249,13 +253,21 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_only_denies_all() {
+        // The new capability: an empty allowlist denies all egress (whereas
+        // Permissive would allow it).
+        let policy = NetworkPolicy::new(Allowlist::Only(vec![]), true);
+        assert!(policy.check("https://example.com/foo", "GET").is_err());
+    }
+
+    #[test]
     fn test_wildcard_matches_bare_domain() {
         let policy = NetworkPolicy::new(
-            vec![EndpointPattern {
+            Allowlist::Only(vec![EndpointPattern {
                 host: "*.example.com".into(),
                 path_prefix: None,
                 methods: None,
-            }],
+            }]),
             true,
         );
         // *.example.com should match both sub.example.com and example.com

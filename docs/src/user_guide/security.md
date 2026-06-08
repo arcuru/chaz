@@ -91,7 +91,17 @@ effective = tool policy  ∩  session ceiling  ∩  agent capabilities  ∩  per
 
 The key property: the **session ceiling** and **agent capabilities** are chokepoints. The filesystem is reachable through both `shell` and `write_file`; the network through both `web_fetch` and `shell` (`curl`). Setting `allow_private: false` on a single tool doesn't stop another tool reaching the resource — but a session or agent ceiling binds _every_ tool that can reach it at once. That is how you express "this agent has no network" (a `private` profile) or "this is a confined session."
 
-Within each grant, attenuation means: **allowlists intersect** (an empty allowlist is permissive, so it narrows to whatever the other tier specifies), **denylists union**, and booleans like `allow_private` are AND-ed. A narrower tier clearing a `deny` entry cannot un-deny it — the union keeps it.
+Within each grant, attenuation means: **allowlists intersect**, **denylists union**, and booleans like `allow_private` are AND-ed. A narrower tier clearing a `deny` entry cannot un-deny it — the union keeps it.
+
+Allowlists (`shell.allow`, `network.endpoints`, `fs.allow_read`/`allow_write`) have three states, so "allow everything" and "allow nothing" are distinct:
+
+| Config                       | Meaning                                   |
+| ---------------------------- | ----------------------------------------- |
+| field omitted                | **permissive** — no constraint, allow-all |
+| `allow: ["git", "ls"]`       | only entries matching the list            |
+| `allow: []` (explicit empty) | **deny-all** — nothing matches            |
+
+A permissive (omitted) allowlist narrows to whatever the other tier specifies; an explicit `[]` is the hard floor that lets a ceiling say "no shell at all" or "no network."
 
 ### Shell grants
 
@@ -145,7 +155,7 @@ Private IP addresses (RFC 1918, loopback, link-local) are always blocked unless 
 
 ### Filesystem grants
 
-File read/write paths are bounded to a set of allowed roots. An absent or empty list is permissive; otherwise a path must resolve to a location at or under one of the roots:
+File read/write paths are bounded to a set of allowed roots. An omitted list is permissive; a populated list confines paths to at/under one of the roots; an explicit empty list (`allow_write: []`) denies all writes:
 
 ```yaml
 security:
@@ -182,7 +192,15 @@ agents:
 
 The session ceiling lives on the session itself (`SessionMeta.capabilities`) rather than in `config.yaml`, so it travels with the session and applies to whichever agents run in it.
 
-> **Expressing "no network at all":** today an empty endpoint allowlist means _allow-all_ at the enforcement layer (the historical default), so an empty list does **not** yet mean deny-all. A hard "no egress" ceiling is the job of the sandboxed host (a network namespace with no interface) and lands with that work. Until then, restrict egress positively — list only the endpoints an agent may reach — rather than relying on an empty list to deny everything.
+> **Expressing "no network at all":** set an explicit empty endpoint allowlist on the ceiling:
+>
+> ```yaml
+> capabilities:
+>   network:
+>     endpoints: [] # deny-all egress
+> ```
+>
+> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — that lands with the sandboxed host. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
 
 ## Leak Detection
 
