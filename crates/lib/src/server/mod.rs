@@ -1270,11 +1270,16 @@ impl Server {
             let burst = crate::session::trailing_agent_message_burst(session.entries(), |name| {
                 self.agents.get(name).is_some()
             });
-            if burst >= self.agent_burst_budget() {
+            let budget = session
+                .read_meta()
+                .await
+                .burst_budget_override
+                .unwrap_or_else(|| self.agent_burst_budget());
+            if burst >= budget {
                 info!(
                     session_db_id,
                     burst,
-                    budget = self.agent_burst_budget(),
+                    budget,
                     "Agent turn budget exhausted — suppressing agent→agent wake"
                 );
                 None

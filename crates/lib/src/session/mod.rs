@@ -134,6 +134,9 @@ pub struct SessionMeta {
     pub backend_name: Option<String>,
     pub backend_url: Option<String>,
     pub backend_key_ref: Option<String>,
+    /// Per-session agent→agent burst budget override. `Some(n)` replaces
+    /// the global `multi_agent.burst_budget`; `None` falls back to it.
+    pub burst_budget_override: Option<usize>,
 }
 
 impl SessionMeta {
@@ -389,6 +392,11 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         Err(_) => HashMap::new(),
     };
 
+    let burst_budget_override: Option<usize> = match store.get_string("burst_budget_override").await {
+        Ok(s) => s.parse().ok(),
+        Err(_) => None,
+    };
+
     SessionMeta {
         name: store.get_string("name").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
@@ -401,6 +409,7 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         backend_name: store.get_string("backend_name").await.ok(),
         backend_url: store.get_string("backend_url").await.ok(),
         backend_key_ref: store.get_string("backend_key_ref").await.ok(),
+        burst_budget_override,
     }
 }
 
@@ -444,6 +453,12 @@ where
         &store,
         "backend_key_ref",
         current.backend_key_ref.as_deref(),
+    )
+    .await?;
+    write_field(
+        &store,
+        "burst_budget_override",
+        current.burst_budget_override.map(|n| n.to_string()).as_deref(),
     )
     .await?;
 

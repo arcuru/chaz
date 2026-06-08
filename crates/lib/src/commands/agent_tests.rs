@@ -1061,6 +1061,93 @@ async fn home_skip_counter_resets_on_run() {
     assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
 }
 
+// --- agent_set_burst tests ---
+
+#[tokio::test]
+async fn burst_set_stores_override_in_session_meta() {
+    let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+    let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+    let cmd = Command::AgentSetBurst(Some(5));
+    match dispatch(cmd, &ctx).await {
+        CommandOutcome::Text(msg) => assert!(msg.contains("5"), "got {msg}"),
+        CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+        _ => panic!("expected Text"),
+    }
+
+    let meta = crate::session::read_meta_from_db(&sdb).await;
+    assert_eq!(meta.burst_budget_override, Some(5));
+}
+
+#[tokio::test]
+async fn burst_clear_resets_override_to_none() {
+    let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+    let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+    // Set first.
+    dispatch(Command::AgentSetBurst(Some(3)), &ctx).await;
+    // Clear.
+    let cmd = Command::AgentSetBurst(None);
+    match dispatch(cmd, &ctx).await {
+        CommandOutcome::Text(msg) => {
+            assert!(msg.contains("Cleared") || msg.contains("default"), "got {msg}");
+        }
+        CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+        _ => panic!("expected Text"),
+    }
+
+    let meta = crate::session::read_meta_from_db(&sdb).await;
+    assert_eq!(meta.burst_budget_override, None);
+}
+
+#[tokio::test]
+async fn burst_rejects_zero() {
+    let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+    let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+    let cmd = Command::AgentSetBurst(Some(0));
+    match dispatch(cmd, &ctx).await {
+        CommandOutcome::Error(msg) => assert!(msg.contains("≥ 1"), "got {msg}"),
+        _ => panic!("expected Error"),
+    }
+
+    // Meta unchanged.
+    let meta = crate::session::read_meta_from_db(&sdb).await;
+    assert_eq!(meta.burst_budget_override, None);
+}
+
+#[tokio::test]
+async fn agent_room_shows_session_override_when_set() {
+    let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+    let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+    // Set burst override.
+    dispatch(Command::AgentSetBurst(Some(7)), &ctx).await;
+
+    match dispatch(Command::AgentRoom, &ctx).await {
+        CommandOutcome::Text(msg) => {
+            assert!(msg.contains("session override"), "expected session override tag: {msg}");
+            assert!(msg.contains("7"), "expected burst value 7: {msg}");
+        }
+        CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+        _ => panic!("expected Text"),
+    }
+}
+
+#[tokio::test]
+async fn agent_room_shows_default_when_no_override() {
+    let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;
+    let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+
+    match dispatch(Command::AgentRoom, &ctx).await {
+        CommandOutcome::Text(msg) => {
+            assert!(msg.contains("default"), "expected default tag: {msg}");
+        }
+        CommandOutcome::Error(e) => panic!("unexpected error: {e}"),
+        _ => panic!("expected Text"),
+    }
+}
+
 #[tokio::test]
 async fn revoke_warns_when_target_was_session_home() {
     let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;

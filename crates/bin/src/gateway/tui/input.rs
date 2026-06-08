@@ -8,9 +8,9 @@ use chaz_core::gateway::ApprovalDecision;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
-    App, ChatAction, ClickTarget, Completion, Overlay, SettingsFocus, SettingsPicker,
-    SettingsPickerIntent, SettingsPrompt, SettingsPromptIntent, SettingsScope, TuiMode, show_error,
-    show_system_msg,
+    App, ChatAction, ClickTarget, Completion, ModelPickerScope, Overlay, SettingsFocus,
+    SettingsPicker, SettingsPickerIntent, SettingsPrompt, SettingsPromptIntent, SettingsScope,
+    TuiMode, show_error, show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -892,6 +892,31 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     if text == "/agent host" {
         return Some(ChatAction::Dispatch(Command::AgentSetHost(None)));
     }
+    if let Some(arg) = text.strip_prefix("/agent burst ") {
+        let s = arg.trim();
+        match s.parse::<usize>() {
+            Ok(n) if n >= 1 => {
+                return Some(ChatAction::Dispatch(Command::AgentSetBurst(Some(n))));
+            }
+            Ok(_) => {
+                show_error(
+                    app,
+                    "Burst budget must be ≥ 1".to_string(),
+                );
+                return None;
+            }
+            Err(_) => {
+                show_error(
+                    app,
+                    format!("Invalid burst budget '{s}' — expected a positive integer"),
+                );
+                return None;
+            }
+        }
+    }
+    if text == "/agent burst" {
+        return Some(ChatAction::Dispatch(Command::AgentSetBurst(None)));
+    }
     if text == "/agent" || text == "/agent list" {
         return Some(ChatAction::Dispatch(Command::AgentsList));
     }
@@ -1226,10 +1251,11 @@ pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPick
 /// reads, command dispatch).
 pub(super) enum SettingsKey {
     None,
-    /// User pressed Enter on the Session → Models category — the main
-    /// loop opens the model picker, seeding it from the active session's
-    /// meta and remembering Settings as the return mode.
-    OpenModelPicker,
+    /// User pressed Enter to open the model picker. When `None`, the
+    /// main loop derives the scope from the cursor (Session→Models path).
+    /// `Some(scope)` is used when the scope is known ahead of time
+    /// (e.g. Peer→Agents → AgentGlobal).
+    OpenModelPicker(Option<ModelPickerScope>),
     /// Dispatch a backend command on behalf of the Settings page. Used
     /// for direct-action keys like `[d]` remove on the session-agents
     /// list — no prompt, just fire and refresh.
@@ -1507,7 +1533,24 @@ pub(super) fn handle_settings_key(
                     Some(super::SessionSettingsCategory::Models)
                 )
             {
-                return SettingsKey::OpenModelPicker;
+                return SettingsKey::OpenModelPicker(None);
+            }
+            // Peer→Agents in detail focus: Enter opens the picker for
+            // agent-global model (DB-level `AgentDbConfig.model`).
+            if matches!(scope, SettingsScope::Peer)
+                && matches!(
+                    super::PeerSettingsCategory::ALL.get(cur),
+                    Some(super::PeerSettingsCategory::Agents)
+                )
+                && matches!(focus, SettingsFocus::Detail)
+            {
+                if let Some(name) =
+                    app.peer_agents_names.get(app.peer_agents_cursor).cloned()
+                {
+                    return SettingsKey::OpenModelPicker(Some(
+                        ModelPickerScope::AgentGlobal(name),
+                    ));
+                }
             }
             // Otherwise Enter on the sidebar dives into the detail pane
             // when one exists — same effect as Right.

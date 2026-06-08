@@ -141,12 +141,19 @@ pub(super) async fn agent_room(ctx: &CommandContext<'_>) -> CommandOutcome {
         ctx.session_db.clone(),
     )
     .await;
-    let budget = ctx.server.agent_burst_budget();
+    let budget = meta
+        .burst_budget_override
+        .unwrap_or_else(|| ctx.server.agent_burst_budget());
+    let budget_label = if meta.burst_budget_override.is_some() {
+        format!("{budget} (session override)")
+    } else {
+        format!("{budget} (default)")
+    };
     let burst = crate::session::trailing_agent_message_burst(session.entries(), |name| {
         ctx.server.agents().get(name).is_some()
     });
     out.push_str(&format!(
-        "  agent→agent burst: {burst}/{budget}{}\n",
+        "  agent→agent burst: {burst}/{budget_label}{}\n",
         if burst >= budget {
             " (exhausted — agent→agent wakes suppressed until a human or schedule speaks)"
         } else {
@@ -198,6 +205,49 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
                 return CommandOutcome::Error(format!("Failed to set host agent: {e}"));
             }
             CommandOutcome::Text(format!("Set host agent to '{name}'"))
+        }
+    }
+}
+
+/// `/agent burst <n>` — set a per-session agent→agent burst budget override.
+/// `Some(n)` stores `n` in `SessionMeta.burst_budget_override` (n ≥ 1);
+/// `None` clears it so the global default applies.
+pub(super) async fn agent_set_burst(
+    n: Option<usize>,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
+
+    match n {
+        None => {
+            if let Err(e) = session
+                .update_meta(|m| m.burst_budget_override = None)
+                .await
+            {
+                return CommandOutcome::Error(format!("Failed to clear burst budget: {e}"));
+            }
+            let global = ctx.server.agent_burst_budget();
+            CommandOutcome::Text(format!(
+                "Cleared burst budget override — global default ({global}) applies"
+            ))
+        }
+        Some(val) => {
+            if val < 1 {
+                return CommandOutcome::Error(
+                    "Burst budget must be ≥ 1".to_string(),
+                );
+            }
+            if let Err(e) = session
+                .update_meta(move |m| m.burst_budget_override = Some(val))
+                .await
+            {
+                return CommandOutcome::Error(format!("Failed to set burst budget: {e}"));
+            }
+            CommandOutcome::Text(format!("Set burst budget to {val} (session override)"))
         }
     }
 }

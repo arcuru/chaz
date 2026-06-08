@@ -127,7 +127,7 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cur) {
             Some(PeerSettingsCategory::Agents) => {
                 if detail {
-                    " ↑↓ select · ← back · [r] reload yaml · Esc back "
+                    " ↑↓ select · ← back · Enter model · [r] reload yaml · Esc back "
                 } else {
                     " ↑↓/Tab category · → list · [r] reload yaml · Esc back "
                 }
@@ -497,7 +497,7 @@ fn render_peer_agents(
         });
     detail.push(Line::from(""));
     detail.push(Line::from(vec![Span::styled(
-        "  [r] reload this agent from yaml",
+        "  Enter — set default model · [r] reload from yaml",
         Style::default().fg(theme::DIM),
     )]));
     f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);

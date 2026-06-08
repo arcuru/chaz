@@ -199,13 +199,16 @@ impl SessionSettingsCategory {
 pub(super) enum ModelPickerScope {
     Session,
     Agent(String),
+    /// Agent-level (DB) scope — writes to the agent's `AgentDbConfig.model`,
+    /// not the session meta. Used from Peer→Agents detail Enter.
+    AgentGlobal(String),
 }
 
 impl ModelPickerScope {
     pub(super) fn label(&self) -> &str {
         match self {
             ModelPickerScope::Session => "Session",
-            ModelPickerScope::Agent(name) => name,
+            ModelPickerScope::Agent(name) | ModelPickerScope::AgentGlobal(name) => name,
         }
     }
 }
@@ -796,7 +799,7 @@ impl App {
     pub(super) fn seed_model_picker(
         &mut self,
         backend: &BackendManager,
-        meta: &SessionMeta,
+        current_pin: Option<String>,
         scope: ModelPickerScope,
     ) {
         self.model_picker_favorites = backend.list_known_models_with_info();
@@ -804,12 +807,7 @@ impl App {
         self.model_search.clear();
         self.model_picker_scroll = 0;
 
-        // Compute the pin for just the active scope. Used for the
-        // `(current)` annotation and floating-active sort.
-        self.model_picker_current_pin = match &scope {
-            ModelPickerScope::Session => meta.model.clone(),
-            ModelPickerScope::Agent(name) => meta.agent_models.get(name).cloned(),
-        };
+        self.model_picker_current_pin = current_pin;
         self.model_picker_scope = scope;
 
         self.rebuild_model_list(Vec::new());
@@ -1231,14 +1229,32 @@ async fn handle_chat_action(
             app.open_settings(scope, TuiMode::Chat);
         }
         ChatAction::OpenModelPicker { scope } => {
-            // Read meta synchronously so we can snapshot the pin for the
-            // caller-selected scope before the picker mounts.
-            let session_db = app.active().session_db.clone();
-            let session_db_id = app.active().session_db_id.clone();
-            let session =
-                Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
-            let meta = session.read_meta().await;
-            app.seed_model_picker(backend, &meta, scope);
+            // Read the current pin for the caller-selected scope so we
+            // can show `(current)` in the picker. Session and Agent
+            // scopes read from session meta; AgentGlobal reads from
+            // the in-memory agent registry.
+            let current_pin = match &scope {
+                ModelPickerScope::Session | ModelPickerScope::Agent(_) => {
+                    let session_db = app.active().session_db.clone();
+                    let session_db_id = app.active().session_db_id.clone();
+                    let session = Session::new(
+                        chaz_core::types::ConversationId(session_db_id),
+                        session_db,
+                    )
+                    .await;
+                    let meta = session.read_meta().await;
+                    match &scope {
+                        ModelPickerScope::Session => meta.model.clone(),
+                        ModelPickerScope::Agent(name) => meta.agent_models.get(name).cloned(),
+                        _ => unreachable!(),
+                    }
+                }
+                ModelPickerScope::AgentGlobal(name) => server
+                    .agents()
+                    .get(name)
+                    .and_then(|a| a.default_model.clone()),
+            };
+            app.seed_model_picker(backend, current_pin, scope);
             // Reuse the session's in-memory catalog if we've already pulled it;
             // otherwise kick off a live fetch. Browsing never persists — only
             // the model the user selects does (see `dispatch_model_selection`).
@@ -1488,6 +1504,11 @@ async fn dispatch_model_selection(
             agent: name,
             model: Some(model_id),
         },
+        ModelPickerScope::AgentGlobal(name) => Command::AgentSet {
+            agent_ref: name,
+            field: "model".to_string(),
+            value: model_id,
+        },
     };
     let outcome = commands::dispatch(cmd, &ctx).await;
     // Record the now-in-use model so the runtime budgets its window (this
@@ -1517,12 +1538,11 @@ async fn handle_settings_outcome(
 ) {
     match outcome {
         input::SettingsKey::None => {}
-        input::SettingsKey::OpenModelPicker => {
-            // Row 0 in the Models page is the session pin; rows 1..n
-            // are per-agent overrides indexed against the session
-            // settings snapshot. Translate cursor → scope here so the
-            // picker mounts pre-scoped.
-            let scope = models_scope_from_cursor(app);
+        input::SettingsKey::OpenModelPicker(given_scope) => {
+            // When the caller already knows the scope (e.g. Peer→Agents →
+            // AgentGlobal), use it directly. Otherwise derive from the
+            // cursor (Session→Models path).
+            let scope = given_scope.unwrap_or_else(|| models_scope_from_cursor(app));
             handle_chat_action(
                 ChatAction::OpenModelPicker { scope },
                 app,

@@ -111,6 +111,9 @@ pub enum Command {
     /// Designate the "host agent" — answers when no @mention pins a turn.
     /// `Some(ref)` sets it; `None` clears it.
     AgentSetHost(Option<String>),
+    /// Set/clear the per-session agent→agent burst budget override.
+    /// `Some(n)` sets it (n ≥ 1); `None` clears it.
+    AgentSetBurst(Option<usize>),
 
     // --- Agent lifecycle ---
     /// Create a new Living Agent DB. Optional `overrides` apply to the
@@ -353,6 +356,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentsList => agent::agents_list(ctx).await,
         Command::AgentRoom => agent::agent_room(ctx).await,
         Command::AgentSetHost(arg) => agent::agent_set_host(arg.as_deref(), ctx).await,
+        Command::AgentSetBurst(n) => agent::agent_set_burst(n, ctx).await,
         Command::AgentNew { name, overrides } => agent::agent_new(&name, &overrides, ctx).await,
         Command::AgentShare(r) => agent::agent_share(&r, ctx).await,
         Command::AgentUnshare(r) => agent::agent_unshare(&r, ctx).await,
