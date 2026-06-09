@@ -374,6 +374,7 @@ mod tests {
                 context_tokens: None,
                 extra: Default::default(),
             }),
+            routing: None,
         }
     }
 

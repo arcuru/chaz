@@ -936,6 +936,7 @@ async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
             timestamp: Utc::now(),
             entry_type: EntryType::Message,
             metadata: None,
+            routing: None,
         })
         .await;
 }

@@ -68,6 +68,11 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
                         timestamp,
                         entry_type: EntryType::Message,
                         metadata: None,
+                        // Backfilled history is context only — not live
+                        // inbound needing a reply — so it carries no
+                        // transport routing. (Live messages get `source`
+                        // stamped by the ingester in mod.rs.)
+                        routing: None,
                     });
                 }
             }

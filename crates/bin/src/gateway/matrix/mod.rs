@@ -9,7 +9,7 @@ use chaz_core::config::Config;
 use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
-use chaz_core::session::{EntryType, Session, SessionEntry};
+use chaz_core::session::{EntryRouting, EntryType, Session, SessionEntry, TransportRef};
 
 use headjack::*;
 use matrix_sdk::Room;
@@ -52,6 +52,13 @@ fn make_room_approval_tx(
 pub struct MatrixGateway {
     config: Config,
     secrets: SecretStore,
+    /// Stable id of the login this gateway runs. Today there is one login
+    /// per process, identified by its MXID (`config.username`); when the
+    /// peer-level `logins:` config lands (chunk 3), this is set per login
+    /// and the spawn loop runs one gateway per login. Stamped into every
+    /// inbound entry's `TransportRef::login_id` so publishers can tell
+    /// shared from dedicated logins apart on the same transport.
+    login_id: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
     /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
     /// instead of looping on `bot.run()`.
@@ -70,9 +77,11 @@ impl MatrixGateway {
         if config.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
+        let login_id = config.username.clone();
         Ok(Self {
             config,
             secrets,
+            login_id,
             shutdown,
         })
     }
@@ -1020,6 +1029,7 @@ impl Gateway for MatrixGateway {
                 Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             let attached_sessions = attached_sessions.clone();
+            let login_id = self.login_id.clone();
             bot.register_text_handler(move |sender, body: String, room, event| {
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
@@ -1029,6 +1039,7 @@ impl Gateway for MatrixGateway {
                 let server = server.clone();
                 let approval_relay_tx = approval_relay_tx.clone();
                 let attached_sessions = attached_sessions.clone();
+                let login_id = login_id.clone();
                 async move {
                     {
                         let mut seen = seen_events.lock().await;
@@ -1145,6 +1156,20 @@ impl Gateway for MatrixGateway {
                             timestamp: chrono::Utc::now(),
                             entry_type: EntryType::Message,
                             metadata: None,
+                            // Stamp transport provenance so an outbound
+                            // publisher (chunk 5) can route replies back to
+                            // this room on this login.
+                            routing: Some(EntryRouting {
+                                source: Some(TransportRef {
+                                    transport: "matrix".to_string(),
+                                    login_id: login_id.clone(),
+                                    channel: room.room_id().to_string(),
+                                    sender: Some(sender.to_string()),
+                                    sender_display: None,
+                                    message_id: Some(event.event_id.to_string()),
+                                }),
+                                ..Default::default()
+                            }),
                         })
                         .await;
 

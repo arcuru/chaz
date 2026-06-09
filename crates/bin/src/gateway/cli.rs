@@ -126,6 +126,7 @@ impl Gateway for CliGateway {
                 timestamp: chrono::Utc::now(),
                 entry_type: EntryType::Message,
                 metadata: None,
+                routing: None,
             })
             .await;
 

@@ -57,6 +57,7 @@ impl Tool for Compact {
                 timestamp: Utc::now(),
                 entry_type: EntryType::Summary,
                 metadata: None,
+                routing: None,
             };
 
             let mut session = ctx.session.lock().await;

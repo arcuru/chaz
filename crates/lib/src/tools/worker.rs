@@ -254,6 +254,7 @@ impl Tool for SpawnWorker {
                     timestamp: chrono::Utc::now(),
                     entry_type: EntryType::Directive,
                     metadata: None,
+                    routing: None,
                 })
                 .await;
 

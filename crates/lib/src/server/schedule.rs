@@ -537,6 +537,7 @@ impl Server {
                             timestamp: Utc::now(),
                             entry_type: EntryType::ToolCall,
                             metadata: None,
+                            routing: None,
                         })
                         .await;
                     }
@@ -563,6 +564,7 @@ impl Server {
                             timestamp: Utc::now(),
                             entry_type: EntryType::ToolResult,
                             metadata: None,
+                            routing: None,
                         })
                         .await;
                     }
@@ -607,6 +609,7 @@ impl Server {
                     timestamp: Utc::now(),
                     entry_type: EntryType::Message,
                     metadata: outcome.metadata.clone(),
+                    routing: None,
                 })
                 .await;
             }
@@ -617,6 +620,7 @@ impl Server {
                     timestamp: Utc::now(),
                     entry_type: EntryType::Error,
                     metadata: None,
+                    routing: None,
                 })
                 .await;
             }

@@ -77,6 +77,66 @@ pub struct SessionEntry {
     pub entry_type: EntryType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<crate::runtime::ResponseMetadata>,
+    /// Transport routing provenance. Present on entries that entered or
+    /// leave the session via an external gateway (Matrix, Discord, …);
+    /// `None` for purely local entries (TUI/CLI chat, tool audit, summaries),
+    /// which is the common case. Grouped into one optional field so the
+    /// many [`SessionEntry`] construction sites stay a one-line `routing:
+    /// None` and future routing fields add zero per-site churn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<EntryRouting>,
+}
+
+/// Transport routing metadata for a [`SessionEntry`].
+///
+/// The session DB is the only channel between gateways and the runtime: an
+/// ingester stamps `source` on inbound user entries; a publisher (one per
+/// login) scans outbound assistant entries and acts on those whose
+/// `reply_to`/`destinations` resolve to its own `(transport, login_id)`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EntryRouting {
+    /// Set by the gateway ingester on inbound user messages: which
+    /// transport/login/channel this entry arrived on, and from whom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TransportRef>,
+    /// Default-reply pointer: the transport `message_id` of the inbound
+    /// entry this is a reply to. The publisher resolves the destination by
+    /// finding the referenced entry and reading its `source`. Lets the
+    /// runtime stay transport-agnostic for the chat-in → chat-out case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// Explicit destinations for proactive / cross-transport sends. Each
+    /// publisher sends the entries whose destination matches its own
+    /// `(transport, login_id)`. Empty for the implicit reply-to-source path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<TransportRef>,
+}
+
+/// A transport-scoped address: where a message came from or should go.
+///
+/// `login_id` disambiguates two logins running on the same transport (one
+/// shared across agents, one dedicated) — a publisher only acts on refs
+/// matching its own login. See the gateway design doc for the full model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportRef {
+    /// Stable transport identifier — "matrix", "discord", "sms".
+    pub transport: String,
+    /// Which login received (source) / should send (destination) this.
+    pub login_id: String,
+    /// Transport-scoped channel address — Matrix room_id, Discord
+    /// channel_id, phone number.
+    pub channel: String,
+    /// Sender of an inbound message (Matrix MXID, etc.). Set on `source`,
+    /// unset on `destinations`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// Sender display name at receipt time, for natural addressing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display: Option<String>,
+    /// Transport-native message id, for threading / edits / reactions and
+    /// as the target of another entry's `reply_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// A reference to an agent authorized to participate in a session.
@@ -837,6 +897,7 @@ mod tests {
             timestamp: Utc::now(),
             entry_type: ty,
             metadata: None,
+            routing: None,
         };
 
         // Empty / no trailing agent messages.
@@ -878,5 +939,72 @@ mod tests {
             mk("patrick", EntryType::Message),
         ];
         assert_eq!(trailing_agent_message_burst(&human_last, is_agent), 0);
+    }
+
+    /// Entries persisted before the `routing` field existed have no
+    /// `routing` key in their stored JSON. They must still deserialize
+    /// (to `routing: None`) so the schema change is backward-compatible
+    /// with already-synced session DBs.
+    #[test]
+    fn legacy_entry_without_routing_deserializes_to_none() {
+        let legacy = r#"{
+            "sender": "patrick",
+            "content": "hi",
+            "timestamp": "2026-06-08T00:00:00Z",
+            "entry_type": "Message"
+        }"#;
+        let entry: SessionEntry = serde_json::from_str(legacy).unwrap();
+        assert!(entry.routing.is_none());
+        assert_eq!(entry.sender, "patrick");
+    }
+
+    /// A local entry (no routing) serializes without a `routing` key —
+    /// `skip_serializing_if` keeps the common case from bloating, and the
+    /// absence is what the legacy-read test above relies on.
+    #[test]
+    fn entry_without_routing_omits_the_field() {
+        let entry = SessionEntry {
+            sender: "patrick".to_string(),
+            content: "hi".to_string(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("routing"), "got: {json}");
+    }
+
+    /// An inbound transport entry round-trips its `source` provenance,
+    /// including the `login_id` that distinguishes shared from dedicated
+    /// logins on the same transport.
+    #[test]
+    fn entry_with_source_round_trips() {
+        let entry = SessionEntry {
+            sender: "@alice:example.com".to_string(),
+            content: "hi".to_string(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: Some(EntryRouting {
+                source: Some(TransportRef {
+                    transport: "matrix".to_string(),
+                    login_id: "@bot:example.com".to_string(),
+                    channel: "!room:example.com".to_string(),
+                    sender: Some("@alice:example.com".to_string()),
+                    sender_display: None,
+                    message_id: Some("$evt".to_string()),
+                }),
+                reply_to: None,
+                destinations: Vec::new(),
+            }),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SessionEntry = serde_json::from_str(&json).unwrap();
+        let src = back.routing.unwrap().source.unwrap();
+        assert_eq!(src.transport, "matrix");
+        assert_eq!(src.login_id, "@bot:example.com");
+        assert_eq!(src.channel, "!room:example.com");
+        assert_eq!(src.message_id.as_deref(), Some("$evt"));
     }
 }

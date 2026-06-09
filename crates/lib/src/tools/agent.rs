@@ -218,6 +218,7 @@ impl Tool for SpawnAgent {
                     timestamp: chrono::Utc::now(),
                     entry_type: EntryType::Directive,
                     metadata: None,
+                    routing: None,
                 })
                 .await;
 

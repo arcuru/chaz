@@ -345,6 +345,7 @@ mod tests {
             timestamp: Utc::now(),
             entry_type,
             metadata: None,
+            routing: None,
         }
     }
 

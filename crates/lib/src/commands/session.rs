@@ -388,6 +388,7 @@ pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
         timestamp: chrono::Utc::now(),
         entry_type: EntryType::Summary,
         metadata: None,
+        routing: None,
     };
 
     let write = async {

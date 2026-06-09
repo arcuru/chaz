@@ -1214,6 +1214,7 @@ async fn handle_chat_action(
                     timestamp: chrono::Utc::now(),
                     entry_type: EntryType::Message,
                     metadata: None,
+                    routing: None,
                 })
                 .await;
             tab.waiting = true;
@@ -1237,11 +1238,9 @@ async fn handle_chat_action(
                 ModelPickerScope::Session | ModelPickerScope::Agent(_) => {
                     let session_db = app.active().session_db.clone();
                     let session_db_id = app.active().session_db_id.clone();
-                    let session = Session::new(
-                        chaz_core::types::ConversationId(session_db_id),
-                        session_db,
-                    )
-                    .await;
+                    let session =
+                        Session::new(chaz_core::types::ConversationId(session_db_id), session_db)
+                            .await;
                     let meta = session.read_meta().await;
                     match &scope {
                         ModelPickerScope::Session => meta.model.clone(),
@@ -1874,6 +1873,7 @@ pub(super) fn show_system_msg(app: &mut App, content: String) {
         timestamp: chrono::Utc::now(),
         entry_type: EntryType::Message,
         metadata: None,
+        routing: None,
     });
 }
 
@@ -1884,5 +1884,6 @@ pub(super) fn show_error(app: &mut App, content: String) {
         timestamp: chrono::Utc::now(),
         entry_type: EntryType::Error,
         metadata: None,
+        routing: None,
     });
 }
