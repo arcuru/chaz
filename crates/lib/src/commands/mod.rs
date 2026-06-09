@@ -27,10 +27,12 @@ use std::sync::Arc;
 
 mod agent;
 mod extensions;
+mod parse;
 mod session;
 mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
+pub use parse::{Parsed, parse};
 
 /// User-visible permission level for co-ownership grants on an Agent DB.
 /// Stays separate from eidetica's `Permission` so the CLI grammar is
@@ -66,6 +68,7 @@ pub fn parse_permission_token(tok: &str) -> Option<CoOwnerPermission> {
 }
 
 /// Parsed, transport-neutral command intent.
+#[derive(Debug)]
 pub enum Command {
     // --- Session management ---
     /// Enumerate all known sessions (TUI opens a picker; Matrix renders text).
