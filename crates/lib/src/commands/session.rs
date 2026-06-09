@@ -155,13 +155,14 @@ pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
     let channels = ctx
         .server
         .registry()
-        .matrix_channels_for_session(ctx.session_db_id)
+        .channels_for_session(ctx.session_db_id)
         .await
         .unwrap_or_default();
     let channels_line = if channels.is_empty() {
         String::new()
     } else {
-        format!("\nMatrix rooms: {}", channels.join(", "))
+        let rooms: Vec<String> = channels.into_iter().map(|(_t, _l, c)| c).collect();
+        format!("\nMatrix rooms: {}", rooms.join(", "))
     };
     let usage_line = format_usage_summary(entries);
     CommandOutcome::Text(format!(
@@ -449,16 +450,19 @@ pub(super) async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
     match ctx
         .server
         .registry()
-        .matrix_channels_for_session(ctx.session_db_id)
+        .channels_for_session(ctx.session_db_id)
         .await
     {
         Ok(channels) if channels.is_empty() => {
             CommandOutcome::Text("No Matrix rooms attached to this session.".to_string())
         }
-        Ok(channels) => CommandOutcome::Text(format!(
-            "Matrix rooms attached to this session:\n  {}",
-            channels.join("\n  ")
-        )),
+        Ok(channels) => {
+            let rooms: Vec<String> = channels.into_iter().map(|(_t, _l, c)| c).collect();
+            CommandOutcome::Text(format!(
+                "Matrix rooms attached to this session:\n  {}",
+                rooms.join("\n  ")
+            ))
+        }
         Err(e) => CommandOutcome::Error(format!("Failed to list channels: {e}")),
     }
 }

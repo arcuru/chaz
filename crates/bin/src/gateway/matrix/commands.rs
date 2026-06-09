@@ -221,7 +221,9 @@ pub async fn get_backend(
 ) -> BackendManager {
     let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
-    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await
+    if let Ok(Some(session_db_id)) = registry
+        .external_channel_session("matrix", &config.username, &room_id)
+        .await
         && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
     {
         let meta = chaz_core::session::read_meta_from_db(&db).await;
@@ -354,7 +356,9 @@ pub async fn get_context(
     }
     // Apply session meta overrides from the session DB
     let room_id = room.room_id().to_string();
-    if let Ok(Some(session_db_id)) = registry.matrix_channel_for_room(&room_id).await
+    if let Ok(Some(session_db_id)) = registry
+        .external_channel_session("matrix", &config.username, &room_id)
+        .await
         && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
     {
         let meta = chaz_core::session::read_meta_from_db(&db).await;

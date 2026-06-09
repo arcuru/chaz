@@ -28,9 +28,13 @@ pub struct NewSessionEvent {
 /// canonical sync-ful state lives in per-session, per-agent, and per-bank DBs.
 ///
 /// `chaz_group` — group-level routing/metadata. Stores:
-/// - `sessions`        (DocStore)  — `session_db_id` → `source` (origin tag)
-/// - `matrix_channels` (DocStore)  — `room_id` → `session_db_id`
-/// - `session_names`   (DocStore)  — `name` → `session_db_id`
+/// - `sessions`          (DocStore)  — `session_db_id` → `source` (origin tag)
+/// - `external_channels` (DocStore)  — `(transport, login_id, channel)` → `session_db_id`
+/// - `session_names`     (DocStore)  — `name` → `session_db_id`
+///
+/// `external_channels` supersedes the legacy Matrix-only `matrix_channels`
+/// (`room_id` → `session_db_id`); the gateway migrates the old store on
+/// startup via [`SessionRegistry::migrate_legacy_matrix_channels`].
 ///
 /// Hosted-agent and hosted-bank lookups live in the in-memory
 /// [`crate::hosted_index::HostedIndex`] caches built at startup from
@@ -54,7 +58,12 @@ pub struct SessionRegistry {
 }
 
 pub(super) const STORE_SESSIONS: &str = "sessions";
-pub(super) const STORE_MATRIX_CHANNELS: &str = "matrix_channels";
+/// Channel→session index keyed by `(transport, login_id, channel)`. See
+/// [`super::channels`].
+pub(super) const STORE_EXTERNAL_CHANNELS: &str = "external_channels";
+/// Legacy Matrix-only channel index (`room_id` → `session_db_id`), read once
+/// by [`SessionRegistry::migrate_legacy_matrix_channels`] then drained.
+pub(super) const STORE_LEGACY_MATRIX_CHANNELS: &str = "matrix_channels";
 pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// User-central session catalog. Companion to `STORE_SESSIONS`; the routing
 /// index there stays a cheap id→source map, while this store holds rich

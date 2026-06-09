@@ -137,7 +137,7 @@ async fn dispatch_in_room(
 
     let (_conv_id, session_db) = server
         .registry()
-        .get_or_create_matrix_session(&room_id)
+        .get_or_create_channel_session("matrix", &config.username, &room_id)
         .await?;
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(&room, &config, &secrets, server.registry()).await;
@@ -687,7 +687,7 @@ impl Gateway for MatrixGateway {
                         let target_sid = target_db.root_id().to_string();
                         if let Err(e) = server
                             .registry()
-                            .attach_matrix_room(&room_id, &target_sid)
+                            .attach_channel("matrix", &config.username, &room_id, &target_sid)
                             .await
                         {
                             let _ = room
@@ -735,15 +735,21 @@ impl Gateway for MatrixGateway {
 
         {
             let server = server.clone();
+            let login_id = config.username.clone();
             bot.register_text_command(
                 "detach",
                 "".to_string(),
                 "Detach this room from its session".to_string(),
                 move |_, _text, room| {
                     let server = server.clone();
+                    let login_id = login_id.clone();
                     async move {
                         let room_id = room.room_id().to_string();
-                        match server.registry().detach_matrix_room(&room_id).await {
+                        match server
+                            .registry()
+                            .detach_channel("matrix", &login_id, &room_id)
+                            .await
+                        {
                             Ok(()) => {
                                 let _ = room
                                     .send(RoomMessageEventContent::notice_plain(
@@ -999,9 +1005,23 @@ impl Gateway for MatrixGateway {
             let config = config.clone();
             let secrets = self.secrets.clone();
             tokio::spawn(async move {
-                match server.registry().list_matrix_channels().await {
+                // Fold any legacy Matrix-only bindings into external_channels
+                // under this login before we read them back.
+                match server
+                    .registry()
+                    .migrate_legacy_matrix_channels(&config.username)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => info!("Migrated {n} legacy matrix channel(s) to external_channels"),
+                    Err(e) => error!("Legacy matrix channel migration failed: {e}"),
+                }
+                match server.registry().list_channels().await {
                     Ok(channels) => {
-                        for (room_id, session_db_id) in channels {
+                        for (transport, login_id, room_id, session_db_id) in channels {
+                            if transport != "matrix" || login_id != config.username {
+                                continue;
+                            }
                             attach_existing_channel(
                                 &server,
                                 &client,
@@ -1014,7 +1034,7 @@ impl Gateway for MatrixGateway {
                             .await;
                         }
                     }
-                    Err(e) => error!("Failed to list matrix channels at startup: {e}"),
+                    Err(e) => error!("Failed to list channels at startup: {e}"),
                 }
             });
         }
@@ -1082,7 +1102,7 @@ impl Gateway for MatrixGateway {
 
                     let (_conv_id, session_db) = match server
                         .registry()
-                        .get_or_create_matrix_session(&room_id)
+                        .get_or_create_channel_session("matrix", &config.username, &room_id)
                         .await
                     {
                         Ok(r) => r,

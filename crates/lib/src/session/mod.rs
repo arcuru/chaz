@@ -7,7 +7,7 @@
 //! - `meta`    (DocStore)            — session configuration (name, agent, model, ...)
 //!
 //! The registry (inside `chaz_group`) holds only indices: `sessions`,
-//! `matrix_channels`, `session_names`. Canonical per-session config lives
+//! `external_channels`, `session_names`. Canonical per-session config lives
 //! in each session's own DB (`SessionMeta`) so it syncs with the session.
 //!
 //! Submodules split `impl SessionRegistry` blocks by concern:
