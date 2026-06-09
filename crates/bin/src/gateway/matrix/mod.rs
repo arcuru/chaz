@@ -111,6 +111,20 @@ impl MatrixGateway {
     }
 }
 
+/// Render an agent's session write for this login's Matrix room.
+///
+/// A login belongs to one agent. The owning agent speaks as the room's Matrix
+/// user, so its writes go out plain; any other agent writing into this session
+/// is a guest, shown with an `[AgentName]` prefix so readers can tell speakers
+/// apart under the single MXID.
+fn render_outbound(owning_agent: &str, sender: &str, content: &str) -> String {
+    if sender == owning_agent {
+        content.to_string()
+    } else {
+        format!("[{sender}] {content}")
+    }
+}
+
 /// Install a response-delivery callback on a session DB that forwards any
 /// agent `Message` entries to the given Matrix room. Idempotent: the
 /// `attached` set is the caller's dedupe gate.
@@ -118,12 +132,14 @@ fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
     agents: Arc<chaz_core::agent::AgentRegistry>,
+    owning_agent: String,
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
     session_db
         .on_write(move |_event, db| {
             let room = room.clone();
             let agents = agents.clone();
+            let owning_agent = owning_agent.clone();
             let db = db.clone();
             let sid = session_db_id.clone();
             Box::pin(async move {
@@ -132,12 +148,9 @@ fn attach_response_callback(
                     && latest.entry_type == EntryType::Message
                     && agents.get(&latest.sender).is_some()
                 {
-                    info!(
-                        "→ Matrix({}): {}",
-                        room.room_id(),
-                        latest.content.replace('\n', " ")
-                    );
-                    let content = RoomMessageEventContent::text_markdown(&latest.content);
+                    let body = render_outbound(&owning_agent, &latest.sender, &latest.content);
+                    info!("→ Matrix({}): {}", room.room_id(), body.replace('\n', " "));
+                    let content = RoomMessageEventContent::text_markdown(&body);
                     if let Err(e) = room.send(content).await {
                         tracing::error!("Failed to send to Matrix: {e}");
                     }
@@ -723,6 +736,7 @@ impl Gateway for MatrixGateway {
             let secrets = self.secrets.clone();
             let config = config.clone();
             let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
             let attached_sessions = attached_sessions.clone();
             bot.register_text_command(
                 "attach",
@@ -733,6 +747,7 @@ impl Gateway for MatrixGateway {
                     let secrets = secrets.clone();
                     let config = config.clone();
                     let login_id = login_id.clone();
+                    let owning_agent = owning_agent.clone();
                     let attached_sessions = attached_sessions.clone();
                     async move {
                         let arg = matrix_args(&text);
@@ -790,6 +805,7 @@ impl Gateway for MatrixGateway {
                                 &target_db,
                                 room.clone(),
                                 server.agents_arc(),
+                                owning_agent.clone(),
                             ) {
                                 error!("Failed to attach response callback: {e}");
                             }
@@ -1245,6 +1261,7 @@ impl Gateway for MatrixGateway {
                                 &session_db,
                                 room.clone(),
                                 server.agents_arc(),
+                                owning_agent.clone(),
                             ) {
                                 error!("Failed to register response callback: {e}");
                             } else {
@@ -1384,12 +1401,41 @@ async fn attach_existing_channel(
         }
     }
 
-    if let Err(e) = attach_response_callback(&session_db, room, server.agents_arc()) {
+    if let Err(e) = attach_response_callback(
+        &session_db,
+        room,
+        server.agents_arc(),
+        owning_agent.to_string(),
+    ) {
         error!("Failed to attach response callback at startup: {e}");
     } else {
         info!(
             session_db_id,
             room_id, "Matrix channel attached at startup (server + response callbacks installed)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_outbound;
+
+    #[test]
+    fn owning_agent_writes_go_out_plain() {
+        assert_eq!(render_outbound("ava", "ava", "clear skies"), "clear skies");
+    }
+
+    #[test]
+    fn guest_agent_writes_are_prefixed() {
+        assert_eq!(
+            render_outbound("ava", "scout", "logs look clean"),
+            "[scout] logs look clean"
+        );
+    }
+
+    #[test]
+    fn prefix_is_exact_name_match() {
+        // A different-cased or partial name is a distinct agent: still a guest.
+        assert_eq!(render_outbound("ava", "Ava", "hi"), "[Ava] hi");
     }
 }
