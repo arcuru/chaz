@@ -72,26 +72,41 @@ pub struct Config {
     pub agent_state_allowlist: HashMap<String, Vec<String>>,
     /// Multi-agent chat-room tuning. Omit to use built-in defaults.
     pub multi_agent: Option<MultiAgentConfig>,
-    /// Matrix logins — a peer-level resource. Each entry is one Matrix
-    /// identity the bot signs in as; the spawn loop runs one gateway per
-    /// login. Multiple agents may share a login and one agent may hold a
-    /// dedicated login (N:M agents↔logins). When omitted, a single login
-    /// is synthesized from the legacy top-level `homeserver_url` /
-    /// `username` / `password` / … fields (see [`Config::matrix_logins`]).
-    pub logins: Option<Vec<LoginConfig>>,
 }
 
-/// One Matrix login (peer-level resource). The `login_id` it exposes —
-/// `id` if set, else `username` — is the routing dimension that lets two
-/// logins on the same transport bind the same room to distinct sessions,
-/// and the per-login state-dir component that keeps their matrix client
-/// stores isolated.
+/// One login an agent owns on some transport. A login belongs to exactly
+/// one agent (`login → agent` is a function); an agent may own several
+/// logins (one per transport), but no login is ever shared. Declared in
+/// the owning agent's `logins:` list and discriminated by `type`, the same
+/// way `backends:` and `web_search.backends:` are — so adding a transport
+/// is a new [`TransportConfig`] variant + gateway impl, never a config
+/// schema change.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoginConfig {
-    /// Stable id for this login. Defaults to `username` when unset. Used
-    /// as the `login_id` routing key and the per-login state-dir name, so
-    /// keep it stable across restarts.
+    /// Stable id for this login — the `login_id` routing dimension and the
+    /// per-login state-dir name. Defaults to a transport-specific value
+    /// (the MXID for Matrix) when unset; keep it stable across restarts.
     pub id: Option<String>,
+    /// Explicit override for this login's transport-client state directory.
+    /// When unset, the spawn loop derives `{base}/{transport}/{login_id}`.
+    pub state_dir: Option<String>,
+    /// Transport-specific connection config, tagged by `type:`.
+    #[serde(flatten)]
+    pub transport: TransportConfig,
+}
+
+/// Transport-specific connection config for a [`LoginConfig`], selected by
+/// the `type:` field. Matrix is the only transport implemented today;
+/// Discord / email / Slack / etc. land as additional variants.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TransportConfig {
+    Matrix(MatrixLogin),
+}
+
+/// Matrix-transport credentials + per-login overrides.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MatrixLogin {
     /// Matrix homeserver URL.
     pub homeserver_url: String,
     /// Matrix username / MXID to log in as.
@@ -100,53 +115,112 @@ pub struct LoginConfig {
     pub password: Option<String>,
     /// Per-login allow list. Falls back to the top-level `allow_list`.
     pub allow_list: Option<String>,
-    /// Per-login room size limit. Falls back to the top-level
-    /// `room_size_limit`.
+    /// Per-login room size limit. Falls back to top-level `room_size_limit`.
     pub room_size_limit: Option<usize>,
-    /// Explicit override for this login's matrix client state directory.
-    /// When unset, the spawn loop derives one (`{base}/matrix/{login_id}`
-    /// for explicit logins; the legacy location for the synthesized login).
-    pub state_dir: Option<String>,
 }
 
 impl LoginConfig {
-    /// Stable identifier for this login: `id` if set, else `username`.
+    /// The transport tag used in `(transport, login_id, channel)` keys.
+    pub fn transport_kind(&self) -> &'static str {
+        match self.transport {
+            TransportConfig::Matrix(_) => "matrix",
+        }
+    }
+
+    /// Stable identifier for this login: explicit `id`, else a
+    /// transport-specific default (the MXID for Matrix).
     pub fn login_id(&self) -> &str {
-        self.id.as_deref().unwrap_or(&self.username)
+        self.id.as_deref().unwrap_or_else(|| match &self.transport {
+            TransportConfig::Matrix(m) => &m.username,
+        })
     }
 }
 
+/// A fully-resolved Matrix login ready to spawn a gateway: identity +
+/// credentials + the agent that owns it. Produced by
+/// [`Config::matrix_logins`] from each agent's `logins:` list (or, for
+/// backward compatibility, from the legacy top-level matrix fields).
+#[derive(Debug, Clone)]
+pub struct MatrixLoginSpec {
+    /// Routing/identity id (`login_id`) — also this login's transport identity.
+    pub login_id: String,
+    /// Agent that owns this login and hosts its rooms by default.
+    pub owning_agent: String,
+    pub homeserver_url: String,
+    pub username: String,
+    pub password: Option<String>,
+    pub allow_list: Option<String>,
+    pub room_size_limit: Option<usize>,
+    /// Explicit per-login state-dir override, if any.
+    pub state_dir: Option<String>,
+    /// True when declared under an agent's `logins:` (isolate state dir);
+    /// false for the legacy synthesized login (preserve historical path).
+    pub explicit: bool,
+}
+
 impl Config {
-    /// The effective list of Matrix logins to run. Prefers the explicit
-    /// `logins:` block; when it is absent or empty, synthesizes a single
-    /// login from the legacy top-level matrix fields for backward
-    /// compatibility. Returns empty when neither is configured (no Matrix).
-    pub fn matrix_logins(&self) -> Vec<LoginConfig> {
-        if let Some(logins) = &self.logins
-            && !logins.is_empty()
-        {
-            return logins.clone();
+    /// Resolve every Matrix login to spawn, each paired with its owning
+    /// agent. Collects each `type: matrix` entry from every agent's
+    /// `logins:` list; when no agent declares one, synthesizes a single
+    /// login from the legacy top-level matrix fields, owned by the default
+    /// agent. Returns empty when neither is configured (no Matrix).
+    pub fn matrix_logins(&self) -> Vec<MatrixLoginSpec> {
+        let mut out = Vec::new();
+        if let Some(agents) = &self.agents {
+            for agent in agents {
+                let Some(logins) = &agent.logins else {
+                    continue;
+                };
+                for login in logins {
+                    // Only matrix logins spawn a MatrixGateway; other
+                    // transports are collected by their own resolvers. A
+                    // match (not `if let`) so a new variant forces a decision.
+                    match &login.transport {
+                        TransportConfig::Matrix(m) => out.push(MatrixLoginSpec {
+                            login_id: login.login_id().to_string(),
+                            owning_agent: agent.name.clone(),
+                            homeserver_url: m.homeserver_url.clone(),
+                            username: m.username.clone(),
+                            password: m.password.clone(),
+                            allow_list: m.allow_list.clone(),
+                            room_size_limit: m.room_size_limit,
+                            state_dir: login.state_dir.clone(),
+                            explicit: true,
+                        }),
+                    }
+                }
+            }
         }
-        if !self.homeserver_url.is_empty() && !self.username.is_empty() {
-            return vec![LoginConfig {
-                id: None,
+        if out.is_empty() && !self.homeserver_url.is_empty() && !self.username.is_empty() {
+            out.push(MatrixLoginSpec {
+                login_id: self.username.clone(),
+                owning_agent: self.default_agent_name(),
                 homeserver_url: self.homeserver_url.clone(),
                 username: self.username.clone(),
                 password: self.password.clone(),
                 allow_list: self.allow_list.clone(),
                 room_size_limit: self.room_size_limit,
                 state_dir: None,
-            }];
+                explicit: false,
+            });
         }
-        Vec::new()
+        out
     }
 
-    /// True when logins come from an explicit `logins:` block rather than
-    /// being synthesized from the legacy top-level fields. Drives whether
-    /// the spawn loop isolates each login's state dir (safe for new
-    /// `logins:` entries) or preserves the legacy on-disk location.
-    pub fn has_explicit_logins(&self) -> bool {
-        self.logins.as_ref().is_some_and(|l| !l.is_empty())
+    /// Name of the default host agent — head of `default_agents`, else the
+    /// first entry in `agents:`, else `"default"`.
+    pub fn default_agent_name(&self) -> String {
+        self.default_agents
+            .as_ref()
+            .and_then(|d| d.first())
+            .cloned()
+            .or_else(|| {
+                self.agents
+                    .as_ref()
+                    .and_then(|a| a.first())
+                    .map(|a| a.name.clone())
+            })
+            .unwrap_or_else(|| "default".to_string())
     }
 }
 
@@ -348,6 +422,11 @@ pub struct AgentConfig {
     /// `default_memory_banks` — missing banks are logged at warn and
     /// skipped, auto-created on first reference if appropriate.
     pub default_skill_banks: Option<Vec<String>>,
+    /// Transport logins this agent owns. Each entry is one account on one
+    /// transport (a `type: matrix` MXID, a future `type: discord` token);
+    /// the spawn loop runs one gateway per login, routing its rooms to this
+    /// agent by default. A login belongs to exactly one agent — never shared.
+    pub logins: Option<Vec<LoginConfig>>,
 }
 
 /// Configuration for a Worker template under an Agent.
@@ -990,68 +1069,95 @@ username: "@bot:matrix.org"
 password: "s3cret"
 allow_list: "@alice:matrix.org"
 room_size_limit: 50
+agents:
+  - name: ava
+  - name: chaz
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(!cfg.has_explicit_logins());
         let logins = cfg.matrix_logins();
         assert_eq!(logins.len(), 1);
         let l = &logins[0];
         // login_id falls back to username when no explicit id.
-        assert_eq!(l.login_id(), "@bot:matrix.org");
+        assert_eq!(l.login_id, "@bot:matrix.org");
         assert_eq!(l.homeserver_url, "https://matrix.org");
         assert_eq!(l.password.as_deref(), Some("s3cret"));
         assert_eq!(l.allow_list.as_deref(), Some("@alice:matrix.org"));
         assert_eq!(l.room_size_limit, Some(50));
-        // Synthesized login leaves state_dir unset → legacy location preserved.
+        // Legacy login is owned by the default agent (first in agents:).
+        assert_eq!(l.owning_agent, "ava");
+        // Synthesized login is non-explicit → historical state-dir preserved.
+        assert!(!l.explicit);
         assert!(l.state_dir.is_none());
     }
 
     #[test]
-    fn matrix_logins_prefers_explicit_block() {
+    fn matrix_logins_collected_from_per_agent_logins() {
+        // Logins live under their owning agent as a type-tagged list.
         let yaml = r#"
 homeserver_url: "https://legacy.example"
 username: "@legacy:example"
-logins:
-  - homeserver_url: "https://a.example"
-    username: "@ava:a.example"
-    password: "pw-a"
-  - id: chaz-login
-    homeserver_url: "https://b.example"
-    username: "@chaz:b.example"
-    allow_list: "@boss:b.example"
+agents:
+  - name: ava
+    logins:
+      - type: matrix
+        homeserver_url: "https://a.example"
+        username: "@ava:a.example"
+        password: "pw-a"
+  - name: chaz
+    logins:
+      - type: matrix
+        id: chaz-login
+        homeserver_url: "https://b.example"
+        username: "@chaz:b.example"
+        allow_list: "@boss:b.example"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.has_explicit_logins());
         let logins = cfg.matrix_logins();
         assert_eq!(logins.len(), 2);
-        // First login_id defaults to its username; second uses explicit id.
-        assert_eq!(logins[0].login_id(), "@ava:a.example");
-        assert_eq!(logins[1].login_id(), "chaz-login");
+        // Each login is paired with its owning agent.
+        assert_eq!(logins[0].login_id, "@ava:a.example");
+        assert_eq!(logins[0].owning_agent, "ava");
+        assert!(logins[0].explicit);
+        // Second uses an explicit id and falls under chaz.
+        assert_eq!(logins[1].login_id, "chaz-login");
+        assert_eq!(logins[1].owning_agent, "chaz");
         assert_eq!(logins[1].allow_list.as_deref(), Some("@boss:b.example"));
-        // Legacy top-level fields are ignored once `logins:` is present.
+        // Legacy top-level fields are ignored once any agent declares a login.
+    }
+
+    #[test]
+    fn login_config_parses_type_tag_and_transport_kind() {
+        let yaml = r#"
+type: matrix
+homeserver_url: "https://s"
+username: "@u:s"
+"#;
+        let login: LoginConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(login.transport_kind(), "matrix");
+        assert_eq!(login.login_id(), "@u:s");
+        let TransportConfig::Matrix(m) = &login.transport;
+        assert_eq!(m.homeserver_url, "https://s");
     }
 
     #[test]
     fn matrix_logins_empty_when_nothing_configured() {
         let cfg: Config = serde_yaml::from_str("").unwrap();
-        assert!(!cfg.has_explicit_logins());
         assert!(cfg.matrix_logins().is_empty());
     }
 
     #[test]
-    fn matrix_logins_empty_block_falls_back_to_legacy() {
-        // An explicit-but-empty `logins: []` is treated as "not configured"
-        // and falls back to the legacy fields.
+    fn matrix_logins_empty_agent_list_falls_back_to_legacy() {
+        // No agent declares a login → fall back to the legacy fields,
+        // owned by the default agent name ("default" when no agents:).
         let yaml = r#"
 homeserver_url: "https://matrix.org"
 username: "@bot:matrix.org"
-logins: []
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(!cfg.has_explicit_logins());
         let logins = cfg.matrix_logins();
         assert_eq!(logins.len(), 1);
-        assert_eq!(logins[0].login_id(), "@bot:matrix.org");
+        assert_eq!(logins[0].login_id, "@bot:matrix.org");
+        assert_eq!(logins[0].owning_agent, "default");
     }
 
     #[test]

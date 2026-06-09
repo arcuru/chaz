@@ -855,7 +855,6 @@ async fn main() -> anyhow::Result<()> {
         let mut background_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
         let matrix_logins = config.matrix_logins();
-        let explicit_logins = config.has_explicit_logins();
         let matrix_configured = !matrix_logins.is_empty();
 
         if matrix_configured {
@@ -863,14 +862,15 @@ async fn main() -> anyhow::Result<()> {
                 info!("Matrix configured but --no-matrix supplied; not spawning");
             } else {
                 for login in matrix_logins {
-                    let login_id = login.login_id().to_string();
-                    // Per-login matrix client state dir. Explicit `logins:`
-                    // entries are isolated under `{base}/matrix/{login_id}`
+                    let login_id = login.login_id.clone();
+                    let owning_agent = login.owning_agent.clone();
+                    // Per-login matrix client state dir. Logins declared
+                    // under an agent are isolated under `{base}/matrix/{login_id}`
                     // so two logins never share a sync token / crypto store;
                     // the legacy synthesized login keeps its historical
                     // location so existing installs don't re-login.
                     let matrix_state_dir = login.state_dir.clone().or_else(|| {
-                        if explicit_logins {
+                        if login.explicit {
                             state_dir.as_ref().map(|base| {
                                 base.join("matrix")
                                     .join(sanitize_login_id(&login_id))
@@ -892,7 +892,7 @@ async fn main() -> anyhow::Result<()> {
                     background_handles.push(tokio::spawn(async move {
                         matrix_gateway.run(server_for_matrix).await
                     }));
-                    info!(login_id = %login_id, "Matrix gateway spawned in background");
+                    info!(login_id = %login_id, agent = %owning_agent, "Matrix gateway spawned in background");
                 }
             }
         }

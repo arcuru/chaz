@@ -5,7 +5,7 @@ use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, ExtensionsAction,
     split_ext_scope,
 };
-use chaz_core::config::{Config, LoginConfig};
+use chaz_core::config::{Config, MatrixLoginSpec};
 use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
@@ -50,11 +50,10 @@ fn make_room_approval_tx(
 }
 
 pub struct MatrixGateway {
-    /// The Matrix login this gateway signs in as — credentials plus the
-    /// per-login allow_list / room_size_limit overrides. One gateway runs
-    /// per login; the spawn loop in `main` builds one of these per entry in
-    /// the resolved `logins:` list.
-    login: LoginConfig,
+    /// The Matrix login this gateway signs in as — credentials, per-login
+    /// overrides, and the agent that owns it. One gateway runs per login;
+    /// the spawn loop in `main` builds one of these per resolved login.
+    login: MatrixLoginSpec,
     /// Resolved on-disk state directory for this login's matrix client
     /// (sync token, crypto store). For explicit `logins:` entries this is
     /// `{base}/matrix/{login_id}` so logins never collide on disk; for the
@@ -67,12 +66,15 @@ pub struct MatrixGateway {
     /// comes from `login` — but everything else still does.
     config: Config,
     secrets: SecretStore,
-    /// Stable id of the login this gateway runs (`login.login_id()`).
+    /// Stable id of the login this gateway runs (`login.login_id`).
     /// Stamped into every inbound entry's `TransportRef::login_id` and used
-    /// as the `login_id` dimension of every channel binding, so publishers
-    /// and routing can tell shared from dedicated logins apart on the same
-    /// transport.
+    /// as the `login_id` dimension of every channel binding. Since a login
+    /// belongs to one agent, it doubles as that agent's transport identity.
     login_id: String,
+    /// The agent that owns this login. Rooms on this login route to it by
+    /// default — it is the host for any session that hasn't been explicitly
+    /// re-hosted (via session meta `agent_name`).
+    owning_agent: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
     /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
     /// instead of looping on `bot.run()`.
@@ -81,7 +83,7 @@ pub struct MatrixGateway {
 
 impl MatrixGateway {
     pub fn new(
-        login: LoginConfig,
+        login: MatrixLoginSpec,
         state_dir: Option<String>,
         config: Config,
         secrets: SecretStore,
@@ -93,13 +95,15 @@ impl MatrixGateway {
         if login.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
-        let login_id = login.login_id().to_string();
+        let login_id = login.login_id.clone();
+        let owning_agent = login.owning_agent.clone();
         Ok(Self {
             login,
             state_dir,
             config,
             secrets,
             login_id,
+            owning_agent,
             shutdown,
         })
     }
@@ -151,6 +155,7 @@ async fn dispatch_in_room(
     config: Arc<Config>,
     secrets: SecretStore,
     login_id: &str,
+    owning_agent: &str,
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
@@ -161,9 +166,12 @@ async fn dispatch_in_room(
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
+    // Commands run in the context of the room's host — an explicit per-room
+    // agent if set, else this login's owning agent.
+    let host = meta.agent_name.as_deref().or(Some(owning_agent));
     let agent = server
         .registry()
-        .resolve_agent(&session_db_id, None, server.agent_index())
+        .resolve_agent(&session_db_id, host, server.agent_index())
         .await;
     let ctx = CommandContext {
         server: &server,
@@ -231,6 +239,7 @@ impl Gateway for MatrixGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let login = self.login;
         let login_id = self.login_id.clone();
+        let owning_agent = self.owning_agent.clone();
         let state_dir = self.state_dir;
         let config = Arc::new(self.config);
 
@@ -408,6 +417,7 @@ impl Gateway for MatrixGateway {
                 let config = config.clone();
                 let secrets = self.secrets.clone();
                 let login_id = login_id.clone();
+                let owning_agent = owning_agent.clone();
                 bot.register_text_command(
                     $name,
                     $usage,
@@ -417,12 +427,20 @@ impl Gateway for MatrixGateway {
                         let config = config.clone();
                         let secrets = secrets.clone();
                         let login_id = login_id.clone();
+                        let owning_agent = owning_agent.clone();
                         let cmd: Option<Command> = $cmd_expr;
                         async move {
                             if let Some(cmd) = cmd {
-                                if let Err(e) =
-                                    dispatch_in_room(cmd, room, server, config, secrets, &login_id)
-                                        .await
+                                if let Err(e) = dispatch_in_room(
+                                    cmd,
+                                    room,
+                                    server,
+                                    config,
+                                    secrets,
+                                    &login_id,
+                                    &owning_agent,
+                                )
+                                .await
                                 {
                                     tracing::error!("Command dispatch failed: {e}");
                                 }
@@ -929,6 +947,7 @@ impl Gateway for MatrixGateway {
             let config_c = config.clone();
             let secrets_c = self.secrets.clone();
             let login_id_c = login_id.clone();
+            let owning_agent_c = owning_agent.clone();
             bot.register_text_command(
                 &name_owned.clone(),
                 "[args...]".to_string(),
@@ -939,11 +958,20 @@ impl Gateway for MatrixGateway {
                     let config = config_c.clone();
                     let secrets = secrets_c.clone();
                     let login_id = login_id_c.clone();
+                    let owning_agent = owning_agent_c.clone();
                     async move {
                         let args = matrix_args(&text);
                         let cmd = Command::Extension { name, args };
-                        if let Err(e) =
-                            dispatch_in_room(cmd, room, server, config, secrets, &login_id).await
+                        if let Err(e) = dispatch_in_room(
+                            cmd,
+                            room,
+                            server,
+                            config,
+                            secrets,
+                            &login_id,
+                            &owning_agent,
+                        )
+                        .await
                         {
                             tracing::error!("Extension command dispatch failed: {e}");
                         }
@@ -1049,6 +1077,7 @@ impl Gateway for MatrixGateway {
             let config = config.clone();
             let secrets = self.secrets.clone();
             let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
             tokio::spawn(async move {
                 // Fold any legacy Matrix-only bindings into external_channels
                 // under this login before we read them back.
@@ -1074,6 +1103,7 @@ impl Gateway for MatrixGateway {
                                 &config,
                                 &secrets,
                                 &login_id,
+                                &owning_agent,
                                 &room_id,
                                 &session_db_id,
                             )
@@ -1096,6 +1126,7 @@ impl Gateway for MatrixGateway {
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             let attached_sessions = attached_sessions.clone();
             let login_id = self.login_id.clone();
+            let owning_agent = self.owning_agent.clone();
             bot.register_text_handler(move |sender, body: String, room, event| {
                 let config = config.clone();
                 let backfilled_rooms = backfilled_rooms.clone();
@@ -1106,6 +1137,7 @@ impl Gateway for MatrixGateway {
                 let approval_relay_tx = approval_relay_tx.clone();
                 let attached_sessions = attached_sessions.clone();
                 let login_id = login_id.clone();
+                let owning_agent = owning_agent.clone();
                 async move {
                     {
                         let mut seen = seen_events.lock().await;
@@ -1160,10 +1192,13 @@ impl Gateway for MatrixGateway {
                     };
                     let session_db_id = session_db.root_id().to_string();
 
-                    // Read agent override from session meta
+                    // Host agent: an explicit per-room agent from session meta,
+                    // else this login's owning agent (a login belongs to one
+                    // agent, which hosts its rooms by default).
                     let agent_override = chaz_core::session::read_meta_from_db(&session_db)
                         .await
-                        .agent_name;
+                        .agent_name
+                        .or_else(|| Some(owning_agent.clone()));
 
                     let approval_tx =
                         make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
@@ -1287,6 +1322,7 @@ async fn attach_existing_channel(
     config: &Arc<Config>,
     secrets: &SecretStore,
     login_id: &str,
+    owning_agent: &str,
     room_id: &str,
     session_db_id: &str,
 ) {
@@ -1305,7 +1341,8 @@ async fn attach_existing_channel(
 
     let agent_override = chaz_core::session::read_meta_from_db(&session_db)
         .await
-        .agent_name;
+        .agent_name
+        .or_else(|| Some(owning_agent.to_string()));
     let backend = get_backend(&room, config, secrets, server.registry(), login_id).await;
     if let Err(e) = server
         .register_session(&session_db, backend, agent_override, None)
