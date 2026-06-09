@@ -19,6 +19,40 @@ use tracing::{info, warn};
 use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
 
 impl SessionRegistry {
+    /// Ensure `agent` is attached to the session and is its host. Called by
+    /// a gateway when a fresh room maps to this session: a login belongs to
+    /// one agent, so that agent owns and hosts its rooms. Resolution then
+    /// picks it with no gateway involvement (host → first-authorized).
+    ///
+    /// Idempotent and cheap on the hot path: returns immediately once the
+    /// agent is in the session roster, so it only writes on first contact.
+    /// Sets `host_agent_db_id` only when unset — an explicit per-room
+    /// re-host (`/agent host`) is preserved.
+    pub async fn ensure_session_host(
+        &self,
+        session_db_id: &str,
+        agent: &DbEntry,
+    ) -> anyhow::Result<()> {
+        let (_conv, session_db) = self.open_session(session_db_id).await?;
+        let meta = read_meta_from_db(&session_db).await;
+        if meta
+            .agents
+            .iter()
+            .any(|a| a.db_id == agent.db_id.to_string())
+        {
+            return Ok(());
+        }
+        self.attach_agent_to_session(session_db_id, agent).await?;
+        let host_id = agent.db_id.to_string();
+        update_meta_on_db(&session_db, |m| {
+            if m.host_agent_db_id.is_none() {
+                m.host_agent_db_id = Some(host_id.clone());
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Attach an agent to a session. Grants the agent's pubkey Write
     /// permission on the session DB, mirrors into SessionMeta.agents, and
     /// appends to the agent DB's session-history log.
@@ -422,6 +456,69 @@ mod tests {
         let rows = history.search(|_| true).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.session_db_id, session_id);
+    }
+
+    #[tokio::test]
+    async fn ensure_session_host_attaches_and_designates_host() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+        let agent = make_agent_entry(&registry, "ava").await;
+
+        registry
+            .ensure_session_host(&session_id, &agent)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        // Attached as a writer and designated host.
+        assert_eq!(meta.agents.len(), 1);
+        assert_eq!(meta.agents[0].display_name, "ava");
+        assert_eq!(
+            meta.host_agent_db_id.as_deref(),
+            Some(agent.db_id.to_string().as_str())
+        );
+
+        // Idempotent: a second call doesn't duplicate the roster entry.
+        registry
+            .ensure_session_host(&session_id, &agent)
+            .await
+            .unwrap();
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_session_host_preserves_explicit_host() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        // A guest is already the explicit host before the owner shows up.
+        let guest = make_agent_entry(&registry, "scout").await;
+        registry
+            .attach_agent_to_session(&session_id, &guest)
+            .await
+            .unwrap();
+        update_meta_on_db(&session_db, |m| {
+            m.host_agent_db_id = Some(guest.db_id.to_string());
+        })
+        .await
+        .unwrap();
+
+        // The login owner attaches but must NOT steal the explicit host.
+        let owner = make_agent_entry(&registry, "ava").await;
+        registry
+            .ensure_session_host(&session_id, &owner)
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 2);
+        assert_eq!(
+            meta.host_agent_db_id.as_deref(),
+            Some(guest.db_id.to_string().as_str())
+        );
     }
 
     #[tokio::test]

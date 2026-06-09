@@ -71,9 +71,11 @@ pub struct MatrixGateway {
     /// as the `login_id` dimension of every channel binding. Since a login
     /// belongs to one agent, it doubles as that agent's transport identity.
     login_id: String,
-    /// The agent that owns this login. Rooms on this login route to it by
-    /// default — it is the host for any session that hasn't been explicitly
-    /// re-hosted (via session meta `agent_name`).
+    /// The agent that owns this login. The gateway attaches it to each of
+    /// this login's rooms as the session host (`ensure_session_host`), so
+    /// resolution routes to it by default. An explicit per-room re-host
+    /// (`/agent host`) is preserved. The gateway itself does no per-message
+    /// agent resolution.
     owning_agent: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
     /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
@@ -147,6 +149,28 @@ fn attach_response_callback(
     Ok(())
 }
 
+/// Ensure this login's owning agent hosts the given session — a login
+/// belongs to one agent, so that agent owns and hosts its rooms. The
+/// gateway does no per-message agent resolution; it just attaches the owner
+/// once at room setup and lets the runtime resolve from there. No-op when
+/// the name doesn't resolve to a hosted agent (e.g. a legacy default that
+/// isn't configured) — resolution then falls back to the global default.
+async fn ensure_owning_agent_hosts(server: &Server, session_db_id: &str, owning_agent: &str) {
+    let Some(entry) = server.agent_index().find_by_name(owning_agent) else {
+        return;
+    };
+    if let Err(e) = server
+        .registry()
+        .ensure_session_host(session_db_id, &entry)
+        .await
+    {
+        error!(
+            owning_agent,
+            session_db_id, "Failed to set owning agent as session host: {e}"
+        );
+    }
+}
+
 /// Dispatch a shared command in the context of a Matrix room.
 async fn dispatch_in_room(
     cmd: Command,
@@ -164,14 +188,14 @@ async fn dispatch_in_room(
         .get_or_create_channel_session("matrix", login_id, &room_id)
         .await?;
     let session_db_id = session_db.root_id().to_string();
+    // A login belongs to one agent: ensure it hosts this room's session, so
+    // resolution picks it without the gateway choosing per message.
+    ensure_owning_agent_hosts(&server, &session_db_id, owning_agent).await;
     let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
-    // Commands run in the context of the room's host — an explicit per-room
-    // agent if set, else this login's owning agent.
-    let host = meta.agent_name.as_deref().or(Some(owning_agent));
     let agent = server
         .registry()
-        .resolve_agent(&session_db_id, host, server.agent_index())
+        .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
     let ctx = CommandContext {
         server: &server,
@@ -1192,13 +1216,14 @@ impl Gateway for MatrixGateway {
                     };
                     let session_db_id = session_db.root_id().to_string();
 
-                    // Host agent: an explicit per-room agent from session meta,
-                    // else this login's owning agent (a login belongs to one
-                    // agent, which hosts its rooms by default).
+                    // A login belongs to one agent: ensure it hosts this
+                    // room's session (idempotent — only writes on first
+                    // contact). Resolution then picks the owner via the host
+                    // slot; an explicit per-room re-host still wins.
+                    ensure_owning_agent_hosts(&server, &session_db_id, &owning_agent).await;
                     let agent_override = chaz_core::session::read_meta_from_db(&session_db)
                         .await
-                        .agent_name
-                        .or_else(|| Some(owning_agent.clone()));
+                        .agent_name;
 
                     let approval_tx =
                         make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
@@ -1339,10 +1364,10 @@ async fn attach_existing_channel(
         return;
     };
 
+    ensure_owning_agent_hosts(server, session_db_id, owning_agent).await;
     let agent_override = chaz_core::session::read_meta_from_db(&session_db)
         .await
-        .agent_name
-        .or_else(|| Some(owning_agent.to_string()));
+        .agent_name;
     let backend = get_backend(&room, config, secrets, server.registry(), login_id).await;
     if let Err(e) = server
         .register_session(&session_db, backend, agent_override, None)
