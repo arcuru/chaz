@@ -97,6 +97,24 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
     }
 }
 
+/// Filesystem-safe component for a login's per-login state directory.
+/// Matrix MXIDs (`@user:server`) contain `@` and `:` — the latter invalid
+/// in path components on some filesystems — so map anything outside
+/// `[A-Za-z0-9._-]` to `_`. Collisions are acceptable: `login_id` is the
+/// routing key (kept verbatim in channel bindings), this is only its dir name.
+fn sanitize_login_id(login_id: &str) -> String {
+    login_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = ChazArgs::parse();
@@ -829,54 +847,80 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let shutdown = Arc::new(tokio::sync::Notify::new());
 
-        // Background gateway handles. Today this vector holds at most one
-        // Matrix handle (process-level `homeserver_url` / `username` / `password`).
-        // The Agent/Worker refactor will replace this with one entry per
-        // matrix-configured agent, iterated the same way — keep the spawn
-        // shape plural so the future change is a loop body, not a rewrite.
+        // Background gateway handles — one per configured Matrix login.
+        // Logins are a peer-level resource (`logins:` in config, or a single
+        // login synthesized from the legacy top-level fields); multiple
+        // agents may share a login and one agent may hold a dedicated login
+        // (N:M agents↔logins). The spawn loop runs one gateway per login.
         let mut background_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
-        let matrix_configured = !config.homeserver_url.is_empty() && !config.username.is_empty();
+        let matrix_logins = config.matrix_logins();
+        let explicit_logins = config.has_explicit_logins();
+        let matrix_configured = !matrix_logins.is_empty();
 
         if matrix_configured {
             if args.no_matrix {
                 info!("Matrix configured but --no-matrix supplied; not spawning");
             } else {
-                // NOTE: today we read the matrix identity (homeserver_url /
-                // username / password) off the process-level `Config`. When
-                // Matrix logins move per-agent, build the per-identity view
-                // here and push one handle per agent.
-                let matrix_gateway = gateway::matrix::MatrixGateway::new(
-                    config.clone(),
-                    secret_store.clone(),
-                    shutdown.clone(),
-                )?;
-                let server_for_matrix = server.clone();
-                background_handles.push(tokio::spawn(async move {
-                    matrix_gateway.run(server_for_matrix).await
-                }));
-                info!("Matrix gateway spawned in background");
+                for login in matrix_logins {
+                    let login_id = login.login_id().to_string();
+                    // Per-login matrix client state dir. Explicit `logins:`
+                    // entries are isolated under `{base}/matrix/{login_id}`
+                    // so two logins never share a sync token / crypto store;
+                    // the legacy synthesized login keeps its historical
+                    // location so existing installs don't re-login.
+                    let matrix_state_dir = login.state_dir.clone().or_else(|| {
+                        if explicit_logins {
+                            state_dir.as_ref().map(|base| {
+                                base.join("matrix")
+                                    .join(sanitize_login_id(&login_id))
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                        } else {
+                            config.state_dir.clone()
+                        }
+                    });
+                    let matrix_gateway = gateway::matrix::MatrixGateway::new(
+                        login,
+                        matrix_state_dir,
+                        config.clone(),
+                        secret_store.clone(),
+                        shutdown.clone(),
+                    )?;
+                    let server_for_matrix = server.clone();
+                    background_handles.push(tokio::spawn(async move {
+                        matrix_gateway.run(server_for_matrix).await
+                    }));
+                    info!(login_id = %login_id, "Matrix gateway spawned in background");
+                }
             }
         }
 
         let fg_result = if args.no_tui {
-            if !matrix_configured {
-                anyhow::bail!(
-                    "--no-tui requires Matrix to be configured (homeserver_url + username)"
-                );
+            if background_handles.is_empty() {
+                anyhow::bail!("--no-tui requires at least one Matrix login configured");
             }
-            // Headless: the only foreground "work" is waiting on the Matrix
-            // task we just spawned. Pop it off and await directly so its
-            // result becomes the foreground result. (`--no-tui` already
-            // conflicts with `--no-matrix` at the clap layer, so a handle
-            // is guaranteed to be present here.)
-            let matrix_handle = background_handles
-                .pop()
-                .expect("matrix gateway was spawned above");
-            match matrix_handle.await {
-                Ok(res) => res,
-                Err(join_err) => Err(anyhow::anyhow!("matrix gateway task panicked: {join_err}")),
+            // Headless: the foreground "work" is awaiting every spawned login
+            // gateway. They run concurrently as tasks; await all and surface
+            // the first error. (`--no-tui` conflicts with `--no-matrix` at the
+            // clap layer, so at least one handle is guaranteed present here.)
+            let mut headless_result = Ok(());
+            for handle in background_handles.drain(..) {
+                let res = match handle.await {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        Err(anyhow::anyhow!("matrix gateway task panicked: {join_err}"))
+                    }
+                };
+                if let Err(e) = res {
+                    error!("Matrix gateway error: {e}");
+                    if headless_result.is_ok() {
+                        headless_result = Err(e);
+                    }
+                }
             }
+            headless_result
         } else {
             let mut tui_gateway = gateway::tui::TuiGateway::new(config, secret_store);
             if let Some(prompt) = args.prompt {

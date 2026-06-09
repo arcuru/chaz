@@ -5,7 +5,7 @@ use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, ExtensionsAction,
     split_ext_scope,
 };
-use chaz_core::config::Config;
+use chaz_core::config::{Config, LoginConfig};
 use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
@@ -50,14 +50,28 @@ fn make_room_approval_tx(
 }
 
 pub struct MatrixGateway {
+    /// The Matrix login this gateway signs in as — credentials plus the
+    /// per-login allow_list / room_size_limit overrides. One gateway runs
+    /// per login; the spawn loop in `main` builds one of these per entry in
+    /// the resolved `logins:` list.
+    login: LoginConfig,
+    /// Resolved on-disk state directory for this login's matrix client
+    /// (sync token, crypto store). For explicit `logins:` entries this is
+    /// `{base}/matrix/{login_id}` so logins never collide on disk; for the
+    /// legacy synthesized login it is the historical location (verbatim
+    /// `config.state_dir`, or headjack's default when unset) so existing
+    /// installs keep their session.
+    state_dir: Option<String>,
+    /// Broader bot configuration (backends, agents, limits) shared across
+    /// all logins. The matrix *identity* no longer comes from here — it
+    /// comes from `login` — but everything else still does.
     config: Config,
     secrets: SecretStore,
-    /// Stable id of the login this gateway runs. Today there is one login
-    /// per process, identified by its MXID (`config.username`); when the
-    /// peer-level `logins:` config lands (chunk 3), this is set per login
-    /// and the spawn loop runs one gateway per login. Stamped into every
-    /// inbound entry's `TransportRef::login_id` so publishers can tell
-    /// shared from dedicated logins apart on the same transport.
+    /// Stable id of the login this gateway runs (`login.login_id()`).
+    /// Stamped into every inbound entry's `TransportRef::login_id` and used
+    /// as the `login_id` dimension of every channel binding, so publishers
+    /// and routing can tell shared from dedicated logins apart on the same
+    /// transport.
     login_id: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
     /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
@@ -67,18 +81,22 @@ pub struct MatrixGateway {
 
 impl MatrixGateway {
     pub fn new(
+        login: LoginConfig,
+        state_dir: Option<String>,
         config: Config,
         secrets: SecretStore,
         shutdown: Arc<Notify>,
     ) -> anyhow::Result<Self> {
-        if config.homeserver_url.is_empty() {
+        if login.homeserver_url.is_empty() {
             anyhow::bail!("homeserver_url is required for Matrix gateway");
         }
-        if config.username.is_empty() {
+        if login.username.is_empty() {
             anyhow::bail!("username is required for Matrix gateway");
         }
-        let login_id = config.username.clone();
+        let login_id = login.login_id().to_string();
         Ok(Self {
+            login,
+            state_dir,
             config,
             secrets,
             login_id,
@@ -132,15 +150,16 @@ async fn dispatch_in_room(
     server: Arc<Server>,
     config: Arc<Config>,
     secrets: SecretStore,
+    login_id: &str,
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
     let (_conv_id, session_db) = server
         .registry()
-        .get_or_create_channel_session("matrix", &config.username, &room_id)
+        .get_or_create_channel_session("matrix", login_id, &room_id)
         .await?;
     let session_db_id = session_db.root_id().to_string();
-    let backend = get_backend(&room, &config, &secrets, server.registry()).await;
+    let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
     let agent = server
         .registry()
@@ -210,19 +229,26 @@ fn matrix_args(text: &str) -> String {
 
 impl Gateway for MatrixGateway {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
+        let login = self.login;
+        let login_id = self.login_id.clone();
+        let state_dir = self.state_dir;
         let config = Arc::new(self.config);
 
         let mut bot = BotConfig {
             command_prefix: None,
-            room_size_limit: config.room_size_limit,
+            // Per-login override, falling back to the shared default.
+            room_size_limit: login.room_size_limit.or(config.room_size_limit),
             login: Login {
-                homeserver_url: config.homeserver_url.clone(),
-                username: config.username.clone(),
-                password: config.password.clone(),
+                homeserver_url: login.homeserver_url.clone(),
+                username: login.username.clone(),
+                password: login.password.clone(),
             },
             name: Some("chaz".to_string()),
-            allow_list: config.allow_list.clone(),
-            state_dir: config.state_dir.clone(),
+            allow_list: login
+                .allow_list
+                .clone()
+                .or_else(|| config.allow_list.clone()),
+            state_dir: state_dir.clone(),
         }
         .login()
         .await?;
@@ -381,6 +407,7 @@ impl Gateway for MatrixGateway {
                 let server = server.clone();
                 let config = config.clone();
                 let secrets = self.secrets.clone();
+                let login_id = login_id.clone();
                 bot.register_text_command(
                     $name,
                     $usage,
@@ -389,11 +416,13 @@ impl Gateway for MatrixGateway {
                         let server = server.clone();
                         let config = config.clone();
                         let secrets = secrets.clone();
+                        let login_id = login_id.clone();
                         let cmd: Option<Command> = $cmd_expr;
                         async move {
                             if let Some(cmd) = cmd {
                                 if let Err(e) =
-                                    dispatch_in_room(cmd, room, server, config, secrets).await
+                                    dispatch_in_room(cmd, room, server, config, secrets, &login_id)
+                                        .await
                                 {
                                     tracing::error!("Command dispatch failed: {e}");
                                 }
@@ -651,6 +680,7 @@ impl Gateway for MatrixGateway {
             let server = server.clone();
             let secrets = self.secrets.clone();
             let config = config.clone();
+            let login_id = login_id.clone();
             let attached_sessions = attached_sessions.clone();
             bot.register_text_command(
                 "attach",
@@ -660,6 +690,7 @@ impl Gateway for MatrixGateway {
                     let server = server.clone();
                     let secrets = secrets.clone();
                     let config = config.clone();
+                    let login_id = login_id.clone();
                     let attached_sessions = attached_sessions.clone();
                     async move {
                         let arg = matrix_args(&text);
@@ -687,7 +718,7 @@ impl Gateway for MatrixGateway {
                         let target_sid = target_db.root_id().to_string();
                         if let Err(e) = server
                             .registry()
-                            .attach_channel("matrix", &config.username, &room_id, &target_sid)
+                            .attach_channel("matrix", &login_id, &room_id, &target_sid)
                             .await
                         {
                             let _ = room
@@ -702,7 +733,8 @@ impl Gateway for MatrixGateway {
                         // session so future writes (including scheduler fires)
                         // reach this room.
                         let backend =
-                            get_backend(&room, &config, &secrets, server.registry()).await;
+                            get_backend(&room, &config, &secrets, server.registry(), &login_id)
+                                .await;
                         let agent_override = chaz_core::session::read_meta_from_db(&target_db)
                             .await
                             .agent_name;
@@ -735,7 +767,7 @@ impl Gateway for MatrixGateway {
 
         {
             let server = server.clone();
-            let login_id = config.username.clone();
+            let login_id = login_id.clone();
             bot.register_text_command(
                 "detach",
                 "".to_string(),
@@ -896,6 +928,7 @@ impl Gateway for MatrixGateway {
             let server_c = server.clone();
             let config_c = config.clone();
             let secrets_c = self.secrets.clone();
+            let login_id_c = login_id.clone();
             bot.register_text_command(
                 &name_owned.clone(),
                 "[args...]".to_string(),
@@ -905,10 +938,13 @@ impl Gateway for MatrixGateway {
                     let server = server_c.clone();
                     let config = config_c.clone();
                     let secrets = secrets_c.clone();
+                    let login_id = login_id_c.clone();
                     async move {
                         let args = matrix_args(&text);
                         let cmd = Command::Extension { name, args };
-                        if let Err(e) = dispatch_in_room(cmd, room, server, config, secrets).await {
+                        if let Err(e) =
+                            dispatch_in_room(cmd, room, server, config, secrets, &login_id).await
+                        {
                             tracing::error!("Extension command dispatch failed: {e}");
                         }
                         Ok(())
@@ -936,6 +972,7 @@ impl Gateway for MatrixGateway {
             let counts = message_counts.clone();
             let secrets = self.secrets.clone();
             let registry = server.registry_arc();
+            let login_id = login_id.clone();
             bot.register_text_command(
                 "send",
                 "<message>".to_string(),
@@ -945,9 +982,12 @@ impl Gateway for MatrixGateway {
                     let counts = counts.clone();
                     let secrets = secrets.clone();
                     let registry = registry.clone();
+                    let login_id = login_id.clone();
                     async move {
-                        commands::send(sender, text, room, &config, &counts, &secrets, &registry)
-                            .await
+                        commands::send(
+                            sender, text, room, &config, &counts, &secrets, &registry, &login_id,
+                        )
+                        .await
                     }
                 },
             )
@@ -974,6 +1014,7 @@ impl Gateway for MatrixGateway {
             let counts = message_counts.clone();
             let secrets = self.secrets.clone();
             let registry = server.registry_arc();
+            let login_id = login_id.clone();
             bot.register_text_command(
                 "rename",
                 "".to_string(),
@@ -983,9 +1024,12 @@ impl Gateway for MatrixGateway {
                     let counts = counts.clone();
                     let secrets = secrets.clone();
                     let registry = registry.clone();
+                    let login_id = login_id.clone();
                     async move {
-                        commands::rename(sender, text, room, &config, &counts, &secrets, &registry)
-                            .await
+                        commands::rename(
+                            sender, text, room, &config, &counts, &secrets, &registry, &login_id,
+                        )
+                        .await
                     }
                 },
             )
@@ -1004,12 +1048,13 @@ impl Gateway for MatrixGateway {
             let attached_sessions = attached_sessions.clone();
             let config = config.clone();
             let secrets = self.secrets.clone();
+            let login_id = login_id.clone();
             tokio::spawn(async move {
                 // Fold any legacy Matrix-only bindings into external_channels
                 // under this login before we read them back.
                 match server
                     .registry()
-                    .migrate_legacy_matrix_channels(&config.username)
+                    .migrate_legacy_matrix_channels(&login_id)
                     .await
                 {
                     Ok(0) => {}
@@ -1018,8 +1063,8 @@ impl Gateway for MatrixGateway {
                 }
                 match server.registry().list_channels().await {
                     Ok(channels) => {
-                        for (transport, login_id, room_id, session_db_id) in channels {
-                            if transport != "matrix" || login_id != config.username {
+                        for (transport, chan_login, room_id, session_db_id) in channels {
+                            if transport != "matrix" || chan_login != login_id {
                                 continue;
                             }
                             attach_existing_channel(
@@ -1028,6 +1073,7 @@ impl Gateway for MatrixGateway {
                                 &attached_sessions,
                                 &config,
                                 &secrets,
+                                &login_id,
                                 &room_id,
                                 &session_db_id,
                             )
@@ -1098,11 +1144,12 @@ impl Gateway for MatrixGateway {
                         body
                     };
 
-                    let backend = get_backend(&room, &config, &secrets, server.registry()).await;
+                    let backend =
+                        get_backend(&room, &config, &secrets, server.registry(), &login_id).await;
 
                     let (_conv_id, session_db) = match server
                         .registry()
-                        .get_or_create_channel_session("matrix", &config.username, &room_id)
+                        .get_or_create_channel_session("matrix", &login_id, &room_id)
                         .await
                     {
                         Ok(r) => r,
@@ -1232,12 +1279,14 @@ impl Gateway for MatrixGateway {
 /// Without an active user in the room, we pass no approval channel — scheduled
 /// Directives fire autonomously. When the user next speaks, the text handler
 /// re-registers the session with an approval channel bound to that message.
+#[allow(clippy::too_many_arguments)]
 async fn attach_existing_channel(
     server: &Arc<Server>,
     client: &matrix_sdk::Client,
     attached_sessions: &Arc<Mutex<HashSet<String>>>,
     config: &Arc<Config>,
     secrets: &SecretStore,
+    login_id: &str,
     room_id: &str,
     session_db_id: &str,
 ) {
@@ -1257,7 +1306,7 @@ async fn attach_existing_channel(
     let agent_override = chaz_core::session::read_meta_from_db(&session_db)
         .await
         .agent_name;
-    let backend = get_backend(&room, config, secrets, server.registry()).await;
+    let backend = get_backend(&room, config, secrets, server.registry(), login_id).await;
     if let Err(e) = server
         .register_session(&session_db, backend, agent_override, None)
         .await

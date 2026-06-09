@@ -68,6 +68,7 @@ pub async fn rate_limit(
 }
 
 /// Send a message without context (Matrix-only legacy command).
+#[allow(clippy::too_many_arguments)]
 pub async fn send(
     sender: matrix_sdk::ruma::OwnedUserId,
     text: String,
@@ -76,6 +77,7 @@ pub async fn send(
     message_counts: &Mutex<HashMap<String, u64>>,
     secrets: &SecretStore,
     registry: &SessionRegistry,
+    login_id: &str,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
@@ -86,7 +88,9 @@ pub async fn send(
         .collect::<Vec<&str>>()
         .join(" ");
 
-    let context = get_context(&room, config, secrets, registry).await.unwrap();
+    let context = get_context(&room, config, secrets, registry, login_id)
+        .await
+        .unwrap();
     let no_context = ChatContext {
         messages: vec![Message::new(MessageRole::User, input.to_string())],
         model: context.model,
@@ -98,7 +102,7 @@ pub async fn send(
         sender.as_str(),
         input.replace('\n', " ")
     );
-    if let Ok(result) = get_backend(&room, config, secrets, registry)
+    if let Ok(result) = get_backend(&room, config, secrets, registry, login_id)
         .await
         .execute(&no_context)
         .await
@@ -116,6 +120,7 @@ pub async fn send(
 
 /// Rename the Matrix room and set its topic based on the conversation
 /// (Matrix-only — operates on the room, not the session).
+#[allow(clippy::too_many_arguments)]
 pub async fn rename(
     sender: OwnedUserId,
     _: String,
@@ -124,11 +129,12 @@ pub async fn rename(
     message_counts: &Mutex<HashMap<String, u64>>,
     secrets: &SecretStore,
     registry: &SessionRegistry,
+    login_id: &str,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
     }
-    if let Ok(context) = get_context(&room, config, secrets, registry).await {
+    if let Ok(context) = get_context(&room, config, secrets, registry, login_id).await {
         let mut context = context;
         context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
@@ -142,7 +148,7 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config, secrets, registry)
+        let response = get_backend(&room, config, secrets, registry, login_id)
             .await
             .execute(&context)
             .await;
@@ -176,7 +182,7 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config, secrets, registry)
+        let response = get_backend(&room, config, secrets, registry, login_id)
             .await
             .execute(&context)
             .await;
@@ -218,11 +224,12 @@ pub async fn get_backend(
     config: &Config,
     secrets: &SecretStore,
     registry: &SessionRegistry,
+    login_id: &str,
 ) -> BackendManager {
     let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
     if let Ok(Some(session_db_id)) = registry
-        .external_channel_session("matrix", &config.username, &room_id)
+        .external_channel_session("matrix", login_id, &room_id)
         .await
         && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
     {
@@ -264,6 +271,7 @@ pub async fn get_context(
     config: &Config,
     secrets: &SecretStore,
     registry: &SessionRegistry,
+    login_id: &str,
 ) -> Result<ChatContext, ()> {
     let mut context = ChatContext {
         messages: Vec::new(),
@@ -291,7 +299,7 @@ pub async fn get_context(
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {
                             let model = text_content.body.split_whitespace().nth(2);
                             if let Some(model) = model
-                                && get_backend(room, config, secrets, registry)
+                                && get_backend(room, config, secrets, registry, login_id)
                                     .await
                                     .validate_model(model)
                                     .is_ok()
@@ -357,7 +365,7 @@ pub async fn get_context(
     // Apply session meta overrides from the session DB
     let room_id = room.room_id().to_string();
     if let Ok(Some(session_db_id)) = registry
-        .external_channel_session("matrix", &config.username, &room_id)
+        .external_channel_session("matrix", login_id, &room_id)
         .await
         && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
     {

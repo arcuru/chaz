@@ -72,6 +72,82 @@ pub struct Config {
     pub agent_state_allowlist: HashMap<String, Vec<String>>,
     /// Multi-agent chat-room tuning. Omit to use built-in defaults.
     pub multi_agent: Option<MultiAgentConfig>,
+    /// Matrix logins — a peer-level resource. Each entry is one Matrix
+    /// identity the bot signs in as; the spawn loop runs one gateway per
+    /// login. Multiple agents may share a login and one agent may hold a
+    /// dedicated login (N:M agents↔logins). When omitted, a single login
+    /// is synthesized from the legacy top-level `homeserver_url` /
+    /// `username` / `password` / … fields (see [`Config::matrix_logins`]).
+    pub logins: Option<Vec<LoginConfig>>,
+}
+
+/// One Matrix login (peer-level resource). The `login_id` it exposes —
+/// `id` if set, else `username` — is the routing dimension that lets two
+/// logins on the same transport bind the same room to distinct sessions,
+/// and the per-login state-dir component that keeps their matrix client
+/// stores isolated.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoginConfig {
+    /// Stable id for this login. Defaults to `username` when unset. Used
+    /// as the `login_id` routing key and the per-login state-dir name, so
+    /// keep it stable across restarts.
+    pub id: Option<String>,
+    /// Matrix homeserver URL.
+    pub homeserver_url: String,
+    /// Matrix username / MXID to log in as.
+    pub username: String,
+    /// Password. Prompted on the command line when omitted.
+    pub password: Option<String>,
+    /// Per-login allow list. Falls back to the top-level `allow_list`.
+    pub allow_list: Option<String>,
+    /// Per-login room size limit. Falls back to the top-level
+    /// `room_size_limit`.
+    pub room_size_limit: Option<usize>,
+    /// Explicit override for this login's matrix client state directory.
+    /// When unset, the spawn loop derives one (`{base}/matrix/{login_id}`
+    /// for explicit logins; the legacy location for the synthesized login).
+    pub state_dir: Option<String>,
+}
+
+impl LoginConfig {
+    /// Stable identifier for this login: `id` if set, else `username`.
+    pub fn login_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.username)
+    }
+}
+
+impl Config {
+    /// The effective list of Matrix logins to run. Prefers the explicit
+    /// `logins:` block; when it is absent or empty, synthesizes a single
+    /// login from the legacy top-level matrix fields for backward
+    /// compatibility. Returns empty when neither is configured (no Matrix).
+    pub fn matrix_logins(&self) -> Vec<LoginConfig> {
+        if let Some(logins) = &self.logins
+            && !logins.is_empty()
+        {
+            return logins.clone();
+        }
+        if !self.homeserver_url.is_empty() && !self.username.is_empty() {
+            return vec![LoginConfig {
+                id: None,
+                homeserver_url: self.homeserver_url.clone(),
+                username: self.username.clone(),
+                password: self.password.clone(),
+                allow_list: self.allow_list.clone(),
+                room_size_limit: self.room_size_limit,
+                state_dir: None,
+            }];
+        }
+        Vec::new()
+    }
+
+    /// True when logins come from an explicit `logins:` block rather than
+    /// being synthesized from the legacy top-level fields. Drives whether
+    /// the spawn loop isolates each login's state dir (safe for new
+    /// `logins:` entries) or preserves the legacy on-disk location.
+    pub fn has_explicit_logins(&self) -> bool {
+        self.logins.as_ref().is_some_and(|l| !l.is_empty())
+    }
 }
 
 /// Tuning for multi-agent chat-room sessions (see
@@ -904,6 +980,78 @@ cli:
             cli.auto_approved_tools,
             vec!["shell", "write_file", "web_fetch"]
         );
+    }
+
+    #[test]
+    fn matrix_logins_synthesizes_single_login_from_legacy_fields() {
+        let yaml = r#"
+homeserver_url: "https://matrix.org"
+username: "@bot:matrix.org"
+password: "s3cret"
+allow_list: "@alice:matrix.org"
+room_size_limit: 50
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.has_explicit_logins());
+        let logins = cfg.matrix_logins();
+        assert_eq!(logins.len(), 1);
+        let l = &logins[0];
+        // login_id falls back to username when no explicit id.
+        assert_eq!(l.login_id(), "@bot:matrix.org");
+        assert_eq!(l.homeserver_url, "https://matrix.org");
+        assert_eq!(l.password.as_deref(), Some("s3cret"));
+        assert_eq!(l.allow_list.as_deref(), Some("@alice:matrix.org"));
+        assert_eq!(l.room_size_limit, Some(50));
+        // Synthesized login leaves state_dir unset → legacy location preserved.
+        assert!(l.state_dir.is_none());
+    }
+
+    #[test]
+    fn matrix_logins_prefers_explicit_block() {
+        let yaml = r#"
+homeserver_url: "https://legacy.example"
+username: "@legacy:example"
+logins:
+  - homeserver_url: "https://a.example"
+    username: "@ava:a.example"
+    password: "pw-a"
+  - id: chaz-login
+    homeserver_url: "https://b.example"
+    username: "@chaz:b.example"
+    allow_list: "@boss:b.example"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.has_explicit_logins());
+        let logins = cfg.matrix_logins();
+        assert_eq!(logins.len(), 2);
+        // First login_id defaults to its username; second uses explicit id.
+        assert_eq!(logins[0].login_id(), "@ava:a.example");
+        assert_eq!(logins[1].login_id(), "chaz-login");
+        assert_eq!(logins[1].allow_list.as_deref(), Some("@boss:b.example"));
+        // Legacy top-level fields are ignored once `logins:` is present.
+    }
+
+    #[test]
+    fn matrix_logins_empty_when_nothing_configured() {
+        let cfg: Config = serde_yaml::from_str("").unwrap();
+        assert!(!cfg.has_explicit_logins());
+        assert!(cfg.matrix_logins().is_empty());
+    }
+
+    #[test]
+    fn matrix_logins_empty_block_falls_back_to_legacy() {
+        // An explicit-but-empty `logins: []` is treated as "not configured"
+        // and falls back to the legacy fields.
+        let yaml = r#"
+homeserver_url: "https://matrix.org"
+username: "@bot:matrix.org"
+logins: []
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.has_explicit_logins());
+        let logins = cfg.matrix_logins();
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins[0].login_id(), "@bot:matrix.org");
     }
 
     #[test]
