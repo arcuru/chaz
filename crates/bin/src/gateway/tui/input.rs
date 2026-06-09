@@ -899,10 +899,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
                 return Some(ChatAction::Dispatch(Command::AgentSetBurst(Some(n))));
             }
             Ok(_) => {
-                show_error(
-                    app,
-                    "Burst budget must be ≥ 1".to_string(),
-                );
+                show_error(app, "Burst budget must be ≥ 1".to_string());
                 return None;
             }
             Err(_) => {
@@ -1543,14 +1540,9 @@ pub(super) fn handle_settings_key(
                     Some(super::PeerSettingsCategory::Agents)
                 )
                 && matches!(focus, SettingsFocus::Detail)
+                && let Some(name) = app.peer_agents_names.get(app.peer_agents_cursor).cloned()
             {
-                if let Some(name) =
-                    app.peer_agents_names.get(app.peer_agents_cursor).cloned()
-                {
-                    return SettingsKey::OpenModelPicker(Some(
-                        ModelPickerScope::AgentGlobal(name),
-                    ));
-                }
+                return SettingsKey::OpenModelPicker(Some(ModelPickerScope::AgentGlobal(name)));
             }
             // Otherwise Enter on the sidebar dives into the detail pane
             // when one exists — same effect as Right.

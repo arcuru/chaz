@@ -212,10 +212,7 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
 /// `/agent burst <n>` — set a per-session agent→agent burst budget override.
 /// `Some(n)` stores `n` in `SessionMeta.burst_budget_override` (n ≥ 1);
 /// `None` clears it so the global default applies.
-pub(super) async fn agent_set_burst(
-    n: Option<usize>,
-    ctx: &CommandContext<'_>,
-) -> CommandOutcome {
+pub(super) async fn agent_set_burst(n: Option<usize>, ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
@@ -237,9 +234,7 @@ pub(super) async fn agent_set_burst(
         }
         Some(val) => {
             if val < 1 {
-                return CommandOutcome::Error(
-                    "Burst budget must be ≥ 1".to_string(),
-                );
+                return CommandOutcome::Error("Burst budget must be ≥ 1".to_string());
             }
             if let Err(e) = session
                 .update_meta(move |m| m.burst_budget_override = Some(val))
