@@ -483,9 +483,9 @@ impl Gateway for MatrixGateway {
                     );
                     let content = RoomMessageEventContent::text_markdown(notice);
                     match room.send(content).await {
-                        Ok(response) => {
+                        Ok(result) => {
                             let mut p = pending.lock().await;
-                            p.insert(response.event_id, req.exchange.decision_tx);
+                            p.insert(result.response.event_id, req.exchange.decision_tx);
                         }
                         Err(e) => {
                             tracing::error!("Failed to send approval request: {e}");
