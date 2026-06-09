@@ -1,9 +1,9 @@
+mod client;
 mod commands;
 mod history;
 
 use chaz_core::commands::{
-    self as shared_commands, Command, CommandContext, CommandOutcome, ExtensionsAction,
-    split_ext_scope,
+    self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
 use chaz_core::config::{Config, MatrixLoginSpec};
 use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
@@ -11,16 +11,18 @@ use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{EntryRouting, EntryType, Session, SessionEntry, TransportRef};
 
-use headjack::*;
-use matrix_sdk::Room;
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::events::room::message::{
+    MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+};
+use matrix_sdk::{Room, RoomState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{error, info};
 
+use client::{Login, MatrixClient, is_allowed};
 use commands::{get_backend, rate_limit};
 use history::read_room_history;
 
@@ -55,10 +57,10 @@ pub struct MatrixGateway {
     /// the spawn loop in `main` builds one of these per resolved login.
     login: MatrixLoginSpec,
     /// Resolved on-disk state directory for this login's matrix client
-    /// (sync token, crypto store). For explicit `logins:` entries this is
+    /// (sync token, session). For explicit `logins:` entries this is
     /// `{base}/matrix/{login_id}` so logins never collide on disk; for the
     /// legacy synthesized login it is the historical location (verbatim
-    /// `config.state_dir`, or headjack's default when unset) so existing
+    /// `config.state_dir`, or the per-name default when unset) so existing
     /// installs keep their session.
     state_dir: Option<String>,
     /// Broader bot configuration (backends, agents, limits) shared across
@@ -79,7 +81,7 @@ pub struct MatrixGateway {
     owning_agent: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
     /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
-    /// instead of looping on `bot.run()`.
+    /// instead of looping on the client sync.
     shutdown: Arc<Notify>,
 }
 
@@ -264,12 +266,156 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
     }
 }
 
-/// Parse the argument portion of a Matrix command.
-fn matrix_args(text: &str) -> String {
-    text.split_whitespace()
-        .skip(2)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Help text for `!chaz help` — the shared `/`-vocabulary plus the Matrix-local
+/// verbs, listed under the `!chaz ` prefix this transport uses.
+fn help_text() -> String {
+    [
+        "**chaz commands** (prefix with `!chaz `):",
+        "",
+        "`sessions` · `info` · `print` · `compact` · `name [<alias>]` — session ops",
+        "`agents` · `agent <add|remove|host|new|delete|share|import|set|reload|invite|rehost> …` — living agents",
+        "`model [<id>|<agent> <id>]` · `role [<name> [prompt]]` · `backend <name> <url> <key>` · `backends` — LLM config",
+        "`share` · `unshare` · `sync <ticket>` · `sharing <status|requests|approve|reject>` — sharing",
+        "`extensions <list|add|remove|settings|set> …` — per-session extensions",
+        "`channels` — rooms bound to this session",
+        "",
+        "Matrix-local: `attach <session>` · `detach` · `clear` · `approve` · `deny` · `send <msg>` · `rename` · `party`",
+        "",
+        "In a DM or when @mentioned, just talk — no prefix needed.",
+    ]
+    .join("\n")
+}
+
+/// Approve or deny the oldest pending tool-approval request in `room`.
+async fn resolve_pending_approval(pending: &PendingApprovals, room: &Room, approve: bool) {
+    let mut p = pending.lock().await;
+    let Some(event_id) = p.keys().next().cloned() else {
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(
+                "No pending approval requests",
+            ))
+            .await;
+        return;
+    };
+    if let Some(tx) = p.remove(&event_id) {
+        let decision = if approve {
+            ApprovalDecision::Approve
+        } else {
+            ApprovalDecision::Deny
+        };
+        let _ = tx.send(decision);
+        let label = if approve {
+            "✅ Approved"
+        } else {
+            "❌ Denied"
+        };
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(label))
+            .await;
+    }
+}
+
+/// `!chaz attach <session>` — bind this room to a specific session and install
+/// the response callback so future writes reach the room. Gateway-local because
+/// it touches the live `attached_sessions` set and matrix `Room`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_attach(
+    arg: &str,
+    room: Room,
+    server: Arc<Server>,
+    config: Arc<Config>,
+    secrets: SecretStore,
+    login_id: &str,
+    owning_agent: &str,
+    attached_sessions: Arc<Mutex<HashSet<String>>>,
+) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(
+                "Usage: !chaz attach <session-name-or-id>",
+            ))
+            .await;
+        return;
+    }
+    let room_id = room.room_id().to_string();
+    let (_cv, target_db) = match server.registry().resolve_session(arg).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = room
+                .send(RoomMessageEventContent::notice_plain(format!(
+                    "!chaz Error: unknown session '{arg}': {e}"
+                )))
+                .await;
+            return;
+        }
+    };
+    let target_sid = target_db.root_id().to_string();
+    if let Err(e) = server
+        .registry()
+        .attach_channel("matrix", login_id, &room_id, &target_sid)
+        .await
+    {
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(format!(
+                "!chaz Error: failed to attach: {e}"
+            )))
+            .await;
+        return;
+    }
+
+    // Install the response callback on the newly-attached session so future
+    // writes (including scheduler fires) reach this room.
+    let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
+    let agent_override = chaz_core::session::read_meta_from_db(&target_db)
+        .await
+        .agent_name;
+    let _ = server
+        .register_session(&target_db, backend, agent_override, None)
+        .await;
+    let mut attached = attached_sessions.lock().await;
+    if attached.insert(target_sid.clone()) {
+        drop(attached);
+        if let Err(e) = attach_response_callback(
+            &target_db,
+            room.clone(),
+            server.agents_arc(),
+            owning_agent.to_string(),
+        ) {
+            error!("Failed to attach response callback: {e}");
+        }
+    }
+
+    let _ = room
+        .send(RoomMessageEventContent::notice_plain(format!(
+            "Attached this room to session {target_sid}."
+        )))
+        .await;
+}
+
+/// `!chaz detach` — unbind this room from its session.
+async fn handle_detach(room: Room, server: Arc<Server>, login_id: &str) {
+    let room_id = room.room_id().to_string();
+    match server
+        .registry()
+        .detach_channel("matrix", login_id, &room_id)
+        .await
+    {
+        Ok(()) => {
+            let _ = room
+                .send(RoomMessageEventContent::notice_plain(
+                    "Room detached. Future messages will create a fresh session.",
+                ))
+                .await;
+        }
+        Err(e) => {
+            let _ = room
+                .send(RoomMessageEventContent::notice_plain(format!(
+                    "!chaz Error: {e}"
+                )))
+                .await;
+        }
+    }
 }
 
 impl Gateway for MatrixGateway {
@@ -278,32 +424,33 @@ impl Gateway for MatrixGateway {
         let login_id = self.login_id.clone();
         let owning_agent = self.owning_agent.clone();
         let state_dir = self.state_dir;
+        let secrets = self.secrets;
         let config = Arc::new(self.config);
+        let shutdown = self.shutdown;
 
-        let mut bot = BotConfig {
-            command_prefix: None,
-            // Per-login override, falling back to the shared default.
-            room_size_limit: login.room_size_limit.or(config.room_size_limit),
-            login: Login {
+        let allow_list = login
+            .allow_list
+            .clone()
+            .or_else(|| config.allow_list.clone());
+        let room_size_limit = login.room_size_limit.or(config.room_size_limit);
+
+        // --- Connect: login/restore, auto-join, prime the sync token ---
+        let mut mc = MatrixClient::login(
+            &Login {
                 homeserver_url: login.homeserver_url.clone(),
                 username: login.username.clone(),
                 password: login.password.clone(),
             },
-            name: Some("chaz".to_string()),
-            allow_list: login
-                .allow_list
-                .clone()
-                .or_else(|| config.allow_list.clone()),
-            state_dir: state_dir.clone(),
-        }
-        .login()
+            state_dir.as_deref(),
+            "chaz",
+        )
         .await?;
 
-        bot.join_rooms();
+        mc.install_autojoin(allow_list.clone(), room_size_limit);
 
-        if let Err(e) = bot.sync().await {
-            tracing::warn!("Initial Matrix sync error: {e}");
-        }
+        // Initial sync primes the token *before* the message handlers are
+        // installed, so room history is not replayed through them on startup.
+        mc.initial_sync().await;
 
         info!("The client is ready! Listening to new messages…");
 
@@ -313,7 +460,7 @@ impl Gateway for MatrixGateway {
 
         {
             let pending = pending_approvals.clone();
-            let client = bot.client().clone();
+            let client = mc.client().clone();
             tokio::spawn(async move {
                 while let Some(req) = approval_relay_rx.recv().await {
                     let room_id_parsed = match matrix_sdk::ruma::RoomId::parse(&req.room_id) {
@@ -349,9 +496,10 @@ impl Gateway for MatrixGateway {
             });
         }
 
+        // Approval decisions via emoji reaction.
         {
             let pending = pending_approvals.clone();
-            bot.client().add_event_handler(
+            mc.client().add_event_handler(
                 move |event: OriginalSyncReactionEvent, room: matrix_sdk::Room| {
                     let pending = pending.clone();
                     async move {
@@ -379,732 +527,10 @@ impl Gateway for MatrixGateway {
             );
         }
 
-        {
-            let pending = pending_approvals.clone();
-            bot.register_text_command(
-                "approve",
-                "".to_string(),
-                "Approve the pending tool call".to_string(),
-                move |_, _, room| {
-                    let pending = pending.clone();
-                    async move {
-                        let mut p = pending.lock().await;
-                        if let Some(event_id) = p.keys().next().cloned() {
-                            if let Some(tx) = p.remove(&event_id) {
-                                let _ = tx.send(ApprovalDecision::Approve);
-                                room.send(RoomMessageEventContent::notice_plain("✅ Approved"))
-                                    .await
-                                    .unwrap();
-                            }
-                        } else {
-                            room.send(RoomMessageEventContent::notice_plain(
-                                "No pending approval requests",
-                            ))
-                            .await
-                            .unwrap();
-                        }
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        }
-
-        {
-            let pending = pending_approvals.clone();
-            bot.register_text_command(
-                "deny",
-                "".to_string(),
-                "Deny the pending tool call".to_string(),
-                move |_, _, room| {
-                    let pending = pending.clone();
-                    async move {
-                        let mut p = pending.lock().await;
-                        if let Some(event_id) = p.keys().next().cloned() {
-                            if let Some(tx) = p.remove(&event_id) {
-                                let _ = tx.send(ApprovalDecision::Deny);
-                                room.send(RoomMessageEventContent::notice_plain("❌ Denied"))
-                                    .await
-                                    .unwrap();
-                            }
-                        } else {
-                            room.send(RoomMessageEventContent::notice_plain(
-                                "No pending approval requests",
-                            ))
-                            .await
-                            .unwrap();
-                        }
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        }
-
-        let message_counts: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
-
         // Track which session DBs have the Matrix response callback installed.
         // Keyed by session_db_id because a single session may be attached to
         // multiple rooms (fan-out delivery).
         let attached_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-
-        macro_rules! register_shared {
-            ($name:expr, $usage:expr, $desc:expr, |$text_ident:ident| $cmd_expr:expr) => {{
-                let server = server.clone();
-                let config = config.clone();
-                let secrets = self.secrets.clone();
-                let login_id = login_id.clone();
-                let owning_agent = owning_agent.clone();
-                bot.register_text_command(
-                    $name,
-                    $usage,
-                    $desc.to_string(),
-                    move |_, $text_ident, room| {
-                        let server = server.clone();
-                        let config = config.clone();
-                        let secrets = secrets.clone();
-                        let login_id = login_id.clone();
-                        let owning_agent = owning_agent.clone();
-                        let cmd: Option<Command> = $cmd_expr;
-                        async move {
-                            if let Some(cmd) = cmd {
-                                if let Err(e) = dispatch_in_room(
-                                    cmd,
-                                    room,
-                                    server,
-                                    config,
-                                    secrets,
-                                    &login_id,
-                                    &owning_agent,
-                                )
-                                .await
-                                {
-                                    tracing::error!("Command dispatch failed: {e}");
-                                }
-                            }
-                            Ok(())
-                        }
-                    },
-                )
-                .await;
-            }};
-        }
-
-        // --- Session ops (parity with TUI) ---
-        register_shared!(
-            "sessions",
-            "".to_string(),
-            "List all known sessions",
-            |_t| { Some(Command::ListSessions) }
-        );
-        register_shared!("info", "".to_string(), "Show current session info", |_t| {
-            Some(Command::Info)
-        });
-        register_shared!(
-            "name",
-            "[<alias>]".to_string(),
-            "Set (or clear, with no arg) a human-friendly alias for this session",
-            |text| {
-                let arg = matrix_args(&text);
-                if arg.trim().is_empty() {
-                    Some(Command::ClearSessionName)
-                } else {
-                    Some(Command::NameSession(arg.trim().to_string()))
-                }
-            }
-        );
-        register_shared!(
-            "share",
-            "".to_string(),
-            "Generate a shareable ticket for the current session",
-            |_t| { Some(Command::Share) }
-        );
-        register_shared!(
-            "unshare",
-            "".to_string(),
-            "Stop sharing the current session",
-            |_t| { Some(Command::SessionUnshare) }
-        );
-        register_shared!(
-            "sync",
-            "<ticket>".to_string(),
-            "Sync a remote session via ticket URL",
-            |text| {
-                let arg = matrix_args(&text);
-                if arg.trim().is_empty() {
-                    None
-                } else {
-                    Some(Command::Sync(arg.trim().to_string()))
-                }
-            }
-        );
-        register_shared!(
-            "compact",
-            "".to_string(),
-            "Summarize and compact conversation history",
-            |_t| { Some(Command::Compact) }
-        );
-        register_shared!("print", "".to_string(), "Print the transcript", |_t| {
-            Some(Command::Print)
-        });
-
-        // --- Living Agents: per-session agent participation ---
-        register_shared!(
-            "agents",
-            "".to_string(),
-            "List agents attached to this session",
-            |_t| { Some(Command::AgentsList) }
-        );
-        register_shared!(
-            "agent",
-            "add|remove|host|list|room|hosted|new|delete|share|import|set|reload|invite|revoke-peer|rehost|home-status <arg>"
-                .to_string(),
-            "Attach/detach, manage host, list, create/delete/share/import/edit/reload/invite/revoke/rehost/home-status a Living Agent",
-            |text| {
-                let arg = matrix_args(&text);
-                let mut parts = arg.trim().splitn(2, char::is_whitespace);
-                let sub = parts.next().unwrap_or("").trim();
-                let rest = parts.next().unwrap_or("").trim();
-                match sub {
-                    "add" if !rest.is_empty() => Some(Command::AgentAdd(rest.to_string())),
-                    "remove" | "rm" if !rest.is_empty() => {
-                        Some(Command::AgentRemove(rest.to_string()))
-                    }
-                    "host" => Some(Command::AgentSetHost(if rest.is_empty() {
-                        None
-                    } else {
-                        Some(rest.to_string())
-                    })),
-                    "list" | "" => Some(Command::AgentsList),
-                    "room" => Some(Command::AgentRoom),
-                    "hosted" => Some(Command::AgentHosted),
-                    "reload" => Some(Command::AgentReload(
-                        (!rest.is_empty()).then(|| rest.to_string()),
-                    )),
-                    "new" if !rest.is_empty() => (|| {
-                        let mut toks = rest.split_whitespace();
-                        let name = toks.next().unwrap_or("").to_string();
-                        if name.is_empty() {
-                            return None;
-                        }
-                        let mut overrides = Vec::new();
-                        for tok in toks {
-                            match tok.split_once('=') {
-                                Some((k, v)) if !k.is_empty() => {
-                                    overrides.push((k.to_string(), v.to_string()))
-                                }
-                                _ => return None,
-                            }
-                        }
-                        Some(Command::AgentNew { name, overrides })
-                    })(),
-                    "delete" | "del" if !rest.is_empty() => {
-                        Some(Command::AgentDelete(rest.to_string()))
-                    }
-                    "share" if !rest.is_empty() => Some(Command::AgentShare(rest.to_string())),
-                    "unshare" if !rest.is_empty() => Some(Command::AgentUnshare(rest.to_string())),
-                    "import" if !rest.is_empty() => (|| {
-                        let mut parts = rest.splitn(2, char::is_whitespace);
-                        let ticket = parts.next().unwrap_or("").trim();
-                        let perm_tok = parts.next().unwrap_or("").trim();
-                        if ticket.is_empty() {
-                            return None;
-                        }
-                        let permission = match perm_tok {
-                            "" => chaz_core::commands::CoOwnerPermission::Write,
-                            other => chaz_core::commands::parse_permission_token(other)?,
-                        };
-                        Some(Command::AgentImport {
-                            ticket: ticket.to_string(),
-                            permission,
-                        })
-                    })(),
-                    "set" if !rest.is_empty() => {
-                        let mut parts = rest.splitn(3, char::is_whitespace);
-                        let agent_ref = parts.next().unwrap_or("").trim();
-                        let field = parts.next().unwrap_or("").trim();
-                        let value = parts.next().unwrap_or("").trim();
-                        if agent_ref.is_empty() || field.is_empty() || value.is_empty() {
-                            None
-                        } else {
-                            Some(Command::AgentSet {
-                                agent_ref: agent_ref.to_string(),
-                                field: field.to_string(),
-                                value: value.to_string(),
-                            })
-                        }
-                    }
-                    "invite" if !rest.is_empty() => {
-                        let mut parts = rest.splitn(3, char::is_whitespace);
-                        let agent_ref = parts.next().unwrap_or("").trim();
-                        let pubkey = parts.next().unwrap_or("").trim();
-                        let perm = parts.next().unwrap_or("").trim();
-                        match chaz_core::commands::parse_permission_token(perm) {
-                            Some(permission) if !agent_ref.is_empty() && !pubkey.is_empty() => {
-                                Some(Command::AgentInvite {
-                                    agent_ref: agent_ref.to_string(),
-                                    pubkey: pubkey.to_string(),
-                                    permission,
-                                })
-                            }
-                            _ => None,
-                        }
-                    }
-                    "revoke-peer" if !rest.is_empty() => {
-                        let mut parts = rest.splitn(2, char::is_whitespace);
-                        let agent_ref = parts.next().unwrap_or("").trim();
-                        let pubkey = parts.next().unwrap_or("").trim();
-                        if agent_ref.is_empty() || pubkey.is_empty() {
-                            None
-                        } else {
-                            Some(Command::AgentRevokePeer {
-                                agent_ref: agent_ref.to_string(),
-                                pubkey: pubkey.to_string(),
-                            })
-                        }
-                    }
-                    "home-status" => Some(Command::AgentHomeStatus(if rest.is_empty() {
-                        None
-                    } else {
-                        Some(rest.to_string())
-                    })),
-                    "rehost" if !rest.is_empty() => {
-                        let mut scope = chaz_core::commands::RehostScope::Session;
-                        let mut clear = false;
-                        let mut positional: Vec<&str> = Vec::new();
-                        for tok in rest.split_whitespace() {
-                            match tok {
-                                "--agent" => scope = chaz_core::commands::RehostScope::Agent,
-                                "--clear" => clear = true,
-                                _ => positional.push(tok),
-                            }
-                        }
-                        let agent_ref = positional.first().copied().unwrap_or("").trim();
-                        let pubkey = positional.get(1).copied().map(str::to_string);
-                        if agent_ref.is_empty() || (clear && pubkey.is_some()) {
-                            None
-                        } else {
-                            Some(Command::AgentRehost {
-                                agent_ref: agent_ref.to_string(),
-                                pubkey,
-                                scope,
-                                clear,
-                            })
-                        }
-                    }
-                    _ => None,
-                }
-            }
-        );
-        register_shared!(
-            "pubkey",
-            "".to_string(),
-            "Show this peer's default pubkey (for /agent invite on another peer)",
-            |_t| { Some(Command::Pubkey) }
-        );
-        // `/memory …` is wholly owned by the memory extension — every
-        // subcommand routes through `Command::Extension`, registered by
-        // the extension-command loop further down. Built-in name
-        // reservations no longer list "memory".
-
-        // --- Bootstrap-queue surface ---
-        register_shared!(
-            "sharing",
-            "status | requests | approve <id> | reject <id>".to_string(),
-            "Inspect shared DBs / manage bootstrap requests across agent/bank/session DBs",
-            |text| {
-                let arg = matrix_args(&text);
-                let mut parts = arg.trim().splitn(2, char::is_whitespace);
-                let sub = parts.next().unwrap_or("").trim();
-                let rest = parts.next().unwrap_or("").trim();
-                match sub {
-                    "" | "status" => Some(Command::SharingStatus),
-                    "requests" | "list" => Some(Command::SharingRequests),
-                    "approve" if !rest.is_empty() => {
-                        Some(Command::SharingApprove(rest.to_string()))
-                    }
-                    "reject" if !rest.is_empty() => Some(Command::SharingReject(rest.to_string())),
-                    _ => None,
-                }
-            }
-        );
-
-        // --- Matrix channel ops (attach/detach are gateway-local so we can
-        //     install the response callback on the new session immediately) ---
-        {
-            let server = server.clone();
-            let secrets = self.secrets.clone();
-            let config = config.clone();
-            let login_id = login_id.clone();
-            let owning_agent = owning_agent.clone();
-            let attached_sessions = attached_sessions.clone();
-            bot.register_text_command(
-                "attach",
-                "<session>".to_string(),
-                "Bind this room to a specific session (by name or DB ID)".to_string(),
-                move |_, text, room| {
-                    let server = server.clone();
-                    let secrets = secrets.clone();
-                    let config = config.clone();
-                    let login_id = login_id.clone();
-                    let owning_agent = owning_agent.clone();
-                    let attached_sessions = attached_sessions.clone();
-                    async move {
-                        let arg = matrix_args(&text);
-                        let arg = arg.trim();
-                        if arg.is_empty() {
-                            let _ = room
-                                .send(RoomMessageEventContent::notice_plain(
-                                    "Usage: !chaz attach <session-name-or-id>",
-                                ))
-                                .await;
-                            return Ok(());
-                        }
-                        let room_id = room.room_id().to_string();
-                        let (_cv, target_db) = match server.registry().resolve_session(arg).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let _ = room
-                                    .send(RoomMessageEventContent::notice_plain(format!(
-                                        "!chaz Error: unknown session '{arg}': {e}"
-                                    )))
-                                    .await;
-                                return Ok(());
-                            }
-                        };
-                        let target_sid = target_db.root_id().to_string();
-                        if let Err(e) = server
-                            .registry()
-                            .attach_channel("matrix", &login_id, &room_id, &target_sid)
-                            .await
-                        {
-                            let _ = room
-                                .send(RoomMessageEventContent::notice_plain(format!(
-                                    "!chaz Error: failed to attach: {e}"
-                                )))
-                                .await;
-                            return Ok(());
-                        }
-
-                        // Install the response callback on the newly-attached
-                        // session so future writes (including scheduler fires)
-                        // reach this room.
-                        let backend =
-                            get_backend(&room, &config, &secrets, server.registry(), &login_id)
-                                .await;
-                        let agent_override = chaz_core::session::read_meta_from_db(&target_db)
-                            .await
-                            .agent_name;
-                        let _ = server
-                            .register_session(&target_db, backend, agent_override, None)
-                            .await;
-                        let mut attached = attached_sessions.lock().await;
-                        if attached.insert(target_sid.clone()) {
-                            drop(attached);
-                            if let Err(e) = attach_response_callback(
-                                &target_db,
-                                room.clone(),
-                                server.agents_arc(),
-                                owning_agent.clone(),
-                            ) {
-                                error!("Failed to attach response callback: {e}");
-                            }
-                        }
-
-                        let _ = room
-                            .send(RoomMessageEventContent::notice_plain(format!(
-                                "Attached this room to session {target_sid}."
-                            )))
-                            .await;
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        }
-
-        {
-            let server = server.clone();
-            let login_id = login_id.clone();
-            bot.register_text_command(
-                "detach",
-                "".to_string(),
-                "Detach this room from its session".to_string(),
-                move |_, _text, room| {
-                    let server = server.clone();
-                    let login_id = login_id.clone();
-                    async move {
-                        let room_id = room.room_id().to_string();
-                        match server
-                            .registry()
-                            .detach_channel("matrix", &login_id, &room_id)
-                            .await
-                        {
-                            Ok(()) => {
-                                let _ = room
-                                    .send(RoomMessageEventContent::notice_plain(
-                                        "Room detached. Future messages will create a fresh session.",
-                                    ))
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = room
-                                    .send(RoomMessageEventContent::notice_plain(format!(
-                                        "!chaz Error: {e}"
-                                    )))
-                                    .await;
-                            }
-                        }
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        }
-
-        register_shared!(
-            "channels",
-            "".to_string(),
-            "List Matrix rooms attached to this session",
-            |_t| { Some(Command::ListChannels) }
-        );
-
-        // --- LLM config ---
-        register_shared!(
-            "model",
-            "[<model>]".to_string(),
-            "Show or set the model",
-            |text| {
-                let arg = matrix_args(&text);
-                let arg = arg.trim();
-                Some(Command::Model(if arg.is_empty() {
-                    None
-                } else {
-                    Some(arg.to_string())
-                }))
-            }
-        );
-        register_shared!(
-            "role",
-            "[<role> [<prompt>]]".to_string(),
-            "Show, select, or define a role",
-            |text| {
-                let rest = matrix_args(&text);
-                let rest = rest.trim();
-                if rest.is_empty() {
-                    Some(Command::Role(None))
-                } else {
-                    let mut parts = rest.splitn(2, char::is_whitespace);
-                    let name = parts.next().unwrap_or("").trim().to_string();
-                    let prompt = parts.next().map(|s| s.trim().to_string());
-                    Some(Command::Role(Some((name, prompt))))
-                }
-            }
-        );
-        register_shared!(
-            "backend",
-            "<name> <api_base> <api_key>".to_string(),
-            "Register a custom backend for this session",
-            |text| {
-                let mut parts = text.split_whitespace().skip(2);
-                match (parts.next(), parts.next(), parts.next()) {
-                    (Some(n), Some(u), Some(k)) => Some(Command::SetBackend {
-                        name: n.to_string(),
-                        url: u.to_string(),
-                        api_key: k.to_string(),
-                    }),
-                    _ => None,
-                }
-            }
-        );
-        register_shared!(
-            "backends",
-            "".to_string(),
-            "List known backends + models",
-            |_t| { Some(Command::ListBackends) }
-        );
-        register_shared!(
-            "list",
-            "".to_string(),
-            "List available models (alias of backends)",
-            |_t| { Some(Command::ListBackends) }
-        );
-
-        register_shared!(
-            "extensions",
-            "list | add|remove <name> [agent] | settings|set <name> …".to_string(),
-            "Per-session/per-agent extension control",
-            |text| {
-                let arg = matrix_args(&text);
-                let trimmed = arg.trim();
-                let mut parts = trimmed.splitn(2, char::is_whitespace);
-                let sub = parts.next().unwrap_or("").trim();
-                let rest = parts.next().unwrap_or("").trim();
-                match sub {
-                    "" | "list" => Some(Command::Extensions(ExtensionsAction::List)),
-                    "add" if !rest.is_empty() => {
-                        let (name, scope) = split_ext_scope(rest);
-                        Some(Command::Extensions(ExtensionsAction::Add(name, scope)))
-                    }
-                    "remove" | "rm" if !rest.is_empty() => {
-                        let (name, scope) = split_ext_scope(rest);
-                        Some(Command::Extensions(ExtensionsAction::Remove(name, scope)))
-                    }
-                    "settings" if !rest.is_empty() => Some(Command::Extensions(
-                        ExtensionsAction::Settings(rest.to_string()),
-                    )),
-                    "set" => {
-                        let mut p = rest.splitn(3, char::is_whitespace);
-                        let name = p.next().unwrap_or("").trim();
-                        let key = p.next().unwrap_or("").trim();
-                        let value = p.next().unwrap_or("").trim();
-                        if name.is_empty() || key.is_empty() || value.is_empty() {
-                            None
-                        } else {
-                            Some(Command::Extensions(ExtensionsAction::Set {
-                                name: name.to_string(),
-                                key: key.to_string(),
-                                value: value.to_string(),
-                            }))
-                        }
-                    }
-                    _ => None,
-                }
-            }
-        );
-
-        // --- Extension-registered slash commands ---
-        //
-        // Mirror every `ExtensionHub::register_command` registration into a
-        // headjack text command so `!chaz <name> <args…>` reaches the
-        // extension via `Command::Extension`. Built-in name reservations
-        // (see `commands::BUILTIN_COMMAND_NAMES`) keep extensions from
-        // shadowing the per-command `register_shared!` blocks above.
-        for (ext_name, ext_desc) in server.extensions().list_commands() {
-            let name_owned = ext_name.to_string();
-            let desc_owned = ext_desc.to_string();
-            let server_c = server.clone();
-            let config_c = config.clone();
-            let secrets_c = self.secrets.clone();
-            let login_id_c = login_id.clone();
-            let owning_agent_c = owning_agent.clone();
-            bot.register_text_command(
-                &name_owned.clone(),
-                "[args...]".to_string(),
-                desc_owned,
-                move |_, text, room| {
-                    let name = name_owned.clone();
-                    let server = server_c.clone();
-                    let config = config_c.clone();
-                    let secrets = secrets_c.clone();
-                    let login_id = login_id_c.clone();
-                    let owning_agent = owning_agent_c.clone();
-                    async move {
-                        let args = matrix_args(&text);
-                        let cmd = Command::Extension { name, args };
-                        if let Err(e) = dispatch_in_room(
-                            cmd,
-                            room,
-                            server,
-                            config,
-                            secrets,
-                            &login_id,
-                            &owning_agent,
-                        )
-                        .await
-                        {
-                            tracing::error!("Extension command dispatch failed: {e}");
-                        }
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        }
-
-        // --- Matrix-only commands ---
-        bot.register_text_command(
-            "party",
-            "".to_string(),
-            "Party!".to_string(),
-            |_, _, room| async move {
-                let content = RoomMessageEventContent::notice_plain(".🎉🎊🥳 let's PARTY!! 🥳🎊🎉");
-                room.send(content).await.unwrap();
-                Ok(())
-            },
-        )
-        .await;
-
-        {
-            let config = config.clone();
-            let counts = message_counts.clone();
-            let secrets = self.secrets.clone();
-            let registry = server.registry_arc();
-            let login_id = login_id.clone();
-            bot.register_text_command(
-                "send",
-                "<message>".to_string(),
-                "Send a message without context".to_string(),
-                move |sender, text, room| {
-                    let config = config.clone();
-                    let counts = counts.clone();
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    let login_id = login_id.clone();
-                    async move {
-                        commands::send(
-                            sender, text, room, &config, &counts, &secrets, &registry, &login_id,
-                        )
-                        .await
-                    }
-                },
-            )
-            .await;
-        }
-
-        bot.register_text_command(
-            "clear",
-            "".to_string(),
-            "Ignore all messages before this point".to_string(),
-            |_, _, room| async move {
-                room.send(RoomMessageEventContent::notice_plain(
-                    "!chaz clear: All messages before this will be ignored",
-                ))
-                .await
-                .unwrap();
-                Ok(())
-            },
-        )
-        .await;
-
-        {
-            let config = config.clone();
-            let counts = message_counts.clone();
-            let secrets = self.secrets.clone();
-            let registry = server.registry_arc();
-            let login_id = login_id.clone();
-            bot.register_text_command(
-                "rename",
-                "".to_string(),
-                "Rename the room and set the topic based on the chat content".to_string(),
-                move |sender, text, room| {
-                    let config = config.clone();
-                    let counts = counts.clone();
-                    let secrets = secrets.clone();
-                    let registry = registry.clone();
-                    let login_id = login_id.clone();
-                    async move {
-                        commands::rename(
-                            sender, text, room, &config, &counts, &secrets, &registry, &login_id,
-                        )
-                        .await
-                    }
-                },
-            )
-            .await;
-        }
-
-        // === Text handler — bridges Matrix events to session DB entries ===
 
         // --- Startup: attach response callbacks + server processing to every
         //     existing Matrix channel for which the bot is joined to the room.
@@ -1112,10 +538,10 @@ impl Gateway for MatrixGateway {
         //     when no user has recently spoken in the room. ---
         {
             let server = server.clone();
-            let client = bot.client().clone();
+            let client = mc.client().clone();
             let attached_sessions = attached_sessions.clone();
             let config = config.clone();
-            let secrets = self.secrets.clone();
+            let secrets = secrets.clone();
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             tokio::spawn(async move {
@@ -1155,171 +581,331 @@ impl Gateway for MatrixGateway {
             });
         }
 
+        // === Unified message handler ===
+        //
+        // One handler replaces headjack's ~20 per-command registrations plus the
+        // free-text handler. A `!chaz ` prefix is the command channel: Matrix-
+        // local verbs are checked first, then the line is normalized to the
+        // shared `/`-grammar and routed through `chaz_core::commands::parse`.
+        // Everything else is a plain message — written to the session when the
+        // bot is addressed (DM or @mention).
         {
-            let config = config.clone();
-            let counts = message_counts;
-            let secrets = self.secrets.clone();
             let server = server.clone();
+            let config = config.clone();
+            let secrets = secrets.clone();
+            let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
+            let allow_list = allow_list.clone();
             let approval_relay_tx = approval_relay_tx.clone();
+            let pending_approvals = pending_approvals.clone();
+            let attached_sessions = attached_sessions.clone();
+            let message_counts: Arc<Mutex<HashMap<String, u64>>> =
+                Arc::new(Mutex::new(HashMap::new()));
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-            let attached_sessions = attached_sessions.clone();
-            let login_id = self.login_id.clone();
-            let owning_agent = self.owning_agent.clone();
-            bot.register_text_handler(move |sender, body: String, room, event| {
-                let config = config.clone();
-                let backfilled_rooms = backfilled_rooms.clone();
-                let seen_events = seen_events.clone();
-                let counts = counts.clone();
-                let secrets = secrets.clone();
-                let server = server.clone();
-                let approval_relay_tx = approval_relay_tx.clone();
-                let attached_sessions = attached_sessions.clone();
-                let login_id = login_id.clone();
-                let owning_agent = owning_agent.clone();
-                async move {
-                    {
-                        let mut seen = seen_events.lock().await;
-                        if !seen.insert(event.event_id.to_string()) {
-                            return Ok(());
+
+            mc.client().add_event_handler(
+                move |event: OriginalSyncRoomMessageEvent, room: Room| {
+                    let server = server.clone();
+                    let config = config.clone();
+                    let secrets = secrets.clone();
+                    let login_id = login_id.clone();
+                    let owning_agent = owning_agent.clone();
+                    let allow_list = allow_list.clone();
+                    let approval_relay_tx = approval_relay_tx.clone();
+                    let pending_approvals = pending_approvals.clone();
+                    let attached_sessions = attached_sessions.clone();
+                    let message_counts = message_counts.clone();
+                    let backfilled_rooms = backfilled_rooms.clone();
+                    let seen_events = seen_events.clone();
+                    async move {
+                        if room.state() != RoomState::Joined {
+                            return;
                         }
-                    }
-                    let is_direct =
-                        room.is_direct().await.unwrap_or(false) || room.joined_members_count() < 3;
-
-                    let mentions_bot = event
-                        .content
-                        .mentions
-                        .as_ref()
-                        .map(|mentions| {
-                            mentions
-                                .user_ids
-                                .iter()
-                                .any(|mention| mention == room.client().user_id().unwrap())
-                        })
-                        .unwrap_or(false);
-
-                    if !(is_direct || body.starts_with("!chaz") || mentions_bot) {
-                        return Ok(());
-                    }
-
-                    if rate_limit(&room, &sender, &config, &counts).await {
-                        return Ok(());
-                    }
-
-                    let room_id = room.room_id().to_string();
-
-                    let body = if body.starts_with("!chaz") {
-                        body.trim_start_matches("!chaz").trim().to_string()
-                    } else {
-                        body
-                    };
-
-                    let backend =
-                        get_backend(&room, &config, &secrets, server.registry(), &login_id).await;
-
-                    let (_conv_id, session_db) = match server
-                        .registry()
-                        .get_or_create_channel_session("matrix", &login_id, &room_id)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("Failed to get session for {room_id}: {e}");
-                            return Ok(());
-                        }
-                    };
-                    let session_db_id = session_db.root_id().to_string();
-
-                    // A login belongs to one agent: ensure it hosts this
-                    // room's session (idempotent — only writes on first
-                    // contact). Resolution then picks the owner via the host
-                    // slot; an explicit per-room re-host still wins.
-                    ensure_owning_agent_hosts(&server, &session_db_id, &owning_agent).await;
-                    let agent_override = chaz_core::session::read_meta_from_db(&session_db)
-                        .await
-                        .agent_name;
-
-                    let approval_tx =
-                        make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
-
-                    if let Err(e) = server
-                        .register_session(&session_db, backend, agent_override, Some(approval_tx))
-                        .await
-                    {
-                        error!("Failed to register session: {e}");
-                        return Ok(());
-                    }
-
-                    // Install response callback if we haven't already.
-                    {
-                        let mut attached = attached_sessions.lock().await;
-                        if attached.insert(session_db_id.clone()) {
-                            drop(attached);
-                            if let Err(e) = attach_response_callback(
-                                &session_db,
-                                room.clone(),
-                                server.agents_arc(),
-                                owning_agent.clone(),
-                            ) {
-                                error!("Failed to register response callback: {e}");
-                            } else {
-                                info!(
-                                    session_db_id = %session_db_id,
-                                    room_id = %room_id,
-                                    "Matrix response callback installed"
-                                );
+                        let MessageType::Text(text_content) = &event.content.msgtype else {
+                            return;
+                        };
+                        // Dedupe: the sync loop can redeliver on reconnect.
+                        {
+                            let mut seen = seen_events.lock().await;
+                            if !seen.insert(event.event_id.to_string()) {
+                                return;
                             }
                         }
-                    }
-
-                    // Backfill room history on first message per room
-                    {
-                        let mut backfilled = backfilled_rooms.lock().await;
-                        if backfilled.insert(room_id.clone()) {
-                            info!("Backfilling history for room {room_id}");
-                            let history = read_room_history(&room).await;
-                            let mut session = Session::new(
-                                chaz_core::types::ConversationId(session_db_id.clone()),
-                                session_db.clone(),
-                            )
-                            .await;
-                            session.backfill(history).await;
+                        let Some(bot_uid) = room.client().user_id().map(|u| u.to_string()) else {
+                            return;
+                        };
+                        if !is_allowed(allow_list.as_deref(), event.sender.as_str(), &bot_uid) {
+                            return;
                         }
-                    }
 
-                    // Write user entry to session DB — triggers server → agent → response
-                    let mut session =
-                        Session::new(chaz_core::types::ConversationId(session_db_id), session_db)
-                            .await;
-                    session
-                        .add_entry(SessionEntry {
-                            sender: sender.to_string(),
-                            content: body,
-                            timestamp: chrono::Utc::now(),
-                            entry_type: EntryType::Message,
-                            metadata: None,
-                            // Stamp transport provenance so an outbound
-                            // publisher (chunk 5) can route replies back to
-                            // this room on this login.
-                            routing: Some(EntryRouting {
-                                source: Some(TransportRef {
-                                    transport: "matrix".to_string(),
-                                    login_id: login_id.clone(),
-                                    channel: room.room_id().to_string(),
-                                    sender: Some(sender.to_string()),
-                                    sender_display: None,
-                                    message_id: Some(event.event_id.to_string()),
-                                }),
-                                ..Default::default()
-                            }),
-                        })
+                        let raw = text_content.body.trim_start();
+
+                        // Command channel: `!chaz` optionally followed by args.
+                        // A word boundary is required so `!chazfoo` is treated
+                        // as a plain message, not the command `foo`.
+                        let command_inner = raw.strip_prefix("!chaz").and_then(|r| {
+                            (r.is_empty() || r.starts_with(char::is_whitespace))
+                                .then(|| r.trim().to_string())
+                        });
+
+                        if let Some(inner) = command_inner {
+                            let verb = inner.split_whitespace().next().unwrap_or("");
+                            // View-local Matrix verbs, checked before the
+                            // shared parser. These either need gateway state
+                            // (approvals, response-callback install) or are
+                            // Matrix-only.
+                            match verb {
+                                "" | "help" => {
+                                    let _ = room
+                                        .send(RoomMessageEventContent::text_markdown(help_text()))
+                                        .await;
+                                    return;
+                                }
+                                "party" => {
+                                    let _ = room
+                                        .send(RoomMessageEventContent::notice_plain(
+                                            ".🎉🎊🥳 let's PARTY!! 🥳🎊🎉",
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                                "clear" => {
+                                    let _ = room
+                                        .send(RoomMessageEventContent::notice_plain(
+                                            "!chaz clear: All messages before this will be ignored",
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                                "approve" => {
+                                    resolve_pending_approval(&pending_approvals, &room, true).await;
+                                    return;
+                                }
+                                "deny" => {
+                                    resolve_pending_approval(&pending_approvals, &room, false)
+                                        .await;
+                                    return;
+                                }
+                                "send" => {
+                                    let _ = commands::send(
+                                        event.sender.clone(),
+                                        raw.to_string(),
+                                        room.clone(),
+                                        &config,
+                                        &message_counts,
+                                        &secrets,
+                                        server.registry(),
+                                        &login_id,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                "rename" => {
+                                    let _ = commands::rename(
+                                        event.sender.clone(),
+                                        raw.to_string(),
+                                        room.clone(),
+                                        &config,
+                                        &message_counts,
+                                        &secrets,
+                                        server.registry(),
+                                        &login_id,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                "attach" => {
+                                    let arg = inner.strip_prefix("attach").unwrap_or("").trim();
+                                    handle_attach(
+                                        arg,
+                                        room.clone(),
+                                        server.clone(),
+                                        config.clone(),
+                                        secrets.clone(),
+                                        &login_id,
+                                        &owning_agent,
+                                        attached_sessions.clone(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                "detach" => {
+                                    handle_detach(room.clone(), server.clone(), &login_id).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+
+                            // Shared vocabulary: `!chaz <rest>` → `/<rest>`.
+                            // `list` is a Matrix-only alias for `backends`
+                            // (the shared grammar has no `/list`).
+                            let slash = if verb == "list" {
+                                "/backends".to_string()
+                            } else {
+                                format!("/{inner}")
+                            };
+                            match shared_commands::parse(&slash) {
+                                Parsed::Command(cmd) => {
+                                    if let Err(e) = dispatch_in_room(
+                                        cmd,
+                                        room.clone(),
+                                        server.clone(),
+                                        config.clone(),
+                                        secrets.clone(),
+                                        &login_id,
+                                        &owning_agent,
+                                    )
+                                    .await
+                                    {
+                                        error!("Command dispatch failed: {e}");
+                                    }
+                                }
+                                Parsed::Usage(msg) => {
+                                    let _ =
+                                        room.send(RoomMessageEventContent::notice_plain(msg)).await;
+                                }
+                                // Unreachable: the input always has a leading `/`.
+                                Parsed::NotCommand => {}
+                            }
+                            return;
+                        }
+
+                        // Plain message: only engage when addressed.
+                        let is_direct = room.is_direct().await.unwrap_or(false)
+                            || room.joined_members_count() < 3;
+                        let mentions_bot = event
+                            .content
+                            .mentions
+                            .as_ref()
+                            .map(|mentions| {
+                                mentions
+                                    .user_ids
+                                    .iter()
+                                    .any(|mention| mention == room.client().user_id().unwrap())
+                            })
+                            .unwrap_or(false);
+                        if !(is_direct || mentions_bot) {
+                            return;
+                        }
+
+                        if rate_limit(&room, &event.sender, &config, &message_counts).await {
+                            return;
+                        }
+
+                        let room_id = room.room_id().to_string();
+                        let backend =
+                            get_backend(&room, &config, &secrets, server.registry(), &login_id)
+                                .await;
+
+                        let (_conv_id, session_db) = match server
+                            .registry()
+                            .get_or_create_channel_session("matrix", &login_id, &room_id)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("Failed to get session for {room_id}: {e}");
+                                return;
+                            }
+                        };
+                        let session_db_id = session_db.root_id().to_string();
+
+                        // A login belongs to one agent: ensure it hosts this
+                        // room's session (idempotent — only writes on first
+                        // contact). Resolution then picks the owner via the host
+                        // slot; an explicit per-room re-host still wins.
+                        ensure_owning_agent_hosts(&server, &session_db_id, &owning_agent).await;
+                        let agent_override = chaz_core::session::read_meta_from_db(&session_db)
+                            .await
+                            .agent_name;
+
+                        let approval_tx =
+                            make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
+
+                        if let Err(e) = server
+                            .register_session(
+                                &session_db,
+                                backend,
+                                agent_override,
+                                Some(approval_tx),
+                            )
+                            .await
+                        {
+                            error!("Failed to register session: {e}");
+                            return;
+                        }
+
+                        // Install response callback if we haven't already.
+                        {
+                            let mut attached = attached_sessions.lock().await;
+                            if attached.insert(session_db_id.clone()) {
+                                drop(attached);
+                                if let Err(e) = attach_response_callback(
+                                    &session_db,
+                                    room.clone(),
+                                    server.agents_arc(),
+                                    owning_agent.clone(),
+                                ) {
+                                    error!("Failed to register response callback: {e}");
+                                } else {
+                                    info!(
+                                        session_db_id = %session_db_id,
+                                        room_id = %room_id,
+                                        "Matrix response callback installed"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Backfill room history on first message per room.
+                        {
+                            let mut backfilled = backfilled_rooms.lock().await;
+                            if backfilled.insert(room_id.clone()) {
+                                info!("Backfilling history for room {room_id}");
+                                let history = read_room_history(&room).await;
+                                let mut session = Session::new(
+                                    chaz_core::types::ConversationId(session_db_id.clone()),
+                                    session_db.clone(),
+                                )
+                                .await;
+                                session.backfill(history).await;
+                            }
+                        }
+
+                        // Write user entry to session DB — triggers server →
+                        // agent → response.
+                        let mut session = Session::new(
+                            chaz_core::types::ConversationId(session_db_id),
+                            session_db,
+                        )
                         .await;
-
-                    Ok(())
-                }
-            });
+                        session
+                            .add_entry(SessionEntry {
+                                sender: event.sender.to_string(),
+                                content: raw.to_string(),
+                                timestamp: chrono::Utc::now(),
+                                entry_type: EntryType::Message,
+                                metadata: None,
+                                // Stamp transport provenance so an agent's reply
+                                // can be routed back to this room on this login.
+                                routing: Some(EntryRouting {
+                                    source: Some(TransportRef {
+                                        transport: "matrix".to_string(),
+                                        login_id: login_id.clone(),
+                                        channel: room.room_id().to_string(),
+                                        sender: Some(event.sender.to_string()),
+                                        sender_display: None,
+                                        message_id: Some(event.event_id.to_string()),
+                                    }),
+                                    ..Default::default()
+                                }),
+                            })
+                            .await;
+                    }
+                },
+            );
         }
 
         // Retry loop for transient sync errors. Returns Ok(()) on a clean
@@ -1328,16 +914,16 @@ impl Gateway for MatrixGateway {
         loop {
             tokio::select! {
                 biased;
-                _ = self.shutdown.notified() => {
+                _ = shutdown.notified() => {
                     info!("Matrix gateway received shutdown signal");
                     return Ok(());
                 }
-                res = bot.run() => match res {
+                res = mc.run_sync_loop() => match res {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         error!("Matrix sync error (retrying in 5s): {e}");
                         tokio::select! {
-                            _ = self.shutdown.notified() => {
+                            _ = shutdown.notified() => {
                                 info!("Matrix gateway received shutdown signal during backoff");
                                 return Ok(());
                             }
@@ -1354,7 +940,7 @@ impl Gateway for MatrixGateway {
 /// startup. Skips rooms the bot isn't joined to, or sessions that fail to open.
 ///
 /// Without an active user in the room, we pass no approval channel — scheduled
-/// Directives fire autonomously. When the user next speaks, the text handler
+/// Directives fire autonomously. When the user next speaks, the message handler
 /// re-registers the session with an approval channel bound to that message.
 #[allow(clippy::too_many_arguments)]
 async fn attach_existing_channel(

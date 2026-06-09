@@ -10,7 +10,6 @@ use chaz_core::config::*;
 use chaz_core::security::SecretStore;
 use chaz_core::session::{SessionMeta, SessionRegistry};
 
-use headjack::*;
 use matrix_sdk::{
     Room, RoomMemberships,
     room::MessagesOptions,
@@ -295,7 +294,7 @@ pub async fn get_context(
                 // and emitting multi-part chat-completion content. See
                 // docs/src/user_guide/matrix.md "Limitations".
                 if let MessageType::Text(text_content) = &content.msgtype {
-                    if is_command("!", &text_content.body) {
+                    if text_content.body.starts_with('!') {
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {
                             let model = text_content.body.split_whitespace().nth(2);
                             if let Some(model) = model

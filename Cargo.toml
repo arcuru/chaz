@@ -9,12 +9,11 @@ authors = ["Patrick Jackson <patrick@jackson.dev>"]
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/arcuru/chaz"
 homepage = "https://github.com/arcuru/chaz"
-# Can't publish to crates.io while headjack/eidetica are git-rev pinned.
+# Can't publish to crates.io while eidetica is git-rev pinned.
 publish = false
 
 [workspace.dependencies]
 # Pinned external sources — kept in sync across both crates.
-headjack = { git = "https://github.com/arcuru/headjack", rev = "0715bf369de97fdb02b915fef682c396f34f24b9" }
 eidetica = { git = "https://github.com/arcuru/eidetica", rev = "e4e98122e491666b9f0be0b2bf9236de084af8cc", features = ["sqlite"] }
 
 # Shared third-party deps.
