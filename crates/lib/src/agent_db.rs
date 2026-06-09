@@ -510,7 +510,7 @@ impl AgentDb {
             .get_store::<Table<ScheduleFire>>(SCHEDULE_FIRES_STORE)
             .await?;
         let mut rows = store.search(|_: &ScheduleFire| true).await?;
-        rows.sort_by(|a, b| a.1.fired_at.cmp(&b.1.fired_at));
+        rows.sort_by_key(|a| a.1.fired_at);
         Ok(rows.into_iter().map(|(_, f)| f).collect())
     }
 

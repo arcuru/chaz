@@ -691,7 +691,7 @@ async fn search_memory_scored(
         // scores so callers can still rank/compare; the absolute values
         // aren't meaningful across result sets.
         let mut sorted = entries;
-        sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
         sorted.truncate(limit);
         let n = sorted.len();
         sorted

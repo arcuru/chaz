@@ -52,12 +52,8 @@
         lib,
         ...
       }: let
-        # Pin to Rust 1.93.0 to avoid rustc regression (rust-lang/rust#152942)
-        # that causes matrix-sdk 0.16 to hit query depth limits on 1.94+
-        fenixStable = inputs.fenix.packages.${system}.toolchainOf {
-          channel = "1.93.0";
-          sha256 = "sha256-vra6TkHITpwRyA5oBKAHSX0Mi6CBDNQD+ryPSpxFsfg=";
-        };
+        # Latest stable Rust toolchain.
+        fenixStable = inputs.fenix.packages.${system}.stable;
         rustSrc = fenixStable.rust-src;
         toolChain = fenixStable.completeToolchain;
 
