@@ -18,6 +18,15 @@ use super::{
 /// headers) and inline completion (which skips them). Templates ending in a
 /// space take an argument; the help overlay and completion both insert the
 /// template verbatim so the cursor lands ready for that argument.
+///
+/// This is the TUI's **presentation layer**, not a mirror of
+/// [`chaz_core::commands::parse`]: it adds section grouping, human descriptions,
+/// the view-local verbs `parse` deliberately omits (`/clear`, `/settings`, …),
+/// and the extension verbs `parse` routes generically (`/memory …`). It is
+/// therefore not deduplicated into the grammar. The one invariant that *must*
+/// hold — every row claiming to be a shared built-in still resolves to one
+/// rather than silently rotting into the `Command::Extension` fallback — is
+/// pinned by the `catalog_rows_match_shared_grammar` test below.
 pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
     vec![
         ("# Session", ""),
@@ -1383,6 +1392,73 @@ mod tests {
                 "bad spacing in {tpl:?}"
             );
             assert!(seen.insert(tpl), "duplicate catalog template {tpl:?}");
+        }
+    }
+
+    /// Drift guard between the presentational catalog and the shared grammar.
+    ///
+    /// The catalog is not a mirror of `chaz_core::commands::parse` (see its
+    /// doc comment), but every row that *claims* to be a shared built-in must
+    /// still parse to a concrete `Command`. If someone renames or removes a
+    /// verb in `parse` without touching the catalog, that row silently falls to
+    /// the `Command::Extension` fallback — completing for a command that no
+    /// longer exists. This pins the relationship so such drift fails the build.
+    ///
+    /// Two small intent-allowlists carry the only state that lives nowhere
+    /// else: verbs the TUI intercepts before `parse` (`parse_chat_line`), and
+    /// verbs intentionally routed to the extension hub.
+    #[test]
+    fn catalog_rows_match_shared_grammar() {
+        use chaz_core::commands::{Command, Parsed, parse};
+
+        // Verbs `parse_chat_line` handles before reaching the shared grammar.
+        const VIEW_LOCAL: &[&str] = &[
+            "/sessions",
+            "/models",
+            "/settings",
+            "/clear",
+            "/raw",
+            "/debug",
+            "/expand",
+            "/help",
+        ];
+        // Verbs deliberately dispatched as `Command::Extension`.
+        const EXTENSION: &[&str] = &["/memory", "/schedule"];
+
+        for (tpl, _) in command_catalog() {
+            if tpl.starts_with('#') {
+                continue;
+            }
+            // First whitespace-delimited segment, e.g. "/agent" or "/memory".
+            let head = tpl.split_whitespace().next().unwrap_or(tpl);
+            if VIEW_LOCAL.contains(&head) {
+                continue;
+            }
+            // Arg-bearing templates end in a space; feed a dummy arg so the
+            // argument arm matches instead of falling through.
+            let probe = if tpl.ends_with(' ') {
+                format!("{tpl}x")
+            } else {
+                tpl.to_string()
+            };
+            // `Usage` (a recognized verb with too few dummy args) counts as
+            // "owned by the grammar" just like a concrete `Command` — only the
+            // `Extension` fallback signals the verb isn't a real built-in.
+            match parse(&probe) {
+                Parsed::Command(Command::Extension { .. }) => assert!(
+                    EXTENSION.contains(&head),
+                    "catalog row {tpl:?} fell through to Command::Extension but isn't an \
+                     allowlisted extension verb — did a built-in get renamed in parse?"
+                ),
+                Parsed::Command(_) | Parsed::Usage(_) => assert!(
+                    !EXTENSION.contains(&head),
+                    "catalog row {tpl:?} now resolves to a built-in but is listed as an \
+                     extension verb — update the EXTENSION allowlist"
+                ),
+                Parsed::NotCommand => {
+                    panic!("catalog row {tpl:?} probed as {probe:?} → NotCommand")
+                }
+            }
         }
     }
 
