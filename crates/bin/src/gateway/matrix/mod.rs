@@ -11,6 +11,8 @@ use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{EntryRouting, EntryType, Session, SessionEntry, TransportRef};
 
+use chrono::{DateTime, Utc};
+
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::{
@@ -127,34 +129,87 @@ fn render_outbound(owning_agent: &str, sender: &str, content: &str) -> String {
     }
 }
 
-/// Install a response-delivery callback on a session DB that forwards any
-/// agent `Message` entries to the given Matrix room. Idempotent: the
-/// `attached` set is the caller's dedupe gate.
-fn attach_response_callback(
+/// Identity of a delivered entry: `(timestamp, content)` — the same key the
+/// session backfill dedupes on.
+type DeliveredKey = (DateTime<Utc>, String);
+/// Per-room set of agent messages already sent to the room.
+type DeliveredSet = Arc<Mutex<HashSet<DeliveredKey>>>;
+
+/// The agent `Message` entries in `entries` not yet in `delivered`.
+///
+/// Pure, so the reconcile rule is unit-testable without a live DB or room.
+/// `is_agent` selects agent senders; human participants' messages are already
+/// in the room, so they are never echoed back.
+fn undelivered_agent_messages<'a>(
+    entries: &'a [SessionEntry],
+    is_agent: impl Fn(&str) -> bool,
+    delivered: &HashSet<DeliveredKey>,
+) -> Vec<&'a SessionEntry> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.entry_type == EntryType::Message
+                && is_agent(&e.sender)
+                && !delivered.contains(&(e.timestamp, e.content.clone()))
+        })
+        .collect()
+}
+
+/// Install a reconciling response callback on a session DB: on every write,
+/// converge the Matrix room to DB state by sending any agent `Message` entries
+/// it doesn't already show. Unlike forwarding `latest_entry()` alone, this emits
+/// the full room-vs-DB delta, so a write that lands several messages at once
+/// (a remote sync, or several agents) loses none.
+///
+/// The history present at install time already shows in the room, so it seeds
+/// the delivered-set and is never re-emitted. Idempotent across the caller's
+/// `attached` gate and across duplicate or out-of-order `on_write` fires.
+async fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
     agents: Arc<chaz_core::agent::AgentRegistry>,
     owning_agent: String,
 ) -> anyhow::Result<()> {
-    let session_db_id = session_db.root_id().to_string();
+    let sid = session_db.root_id().to_string();
+    // Seed with everything already committed — the room shows it already.
+    let delivered: DeliveredSet = {
+        let session = Session::new(
+            chaz_core::types::ConversationId(sid.clone()),
+            session_db.clone(),
+        )
+        .await;
+        let seed = session
+            .entries()
+            .iter()
+            .map(|e| (e.timestamp, e.content.clone()))
+            .collect();
+        Arc::new(Mutex::new(seed))
+    };
     session_db
         .on_write(move |_event, db| {
             let room = room.clone();
             let agents = agents.clone();
             let owning_agent = owning_agent.clone();
             let db = db.clone();
-            let sid = session_db_id.clone();
+            let sid = sid.clone();
+            let delivered = delivered.clone();
             Box::pin(async move {
                 let session = Session::new(chaz_core::types::ConversationId(sid), db).await;
-                if let Some(latest) = session.latest_entry()
-                    && latest.entry_type == EntryType::Message
-                    && agents.get(&latest.sender).is_some()
-                {
-                    let body = render_outbound(&owning_agent, &latest.sender, &latest.content);
+                // Hold the lock across the sends so concurrent writes can't
+                // interleave or double-emit; the room delivery is serialized.
+                let mut delivered = delivered.lock().await;
+                let pending = undelivered_agent_messages(
+                    session.entries(),
+                    |s| agents.get(s).is_some(),
+                    &delivered,
+                );
+                for entry in pending {
+                    delivered.insert((entry.timestamp, entry.content.clone()));
+                    let body = render_outbound(&owning_agent, &entry.sender, &entry.content);
                     info!("→ Matrix({}): {}", room.room_id(), body.replace('\n', " "));
                     let content = RoomMessageEventContent::text_markdown(&body);
                     if let Err(e) = room.send(content).await {
-                        tracing::error!("Failed to send to Matrix: {e}");
+                        error!("Failed to send to Matrix: {e}");
                     }
                 }
                 Ok(())
@@ -381,7 +436,9 @@ async fn handle_attach(
             room.clone(),
             server.agents_arc(),
             owning_agent.to_string(),
-        ) {
+        )
+        .await
+        {
             error!("Failed to attach response callback: {e}");
         }
     }
@@ -847,7 +904,9 @@ impl Gateway for MatrixGateway {
                                     room.clone(),
                                     server.agents_arc(),
                                     owning_agent.clone(),
-                                ) {
+                                )
+                                .await
+                                {
                                     error!("Failed to register response callback: {e}");
                                 } else {
                                     info!(
@@ -992,7 +1051,9 @@ async fn attach_existing_channel(
         room,
         server.agents_arc(),
         owning_agent.to_string(),
-    ) {
+    )
+    .await
+    {
         error!("Failed to attach response callback at startup: {e}");
     } else {
         info!(
@@ -1004,7 +1065,18 @@ async fn attach_existing_channel(
 
 #[cfg(test)]
 mod tests {
-    use super::render_outbound;
+    use super::*;
+
+    fn entry(sender: &str, content: &str, ts: i64, entry_type: EntryType) -> SessionEntry {
+        SessionEntry {
+            sender: sender.to_string(),
+            content: content.to_string(),
+            timestamp: DateTime::from_timestamp(ts, 0).unwrap(),
+            entry_type,
+            metadata: None,
+            routing: None,
+        }
+    }
 
     #[test]
     fn owning_agent_writes_go_out_plain() {
@@ -1023,5 +1095,40 @@ mod tests {
     fn prefix_is_exact_name_match() {
         // A different-cased or partial name is a distinct agent: still a guest.
         assert_eq!(render_outbound("ava", "Ava", "hi"), "[Ava] hi");
+    }
+
+    #[test]
+    fn reconcile_delivers_only_undelivered_agent_messages() {
+        let entries = vec![
+            entry("@human:s", "hi", 1, EntryType::Message), // human → already in room
+            entry("ava", "hello", 2, EntryType::Message),   // agent, new → send
+            entry("ava", "ls()", 3, EntryType::ToolCall),   // audit trail → skip
+            entry("scout", "done", 4, EntryType::Message),  // guest agent, new → send
+            entry("ava", "old", 5, EntryType::Message),     // agent, already delivered → skip
+        ];
+        let is_agent = |s: &str| s == "ava" || s == "scout";
+        let mut delivered = HashSet::new();
+        delivered.insert((entries[4].timestamp, "old".to_string()));
+
+        let got: Vec<&str> = undelivered_agent_messages(&entries, is_agent, &delivered)
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect();
+        assert_eq!(got, vec!["hello", "done"]);
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_once_delivered() {
+        let entries = vec![entry("ava", "hello", 2, EntryType::Message)];
+        let is_agent = |s: &str| s == "ava";
+
+        let mut delivered = HashSet::new();
+        assert_eq!(
+            undelivered_agent_messages(&entries, is_agent, &delivered).len(),
+            1
+        );
+        // Mark it delivered (what the callback does) → a second pass is a no-op.
+        delivered.insert((entries[0].timestamp, "hello".to_string()));
+        assert!(undelivered_agent_messages(&entries, is_agent, &delivered).is_empty());
     }
 }
