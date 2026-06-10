@@ -1,0 +1,28 @@
+[package]
+name = "chaz-discord-gateway"
+description = "Standalone Discord gateway for chaz — maps an eidetica session DB to a Discord channel."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "chaz-discord"
+path = "src/main.rs"
+
+[dependencies]
+chaz-core = { path = "../lib" }
+
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+eidetica.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+serenity.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
