@@ -133,6 +133,42 @@ pub fn undelivered_agent_messages<'a>(
         .collect()
 }
 
+/// Deliver `pending` agent entries to a transport in order, marking each one
+/// delivered only *after* its `send` succeeds. A failed send logs and stops the
+/// pass, leaving that entry and the tail behind it unmarked so a later
+/// reconcile retries them — in order. Marking before (or despite) a failed send
+/// is what silently drops a message; this never does. A `send` never writes the
+/// session DB, so a persistently failing transport can't spin this into a
+/// resend loop — the retry only fires when fresh session activity arrives.
+///
+/// Returns the number delivered this pass. Split out from [`attach_reconciler`]
+/// so the mark-after-success contract is unit-testable without a live DB.
+async fn deliver_in_order<S, Fut>(
+    pending: &[&SessionEntry],
+    owning_agent: &str,
+    delivered: &mut HashSet<DeliveredKey>,
+    send: &S,
+) -> usize
+where
+    S: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut delivered_now = 0;
+    for entry in pending {
+        let body = render_outbound(owning_agent, &entry.sender, &entry.content);
+        if let Err(e) = send(body).await {
+            error!(
+                "Failed to deliver to transport: {e}; \
+                 leaving it for retry on the next write"
+            );
+            break;
+        }
+        delivered.insert((entry.timestamp, entry.content.clone()));
+        delivered_now += 1;
+    }
+    delivered_now
+}
+
 /// Install a reconciling response callback on a session DB: on every write,
 /// converge the transport channel to DB state by sending any agent `Message`
 /// entries it doesn't already show. Unlike forwarding `latest_entry()` alone,
@@ -143,6 +179,13 @@ pub fn undelivered_agent_messages<'a>(
 /// seeds the delivered-set and is never re-emitted. Idempotent across the
 /// caller's `attached` gate and across duplicate or out-of-order `on_write`
 /// fires.
+///
+/// Delivery is at-least-once: an entry is added to the delivered-set only
+/// after `send` reports success, and a failing send stops the pass so the
+/// undelivered tail is retried — in order — on the next write. A transport
+/// that delivers a multi-part body non-atomically (e.g. chunked to fit a
+/// length cap) may therefore re-emit the already-sent prefix on retry; that
+/// is the cost of never silently dropping a message.
 ///
 /// `send` is the transport's delivery closure — it receives each rendered
 /// body and is responsible for delivering it (and any transport-specific
@@ -189,13 +232,7 @@ where
                     |s| agents.get(s).is_some(),
                     &delivered,
                 );
-                for entry in pending {
-                    delivered.insert((entry.timestamp, entry.content.clone()));
-                    let body = render_outbound(&owning_agent, &entry.sender, &entry.content);
-                    if let Err(e) = send(body).await {
-                        error!("Failed to deliver to transport: {e}");
-                    }
-                }
+                deliver_in_order(&pending, &owning_agent, &mut delivered, send.as_ref()).await;
                 Ok(())
             })
         })?
@@ -292,5 +329,112 @@ mod tests {
         assert_eq!(src.channel, "chan-42");
         assert_eq!(src.sender.as_deref(), Some("@user:x"));
         assert_eq!(src.message_id.as_deref(), Some("msg-7"));
+    }
+
+    /// A send closure backed by shared state: it records every body it
+    /// *successfully* delivers, and fails the configured bodies on their first
+    /// attempt only (so a retry of the same body goes through).
+    fn flaky_send(
+        sent: Arc<Mutex<Vec<String>>>,
+        fail_once: &[&str],
+    ) -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>>
+    {
+        let fail_once: HashSet<String> = fail_once.iter().map(|s| s.to_string()).collect();
+        let failed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        move |body: String| {
+            let sent = sent.clone();
+            let failed = failed.clone();
+            let fail_once = fail_once.clone();
+            Box::pin(async move {
+                if fail_once.contains(&body) && failed.lock().await.insert(body.clone()) {
+                    anyhow::bail!("simulated transport failure delivering {body:?}");
+                }
+                sent.lock().await.push(body);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_send_is_not_marked_then_retries() {
+        let entries = vec![entry("ava", "hello", 2, EntryType::Message)];
+        let pending: Vec<&SessionEntry> = entries.iter().collect();
+        let mut delivered = HashSet::new();
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send = flaky_send(sent.clone(), &["hello"]);
+
+        // First pass: the only send fails → nothing delivered, nothing marked.
+        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        assert_eq!(n, 0);
+        assert!(delivered.is_empty(), "a failed send must not be marked");
+        assert!(sent.lock().await.is_empty());
+
+        // The next write retries the same still-undelivered entry; now it lands.
+        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        assert_eq!(n, 1);
+        assert!(delivered.contains(&(entries[0].timestamp, "hello".to_string())));
+        assert_eq!(sent.lock().await.as_slice(), &["hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stops_at_first_failure_and_resumes_in_order() {
+        let entries = vec![
+            entry("ava", "a", 1, EntryType::Message),
+            entry("ava", "b", 2, EntryType::Message),
+            entry("ava", "c", 3, EntryType::Message),
+        ];
+        let pending: Vec<&SessionEntry> = entries.iter().collect();
+        let mut delivered = HashSet::new();
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send = flaky_send(sent.clone(), &["b"]); // "b" fails its first attempt
+
+        // First pass: "a" lands, "b" fails → stop. "c" is never attempted.
+        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        assert_eq!(n, 1);
+        assert_eq!(sent.lock().await.as_slice(), &["a".to_string()]);
+        assert!(delivered.contains(&(entries[0].timestamp, "a".to_string())));
+        assert!(!delivered.contains(&(entries[1].timestamp, "b".to_string())));
+
+        // The reconciler recomputes pending from the delivered-set: "a" drops
+        // out, leaving ["b", "c"]. The retry delivers both, in order.
+        let retry: Vec<&SessionEntry> = pending
+            .iter()
+            .copied()
+            .filter(|e| !delivered.contains(&(e.timestamp, e.content.clone())))
+            .collect();
+        assert_eq!(
+            retry.iter().map(|e| e.content.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+        let n = deliver_in_order(&retry, "ava", &mut delivered, &send).await;
+        assert_eq!(n, 2);
+        assert_eq!(
+            sent.lock().await.as_slice(),
+            &["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_run_marks_every_entry() {
+        let entries = vec![
+            entry("ava", "one", 1, EntryType::Message),
+            entry("scout", "two", 2, EntryType::Message), // guest → prefixed body
+        ];
+        let pending: Vec<&SessionEntry> = entries.iter().collect();
+        let mut delivered = HashSet::new();
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send = flaky_send(sent.clone(), &[]); // nothing fails
+
+        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        assert_eq!(n, 2);
+        // Owning agent plain; guest prefixed (render_outbound contract).
+        assert_eq!(
+            sent.lock().await.as_slice(),
+            &["one".to_string(), "[scout] two".to_string()]
+        );
+        assert_eq!(delivered.len(), 2);
     }
 }
