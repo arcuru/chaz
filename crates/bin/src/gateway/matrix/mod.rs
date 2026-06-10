@@ -9,9 +9,7 @@ use chaz_core::config::{Config, MatrixLoginSpec};
 use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
-use chaz_core::session::{EntryRouting, EntryType, Session, SessionEntry, TransportRef};
-
-use chrono::{DateTime, Utc};
+use chaz_core::session::Session;
 
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
@@ -115,108 +113,29 @@ impl MatrixGateway {
     }
 }
 
-/// Render an agent's session write for this login's Matrix room.
+/// Install the reconciling response callback for a Matrix room.
 ///
-/// A login belongs to one agent. The owning agent speaks as the room's Matrix
-/// user, so its writes go out plain; any other agent writing into this session
-/// is a guest, shown with an `[AgentName]` prefix so readers can tell speakers
-/// apart under the single MXID.
-fn render_outbound(owning_agent: &str, sender: &str, content: &str) -> String {
-    if sender == owning_agent {
-        content.to_string()
-    } else {
-        format!("[{sender}] {content}")
-    }
-}
-
-/// Identity of a delivered entry: `(timestamp, content)` — the same key the
-/// session backfill dedupes on.
-type DeliveredKey = (DateTime<Utc>, String);
-/// Per-room set of agent messages already sent to the room.
-type DeliveredSet = Arc<Mutex<HashSet<DeliveredKey>>>;
-
-/// The agent `Message` entries in `entries` not yet in `delivered`.
-///
-/// Pure, so the reconcile rule is unit-testable without a live DB or room.
-/// `is_agent` selects agent senders; human participants' messages are already
-/// in the room, so they are never echoed back.
-fn undelivered_agent_messages<'a>(
-    entries: &'a [SessionEntry],
-    is_agent: impl Fn(&str) -> bool,
-    delivered: &HashSet<DeliveredKey>,
-) -> Vec<&'a SessionEntry> {
-    entries
-        .iter()
-        .filter(|e| {
-            e.entry_type == EntryType::Message
-                && is_agent(&e.sender)
-                && !delivered.contains(&(e.timestamp, e.content.clone()))
-        })
-        .collect()
-}
-
-/// Install a reconciling response callback on a session DB: on every write,
-/// converge the Matrix room to DB state by sending any agent `Message` entries
-/// it doesn't already show. Unlike forwarding `latest_entry()` alone, this emits
-/// the full room-vs-DB delta, so a write that lands several messages at once
-/// (a remote sync, or several agents) loses none.
-///
-/// The history present at install time already shows in the room, so it seeds
-/// the delivered-set and is never re-emitted. Idempotent across the caller's
-/// `attached` gate and across duplicate or out-of-order `on_write` fires.
+/// Thin transport adapter over [`chaz_core::gateway::attach_reconciler`]: the
+/// reconcile rule (delta scan, delivered-set, `[guest]` prefixing) lives in
+/// the lib; this only supplies the Matrix `send` closure — render markdown and
+/// hand it to `room.send`. Proving the lib API is sufficient for Matrix is
+/// what keeps it honest as the surface a `chaz-discord` binary links against.
 async fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
     agents: Arc<chaz_core::agent::AgentRegistry>,
     owning_agent: String,
 ) -> anyhow::Result<()> {
-    let sid = session_db.root_id().to_string();
-    // Seed with everything already committed — the room shows it already.
-    let delivered: DeliveredSet = {
-        let session = Session::new(
-            chaz_core::types::ConversationId(sid.clone()),
-            session_db.clone(),
-        )
-        .await;
-        let seed = session
-            .entries()
-            .iter()
-            .map(|e| (e.timestamp, e.content.clone()))
-            .collect();
-        Arc::new(Mutex::new(seed))
-    };
-    session_db
-        .on_write(move |_event, db| {
-            let room = room.clone();
-            let agents = agents.clone();
-            let owning_agent = owning_agent.clone();
-            let db = db.clone();
-            let sid = sid.clone();
-            let delivered = delivered.clone();
-            Box::pin(async move {
-                let session = Session::new(chaz_core::types::ConversationId(sid), db).await;
-                // Hold the lock across the sends so concurrent writes can't
-                // interleave or double-emit; the room delivery is serialized.
-                let mut delivered = delivered.lock().await;
-                let pending = undelivered_agent_messages(
-                    session.entries(),
-                    |s| agents.get(s).is_some(),
-                    &delivered,
-                );
-                for entry in pending {
-                    delivered.insert((entry.timestamp, entry.content.clone()));
-                    let body = render_outbound(&owning_agent, &entry.sender, &entry.content);
-                    info!("→ Matrix({}): {}", room.room_id(), body.replace('\n', " "));
-                    let content = RoomMessageEventContent::text_markdown(&body);
-                    if let Err(e) = room.send(content).await {
-                        error!("Failed to send to Matrix: {e}");
-                    }
-                }
-                Ok(())
-            })
-        })?
-        .detach();
-    Ok(())
+    chaz_core::gateway::attach_reconciler(session_db, agents, owning_agent, move |body| {
+        let room = room.clone();
+        async move {
+            info!("→ Matrix({}): {}", room.room_id(), body.replace('\n', " "));
+            let content = RoomMessageEventContent::text_markdown(&body);
+            room.send(content).await?;
+            Ok(())
+        }
+    })
+    .await
 }
 
 /// Ensure this login's owning agent hosts the given session — a login
@@ -940,27 +859,18 @@ impl Gateway for MatrixGateway {
                             session_db,
                         )
                         .await;
+                        // Stamp transport provenance so an agent's reply can
+                        // be routed back to this room on this login.
                         session
-                            .add_entry(SessionEntry {
-                                sender: event.sender.to_string(),
-                                content: raw.to_string(),
-                                timestamp: chrono::Utc::now(),
-                                entry_type: EntryType::Message,
-                                metadata: None,
-                                // Stamp transport provenance so an agent's reply
-                                // can be routed back to this room on this login.
-                                routing: Some(EntryRouting {
-                                    source: Some(TransportRef {
-                                        transport: "matrix".to_string(),
-                                        login_id: login_id.clone(),
-                                        channel: room.room_id().to_string(),
-                                        sender: Some(event.sender.to_string()),
-                                        sender_display: None,
-                                        message_id: Some(event.event_id.to_string()),
-                                    }),
-                                    ..Default::default()
-                                }),
-                            })
+                            .add_entry(chaz_core::gateway::inbound_user_entry(
+                                "matrix",
+                                &login_id,
+                                room.room_id().as_ref(),
+                                event.sender.as_ref(),
+                                None,
+                                raw,
+                                Some(event.event_id.to_string()),
+                            ))
                             .await;
                     }
                 },
@@ -1060,75 +970,5 @@ async fn attach_existing_channel(
             session_db_id,
             room_id, "Matrix channel attached at startup (server + response callbacks installed)"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(sender: &str, content: &str, ts: i64, entry_type: EntryType) -> SessionEntry {
-        SessionEntry {
-            sender: sender.to_string(),
-            content: content.to_string(),
-            timestamp: DateTime::from_timestamp(ts, 0).unwrap(),
-            entry_type,
-            metadata: None,
-            routing: None,
-        }
-    }
-
-    #[test]
-    fn owning_agent_writes_go_out_plain() {
-        assert_eq!(render_outbound("ava", "ava", "clear skies"), "clear skies");
-    }
-
-    #[test]
-    fn guest_agent_writes_are_prefixed() {
-        assert_eq!(
-            render_outbound("ava", "scout", "logs look clean"),
-            "[scout] logs look clean"
-        );
-    }
-
-    #[test]
-    fn prefix_is_exact_name_match() {
-        // A different-cased or partial name is a distinct agent: still a guest.
-        assert_eq!(render_outbound("ava", "Ava", "hi"), "[Ava] hi");
-    }
-
-    #[test]
-    fn reconcile_delivers_only_undelivered_agent_messages() {
-        let entries = vec![
-            entry("@human:s", "hi", 1, EntryType::Message), // human → already in room
-            entry("ava", "hello", 2, EntryType::Message),   // agent, new → send
-            entry("ava", "ls()", 3, EntryType::ToolCall),   // audit trail → skip
-            entry("scout", "done", 4, EntryType::Message),  // guest agent, new → send
-            entry("ava", "old", 5, EntryType::Message),     // agent, already delivered → skip
-        ];
-        let is_agent = |s: &str| s == "ava" || s == "scout";
-        let mut delivered = HashSet::new();
-        delivered.insert((entries[4].timestamp, "old".to_string()));
-
-        let got: Vec<&str> = undelivered_agent_messages(&entries, is_agent, &delivered)
-            .iter()
-            .map(|e| e.content.as_str())
-            .collect();
-        assert_eq!(got, vec!["hello", "done"]);
-    }
-
-    #[test]
-    fn reconcile_is_idempotent_once_delivered() {
-        let entries = vec![entry("ava", "hello", 2, EntryType::Message)];
-        let is_agent = |s: &str| s == "ava";
-
-        let mut delivered = HashSet::new();
-        assert_eq!(
-            undelivered_agent_messages(&entries, is_agent, &delivered).len(),
-            1
-        );
-        // Mark it delivered (what the callback does) → a second pass is a no-op.
-        delivered.insert((entries[0].timestamp, "hello".to_string()));
-        assert!(undelivered_agent_messages(&entries, is_agent, &delivered).is_empty());
     }
 }
