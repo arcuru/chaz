@@ -16,6 +16,9 @@ ignore = [
     # Transitive via headjack → matrix-sdk
     "RUSTSEC-2024-0384", # instant unmaintained
     "RUSTSEC-2024-0436", # paste-impl unmaintained
+    # Transitive via serenity (chaz-discord gateway)
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (serenity proc-macros)
+    "RUSTSEC-2026-0049", # rustls CRL distribution-point matching; no custom CRLs in use
 ]
 
 [bans]

@@ -118,6 +118,20 @@
               --prefix PATH : ${lib.makeBinPath [pkgs.aichat]}
           '';
 
+        # The standalone Discord gateway (separate crate, same workspace build).
+        # Wrapped like chaz so it shares the backend toolchain (aichat) on PATH.
+        chaz-discord =
+          pkgs.runCommand "chaz-discord" {
+            inherit (chaz-unwrapped) version;
+            pname = "chaz-discord";
+            nativeBuildInputs = [pkgs.makeWrapper];
+          } ''
+            mkdir -p $out/bin
+            cp ${chaz-unwrapped}/bin/chaz-discord $out/bin
+            wrapProgram $out/bin/chaz-discord \
+              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]}
+          '';
+
         # Lint packages
         chaz-clippy = craneLib.cargoClippy (buildArgs
           // {
@@ -206,11 +220,16 @@
             unwrapped = chaz-unwrapped;
           };
 
+          # Standalone Discord gateway
+          chaz-discord = {
+            bin = chaz-discord;
+          };
+
           default = chaz;
         };
 
         packages = {
-          inherit chaz chaz-unwrapped;
+          inherit chaz chaz-unwrapped chaz-discord;
           default = chaz;
         };
 
@@ -236,6 +255,10 @@
           default = {
             type = "app";
             program = "${chaz}/bin/chaz";
+          };
+          chaz-discord = {
+            type = "app";
+            program = "${chaz-discord}/bin/chaz-discord";
           };
         };
 

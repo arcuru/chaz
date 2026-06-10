@@ -26,8 +26,10 @@ use chaz_core::session::Session;
 use chaz_core::types::ConversationId;
 
 use serenity::async_trait;
+use serenity::http::Http;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
+use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 
 use tokio::sync::Mutex;
@@ -142,33 +144,13 @@ impl Handler {
 
         // Install the reconciler once per session: outbound delivery is the
         // lib's job; we only supply the Discord send closure.
-        {
-            let mut attached = self.attached.lock().await;
-            if attached.insert(session_db_id.clone()) {
-                drop(attached);
-                let http = ctx.http.clone();
-                let channel_id = msg.channel_id;
-                attach_reconciler(
-                    &session_db,
-                    self.server.agents_arc(),
-                    self.owning_agent.clone(),
-                    move |body| {
-                        let http = http.clone();
-                        async move {
-                            info!("→ Discord({channel_id}): {}", body.replace('\n', " "));
-                            channel_id.say(&http, body).await?;
-                            Ok(())
-                        }
-                    },
-                )
-                .await?;
-                info!(
-                    session_db_id = %session_db_id,
-                    channel = %channel,
-                    "Discord reconciler installed"
-                );
-            }
-        }
+        self.attach_once(
+            ctx.http.clone(),
+            msg.channel_id,
+            &session_db,
+            &session_db_id,
+        )
+        .await?;
 
         // Stamp transport provenance so an agent's reply routes back here.
         let display = msg.author.global_name.clone();
@@ -185,6 +167,84 @@ impl Handler {
             ))
             .await;
         Ok(())
+    }
+
+    /// Install the outbound reconciler for a channel exactly once, guarded by
+    /// the `attached` set. The reconcile rule lives in `chaz_core`; the only
+    /// Discord-specific part is the `ChannelId::say` send closure.
+    async fn attach_once(
+        &self,
+        http: Arc<Http>,
+        channel_id: ChannelId,
+        session_db: &eidetica::Database,
+        session_db_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut attached = self.attached.lock().await;
+        if !attached.insert(session_db_id.to_string()) {
+            return Ok(());
+        }
+        drop(attached);
+        attach_reconciler(
+            session_db,
+            self.server.agents_arc(),
+            self.owning_agent.clone(),
+            move |body| {
+                let http = http.clone();
+                async move {
+                    info!("→ Discord({channel_id}): {}", body.replace('\n', " "));
+                    channel_id.say(&http, body).await?;
+                    Ok(())
+                }
+            },
+        )
+        .await?;
+        info!(session_db_id, "Discord reconciler installed");
+        Ok(())
+    }
+
+    /// On connect, reattach every Discord channel already bound to this login
+    /// so scheduled-session output is delivered with no inbound trigger.
+    /// Mirrors the Matrix gateway's startup reattach.
+    async fn reattach_existing_channels(&self, http: Arc<Http>) {
+        let channels = match self.server.registry().list_channels().await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to list channels at startup: {e}");
+                return;
+            }
+        };
+        for (transport, chan_login, channel, session_db_id) in channels {
+            if transport != "discord" || chan_login != self.login_id {
+                continue;
+            }
+            if let Err(e) = self
+                .reattach_channel(http.clone(), &channel, &session_db_id)
+                .await
+            {
+                error!(channel = %channel, "Failed to reattach Discord channel: {e}");
+            }
+        }
+    }
+
+    /// Host + register + reconcile an already-bound channel (no inbound entry).
+    async fn reattach_channel(
+        &self,
+        http: Arc<Http>,
+        channel: &str,
+        session_db_id: &str,
+    ) -> anyhow::Result<()> {
+        let (_conv_id, session_db) = self.server.registry().open_session(session_db_id).await?;
+        self.ensure_owning_agent_hosts(session_db_id).await;
+        let agent_override = chaz_core::session::read_meta_from_db(&session_db)
+            .await
+            .agent_name;
+        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        self.server
+            .register_session(&session_db, backend, agent_override, None)
+            .await?;
+        let channel_id = ChannelId::new(channel.parse::<u64>()?);
+        self.attach_once(http, channel_id, &session_db, session_db_id)
+            .await
     }
 
     /// Ensure this login's owning agent hosts the given session — mirrors the
@@ -215,7 +275,10 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!(bot = %ready.user.name, "Discord gateway connected");
+        // Reattach already-bound channels so scheduled output flows without an
+        // inbound message first.
+        self.reattach_existing_channels(ctx.http.clone()).await;
     }
 }
