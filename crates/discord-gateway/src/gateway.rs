@@ -280,7 +280,13 @@ impl Handler {
                 let http = http.clone();
                 async move {
                     info!("→ Discord({channel_id}): {}", body.replace('\n', " "));
-                    channel_id.say(&http, body).await?;
+                    // Discord rejects any message over DISCORD_MESSAGE_LIMIT
+                    // characters, so a long agent reply goes out as several
+                    // messages split on natural boundaries. A body that already
+                    // fits produces a single chunk (and an empty body, none).
+                    for piece in chunk_message(&body, DISCORD_MESSAGE_LIMIT) {
+                        channel_id.say(&http, piece).await?;
+                    }
                     Ok(())
                 }
             },
@@ -539,6 +545,105 @@ fn help_text() -> String {
     .join("\n")
 }
 
+/// Discord rejects messages longer than 2000 characters (counted as Unicode
+/// scalar values, not bytes). Outbound bodies are split to fit this ceiling.
+const DISCORD_MESSAGE_LIMIT: usize = 2000;
+
+/// Split `body` into pieces that each fit within `limit` characters, for
+/// delivery as one Discord message apiece.
+///
+/// Splitting prefers the least disruptive boundary: first newlines, then
+/// spaces within an over-long line, and only as a last resort a hard cut
+/// through a single oversized token (a URL, a base64 blob). Lengths are
+/// measured in `char`s — Discord counts Unicode scalar values — and cuts never
+/// fall inside a multi-byte char. A body that already fits yields one chunk; an
+/// empty body yields none (nothing to send).
+///
+/// Pure, so it is unit-testable without a live transport.
+fn chunk_message(body: &str, limit: usize) -> Vec<String> {
+    pack_parts(body.split('\n'), "\n", limit, |line, lim| {
+        pack_parts(line.split(' '), " ", lim, hard_split)
+    })
+}
+
+/// Greedily pack `parts` (rejoined with `sep`) into chunks of at most `limit`
+/// chars. A single part that exceeds `limit` on its own is broken up by
+/// `break_part`, whose last piece is left open so following parts can still
+/// pack onto it — this avoids stranding a long token's tail on its own line.
+fn pack_parts<'a, I, B>(parts: I, sep: &str, limit: usize, break_part: B) -> Vec<String>
+where
+    I: Iterator<Item = &'a str>,
+    B: Fn(&str, usize) -> Vec<String>,
+{
+    let sep_len = sep.chars().count();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+
+    for part in parts {
+        let plen = part.chars().count();
+        let need = if cur.is_empty() {
+            plen
+        } else {
+            cur_len + sep_len + plen
+        };
+        if need <= limit {
+            if !cur.is_empty() {
+                cur.push_str(sep);
+                cur_len += sep_len;
+            }
+            cur.push_str(part);
+            cur_len += plen;
+            continue;
+        }
+
+        // The part won't pack onto the current chunk: flush it first.
+        if !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        if plen <= limit {
+            // Fits on its own — start a fresh chunk with it.
+            cur.push_str(part);
+            cur_len = plen;
+        } else {
+            // Too long even alone: break it, emitting all but the last piece
+            // and leaving that last piece open for the next part to join.
+            let mut pieces = break_part(part, limit);
+            if let Some(last) = pieces.pop() {
+                chunks.extend(pieces);
+                cur_len = last.chars().count();
+                cur = last;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Last-resort split of a single token that exceeds `limit`: cut it into
+/// consecutive `limit`-char pieces on char boundaries. Joining the result back
+/// reproduces the input exactly (no separator is inserted or dropped).
+fn hard_split(token: &str, limit: usize) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0usize;
+    for ch in token.chars() {
+        if n == limit {
+            pieces.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+        cur.push(ch);
+        n += 1;
+    }
+    if !cur.is_empty() {
+        pieces.push(cur);
+    }
+    pieces
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
@@ -575,5 +680,126 @@ impl EventHandler for Handler {
             info!(channel = %add.channel_id, ?decision, "Approval decision via reaction");
             let _ = tx.send(decision);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chunk_message, hard_split};
+
+    /// Every chunk must respect the char ceiling — the whole point of the split.
+    fn assert_within_limit(chunks: &[String], limit: usize) {
+        for c in chunks {
+            assert!(
+                c.chars().count() <= limit,
+                "chunk exceeds limit {limit}: {} chars",
+                c.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn short_body_is_one_chunk_unchanged() {
+        assert_eq!(chunk_message("hello world", 2000), vec!["hello world"]);
+    }
+
+    #[test]
+    fn body_at_exactly_the_limit_is_not_split() {
+        let body = "x".repeat(2000);
+        let chunks = chunk_message(&body, 2000);
+        assert_eq!(chunks, vec![body]);
+    }
+
+    #[test]
+    fn empty_body_sends_nothing() {
+        assert!(chunk_message("", 2000).is_empty());
+    }
+
+    #[test]
+    fn splits_on_newline_boundaries() {
+        // Three 40-char lines, limit 100: two lines pack, the third spills over.
+        let line = "a".repeat(40);
+        let body = format!("{line}\n{line}\n{line}");
+        let chunks = chunk_message(&body, 100);
+        assert_within_limit(&chunks, 100);
+        // First chunk packs two lines joined by the newline; never a torn line.
+        assert_eq!(chunks, vec![format!("{line}\n{line}"), line]);
+    }
+
+    #[test]
+    fn splits_long_line_on_spaces_without_breaking_words() {
+        // One line of 10 six-char words ("word00".."word09") = 69 chars.
+        let words: Vec<String> = (0..10).map(|i| format!("word{i:02}")).collect();
+        let body = words.join(" ");
+        let chunks = chunk_message(&body, 20);
+        assert_within_limit(&chunks, 20);
+        // No word is ever split: every whitespace-delimited token in every chunk
+        // is one of the originals.
+        for chunk in &chunks {
+            for tok in chunk.split(' ') {
+                assert!(words.contains(&tok.to_string()), "torn word: {tok:?}");
+            }
+        }
+        // And nothing is lost: flatten the chunks back to the original words.
+        let recovered: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| c.split(' ').map(str::to_string))
+            .collect();
+        assert_eq!(recovered, words);
+    }
+
+    #[test]
+    fn hard_splits_a_single_oversized_token() {
+        // A 4500-char URL-like blob with no spaces: only a hard cut fits it.
+        let blob = "h".repeat(4500);
+        let chunks = chunk_message(&blob, 2000);
+        assert_within_limit(&chunks, 2000);
+        assert_eq!(chunks.len(), 3); // 2000 + 2000 + 500
+        assert_eq!(chunks.concat(), blob); // no character lost or duplicated
+    }
+
+    #[test]
+    fn oversized_token_tail_packs_with_following_words() {
+        // A 25-char token then a short word, limit 10: the token hard-splits to
+        // [10, 10, 5] and the trailing "hi" packs onto the open 5-char tail
+        // rather than stranding on its own message.
+        let body = format!("{} hi", "z".repeat(25));
+        let chunks = chunk_message(&body, 10);
+        assert_within_limit(&chunks, 10);
+        assert_eq!(chunks, vec!["zzzzzzzzzz", "zzzzzzzzzz", "zzzzz hi"]);
+    }
+
+    #[test]
+    fn cuts_never_fall_inside_a_multibyte_char() {
+        // Each char is multi-byte; a byte-indexed split would panic or corrupt.
+        let body = "áéíóú".repeat(3); // 15 chars, 30 bytes
+        let chunks = chunk_message(&body, 4);
+        assert_within_limit(&chunks, 4);
+        assert_eq!(chunks.concat(), body); // round-trips intact
+        // Sanity: a 4-byte emoji is one char, so it packs four-per-chunk.
+        let crabs = "🦀".repeat(9);
+        let chunks = chunk_message(&crabs, 4);
+        assert_within_limit(&chunks, 4);
+        assert_eq!(chunks.concat(), crabs);
+    }
+
+    #[test]
+    fn hard_split_is_exact_and_lossless() {
+        assert_eq!(hard_split("abcdefg", 3), vec!["abc", "def", "g"]);
+        assert_eq!(hard_split("ab", 3), vec!["ab"]);
+        assert!(hard_split("", 3).is_empty());
+    }
+
+    #[test]
+    fn mixed_body_every_chunk_within_limit() {
+        // Newlines, normal words, a giant token, and blank lines together.
+        let body = format!(
+            "intro line here\n\n{}\nshort tail\n{}",
+            "tok ".repeat(200).trim(),
+            "Q".repeat(3000)
+        );
+        let chunks = chunk_message(&body, 2000);
+        assert_within_limit(&chunks, 2000);
+        assert!(!chunks.is_empty());
     }
 }
