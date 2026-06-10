@@ -34,7 +34,10 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, error, info};
 
+mod build;
 mod schedule;
+
+pub use build::{BuildOptions, BuiltServer, build};
 
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
