@@ -134,6 +134,17 @@ impl LoginConfig {
             TransportConfig::Matrix(m) => &m.username,
         })
     }
+
+    /// The secret credential for this login, if any (the Matrix password,
+    /// etc.). Seeded into the owning agent's encrypted login-secrets store;
+    /// never persisted in the clear. May still be a `${VAR}` reference at this
+    /// point — resolve via [`SecretStore::resolve_env`](crate::security::SecretStore::resolve_env)
+    /// before storing.
+    pub fn secret(&self) -> Option<&str> {
+        match &self.transport {
+            TransportConfig::Matrix(m) => m.password.as_deref(),
+        }
+    }
 }
 
 /// A fully-resolved Matrix login ready to spawn a bridge: identity +

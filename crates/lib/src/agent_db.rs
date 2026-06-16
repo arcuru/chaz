@@ -26,7 +26,7 @@ use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
-use eidetica::store::{DocStore, Table};
+use eidetica::store::{DocStore, PasswordStore, Table};
 use eidetica::user::User;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -41,6 +41,11 @@ pub const SCHEDULES_STORE: &str = "schedules";
 pub const SCHEDULE_FIRES_STORE: &str = "schedule_fires";
 pub const SKILLS_STORE: &str = "skills";
 pub const SKILL_BANKS_STORE: &str = "skill_banks";
+/// Encrypted per-agent transport-login secrets: a `PasswordStore<DocStore>`
+/// keyed by `login_id`. Unlocked with a local-disk password that never syncs;
+/// the contents sync only as opaque ciphertext. The non-secret login metadata
+/// lives alongside, in the clear, in [`AgentDbConfig::logins`].
+pub const LOGIN_SECRETS_STORE: &str = "login_secrets";
 
 const BLOB_KEY: &str = "value";
 
@@ -112,6 +117,13 @@ pub struct AgentDbConfig {
     /// Skill banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_skill_banks`].
     #[serde(default)]
     pub default_skill_banks: Vec<String>,
+    /// Transport logins this agent owns, non-secret metadata only. Mirrors
+    /// [`AgentConfig::logins`]; the matching credentials live encrypted in
+    /// [`LOGIN_SECRETS_STORE`], keyed by each login's `login_id`. Synced in the
+    /// clear so any peer can enumerate an agent's logins without being able to
+    /// authenticate as them.
+    #[serde(default)]
+    pub logins: Vec<AgentDbLogin>,
 }
 
 /// Serializable Worker template. Mirrors [`WorkerConfig`].
@@ -146,6 +158,82 @@ impl WorkerDbConfig {
     }
 }
 
+/// A transport login owned by this agent, minus its secret. Mirrors the yaml
+/// [`LoginConfig`](crate::config::LoginConfig) but is `Serialize` (it persists
+/// in the agent DB) and carries no credential — the password / token lives
+/// encrypted in [`LOGIN_SECRETS_STORE`], keyed by [`Self::login_id`]. This
+/// metadata syncs in the clear so any peer can enumerate which logins an agent
+/// owns without being able to authenticate as them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentDbLogin {
+    /// Stable login id (routing dimension + per-login state-dir name). `None`
+    /// falls back to a transport default (the MXID for Matrix).
+    pub id: Option<String>,
+    /// Explicit transport-client state-dir override.
+    pub state_dir: Option<String>,
+    /// Transport-specific, non-secret connection metadata.
+    #[serde(flatten)]
+    pub transport: AgentDbTransport,
+}
+
+/// Non-secret transport metadata for an [`AgentDbLogin`], tagged by `type`.
+/// Parallels [`TransportConfig`](crate::config::TransportConfig): adding a
+/// transport is a new variant, never a schema change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum AgentDbTransport {
+    Matrix(AgentDbMatrixLogin),
+}
+
+/// Matrix login metadata, secret excluded (the password lives in
+/// [`LOGIN_SECRETS_STORE`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentDbMatrixLogin {
+    pub homeserver_url: String,
+    pub username: String,
+    pub allow_list: Option<String>,
+    pub room_size_limit: Option<usize>,
+}
+
+impl AgentDbLogin {
+    /// Build from a yaml [`LoginConfig`](crate::config::LoginConfig), dropping
+    /// the secret credential — the caller seeds that into
+    /// [`LOGIN_SECRETS_STORE`] via [`AgentDb::write_login_secret`] separately.
+    pub fn from_login_config(cfg: &crate::config::LoginConfig) -> Self {
+        let transport = match &cfg.transport {
+            crate::config::TransportConfig::Matrix(m) => {
+                AgentDbTransport::Matrix(AgentDbMatrixLogin {
+                    homeserver_url: m.homeserver_url.clone(),
+                    username: m.username.clone(),
+                    allow_list: m.allow_list.clone(),
+                    room_size_limit: m.room_size_limit,
+                })
+            }
+        };
+        Self {
+            id: cfg.id.clone(),
+            state_dir: cfg.state_dir.clone(),
+            transport,
+        }
+    }
+
+    /// Stable identifier: explicit `id`, else a transport default (the MXID for
+    /// Matrix). Mirrors
+    /// [`LoginConfig::login_id`](crate::config::LoginConfig::login_id).
+    pub fn login_id(&self) -> &str {
+        self.id.as_deref().unwrap_or_else(|| match &self.transport {
+            AgentDbTransport::Matrix(m) => &m.username,
+        })
+    }
+
+    /// Transport tag (`"matrix"`, …).
+    pub fn transport_kind(&self) -> &'static str {
+        match self.transport {
+            AgentDbTransport::Matrix(_) => "matrix",
+        }
+    }
+}
+
 impl AgentDbConfig {
     pub fn from_agent_config(cfg: &AgentConfig) -> Self {
         Self {
@@ -171,6 +259,11 @@ impl AgentDbConfig {
             grants: cfg.grants.clone().unwrap_or_default(),
             default_memory_banks: cfg.default_memory_banks.clone().unwrap_or_default(),
             default_skill_banks: cfg.default_skill_banks.clone().unwrap_or_default(),
+            logins: cfg
+                .logins
+                .as_ref()
+                .map(|ls| ls.iter().map(AgentDbLogin::from_login_config).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -441,6 +534,62 @@ impl AgentDb {
             .await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Encrypted transport-login secrets ([`LOGIN_SECRETS_STORE`])
+    //
+    // Credentials for this agent's logins live in a `PasswordStore<DocStore>`
+    // keyed by `login_id`: encrypted at rest, synced only as opaque ciphertext.
+    // `unlock_password` is supplied by the caller — Phase 2 sources it from a
+    // local-disk key file that never syncs. The companion non-secret metadata
+    // is [`AgentDbConfig::logins`].
+    // -----------------------------------------------------------------
+
+    /// Write (or overwrite) the secret for `login_id`, encrypting it under
+    /// `unlock_password`. Initializes the store on first use; opens it with the
+    /// password thereafter (a wrong password errors).
+    pub async fn write_login_secret(
+        &self,
+        login_id: &str,
+        secret: &str,
+        unlock_password: &str,
+    ) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let mut store = txn
+            .get_store::<PasswordStore<DocStore>>(LOGIN_SECRETS_STORE)
+            .await?;
+        if store.is_initialized() {
+            store.open(unlock_password)?;
+        } else {
+            store.initialize(unlock_password, Doc::new()).await?;
+        }
+        store.inner().await?.set_string(login_id, secret).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Read the decrypted secret for `login_id`. `Ok(None)` when the store has
+    /// never been initialized or the login has no secret; errors if
+    /// `unlock_password` is wrong (the store fails to open).
+    pub async fn read_login_secret(
+        &self,
+        login_id: &str,
+        unlock_password: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let txn = self.database.new_transaction().await?;
+        let mut store = txn
+            .get_store::<PasswordStore<DocStore>>(LOGIN_SECRETS_STORE)
+            .await?;
+        if !store.is_initialized() {
+            return Ok(None);
+        }
+        store.open(unlock_password)?;
+        match store.inner().await?.get_string(login_id).await {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1303,5 +1452,112 @@ mod tests {
             serde_json::from_str::<ScheduleTarget>(&f).unwrap(),
             ScheduleTarget::Fresh
         );
+    }
+
+    // ----- transport-login schema + encrypted secret store (Phase 1) -----
+
+    fn matrix_login(
+        id: Option<&str>,
+        user: &str,
+        password: Option<&str>,
+    ) -> crate::config::LoginConfig {
+        use crate::config::{LoginConfig, MatrixLogin, TransportConfig};
+        LoginConfig {
+            id: id.map(str::to_string),
+            state_dir: None,
+            transport: TransportConfig::Matrix(MatrixLogin {
+                homeserver_url: "https://hs.example".into(),
+                username: user.into(),
+                password: password.map(str::to_string),
+                allow_list: None,
+                room_size_limit: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn login_metadata_drops_secret_and_resolves_id() {
+        let meta =
+            AgentDbLogin::from_login_config(&matrix_login(None, "@ava:example", Some("hunter2")));
+        // login_id falls back to the MXID; transport tag carried over.
+        assert_eq!(meta.login_id(), "@ava:example");
+        assert_eq!(meta.transport_kind(), "matrix");
+        // The DB-side type has no secret field; prove the credential never
+        // reaches the persisted form, and the `type` tag flattens in.
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("hunter2"),
+            "secret leaked into metadata: {json}"
+        );
+        assert!(json.contains("\"type\":\"matrix\""), "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn login_metadata_round_trips_in_config() {
+        let mut user = test_peer_user().await;
+        let cfg = AgentDbConfig {
+            logins: vec![AgentDbLogin::from_login_config(&matrix_login(
+                Some("primary"),
+                "@ava:example",
+                Some("hunter2"),
+            ))],
+            ..Default::default()
+        };
+        let (db, _) = create_agent_db(
+            &mut user,
+            "ava",
+            &cfg,
+            &AgentMeta {
+                display_name: Some("ava".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let read = db.read_config().await.unwrap();
+        assert_eq!(read.logins, cfg.logins);
+        assert_eq!(read.logins[0].login_id(), "primary");
+    }
+
+    #[tokio::test]
+    async fn login_secret_round_trips_encrypted() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.write_login_secret("primary", "hunter2", "unlock-key")
+            .await
+            .unwrap();
+        let got = db.read_login_secret("primary", "unlock-key").await.unwrap();
+        assert_eq!(got.as_deref(), Some("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn login_secret_absent_before_any_write() {
+        let (_user, db) = peer_with_agent_db().await;
+        let got = db.read_login_secret("primary", "unlock-key").await.unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn login_secret_wrong_password_fails() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.write_login_secret("primary", "hunter2", "correct-key")
+            .await
+            .unwrap();
+        assert!(
+            db.read_login_secret("primary", "wrong-key").await.is_err(),
+            "wrong unlock password must not decrypt the secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_secret_overwrite_updates_value() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.write_login_secret("primary", "old", "key")
+            .await
+            .unwrap();
+        db.write_login_secret("primary", "new", "key")
+            .await
+            .unwrap();
+        let got = db.read_login_secret("primary", "key").await.unwrap();
+        assert_eq!(got.as_deref(), Some("new"));
     }
 }
