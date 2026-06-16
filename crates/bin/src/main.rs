@@ -1,7 +1,7 @@
-mod gateway;
+mod bridge;
 
+use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
-use chaz_core::gateway::Gateway;
 use chaz_core::{agent, config, server, session};
 
 use clap::Parser;
@@ -19,13 +19,13 @@ struct ChazArgs {
     #[arg(short = 'p', long = "print")]
     print: bool,
 
-    /// Run headless: skip the TUI, run only background gateways (Matrix).
+    /// Run headless: skip the TUI, run only background bridges (Matrix).
     /// Requires Matrix to be configured. Stdout receives logs in this mode
     /// (no TUI to grab it).
     #[arg(long, conflicts_with = "print")]
     no_tui: bool,
 
-    /// Don't spawn the Matrix gateway in the background, even when Matrix is
+    /// Don't spawn the Matrix bridge in the background, even when Matrix is
     /// configured. Useful for local TUI sessions where you don't want
     /// rooms answered. Ignored under `--print`.
     #[arg(long, conflicts_with_all = ["print", "no_tui"])]
@@ -54,7 +54,7 @@ struct ChazArgs {
 #[derive(clap::Subcommand)]
 enum Subcommand {
     /// Aggregate LLM usage and cost across all sessions, then exit.
-    /// Reads the user-central session catalog; no gateway is started.
+    /// Reads the user-central session catalog; no bridge is started.
     Usage(UsageArgs),
 }
 
@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.no_tui && args.prompt.is_some() {
         anyhow::bail!(
-            "--no-tui does not accept a positional prompt — background gateways receive \
+            "--no-tui does not accept a positional prompt — background bridges receive \
              input from their transport, not the CLI"
         );
     }
@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Subcommand short-circuit: read-only utilities open the DB, do their
-    // work, and exit — no gateway, scheduler, MCP, or sync setup.
+    // work, and exit — no bridge, scheduler, MCP, or sync setup.
     if let Some(sub) = args.subcommand {
         // Bare stderr logging — stdout is reserved for the subcommand's
         // own output (text or JSON) so it stays pipe-friendly.
@@ -275,14 +275,14 @@ async fn main() -> anyhow::Result<()> {
         "Server built; handing off to gateway"
     );
 
-    // Gateway dispatch.
+    // Bridge dispatch.
     //
-    // - `--print`           : one-shot CLI, no background gateways
+    // - `--print`           : one-shot CLI, no background bridges
     // - `--no-tui`          : Matrix is the foreground; required to be configured
     // - default             : TUI is the foreground; Matrix spawns in the background
     //                         iff configured and `!--no-matrix`
     //
-    // Cooperative shutdown: when the foreground gateway returns, `shutdown`
+    // Cooperative shutdown: when the foreground bridge returns, `shutdown`
     // is notified and background handles are awaited with a timeout so the
     // process doesn't hang on a stuck sync loop.
     let mode = if args.print {
@@ -292,21 +292,21 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "tui"
     };
-    info!(mode, "Starting gateway");
+    info!(mode, "Starting bridge");
 
     let result = if args.print {
-        // One-shot: no background gateways, no shutdown plumbing needed.
+        // One-shot: no background bridges, no shutdown plumbing needed.
         let prompt = args.prompt.clone().expect("--print requires PROMPT");
-        let gateway = gateway::cli::CliGateway::new(config, secret_store, prompt, args.session);
-        gateway.run(server).await
+        let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
+        bridge.run(server).await
     } else {
         let shutdown = Arc::new(tokio::sync::Notify::new());
 
-        // Background gateway handles — one per configured Matrix login.
+        // Background bridge handles — one per configured Matrix login.
         // Logins are a peer-level resource (`logins:` in config, or a single
         // login synthesized from the legacy top-level fields); multiple
         // agents may share a login and one agent may hold a dedicated login
-        // (N:M agents↔logins). The spawn loop runs one gateway per login.
+        // (N:M agents↔logins). The spawn loop runs one bridge per login.
         let mut background_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
         let matrix_logins = config.matrix_logins();
@@ -336,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
                             config.state_dir.clone()
                         }
                     });
-                    let matrix_gateway = gateway::matrix::MatrixGateway::new(
+                    let matrix_bridge = bridge::matrix::MatrixBridge::new(
                         login,
                         matrix_state_dir,
                         config.clone(),
@@ -345,9 +345,9 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     let server_for_matrix = server.clone();
                     background_handles.push(tokio::spawn(async move {
-                        matrix_gateway.run(server_for_matrix).await
+                        matrix_bridge.run(server_for_matrix).await
                     }));
-                    info!(login_id = %login_id, agent = %owning_agent, "Matrix gateway spawned in background");
+                    info!(login_id = %login_id, agent = %owning_agent, "Matrix bridge spawned in background");
                 }
             }
         }
@@ -357,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("--no-tui requires at least one Matrix login configured");
             }
             // Headless: the foreground "work" is awaiting every spawned login
-            // gateway. They run concurrently as tasks; await all and surface
+            // bridge. They run concurrently as tasks; await all and surface
             // the first error. (`--no-tui` conflicts with `--no-matrix` at the
             // clap layer, so at least one handle is guaranteed present here.)
             let mut headless_result = Ok(());
@@ -365,11 +365,11 @@ async fn main() -> anyhow::Result<()> {
                 let res = match handle.await {
                     Ok(res) => res,
                     Err(join_err) => {
-                        Err(anyhow::anyhow!("matrix gateway task panicked: {join_err}"))
+                        Err(anyhow::anyhow!("matrix bridge task panicked: {join_err}"))
                     }
                 };
                 if let Err(e) = res {
-                    error!("Matrix gateway error: {e}");
+                    error!("Matrix bridge error: {e}");
                     if headless_result.is_ok() {
                         headless_result = Err(e);
                     }
@@ -377,22 +377,22 @@ async fn main() -> anyhow::Result<()> {
             }
             headless_result
         } else {
-            let mut tui_gateway = gateway::tui::TuiGateway::new(config, secret_store);
+            let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store);
             if let Some(prompt) = args.prompt {
-                tui_gateway = tui_gateway.with_initial_prompt(prompt);
+                tui_bridge = tui_bridge.with_initial_prompt(prompt);
             }
-            tui_gateway.run(server).await
+            tui_bridge.run(server).await
         };
 
-        // TUI (or headless main) exited — drain background gateways.
+        // TUI (or headless main) exited — drain background bridges.
         if !background_handles.is_empty() {
             shutdown.notify_waiters();
             let drain = async {
                 for handle in background_handles {
                     match handle.await {
                         Ok(Ok(())) => {}
-                        Ok(Err(e)) => error!("Background gateway error: {e}"),
-                        Err(join_err) => error!("Background gateway task panicked: {join_err}"),
+                        Ok(Err(e)) => error!("Background bridge error: {e}"),
+                        Err(join_err) => error!("Background bridge task panicked: {join_err}"),
                     }
                 }
             };
@@ -400,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .is_err()
             {
-                warn!("Background gateways did not drain within 5s; exiting anyway");
+                warn!("Background bridges did not drain within 5s; exiting anyway");
             }
         }
 
@@ -408,7 +408,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if let Err(e) = result {
-        error!("Gateway error: {e}");
+        error!("Bridge error: {e}");
     }
 
     Ok(())
@@ -416,7 +416,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// `chaz usage` — open the eidetica DB read-only, walk the user-central
 /// session catalog, aggregate per-message `ResponseMetadata`, print either
-/// human-readable text or JSON, then exit. Skips all gateway/sync/scheduler
+/// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
 /// setup since we never serve a session here.
 async fn run_usage_subcommand(
     args: UsageArgs,

@@ -1,14 +1,14 @@
 # Architecture Overview
 
-Chaz is structured as a layered system: gateways handle transport concerns, the server coordinates agent execution, and the runtime runs the ReAct loop.
+Chaz is structured as a layered system: bridges handle transport concerns, the server coordinates agent execution, and the runtime runs the ReAct loop.
 
 ## System Diagram
 
 ```mermaid
 graph TD
-    subgraph Gateways
-        MG[MatrixGateway]
-        TG[TuiGateway]
+    subgraph Bridges
+        MG[MatrixBridge]
+        TG[TuiBridge]
     end
 
     subgraph Server
@@ -52,33 +52,33 @@ graph TD
 
 ## Key Components
 
-### Gateways
+### Bridges
 
-Gateways bridge between a transport (Matrix, terminal) and the session database. They:
+Bridges translate between a transport (Matrix, terminal) and the session database. They:
 
 - Write user messages as `SessionEntry` records to the session DB
 - Register `on_local_write` callbacks to detect agent responses
 - Deliver responses to their transport
 
-Gateways are transport-specific but the server is transport-agnostic. Adding a new gateway (Slack, Discord, HTTP API) requires implementing the `Gateway` trait and writing/reading session entries.
+Bridges are transport-specific but the server is transport-agnostic. Adding a new bridge (Slack, Discord, HTTP API) requires implementing the `Bridge` trait and writing/reading session entries.
 
-**Design stance — a gateway is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode." That framing has two consequences:
+**Design stance — a bridge is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode." That framing has two consequences:
 
-- The CLI surface picks the _user interface_ (TUI default, `-p` one-shot), and gateways activate based on what they actually expose. Background gateways auto-spawn alongside the TUI whenever they're configured: Matrix runs in the background when at least one Matrix login is configured, so a TUI user and Matrix room users drive the same hosted session concurrently. `--no-matrix` suppresses the background spawn for a single run; `--no-tui` flips Matrix to the foreground for headless / daemon use. `main.rs` collects background handles into a `Vec<JoinHandle>` and drains them via an `Arc<tokio::sync::Notify>` on TUI exit — the plural shape carries the per-agent Matrix logins: one gateway runs per login, and a login belongs to one agent, declared in that agent's `type`-tagged `logins:` list (legacy top-level `homeserver_url`/`username` still synthesizes a single login for the default agent).
-- Future gateways (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in _that_ mode." `chaz` the binary is always a TUI on a terminal first.
+- The CLI surface picks the _user interface_ (TUI default, `-p` one-shot), and bridges activate based on what they actually expose. Background bridges auto-spawn alongside the TUI whenever they're configured: Matrix runs in the background when at least one Matrix login is configured, so a TUI user and Matrix room users drive the same hosted session concurrently. `--no-matrix` suppresses the background spawn for a single run; `--no-tui` flips Matrix to the foreground for headless / daemon use. `main.rs` collects background handles into a `Vec<JoinHandle>` and drains them via an `Arc<tokio::sync::Notify>` on TUI exit — the plural shape carries the per-agent Matrix logins: one bridge runs per login, and a login belongs to one agent, declared in that agent's `type`-tagged `logins:` list (legacy top-level `homeserver_url`/`username` still synthesizes a single login for the default agent).
+- Future bridges (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in _that_ mode." `chaz` the binary is always a TUI on a terminal first.
 
-**Multi-agent rooms under the login model (interim).** A login is one agent's real Matrix account, so a room is owned by exactly one login/agent. When other agents participate in that room (e.g. a human `@mention`s one, or the host routes to a guest), their messages egress through the owning agent's single MXID, prefixed `[AgentName]` so readers can tell speakers apart; the owning agent speaks plain. This is the best a normal login can do — one account can only present as itself. It has two known sharp edges: (1) `/agent host` can point the default responder at a non-owner agent, which then answers `[prefixed]` through the owner's MXID — keep host = owner to avoid the confusing mismatch; (2) joining two chaz logins into the _same_ room gives each its own per-`(login_id, room)` session, i.e. parallel conversations — don't; use one login per room plus `@mention` for guests. The clean fix is native per-agent identity via a Matrix **application-service / puppeting gateway** (one connection, a `@chaz_*` ghost user per agent, no prefix hack, no split-brain). That requires a homeserver you administer and a from-scratch AS integration (ruma appservice API + inbound transaction endpoint), so it lands later as its own gateway type — not a change to the login gateway.
+**Multi-agent rooms under the login model (interim).** A login is one agent's real Matrix account, so a room is owned by exactly one login/agent. When other agents participate in that room (e.g. a human `@mention`s one, or the host routes to a guest), their messages egress through the owning agent's single MXID, prefixed `[AgentName]` so readers can tell speakers apart; the owning agent speaks plain. This is the best a normal login can do — one account can only present as itself. It has two known sharp edges: (1) `/agent host` can point the default responder at a non-owner agent, which then answers `[prefixed]` through the owner's MXID — keep host = owner to avoid the confusing mismatch; (2) joining two chaz logins into the _same_ room gives each its own per-`(login_id, room)` session, i.e. parallel conversations — don't; use one login per room plus `@mention` for guests. The clean fix is native per-agent identity via a Matrix **application-service / puppeting gateway** (one connection, a `@chaz_*` ghost user per agent, no prefix hack, no split-brain). That requires a homeserver you administer and a from-scratch AS integration (ruma appservice API + inbound transaction endpoint), so it lands later as its own bridge type — not a change to the login bridge.
 
-**Source**: `crates/bin/src/gateway/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
+**Source**: `crates/bin/src/bridge/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
 
 ### Server
 
 The callback-driven server watches session databases and spawns agent tasks:
 
-1. Gateways call `register_session` to set up `on_local_write` callbacks
+1. Bridges call `register_session` to set up `on_local_write` callbacks
 2. When a callback fires, the processing loop checks the latest entry
 3. If it's a `Message` from a non-agent or a `Directive`, the server spawns an agent task
-4. The agent writes its response to the session DB, triggering gateway callbacks
+4. The agent writes its response to the session DB, triggering bridge callbacks
 
 Per-session serialization ensures only one agent task runs per session at a time, preventing duplicate responses from concurrent writes.
 
@@ -118,7 +118,7 @@ See [Tool System](tools.md) for details.
 
 ```text
 crates/lib/src/
-  main.rs              CLI, config, eidetica init, extension install, gateway dispatch
+  main.rs              CLI, config, eidetica init, extension install, bridge dispatch
   config.rs            Config types (backends, agents, security, multi_agent, agent_state_allowlist)
   types.rs             ConversationId
   util.rs              Shared utilities
@@ -205,11 +205,11 @@ crates/lib/src/
     parse.rs           JSON-RPC framing
     transport.rs       Stdio + HTTP transports
     server.rs          Tool descriptor + invoke
-  gateway/             Gateway trait + transport implementations
-    mod.rs             Gateway trait, ApprovalExchange
-    cli.rs             One-shot CLI gateway (`chaz prompt …`)
+  bridge/              Bridge trait + transport implementations
+    mod.rs             Bridge trait, ApprovalExchange
+    cli.rs             One-shot CLI bridge (`chaz prompt …`)
     tui/               TUI with multi-session tabs, mouse + keyboard nav (mod/input/view)
-    matrix/            Matrix gateway
+    matrix/            Matrix bridge
       mod.rs           Lifecycle, channel callbacks
       commands.rs      Matrix-syntax command parsing
       history.rs       Room history backfill

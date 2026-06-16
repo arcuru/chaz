@@ -1,28 +1,28 @@
-//! The Discord gateway: a bidirectional translator between one Discord
+//! The Discord bridge: a bidirectional translator between one Discord
 //! channel and its eidetica session DB, written entirely against the
-//! `chaz_core` gateway SDK.
+//! `chaz_core` bridge SDK.
 //!
 //! Inbound (`EventHandler::message`): gate the message, resolve the
 //! channel→session binding through the transport-agnostic registry, ensure
 //! the owning agent hosts it, register it with the server (so the runtime
 //! answers), and stamp an inbound entry via
-//! [`chaz_core::gateway::inbound_user_entry`].
+//! [`chaz_core::bridge::inbound_user_entry`].
 //!
-//! Outbound: [`chaz_core::gateway::attach_reconciler`] installs an `on_write`
+//! Outbound: [`chaz_core::bridge::attach_reconciler`] installs an `on_write`
 //! callback that converges the channel to DB state; the only Discord-specific
 //! part is the `send` closure (`ChannelId::say`). The reconcile rule, the
 //! delivered-set, and the `[guest]` prefixing all live in the lib — the same
-//! code the Matrix gateway runs.
+//! code the Matrix bridge runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use chaz_core::backends::BackendManager;
+use chaz_core::bridge::{
+    ApprovalDecision, ApprovalExchange, Bridge, attach_reconciler, inbound_user_entry,
+};
 use chaz_core::commands::{self, CommandContext, CommandOutcome, Parsed};
 use chaz_core::config::Config;
-use chaz_core::gateway::{
-    ApprovalDecision, ApprovalExchange, Gateway, attach_reconciler, inbound_user_entry,
-};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::Session;
@@ -41,7 +41,7 @@ use tracing::{error, info};
 use crate::config::DiscordConfig;
 
 /// A tool-approval prompt routed to a specific channel. The runtime hands the
-/// gateway an [`ApprovalExchange`]; the relay tags it with the channel to post
+/// bridge an [`ApprovalExchange`]; the relay tags it with the channel to post
 /// in.
 struct ApprovalRequest {
     channel_id: ChannelId,
@@ -52,14 +52,14 @@ struct ApprovalRequest {
 /// on that message resolves it.
 type PendingApprovals = Arc<Mutex<HashMap<MessageId, oneshot::Sender<ApprovalDecision>>>>;
 
-/// A standalone Discord gateway bound to one login/agent.
-pub struct DiscordGateway {
+/// A standalone Discord bridge bound to one login/agent.
+pub struct DiscordBridge {
     pub config: Config,
     pub discord: DiscordConfig,
     pub secrets: SecretStore,
 }
 
-impl DiscordGateway {
+impl DiscordBridge {
     pub fn new(config: Config, discord: DiscordConfig, secrets: SecretStore) -> Self {
         Self {
             config,
@@ -69,7 +69,7 @@ impl DiscordGateway {
     }
 }
 
-impl Gateway for DiscordGateway {
+impl Bridge for DiscordBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let token = self.discord.resolve_token()?;
 
@@ -111,7 +111,7 @@ impl Gateway for DiscordGateway {
         info!(
             login_id = %self.discord.login_id,
             agent = %self.discord.owning_agent,
-            "Starting Discord gateway"
+            "Starting Discord bridge"
         );
         client.start().await?;
         Ok(())
@@ -298,7 +298,7 @@ impl Handler {
 
     /// On connect, reattach every Discord channel already bound to this login
     /// so scheduled-session output is delivered with no inbound trigger.
-    /// Mirrors the Matrix gateway's startup reattach.
+    /// Mirrors the Matrix bridge's startup reattach.
     async fn reattach_existing_channels(&self, http: Arc<Http>) {
         let channels = match self.server.registry().list_channels().await {
             Ok(c) => c,
@@ -343,7 +343,7 @@ impl Handler {
     }
 
     /// Ensure this login's owning agent hosts the given session — mirrors the
-    /// Matrix gateway. No-op when the name doesn't resolve to a hosted agent.
+    /// Matrix bridge. No-op when the name doesn't resolve to a hosted agent.
     async fn ensure_owning_agent_hosts(&self, session_db_id: &str) {
         let Some(entry) = self.server.agent_index().find_by_name(&self.owning_agent) else {
             return;
@@ -363,7 +363,7 @@ impl Handler {
 
     /// Build a per-channel approval sender: the runtime sends an
     /// [`ApprovalExchange`] here; a forwarder tags it with `channel_id` and
-    /// relays it to the gateway's approval task. Mirrors the Matrix gateway's
+    /// relays it to the bridge's approval task. Mirrors the Matrix bridge's
     /// per-room approval tx.
     fn make_channel_approval_tx(&self, channel_id: ChannelId) -> mpsc::Sender<ApprovalExchange> {
         let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
@@ -653,7 +653,7 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        info!(bot = %ready.user.name, "Discord gateway connected");
+        info!(bot = %ready.user.name, "Discord bridge connected");
         // Remember our own id so we ignore the reactions we seed on prompts.
         let _ = self.bot_id.set(ready.user.id);
         // Reattach already-bound channels so scheduled output flows without an

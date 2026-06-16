@@ -12,9 +12,9 @@
 //! - Content from tool outputs is scanned for injection patterns (warning-only)
 
 use crate::backends::BackendManager;
+use crate::bridge::ApprovalDecision;
 use crate::error::LlmError;
 use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
-use crate::gateway::ApprovalDecision;
 use crate::security::SecurityContext;
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};

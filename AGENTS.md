@@ -32,8 +32,8 @@ Tests: `CARGO_TARGET_DIR=target-test cargo test` (separate target dir avoids con
 
 Two-crate Cargo workspace.
 
-- **`crates/lib/`** — `chaz-core` library. Runtime, tools, extensions, session model, security, MCP, backends, commands, sandbox hosts, gateway trait + approval types. The testable surface (~10k lines).
-- **`crates/bin/`** — `chaz` binary. Entrypoint (`main.rs`) and the concrete gateway implementations (Matrix, TUI, CLI). Structurally hard to test without mocking matrix-sdk / ratatui (~3k lines).
+- **`crates/lib/`** — `chaz-core` library. Runtime, tools, extensions, session model, security, MCP, backends, commands, sandbox hosts, bridge trait + approval types. The testable surface (~10k lines).
+- **`crates/bin/`** — `chaz` binary. Entrypoint (`main.rs`) and the concrete bridge implementations (Matrix, TUI, CLI). Structurally hard to test without mocking matrix-sdk / ratatui (~3k lines).
 
 Shared dependency versions live in the workspace-root `Cargo.toml` `[workspace.dependencies]` block; each crate pulls them with `workspace = true`.
 
@@ -65,7 +65,7 @@ tools/               Built-in tools: agent, task, compact, describe, time, calcu
 security/            SecurityContext, SecretStore, LeakDetector, NetworkPolicy, Sanitizer
 runtime.rs           ReAct loop: approval, timeouts, leak/injection scanning, retry, loop detection
 server.rs            Callback-driven Server: on_local_write → process_session → spawn agent → deliver response
-gateway.rs           Gateway trait + ApprovalExchange + ApprovalDecision — concrete impls live in the bin crate
+bridge.rs            Bridge trait + ApprovalExchange + ApprovalDecision — concrete impls live in the bin crate
 error.rs             Error + LlmError (retryable/permanent classification)
 backends.rs          BackendManager, LLMBackend trait, ChatContext, Message
 openai.rs            OpenAI-compatible backend
@@ -78,10 +78,10 @@ test_support/        #[cfg(test)] harness: MockBackend, MockHost, fresh_session,
 ### `chaz` binary (crates/bin/src/)
 
 ```
-main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, gateway dispatch
-gateway/cli.rs       CliGateway — one-shot `-p` / `--print` prompt runner
-gateway/matrix/      MatrixGateway — matrix-sdk login/sync + session bridging (background gateway when `matrix:` configured; `--no-tui` to run headless)
-gateway/tui/         TuiGateway — ratatui-based local interactive surface (default)
+main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, bridge dispatch
+bridge/cli.rs        CliBridge — one-shot `-p` / `--print` prompt runner
+bridge/matrix/       MatrixBridge — matrix-sdk login/sync + session bridging (background bridge when `matrix:` configured; `--no-tui` to run headless)
+bridge/tui/          TuiBridge — ratatui-based local interactive surface (default)
 ```
 
 ## Key Invariants
@@ -94,7 +94,7 @@ gateway/tui/         TuiGateway — ratatui-based local interactive surface (def
 - **Tools access system resources through `ToolHost`.** The host (`ctx.host()`) enforces grants at the capability boundary. Tools request capabilities (Shell, FileRead, FileWrite, HttpRequest) rather than calling OS APIs directly. New capability types go in `tool_host.rs`.
 - **Context entries**: only `Message`, `Directive`, and `Summary` enter the LLM context window. `ToolCall`/`ToolResult`/`Ack`/`Error` are audit-only.
 - **System prompts rebuild every turn from `AgentDbConfig`.** `system_prompt` + `system_prompt_files` live on the agent's DB config; ContextBuilder assembles them fresh on each turn, plus any `PromptAugmentation` contributions from the extension hub (skills, memory recall, …). Disk edits to a `system_prompt_files` path require a re-write via `/agent set` to be re-read. No per-session snapshot layer — the previous `PersonaSnapshot` entry type, `persona.rs`, and `role.rs` were all deleted; legacy `role:` configs surface a deprecation message pointing to `/agent set <name> system_prompt <text>`.
-- **A gateway is a transport, not a CLI mode.** Matrix exposes a session to a room; CLI prints one turn; TUI is the local user interface. The flag surface picks the _user interface_; gateways activate based on what they expose. Background gateways (today: Matrix) auto-spawn alongside the TUI when configured. `main.rs` collects them into a `Vec<JoinHandle>` and drains them on TUI exit via an `Arc<Notify>`; the plural shape lets per-agent Matrix logins (one gateway per login; a login belongs to one agent, declared in that agent's `type`-tagged `logins:` list) drop in as a loop body, not a dispatch rewrite. Opt-out via `--no-matrix`; headless via `--no-tui`.
+- **A bridge is a transport, not a CLI mode.** Matrix exposes a session to a room; CLI prints one turn; TUI is the local user interface. The flag surface picks the _user interface_; bridges activate based on what they expose. Background bridges (today: Matrix) auto-spawn alongside the TUI when configured. `main.rs` collects them into a `Vec<JoinHandle>` and drains them on TUI exit via an `Arc<Notify>`; the plural shape lets per-agent Matrix logins (one bridge per login; a login belongs to one agent, declared in that agent's `type`-tagged `logins:` list) drop in as a loop body, not a dispatch rewrite. Opt-out via `--no-matrix`; headless via `--no-tui`.
 
 ## Test Instance
 

@@ -15,10 +15,10 @@
 
 use crate::agent::AgentRegistry;
 use crate::backends::{BackendManager, ModelInfo};
+use crate::bridge::ApprovalExchange;
 use crate::config::ContextConfig;
 use crate::context::ContextBuilder;
 use crate::extension::{ExtensionHub, HookContext};
-use crate::gateway::ApprovalExchange;
 use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;

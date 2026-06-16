@@ -132,7 +132,7 @@ Resolution order on every turn:
 3. Agent's own `default_model` from its DB config
 4. Backend default
 
-The same chain runs whether the agent turn was kicked off by a human message, an `@mention` chain, or a scheduled fire — `run_schedule_turn` and `spawn_agent_task` both resolve through `SessionMeta::resolve_model_for_agent(name)`. The Matrix gateway's legacy `!chaz` direct-chat path doesn't run through the agent runtime and so isn't agent-scoped; live Matrix agent turns are.
+The same chain runs whether the agent turn was kicked off by a human message, an `@mention` chain, or a scheduled fire — `run_schedule_turn` and `spawn_agent_task` both resolve through `SessionMeta::resolve_model_for_agent(name)`. The Matrix bridge's legacy `!chaz` direct-chat path doesn't run through the agent runtime and so isn't agent-scoped; live Matrix agent turns are.
 
 ### `/agent` commands
 
@@ -277,7 +277,7 @@ If you had co-owned agents/sessions before this feature landed (post Stage 10), 
 
 When a message arrives on a multi-agent session, routing picks one agent in this precedence:
 
-1. Explicit override (gateway/schedule directives).
+1. Explicit override (bridge/schedule directives).
 2. **`@<name>` mention** in the message text — first token matching an attached agent's display_name wins. `@alpha`, `@beta-bot,`, `@gamma.` all work; `a@b.com` is ignored (no leading `@` at token start).
 3. **Host agent** (`SessionMeta.host_agent_db_id`) if that agent is still attached.
 4. First attached agent in AuthSettings order.
@@ -336,7 +336,7 @@ Routines are created two ways, both compiling to the same `Routine` rows fired b
 
 ### When rules fire
 
-Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a gateway only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
+Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
 
 - **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.

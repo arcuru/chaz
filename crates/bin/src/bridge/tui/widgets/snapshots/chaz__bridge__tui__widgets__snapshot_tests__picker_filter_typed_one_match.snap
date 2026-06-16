@@ -1,5 +1,5 @@
 ---
-source: crates/bin/src/gateway/tui/widgets/snapshot_tests.rs
+source: crates/bin/src/bridge/tui/widgets/snapshot_tests.rs
 assertion_line: 150
 expression: s
 ---

@@ -1,4 +1,4 @@
-//! Terminal UI gateway. Elm-style architecture:
+//! Terminal UI bridge. Elm-style architecture:
 //! - `App` holds global UI state (mode, overlay, input, click regions, tab
 //!   list) plus a `Vec<Tab>` where each `Tab` owns one session's state
 //!   (entries, scroll, pending approval, session DB handle, etc.).
@@ -11,9 +11,9 @@
 //! - `view`  — ratatui rendering
 
 use chaz_core::backends::{BackendManager, ModelInfo};
+use chaz_core::bridge::{ApprovalExchange, Bridge};
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
-use chaz_core::gateway::{ApprovalExchange, Gateway};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-mod gateway_impl;
+mod bridge_impl;
 mod input;
 mod theme;
 mod view;
@@ -42,7 +42,7 @@ mod widgets;
 /// reopened on subsequent launches.
 const TUI_DEFAULT_NAME: &str = "tui";
 
-pub struct TuiGateway {
+pub struct TuiBridge {
     config: Config,
     secrets: SecretStore,
     /// Optional text to pre-fill the input box with on launch. Mirrors
@@ -53,7 +53,7 @@ pub struct TuiGateway {
     initial_prompt: Option<String>,
 }
 
-impl TuiGateway {
+impl TuiBridge {
     pub fn new(config: Config, secrets: SecretStore) -> Self {
         Self {
             config,

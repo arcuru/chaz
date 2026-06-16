@@ -25,7 +25,7 @@ To send without the `!chaz` prefix in a DM, just type normally.
 
 ## Commands
 
-Commands are sent as Matrix messages. Session ops go through the same transport-neutral dispatch as the TUI — both gateways stay in sync. Most TUI slash commands have a `!chaz` equivalent; the table below covers the common surface. Extension-registered commands (e.g. `!chaz schedule`, `!chaz memory`) are auto-registered for whichever extensions are installed — see the relevant page for syntax.
+Commands are sent as Matrix messages. Session ops go through the same transport-neutral dispatch as the TUI — both bridges stay in sync. Most TUI slash commands have a `!chaz` equivalent; the table below covers the common surface. Extension-registered commands (e.g. `!chaz schedule`, `!chaz memory`) are auto-registered for whichever extensions are installed — see the relevant page for syntax.
 
 ### Session
 
@@ -80,7 +80,7 @@ A Matrix room is connected to a session through an explicit _channel_ record (`r
 
 Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next message in the room creates a fresh session.
 
-At gateway startup, the bot re-installs response-delivery callbacks for every persisted channel whose room it's joined to. This is what makes scheduled-task responses reach a Matrix room even when no user is currently active there.
+At bridge startup, the bot re-installs response-delivery callbacks for every persisted channel whose room it's joined to. This is what makes scheduled-task responses reach a Matrix room even when no user is currently active there.
 
 ## Per-Session Settings
 
@@ -100,4 +100,4 @@ The bot surfaces approval requests as markdown notices in the room. Respond eith
 
 ## Limitations
 
-- **Text only.** The Matrix gateway currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/bin/src/gateway/matrix/commands.rs` and `crates/bin/src/gateway/matrix/history.rs`.
+- **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/bin/src/bridge/matrix/commands.rs` and `crates/bin/src/bridge/matrix/history.rs`.

@@ -1,17 +1,17 @@
-//! Cross-crate gateway surface.
+//! Cross-crate bridge surface.
 //!
-//! The [`Gateway`] trait, [`ApprovalExchange`] struct, and
+//! The [`Bridge`] trait, [`ApprovalExchange`] struct, and
 //! [`ApprovalDecision`] enum live in the library so runtime / security /
-//! server code can reference them. Concrete gateway implementations
+//! server code can reference them. Concrete bridge implementations
 //! (Matrix, TUI, CLI) live in the binary crate.
 //!
-//! The session DB *is* the conversation; a gateway is a pure bidirectional
+//! The session DB *is* the conversation; a bridge is a pure bidirectional
 //! translator between one session DB and one transport. The reconcile
 //! helpers below ([`inbound_user_entry`], [`render_outbound`],
 //! [`undelivered_agent_messages`], [`attach_reconciler`]) are the
-//! transport-generic half of that contract — an external gateway binary
+//! transport-generic half of that contract — an external bridge binary
 //! (`chaz-discord`, …) links them rather than re-deriving the DB↔surface
-//! invariants. The Matrix gateway in the binary crate is itself written on
+//! invariants. The Matrix bridge in the binary crate is itself written on
 //! top of them, so they stay honest about being transport-agnostic.
 
 use crate::agent::AgentRegistry;
@@ -25,12 +25,12 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tracing::error;
 
-/// Trait for transport gateways (Matrix, TUI, etc.)
+/// Trait for transport bridges (Matrix, TUI, etc.)
 ///
-/// A gateway owns a transport connection and bridges platform events
+/// A bridge owns a transport connection and translates platform events
 /// into session database entries. The server processes entries via
 /// callbacks and delivers responses through the response channel.
-pub trait Gateway {
+pub trait Bridge {
     fn run(
         self,
         server: Arc<Server>,
@@ -58,11 +58,11 @@ pub enum ApprovalDecision {
 
 /// Build the inbound user entry for a message received on a transport.
 ///
-/// Stamps the invariants every gateway ingester must get right: an
+/// Stamps the invariants every bridge ingester must get right: an
 /// `EntryType::Message`, the receipt timestamp, and an [`EntryRouting`]
 /// `source` recording which `(transport, login_id, channel)` it arrived on
 /// and from whom. An agent's reply is routed back to this channel by
-/// resolving that `source`, so a gateway author writes one call here instead
+/// resolving that `source`, so a bridge author writes one call here instead
 /// of re-deriving the routing shape.
 pub fn inbound_user_entry(
     transport: &str,

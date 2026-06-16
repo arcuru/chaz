@@ -1,12 +1,12 @@
-//! `Gateway` trait implementation for the TUI. Extracted from `mod.rs`.
+//! `Bridge` trait implementation for the TUI. Extracted from `mod.rs`.
 //!
-//! Child module of `tui` so the impl retains access to `TuiGateway`/`App`
+//! Child module of `tui` so the impl retains access to `TuiBridge`/`App`
 //! private state and the module-level render/terminal helpers via
 //! `use super::*`.
 
 use super::*;
 
-impl Gateway for TuiGateway {
+impl Bridge for TuiBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let (approval_tx, mut approval_rx) = mpsc::channel::<TaggedApproval>(8);
         let (notify_tx, mut notify_rx) = mpsc::channel::<String>(64);
@@ -427,7 +427,7 @@ impl Gateway for TuiGateway {
                         // so the runtime doesn't hang waiting.
                         let _ = exchange
                             .decision_tx
-                            .send(chaz_core::gateway::ApprovalDecision::Deny);
+                            .send(chaz_core::bridge::ApprovalDecision::Deny);
                     }
                 }
                 Action::ModelsFetched(res) => {

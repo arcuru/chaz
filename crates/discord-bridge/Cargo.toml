@@ -1,6 +1,6 @@
 [package]
-name = "chaz-discord-gateway"
-description = "Standalone Discord gateway for chaz — maps an eidetica session DB to a Discord channel."
+name = "chaz-discord-bridge"
+description = "Standalone Discord bridge for chaz — maps an eidetica session DB to a Discord channel."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -1,4 +1,4 @@
-//! Single-shot CLI gateway. Sends one prompt and prints the agent's reply
+//! Single-shot CLI bridge. Sends one prompt and prints the agent's reply
 //! on stdout.
 //!
 //! Session behavior:
@@ -12,8 +12,8 @@
 //! (see [`SecurityContext::request_approval`] when `approval_callback` is None).
 
 use chaz_core::backends::BackendManager;
+use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
-use chaz_core::gateway::Gateway;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{EntryType, Session, SessionEntry};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-pub struct CliGateway {
+pub struct CliBridge {
     config: Config,
     secrets: SecretStore,
     prompt: String,
@@ -32,7 +32,7 @@ pub struct CliGateway {
     session_name: Option<String>,
 }
 
-impl CliGateway {
+impl CliBridge {
     pub fn new(
         config: Config,
         secrets: SecretStore,
@@ -84,7 +84,7 @@ async fn resolve_cli_session(
     }
 }
 
-impl Gateway for CliGateway {
+impl Bridge for CliBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let (conv_id, session_db) =
             resolve_cli_session(&server, self.session_name.as_deref()).await?;

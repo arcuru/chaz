@@ -848,7 +848,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "chaz-discord-gateway"
+name = "chaz-discord-bridge"
 version = "0.3.0"
 dependencies = [
  "anyhow",

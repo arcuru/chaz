@@ -2,8 +2,8 @@
 //! help text, session-picker navigation. No async, no side effects beyond
 //! mutating the shared `App` state.
 
+use chaz_core::bridge::ApprovalDecision;
 use chaz_core::commands::Parsed;
-use chaz_core::gateway::ApprovalDecision;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 

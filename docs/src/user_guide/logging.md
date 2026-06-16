@@ -4,7 +4,7 @@ Chaz uses the [tracing](https://docs.rs/tracing) crate for structured logging. D
 
 ## Where Logs Go
 
-The sink depends on the gateway mode, because the TUI and print modes need to keep stdout clean for their own output:
+The sink depends on the bridge mode, because the TUI and print modes need to keep stdout clean for their own output:
 
 | Mode               | Default destination                                      |
 | ------------------ | -------------------------------------------------------- |
@@ -13,7 +13,7 @@ The sink depends on the gateway mode, because the TUI and print modes need to ke
 | `--no-tui`         | stdout (collected by systemd / docker / your supervisor) |
 | `chaz usage` (CLI) | stderr (stdout is the rollup output)                     |
 
-Background gateways (today: Matrix when configured alongside the TUI) log
+Background bridges (today: Matrix when configured alongside the TUI) log
 to the same destination as the foreground TUI — the TUI grabs stdout, so
 everything in-process goes to the rotated file.
 
@@ -43,8 +43,8 @@ RUST_LOG=chaz_core::runtime=debug,chaz_core::security=warn chaz --config config.
 
 At the default level you'll see:
 
-- **Startup**: config loaded, agent count, tool registry ready, gateway mode, eidetica sync address
-- **Sessions**: new session creation, backfill, gateway callback registration
+- **Startup**: config loaded, agent count, tool registry ready, bridge mode, eidetica sync address
+- **Sessions**: new session creation, backfill, bridge callback registration
 - **Agent lifecycle**: ReAct loop completion, max iterations reached, tool-aware fallback
 - **Tool execution**: shell commands run, files written, web fetches initiated
 - **Security**: approval decisions (approve/deny/approve-all), MCP server restarts
@@ -68,7 +68,7 @@ Errors indicate failures needing attention:
 - Matrix login or sync failures
 - Session database errors (load, persist, commit)
 - Agent execution failures
-- Gateway crashes
+- Bridge crashes
 
 ### debug
 
@@ -99,7 +99,7 @@ TUI and `-p` / `--print` modes already log to a daily-rotated file in `state_dir
 
 ## Security Audit Trail
 
-For security auditing, `warn` level captures all enforcement actions. The exact pipeline depends on where the logs land for your gateway:
+For security auditing, `warn` level captures all enforcement actions. The exact pipeline depends on where the logs land for your bridge:
 
 ```bash
 # Headless mode (`--no-tui`) — logs are on stdout/stderr, filter live

@@ -2,11 +2,11 @@ mod client;
 mod commands;
 mod history;
 
+use chaz_core::bridge::{ApprovalDecision, ApprovalExchange, Bridge};
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
 use chaz_core::config::{Config, MatrixLoginSpec};
-use chaz_core::gateway::{ApprovalDecision, ApprovalExchange, Gateway};
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::Session;
@@ -51,9 +51,9 @@ fn make_room_approval_tx(
     tx
 }
 
-pub struct MatrixGateway {
-    /// The Matrix login this gateway signs in as — credentials, per-login
-    /// overrides, and the agent that owns it. One gateway runs per login;
+pub struct MatrixBridge {
+    /// The Matrix login this bridge signs in as — credentials, per-login
+    /// overrides, and the agent that owns it. One bridge runs per login;
     /// the spawn loop in `main` builds one of these per resolved login.
     login: MatrixLoginSpec,
     /// Resolved on-disk state directory for this login's matrix client
@@ -68,15 +68,15 @@ pub struct MatrixGateway {
     /// comes from `login` — but everything else still does.
     config: Config,
     secrets: SecretStore,
-    /// Stable id of the login this gateway runs (`login.login_id`).
+    /// Stable id of the login this bridge runs (`login.login_id`).
     /// Stamped into every inbound entry's `TransportRef::login_id` and used
     /// as the `login_id` dimension of every channel binding. Since a login
     /// belongs to one agent, it doubles as that agent's transport identity.
     login_id: String,
-    /// The agent that owns this login. The gateway attaches it to each of
+    /// The agent that owns this login. The bridge attaches it to each of
     /// this login's rooms as the session host (`ensure_session_host`), so
     /// resolution routes to it by default. An explicit per-room re-host
-    /// (`/agent host`) is preserved. The gateway itself does no per-message
+    /// (`/agent host`) is preserved. The bridge itself does no per-message
     /// agent resolution.
     owning_agent: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
@@ -85,7 +85,7 @@ pub struct MatrixGateway {
     shutdown: Arc<Notify>,
 }
 
-impl MatrixGateway {
+impl MatrixBridge {
     pub fn new(
         login: MatrixLoginSpec,
         state_dir: Option<String>,
@@ -94,10 +94,10 @@ impl MatrixGateway {
         shutdown: Arc<Notify>,
     ) -> anyhow::Result<Self> {
         if login.homeserver_url.is_empty() {
-            anyhow::bail!("homeserver_url is required for Matrix gateway");
+            anyhow::bail!("homeserver_url is required for Matrix bridge");
         }
         if login.username.is_empty() {
-            anyhow::bail!("username is required for Matrix gateway");
+            anyhow::bail!("username is required for Matrix bridge");
         }
         let login_id = login.login_id.clone();
         let owning_agent = login.owning_agent.clone();
@@ -115,7 +115,7 @@ impl MatrixGateway {
 
 /// Install the reconciling response callback for a Matrix room.
 ///
-/// Thin transport adapter over [`chaz_core::gateway::attach_reconciler`]: the
+/// Thin transport adapter over [`chaz_core::bridge::attach_reconciler`]: the
 /// reconcile rule (delta scan, delivered-set, `[guest]` prefixing) lives in
 /// the lib; this only supplies the Matrix `send` closure — render markdown and
 /// hand it to `room.send`. Proving the lib API is sufficient for Matrix is
@@ -126,7 +126,7 @@ async fn attach_response_callback(
     agents: Arc<chaz_core::agent::AgentRegistry>,
     owning_agent: String,
 ) -> anyhow::Result<()> {
-    chaz_core::gateway::attach_reconciler(session_db, agents, owning_agent, move |body| {
+    chaz_core::bridge::attach_reconciler(session_db, agents, owning_agent, move |body| {
         let room = room.clone();
         async move {
             info!("→ Matrix({}): {}", room.room_id(), body.replace('\n', " "));
@@ -140,7 +140,7 @@ async fn attach_response_callback(
 
 /// Ensure this login's owning agent hosts the given session — a login
 /// belongs to one agent, so that agent owns and hosts its rooms. The
-/// gateway does no per-message agent resolution; it just attaches the owner
+/// bridge does no per-message agent resolution; it just attaches the owner
 /// once at room setup and lets the runtime resolve from there. No-op when
 /// the name doesn't resolve to a hosted agent (e.g. a legacy default that
 /// isn't configured) — resolution then falls back to the global default.
@@ -178,7 +178,7 @@ async fn dispatch_in_room(
         .await?;
     let session_db_id = session_db.root_id().to_string();
     // A login belongs to one agent: ensure it hosts this room's session, so
-    // resolution picks it without the gateway choosing per message.
+    // resolution picks it without the bridge choosing per message.
     ensure_owning_agent_hosts(&server, &session_db_id, owning_agent).await;
     let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
@@ -290,7 +290,7 @@ async fn resolve_pending_approval(pending: &PendingApprovals, room: &Room, appro
 }
 
 /// `!chaz attach <session>` — bind this room to a specific session and install
-/// the response callback so future writes reach the room. Gateway-local because
+/// the response callback so future writes reach the room. Bridge-local because
 /// it touches the live `attached_sessions` set and matrix `Room`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach(
@@ -394,7 +394,7 @@ async fn handle_detach(room: Room, server: Arc<Server>, login_id: &str) {
     }
 }
 
-impl Gateway for MatrixGateway {
+impl Bridge for MatrixBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let login = self.login;
         let login_id = self.login_id.clone();
@@ -629,7 +629,7 @@ impl Gateway for MatrixGateway {
                         if let Some(inner) = command_inner {
                             let verb = inner.split_whitespace().next().unwrap_or("");
                             // View-local Matrix verbs, checked before the
-                            // shared parser. These either need gateway state
+                            // shared parser. These either need bridge state
                             // (approvals, response-callback install) or are
                             // Matrix-only.
                             match verb {
@@ -862,7 +862,7 @@ impl Gateway for MatrixGateway {
                         // Stamp transport provenance so an agent's reply can
                         // be routed back to this room on this login.
                         session
-                            .add_entry(chaz_core::gateway::inbound_user_entry(
+                            .add_entry(chaz_core::bridge::inbound_user_entry(
                                 "matrix",
                                 &login_id,
                                 room.room_id().as_ref(),
@@ -878,13 +878,13 @@ impl Gateway for MatrixGateway {
         }
 
         // Retry loop for transient sync errors. Returns Ok(()) on a clean
-        // shutdown signal so the parent can drain background gateways
+        // shutdown signal so the parent can drain background bridges
         // without surfacing a spurious error.
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.notified() => {
-                    info!("Matrix gateway received shutdown signal");
+                    info!("Matrix bridge received shutdown signal");
                     return Ok(());
                 }
                 res = mc.run_sync_loop() => match res {
@@ -893,7 +893,7 @@ impl Gateway for MatrixGateway {
                         error!("Matrix sync error (retrying in 5s): {e}");
                         tokio::select! {
                             _ = shutdown.notified() => {
-                                info!("Matrix gateway received shutdown signal during backoff");
+                                info!("Matrix bridge received shutdown signal during backoff");
                                 return Ok(());
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}

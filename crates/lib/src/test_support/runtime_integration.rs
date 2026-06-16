@@ -15,8 +15,8 @@ use super::{
     tool_context,
 };
 use crate::backends::BackendManager;
+use crate::bridge::ApprovalDecision;
 use crate::error::LlmError;
-use crate::gateway::ApprovalDecision;
 use crate::runtime::{self, RuntimeMessage};
 use crate::tool::{
     ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,

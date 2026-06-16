@@ -36,7 +36,7 @@ Every assistant `Message` entry carries an optional `ResponseMetadata`: the mode
 
 ```mermaid
 sequenceDiagram
-    participant U as User/Gateway
+    participant U as User/Bridge
     participant S as Session DB
     participant SV as Server
     participant A as Agent Task
@@ -76,7 +76,7 @@ graph LR
 
 ### Matrix channels
 
-A Matrix channel is an explicit `(room_id → session_db_id)` attachment. A room's first message auto-creates a session and a channel. `!chaz attach <session>` rebinds a room to a different session; `!chaz detach` removes the binding; `!chaz channels` lists rooms attached to the current session. At Matrix gateway startup, every persisted channel for a joined room receives both server-processing and response-delivery callbacks — this is how scheduled-session responses reach Matrix even when no user is active in the room.
+A Matrix channel is an explicit `(room_id → session_db_id)` attachment. A room's first message auto-creates a session and a channel. `!chaz attach <session>` rebinds a room to a different session; `!chaz detach` removes the binding; `!chaz channels` lists rooms attached to the current session. At Matrix bridge startup, every persisted channel for a joined room receives both server-processing and response-delivery callbacks — this is how scheduled-session responses reach Matrix even when no user is active in the room.
 
 ### Named Sessions
 
@@ -102,7 +102,7 @@ The `compact` tool and `/compact` TUI command write a `Summary` entry to the ses
 
 Because each session is a standalone eidetica database, sessions can be synced between chaz instances. The `/share` command generates a `DatabaseTicket` URL, and `/sync` pulls a remote session. Eidetica handles the Merkle-CRDT synchronization protocol.
 
-Synced sessions receive remote writes via eidetica's `on_local_write` callbacks with `WriteSource::Remote`, triggering the same gateway notification path as local writes.
+Synced sessions receive remote writes via eidetica's `on_local_write` callbacks with `WriteSource::Remote`, triggering the same bridge notification path as local writes.
 
 ## Home Peer (Per-Session, with Agent-Level Fresh-Timer Default)
 

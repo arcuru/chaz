@@ -1,29 +1,29 @@
-//! `chaz-discord` — a standalone Discord gateway for chaz.
+//! `chaz-discord` — a standalone Discord bridge for chaz.
 //!
 //! This is its own process and its own `fn main()`, linking `chaz-core` as a
 //! library. It opens the same eidetica DB chaz uses, assembles a fully-wired
-//! `Server` via [`chaz_core::server::build`], and runs a [`DiscordGateway`]
+//! `Server` via [`chaz_core::server::build`], and runs a [`DiscordBridge`]
 //! that maps one Discord channel to its session DB. Nothing is loaded into the
 //! chaz binary; this is the "author writes their own binary against
 //! chaz-core" composition model in concrete form.
 
+mod bridge;
 mod config;
-mod gateway;
 
 use std::path::PathBuf;
 
+use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
-use chaz_core::gateway::Gateway;
 use chaz_core::server;
 
 use clap::Parser;
 use tracing::info;
 
+use crate::bridge::DiscordBridge;
 use crate::config::DiscordRoot;
-use crate::gateway::DiscordGateway;
 
 #[derive(Parser)]
-#[command(author, version, about = "Standalone Discord gateway for chaz", long_about = None)]
+#[command(author, version, about = "Standalone Discord bridge for chaz", long_about = None)]
 struct Args {
     /// Path to the chaz config file (same file chaz reads). When unset, falls
     /// back to `$XDG_CONFIG_HOME/chaz/config.yaml`. The Discord-specific
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         None => instance.login_user("chaz", None).await?,
     };
 
-    // A long-lived gateway: sync and the routine engine both run.
+    // A long-lived bridge: sync and the routine engine both run.
     let server::BuiltServer {
         server,
         secret_store,
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    DiscordGateway::new(config, discord, secret_store)
+    DiscordBridge::new(config, discord, secret_store)
         .run(server)
         .await
 }

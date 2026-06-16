@@ -95,7 +95,7 @@ Type `/help` to see available commands.
 
 ## Running the Matrix Bot
 
-When `matrix:` is configured, the Matrix gateway spawns automatically in
+When `matrix:` is configured, the Matrix bridge spawns automatically in
 the background alongside the TUI — you can drive a session locally while
 Matrix room users chat into the same session. To run headless (no TUI;
 intended for daemons or containers):
@@ -104,7 +104,7 @@ intended for daemons or containers):
 chaz --config config.yaml --no-tui
 ```
 
-To suppress the background Matrix gateway for a single TUI run, pass
+To suppress the background Matrix bridge for a single TUI run, pass
 `--no-matrix`.
 
 The bot will log in to Matrix, accept room invites from allowed users, and respond to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages or messages that @-mention the bot.
@@ -129,7 +129,7 @@ chaz --config config.yaml usage --json    # for piping
 chaz --config config.yaml usage --gateway cli --active-only
 ```
 
-Walks every session in the state directory and aggregates LLM token/cost metadata. Read-only — no gateway, scheduler, or sync starts. See [Cost Tracking & Usage](usage.md).
+Walks every session in the state directory and aggregates LLM token/cost metadata. Read-only — no bridge, scheduler, or sync starts. See [Cost Tracking & Usage](usage.md).
 
 ## Troubleshooting
 

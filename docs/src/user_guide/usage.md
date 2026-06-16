@@ -32,7 +32,7 @@ Unreadable sessions are logged and skipped rather than failing the whole rollup 
 
 ## `chaz usage` (CLI)
 
-For headless or scripted rollups — say, in a cron job, dashboard, or one-off audit — run the subcommand mode. It opens the eidetica store, computes the same rollup, prints it, and exits without starting any gateway.
+For headless or scripted rollups — say, in a cron job, dashboard, or one-off audit — run the subcommand mode. It opens the eidetica store, computes the same rollup, prints it, and exits without starting any bridge.
 
 ```bash
 chaz --config config.yaml usage

@@ -8,7 +8,7 @@ pub use network::NetworkPolicy;
 pub use sanitizer::Sanitizer;
 pub use secrets::SecretStore;
 
-use crate::gateway::{ApprovalDecision, ApprovalExchange};
+use crate::bridge::{ApprovalDecision, ApprovalExchange};
 use crate::tool::{ApprovalRequirement, ToolApprovalInfo};
 use std::collections::HashSet;
 use tokio::sync::{mpsc, oneshot};

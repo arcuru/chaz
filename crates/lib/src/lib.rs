@@ -2,12 +2,13 @@
 //!
 //! Holds the runtime, tool system, extensions, session model, security
 //! surface, MCP bridge, backends, and command dispatcher. The binary
-//! crate (`chaz`) brings the gateway implementations (Matrix, TUI,
+//! crate (`chaz`) brings the bridge implementations (Matrix, TUI,
 //! CLI) and the entrypoint.
 
 pub mod agent;
 pub mod agent_db;
 pub mod backends;
+pub mod bridge;
 pub mod bubblewrap_host;
 pub mod commands;
 pub mod config;
@@ -18,7 +19,6 @@ pub mod embedding;
 pub mod error;
 pub mod extension;
 pub mod extensions;
-pub mod gateway;
 pub mod grants;
 pub mod hosted_index;
 pub mod mcp;

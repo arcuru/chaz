@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::agent::AgentRegistry;
-use crate::gateway::{ApprovalDecision, ApprovalExchange};
+use crate::bridge::{ApprovalDecision, ApprovalExchange};
 use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
 use crate::session::{Session, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};

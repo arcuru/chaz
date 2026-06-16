@@ -1,6 +1,6 @@
 # chaz
 
-Chaz is an experimental AI agent framework built on [eidetica](https://github.com/arcuru/eidetica). It features a ReAct tool-calling loop, multi-agent orchestration, and persistent + syncable per-session state. The primary gateway is a [Matrix](https://matrix.org) bot connecting to any OpenAI-compatible LLM provider; a TUI is also included.
+Chaz is an experimental AI agent framework built on [eidetica](https://github.com/arcuru/eidetica). It features a ReAct tool-calling loop, multi-agent orchestration, and persistent + syncable per-session state. The primary bridge is a [Matrix](https://matrix.org) bot connecting to any OpenAI-compatible LLM provider; a TUI is also included.
 
 > ⚠️ **Experimental.** APIs, config, and on-disk state may change without notice. Don't run against data you can't afford to lose.
 
@@ -68,18 +68,18 @@ chaz -p "summarize today's stand-up"
 Each invocation creates a fresh ephemeral session by default. Pass
 `--session NAME` to reuse one across invocations (find-or-create).
 
-### Matrix gateway
+### Matrix bridge
 
-When the `matrix:` block in your config is populated, the Matrix gateway
+When the `matrix:` block in your config is populated, the Matrix bridge
 spawns automatically in the background alongside the TUI — a TUI user and
 Matrix room users can drive the same hosted session at the same time. To
-opt out of the background gateway for a single run:
+opt out of the background bridge for a single run:
 
 ```bash
 chaz --config config.yaml --no-matrix
 ```
 
-To run Matrix as the only gateway (headless, no TUI — for daemons /
+To run Matrix as the only bridge (headless, no TUI — for daemons /
 containers):
 
 ```bash
