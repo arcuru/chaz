@@ -304,6 +304,61 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
 }
 
 #[tokio::test]
+async fn reconcile_seeds_login_secret_into_encrypted_store() {
+    let (_instance, server, registry) = server_fixture().await;
+    let state_dir = tempfile::tempdir().unwrap();
+    server.set_state_dir(Some(state_dir.path().to_path_buf()));
+
+    let ac: crate::config::AgentConfig = serde_yaml::from_str(
+        "name: ava\nlogins:\n- type: matrix\n  homeserver_url: https://hs.example\n  username: \"@ava:example\"\n  password: hunter2\n",
+    )
+    .unwrap();
+
+    let (db, pubkey) = {
+        let mut user = registry.user_for_tests().await;
+        create_agent_db(
+            &mut user,
+            "ava",
+            &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
+            &AgentMeta {
+                display_name: Some("ava".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    };
+    server.agent_index().register(DbEntry {
+        db_id: db.id(),
+        display_name: "ava".to_string(),
+        pubkey,
+    });
+
+    server.reconcile_agent_from_yaml(&ac).await.unwrap();
+
+    // The credential landed in the agent's encrypted store under its login_id,
+    // unlockable with the agent's local-disk key.
+    let key = crate::security::ensure_login_unlock_key(state_dir.path(), "ava").unwrap();
+    let secret = db.read_login_secret("@ava:example", &key).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("hunter2"));
+
+    // The metadata synced in the clear, without the password.
+    let cfg = db.read_config().await.unwrap();
+    assert_eq!(cfg.logins.len(), 1);
+    assert_eq!(cfg.logins[0].login_id(), "@ava:example");
+    let json = serde_json::to_string(&cfg.logins[0]).unwrap();
+    assert!(
+        !json.contains("hunter2"),
+        "secret leaked into metadata: {json}"
+    );
+
+    // Idempotent: a second reconcile neither errors nor clobbers the secret.
+    server.reconcile_agent_from_yaml(&ac).await.unwrap();
+    let again = db.read_login_secret("@ava:example", &key).await.unwrap();
+    assert_eq!(again.as_deref(), Some("hunter2"));
+}
+
+#[tokio::test]
 async fn reload_config_for_rereads_yaml_from_disk() {
     // `/agent reload` path: a config file on disk drives the reconcile via
     // the server-held config path, not a pre-parsed Config in hand.

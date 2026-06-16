@@ -826,6 +826,7 @@ dependencies = [
  "dirs",
  "eidetica",
  "futures",
+ "getrandom 0.3.4",
  "lazy_static",
  "matrix-sdk",
  "meval",

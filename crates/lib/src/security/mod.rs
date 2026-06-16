@@ -6,7 +6,7 @@ pub mod secrets;
 pub use leak_detector::{LeakDetector, LeakPolicy};
 pub use network::NetworkPolicy;
 pub use sanitizer::Sanitizer;
-pub use secrets::SecretStore;
+pub use secrets::{SecretStore, ensure_login_unlock_key, login_unlock_key_path};
 
 use crate::bridge::{ApprovalDecision, ApprovalExchange};
 use crate::tool::{ApprovalRequirement, ToolApprovalInfo};

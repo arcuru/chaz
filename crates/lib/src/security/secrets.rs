@@ -1,6 +1,7 @@
 use eidetica::Database;
 use eidetica::store::DocStore;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
@@ -138,6 +139,70 @@ impl std::fmt::Debug for SecretStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Login-secrets unlock key (local disk, never synced)
+//
+// Each agent's transport-login credentials live in an encrypted
+// `PasswordStore<DocStore>` on its synced DB; the password that unlocks that
+// store is kept here, on local disk only, so the ciphertext can propagate to
+// peers while the key never does. Losing the key file makes the agent's stored
+// secrets unrecoverable — re-seed from yaml or re-add via the runtime command.
+// ---------------------------------------------------------------------------
+
+/// Filesystem location of an agent's login-secrets unlock key:
+/// `<state_dir>/agents/<agent>/login_secrets.key`.
+pub fn login_unlock_key_path(state_dir: &Path, agent_name: &str) -> PathBuf {
+    state_dir
+        .join("agents")
+        .join(sanitize_agent_name(agent_name))
+        .join("login_secrets.key")
+}
+
+/// Read the agent's login-secrets unlock key, generating and persisting a
+/// fresh random one (0600 on Unix) on first use. Idempotent: an existing
+/// non-empty key file is returned as-is.
+pub fn ensure_login_unlock_key(state_dir: &Path, agent_name: &str) -> std::io::Result<String> {
+    let path = login_unlock_key_path(state_dir, agent_name);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let key = generate_unlock_key()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(key)
+}
+
+/// 32 bytes of OS randomness, hex-encoded (64 chars).
+fn generate_unlock_key() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| std::io::Error::other(format!("OS RNG unavailable: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Map an agent name to a filesystem-safe directory segment.
+fn sanitize_agent_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +251,44 @@ mod tests {
     #[test]
     fn test_resolve_env_bare_dollar() {
         assert_eq!(SecretStore::resolve_env("$").unwrap(), "$");
+    }
+
+    #[test]
+    fn unlock_key_generates_then_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = ensure_login_unlock_key(dir.path(), "ava").unwrap();
+        assert_eq!(k1.len(), 64, "expected 32 hex-encoded bytes");
+        assert!(k1.chars().all(|c| c.is_ascii_hexdigit()));
+        // Second call reads the persisted key rather than regenerating.
+        let k2 = ensure_login_unlock_key(dir.path(), "ava").unwrap();
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn unlock_key_is_per_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ensure_login_unlock_key(dir.path(), "ava").unwrap();
+        let b = ensure_login_unlock_key(dir.path(), "chaz").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn unlock_key_path_shape_and_sanitization() {
+        let p = login_unlock_key_path(Path::new("/state"), "research/orchestrator");
+        assert_eq!(
+            p,
+            Path::new("/state/agents/research_orchestrator/login_secrets.key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlock_key_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        ensure_login_unlock_key(dir.path(), "ava").unwrap();
+        let path = login_unlock_key_path(dir.path(), "ava");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"] }
 lazy_static = "1"
 regex = "1"
 dirs = "5"
+getrandom = "0.3"
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "byot", "chat-completion"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
