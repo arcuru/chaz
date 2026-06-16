@@ -1478,9 +1478,9 @@ mod tests {
     #[test]
     fn login_metadata_drops_secret_and_resolves_id() {
         let meta =
-            AgentDbLogin::from_login_config(&matrix_login(None, "@ava:example", Some("hunter2")));
+            AgentDbLogin::from_login_config(&matrix_login(None, "@chaz:example", Some("hunter2")));
         // login_id falls back to the MXID; transport tag carried over.
-        assert_eq!(meta.login_id(), "@ava:example");
+        assert_eq!(meta.login_id(), "@chaz:example");
         assert_eq!(meta.transport_kind(), "matrix");
         // The DB-side type has no secret field; prove the credential never
         // reaches the persisted form, and the `type` tag flattens in.
@@ -1498,17 +1498,17 @@ mod tests {
         let cfg = AgentDbConfig {
             logins: vec![AgentDbLogin::from_login_config(&matrix_login(
                 Some("primary"),
-                "@ava:example",
+                "@chaz:example",
                 Some("hunter2"),
             ))],
             ..Default::default()
         };
         let (db, _) = create_agent_db(
             &mut user,
-            "ava",
+            "chaz",
             &cfg,
             &AgentMeta {
-                display_name: Some("ava".into()),
+                display_name: Some("chaz".into()),
                 ..Default::default()
             },
         )

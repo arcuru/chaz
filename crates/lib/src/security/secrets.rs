@@ -256,19 +256,19 @@ mod tests {
     #[test]
     fn unlock_key_generates_then_is_stable() {
         let dir = tempfile::tempdir().unwrap();
-        let k1 = ensure_login_unlock_key(dir.path(), "ava").unwrap();
+        let k1 = ensure_login_unlock_key(dir.path(), "chaz").unwrap();
         assert_eq!(k1.len(), 64, "expected 32 hex-encoded bytes");
         assert!(k1.chars().all(|c| c.is_ascii_hexdigit()));
         // Second call reads the persisted key rather than regenerating.
-        let k2 = ensure_login_unlock_key(dir.path(), "ava").unwrap();
+        let k2 = ensure_login_unlock_key(dir.path(), "chaz").unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn unlock_key_is_per_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let a = ensure_login_unlock_key(dir.path(), "ava").unwrap();
-        let b = ensure_login_unlock_key(dir.path(), "chaz").unwrap();
+        let a = ensure_login_unlock_key(dir.path(), "chaz").unwrap();
+        let b = ensure_login_unlock_key(dir.path(), "researcher").unwrap();
         assert_ne!(a, b);
     }
 
@@ -286,8 +286,8 @@ mod tests {
     fn unlock_key_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        ensure_login_unlock_key(dir.path(), "ava").unwrap();
-        let path = login_unlock_key_path(dir.path(), "ava");
+        ensure_login_unlock_key(dir.path(), "chaz").unwrap();
+        let path = login_unlock_key_path(dir.path(), "chaz");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }

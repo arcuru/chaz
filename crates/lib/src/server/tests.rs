@@ -310,7 +310,7 @@ async fn reconcile_seeds_login_secret_into_encrypted_store() {
     server.set_state_dir(Some(state_dir.path().to_path_buf()));
 
     let ac: crate::config::AgentConfig = serde_yaml::from_str(
-        "name: ava\nlogins:\n- type: matrix\n  homeserver_url: https://hs.example\n  username: \"@ava:example\"\n  password: hunter2\n",
+        "name: chaz\nlogins:\n- type: matrix\n  homeserver_url: https://hs.example\n  username: \"@chaz:example\"\n  password: hunter2\n",
     )
     .unwrap();
 
@@ -318,10 +318,10 @@ async fn reconcile_seeds_login_secret_into_encrypted_store() {
         let mut user = registry.user_for_tests().await;
         create_agent_db(
             &mut user,
-            "ava",
+            "chaz",
             &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
             &AgentMeta {
-                display_name: Some("ava".to_string()),
+                display_name: Some("chaz".to_string()),
                 ..Default::default()
             },
         )
@@ -330,7 +330,7 @@ async fn reconcile_seeds_login_secret_into_encrypted_store() {
     };
     server.agent_index().register(DbEntry {
         db_id: db.id(),
-        display_name: "ava".to_string(),
+        display_name: "chaz".to_string(),
         pubkey,
     });
 
@@ -338,14 +338,14 @@ async fn reconcile_seeds_login_secret_into_encrypted_store() {
 
     // The credential landed in the agent's encrypted store under its login_id,
     // unlockable with the agent's local-disk key.
-    let key = crate::security::ensure_login_unlock_key(state_dir.path(), "ava").unwrap();
-    let secret = db.read_login_secret("@ava:example", &key).await.unwrap();
+    let key = crate::security::ensure_login_unlock_key(state_dir.path(), "chaz").unwrap();
+    let secret = db.read_login_secret("@chaz:example", &key).await.unwrap();
     assert_eq!(secret.as_deref(), Some("hunter2"));
 
     // The metadata synced in the clear, without the password.
     let cfg = db.read_config().await.unwrap();
     assert_eq!(cfg.logins.len(), 1);
-    assert_eq!(cfg.logins[0].login_id(), "@ava:example");
+    assert_eq!(cfg.logins[0].login_id(), "@chaz:example");
     let json = serde_json::to_string(&cfg.logins[0]).unwrap();
     assert!(
         !json.contains("hunter2"),
@@ -354,7 +354,7 @@ async fn reconcile_seeds_login_secret_into_encrypted_store() {
 
     // Idempotent: a second reconcile neither errors nor clobbers the secret.
     server.reconcile_agent_from_yaml(&ac).await.unwrap();
-    let again = db.read_login_secret("@ava:example", &key).await.unwrap();
+    let again = db.read_login_secret("@chaz:example", &key).await.unwrap();
     assert_eq!(again.as_deref(), Some("hunter2"));
 }
 
