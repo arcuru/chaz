@@ -357,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_is_not_marked_then_retries() {
-        let entries = vec![entry("ava", "hello", 2, EntryType::Message)];
+        let entries = [entry("ava", "hello", 2, EntryType::Message)];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
         let mut delivered = HashSet::new();
 
@@ -379,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn stops_at_first_failure_and_resumes_in_order() {
-        let entries = vec![
+        let entries = [
             entry("ava", "a", 1, EntryType::Message),
             entry("ava", "b", 2, EntryType::Message),
             entry("ava", "c", 3, EntryType::Message),
@@ -418,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_run_marks_every_entry() {
-        let entries = vec![
+        let entries = [
             entry("ava", "one", 1, EntryType::Message),
             entry("scout", "two", 2, EntryType::Message), // guest → prefixed body
         ];
