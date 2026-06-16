@@ -5,10 +5,10 @@ use std::collections::HashMap;
 /// Configuration for the chaz bot
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
-    /// Matrix homeserver URL (required for Matrix gateway)
+    /// Matrix homeserver URL (required for Matrix bridge)
     #[serde(default)]
     pub homeserver_url: String,
-    /// Matrix username (required for Matrix gateway)
+    /// Matrix username (required for Matrix bridge)
     #[serde(default)]
     pub username: String,
     /// Optionally specify the password, if not set it will be asked for on cmd line
@@ -79,7 +79,7 @@ pub struct Config {
 /// logins (one per transport), but no login is ever shared. Declared in
 /// the owning agent's `logins:` list and discriminated by `type`, the same
 /// way `backends:` and `web_search.backends:` are — so adding a transport
-/// is a new [`TransportConfig`] variant + gateway impl, never a config
+/// is a new [`TransportConfig`] variant + bridge impl, never a config
 /// schema change.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoginConfig {
@@ -136,7 +136,7 @@ impl LoginConfig {
     }
 }
 
-/// A fully-resolved Matrix login ready to spawn a gateway: identity +
+/// A fully-resolved Matrix login ready to spawn a bridge: identity +
 /// credentials + the agent that owns it. Produced by
 /// [`Config::matrix_logins`] from each agent's `logins:` list (or, for
 /// backward compatibility, from the legacy top-level matrix fields).
@@ -172,7 +172,7 @@ impl Config {
                     continue;
                 };
                 for login in logins {
-                    // Only matrix logins spawn a MatrixGateway; other
+                    // Only matrix logins spawn a MatrixBridge; other
                     // transports are collected by their own resolvers. A
                     // match (not `if let`) so a new variant forces a decision.
                     match &login.transport {
@@ -424,7 +424,7 @@ pub struct AgentConfig {
     pub default_skill_banks: Option<Vec<String>>,
     /// Transport logins this agent owns. Each entry is one account on one
     /// transport (a `type: matrix` MXID, a future `type: discord` token);
-    /// the spawn loop runs one gateway per login, routing its rooms to this
+    /// the spawn loop runs one bridge per login, routing its rooms to this
     /// agent by default. A login belongs to exactly one agent — never shared.
     pub logins: Option<Vec<LoginConfig>>,
 }

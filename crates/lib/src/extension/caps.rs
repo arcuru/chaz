@@ -78,7 +78,7 @@ pub enum CapabilityKind {
     Settings,
     /// Register tools that flow into the agent's tool list.
     ToolRegistration,
-    /// Register slash commands the gateway can dispatch.
+    /// Register slash commands the bridge can dispatch.
     CommandRegistration,
     /// Send a message to a named target (channel, room, agent...).
     Messenger,

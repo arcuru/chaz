@@ -1,4 +1,4 @@
-//! Matrix-specific gateway commands.
+//! Matrix-specific bridge commands.
 //!
 //! Commands that have a cross-transport analogue (model/role/compact/share/…)
 //! are handled by `chaz_core::commands::dispatch`. This module keeps only the

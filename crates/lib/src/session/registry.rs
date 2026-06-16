@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use super::{
-    GatewayKind, SessionCatalogEntry, SessionIndex, SessionStatus, find_or_create_db,
+    BridgeKind, SessionCatalogEntry, SessionIndex, SessionStatus, find_or_create_db,
     read_meta_from_db, update_meta_on_db,
 };
 
@@ -33,7 +33,7 @@ pub struct NewSessionEvent {
 /// - `session_names`     (DocStore)  — `name` → `session_db_id`
 ///
 /// `external_channels` supersedes the legacy Matrix-only `matrix_channels`
-/// (`room_id` → `session_db_id`); the gateway migrates the old store on
+/// (`room_id` → `session_db_id`); the bridge migrates the old store on
 /// startup via [`SessionRegistry::migrate_legacy_matrix_channels`].
 ///
 /// Hosted-agent and hosted-bank lookups live in the in-memory
@@ -67,7 +67,7 @@ pub(super) const STORE_LEGACY_MATRIX_CHANNELS: &str = "matrix_channels";
 pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// User-central session catalog. Companion to `STORE_SESSIONS`; the routing
 /// index there stays a cheap id→source map, while this store holds rich
-/// per-session metadata (gateway, created_at, status) as JSON.
+/// per-session metadata (bridge, created_at, status) as JSON.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 
 /// Peer-runtime overrides that survive restart. v1 holds one key
@@ -177,7 +177,7 @@ impl SessionRegistry {
         let catalog_entry = SessionCatalogEntry {
             session_db_id: session_db_id.clone(),
             source: source.map(|s| s.to_string()),
-            gateway: GatewayKind::from_source(source),
+            bridge: BridgeKind::from_source(source),
             created_at: chrono::Utc::now(),
             status: SessionStatus::Active,
         };
@@ -280,7 +280,7 @@ impl SessionRegistry {
     ///
     /// Joins the routing index (`sessions`) with the catalog
     /// (`session_catalog`). Sessions created before the catalog existed
-    /// surface here with `created_at = None` and gateway derived from their
+    /// surface here with `created_at = None` and bridge derived from their
     /// routing-index source string.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionIndex>> {
         let txn = self.chaz_group.new_transaction().await?;
@@ -307,18 +307,18 @@ impl SessionRegistry {
                 }
                 None => None,
             };
-            let (source, gateway, created_at, status) = match entry {
-                Some(e) => (e.source, e.gateway, Some(e.created_at), e.status),
+            let (source, bridge, created_at, status) = match entry {
+                Some(e) => (e.source, e.bridge, Some(e.created_at), e.status),
                 None => {
                     // Legacy: synthesize from routing-index source only.
-                    let g = GatewayKind::from_source(routing_source.as_deref());
+                    let g = BridgeKind::from_source(routing_source.as_deref());
                     (routing_source, g, None, SessionStatus::Active)
                 }
             };
             out.push(SessionIndex {
                 session_db_id: key.clone(),
                 source,
-                gateway,
+                bridge,
                 created_at,
                 status,
             });
@@ -497,18 +497,18 @@ mod tests {
             list.iter().map(|s| (s.session_db_id.as_str(), s)).collect();
 
         let cli = by_id[db_cli.root_id().to_string().as_str()];
-        assert_eq!(cli.gateway, GatewayKind::Cli);
+        assert_eq!(cli.bridge, BridgeKind::Cli);
         assert_eq!(cli.source.as_deref(), Some("cli"));
         assert_eq!(cli.status, SessionStatus::Active);
         let cli_created = cli.created_at.expect("cli session should have created_at");
         assert!(cli_created >= before && cli_created <= after);
 
         let matrix = by_id[db_matrix.root_id().to_string().as_str()];
-        assert_eq!(matrix.gateway, GatewayKind::Matrix);
+        assert_eq!(matrix.bridge, BridgeKind::Matrix);
         assert!(matrix.source.as_deref().unwrap().starts_with("matrix:"));
 
         let bare = by_id[db_bare.root_id().to_string().as_str()];
-        assert_eq!(bare.gateway, GatewayKind::Other);
+        assert_eq!(bare.bridge, BridgeKind::Other);
         assert_eq!(bare.source, None);
         assert!(bare.created_at.is_some());
     }

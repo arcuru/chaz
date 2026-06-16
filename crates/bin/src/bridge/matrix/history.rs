@@ -21,7 +21,7 @@ pub async fn read_room_history(room: &Room) -> Vec<SessionEntry> {
                     .unwrap_or(None),
             ) {
                 // TODO(multimodal): backfill skips non-text events (images,
-                // files, etc.). See gateway/matrix/commands.rs and
+                // files, etc.). See bridge/matrix/commands.rs and
                 // docs/src/user_guide/matrix.md "Limitations".
                 if let MessageType::Text(text_content) = &content.msgtype {
                     // Stop at !chaz clear

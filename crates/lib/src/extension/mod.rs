@@ -385,7 +385,7 @@ impl HookContext {
 /// Outcome of an extension-registered slash command.
 ///
 /// Mirrors `commands::CommandOutcome::Text`/`Error` — extensions can't
-/// produce session switches or session lists, which are gateway-coupled.
+/// produce session switches or session lists, which are bridge-coupled.
 pub enum ExtensionCommandOutcome {
     Text(String),
     Error(String),

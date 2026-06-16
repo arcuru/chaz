@@ -1,12 +1,12 @@
 //! Transport-neutral session command dispatch.
 //!
-//! Gateways (Matrix, TUI, future HTTP/etc.) parse their own syntax into a
+//! Bridges (Matrix, TUI, future HTTP/etc.) parse their own syntax into a
 //! `Command`, call `dispatch`, and render the `CommandOutcome` to their
 //! transport. All the session/registry/scheduler/backend mutation logic
-//! lives here — gateways are pure adapters.
+//! lives here — bridges are pure adapters.
 //!
 //! Transport-specific commands (e.g. Matrix room `rename`, TUI `/debug`)
-//! stay in the gateway modules — this file is only for the session ops
+//! stay in the bridge modules — this file is only for the session ops
 //! that make sense across transports.
 //!
 //! Submodules group handlers by family:
@@ -244,7 +244,7 @@ pub enum Command {
     Quit,
 
     /// Slash command registered by a chaz extension (see `crate::extension`).
-    /// Gateways produce this variant when a `/foo` doesn't match any
+    /// Bridges produce this variant when a `/foo` doesn't match any
     /// built-in. `dispatch` looks `name` up in `Server::extensions().commands`
     /// and routes there; an unregistered name yields an "Unknown command"
     /// error.
@@ -295,8 +295,8 @@ pub struct SessionInfo {
     pub name: Option<String>,
     pub entry_count: usize,
     pub last_message: Option<String>,
-    /// Normalized gateway-of-origin from the session catalog.
-    pub gateway: crate::session::GatewayKind,
+    /// Normalized bridge-of-origin from the session catalog.
+    pub bridge: crate::session::BridgeKind,
     /// Catalog creation timestamp. `None` for sessions that predate the
     /// catalog (legacy rows in the routing index).
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -311,7 +311,7 @@ pub struct SessionInfo {
     pub llm_call_count: u32,
 }
 
-/// Everything a command handler needs. Borrowed from the gateway.
+/// Everything a command handler needs. Borrowed from the bridge.
 pub struct CommandContext<'a> {
     pub server: &'a Arc<Server>,
     pub secrets: &'a SecretStore,

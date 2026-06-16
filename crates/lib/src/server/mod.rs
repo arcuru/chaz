@@ -6,7 +6,7 @@
 //! the response back to the session database.
 //!
 //! The server is transport-agnostic — it only cares about session DBs and
-//! agent execution. Gateways (Matrix, TUI) register their own callbacks on
+//! agent execution. Bridges (Matrix, TUI) register their own callbacks on
 //! session DBs to detect agent responses and deliver them to their transports.
 //!
 //! Per-session serialization prevents duplicate agent runs: a `processing`
@@ -85,14 +85,14 @@ struct SessionRuntime {
     backend: BackendManager,
     agent_override: Option<String>,
     approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
-    /// Spawn nesting depth (0 for gateway-originated sessions)
+    /// Spawn nesting depth (0 for bridge-originated sessions)
     call_depth: usize,
     /// Maximum spawn depth for this session's agent
     max_call_depth: usize,
     /// Parent's tool scope for transitive narrowing (None = use agent defaults)
     parent_tools: Option<ScopedTools>,
     /// Shared ReAct iteration budget inherited from the spawning parent
-    /// (set by `register_child_session`). `None` on gateway-originated
+    /// (set by `register_child_session`). `None` on bridge-originated
     /// sessions — the task builder allocates a fresh budget then.
     iteration_budget: Option<Arc<AtomicU32>>,
     /// Signaled when the agent task completes (for synchronous spawn_agent)
@@ -302,7 +302,7 @@ pub struct Server {
     /// Agent→agent burst budget. Defaults to
     /// [`DEFAULT_AGENT_BURST_BUDGET`]; operators override it via
     /// `multi_agent.burst_budget` (applied once at startup before the
-    /// gateway begins delivering messages).
+    /// bridge begins delivering messages).
     agent_burst_budget: AtomicUsize,
     /// Names of agents auto-attached to every freshly-created session, in
     /// order. Set once at startup from `Config.default_agents` via
@@ -648,7 +648,7 @@ impl Server {
 
     /// Override the agent→agent burst budget. Called once at startup
     /// from `main.rs` when `multi_agent.burst_budget` is configured,
-    /// before the gateway starts delivering messages.
+    /// before the bridge starts delivering messages.
     pub fn set_agent_burst_budget(&self, budget: usize) {
         self.agent_burst_budget.store(budget, Ordering::Relaxed);
     }
@@ -915,7 +915,7 @@ impl Server {
     /// `model_info_store` into the default backend's overlay, so window-aware
     /// budgeting works with zero config (no `context_window:` hand-edited into
     /// YAML). Idempotent and cheap — one DB read of the `chaz_peer`
-    /// `model_info` store. Call once at startup, before the gateway delivers
+    /// `model_info` store. Call once at startup, before the bridge delivers
     /// messages. A miss (no model used on this machine yet) is a no-op: the
     /// runtime falls back to the static budget until a model is used or picked,
     /// at which point [`ensure_model_window_cached`](Self::ensure_model_window_cached)
@@ -1080,7 +1080,7 @@ impl Server {
     /// whether written locally or via remote sync. Stores per-session runtime state (backend, agent
     /// override, approval channel) keyed by the session DB ID.
     ///
-    /// Gateways should register their own callbacks on the session DB to handle
+    /// Bridges should register their own callbacks on the session DB to handle
     /// response delivery.
     ///
     /// Safe to call multiple times — updates metadata, skips duplicate callback registration.
@@ -1293,7 +1293,7 @@ impl Server {
     }
 
     /// Watch for new sessions appearing in the registry (local creates, sync, etc.)
-    /// and log them. Gateways are responsible for calling `register_session` to
+    /// and log them. Bridges are responsible for calling `register_session` to
     /// wire up agent processing and response delivery for their channels.
     async fn new_session_watcher(&self) {
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
@@ -1553,7 +1553,7 @@ impl Server {
             .with_active_extensions(Some(active_extensions.clone()));
 
             // Inherit the parent's budget if a spawning Worker passed one
-            // in; otherwise this is a top-level run (gateway / schedule
+            // in; otherwise this is a top-level run (bridge / schedule
             // wake) and we allocate a fresh budget seeded from the
             // agent's `max_iterations`.
             let iteration_budget = spawn

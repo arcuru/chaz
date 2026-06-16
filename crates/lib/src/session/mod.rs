@@ -78,7 +78,7 @@ pub struct SessionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<crate::runtime::ResponseMetadata>,
     /// Transport routing provenance. Present on entries that entered or
-    /// leave the session via an external gateway (Matrix, Discord, …);
+    /// leave the session via an external bridge (Matrix, Discord, …);
     /// `None` for purely local entries (TUI/CLI chat, tool audit, summaries),
     /// which is the common case. Grouped into one optional field so the
     /// many [`SessionEntry`] construction sites stay a one-line `routing:
@@ -89,13 +89,13 @@ pub struct SessionEntry {
 
 /// Transport routing metadata for a [`SessionEntry`].
 ///
-/// The session DB is the only channel between gateways and the runtime: an
+/// The session DB is the only channel between bridges and the runtime: an
 /// ingester stamps `source` on inbound user entries; a publisher (one per
 /// login) scans outbound assistant entries and acts on those whose
 /// `reply_to`/`destinations` resolve to its own `(transport, login_id)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct EntryRouting {
-    /// Set by the gateway ingester on inbound user messages: which
+    /// Set by the bridge ingester on inbound user messages: which
     /// transport/login/channel this entry arrived on, and from whom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<TransportRef>,
@@ -116,7 +116,7 @@ pub struct EntryRouting {
 ///
 /// `login_id` disambiguates two logins running on the same transport (one
 /// shared across agents, one dedicated) — a publisher only acts on refs
-/// matching its own login. See the gateway design doc for the full model.
+/// matching its own login. See the bridge design doc for the full model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransportRef {
     /// Stable transport identifier — "matrix", "discord", "sms".
@@ -221,23 +221,23 @@ impl SessionMeta {
 /// Registry index entry — exists for every session known to this instance.
 ///
 /// Combines the lightweight routing index (`sessions` DocStore: id→source)
-/// with the richer catalog metadata (`session_catalog` DocStore: gateway,
+/// with the richer catalog metadata (`session_catalog` DocStore: bridge,
 /// created_at, status). Legacy sessions registered before the catalog
-/// existed surface here with `gateway = Other` and `created_at = None`.
+/// existed surface here with `bridge = Other` and `created_at = None`.
 #[derive(Debug, Clone)]
 pub struct SessionIndex {
     pub session_db_id: String,
     /// Free-form origin tag for debugging ("matrix:!room", "tui", "spawn:uuid").
     pub source: Option<String>,
-    pub gateway: GatewayKind,
+    pub bridge: BridgeKind,
     pub created_at: Option<DateTime<Utc>>,
     pub status: SessionStatus,
 }
 
-/// Normalized gateway-of-origin derived from the session's `source` tag.
+/// Normalized bridge-of-origin derived from the session's `source` tag.
 /// Stored alongside the raw source so consumers can filter without parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum GatewayKind {
+pub enum BridgeKind {
     Cli,
     Tui,
     Matrix,
@@ -246,8 +246,8 @@ pub enum GatewayKind {
     Other,
 }
 
-impl GatewayKind {
-    /// Map a free-form `source` tag to a normalized gateway kind.
+impl BridgeKind {
+    /// Map a free-form `source` tag to a normalized bridge kind.
     pub fn from_source(source: Option<&str>) -> Self {
         match source {
             Some("cli") => Self::Cli,
@@ -269,7 +269,7 @@ impl GatewayKind {
     }
 
     /// Parse the case-insensitive short name produced by `as_str`. Used by
-    /// CLI filters (`chaz usage --gateway tui`).
+    /// CLI filters (`chaz usage --bridge tui`).
     pub fn from_filter_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "cli" => Some(Self::Cli),
@@ -300,7 +300,10 @@ pub enum SessionStatus {
 pub struct SessionCatalogEntry {
     pub session_db_id: String,
     pub source: Option<String>,
-    pub gateway: GatewayKind,
+    /// Persisted to existing session DBs under the JSON key `gateway`; the
+    /// `serde(rename)` preserves the on-disk format across the type rename.
+    #[serde(rename = "gateway")]
+    pub bridge: BridgeKind,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub status: SessionStatus,
@@ -368,7 +371,7 @@ impl Session {
         self.entries.push(entry);
     }
 
-    /// Merge backfill history from a gateway (e.g., Matrix room history).
+    /// Merge backfill history from a bridge (e.g., Matrix room history).
     /// Only inserts entries that are older than our earliest entry or fill gaps.
     /// Deduplicates by timestamp+content.
     pub async fn backfill(&mut self, history: Vec<SessionEntry>) {

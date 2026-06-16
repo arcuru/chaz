@@ -57,7 +57,7 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
             name: meta_name,
             entry_count,
             last_message,
-            gateway: index.gateway,
+            bridge: index.bridge,
             created_at: index.created_at,
             status: index.status,
             total_cost_usd: cost_total,
@@ -443,7 +443,7 @@ pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome
 }
 
 // -----------------------------------------------------------------------------
-// Matrix channels (listing is transport-neutral; attach/detach are per-gateway)
+// Matrix channels (listing is transport-neutral; attach/detach are per-bridge)
 // -----------------------------------------------------------------------------
 
 pub(super) async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {

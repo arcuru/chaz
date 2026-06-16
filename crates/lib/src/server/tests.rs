@@ -612,7 +612,7 @@ async fn agent_schedule_pinned_reuses_existing_session() {
     let (entry, adb) = seed_agent(&server, &registry, "beta").await;
 
     // Create a session, register it with the server, attach the agent.
-    // register_session is what real callers (gateways) do; without it
+    // register_session is what real callers (bridges) do; without it
     // the closed-session retirement check at fire time would self-skip.
     let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
     let session_db_id = session_db.root_id().to_string();

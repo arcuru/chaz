@@ -1,7 +1,7 @@
 //! Assembling a fully-wired [`Server`] from a [`Config`] — the shared bootstrap
 //! path for every chaz binary.
 //!
-//! The `chaz` binary and any standalone gateway binary (e.g. a Discord gateway)
+//! The `chaz` binary and any standalone bridge binary (e.g. a Discord bridge)
 //! need the *same* runtime behind their transport: eidetica opened, the session
 //! registry built, per-agent DBs bootstrapped, the secret store + extension hub
 //! assembled, the [`Server`] constructed with the spawn-tool cell wired, agent
@@ -10,11 +10,11 @@
 //! `OnceLock` must be set *after* `Server::new`, and the extension hub must be
 //! `install_all`'d before it) and historically lived inline in the `chaz`
 //! binary's `main`. [`build`] is the single shared implementation so external
-//! gateway binaries don't copy-paste it.
+//! bridge binaries don't copy-paste it.
 //!
 //! The caller opens eidetica (choosing the backend/path) and hands in the
 //! `Instance` + `User`; [`build`] does everything else and returns the wired
-//! [`Server`] plus the handles a gateway needs alongside it ([`BuiltServer`]).
+//! [`Server`] plus the handles a bridge needs alongside it ([`BuiltServer`]).
 //! Mode-specific behavior the config can't express is passed via
 //! [`BuildOptions`].
 
@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// Knobs [`build`] can't infer from [`Config`] — behavior a one-shot CLI run and
-/// a long-lived gateway decide differently.
+/// a long-lived bridge decide differently.
 pub struct BuildOptions {
     /// Path the config was loaded from; recorded on the server so `/agent
     /// reload` (and config reconcile) can re-read it.
@@ -50,7 +50,7 @@ pub struct BuildOptions {
     pub extra_auto_approved_tools: Vec<String>,
 }
 
-/// A fully-wired [`Server`] plus the handles a gateway needs beside it.
+/// A fully-wired [`Server`] plus the handles a bridge needs beside it.
 pub struct BuiltServer {
     pub server: Arc<Server>,
     pub registry: Arc<session::SessionRegistry>,
@@ -453,7 +453,7 @@ pub async fn build(
         "Spawn tool server cell already set"
     );
 
-    // Apply operator multi-agent tuning before the gateway starts
+    // Apply operator multi-agent tuning before the bridge starts
     // delivering messages (set_agent_burst_budget is read by
     // process_session, which only fires on the first inbound notify).
     if let Some(mc) = &config.multi_agent {

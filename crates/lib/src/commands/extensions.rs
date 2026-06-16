@@ -44,7 +44,7 @@ pub enum ExtScope {
     Agent,
 }
 
-/// Parsed `/extensions <action>` from the gateway parser.
+/// Parsed `/extensions <action>` from the bridge parser.
 #[derive(Debug)]
 pub enum ExtensionsAction {
     List,
@@ -316,7 +316,7 @@ mod tests {
     //! Integration tests for the `/extensions` command + per-session
     //! filtering. Each test builds a real `Arc<Server>` with the full
     //! built-in extension set registered so the assertions exercise the
-    //! same code path the TUI/Matrix gateways take. No LLM backend is
+    //! same code path the TUI/Matrix bridges take. No LLM backend is
     //! involved — tests don't run agent turns, they verify state
     //! observable through `Server::active_extensions_for`,
     //! `dispatch_extension`, and `ScopedTools::definitions`.

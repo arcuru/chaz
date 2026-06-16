@@ -64,10 +64,11 @@ struct UsageArgs {
     #[arg(long)]
     json: bool,
 
-    /// Only include sessions originating from this gateway (cli, tui,
-    /// matrix, spawn, other).
-    #[arg(long, value_name = "KIND")]
-    gateway: Option<String>,
+    /// Only include sessions originating from this bridge (cli, tui,
+    /// matrix, spawn, other). Flag name kept as `--gateway` to preserve the
+    /// existing CLI contract.
+    #[arg(long = "gateway", value_name = "KIND")]
+    bridge: Option<String>,
 
     /// Skip sessions marked closed.
     #[arg(long)]
@@ -423,8 +424,8 @@ async fn run_usage_subcommand(
     config: &Config,
     state_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let gateway_filter = match args.gateway.as_deref() {
-        Some(s) => Some(session::GatewayKind::from_filter_str(s).ok_or_else(|| {
+    let bridge_filter = match args.bridge.as_deref() {
+        Some(s) => Some(session::BridgeKind::from_filter_str(s).ok_or_else(|| {
             anyhow::anyhow!(
                 "Unknown --gateway value '{s}' (expected: cli, tui, matrix, spawn, other)"
             )
@@ -454,7 +455,7 @@ async fn run_usage_subcommand(
 
     let filter = session::usage::UsageFilter {
         since: None,
-        gateway: gateway_filter,
+        bridge: bridge_filter,
         active_only: args.active_only,
     };
     let rollup = session::usage::collect_usage(&registry, &filter).await?;

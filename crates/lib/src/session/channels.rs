@@ -114,7 +114,7 @@ impl SessionRegistry {
             .collect())
     }
 
-    /// Convenience for a gateway: get (or create) the session bound to a
+    /// Convenience for a bridge: get (or create) the session bound to a
     /// channel on a given login.
     ///
     /// If no binding exists, creates a fresh session, attaches the channel to
@@ -157,7 +157,7 @@ impl SessionRegistry {
     ///
     /// Idempotent — migrated entries are removed from the legacy store, so a
     /// second call, or a deployment that never had legacy data, is a no-op.
-    /// The gateway invokes this at startup with its own login id, which is
+    /// The bridge invokes this at startup with its own login id, which is
     /// correct: legacy data predates multi-login, so all of it belonged to the
     /// single configured login. Returns the number of bindings migrated.
     pub async fn migrate_legacy_matrix_channels(&self, login_id: &str) -> anyhow::Result<usize> {

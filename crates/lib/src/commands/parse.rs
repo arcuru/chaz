@@ -2,7 +2,7 @@
 //!
 //! Every frontend (TUI, Matrix, future HTTP/Discord/…) recognizes the same
 //! `/command` vocabulary and builds the same [`Command`]. Historically each
-//! gateway re-encoded that vocabulary: the TUI in `parse_chat_line`, Matrix in
+//! bridge re-encoded that vocabulary: the TUI in `parse_chat_line`, Matrix in
 //! ~20 `register_text_command` closures. [`parse`] is the single source of that
 //! grammar.
 //!

@@ -20,9 +20,9 @@ use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update
 
 impl SessionRegistry {
     /// Ensure `agent` is attached to the session and is its host. Called by
-    /// a gateway when a fresh room maps to this session: a login belongs to
+    /// a bridge when a fresh room maps to this session: a login belongs to
     /// one agent, so that agent owns and hosts its rooms. Resolution then
-    /// picks it with no gateway involvement (host → first-authorized).
+    /// picks it with no bridge involvement (host → first-authorized).
     ///
     /// Idempotent and cheap on the hot path: returns immediately once the
     /// agent is in the session roster, so it only writes on first contact.

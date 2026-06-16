@@ -10,7 +10,7 @@
 
 use crate::runtime::ResponseMetadata;
 use crate::session::{
-    EntryType, GatewayKind, Session, SessionEntry, SessionRegistry, SessionStatus,
+    BridgeKind, EntryType, Session, SessionEntry, SessionRegistry, SessionStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -22,8 +22,8 @@ use tracing::warn;
 pub struct UsageFilter {
     /// Only count entries whose timestamp is `>= since`.
     pub since: Option<DateTime<Utc>>,
-    /// Only count sessions from this gateway origin.
-    pub gateway: Option<GatewayKind>,
+    /// Only count sessions from this bridge origin.
+    pub bridge: Option<BridgeKind>,
     /// Skip sessions marked `Closed`.
     pub active_only: bool,
 }
@@ -59,10 +59,12 @@ pub struct UsageTotals {
 pub struct SessionUsage {
     pub session_db_id: String,
     pub name: Option<String>,
-    /// Lowercase gateway tag (`"cli"`, `"tui"`, …) — matches
-    /// `GatewayKind::as_str()`. Stringified here so JSON consumers don't
-    /// depend on the catalog enum's Rust variant naming.
-    pub gateway: String,
+    /// Lowercase bridge tag (`"cli"`, `"tui"`, …) — matches
+    /// `BridgeKind::as_str()`. Stringified here so JSON consumers don't
+    /// depend on the catalog enum's Rust variant naming. JSON key stays
+    /// `gateway` to preserve the `chaz usage --json` output contract.
+    #[serde(rename = "gateway")]
+    pub bridge: String,
     pub created_at: Option<DateTime<Utc>>,
     pub status: SessionStatus,
     pub totals: UsageTotals,
@@ -82,7 +84,9 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageFilterSummary {
     pub since: Option<DateTime<Utc>>,
-    pub gateway: Option<String>,
+    /// JSON key stays `gateway` to preserve the `chaz usage --json` contract.
+    #[serde(rename = "gateway")]
+    pub bridge: Option<String>,
     pub active_only: bool,
 }
 
@@ -117,8 +121,8 @@ pub async fn collect_usage(
     let mut per_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
 
     for index in indices {
-        if let Some(g) = filter.gateway
-            && index.gateway != g
+        if let Some(g) = filter.bridge
+            && index.bridge != g
         {
             continue;
         }
@@ -178,7 +182,7 @@ pub async fn collect_usage(
         per_session.push(SessionUsage {
             session_db_id: index.session_db_id.clone(),
             name,
-            gateway: index.gateway.as_str().to_string(),
+            bridge: index.bridge.as_str().to_string(),
             created_at: index.created_at,
             status: index.status,
             totals,
@@ -206,7 +210,7 @@ pub async fn collect_usage(
         per_model,
         filter: UsageFilterSummary {
             since: filter.since,
-            gateway: filter.gateway.map(|g| g.as_str().to_string()),
+            bridge: filter.bridge.map(|g| g.as_str().to_string()),
             active_only: filter.active_only,
         },
     })
@@ -313,7 +317,7 @@ pub fn render_text(r: &UsageRollup) -> String {
             };
             out.push_str(&format!(
                 "  {label:<32} [{:<6}] {:>4} call{}{cost}\n",
-                s.gateway,
+                s.bridge,
                 s.totals.calls,
                 if s.totals.calls == 1 { "" } else { "s" },
             ));
@@ -328,8 +332,8 @@ fn describe_filter(f: &UsageFilterSummary) -> String {
     if let Some(since) = f.since {
         parts.push(format!("since {}", since.format("%Y-%m-%d %H:%M UTC")));
     }
-    if let Some(g) = &f.gateway {
-        parts.push(format!("gateway={g}"));
+    if let Some(g) = &f.bridge {
+        parts.push(format!("bridge={g}"));
     }
     if f.active_only {
         parts.push("active sessions only".to_string());

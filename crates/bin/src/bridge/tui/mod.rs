@@ -1803,7 +1803,7 @@ async fn render_outcome(
                         "\n  {}{} [{}] ({}, {} entries, {}{cost})",
                         info.session_db_id,
                         name,
-                        info.gateway.as_str(),
+                        info.bridge.as_str(),
                         agent,
                         info.entry_count,
                         age

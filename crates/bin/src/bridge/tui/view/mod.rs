@@ -1182,7 +1182,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 Some(n) => format!("\"{n}\""),
                 None => short_session_id(&info.session_db_id),
             };
-            let gateway = info.gateway.as_str();
+            let bridge = info.bridge.as_str();
             let age = humanize_age(info.created_at, now);
             let closed_suffix = match info.status {
                 chaz_core::session::SessionStatus::Closed => " (closed)",
@@ -1198,7 +1198,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 String::new()
             };
             let header = format!(
-                "{marker}{title}{current_marker} [{gateway}] {agent_str} • {} entries • {age}{cost_suffix}{closed_suffix}",
+                "{marker}{title}{current_marker} [{bridge}] {agent_str} • {} entries • {age}{cost_suffix}{closed_suffix}",
                 info.entry_count
             );
 

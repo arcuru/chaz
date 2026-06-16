@@ -258,7 +258,7 @@ fn strip_param_descriptions(params: &Value) -> Value {
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
-    /// Current spawn depth (0 = root agent from gateway)
+    /// Current spawn depth (0 = root agent from bridge)
     pub call_depth: usize,
     /// Maximum allowed spawn depth
     pub max_call_depth: usize,
