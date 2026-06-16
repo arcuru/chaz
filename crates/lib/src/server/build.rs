@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{error, info, warn};
 
@@ -68,6 +69,11 @@ pub async fn build(
     mut user: eidetica::user::User,
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
+    // Wall-clock instrumentation for the critical-path build. Individual
+    // heavy steps log their own `elapsed_ms`; this bounds the whole
+    // gateway-blocking prefix so regressions are visible in the log.
+    let build_start = Instant::now();
+
     // Enable eidetica sync for session sharing. Register iroh P2P transport
     // by default (stable peer identity, no address config needed). If
     // sync_listen is configured, also bind HTTP for traditional access.
@@ -104,10 +110,12 @@ pub async fn build(
     // Materialize an eidetica DB per yaml-declared agent. Idempotent on
     // re-runs (yaml is a first-boot template; AgentDb is the source of
     // truth afterwards).
+    let t = Instant::now();
     let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
     if !bootstrapped.is_empty() {
         info!(
             count = bootstrapped.len(),
+            elapsed_ms = t.elapsed().as_millis() as u64,
             "Agent DBs bootstrapped from config"
         );
     }
@@ -122,7 +130,12 @@ pub async fn build(
         }
     }
 
+    let t = Instant::now();
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Session registry initialized"
+    );
     let chaz_peer = registry.chaz_peer().clone();
 
     // Build the peer-local Agent and Memory Bank indices in-memory by
@@ -371,7 +384,13 @@ pub async fn build(
         }
     }
 
+    let t = Instant::now();
     extension_hub.install_all(extensions).await?;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        mcp_servers = mcp_configs.len(),
+        "Extensions installed (MCP servers started)"
+    );
     let extension_names = extension_hub.extension_names();
     if !extension_names.is_empty() {
         info!(?extension_names, "Extensions registered");
@@ -442,20 +461,9 @@ pub async fn build(
         info!(burst_budget = mc.burst_budget, "Applied multi_agent config");
     }
 
-    // Seed the context-window overlay from the persisted in-use model store so
-    // the per-turn budget respects each model's real window without any
-    // `context_window:` in YAML. No-op on a fresh machine until a model is used
-    // or picked, which populates the store for next time.
-    server.warm_model_windows().await;
-
-    // Reconcile each agent's DB config from yaml: resolve system prompts into
-    // the blob store, refresh declarative fields when the yaml block changed
-    // (hash-gated, so live `/agent set` edits are preserved otherwise). This is
-    // what makes a yaml prompt-path edit reach an already-bootstrapped agent,
-    // since `bootstrap_from_config` reuses an existing DB and treats yaml as a
-    // first-boot template. `/agent reload` runs the same path on demand.
+    // Record the config path before anything (the gateway, `/agent reload`,
+    // or the deferred reconcile below) can re-read it.
     server.set_config_path(opts.config_path.clone());
-    server.reconcile_agents_from_config(config).await;
 
     // Apply default_agents list: which agents auto-attach to new
     // sessions. First entry is the routing host. Set before any
@@ -479,12 +487,96 @@ pub async fn build(
         server.set_default_agents(default_agents);
     }
 
-    // Translate YAML `schedules:` into agent-owned Schedules. Each
-    // ScheduleConfig becomes one cron Schedule in the owning agent's DB,
-    // Pinned to the resolved session. The routine engine picks these up
-    // via `register_agent` below — there is no session-scoped routine row
-    // and no broadcast Directive. Idempotent by schedule id == schedule
-    // name within the owning agent.
+    // Fast-start: the server is now fully constructed and the spawn-tool
+    // cell is wired, so the gateway can draw and accept input immediately.
+    // The remaining at-startup work — model-window warm, agent reconcile,
+    // schedule materialization, routine engine — is heavy (per-agent and
+    // per-session DB opens) and does NOT need to block the first render.
+    // Run it in the background; message *processing* is gated on the
+    // reconcile via `mark_startup_pending`/`mark_startup_ready` so a turn
+    // never executes against half-reconciled agent config.
+    info!(
+        critical_path_ms = build_start.elapsed().as_millis() as u64,
+        "Critical-path build complete; deferring at-startup work to background"
+    );
+    server.mark_startup_pending();
+    {
+        let server = server.clone();
+        let registry = registry.clone();
+        let default_backend = default_backend.clone();
+        let deferred_config = config.clone();
+        let run_routine_engine = opts.run_routine_engine;
+        tokio::spawn(async move {
+            run_deferred_startup(
+                server,
+                registry,
+                deferred_config,
+                default_backend,
+                run_routine_engine,
+            )
+            .await;
+        });
+    }
+
+    Ok(BuiltServer {
+        server,
+        registry,
+        secret_store,
+    })
+}
+
+/// The deferred at-startup work, run in a background task off the
+/// critical path so the gateway draws/serves immediately (see the
+/// fast-start block at the end of [`build`]). Order matters:
+///
+/// 1. `warm_model_windows` — best-effort; the per-turn budget falls back
+///    to the static default until this lands, so a miss is tolerated.
+/// 2. `reconcile_agents_from_config` — resolves yaml system prompts into
+///    the blob store and refreshes declarative agent fields. This is the
+///    data-correctness gate: `mark_startup_ready` runs immediately after
+///    so held turns release the moment agent config is consistent, before
+///    the (slower) schedule + routine work below.
+/// 3. Schedule materialization + routine engine — long-lived background
+///    services; nothing user-facing waits on them.
+///
+/// Errors are logged, not propagated: the gateway is already live, so a
+/// failure here degrades a feature rather than aborting the process.
+async fn run_deferred_startup(
+    server: Arc<Server>,
+    registry: Arc<session::SessionRegistry>,
+    config: Config,
+    default_backend: backends::BackendManager,
+    run_routine_engine: bool,
+) {
+    let deferred_start = Instant::now();
+
+    // 1. Seed the context-window overlay from the persisted in-use model
+    //    store. No-op on a fresh machine until a model is used or picked.
+    let t = Instant::now();
+    server.warm_model_windows().await;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Deferred: warmed model windows"
+    );
+
+    // 2. Reconcile each agent's DB config from yaml, then open the gate.
+    //    `/agent reload` runs this same path on demand.
+    let t = Instant::now();
+    server.reconcile_agents_from_config(&config).await;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Deferred: reconciled agents from config"
+    );
+    server.mark_startup_ready();
+    info!(
+        ready_after_ms = deferred_start.elapsed().as_millis() as u64,
+        "Startup gate released — message processing enabled"
+    );
+
+    // 3a. Translate YAML `schedules:` into agent-owned Schedules. Each
+    //     ScheduleConfig becomes one cron Schedule in the owning agent's
+    //     DB, Pinned to the resolved session. Idempotent by schedule id ==
+    //     schedule name within the owning agent.
     if let Some(schedules) = config.schedules.clone() {
         for cfg in schedules {
             if !cfg.enabled {
@@ -579,15 +671,21 @@ pub async fn build(
         }
     }
 
-    // Spawn the routine engine. Loads global routines from
-    // `chaz_peer.routines`, then walks every hosted session and
-    // registers its session-scoped routines (heartbeats + scheduler
-    // fires). Skipped for one-shot CLI: a single ReAct loop doesn't need
-    // the engine running.
-    if opts.run_routine_engine {
+    // 3b. Spawn the routine engine. Loads global routines from
+    //     `chaz_peer.routines`, then walks every hosted session and
+    //     registers its session-scoped routines (heartbeats + scheduler
+    //     fires). Skipped for one-shot CLI: a single ReAct loop doesn't
+    //     need the engine running.
+    if run_routine_engine {
+        let chaz_peer = registry.chaz_peer().clone();
         let engine =
-            routine::RoutineEngine::new(chaz_peer.clone(), Some(server.extensions().clone()))
-                .await?;
+            match routine::RoutineEngine::new(chaz_peer, Some(server.extensions().clone())).await {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("Failed to start routine engine: {e}");
+                    return;
+                }
+            };
         // Hand the engine to the server so each `HookContext` / `ToolContext`
         // built for a session can resync the live schedule after a committed
         // mutation (the `/schedule` command, `schedule_*` tools, `schedule_once`,
@@ -647,11 +745,10 @@ pub async fn build(
         });
     }
 
-    Ok(BuiltServer {
-        server,
-        registry,
-        secret_store,
-    })
+    info!(
+        total_ms = deferred_start.elapsed().as_millis() as u64,
+        "Deferred at-startup work complete"
+    );
 }
 
 /// Startup migration WARN: any locally-hosted agent that is co-owned

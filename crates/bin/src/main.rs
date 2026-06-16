@@ -6,6 +6,7 @@ use chaz_core::{agent, config, server, session};
 
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{fs::File, io::Read, path::PathBuf};
 use tracing::{error, info, warn};
 
@@ -209,11 +210,15 @@ async fn main() -> anyhow::Result<()> {
     );
     info!("Config loaded from {}", config_path.display());
 
+    // Whole-startup wall clock: time from here to the gateway taking over.
+    let startup_start = Instant::now();
+
     // Initialize eidetica with SQLite backend for persistent storage
     let eidetica_db_path = state_dir
         .as_ref()
         .map(|d| d.join("eidetica.db"))
         .unwrap_or_else(|| PathBuf::from("eidetica.db"));
+    let t = Instant::now();
     let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
     let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
         Box::new(backend),
@@ -224,6 +229,10 @@ async fn main() -> anyhow::Result<()> {
         Some(u) => u,
         None => instance.login_user("chaz", None).await?,
     };
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "eidetica opened"
+    );
 
     // In non-interactive --print mode there is no approval UI; pass the
     // configured (or default) CLI auto-approved tools so shell/write_file work
@@ -243,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
     // extension hub, schedules, routine engine) from the opened eidetica
     // instance. Sync and the routine engine are long-lived and skipped for a
     // one-shot CLI run. See `chaz_core::server::build`.
+    let t = Instant::now();
     let server::BuiltServer {
         server,
         secret_store,
@@ -259,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
+    info!(
+        build_ms = t.elapsed().as_millis() as u64,
+        time_to_gateway_ms = startup_start.elapsed().as_millis() as u64,
+        "Server built; handing off to gateway"
+    );
 
     // Gateway dispatch.
     //

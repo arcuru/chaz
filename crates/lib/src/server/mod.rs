@@ -30,7 +30,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, error, info};
 
@@ -329,6 +329,20 @@ pub struct Server {
     /// same registry is wired into [`crate::extension::PeerHandles`]
     /// so the install path and the readers see the same data.
     mcp_registry: Arc<crate::mcp::McpRegistry>,
+    /// Startup-readiness gate for the fast-start path. `build` returns the
+    /// wired `Server` to the gateway *before* the deferred at-startup work
+    /// (model-window warm, agent reconcile, schedule materialization,
+    /// routine engine) finishes, so the TUI/Matrix surface draws
+    /// immediately. Message *processing* is gated on this flag flipping
+    /// true (set after the agent reconcile lands) so a turn never runs
+    /// against half-reconciled agent config. Defaults to `true` — CLI
+    /// `--print`, tests, and any path that does its setup inline never
+    /// block. See [`Server::mark_startup_pending`] / [`Server::mark_startup_ready`].
+    startup_ready_flag: Arc<AtomicBool>,
+    /// Wakes [`Server::await_startup_ready`] waiters when the deferred
+    /// startup work releases the gate. Paired with `startup_ready_flag`
+    /// (the flag is the source of truth; this just avoids a poll loop).
+    startup_ready_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Server {
@@ -379,6 +393,11 @@ impl Server {
             config_path: std::sync::RwLock::new(None),
             routine_engine: OnceLock::new(),
             mcp_registry,
+            // Ready by default: only the deferred fast-start path (build)
+            // flips this to pending and back. Inline-setup callers (CLI,
+            // tests) never gate.
+            startup_ready_flag: Arc::new(AtomicBool::new(true)),
+            startup_ready_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let server_clone = server.clone();
@@ -396,6 +415,55 @@ impl Server {
 
     pub fn agent_index(&self) -> &HostedIndex {
         &self.agent_index
+    }
+
+    /// Mark startup as pending — closes the message-processing gate. Called
+    /// by `build` on the fast-start path right before it spawns the
+    /// deferred at-startup work and hands the (drawable) server back to the
+    /// gateway. Until [`Server::mark_startup_ready`] runs, `process_session`
+    /// parks inbound turns instead of running them against half-reconciled
+    /// agent config.
+    pub fn mark_startup_pending(&self) {
+        self.startup_ready_flag.store(false, Ordering::Release);
+    }
+
+    /// Release the message-processing gate — the deferred startup work has
+    /// reconciled agent config and turns may now run. Idempotent; wakes any
+    /// parked `process_session` callers.
+    pub fn mark_startup_ready(&self) {
+        self.startup_ready_flag.store(true, Ordering::Release);
+        self.startup_ready_notify.notify_waiters();
+    }
+
+    /// Whether the startup gate is open (deferred at-startup work done, or
+    /// never deferred). Cheap, lock-free — gateways can poll this to render
+    /// a "reconciling agents…" status line while it returns false.
+    pub fn is_startup_ready(&self) -> bool {
+        self.startup_ready_flag.load(Ordering::Acquire)
+    }
+
+    /// Park until the startup gate opens. Returns immediately when ready
+    /// (the common case — flag defaults true and the fast-start window is
+    /// brief). Uses the standard `Notify` lost-wakeup-safe pattern: register
+    /// interest, re-check the flag, then await.
+    async fn await_startup_ready(&self) {
+        if self.startup_ready_flag.load(Ordering::Acquire) {
+            return;
+        }
+        loop {
+            let notified = self.startup_ready_notify.notified();
+            tokio::pin!(notified);
+            // Enable the waiter before the condition re-check so a
+            // `notify_waiters` between the check and the await is not lost.
+            notified.as_mut().enable();
+            if self.startup_ready_flag.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+            if self.startup_ready_flag.load(Ordering::Acquire) {
+                return;
+            }
+        }
     }
 
     /// Set the list of agents auto-attached to new sessions. Applied
@@ -1306,6 +1374,19 @@ impl Server {
         };
         if !should_process {
             return Ok(());
+        }
+
+        // Fast-start gate: the gateway may already be drawn and accepting
+        // input while the deferred at-startup work (agent reconcile) is
+        // still in flight. Park the turn until reconcile lands so we never
+        // run an agent against half-reconciled config. No-op once ready
+        // (the default), so steady-state turns pay nothing.
+        if !self.is_startup_ready() {
+            info!(
+                session_db_id,
+                "Holding turn until startup reconcile completes"
+            );
+            self.await_startup_ready().await;
         }
 
         {

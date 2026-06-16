@@ -516,6 +516,11 @@ pub(super) struct App {
     pub(super) agent_names: HashSet<String>,
     pub(super) should_quit: bool,
     pub(super) debug_mode: bool,
+    /// Mirror of `Server::is_startup_ready`, refreshed each frame in `ui`.
+    /// Drives the "⟳ reconciling agents…" status indicator on the fast-start
+    /// path; the deferred at-startup work clears it once the gate opens.
+    /// Defaults `true` so steady-state and tests show no indicator.
+    pub(super) startup_ready: bool,
     /// When true, tool calls / tool results / directives render their full
     /// content. When false (default), they collapse to a one-line summary.
     /// Toggled by Ctrl+T or `/expand`.
@@ -674,6 +679,7 @@ impl App {
             agent_names,
             should_quit: false,
             debug_mode: false,
+            startup_ready: true,
             expand_all: false,
             session_list: Vec::new(),
             session_list_fresh: false,

@@ -136,6 +136,11 @@ pub(super) fn ui(
     // what the user is currently seeing.
     app.click_regions.clear();
 
+    // Mirror the fast-start gate so ui_chat (which has no `server` handle)
+    // can show the "reconciling agents…" indicator until the deferred
+    // at-startup work releases it.
+    app.startup_ready = server.is_startup_ready();
+
     // Refresh peer-side caches whenever any Settings page is up. The Peer
     // Settings views index into these directly for action keys ([r]
     // reload, [d] remove, Ctrl+↑↓ reorder); the Session→Agents picker
@@ -712,6 +717,14 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
 
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
     let expand_indicator = if app.expand_all { " | EXP" } else { "" };
+    // Fast-start: the TUI draws before the deferred at-startup work (agent
+    // reconcile) finishes. Surface that so a held first turn doesn't look
+    // like a hang. Clears itself once the gate opens.
+    let startup_indicator = if app.startup_ready {
+        ""
+    } else {
+        " | ⟳ reconciling agents…"
+    };
 
     // Agent/model segment. Single-agent (or roster-less) sessions render the
     // original ` | agent: X | model: Y` so their bar stays byte-identical;
@@ -743,7 +756,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
 
     let make_status = |agent_segment: &str| {
         format!(
-            " {session_label}{agent_segment}{ctx_segment}{usage_segment}{debug_indicator}{expand_indicator}"
+            " {session_label}{agent_segment}{ctx_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
         )
     };
     let mut status_text = make_status(&agent_segment);
