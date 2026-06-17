@@ -138,10 +138,11 @@ impl SessionRegistry {
         login_id: &str,
         channel: &str,
     ) -> anyhow::Result<Option<(ConversationId, Database)>> {
-        let Some(agent_db) = self
-            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
-            .await?
-        else {
+        // `None` → `find_key`: open the agent DB under whatever key this peer
+        // holds for it — the agent's own key on the daemon, the `bridge` key on
+        // a bridge. Passing the agent pubkey would fail on the bridge, which
+        // doesn't hold the agent's private key.
+        let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? else {
             return Ok(None);
         };
         for r in agent_db.list_session_refs().await? {
@@ -194,10 +195,9 @@ impl SessionRegistry {
         // session auth to the agent DB, and lists the session in the agent
         // registry (exposed_on empty until the expose below).
         self.ensure_session_host(&session_db_id, agent).await?;
-        if let Some(agent_db) = self
-            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
-            .await?
-        {
+        // `None` → `find_key` so the bridge opens the agent DB under its own
+        // `bridge` key (it doesn't hold the agent's key); see find_channel_session.
+        if let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? {
             agent_db
                 .expose_session_on(&session_db_id, bridge_label)
                 .await?;

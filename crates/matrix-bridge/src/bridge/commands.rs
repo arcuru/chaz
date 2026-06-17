@@ -8,7 +8,7 @@
 use chaz_core::backends::{BackendManager, ChatContext, Message, MessageRole};
 use chaz_core::config::*;
 use chaz_core::security::SecretStore;
-use chaz_core::session::{SessionMeta, SessionRegistry};
+use chaz_core::session::SessionMeta;
 
 use matrix_sdk::{
     Room, RoomMemberships,
@@ -66,8 +66,8 @@ pub async fn rate_limit(
     true
 }
 
-/// Send a message without context (Matrix-only legacy command).
-#[allow(clippy::too_many_arguments)]
+/// Send a message without context (Matrix-only legacy command). Operates on
+/// Matrix room history, not the session DB, so it uses config-default backends.
 pub async fn send(
     sender: matrix_sdk::ruma::OwnedUserId,
     text: String,
@@ -75,8 +75,6 @@ pub async fn send(
     config: &Config,
     message_counts: &Mutex<HashMap<String, u64>>,
     secrets: &SecretStore,
-    registry: &SessionRegistry,
-    login_id: &str,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
@@ -87,9 +85,7 @@ pub async fn send(
         .collect::<Vec<&str>>()
         .join(" ");
 
-    let context = get_context(&room, config, secrets, registry, login_id)
-        .await
-        .unwrap();
+    let context = get_context(&room, config, secrets, None).await.unwrap();
     let no_context = ChatContext {
         messages: vec![Message::new(MessageRole::User, input.to_string())],
         model: context.model,
@@ -101,7 +97,7 @@ pub async fn send(
         sender.as_str(),
         input.replace('\n', " ")
     );
-    if let Ok(result) = get_backend(&room, config, secrets, registry, login_id)
+    if let Ok(result) = get_backend(None, config, secrets)
         .await
         .execute(&no_context)
         .await
@@ -119,7 +115,6 @@ pub async fn send(
 
 /// Rename the Matrix room and set its topic based on the conversation
 /// (Matrix-only — operates on the room, not the session).
-#[allow(clippy::too_many_arguments)]
 pub async fn rename(
     sender: OwnedUserId,
     _: String,
@@ -127,13 +122,11 @@ pub async fn rename(
     config: &Config,
     message_counts: &Mutex<HashMap<String, u64>>,
     secrets: &SecretStore,
-    registry: &SessionRegistry,
-    login_id: &str,
 ) -> Result<(), ()> {
     if rate_limit(&room, &sender, config, message_counts).await {
         return Ok(());
     }
-    if let Ok(context) = get_context(&room, config, secrets, registry, login_id).await {
+    if let Ok(context) = get_context(&room, config, secrets, None).await {
         let mut context = context;
         context.model = config.chat_summary_model.clone();
         context.messages.push(Message::new(
@@ -147,7 +140,7 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config, secrets, registry, login_id)
+        let response = get_backend(None, config, secrets)
             .await
             .execute(&context)
             .await;
@@ -181,7 +174,7 @@ pub async fn rename(
             .join(" "),
         ));
 
-        let response = get_backend(&room, config, secrets, registry, login_id)
+        let response = get_backend(None, config, secrets)
             .await
             .execute(&context)
             .await;
@@ -216,23 +209,18 @@ fn meta_backend(meta: &SessionMeta) -> Option<Backend> {
     Some(backend)
 }
 
-/// Returns the BackendManager for a Matrix room — merges session meta overrides
-/// (if any) with the config backends.
+/// Returns the BackendManager for a session — merges its meta backend override
+/// (if any) with the config backends. The caller resolves the session DB (the
+/// bridge no longer re-derives it from the room via a central channel index);
+/// `None` falls back to config backends only (the legacy `send`/`rename` path).
 pub async fn get_backend(
-    room: &Room,
+    session_db: Option<&eidetica::Database>,
     config: &Config,
     secrets: &SecretStore,
-    registry: &SessionRegistry,
-    login_id: &str,
 ) -> BackendManager {
-    let room_id = room.room_id().to_string();
     let mut backends = Vec::new();
-    if let Ok(Some(session_db_id)) = registry
-        .external_channel_session("matrix", login_id, &room_id)
-        .await
-        && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
-    {
-        let meta = chaz_core::session::read_meta_from_db(&db).await;
+    if let Some(db) = session_db {
+        let meta = chaz_core::session::read_meta_from_db(db).await;
         if let Some(backend) = meta_backend(&meta) {
             backends.push(backend);
         }
@@ -269,8 +257,7 @@ pub async fn get_context(
     room: &Room,
     config: &Config,
     secrets: &SecretStore,
-    registry: &SessionRegistry,
-    login_id: &str,
+    session_db: Option<&eidetica::Database>,
 ) -> Result<ChatContext, ()> {
     let mut context = ChatContext {
         messages: Vec::new(),
@@ -298,7 +285,7 @@ pub async fn get_context(
                         if text_content.body.starts_with("!chaz model") && context.model.is_none() {
                             let model = text_content.body.split_whitespace().nth(2);
                             if let Some(model) = model
-                                && get_backend(room, config, secrets, registry, login_id)
+                                && get_backend(session_db, config, secrets)
                                     .await
                                     .validate_model(model)
                                     .is_ok()
@@ -361,14 +348,9 @@ pub async fn get_context(
             break;
         }
     }
-    // Apply session meta overrides from the session DB
-    let room_id = room.room_id().to_string();
-    if let Ok(Some(session_db_id)) = registry
-        .external_channel_session("matrix", login_id, &room_id)
-        .await
-        && let Ok((_conv_id, db)) = registry.open_session(&session_db_id).await
-    {
-        let meta = chaz_core::session::read_meta_from_db(&db).await;
+    // Apply session meta overrides from the resolved session DB (if any).
+    if let Some(db) = session_db {
+        let meta = chaz_core::session::read_meta_from_db(db).await;
         if let Some(model) = &meta.model {
             context.model = Some(model.clone());
         }

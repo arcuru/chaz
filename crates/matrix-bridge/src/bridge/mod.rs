@@ -7,9 +7,10 @@ use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
 use chaz_core::config::Config;
+use chaz_core::hosted_index::DbEntry;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
-use chaz_core::session::Session;
+use chaz_core::session::{Session, bind_transport, transport_bindings, unbind_transport};
 
 use crate::credentials::MatrixCredentials;
 
@@ -28,31 +29,6 @@ use client::{Login, MatrixClient, is_allowed};
 use commands::{get_backend, rate_limit};
 use history::read_room_history;
 
-type PendingApprovals = Arc<Mutex<HashMap<OwnedEventId, oneshot::Sender<ApprovalDecision>>>>;
-
-struct RoomApprovalRequest {
-    room_id: String,
-    exchange: ApprovalExchange,
-}
-
-fn make_room_approval_tx(
-    room_id: String,
-    relay_tx: mpsc::Sender<RoomApprovalRequest>,
-) -> mpsc::Sender<ApprovalExchange> {
-    let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
-    tokio::spawn(async move {
-        while let Some(exchange) = rx.recv().await {
-            let _ = relay_tx
-                .send(RoomApprovalRequest {
-                    room_id: room_id.clone(),
-                    exchange,
-                })
-                .await;
-        }
-    });
-    tx
-}
-
 pub struct MatrixBridge {
     /// The resolved Matrix credentials this bridge signs in as: homeserver,
     /// username, password, plus the per-login allow_list / room_size_limit
@@ -66,21 +42,20 @@ pub struct MatrixBridge {
     /// `config.state_dir`, or the per-name default when unset) so existing
     /// installs keep their session.
     state_dir: Option<String>,
-    /// Broader bot configuration (backends, agents, limits) shared across
-    /// all logins. The matrix *identity* no longer comes from here — it
-    /// comes from `login` — but everything else still does.
+    /// Broader bot configuration (backends, limits) shared across all logins.
+    /// The matrix *identity* comes from `creds`, not here.
     config: Config,
     secrets: SecretStore,
     /// Stable id of the login this bridge runs (`login.login_id`).
-    /// Stamped into every inbound entry's `TransportRef::login_id` and used
-    /// as the `login_id` dimension of every channel binding. Since a login
+    /// Stamped into every inbound entry's `TransportRef::login_id`, used as the
+    /// `login_id` dimension of every channel binding, and as this bridge's
+    /// label in the agent's session registry (`exposed_on`). Since a login
     /// belongs to one agent, it doubles as that agent's transport identity.
     login_id: String,
-    /// The agent that owns this login. The bridge attaches it to each of
-    /// this login's rooms as the session host (`ensure_session_host`), so
-    /// resolution routes to it by default. An explicit per-room re-host
-    /// (`/agent host`) is preserved. The bridge itself does no per-message
-    /// agent resolution.
+    /// The agent that owns this login. The bridge attaches it to each of this
+    /// login's sessions as the host (so the daemon's resolver routes to it),
+    /// but never runs it — the daemon does. Resolved to a [`DbEntry`] against
+    /// the (ticket-synced) agent index at message time.
     owning_agent: String,
     /// Cooperative shutdown signal. When the parent (typically `main` after
     /// the TUI exits) calls `notify_waiters`, the sync loop returns `Ok(())`
@@ -116,13 +91,21 @@ impl MatrixBridge {
     }
 }
 
+/// Resolve this login's owning agent to a [`DbEntry`] against the peer's agent
+/// index. `None` when the agent isn't hosted/synced yet — callers skip the
+/// session work rather than fork a session against a missing agent.
+fn owning_agent_entry(server: &Server, owning_agent: &str) -> Option<DbEntry> {
+    server.agent_index().find_by_name(owning_agent)
+}
+
 /// Install the reconciling response callback for a Matrix room.
 ///
 /// Thin transport adapter over [`chaz_core::bridge::attach_reconciler`]: the
 /// reconcile rule (delta scan, delivered-set, `[guest]` prefixing) lives in
 /// the lib; this only supplies the Matrix `send` closure — render markdown and
-/// hand it to `room.send`. Proving the lib API is sufficient for Matrix is
-/// what keeps it honest as the surface a `chaz-discord` binary links against.
+/// hand it to `room.send`. This is the bridge's whole outbound path: the
+/// daemon writes the agent's reply into the (synced) session DB, the callback
+/// fires here, and the reply lands in the room.
 async fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
@@ -141,28 +124,6 @@ async fn attach_response_callback(
     .await
 }
 
-/// Ensure this login's owning agent hosts the given session — a login
-/// belongs to one agent, so that agent owns and hosts its rooms. The
-/// bridge does no per-message agent resolution; it just attaches the owner
-/// once at room setup and lets the runtime resolve from there. No-op when
-/// the name doesn't resolve to a hosted agent (e.g. a legacy default that
-/// isn't configured) — resolution then falls back to the global default.
-async fn ensure_owning_agent_hosts(server: &Server, session_db_id: &str, owning_agent: &str) {
-    let Some(entry) = server.agent_index().find_by_name(owning_agent) else {
-        return;
-    };
-    if let Err(e) = server
-        .registry()
-        .ensure_session_host(session_db_id, &entry)
-        .await
-    {
-        error!(
-            owning_agent,
-            session_db_id, "Failed to set owning agent as session host: {e}"
-        );
-    }
-}
-
 /// Dispatch a shared command in the context of a Matrix room.
 async fn dispatch_in_room(
     cmd: Command,
@@ -175,15 +136,15 @@ async fn dispatch_in_room(
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
+    let Some(agent_entry) = owning_agent_entry(&server, owning_agent) else {
+        anyhow::bail!("owning agent '{owning_agent}' is not hosted on this bridge yet");
+    };
     let (_conv_id, session_db) = server
         .registry()
-        .get_or_create_channel_session("matrix", login_id, &room_id)
+        .get_or_create_channel_session(&agent_entry, login_id, "matrix", login_id, &room_id)
         .await?;
     let session_db_id = session_db.root_id().to_string();
-    // A login belongs to one agent: ensure it hosts this room's session, so
-    // resolution picks it without the bridge choosing per message.
-    ensure_owning_agent_hosts(&server, &session_db_id, owning_agent).await;
-    let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
+    let backend = get_backend(Some(&session_db), &config, &secrets).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
     let agent = server
         .registry()
@@ -256,52 +217,20 @@ fn help_text() -> String {
         "`extensions <list|add|remove|settings|set> …` — per-session extensions",
         "`channels` — rooms bound to this session",
         "",
-        "Matrix-local: `attach <session>` · `detach` · `clear` · `approve` · `deny` · `send <msg>` · `rename` · `party`",
+        "Matrix-local: `attach <session>` · `detach` · `clear` · `send <msg>` · `rename` · `party`",
         "",
         "In a DM or when @mentioned, just talk — no prefix needed.",
     ]
     .join("\n")
 }
 
-/// Approve or deny the oldest pending tool-approval request in `room`.
-async fn resolve_pending_approval(pending: &PendingApprovals, room: &Room, approve: bool) {
-    let mut p = pending.lock().await;
-    let Some(event_id) = p.keys().next().cloned() else {
-        let _ = room
-            .send(RoomMessageEventContent::notice_plain(
-                "No pending approval requests",
-            ))
-            .await;
-        return;
-    };
-    if let Some(tx) = p.remove(&event_id) {
-        let decision = if approve {
-            ApprovalDecision::Approve
-        } else {
-            ApprovalDecision::Deny
-        };
-        let _ = tx.send(decision);
-        let label = if approve {
-            "✅ Approved"
-        } else {
-            "❌ Denied"
-        };
-        let _ = room
-            .send(RoomMessageEventContent::notice_plain(label))
-            .await;
-    }
-}
-
 /// `!chaz attach <session>` — bind this room to a specific session and install
 /// the response callback so future writes reach the room. Bridge-local because
 /// it touches the live `attached_sessions` set and matrix `Room`.
-#[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     arg: &str,
     room: Room,
     server: Arc<Server>,
-    config: Arc<Config>,
-    secrets: SecretStore,
     login_id: &str,
     owning_agent: &str,
     attached_sessions: Arc<Mutex<HashSet<String>>>,
@@ -328,28 +257,33 @@ async fn handle_attach(
         }
     };
     let target_sid = target_db.root_id().to_string();
-    if let Err(e) = server
-        .registry()
-        .attach_channel("matrix", login_id, &room_id, &target_sid)
-        .await
-    {
+
+    // Bind the room into the session DB, then expose the session on this bridge
+    // and ensure the owning agent hosts it so the daemon picks it up.
+    if let Err(e) = bind_transport(&target_db, "matrix", login_id, &room_id).await {
         let _ = room
             .send(RoomMessageEventContent::notice_plain(format!(
-                "!chaz Error: failed to attach: {e}"
+                "!chaz Error: failed to bind room: {e}"
             )))
             .await;
         return;
     }
+    if let Some(agent_entry) = owning_agent_entry(&server, owning_agent) {
+        let _ = server
+            .registry()
+            .ensure_session_host(&target_sid, &agent_entry)
+            .await;
+        if let Ok(Some(agent_db)) = server
+            .registry()
+            .open_agent_db(&agent_entry.db_id, None)
+            .await
+        {
+            let _ = agent_db.expose_session_on(&target_sid, login_id).await;
+        }
+    }
 
     // Install the response callback on the newly-attached session so future
-    // writes (including scheduler fires) reach this room.
-    let backend = get_backend(&room, &config, &secrets, server.registry(), login_id).await;
-    let agent_override = chaz_core::session::read_meta_from_db(&target_db)
-        .await
-        .agent_name;
-    let _ = server
-        .register_session(&target_db, backend, agent_override, None)
-        .await;
+    // writes (the daemon's replies, scheduler fires) reach this room.
     let mut attached = attached_sessions.lock().await;
     if attached.insert(target_sid.clone()) {
         drop(attached);
@@ -373,17 +307,41 @@ async fn handle_attach(
 }
 
 /// `!chaz detach` — unbind this room from its session.
-async fn handle_detach(room: Room, server: Arc<Server>, login_id: &str) {
+async fn handle_detach(room: Room, server: Arc<Server>, login_id: &str, owning_agent: &str) {
     let room_id = room.room_id().to_string();
+    let Some(agent_entry) = owning_agent_entry(&server, owning_agent) else {
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(
+                "!chaz Error: owning agent not available",
+            ))
+            .await;
+        return;
+    };
     match server
         .registry()
-        .detach_channel("matrix", login_id, &room_id)
+        .find_channel_session(&agent_entry, login_id, "matrix", login_id, &room_id)
         .await
     {
-        Ok(()) => {
+        Ok(Some((_cv, db))) => {
+            let sid = db.root_id().to_string();
+            let _ = unbind_transport(&db, "matrix", login_id, &room_id).await;
+            if let Ok(Some(agent_db)) = server
+                .registry()
+                .open_agent_db(&agent_entry.db_id, None)
+                .await
+            {
+                let _ = agent_db.unexpose_session_from(&sid, login_id).await;
+            }
             let _ = room
                 .send(RoomMessageEventContent::notice_plain(
                     "Room detached. Future messages will create a fresh session.",
+                ))
+                .await;
+        }
+        Ok(None) => {
+            let _ = room
+                .send(RoomMessageEventContent::notice_plain(
+                    "This room isn't bound to a session.",
                 ))
                 .await;
         }
@@ -433,129 +391,63 @@ impl Bridge for MatrixBridge {
 
         info!("The client is ready! Listening to new messages…");
 
-        // === Approval infrastructure ===
-        let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
-        let (approval_relay_tx, mut approval_relay_rx) = mpsc::channel::<RoomApprovalRequest>(64);
-
-        {
-            let pending = pending_approvals.clone();
-            let client = mc.client().clone();
-            tokio::spawn(async move {
-                while let Some(req) = approval_relay_rx.recv().await {
-                    let room_id_parsed = match matrix_sdk::ruma::RoomId::parse(&req.room_id) {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-                    let Some(room) = client.get_room(&room_id_parsed) else {
-                        continue;
-                    };
-
-                    let info = &req.exchange.info;
-                    let notice = format!(
-                        "🔒 **Tool approval required**\n\n\
-                         **Tool:** `{}`\n\
-                         **Risk:** {:?}\n\
-                         **Args:** `{}`\n\n\
-                         React: ✅ approve · ❌ deny · ⏭ approve all\n\
-                         Or reply: `!chaz approve` / `!chaz deny`",
-                        info.name, info.risk_level, info.arguments_display
-                    );
-                    let content = RoomMessageEventContent::text_markdown(notice);
-                    match room.send(content).await {
-                        Ok(result) => {
-                            let mut p = pending.lock().await;
-                            p.insert(result.response.event_id, req.exchange.decision_tx);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to send approval request: {e}");
-                            let _ = req.exchange.decision_tx.send(ApprovalDecision::Deny);
-                        }
-                    }
-                }
-            });
-        }
-
-        // Approval decisions via emoji reaction.
-        {
-            let pending = pending_approvals.clone();
-            mc.client().add_event_handler(
-                move |event: OriginalSyncReactionEvent, room: matrix_sdk::Room| {
-                    let pending = pending.clone();
-                    async move {
-                        let relates_to = &event.content.relates_to;
-                        let decision = match relates_to.key.as_str() {
-                            "✅" => Some(ApprovalDecision::Approve),
-                            "❌" => Some(ApprovalDecision::Deny),
-                            "⏭" | "⏭️" => Some(ApprovalDecision::ApproveAll),
-                            _ => None,
-                        };
-                        if let Some(decision) = decision {
-                            let event_id = &relates_to.event_id;
-                            let mut p = pending.lock().await;
-                            if let Some(tx) = p.remove(event_id) {
-                                info!(
-                                    "Approval decision via reaction in {}: {:?}",
-                                    room.room_id(),
-                                    decision
-                                );
-                                let _ = tx.send(decision);
-                            }
-                        }
-                    }
-                },
-            );
-        }
-
         // Track which session DBs have the Matrix response callback installed.
         // Keyed by session_db_id because a single session may be attached to
         // multiple rooms (fan-out delivery).
         let attached_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-        // --- Startup: attach response callbacks + server processing to every
-        //     existing Matrix channel for which the bot is joined to the room.
-        //     This is what makes scheduled-session responses actually deliver
-        //     when no user has recently spoken in the room. ---
+        // --- Startup: install response callbacks for every room this login
+        //     already has a session bound to. This is what makes the daemon's
+        //     replies (including scheduler fires) deliver when no user has
+        //     recently spoken in the room. We discover them by walking the
+        //     owning agent's session registry — the sessions exposed on this
+        //     bridge — and reading each session's transport bindings. ---
         {
             let server = server.clone();
             let client = mc.client().clone();
             let attached_sessions = attached_sessions.clone();
-            let config = config.clone();
-            let secrets = secrets.clone();
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             tokio::spawn(async move {
-                // Fold any legacy Matrix-only bindings into external_channels
-                // under this login before we read them back.
-                match server
+                let Some(agent_entry) = owning_agent_entry(&server, &owning_agent) else {
+                    info!("Owning agent not hosted yet; skipping startup channel attach");
+                    return;
+                };
+                let agent_db = match server
                     .registry()
-                    .migrate_legacy_matrix_channels(&login_id)
+                    .open_agent_db(&agent_entry.db_id, None)
                     .await
                 {
-                    Ok(0) => {}
-                    Ok(n) => info!("Migrated {n} legacy matrix channel(s) to external_channels"),
-                    Err(e) => error!("Legacy matrix channel migration failed: {e}"),
-                }
-                match server.registry().list_channels().await {
-                    Ok(channels) => {
-                        for (transport, chan_login, room_id, session_db_id) in channels {
-                            if transport != "matrix" || chan_login != login_id {
-                                continue;
-                            }
-                            attach_existing_channel(
-                                &server,
-                                &client,
-                                &attached_sessions,
-                                &config,
-                                &secrets,
-                                &login_id,
-                                &owning_agent,
-                                &room_id,
-                                &session_db_id,
-                            )
-                            .await;
-                        }
+                    Ok(Some(db)) => db,
+                    _ => {
+                        info!("Owning agent DB not openable yet; skipping startup attach");
+                        return;
                     }
-                    Err(e) => error!("Failed to list channels at startup: {e}"),
+                };
+                let refs = agent_db.list_session_refs().await.unwrap_or_default();
+                for r in refs {
+                    if !r.exposed_on.iter().any(|b| b == &login_id) {
+                        continue;
+                    }
+                    let Ok((_c, db)) = server.registry().open_session(&r.session_db_id).await
+                    else {
+                        continue;
+                    };
+                    let bindings = transport_bindings(&db).await.unwrap_or_default();
+                    for (transport, chan_login, room_id) in bindings {
+                        if transport != "matrix" || chan_login != login_id {
+                            continue;
+                        }
+                        attach_existing_channel(
+                            &server,
+                            &client,
+                            &attached_sessions,
+                            &owning_agent,
+                            &room_id,
+                            &r.session_db_id,
+                        )
+                        .await;
+                    }
                 }
             });
         }
@@ -567,7 +459,9 @@ impl Bridge for MatrixBridge {
         // local verbs are checked first, then the line is normalized to the
         // shared `/`-grammar and routed through `chaz_core::commands::parse`.
         // Everything else is a plain message — written to the session when the
-        // bot is addressed (DM or @mention).
+        // bot is addressed (DM or @mention). The bridge never runs an agent;
+        // writing the inbound entry is enough — the daemon, watching the
+        // exposed session, runs the agent and writes the reply back.
         {
             let server = server.clone();
             let config = config.clone();
@@ -575,8 +469,6 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let allow_list = allow_list.clone();
-            let approval_relay_tx = approval_relay_tx.clone();
-            let pending_approvals = pending_approvals.clone();
             let attached_sessions = attached_sessions.clone();
             let message_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
@@ -592,8 +484,6 @@ impl Bridge for MatrixBridge {
                     let login_id = login_id.clone();
                     let owning_agent = owning_agent.clone();
                     let allow_list = allow_list.clone();
-                    let approval_relay_tx = approval_relay_tx.clone();
-                    let pending_approvals = pending_approvals.clone();
                     let attached_sessions = attached_sessions.clone();
                     let message_counts = message_counts.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
@@ -633,8 +523,7 @@ impl Bridge for MatrixBridge {
                             let verb = inner.split_whitespace().next().unwrap_or("");
                             // View-local Matrix verbs, checked before the
                             // shared parser. These either need bridge state
-                            // (approvals, response-callback install) or are
-                            // Matrix-only.
+                            // (response-callback install) or are Matrix-only.
                             match verb {
                                 "" | "help" => {
                                     let _ = room
@@ -658,15 +547,6 @@ impl Bridge for MatrixBridge {
                                         .await;
                                     return;
                                 }
-                                "approve" => {
-                                    resolve_pending_approval(&pending_approvals, &room, true).await;
-                                    return;
-                                }
-                                "deny" => {
-                                    resolve_pending_approval(&pending_approvals, &room, false)
-                                        .await;
-                                    return;
-                                }
                                 "send" => {
                                     let _ = commands::send(
                                         event.sender.clone(),
@@ -675,8 +555,6 @@ impl Bridge for MatrixBridge {
                                         &config,
                                         &message_counts,
                                         &secrets,
-                                        server.registry(),
-                                        &login_id,
                                     )
                                     .await;
                                     return;
@@ -689,8 +567,6 @@ impl Bridge for MatrixBridge {
                                         &config,
                                         &message_counts,
                                         &secrets,
-                                        server.registry(),
-                                        &login_id,
                                     )
                                     .await;
                                     return;
@@ -701,8 +577,6 @@ impl Bridge for MatrixBridge {
                                         arg,
                                         room.clone(),
                                         server.clone(),
-                                        config.clone(),
-                                        secrets.clone(),
                                         &login_id,
                                         &owning_agent,
                                         attached_sessions.clone(),
@@ -711,7 +585,13 @@ impl Bridge for MatrixBridge {
                                     return;
                                 }
                                 "detach" => {
-                                    handle_detach(room.clone(), server.clone(), &login_id).await;
+                                    handle_detach(
+                                        room.clone(),
+                                        server.clone(),
+                                        &login_id,
+                                        &owning_agent,
+                                    )
+                                    .await;
                                     return;
                                 }
                                 _ => {}
@@ -774,13 +654,27 @@ impl Bridge for MatrixBridge {
                         }
 
                         let room_id = room.room_id().to_string();
-                        let backend =
-                            get_backend(&room, &config, &secrets, server.registry(), &login_id)
-                                .await;
 
+                        // Resolve (or create) the session bound to this room.
+                        // On create this binds the room into the session DB,
+                        // attaches the owning agent as host (delegating session
+                        // auth to the agent DB), and exposes the session on this
+                        // bridge — so the daemon discovers and runs it.
+                        let Some(agent_entry) = owning_agent_entry(&server, &owning_agent) else {
+                            error!(
+                                "Owning agent '{owning_agent}' not hosted; dropping message in {room_id}"
+                            );
+                            return;
+                        };
                         let (_conv_id, session_db) = match server
                             .registry()
-                            .get_or_create_channel_session("matrix", &login_id, &room_id)
+                            .get_or_create_channel_session(
+                                &agent_entry,
+                                &login_id,
+                                "matrix",
+                                &login_id,
+                                &room_id,
+                            )
                             .await
                         {
                             Ok(r) => r,
@@ -791,32 +685,8 @@ impl Bridge for MatrixBridge {
                         };
                         let session_db_id = session_db.root_id().to_string();
 
-                        // A login belongs to one agent: ensure it hosts this
-                        // room's session (idempotent — only writes on first
-                        // contact). Resolution then picks the owner via the host
-                        // slot; an explicit per-room re-host still wins.
-                        ensure_owning_agent_hosts(&server, &session_db_id, &owning_agent).await;
-                        let agent_override = chaz_core::session::read_meta_from_db(&session_db)
-                            .await
-                            .agent_name;
-
-                        let approval_tx =
-                            make_room_approval_tx(room_id.clone(), approval_relay_tx.clone());
-
-                        if let Err(e) = server
-                            .register_session(
-                                &session_db,
-                                backend,
-                                agent_override,
-                                Some(approval_tx),
-                            )
-                            .await
-                        {
-                            error!("Failed to register session: {e}");
-                            return;
-                        }
-
-                        // Install response callback if we haven't already.
+                        // Install response callback if we haven't already, so
+                        // the daemon's reply reaches this room.
                         {
                             let mut attached = attached_sessions.lock().await;
                             if attached.insert(session_db_id.clone()) {
@@ -855,8 +725,10 @@ impl Bridge for MatrixBridge {
                             }
                         }
 
-                        // Write user entry to session DB — triggers server →
-                        // agent → response.
+                        // Write the user entry to the session DB. This is the
+                        // bridge's whole inbound job — the daemon, watching the
+                        // exposed session, runs the agent and writes the reply,
+                        // which the response callback above delivers back here.
                         let mut session = Session::new(
                             chaz_core::types::ConversationId(session_db_id),
                             session_db,
@@ -908,20 +780,15 @@ impl Bridge for MatrixBridge {
     }
 }
 
-/// Install server processing + response-delivery for a persisted channel at
-/// startup. Skips rooms the bot isn't joined to, or sessions that fail to open.
-///
-/// Without an active user in the room, we pass no approval channel — scheduled
-/// Directives fire autonomously. When the user next speaks, the message handler
-/// re-registers the session with an approval channel bound to that message.
-#[allow(clippy::too_many_arguments)]
+/// Install the response-delivery callback for a persisted channel at startup.
+/// Skips rooms the bot isn't joined to, or sessions that fail to open. The
+/// bridge does not register the session for processing — the daemon does that
+/// when it sees the session exposed in the agent registry — so this only wires
+/// up outbound delivery.
 async fn attach_existing_channel(
     server: &Arc<Server>,
     client: &matrix_sdk::Client,
     attached_sessions: &Arc<Mutex<HashSet<String>>>,
-    config: &Arc<Config>,
-    secrets: &SecretStore,
-    login_id: &str,
     owning_agent: &str,
     room_id: &str,
     session_db_id: &str,
@@ -938,19 +805,6 @@ async fn attach_existing_channel(
         tracing::warn!(session_db_id, "Stale matrix channel — session not openable");
         return;
     };
-
-    ensure_owning_agent_hosts(server, session_db_id, owning_agent).await;
-    let agent_override = chaz_core::session::read_meta_from_db(&session_db)
-        .await
-        .agent_name;
-    let backend = get_backend(&room, config, secrets, server.registry(), login_id).await;
-    if let Err(e) = server
-        .register_session(&session_db, backend, agent_override, None)
-        .await
-    {
-        error!(session_db_id, "Failed to register session at startup: {e}");
-        return;
-    }
 
     {
         let mut attached = attached_sessions.lock().await;
@@ -971,7 +825,150 @@ async fn attach_existing_channel(
     } else {
         info!(
             session_db_id,
-            room_id, "Matrix channel attached at startup (server + response callbacks installed)"
+            room_id, "Matrix channel response callback installed at startup"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parked approval scaffolding — reused in Stage 4 (TODO-7755e097).
+//
+// The dumb bridge no longer runs the agent, so a tool-approval request no
+// longer arrives over an in-process mpsc from a co-located runtime — the trigger
+// (`register_session`'s approval channel) is gone. The render-the-prompt /
+// capture-the-reaction half below is transport code that comes back near
+// verbatim once approvals are proxied over the session DB (the daemon writes a
+// request entry → the bridge renders it + captures the reaction → the bridge
+// writes a decision entry → the daemon resolves the `ApprovalExchange`). Kept
+// compiling behind `allow(dead_code)` rather than resurrected from git history;
+// Stage 4 rewires it to the session-DB watcher.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+type PendingApprovals = Arc<Mutex<HashMap<OwnedEventId, oneshot::Sender<ApprovalDecision>>>>;
+
+#[allow(dead_code)]
+struct RoomApprovalRequest {
+    room_id: String,
+    exchange: ApprovalExchange,
+}
+
+/// Per-room forwarder: the runtime sends an [`ApprovalExchange`] here; this tags
+/// it with the room and relays it to the bridge's approval task.
+#[allow(dead_code)]
+fn make_room_approval_tx(
+    room_id: String,
+    relay_tx: mpsc::Sender<RoomApprovalRequest>,
+) -> mpsc::Sender<ApprovalExchange> {
+    let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
+    tokio::spawn(async move {
+        while let Some(exchange) = rx.recv().await {
+            let _ = relay_tx
+                .send(RoomApprovalRequest {
+                    room_id: room_id.clone(),
+                    exchange,
+                })
+                .await;
+        }
+    });
+    tx
+}
+
+/// Background task: post each approval request to its room with seeded
+/// ✅/❌/⏭ reactions and remember the message so a reaction resolves it.
+/// Posting failure denies (safe default).
+#[allow(dead_code)]
+async fn run_approval_relay(
+    mut rx: mpsc::Receiver<RoomApprovalRequest>,
+    client: matrix_sdk::Client,
+    pending: PendingApprovals,
+) {
+    while let Some(req) = rx.recv().await {
+        let Ok(room_id_parsed) = matrix_sdk::ruma::RoomId::parse(&req.room_id) else {
+            continue;
+        };
+        let Some(room) = client.get_room(&room_id_parsed) else {
+            continue;
+        };
+        let info = &req.exchange.info;
+        let notice = format!(
+            "🔒 **Tool approval required**\n\n\
+             **Tool:** `{}`\n\
+             **Risk:** {:?}\n\
+             **Args:** `{}`\n\n\
+             React: ✅ approve · ❌ deny · ⏭ approve all\n\
+             Or reply: `!chaz approve` / `!chaz deny`",
+            info.name, info.risk_level, info.arguments_display
+        );
+        let content = RoomMessageEventContent::text_markdown(notice);
+        match room.send(content).await {
+            Ok(result) => {
+                pending
+                    .lock()
+                    .await
+                    .insert(result.response.event_id, req.exchange.decision_tx);
+            }
+            Err(e) => {
+                tracing::error!("Failed to send approval request: {e}");
+                let _ = req.exchange.decision_tx.send(ApprovalDecision::Deny);
+            }
+        }
+    }
+}
+
+/// Resolve an approval decision arriving as an emoji reaction on a prompt.
+#[allow(dead_code)]
+async fn handle_approval_reaction(
+    event: OriginalSyncReactionEvent,
+    room: Room,
+    pending: PendingApprovals,
+) {
+    let relates_to = &event.content.relates_to;
+    let decision = match relates_to.key.as_str() {
+        "✅" => Some(ApprovalDecision::Approve),
+        "❌" => Some(ApprovalDecision::Deny),
+        "⏭" | "⏭️" => Some(ApprovalDecision::ApproveAll),
+        _ => None,
+    };
+    if let Some(decision) = decision
+        && let Some(tx) = pending.lock().await.remove(&relates_to.event_id)
+    {
+        info!(
+            "Approval decision via reaction in {}: {:?}",
+            room.room_id(),
+            decision
+        );
+        let _ = tx.send(decision);
+    }
+}
+
+/// Approve or deny the oldest pending tool-approval request in `room` — the
+/// `!chaz approve` / `!chaz deny` text path.
+#[allow(dead_code)]
+async fn resolve_pending_approval(pending: &PendingApprovals, room: &Room, approve: bool) {
+    let mut p = pending.lock().await;
+    let Some(event_id) = p.keys().next().cloned() else {
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(
+                "No pending approval requests",
+            ))
+            .await;
+        return;
+    };
+    if let Some(tx) = p.remove(&event_id) {
+        let decision = if approve {
+            ApprovalDecision::Approve
+        } else {
+            ApprovalDecision::Deny
+        };
+        let _ = tx.send(decision);
+        let label = if approve {
+            "✅ Approved"
+        } else {
+            "❌ Denied"
+        };
+        let _ = room
+            .send(RoomMessageEventContent::notice_plain(label))
+            .await;
     }
 }
