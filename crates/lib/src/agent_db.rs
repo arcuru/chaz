@@ -47,6 +47,14 @@ pub const SKILL_BANKS_STORE: &str = "skill_banks";
 /// locate the managing bridge. The secrets live in a separate bridge-owned DB,
 /// linked by [`LoginRef::bridge_db_id`].
 pub const LOGINS_STORE: &str = "logins";
+/// Unencrypted session registry: a `Table<SessionRef>` listing the sessions
+/// attached to this agent and which transport bridges each is exposed on. It
+/// lives on the **agent DB** (not a peer-local store) precisely so it syncs:
+/// dumb bridges write/expose sessions here, and the daemon watches it to learn
+/// which session DBs to run the agent on. The per-session transport binding
+/// (which room/channel) lives in the session DB, not here — this is just the
+/// index.
+pub const SESSIONS_STORE: &str = "sessions";
 
 const BLOB_KEY: &str = "value";
 
@@ -172,6 +180,26 @@ pub struct LoginRef {
     /// Eidetica root ID of the bridge-owned settings DB holding this login's
     /// encrypted credentials. The bridge creates and fully manages that DB.
     pub bridge_db_id: String,
+}
+
+/// Registry entry in the unencrypted [`SESSIONS_STORE`]: one session attached
+/// to this agent, plus the transport bridges currently exposing it.
+///
+/// This is the synced index that makes dumb bridges work. A bridge creates a
+/// session (for a new room/channel), records the room↔session binding **in the
+/// session DB**, and registers the session here marked `exposed_on` its own
+/// label. The daemon watches this store: when a session appears it syncs and
+/// runs the agent on it; the bridge only proxies messages and delivers replies.
+/// Holds no transport detail beyond the bridge labels — the room/channel
+/// binding lives in the session DB.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionRef {
+    /// Eidetica root ID of the session DB. Dedup key within the registry.
+    pub session_db_id: String,
+    /// Bridge labels exposing this session (`"matrix"`, `"discord"`, …). Empty
+    /// means the session is attached to the agent but not surfaced on any
+    /// transport (e.g. a TUI/CLI session).
+    pub exposed_on: Vec<String>,
 }
 
 impl AgentDbConfig {
@@ -468,6 +496,7 @@ impl AgentDb {
         txn.get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
             .await?;
         txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
+        txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
         txn.commit().await?;
         Ok(())
     }
@@ -530,6 +559,110 @@ impl AgentDb {
             .search(|r: &LoginRef| r.identifier == identifier)
             .await?;
         Ok(rows.pop().map(|(_, r)| r))
+    }
+
+    // -----------------------------------------------------------------
+    // Session registry ([`SESSIONS_STORE`])
+    //
+    // The synced index of sessions attached to this agent and the bridges
+    // exposing each. Dumb bridges register sessions here and toggle their
+    // exposure; the daemon watches it to learn which session DBs to run the
+    // agent on. Upsert-by-`session_db_id`, mirroring the login registry.
+    // -----------------------------------------------------------------
+
+    /// List every session attached to this agent.
+    pub async fn list_session_refs(&self) -> anyhow::Result<Vec<SessionRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
+        let rows = store.search(|_: &SessionRef| true).await?;
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// Find a single session entry by its `session_db_id`.
+    pub async fn find_session_ref(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<Option<SessionRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
+        let mut rows = store
+            .search(|r: &SessionRef| r.session_db_id == session_db_id)
+            .await?;
+        Ok(rows.pop().map(|(_, r)| r))
+    }
+
+    /// Add or update a session entry, replacing any existing row with the same
+    /// `session_db_id` so re-registration updates in place.
+    pub async fn register_session_ref(&self, session: SessionRef) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
+        let existing = store
+            .search(|r: &SessionRef| r.session_db_id == session.session_db_id)
+            .await?;
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        store.insert(session).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a session entry. Returns true if a row was removed; no-op (false)
+    /// on an unknown id.
+    pub async fn deregister_session_ref(&self, session_db_id: &str) -> anyhow::Result<bool> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
+        let existing = store
+            .search(|r: &SessionRef| r.session_db_id == session_db_id)
+            .await?;
+        let removed = !existing.is_empty();
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        txn.commit().await?;
+        Ok(removed)
+    }
+
+    /// Mark a session as exposed on `bridge_label`, creating the entry if it
+    /// doesn't exist yet. Idempotent — re-exposing an already-exposed session
+    /// is a no-op. This is how a bridge announces "I'm surfacing this session."
+    pub async fn expose_session_on(
+        &self,
+        session_db_id: &str,
+        bridge_label: &str,
+    ) -> anyhow::Result<()> {
+        let mut entry = self
+            .find_session_ref(session_db_id)
+            .await?
+            .unwrap_or_else(|| SessionRef {
+                session_db_id: session_db_id.to_string(),
+                exposed_on: Vec::new(),
+            });
+        if !entry.exposed_on.iter().any(|b| b == bridge_label) {
+            entry.exposed_on.push(bridge_label.to_string());
+        }
+        self.register_session_ref(entry).await
+    }
+
+    /// Stop exposing a session on `bridge_label`. Returns true if the label was
+    /// present and removed. The session entry remains (possibly exposed on
+    /// nothing) so the agent stays attached to it; use
+    /// [`deregister_session_ref`](Self::deregister_session_ref) to drop it.
+    pub async fn unexpose_session_from(
+        &self,
+        session_db_id: &str,
+        bridge_label: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(mut entry) = self.find_session_ref(session_db_id).await? else {
+            return Ok(false);
+        };
+        let before = entry.exposed_on.len();
+        entry.exposed_on.retain(|b| b != bridge_label);
+        if entry.exposed_on.len() == before {
+            return Ok(false);
+        }
+        self.register_session_ref(entry).await?;
+        Ok(true)
     }
 
     // -----------------------------------------------------------------
@@ -1451,5 +1584,81 @@ mod tests {
         assert!(db.list_logins().await.unwrap().is_empty());
         // Second deregister is a no-op; returns false.
         assert!(!db.deregister_login("@chaz:example").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sessions_empty_by_default() {
+        let (_user, db) = peer_with_agent_db().await;
+        assert!(db.list_session_refs().await.unwrap().is_empty());
+        assert!(db.find_session_ref("sha256:s").await.unwrap().is_none());
+        assert!(!db.deregister_session_ref("sha256:s").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn register_and_find_session_ref() {
+        let (_user, db) = peer_with_agent_db().await;
+        let s = SessionRef {
+            session_db_id: "sha256:sess".into(),
+            exposed_on: vec!["matrix".into()],
+        };
+        db.register_session_ref(s.clone()).await.unwrap();
+        assert_eq!(db.list_session_refs().await.unwrap(), vec![s.clone()]);
+        assert_eq!(db.find_session_ref("sha256:sess").await.unwrap(), Some(s));
+    }
+
+    #[tokio::test]
+    async fn register_session_ref_replaces_by_id() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.register_session_ref(SessionRef {
+            session_db_id: "sha256:sess".into(),
+            exposed_on: vec!["matrix".into()],
+        })
+        .await
+        .unwrap();
+        db.register_session_ref(SessionRef {
+            session_db_id: "sha256:sess".into(),
+            exposed_on: vec!["matrix".into(), "discord".into()],
+        })
+        .await
+        .unwrap();
+        let all = db.list_session_refs().await.unwrap();
+        assert_eq!(all.len(), 1, "register must replace, not append");
+        assert_eq!(all[0].exposed_on, vec!["matrix", "discord"]);
+    }
+
+    #[tokio::test]
+    async fn expose_and_unexpose_session() {
+        let (_user, db) = peer_with_agent_db().await;
+        // expose creates the entry on first call and is idempotent.
+        db.expose_session_on("sha256:sess", "matrix").await.unwrap();
+        db.expose_session_on("sha256:sess", "matrix").await.unwrap();
+        db.expose_session_on("sha256:sess", "discord")
+            .await
+            .unwrap();
+        let entry = db.find_session_ref("sha256:sess").await.unwrap().unwrap();
+        assert_eq!(entry.exposed_on, vec!["matrix", "discord"]);
+
+        // unexpose removes one label and reports whether it was present.
+        assert!(
+            db.unexpose_session_from("sha256:sess", "matrix")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.unexpose_session_from("sha256:sess", "matrix")
+                .await
+                .unwrap()
+        );
+        let entry = db.find_session_ref("sha256:sess").await.unwrap().unwrap();
+        assert_eq!(entry.exposed_on, vec!["discord"]);
+        // The entry survives with no exposure until explicitly deregistered.
+        assert!(
+            db.unexpose_session_from("sha256:sess", "discord")
+                .await
+                .unwrap()
+        );
+        assert!(db.find_session_ref("sha256:sess").await.unwrap().is_some());
+        assert!(db.deregister_session_ref("sha256:sess").await.unwrap());
+        assert!(db.list_session_refs().await.unwrap().is_empty());
     }
 }
