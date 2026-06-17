@@ -9,7 +9,6 @@ pub mod agent;
 pub mod agent_db;
 pub mod backends;
 pub mod bridge;
-pub mod bridge_config;
 pub mod bridge_db;
 pub mod bridge_identity;
 pub mod bubblewrap_host;

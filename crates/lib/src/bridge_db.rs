@@ -25,49 +25,25 @@ use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, PasswordStore};
 use eidetica::user::User;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tracing::info;
 
-/// Encrypted credentials store: a `PasswordStore<DocStore>` keyed by
-/// `login_id`, each value a JSON-serialized [`LoginCredentials`]. Created
-/// lazily on the first seed (it can't exist before the unlock password
-/// initializes its encryption) and unlocked with a password that never syncs.
+/// Encrypted store of a bridge's own details: a `PasswordStore<DocStore>`
+/// keyed by `login_id`, each value a JSON blob whose **shape is the bridge's
+/// own business**. chaz-core imposes no credential schema — a Matrix bridge
+/// stores homeserver/user/password, a Discord bridge stores token/allowed
+/// users; this layer only encrypts, keys, and round-trips opaque serializable
+/// values. Created lazily on the first seed (it can't exist before the unlock
+/// password initializes its encryption) and unlocked with a password that
+/// never syncs.
 pub const CREDENTIALS_STORE: &str = "credentials";
 
-/// Full, secret-bearing credentials for one transport login — the encrypted
-/// counterpart to [`crate::agent_db::LoginRef`]. Where `LoginRef` is the
-/// public pointer (kind + identifier + which bridge DB), this is everything
-/// the bridge needs to authenticate. Lives only inside a
-/// `PasswordStore<DocStore>`; never written in the clear and never placed in
-/// LLM context.
-///
-/// Values here are **fully resolved** — any `${VAR}` reference from the bridge
-/// config must be expanded (via
-/// [`SecretStore::resolve_env`](crate::security::SecretStore::resolve_env))
-/// before seeding.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LoginCredentials {
-    /// Transport kind (`"matrix"`, `"discord"`, …). Matches `LoginRef::kind`.
-    pub kind: String,
-    /// Public login identity (the MXID, bot identity, …). Matches
-    /// `LoginRef::identifier`.
-    pub identifier: String,
-    /// Transport endpoint — the Matrix homeserver URL. `None` for transports
-    /// that don't need one.
-    pub homeserver_url: Option<String>,
-    /// Login username, when distinct from `identifier`.
-    pub username: Option<String>,
-    /// The secret credential — Matrix password or bot token — fully resolved.
-    /// The whole reason this DB is encrypted.
-    pub secret: Option<String>,
-    /// Per-login allow list (who may talk to the agent over this transport).
-    pub allow_list: Option<String>,
-    /// Per-login room/channel size cap.
-    pub room_size_limit: Option<usize>,
-}
-
-/// Handle over the eidetica `Database` that holds a bridge's encrypted
-/// credentials.
+/// Handle over the eidetica `Database` a bridge fully owns and manages. Holds
+/// the bridge's encrypted, transport-specific details; the only thing that
+/// crosses into the shared world is the [`LoginRef`](crate::agent_db::LoginRef)
+/// pointer the bridge drops into its agent's DB (`kind` / `identifier` / this
+/// DB's id).
 #[derive(Clone, Debug)]
 pub struct BridgeDb {
     database: Database,
@@ -80,7 +56,7 @@ impl BridgeDb {
         Self { database }
     }
 
-    /// Eidetica root ID of this bridge settings DB — the value an agent DB's
+    /// Eidetica root ID of this bridge DB — the value an agent DB's
     /// [`LoginRef::bridge_db_id`](crate::agent_db::LoginRef::bridge_db_id)
     /// points at.
     pub fn id(&self) -> ID {
@@ -91,15 +67,16 @@ impl BridgeDb {
         &self.database
     }
 
-    /// Write (or overwrite) the credentials for `login_id`, encrypting them
-    /// under `unlock_password`. Initializes the credentials store on first
-    /// use; opens it with the password thereafter (a wrong password errors).
-    /// Idempotent — re-seeding a `login_id` replaces the prior value, so the
-    /// bridge's first-boot seeding can run on every start.
-    pub async fn seed_credentials(
+    /// Write (or overwrite) the `creds` value for `login_id`, encrypting it
+    /// under `unlock_password`. `T` is whatever the bridge wants to persist —
+    /// chaz-core never inspects it. Initializes the store on first use; opens
+    /// it with the password thereafter (a wrong password errors). Idempotent —
+    /// re-seeding a `login_id` replaces the prior value, so the bridge's
+    /// first-boot seeding can run on every start.
+    pub async fn seed_credentials<T: Serialize>(
         &self,
         login_id: &str,
-        creds: &LoginCredentials,
+        creds: &T,
         unlock_password: &str,
     ) -> anyhow::Result<()> {
         let json = serde_json::to_string(creds)?;
@@ -117,14 +94,15 @@ impl BridgeDb {
         Ok(())
     }
 
-    /// Read and decrypt the credentials for `login_id`. `Ok(None)` when the
-    /// store has never been initialized or the login is absent; errors when
-    /// `unlock_password` is wrong (the store refuses to open).
-    pub async fn read_credentials(
+    /// Read and decrypt the value for `login_id`, deserializing it as `T` (the
+    /// same type the bridge seeded). `Ok(None)` when the store has never been
+    /// initialized or the login is absent; errors when `unlock_password` is
+    /// wrong (the store refuses to open) or the stored blob isn't a `T`.
+    pub async fn read_credentials<T: DeserializeOwned>(
         &self,
         login_id: &str,
         unlock_password: &str,
-    ) -> anyhow::Result<Option<LoginCredentials>> {
+    ) -> anyhow::Result<Option<T>> {
         let txn = self.database.new_transaction().await?;
         let mut store = txn
             .get_store::<PasswordStore<DocStore>>(CREDENTIALS_STORE)
@@ -187,8 +165,18 @@ pub async fn find_bridge_db(user: &User, label: &str) -> Option<(BridgeDb, Publi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewUser};
+
+    /// Stand-in for whatever shape a real bridge stores — chaz-core is
+    /// schema-agnostic, so the test brings its own type.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct TestCreds {
+        identifier: String,
+        secret: String,
+    }
 
     async fn test_user() -> User {
         let backend = InMemory::new();
@@ -199,15 +187,10 @@ mod tests {
         user
     }
 
-    fn matrix_creds(identifier: &str, secret: &str) -> LoginCredentials {
-        LoginCredentials {
-            kind: "matrix".to_string(),
+    fn matrix_creds(identifier: &str, secret: &str) -> TestCreds {
+        TestCreds {
             identifier: identifier.to_string(),
-            homeserver_url: Some("https://matrix.example".to_string()),
-            username: Some(identifier.to_string()),
-            secret: Some(secret.to_string()),
-            allow_list: Some("@patrick:example".to_string()),
-            room_size_limit: Some(5),
+            secret: secret.to_string(),
         }
     }
 
@@ -245,7 +228,7 @@ mod tests {
     async fn credentials_absent_before_any_seed() {
         let (_user, db) = peer_with_bridge_db().await;
         let got = db
-            .read_credentials("@chaz:example", "unlock-pw")
+            .read_credentials::<TestCreds>("@chaz:example", "unlock-pw")
             .await
             .unwrap();
         assert_eq!(got, None);
@@ -260,7 +243,7 @@ mod tests {
             .unwrap();
 
         let got = db
-            .read_credentials("@chaz:example", "unlock-pw")
+            .read_credentials::<TestCreds>("@chaz:example", "unlock-pw")
             .await
             .unwrap();
         assert_eq!(got, Some(creds));
@@ -277,7 +260,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            db.read_credentials("@chaz:example", "wrong-pw")
+            db.read_credentials::<TestCreds>("@chaz:example", "wrong-pw")
                 .await
                 .is_err(),
             "wrong unlock password must not decrypt the credentials"
@@ -294,12 +277,12 @@ mod tests {
             .await
             .unwrap();
 
-        let got = db
+        let got: TestCreds = db
             .read_credentials("@chaz:example", "pw")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.secret.as_deref(), Some("new"));
+        assert_eq!(got.secret, "new");
     }
 
     #[tokio::test]
@@ -314,17 +297,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            db.read_credentials("@chaz:example", "pw")
+            db.read_credentials::<TestCreds>("@chaz:example", "pw")
                 .await
                 .unwrap()
-                .and_then(|c| c.secret),
+                .map(|c| c.secret),
             Some("a".to_string())
         );
         assert_eq!(
-            db.read_credentials("@other:example", "pw")
+            db.read_credentials::<TestCreds>("@other:example", "pw")
                 .await
                 .unwrap()
-                .and_then(|c| c.secret),
+                .map(|c| c.secret),
             Some("b".to_string())
         );
     }

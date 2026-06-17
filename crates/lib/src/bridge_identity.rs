@@ -24,7 +24,6 @@
 #![allow(dead_code)]
 
 use crate::agent_db::{AgentDb, LoginRef};
-use crate::bridge_db::LoginCredentials;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::auth::types::Permission;
 use eidetica::entry::ID;
@@ -101,56 +100,44 @@ impl AccessBootstrap for SyncBootstrap {
     }
 }
 
-/// Build the public [`LoginRef`] for a credential set — pointing at the bridge
-/// settings DB that holds the secret — and register it in the agent's DB.
-/// Idempotent (upsert by identifier), so a bridge re-registering after a
-/// settings-DB change updates the pointer in place.
-pub async fn register_login_pointer(
-    agent_db: &AgentDb,
-    creds: &LoginCredentials,
-    bridge_settings_db_id: &ID,
-) -> anyhow::Result<()> {
-    agent_db
-        .register_login(LoginRef {
-            kind: creds.kind.clone(),
-            identifier: creds.identifier.clone(),
-            bridge_db_id: bridge_settings_db_id.to_string(),
-        })
-        .await
+/// Identity of the bridge issuing a bootstrap request: its own key plus the
+/// display name that key carries (also the `requesting_key_name`).
+pub struct BridgeIdentity<'a> {
+    pub key: &'a PublicKey,
+    pub key_name: &'a str,
 }
 
 /// Bring one bridged login online against its owning agent:
 ///
 /// 1. request `Write` on the agent DB (via the [`AccessBootstrap`] seam),
 /// 2. open the now-authorized agent DB,
-/// 3. self-register the public [`LoginRef`] pointing at the bridge settings DB.
+/// 3. self-register the public [`LoginRef`] (`kind` / `identifier` / this
+///    bridge's DB id) so peers can discover the login.
 ///
-/// The credentials themselves were already seeded into the bridge settings DB
-/// (see [`crate::bridge_config::BridgeConfig::seed_into`]); this step only
-/// publishes the non-secret pointer so peers can discover the login.
+/// The secret details were already seeded into the bridge's own DB (the
+/// bridge manages that); this step only publishes the non-secret pointer.
 pub async fn establish_login<B: AccessBootstrap>(
     user: &User,
     bootstrap: &B,
-    bridge_key: &PublicKey,
-    bridge_key_name: &str,
+    identity: &BridgeIdentity<'_>,
     agent_db_id: &ID,
-    bridge_settings_db_id: &ID,
-    creds: &LoginCredentials,
+    login: LoginRef,
 ) -> anyhow::Result<()> {
     bootstrap
         .request_access(
             agent_db_id,
-            bridge_key,
-            bridge_key_name,
+            identity.key,
+            identity.key_name,
             Permission::Write(BRIDGE_WRITE_PRIORITY),
         )
         .await?;
     let database = user.open_database(agent_db_id).await?;
     let agent_db = AgentDb::from_database(database);
-    register_login_pointer(&agent_db, creds, bridge_settings_db_id).await?;
+    let identifier = login.identifier.clone();
+    agent_db.register_login(login).await?;
     info!(
         agent_db = %agent_db_id,
-        login = %creds.identifier,
+        login = %identifier,
         "Registered bridge login pointer in agent DB"
     );
     Ok(())
@@ -171,18 +158,6 @@ mod tests {
                 .await
                 .unwrap();
         user
-    }
-
-    fn matrix_creds(identifier: &str) -> LoginCredentials {
-        LoginCredentials {
-            kind: "matrix".to_string(),
-            identifier: identifier.to_string(),
-            homeserver_url: Some("https://matrix.example".to_string()),
-            username: Some(identifier.to_string()),
-            secret: Some("hunter2".to_string()),
-            allow_list: None,
-            room_size_limit: None,
-        }
     }
 
     /// A no-op bootstrap: access is assumed already in hand. Lets the
@@ -247,16 +222,20 @@ mod tests {
         let agent_db_id = agent_db.id();
         let (bridge_db, _) = create_bridge_db(&mut user, "matrix").await.unwrap();
         let settings_db_id = bridge_db.id();
-        let creds = matrix_creds("@chaz:example");
 
         establish_login(
             &user,
             &GrantedBootstrap,
-            &bridge_key,
-            BRIDGE_KEY_NAME,
+            &BridgeIdentity {
+                key: &bridge_key,
+                key_name: BRIDGE_KEY_NAME,
+            },
             &agent_db_id,
-            &settings_db_id,
-            &creds,
+            LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: settings_db_id.to_string(),
+            },
         )
         .await
         .unwrap();
@@ -264,9 +243,6 @@ mod tests {
         let reg = agent_db.find_login("@chaz:example").await.unwrap().unwrap();
         assert_eq!(reg.kind, "matrix");
         assert_eq!(reg.bridge_db_id, settings_db_id.to_string());
-        // The registry pointer carries no secret.
-        let json = serde_json::to_string(&reg).unwrap();
-        assert!(!json.contains("hunter2"));
     }
 
     #[tokio::test]
@@ -288,11 +264,16 @@ mod tests {
         let err = establish_login(
             &user,
             &DeniedBootstrap,
-            &bridge_key,
-            BRIDGE_KEY_NAME,
+            &BridgeIdentity {
+                key: &bridge_key,
+                key_name: BRIDGE_KEY_NAME,
+            },
             &agent_db_id,
-            &settings_db_id,
-            &matrix_creds("@chaz:example"),
+            LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: settings_db_id.to_string(),
+            },
         )
         .await;
         assert!(err.is_err(), "denied access must abort");
