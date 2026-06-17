@@ -249,11 +249,13 @@ Revoke doesn't block on this — but the warning surfaces what's about to go sil
 
 ## Example: Watching a Matrix Bot's Session
 
-1. Start the Matrix bot on a server:
+1. Run the Matrix bot on a server. The bot is the standalone `chaz-matrix`
+   bridge running alongside the `chaz` daemon (see [Transport Bridges](bridges.md)):
 
    ```bash
-   chaz --config /etc/chaz/config.yaml
-   # Logs: Eidetica sync listening on 0.0.0.0:12345
+   chaz --config /etc/chaz/config.yaml             # the daemon (runs the agent)
+   chaz-matrix --config /etc/chaz/matrix-bridge.yaml   # the bridge (carries Matrix I/O)
+   # Each logs its eidetica sync address on startup.
    ```
 
 2. Start a local TUI:
@@ -262,7 +264,7 @@ Revoke doesn't block on this — but the warning surfaces what's about to go sil
    chaz --config ~/chaz-local.yaml
    ```
 
-3. On the server (via a second TUI or programmatically), get the session ticket:
+3. On the peer hosting the session (a second TUI on the daemon, or programmatically), get the session ticket:
 
    ```text
    /join !roomid:matrix.org

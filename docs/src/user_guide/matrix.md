@@ -1,14 +1,65 @@
 # Matrix Bot
 
-Chaz connects to Matrix as a bot, responding to messages in rooms it's invited to.
+Chaz connects to Matrix as a bot, responding to messages in rooms it's invited
+to. The Matrix bridge runs as its own process and eidetica peer (`chaz-matrix`),
+separate from the `chaz` daemon — read [Transport Bridges](bridges.md) first for
+the architecture and the one-time approval flow. This page covers Matrix-specific
+configuration and behavior.
 
 ## Setup
 
-1. Create a Matrix account for the bot on any homeserver
-2. Configure `homeserver_url`, `username`, `password`, and `allow_list` in your config
-3. Run `chaz --config config.yaml`
+1. **Create a Matrix account** for the bot on any homeserver.
 
-The bot will log in, accept invites from allowed users, and start responding.
+2. **Share the owning agent from the daemon** and copy the ticket:
+
+   ```text
+   /agent share chaz
+   # eidetica:?db=<agent_db_id>&pr=iroh:<addr>
+   ```
+
+3. **Write the bridge config** (default `$XDG_CONFIG_HOME/chaz/matrix-bridge.yaml`,
+   or pass `--config`). Each `logins:` entry pairs a Matrix account with its
+   owning agent and the ticket from step 2:
+
+   ```yaml
+   unlock_password: ${CHAZ_BRIDGE_UNLOCK}
+
+   logins:
+     - agent: chaz
+       ticket: "eidetica:?db=<agent_db_id>&pr=iroh:<addr>"
+       type: matrix
+       homeserver_url: https://matrix.example
+       username: "@chaz:example"
+       password: ${MATRIX_PASSWORD}
+       allow_list: "@you:example" # optional; falls back to a top-level allow_list
+       # id: <stable-login-id>         # optional; defaults to the MXID
+       # room_size_limit: 100          # optional per-login cap
+
+   # chaz runtime keys the embedded server needs:
+   state_dir: /var/lib/chaz-matrix
+   backends:
+     - name: openai
+       api_key: ${OPENAI_API_KEY}
+   agents:
+     - name: chaz
+   ```
+
+   `homeserver_url`, `username`, and `password` are the bot's login; `password`
+   (and `unlock_password`) accept `${ENV}` references so no secret has to live in
+   the file. `allow_list` / `room_size_limit` may be set per-login or as global
+   fallbacks at the top level.
+
+4. **Run the bridge** (with the daemon already running):
+
+   ```bash
+   chaz-matrix --config /etc/chaz/matrix-bridge.yaml
+   ```
+
+5. **Approve the access request** on the daemon (`/sharing requests` →
+   `/sharing approve <id>`) and restart the bridge — see
+   [Transport Bridges → Setup](bridges.md#setup).
+
+The bot then logs in, accepts invites from allowed users, and starts responding.
 
 ## Message Handling
 
@@ -100,4 +151,4 @@ The bot surfaces approval requests as markdown notices in the room. Respond eith
 
 ## Limitations
 
-- **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/bin/src/bridge/matrix/commands.rs` and `crates/bin/src/bridge/matrix/history.rs`.
+- **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/matrix-bridge/src/bridge/commands.rs` and `crates/matrix-bridge/src/bridge/history.rs`.
