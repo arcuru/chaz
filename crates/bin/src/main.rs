@@ -5,10 +5,9 @@ use chaz_core::config::Config;
 use chaz_core::{agent, config, server, session};
 
 use clap::Parser;
-use std::sync::Arc;
 use std::time::Instant;
 use std::{fs::File, io::Read, path::PathBuf};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -18,18 +17,6 @@ struct ChazArgs {
     /// NAME to reuse one. Without --print, chaz launches the TUI.
     #[arg(short = 'p', long = "print")]
     print: bool,
-
-    /// Run headless: skip the TUI, run only background bridges (Matrix).
-    /// Requires Matrix to be configured. Stdout receives logs in this mode
-    /// (no TUI to grab it).
-    #[arg(long, conflicts_with = "print")]
-    no_tui: bool,
-
-    /// Don't spawn the Matrix bridge in the background, even when Matrix is
-    /// configured. Useful for local TUI sessions where you don't want
-    /// rooms answered. Ignored under `--print`.
-    #[arg(long, conflicts_with_all = ["print", "no_tui"])]
-    no_matrix: bool,
 
     /// Path to config file. When unset, falls back to
     /// `$XDG_CONFIG_HOME/chaz/config.yaml` (typically
@@ -96,34 +83,9 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
     }
 }
 
-/// Filesystem-safe component for a login's per-login state directory.
-/// Matrix MXIDs (`@user:server`) contain `@` and `:` — the latter invalid
-/// in path components on some filesystems — so map anything outside
-/// `[A-Za-z0-9._-]` to `_`. Collisions are acceptable: `login_id` is the
-/// routing key (kept verbatim in channel bindings), this is only its dir name.
-fn sanitize_login_id(login_id: &str) -> String {
-    login_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = ChazArgs::parse();
-
-    if args.no_tui && args.prompt.is_some() {
-        anyhow::bail!(
-            "--no-tui does not accept a positional prompt — background bridges receive \
-             input from their transport, not the CLI"
-        );
-    }
 
     let config_path = resolve_config_path(args.config.as_deref())?;
 
@@ -175,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
     // another terminal to follow live.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _file_log_guard = if !args.no_tui {
+    let _file_log_guard = {
         let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
         let prefix = if args.print { "chaz-cli" } else { "chaz-tui" };
         let appender = tracing_appender::rolling::Builder::new()
@@ -196,16 +158,11 @@ async fn main() -> anyhow::Result<()> {
             log_dir.display(),
             prefix,
         );
-        Some(guard)
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-        None
+        guard
     };
 
     info!(
         config = %config_path.display(),
-        no_tui = args.no_tui,
-        no_matrix = args.no_matrix,
         print = args.print,
         "Starting chaz"
     );
@@ -280,21 +237,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Bridge dispatch.
     //
-    // - `--print`           : one-shot CLI, no background bridges
-    // - `--no-tui`          : Matrix is the foreground; required to be configured
-    // - default             : TUI is the foreground; Matrix spawns in the background
-    //                         iff configured and `!--no-matrix`
+    // - `--print` : one-shot CLI
+    // - default   : TUI
     //
-    // Cooperative shutdown: when the foreground bridge returns, `shutdown`
-    // is notified and background handles are awaited with a timeout so the
-    // process doesn't hang on a stuck sync loop.
-    let mode = if args.print {
-        "cli"
-    } else if args.no_tui {
-        "matrix-headless"
-    } else {
-        "tui"
-    };
+    // Transport bridges (Matrix, Discord) are their own standalone peer
+    // binaries (`chaz-matrix`, `chaz-discord`) — this process no longer spawns
+    // any in-process.
+    let mode = if args.print { "cli" } else { "tui" };
     info!(mode, "Starting bridge");
 
     let result = if args.print {
@@ -303,124 +252,11 @@ async fn main() -> anyhow::Result<()> {
         let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
         bridge.run(server).await
     } else {
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-
-        // Background bridge handles — one per configured Matrix login.
-        // Logins are a peer-level resource (`logins:` in config, or a single
-        // login synthesized from the legacy top-level fields); multiple
-        // agents may share a login and one agent may hold a dedicated login
-        // (N:M agents↔logins). The spawn loop runs one bridge per login.
-        let mut background_handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
-
-        let matrix_logins = config.matrix_logins();
-        let matrix_configured = !matrix_logins.is_empty();
-
-        if matrix_configured {
-            if args.no_matrix {
-                info!("Matrix configured but --no-matrix supplied; not spawning");
-            } else {
-                for login in matrix_logins {
-                    let login_id = login.login_id.clone();
-                    let owning_agent = login.owning_agent.clone();
-                    // Per-login matrix client state dir. Logins declared
-                    // under an agent are isolated under `{base}/matrix/{login_id}`
-                    // so two logins never share a sync token / crypto store;
-                    // the legacy synthesized login keeps its historical
-                    // location so existing installs don't re-login.
-                    let matrix_state_dir = login.state_dir.clone().or_else(|| {
-                        if login.explicit {
-                            state_dir.as_ref().map(|base| {
-                                base.join("matrix")
-                                    .join(sanitize_login_id(&login_id))
-                                    .to_string_lossy()
-                                    .into_owned()
-                            })
-                        } else {
-                            config.state_dir.clone()
-                        }
-                    });
-                    // Bridge now owns its credential shape; until the in-process
-                    // spawn is retired (the standalone `chaz-matrix` binary
-                    // replaces it), translate the resolved login spec into the
-                    // bridge's `MatrixCredentials` at the call site.
-                    let creds = chaz_matrix_bridge::MatrixCredentials {
-                        homeserver_url: login.homeserver_url.clone(),
-                        username: login.username.clone(),
-                        password: login.password.clone(),
-                        allow_list: login.allow_list.clone(),
-                        room_size_limit: login.room_size_limit,
-                    };
-                    let matrix_bridge = chaz_matrix_bridge::MatrixBridge::new(
-                        creds,
-                        login_id.clone(),
-                        owning_agent.clone(),
-                        matrix_state_dir,
-                        config.clone(),
-                        secret_store.clone(),
-                        shutdown.clone(),
-                    )?;
-                    let server_for_matrix = server.clone();
-                    background_handles.push(tokio::spawn(async move {
-                        matrix_bridge.run(server_for_matrix).await
-                    }));
-                    info!(login_id = %login_id, agent = %owning_agent, "Matrix bridge spawned in background");
-                }
-            }
+        let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store);
+        if let Some(prompt) = args.prompt {
+            tui_bridge = tui_bridge.with_initial_prompt(prompt);
         }
-
-        let fg_result = if args.no_tui {
-            if background_handles.is_empty() {
-                anyhow::bail!("--no-tui requires at least one Matrix login configured");
-            }
-            // Headless: the foreground "work" is awaiting every spawned login
-            // bridge. They run concurrently as tasks; await all and surface
-            // the first error. (`--no-tui` conflicts with `--no-matrix` at the
-            // clap layer, so at least one handle is guaranteed present here.)
-            let mut headless_result = Ok(());
-            for handle in background_handles.drain(..) {
-                let res = match handle.await {
-                    Ok(res) => res,
-                    Err(join_err) => {
-                        Err(anyhow::anyhow!("matrix bridge task panicked: {join_err}"))
-                    }
-                };
-                if let Err(e) = res {
-                    error!("Matrix bridge error: {e}");
-                    if headless_result.is_ok() {
-                        headless_result = Err(e);
-                    }
-                }
-            }
-            headless_result
-        } else {
-            let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store);
-            if let Some(prompt) = args.prompt {
-                tui_bridge = tui_bridge.with_initial_prompt(prompt);
-            }
-            tui_bridge.run(server).await
-        };
-
-        // TUI (or headless main) exited — drain background bridges.
-        if !background_handles.is_empty() {
-            shutdown.notify_waiters();
-            let drain = async {
-                for handle in background_handles {
-                    match handle.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => error!("Background bridge error: {e}"),
-                        Err(join_err) => error!("Background bridge task panicked: {join_err}"),
-                    }
-                }
-            };
-            if tokio::time::timeout(std::time::Duration::from_secs(5), drain)
-                .await
-                .is_err()
-            {
-                warn!("Background bridges did not drain within 5s; exiting anyway");
-            }
-        }
-
-        fg_result
+        tui_bridge.run(server).await
     };
 
     if let Err(e) = result {

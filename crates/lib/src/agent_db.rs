@@ -931,7 +931,6 @@ mod tests {
             grants: None,
             default_memory_banks: None,
             default_skill_banks: None,
-            logins: None,
         }
     }
 

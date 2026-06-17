@@ -792,7 +792,6 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "chaz-core",
- "chaz-matrix-bridge",
  "chrono",
  "clap",
  "crossterm",

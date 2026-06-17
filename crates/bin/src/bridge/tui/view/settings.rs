@@ -329,16 +329,10 @@ fn render_peer_backends(
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-/// Peer → Bridges (read-only). v1: tui + cli are always-on; matrix is
-/// enabled when a homeserver_url is set in config.
-fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, config: &Config) {
-    let matrix_active = !config.homeserver_url.is_empty();
-    let matrix_status = if matrix_active {
-        format!("active ({})", config.homeserver_url)
-    } else {
-        "(homeserver_url unset)".to_string()
-    };
-
+/// Peer → Bridges (read-only). v1: tui + cli are always-on, in-process.
+/// Matrix and Discord are their own standalone peer binaries (`chaz-matrix`,
+/// `chaz-discord`), external to this process, so they show as external.
+fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, _config: &Config) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  Bridges", theme::accent_bold())]),
@@ -349,7 +343,8 @@ fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, config: &Config) {
         Line::from(""),
         bridge_row("tui", "active"),
         bridge_row("cli", "available (`chaz -p`)"),
-        bridge_row("matrix", &matrix_status),
+        bridge_row("matrix", "external (`chaz-matrix`)"),
+        bridge_row("discord", "external (`chaz-discord`)"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  (view-only in v1)",
@@ -829,14 +824,9 @@ fn render_peer_about(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(none — falls back to first agent)".to_string());
 
-    // Matrix is "enabled" when a homeserver_url has been configured. Other
-    // bridges (CLI, TUI) are always wired in chaz.
-    let matrix_enabled = !config.homeserver_url.is_empty();
-    let bridges = if matrix_enabled {
-        "tui, cli, matrix"
-    } else {
-        "tui, cli"
-    };
+    // Only the in-process bridges count here; Matrix/Discord are external
+    // standalone peer binaries (`chaz-matrix`, `chaz-discord`).
+    let bridges = "tui, cli";
 
     let agent_count_s = agent_count.to_string();
     let backend_s = format!("{backend_count} ({model_count} known models)");

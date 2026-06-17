@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 chaz-core = { path = "../lib" }
-chaz-matrix-bridge = { path = "../matrix-bridge" }
 
 anyhow.workspace = true
 chrono.workspace = true

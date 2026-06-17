@@ -45,7 +45,6 @@ pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
         grants: None,
         default_memory_banks: None,
         default_skill_banks: None,
-        logins: None,
     }
 }
 

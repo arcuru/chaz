@@ -7,14 +7,10 @@ use lazy_static::lazy_static;
 lazy_static! {
     pub static ref DEFAULT_CONFIG: Config =
         serde_yaml::from_str(r#"
-# These are required to be set by the user's config.
-homeserver_url: ""
-username: ""
+# Transport logins (Matrix, Discord) live in their own standalone bridge
+# binaries' config now (chaz-matrix / chaz-discord), not here.
 
-# Optional, if not given it will be asked for on first run
-#password: ""
-
-# Technically optional, but the bot won't respond without it
+# Optional global allow-list fallback a bridge applies when a login sets none.
 #allow_list: ""
 
 # Optional. Not setting it here because reading it from an XDG library is safer.
@@ -99,7 +95,8 @@ mod tests {
     /// invalid YAML.
     #[test]
     fn default_config_parses() {
-        let _ = DEFAULT_CONFIG.homeserver_url.as_str();
+        // Touch a field to force the lazy_static initializer to run.
+        let _ = DEFAULT_CONFIG.agents.is_some();
     }
 
     #[test]

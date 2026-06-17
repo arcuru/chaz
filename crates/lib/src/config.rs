@@ -5,19 +5,13 @@ use std::collections::HashMap;
 /// Configuration for the chaz bot
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
-    /// Matrix homeserver URL (required for Matrix bridge)
-    #[serde(default)]
-    pub homeserver_url: String,
-    /// Matrix username (required for Matrix bridge)
-    #[serde(default)]
-    pub username: String,
-    /// Optionally specify the password, if not set it will be asked for on cmd line
-    pub password: Option<String>,
-    /// Allow list of which accounts we will respond to
+    /// Allow list of which accounts a transport bridge responds to. Read by
+    /// the standalone bridge binaries as the global fallback when a login
+    /// declares no per-login `allow_list`.
     pub allow_list: Option<String>,
-    /// Per-account message limit while the bot is running
+    /// Per-account message limit while a bridge is running.
     pub message_limit: Option<u64>,
-    /// Room size limit to respond to
+    /// Room size limit a bridge will respond in (global fallback).
     pub room_size_limit: Option<usize>,
     /// Set the state directory for chaz
     pub state_dir: Option<String>,
@@ -74,13 +68,13 @@ pub struct Config {
     pub multi_agent: Option<MultiAgentConfig>,
 }
 
-/// One login an agent owns on some transport. A login belongs to exactly
-/// one agent (`login → agent` is a function); an agent may own several
-/// logins (one per transport), but no login is ever shared. Declared in
-/// the owning agent's `logins:` list and discriminated by `type`, the same
-/// way `backends:` and `web_search.backends:` are — so adding a transport
-/// is a new [`TransportConfig`] variant + bridge impl, never a config
-/// schema change.
+/// One login on some transport, owned by exactly one agent (`login → agent`
+/// is a function); an agent may own several logins (one per transport), but no
+/// login is ever shared. Declared in a standalone bridge binary's own config
+/// (`chaz-matrix-bridge`'s `logins:` list) and discriminated by `type`, the
+/// same way `backends:` and `web_search.backends:` are — so adding a transport
+/// is a new [`TransportConfig`] variant + bridge impl, never a config schema
+/// change. Lives in chaz-core because the bridge config reuses it verbatim.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoginConfig {
     /// Stable id for this login — the `login_id` routing dimension and the
@@ -144,94 +138,6 @@ impl LoginConfig {
         match &self.transport {
             TransportConfig::Matrix(m) => m.password.as_deref(),
         }
-    }
-}
-
-/// A fully-resolved Matrix login ready to spawn a bridge: identity +
-/// credentials + the agent that owns it. Produced by
-/// [`Config::matrix_logins`] from each agent's `logins:` list (or, for
-/// backward compatibility, from the legacy top-level matrix fields).
-#[derive(Debug, Clone)]
-pub struct MatrixLoginSpec {
-    /// Routing/identity id (`login_id`) — also this login's transport identity.
-    pub login_id: String,
-    /// Agent that owns this login and hosts its rooms by default.
-    pub owning_agent: String,
-    pub homeserver_url: String,
-    pub username: String,
-    pub password: Option<String>,
-    pub allow_list: Option<String>,
-    pub room_size_limit: Option<usize>,
-    /// Explicit per-login state-dir override, if any.
-    pub state_dir: Option<String>,
-    /// True when declared under an agent's `logins:` (isolate state dir);
-    /// false for the legacy synthesized login (preserve historical path).
-    pub explicit: bool,
-}
-
-impl Config {
-    /// Resolve every Matrix login to spawn, each paired with its owning
-    /// agent. Collects each `type: matrix` entry from every agent's
-    /// `logins:` list; when no agent declares one, synthesizes a single
-    /// login from the legacy top-level matrix fields, owned by the default
-    /// agent. Returns empty when neither is configured (no Matrix).
-    pub fn matrix_logins(&self) -> Vec<MatrixLoginSpec> {
-        let mut out = Vec::new();
-        if let Some(agents) = &self.agents {
-            for agent in agents {
-                let Some(logins) = &agent.logins else {
-                    continue;
-                };
-                for login in logins {
-                    // Only matrix logins spawn a MatrixBridge; other
-                    // transports are collected by their own resolvers. A
-                    // match (not `if let`) so a new variant forces a decision.
-                    match &login.transport {
-                        TransportConfig::Matrix(m) => out.push(MatrixLoginSpec {
-                            login_id: login.login_id().to_string(),
-                            owning_agent: agent.name.clone(),
-                            homeserver_url: m.homeserver_url.clone(),
-                            username: m.username.clone(),
-                            password: m.password.clone(),
-                            allow_list: m.allow_list.clone(),
-                            room_size_limit: m.room_size_limit,
-                            state_dir: login.state_dir.clone(),
-                            explicit: true,
-                        }),
-                    }
-                }
-            }
-        }
-        if out.is_empty() && !self.homeserver_url.is_empty() && !self.username.is_empty() {
-            out.push(MatrixLoginSpec {
-                login_id: self.username.clone(),
-                owning_agent: self.default_agent_name(),
-                homeserver_url: self.homeserver_url.clone(),
-                username: self.username.clone(),
-                password: self.password.clone(),
-                allow_list: self.allow_list.clone(),
-                room_size_limit: self.room_size_limit,
-                state_dir: None,
-                explicit: false,
-            });
-        }
-        out
-    }
-
-    /// Name of the default host agent — head of `default_agents`, else the
-    /// first entry in `agents:`, else `"default"`.
-    pub fn default_agent_name(&self) -> String {
-        self.default_agents
-            .as_ref()
-            .and_then(|d| d.first())
-            .cloned()
-            .or_else(|| {
-                self.agents
-                    .as_ref()
-                    .and_then(|a| a.first())
-                    .map(|a| a.name.clone())
-            })
-            .unwrap_or_else(|| "default".to_string())
     }
 }
 
@@ -433,11 +339,6 @@ pub struct AgentConfig {
     /// `default_memory_banks` — missing banks are logged at warn and
     /// skipped, auto-created on first reference if appropriate.
     pub default_skill_banks: Option<Vec<String>>,
-    /// Transport logins this agent owns. Each entry is one account on one
-    /// transport (a `type: matrix` MXID, a future `type: discord` token);
-    /// the spawn loop runs one bridge per login, routing its rooms to this
-    /// agent by default. A login belongs to exactly one agent — never shared.
-    pub logins: Option<Vec<LoginConfig>>,
 }
 
 /// Configuration for a Worker template under an Agent.
@@ -726,21 +627,17 @@ mod tests {
 
     #[test]
     fn parse_minimal_config() {
-        // The only two nominally required fields both have #[serde(default)],
-        // so an empty document parses cleanly.
+        // Every field is optional, so an empty document parses cleanly.
         let cfg: Config = serde_yaml::from_str("").unwrap();
-        assert!(cfg.homeserver_url.is_empty());
-        assert!(cfg.username.is_empty());
-        assert!(cfg.password.is_none());
+        assert!(cfg.allow_list.is_none());
         assert!(cfg.agents.is_none());
     }
 
     #[test]
-    fn parse_full_matrix_stub() {
+    fn parse_global_bridge_fallbacks() {
+        // The global transport fallbacks a standalone bridge reads from the
+        // shared config (the legacy top-level Matrix identity fields are gone).
         let yaml = r#"
-homeserver_url: "https://matrix.org"
-username: "@bot:matrix.org"
-password: "s3cret"
 allow_list: "@alice:matrix.org|@bob:matrix.org"
 message_limit: 500
 room_size_limit: 100
@@ -748,10 +645,13 @@ state_dir: "/var/lib/chaz"
 chat_summary_model: "gpt-4"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.homeserver_url, "https://matrix.org");
-        assert_eq!(cfg.username, "@bot:matrix.org");
-        assert_eq!(cfg.password.as_deref(), Some("s3cret"));
+        assert_eq!(
+            cfg.allow_list.as_deref(),
+            Some("@alice:matrix.org|@bob:matrix.org")
+        );
         assert_eq!(cfg.message_limit, Some(500));
+        assert_eq!(cfg.room_size_limit, Some(100));
+        assert_eq!(cfg.state_dir.as_deref(), Some("/var/lib/chaz"));
     }
 
     #[test]
@@ -1073,70 +973,6 @@ cli:
     }
 
     #[test]
-    fn matrix_logins_synthesizes_single_login_from_legacy_fields() {
-        let yaml = r#"
-homeserver_url: "https://matrix.org"
-username: "@bot:matrix.org"
-password: "s3cret"
-allow_list: "@alice:matrix.org"
-room_size_limit: 50
-agents:
-  - name: ava
-  - name: chaz
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        let logins = cfg.matrix_logins();
-        assert_eq!(logins.len(), 1);
-        let l = &logins[0];
-        // login_id falls back to username when no explicit id.
-        assert_eq!(l.login_id, "@bot:matrix.org");
-        assert_eq!(l.homeserver_url, "https://matrix.org");
-        assert_eq!(l.password.as_deref(), Some("s3cret"));
-        assert_eq!(l.allow_list.as_deref(), Some("@alice:matrix.org"));
-        assert_eq!(l.room_size_limit, Some(50));
-        // Legacy login is owned by the default agent (first in agents:).
-        assert_eq!(l.owning_agent, "ava");
-        // Synthesized login is non-explicit → historical state-dir preserved.
-        assert!(!l.explicit);
-        assert!(l.state_dir.is_none());
-    }
-
-    #[test]
-    fn matrix_logins_collected_from_per_agent_logins() {
-        // Logins live under their owning agent as a type-tagged list.
-        let yaml = r#"
-homeserver_url: "https://legacy.example"
-username: "@legacy:example"
-agents:
-  - name: ava
-    logins:
-      - type: matrix
-        homeserver_url: "https://a.example"
-        username: "@ava:a.example"
-        password: "pw-a"
-  - name: chaz
-    logins:
-      - type: matrix
-        id: chaz-login
-        homeserver_url: "https://b.example"
-        username: "@chaz:b.example"
-        allow_list: "@boss:b.example"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        let logins = cfg.matrix_logins();
-        assert_eq!(logins.len(), 2);
-        // Each login is paired with its owning agent.
-        assert_eq!(logins[0].login_id, "@ava:a.example");
-        assert_eq!(logins[0].owning_agent, "ava");
-        assert!(logins[0].explicit);
-        // Second uses an explicit id and falls under chaz.
-        assert_eq!(logins[1].login_id, "chaz-login");
-        assert_eq!(logins[1].owning_agent, "chaz");
-        assert_eq!(logins[1].allow_list.as_deref(), Some("@boss:b.example"));
-        // Legacy top-level fields are ignored once any agent declares a login.
-    }
-
-    #[test]
     fn login_config_parses_type_tag_and_transport_kind() {
         let yaml = r#"
 type: matrix
@@ -1148,27 +984,6 @@ username: "@u:s"
         assert_eq!(login.login_id(), "@u:s");
         let TransportConfig::Matrix(m) = &login.transport;
         assert_eq!(m.homeserver_url, "https://s");
-    }
-
-    #[test]
-    fn matrix_logins_empty_when_nothing_configured() {
-        let cfg: Config = serde_yaml::from_str("").unwrap();
-        assert!(cfg.matrix_logins().is_empty());
-    }
-
-    #[test]
-    fn matrix_logins_empty_agent_list_falls_back_to_legacy() {
-        // No agent declares a login → fall back to the legacy fields,
-        // owned by the default agent name ("default" when no agents:).
-        let yaml = r#"
-homeserver_url: "https://matrix.org"
-username: "@bot:matrix.org"
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        let logins = cfg.matrix_logins();
-        assert_eq!(logins.len(), 1);
-        assert_eq!(logins[0].login_id, "@bot:matrix.org");
-        assert_eq!(logins[0].owning_agent, "default");
     }
 
     #[test]
