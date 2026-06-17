@@ -38,7 +38,7 @@ use serenity::prelude::*;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{error, info};
 
-use crate::config::DiscordConfig;
+use crate::credentials::DiscordCredentials;
 
 /// A tool-approval prompt routed to a specific channel. The runtime hands the
 /// bridge an [`ApprovalExchange`]; the relay tags it with the channel to post
@@ -52,18 +52,30 @@ struct ApprovalRequest {
 /// on that message resolves it.
 type PendingApprovals = Arc<Mutex<HashMap<MessageId, oneshot::Sender<ApprovalDecision>>>>;
 
-/// A standalone Discord bridge bound to one login/agent.
+/// A standalone Discord bridge bound to one login/agent. Credentials are
+/// resolved (out of the bridge's own `BridgeDb`) before this is built; the
+/// `login_id` / `owning_agent` pointer fields come from the bridge config.
 pub struct DiscordBridge {
+    pub login_id: String,
+    pub owning_agent: String,
+    pub creds: DiscordCredentials,
     pub config: Config,
-    pub discord: DiscordConfig,
     pub secrets: SecretStore,
 }
 
 impl DiscordBridge {
-    pub fn new(config: Config, discord: DiscordConfig, secrets: SecretStore) -> Self {
+    pub fn new(
+        login_id: String,
+        owning_agent: String,
+        creds: DiscordCredentials,
+        config: Config,
+        secrets: SecretStore,
+    ) -> Self {
         Self {
+            login_id,
+            owning_agent,
+            creds,
             config,
-            discord,
             secrets,
         }
     }
@@ -71,7 +83,7 @@ impl DiscordBridge {
 
 impl Bridge for DiscordBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
-        let token = self.discord.resolve_token()?;
+        let token = self.creds.bot_token.clone();
 
         // MESSAGE_CONTENT is privileged — it must also be toggled on in the
         // Discord developer portal for the bot, or message bodies arrive empty.
@@ -87,11 +99,11 @@ impl Bridge for DiscordBridge {
 
         let handler = Handler {
             server,
-            login_id: self.discord.login_id.clone(),
-            owning_agent: self.discord.owning_agent.clone(),
+            login_id: self.login_id.clone(),
+            owning_agent: self.owning_agent.clone(),
             secrets: self.secrets.clone(),
             config: self.config.clone(),
-            allowed_users: self.discord.allowed_users.clone(),
+            allowed_users: self.creds.allowed_users.clone(),
             attached: Arc::new(Mutex::new(HashSet::new())),
             approval_relay_tx,
             pending_approvals: pending_approvals.clone(),
@@ -109,8 +121,8 @@ impl Bridge for DiscordBridge {
         tokio::spawn(approval_relay(approval_relay_rx, http, pending_approvals));
 
         info!(
-            login_id = %self.discord.login_id,
-            agent = %self.discord.owning_agent,
+            login_id = %self.login_id,
+            agent = %self.owning_agent,
             "Starting Discord bridge"
         );
         client.start().await?;
