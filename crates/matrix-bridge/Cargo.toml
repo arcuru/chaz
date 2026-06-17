@@ -1,0 +1,22 @@
+[package]
+name = "chaz-matrix-bridge"
+description = "Standalone Matrix bridge for chaz — maps an eidetica session DB to Matrix rooms."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+chaz-core = { path = "../lib" }
+
+anyhow.workspace = true
+eidetica.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
