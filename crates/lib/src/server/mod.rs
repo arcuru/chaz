@@ -362,6 +362,7 @@ impl Server {
         extensions: Arc<ExtensionHub>,
         default_backend: BackendManager,
         mcp_registry: Arc<crate::mcp::McpRegistry>,
+        run_agent_loop: bool,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
 
@@ -400,10 +401,19 @@ impl Server {
             startup_ready_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
-        let server_clone = server.clone();
-        tokio::spawn(async move {
-            server_clone.processing_loop(notify_rx).await;
-        });
+        // The agent-running path. `processing_loop` drains `notify_tx` and
+        // runs the ReAct loop for any watched session that gets a write. A
+        // standalone bridge sets `run_agent_loop: false` — it proxies and
+        // delivers messages but never runs an agent itself; the chaz daemon
+        // (a separate peer) watches the exposed sessions and runs them. With
+        // the loop unspawned, `notify_rx` is dropped and the `notify_tx`
+        // sends behind `register_session` become harmless no-ops.
+        if run_agent_loop {
+            let server_clone = server.clone();
+            tokio::spawn(async move {
+                server_clone.processing_loop(notify_rx).await;
+            });
+        }
 
         let server_clone = server.clone();
         tokio::spawn(async move {

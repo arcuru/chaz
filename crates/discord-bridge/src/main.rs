@@ -196,6 +196,8 @@ async fn main() -> anyhow::Result<()> {
             enable_sync: true, // idempotent — already enabled above
             run_routine_engine: false,
             bootstrap_agents_from_config: false,
+            // Dumb bridge: proxy + deliver only. The daemon runs agents.
+            run_agent_loop: false,
             extra_auto_approved_tools: Vec::new(),
         },
     )

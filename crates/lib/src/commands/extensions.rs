@@ -458,6 +458,7 @@ mod tests {
             hub,
             backend_mgr.clone(),
             Arc::new(crate::mcp::McpRegistry::new()),
+            true,
         );
         let _ = spawn_cell.set(server.clone());
 

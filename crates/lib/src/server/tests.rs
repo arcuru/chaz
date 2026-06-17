@@ -111,6 +111,7 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
         Arc::new(crate::extension::ExtensionHub::new()),
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
+        true,
     );
     (instance, server, registry)
 }

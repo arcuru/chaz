@@ -51,6 +51,13 @@ pub struct BuildOptions {
     /// and the hosted index then discovers those synced DBs. Minting locally
     /// here would fork a second, divergent agent DB against the daemon's.
     pub bootstrap_agents_from_config: bool,
+    /// Spawn the agent-running `processing_loop`. True for the chaz daemon,
+    /// which runs agents. A standalone (dumb) bridge sets this **false**: it
+    /// proxies inbound messages into session DBs and delivers replies back to
+    /// its transport, but never runs an agent — the daemon watches the
+    /// exposed sessions and runs them. Distinct from `run_routine_engine`,
+    /// which only gates schedulers/heartbeats, not the ReAct message loop.
+    pub run_agent_loop: bool,
     /// Tools to add to the auto-approved set on top of `config.security`. The
     /// CLI passes its non-interactive allowlist here so `shell`/`write_file`
     /// work under `--print` where there is no interactive approval.
@@ -459,6 +466,7 @@ pub async fn build(
         extension_hub,
         default_backend.clone(),
         mcp_registry.clone(),
+        opts.run_agent_loop,
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),

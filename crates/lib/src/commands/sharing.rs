@@ -226,6 +226,7 @@ mod tests {
             std::sync::Arc::new(crate::extension::ExtensionHub::new()),
             backend_mgr.clone(),
             std::sync::Arc::new(crate::mcp::McpRegistry::new()),
+            true,
         );
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();

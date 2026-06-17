@@ -225,6 +225,8 @@ async fn main() -> anyhow::Result<()> {
             run_routine_engine: !args.print,
             // The chaz daemon owns its agents — mint their DBs from config.
             bootstrap_agents_from_config: true,
+            // The daemon is the peer that runs agents.
+            run_agent_loop: true,
             extra_auto_approved_tools,
         },
     )
