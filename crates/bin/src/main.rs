@@ -266,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
             config_path: config_path.clone(),
             enable_sync: !args.print,
             run_routine_engine: !args.print,
+            // The chaz daemon owns its agents — mint their DBs from config.
+            bootstrap_agents_from_config: true,
             extra_auto_approved_tools,
         },
     )

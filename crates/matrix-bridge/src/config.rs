@@ -52,6 +52,13 @@ pub struct MatrixLoginConfig {
     /// the public `LoginRef` pointer gets registered.
     pub agent: String,
 
+    /// Access ticket for this agent's DB — produced by the chaz daemon's
+    /// `/agent share` (an `eidetica:?db=…&pr=…` string). The bridge bootstraps
+    /// Write access through it (`bootstrap_with_ticket`) and registers the
+    /// login pointer on the agent DB it points at. The bridge owns no agents
+    /// of its own; this ticket is how it reaches one.
+    pub ticket: String,
+
     /// Transport identity + credentials (`type: matrix`, homeserver, username,
     /// password, allow_list, …). Secret fields may be `${ENV}` references.
     #[serde(flatten)]
@@ -138,6 +145,7 @@ label: matrix
 unlock_password: ${{{unlock_var}}}
 logins:
   - agent: chaz
+    ticket: "eidetica:?db=sha256:agentdbid&pr=iroh:peeraddr"
     type: matrix
     homeserver_url: https://matrix.example
     username: "@chaz:example"
@@ -155,6 +163,10 @@ logins:
         assert_eq!(cfg.logins.len(), 1);
         let entry = &cfg.logins[0];
         assert_eq!(entry.agent, "chaz");
+        assert_eq!(
+            entry.ticket,
+            "eidetica:?db=sha256:agentdbid&pr=iroh:peeraddr"
+        );
         assert_eq!(entry.login.login_id(), "@chaz:example");
         assert_eq!(entry.login.transport_kind(), "matrix");
     }

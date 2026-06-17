@@ -44,6 +44,13 @@ pub struct BuildOptions {
     /// Spawn the routine engine (heartbeats + schedulers) and register every
     /// hosted session/agent with it. Off for one-shot CLI runs.
     pub run_routine_engine: bool,
+    /// Materialize an eidetica AgentDb per config-declared agent (minting one
+    /// locally on this peer). True for the chaz daemon, which owns its agents.
+    /// A standalone bridge sets this **false**: it owns no agents — it
+    /// ticket-bootstraps each agent DB from the daemon before calling `build`,
+    /// and the hosted index then discovers those synced DBs. Minting locally
+    /// here would fork a second, divergent agent DB against the daemon's.
+    pub bootstrap_agents_from_config: bool,
     /// Tools to add to the auto-approved set on top of `config.security`. The
     /// CLI passes its non-interactive allowlist here so `shell`/`write_file`
     /// work under `--print` where there is no interactive approval.
@@ -109,24 +116,29 @@ pub async fn build(
 
     // Materialize an eidetica DB per yaml-declared agent. Idempotent on
     // re-runs (yaml is a first-boot template; AgentDb is the source of
-    // truth afterwards).
-    let t = Instant::now();
-    let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
-    if !bootstrapped.is_empty() {
-        info!(
-            count = bootstrapped.len(),
-            elapsed_ms = t.elapsed().as_millis() as u64,
-            "Agent DBs bootstrapped from config"
-        );
-    }
+    // truth afterwards). Skipped for a standalone bridge, which owns no
+    // agents and instead ticket-bootstraps the daemon's agent DBs (minting
+    // here would fork a divergent copy); the hosted index below discovers
+    // those already-synced DBs.
+    if opts.bootstrap_agents_from_config {
+        let t = Instant::now();
+        let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
+        if !bootstrapped.is_empty() {
+            info!(
+                count = bootstrapped.len(),
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                "Agent DBs bootstrapped from config"
+            );
+        }
 
-    // Every AgentRegistry entry needs an AgentDb so per-agent memory tools
-    // resolve. The default `chaz` agent (when no yaml `agents:` block) has
-    // no bootstrap entry — ensure one exists.
-    for name in agent_registry.names() {
-        if !bootstrapped.contains_key(&name) {
-            let bs = agent_db::ensure_agent_db(&mut user, &name).await?;
-            info!(agent = %name, db_id = %bs.db.id(), "Created default Agent DB");
+        // Every AgentRegistry entry needs an AgentDb so per-agent memory tools
+        // resolve. The default `chaz` agent (when no yaml `agents:` block) has
+        // no bootstrap entry — ensure one exists.
+        for name in agent_registry.names() {
+            if !bootstrapped.contains_key(&name) {
+                let bs = agent_db::ensure_agent_db(&mut user, &name).await?;
+                info!(agent = %name, db_id = %bs.db.id(), "Created default Agent DB");
+            }
         }
     }
 

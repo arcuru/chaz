@@ -91,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
             config_path: config_path.clone(),
             enable_sync: true,
             run_routine_engine: true,
+            // Current discord bridge is co-located on chaz's DB and owns its
+            // agents the same way; the standalone-peer migration flips this.
+            bootstrap_agents_from_config: true,
             extra_auto_approved_tools: Vec::new(),
         },
     )

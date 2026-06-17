@@ -9,11 +9,16 @@ repository.workspace = true
 homepage.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "chaz-matrix"
+path = "src/main.rs"
+
 [dependencies]
 chaz-core = { path = "../lib" }
 
 anyhow.workspace = true
 chrono.workspace = true
+clap.workspace = true
 dirs.workspace = true
 eidetica.workspace = true
 matrix-sdk.workspace = true
@@ -23,3 +28,4 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
