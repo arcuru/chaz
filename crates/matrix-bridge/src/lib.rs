@@ -17,8 +17,10 @@
 //! `LoginRef` pointer) lives in chaz-core's `bridge_identity` and is driven by
 //! the bridge binary.
 
+pub mod bridge;
 pub mod config;
 pub mod credentials;
 
+pub use bridge::MatrixBridge;
 pub use config::{MatrixBridgeConfig, MatrixLoginConfig};
 pub use credentials::MatrixCredentials;

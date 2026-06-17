@@ -337,8 +337,21 @@ async fn main() -> anyhow::Result<()> {
                             config.state_dir.clone()
                         }
                     });
-                    let matrix_bridge = bridge::matrix::MatrixBridge::new(
-                        login,
+                    // Bridge now owns its credential shape; until the in-process
+                    // spawn is retired (the standalone `chaz-matrix` binary
+                    // replaces it), translate the resolved login spec into the
+                    // bridge's `MatrixCredentials` at the call site.
+                    let creds = chaz_matrix_bridge::MatrixCredentials {
+                        homeserver_url: login.homeserver_url.clone(),
+                        username: login.username.clone(),
+                        password: login.password.clone(),
+                        allow_list: login.allow_list.clone(),
+                        room_size_limit: login.room_size_limit,
+                    };
+                    let matrix_bridge = chaz_matrix_bridge::MatrixBridge::new(
+                        creds,
+                        login_id.clone(),
+                        owning_agent.clone(),
                         matrix_state_dir,
                         config.clone(),
                         secret_store.clone(),

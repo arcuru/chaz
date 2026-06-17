@@ -6,10 +6,12 @@ use chaz_core::bridge::{ApprovalDecision, ApprovalExchange, Bridge};
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
-use chaz_core::config::{Config, MatrixLoginSpec};
+use chaz_core::config::Config;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::Session;
+
+use crate::credentials::MatrixCredentials;
 
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
@@ -52,10 +54,11 @@ fn make_room_approval_tx(
 }
 
 pub struct MatrixBridge {
-    /// The Matrix login this bridge signs in as — credentials, per-login
-    /// overrides, and the agent that owns it. One bridge runs per login;
-    /// the spawn loop in `main` builds one of these per resolved login.
-    login: MatrixLoginSpec,
+    /// The resolved Matrix credentials this bridge signs in as: homeserver,
+    /// username, password, plus the per-login allow_list / room_size_limit
+    /// filters. Read out of the bridge's own `BridgeDb` (opaque to chaz-core)
+    /// before this bridge is built. One bridge runs per login.
+    creds: MatrixCredentials,
     /// Resolved on-disk state directory for this login's matrix client
     /// (sync token, session). For explicit `logins:` entries this is
     /// `{base}/matrix/{login_id}` so logins never collide on disk; for the
@@ -87,22 +90,22 @@ pub struct MatrixBridge {
 
 impl MatrixBridge {
     pub fn new(
-        login: MatrixLoginSpec,
+        creds: MatrixCredentials,
+        login_id: String,
+        owning_agent: String,
         state_dir: Option<String>,
         config: Config,
         secrets: SecretStore,
         shutdown: Arc<Notify>,
     ) -> anyhow::Result<Self> {
-        if login.homeserver_url.is_empty() {
+        if creds.homeserver_url.is_empty() {
             anyhow::bail!("homeserver_url is required for Matrix bridge");
         }
-        if login.username.is_empty() {
+        if creds.username.is_empty() {
             anyhow::bail!("username is required for Matrix bridge");
         }
-        let login_id = login.login_id.clone();
-        let owning_agent = login.owning_agent.clone();
         Ok(Self {
-            login,
+            creds,
             state_dir,
             config,
             secrets,
@@ -396,7 +399,7 @@ async fn handle_detach(room: Room, server: Arc<Server>, login_id: &str) {
 
 impl Bridge for MatrixBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
-        let login = self.login;
+        let creds = self.creds;
         let login_id = self.login_id.clone();
         let owning_agent = self.owning_agent.clone();
         let state_dir = self.state_dir;
@@ -404,18 +407,18 @@ impl Bridge for MatrixBridge {
         let config = Arc::new(self.config);
         let shutdown = self.shutdown;
 
-        let allow_list = login
+        let allow_list = creds
             .allow_list
             .clone()
             .or_else(|| config.allow_list.clone());
-        let room_size_limit = login.room_size_limit.or(config.room_size_limit);
+        let room_size_limit = creds.room_size_limit.or(config.room_size_limit);
 
         // --- Connect: login/restore, auto-join, prime the sync token ---
         let mut mc = MatrixClient::login(
             &Login {
-                homeserver_url: login.homeserver_url.clone(),
-                username: login.username.clone(),
-                password: login.password.clone(),
+                homeserver_url: creds.homeserver_url.clone(),
+                username: creds.username.clone(),
+                password: creds.password.clone(),
             },
             state_dir.as_deref(),
             "chaz",

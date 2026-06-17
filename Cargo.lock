@@ -792,6 +792,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "chaz-core",
+ "chaz-matrix-bridge",
  "chrono",
  "clap",
  "crossterm",
@@ -863,6 +864,24 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "chaz-matrix-bridge"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chaz-core",
+ "chrono",
+ "dirs",
+ "eidetica",
+ "matrix-sdk",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
