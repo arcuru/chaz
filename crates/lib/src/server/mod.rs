@@ -316,10 +316,6 @@ pub struct Server {
     /// threading the path through every call site. `None` in `--print` and
     /// tests, where reload is unavailable.
     config_path: std::sync::RwLock<Option<std::path::PathBuf>>,
-    /// chaz state directory (eidetica DB + per-agent local state). Used to
-    /// locate each agent's local-only login-secrets unlock key for seeding and
-    /// bridge launch. `None` in `--print`/tests, where seeding is skipped.
-    state_dir: std::sync::RwLock<Option<std::path::PathBuf>>,
     /// Running `RoutineEngine`, set once at startup via
     /// `set_routine_engine` (skipped under `--print`). Threaded into the
     /// `HookContext` / `ToolContext` built for each session so that
@@ -395,7 +391,6 @@ impl Server {
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
             config_path: std::sync::RwLock::new(None),
-            state_dir: std::sync::RwLock::new(None),
             routine_engine: OnceLock::new(),
             mcp_registry,
             // Ready by default: only the deferred fast-start path (build)
@@ -791,21 +786,6 @@ impl Server {
         *self.config_path.write().expect("config_path lock poisoned") = Some(path);
     }
 
-    /// Record the chaz state directory so login-secret seeding and (later)
-    /// bridge launch can locate each agent's local-only unlock key. Called
-    /// once at startup; `None` leaves login-secret seeding disabled.
-    pub fn set_state_dir(&self, dir: Option<std::path::PathBuf>) {
-        *self.state_dir.write().expect("state_dir lock poisoned") = dir;
-    }
-
-    /// The chaz state directory, if set. See [`Server::set_state_dir`].
-    pub fn state_dir(&self) -> Option<std::path::PathBuf> {
-        self.state_dir
-            .read()
-            .expect("state_dir lock poisoned")
-            .clone()
-    }
-
     /// Re-read the on-disk chaz yaml and re-run the agent reconcile, optionally
     /// scoped to a single agent name (`only`). Returns the names of agents
     /// whose DB config changed plus how many yaml entries were considered (so a
@@ -873,14 +853,6 @@ impl Server {
             return Ok(false);
         };
 
-        // Seed login credentials into the agent's encrypted store. Idempotent
-        // and independent of the metadata hash gate below — a rotated password
-        // doesn't change the (secret-free) metadata, and seeding only writes a
-        // login that has no secret yet, so it never clobbers a runtime edit.
-        if let Err(e) = self.seed_login_secrets(ac, &db).await {
-            tracing::warn!(agent = %ac.name, error = %e, "login secret seeding failed");
-        }
-
         let current = db.read_config().await.unwrap_or_default();
 
         // Resolve the prompt from yaml's declared sources into the blob store,
@@ -908,56 +880,6 @@ impl Server {
         intended.applied_config_hash = Some(new_hash);
         db.write_config(&intended).await?;
         Ok(true)
-    }
-
-    /// First-boot seeding of an agent's transport-login credentials into its
-    /// encrypted [`LOGIN_SECRETS_STORE`](crate::agent_db::LOGIN_SECRETS_STORE).
-    /// For each yaml login that declares a secret, resolve any `${ENV}`
-    /// reference and write it under the login's `login_id` — but only when the
-    /// store has no secret for that login yet, so runtime edits and
-    /// out-of-band rotations survive a restart. The unlock key is read (or
-    /// generated) from local disk and never syncs. A missing `state_dir`
-    /// (`--print`, tests) or an unresolved env var skips rather than aborts.
-    async fn seed_login_secrets(
-        &self,
-        ac: &crate::config::AgentConfig,
-        db: &crate::agent_db::AgentDb,
-    ) -> anyhow::Result<()> {
-        let Some(logins) = ac.logins.as_ref() else {
-            return Ok(());
-        };
-        let Some(state_dir) = self.state_dir() else {
-            return Ok(());
-        };
-        for login in logins {
-            let Some(raw) = login.secret() else {
-                continue;
-            };
-            let login_id = login.login_id();
-            let key = crate::security::ensure_login_unlock_key(&state_dir, &ac.name)?;
-            if db.read_login_secret(login_id, &key).await?.is_some() {
-                continue;
-            }
-            let resolved = match crate::security::SecretStore::resolve_env(raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        agent = %ac.name,
-                        login = login_id,
-                        error = %e,
-                        "skipping login: secret env unresolved"
-                    );
-                    continue;
-                }
-            };
-            db.write_login_secret(login_id, &resolved, &key).await?;
-            tracing::info!(
-                agent = %ac.name,
-                login = login_id,
-                "seeded login secret into encrypted store"
-            );
-        }
-        Ok(())
     }
 
     /// Reconcile every agent declared in `config` from yaml into its DB. Run at

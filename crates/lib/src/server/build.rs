@@ -37,10 +37,6 @@ pub struct BuildOptions {
     /// Path the config was loaded from; recorded on the server so `/agent
     /// reload` (and config reconcile) can re-read it.
     pub config_path: PathBuf,
-    /// chaz state directory (eidetica DB + per-agent local state). Recorded on
-    /// the server so login-secret seeding can locate each agent's local-only
-    /// unlock key. `None` when it isn't resolved (e.g. a bare one-shot run).
-    pub state_dir: Option<PathBuf>,
     /// Enable eidetica P2P sync (iroh transport + optional HTTP bind from
     /// `config.sync_listen`). A one-shot CLI invocation leaves this off — the
     /// engine and public endpoint would outlive the single ReAct loop.
@@ -468,7 +464,6 @@ pub async fn build(
     // Record the config path before anything (the gateway, `/agent reload`,
     // or the deferred reconcile below) can re-read it.
     server.set_config_path(opts.config_path.clone());
-    server.set_state_dir(opts.state_dir.clone());
 
     // Apply default_agents list: which agents auto-attach to new
     // sessions. First entry is the routing host. Set before any

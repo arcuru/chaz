@@ -264,7 +264,6 @@ async fn main() -> anyhow::Result<()> {
         user,
         server::BuildOptions {
             config_path: config_path.clone(),
-            state_dir: state_dir.clone(),
             enable_sync: !args.print,
             run_routine_engine: !args.print,
             extra_auto_approved_tools,

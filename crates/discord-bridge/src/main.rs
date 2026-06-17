@@ -89,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
         user,
         server::BuildOptions {
             config_path: config_path.clone(),
-            state_dir: state_dir.clone(),
             enable_sync: true,
             run_routine_engine: true,
             extra_auto_approved_tools: Vec::new(),
