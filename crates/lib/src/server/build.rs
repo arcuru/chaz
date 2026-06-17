@@ -526,6 +526,7 @@ pub async fn build(
         let default_backend = default_backend.clone();
         let deferred_config = config.clone();
         let run_routine_engine = opts.run_routine_engine;
+        let run_agent_loop = opts.run_agent_loop;
         tokio::spawn(async move {
             run_deferred_startup(
                 server,
@@ -533,6 +534,7 @@ pub async fn build(
                 deferred_config,
                 default_backend,
                 run_routine_engine,
+                run_agent_loop,
             )
             .await;
         });
@@ -567,6 +569,7 @@ async fn run_deferred_startup(
     config: Config,
     default_backend: backends::BackendManager,
     run_routine_engine: bool,
+    run_agent_loop: bool,
 ) {
     let deferred_start = Instant::now();
 
@@ -765,10 +768,138 @@ async fn run_deferred_startup(
         });
     }
 
+    // 4. Watch each hosted agent DB's session registry so the daemon runs the
+    //    agent on sessions a (dumb) bridge created and exposed. Only the
+    //    agent-running peer does this — a bridge sets `run_agent_loop:false`.
+    if run_agent_loop {
+        watch_agent_session_registries(server.clone(), registry.clone(), default_backend.clone())
+            .await;
+    }
+
     info!(
         total_ms = deferred_start.elapsed().as_millis() as u64,
         "Deferred at-startup work complete"
     );
+}
+
+/// Run the agent on sessions that a dumb bridge created and exposed.
+///
+/// A bridge (a separate peer) creates a session DB, attaches a daemon-owned
+/// agent to it (granting the agent Write + delegating session auth to the agent
+/// DB), and records a [`agent_db::SessionRef`] in the agent DB's synced session
+/// registry with the bridge in `exposed_on`. That registry write syncs to the
+/// daemon. This installs an `on_write` on each hosted agent DB and, on every
+/// write (local *or* remote/synced — eidetica's `on_write` fires for both),
+/// re-scans the registry and `register_session`s any exposed session not yet
+/// watched, so the daemon's ReAct loop answers it.
+///
+/// `open_session` on a freshly-exposed session can transiently fail if its DB
+/// hasn't synced over yet; that's fine — the next registry sync-write re-scans
+/// and retries, so registration is self-healing rather than one-shot. Agents
+/// created after startup aren't watched here (config-bootstrapped agents are
+/// all present by now); revisit if runtime agent creation needs it.
+async fn watch_agent_session_registries(
+    server: Arc<Server>,
+    registry: Arc<session::SessionRegistry>,
+    default_backend: backends::BackendManager,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(64);
+
+    // Install a write-watch on every hosted agent DB → ping the rescan channel.
+    let mut watched_agents = 0usize;
+    for entry in server.agent_index().list() {
+        let Some(adb) = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .ok()
+            .flatten()
+        else {
+            warn!(agent = %entry.display_name, "Could not open agent DB for registry watch");
+            continue;
+        };
+        let tx = tx.clone();
+        match adb.database().on_write(move |_event, _db| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(()).await;
+                Ok(())
+            })
+        }) {
+            Ok(sub) => {
+                sub.detach();
+                watched_agents += 1;
+            }
+            Err(e) => {
+                warn!(agent = %entry.display_name, "agent DB on_write failed: {e}");
+            }
+        }
+    }
+    drop(tx); // only the per-agent clones keep the channel open
+    info!(
+        agents = watched_agents,
+        "Watching agent session registries for bridge-exposed sessions"
+    );
+
+    // Initial pass: register sessions already exposed before startup.
+    register_exposed_sessions(&server, &registry, &default_backend).await;
+
+    // React to every agent-DB write (a bridge's SessionRef sync lands here),
+    // debouncing a burst into one rescan.
+    while rx.recv().await.is_some() {
+        while rx.try_recv().is_ok() {}
+        register_exposed_sessions(&server, &registry, &default_backend).await;
+    }
+}
+
+/// One rescan pass: for every hosted agent, `register_session` each exposed
+/// session not already watched. Idempotent — `register_session` early-returns
+/// for an already-watched session, so re-scans are cheap.
+pub(crate) async fn register_exposed_sessions(
+    server: &Arc<Server>,
+    registry: &Arc<session::SessionRegistry>,
+    default_backend: &backends::BackendManager,
+) {
+    for entry in server.agent_index().list() {
+        let Some(adb) = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let refs = adb.list_session_refs().await.unwrap_or_default();
+        for r in refs {
+            if r.exposed_on.is_empty() || server.is_watching_session(&r.session_db_id).await {
+                continue;
+            }
+            match registry.open_session(&r.session_db_id).await {
+                Ok((_conv, sdb)) => {
+                    if let Err(e) = server
+                        .register_session(&sdb, default_backend.clone(), None, None)
+                        .await
+                    {
+                        warn!(session_db_id = %r.session_db_id, "register exposed session failed: {e}");
+                    } else {
+                        info!(
+                            session_db_id = %r.session_db_id,
+                            agent = %entry.display_name,
+                            exposed_on = ?r.exposed_on,
+                            "Daemon registered bridge-exposed session"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Not synced over yet (or unreadable) — a later registry
+                    // sync-write will re-trigger this scan and retry.
+                    tracing::debug!(
+                        session_db_id = %r.session_db_id,
+                        "Exposed session not yet openable; will retry on next registry write: {e}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Startup migration WARN: any locally-hosted agent that is co-owned

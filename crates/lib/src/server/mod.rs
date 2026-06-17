@@ -427,6 +427,13 @@ impl Server {
         &self.agent_index
     }
 
+    /// Whether this server already watches the given session (its `on_write`
+    /// is installed and runtime state stored). Lets the agent-registry watcher
+    /// skip re-opening sessions it has already registered.
+    pub async fn is_watching_session(&self, session_db_id: &str) -> bool {
+        self.watched.lock().await.contains(session_db_id)
+    }
+
     /// Mark startup as pending — closes the message-processing gate. Called
     /// by `build` on the fast-start path right before it spawns the
     /// deferred at-startup work and hands the (drawable) server back to the

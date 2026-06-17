@@ -1148,3 +1148,48 @@ async fn fire_pinned_skips_when_session_home_is_another_peer() {
         "non-home pinned fire should not record a fire"
     );
 }
+
+#[tokio::test]
+async fn watcher_registers_exposed_sessions_only() {
+    // The daemon's agent-registry watcher must register sessions a bridge
+    // exposed (so the agent answers them) and leave attached-but-unexposed
+    // sessions alone. Single-peer stand-in for the cross-peer flow.
+    let (_instance, server, registry) = server_fixture().await;
+    let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+    server.agent_index().register(agent.clone());
+
+    // Exposed on a bridge → must be registered.
+    let (_c, sdb) = registry.create_session(Some("exposed")).await.unwrap();
+    let exposed = sdb.root_id().to_string();
+    registry
+        .attach_agent_to_session(&exposed, &agent)
+        .await
+        .unwrap();
+    let adb = registry
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    adb.expose_session_on(&exposed, "matrix").await.unwrap();
+
+    // Attached but never exposed → must be skipped.
+    let (_c2, sdb2) = registry.create_session(Some("private")).await.unwrap();
+    let private = sdb2.root_id().to_string();
+    registry
+        .attach_agent_to_session(&private, &agent)
+        .await
+        .unwrap();
+
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::new(&None, secrets);
+    super::build::register_exposed_sessions(&server, &registry, &backend).await;
+
+    assert!(
+        server.is_watching_session(&exposed).await,
+        "exposed session must be registered for the agent to answer"
+    );
+    assert!(
+        !server.is_watching_session(&private).await,
+        "attached-but-unexposed session must be skipped"
+    );
+}

@@ -34,7 +34,7 @@ pub mod usage;
 
 pub use keys::BootstrapOutcome;
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 pub use registry::SessionRegistry;
 pub use transport::{bind_transport, is_bound, transport_bindings, unbind_transport};
