@@ -41,10 +41,17 @@ pub const SCHEDULES_STORE: &str = "schedules";
 pub const SCHEDULE_FIRES_STORE: &str = "schedule_fires";
 pub const SKILLS_STORE: &str = "skills";
 pub const SKILL_BANKS_STORE: &str = "skill_banks";
-/// Encrypted per-agent transport-login secrets: a `PasswordStore<DocStore>`
-/// keyed by `login_id`. Unlocked with a local-disk password that never syncs;
-/// the contents sync only as opaque ciphertext. The non-secret login metadata
-/// lives alongside, in the clear, in [`AgentDbConfig::logins`].
+/// Unencrypted transport-login registry: a `Table<LoginRef>` recording that a
+/// login exists and where its (bridge-owned, encrypted) settings DB lives. No
+/// credentials — just enough for any peer to enumerate an agent's logins and
+/// locate the managing bridge. The secrets live in a separate bridge-owned DB,
+/// linked by [`LoginRef::bridge_db_id`].
+pub const LOGINS_STORE: &str = "logins";
+/// Encrypted transport-login secrets: a `PasswordStore<DocStore>` keyed by
+/// `login_id`, unlocked with a password that never syncs (contents sync only as
+/// opaque ciphertext). **Bridge-bound:** Phase 2 relocates this store onto the
+/// bridge-owned settings DB pointed at by [`LoginRef::bridge_db_id`]; until then
+/// the read/write helpers operate on whatever `Database` handle wraps them.
 pub const LOGIN_SECRETS_STORE: &str = "login_secrets";
 
 const BLOB_KEY: &str = "value";
@@ -117,13 +124,6 @@ pub struct AgentDbConfig {
     /// Skill banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_skill_banks`].
     #[serde(default)]
     pub default_skill_banks: Vec<String>,
-    /// Transport logins this agent owns, non-secret metadata only. Mirrors
-    /// [`AgentConfig::logins`]; the matching credentials live encrypted in
-    /// [`LOGIN_SECRETS_STORE`], keyed by each login's `login_id`. Synced in the
-    /// clear so any peer can enumerate an agent's logins without being able to
-    /// authenticate as them.
-    #[serde(default)]
-    pub logins: Vec<AgentDbLogin>,
 }
 
 /// Serializable Worker template. Mirrors [`WorkerConfig`].
@@ -158,80 +158,26 @@ impl WorkerDbConfig {
     }
 }
 
-/// A transport login owned by this agent, minus its secret. Mirrors the yaml
-/// [`LoginConfig`](crate::config::LoginConfig) but is `Serialize` (it persists
-/// in the agent DB) and carries no credential — the password / token lives
-/// encrypted in [`LOGIN_SECRETS_STORE`], keyed by [`Self::login_id`]. This
-/// metadata syncs in the clear so any peer can enumerate which logins an agent
-/// owns without being able to authenticate as them.
+/// Registry entry in the unencrypted [`LOGINS_STORE`]: a non-secret pointer
+/// recording that a transport login exists and where its credentials live.
+/// Holds no credential and no connection detail beyond the public identity —
+/// the homeserver/username/password and everything else live encrypted in a
+/// separate **bridge-owned settings DB**, referenced here by [`Self::bridge_db_id`].
+///
+/// This is what lets any peer enumerate which logins an agent has and locate
+/// the bridge that manages each, without being able to authenticate as them.
+/// It is a separate store (not a field on [`AgentDbConfig`]) so chaz's yaml
+/// reconcile never clobbers a bridge's self-registration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentDbLogin {
-    /// Stable login id (routing dimension + per-login state-dir name). `None`
-    /// falls back to a transport default (the MXID for Matrix).
-    pub id: Option<String>,
-    /// Explicit transport-client state-dir override.
-    pub state_dir: Option<String>,
-    /// Transport-specific, non-secret connection metadata.
-    #[serde(flatten)]
-    pub transport: AgentDbTransport,
-}
-
-/// Non-secret transport metadata for an [`AgentDbLogin`], tagged by `type`.
-/// Parallels [`TransportConfig`](crate::config::TransportConfig): adding a
-/// transport is a new variant, never a schema change.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum AgentDbTransport {
-    Matrix(AgentDbMatrixLogin),
-}
-
-/// Matrix login metadata, secret excluded (the password lives in
-/// [`LOGIN_SECRETS_STORE`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentDbMatrixLogin {
-    pub homeserver_url: String,
-    pub username: String,
-    pub allow_list: Option<String>,
-    pub room_size_limit: Option<usize>,
-}
-
-impl AgentDbLogin {
-    /// Build from a yaml [`LoginConfig`](crate::config::LoginConfig), dropping
-    /// the secret credential — the caller seeds that into
-    /// [`LOGIN_SECRETS_STORE`] via [`AgentDb::write_login_secret`] separately.
-    pub fn from_login_config(cfg: &crate::config::LoginConfig) -> Self {
-        let transport = match &cfg.transport {
-            crate::config::TransportConfig::Matrix(m) => {
-                AgentDbTransport::Matrix(AgentDbMatrixLogin {
-                    homeserver_url: m.homeserver_url.clone(),
-                    username: m.username.clone(),
-                    allow_list: m.allow_list.clone(),
-                    room_size_limit: m.room_size_limit,
-                })
-            }
-        };
-        Self {
-            id: cfg.id.clone(),
-            state_dir: cfg.state_dir.clone(),
-            transport,
-        }
-    }
-
-    /// Stable identifier: explicit `id`, else a transport default (the MXID for
-    /// Matrix). Mirrors
-    /// [`LoginConfig::login_id`](crate::config::LoginConfig::login_id).
-    pub fn login_id(&self) -> &str {
-        self.id.as_deref().unwrap_or_else(|| match &self.transport {
-            AgentDbTransport::Matrix(m) => &m.username,
-        })
-    }
-
-    /// Transport tag (`"matrix"`, …).
-    pub fn transport_kind(&self) -> &'static str {
-        match self.transport {
-            AgentDbTransport::Matrix(_) => "matrix",
-        }
-    }
+pub struct LoginRef {
+    /// Transport kind (`"matrix"`, `"discord"`, …).
+    pub kind: String,
+    /// Stable public login identity — e.g. the MXID `@chaz:matrix.org`.
+    /// Dedup key within the registry.
+    pub identifier: String,
+    /// Eidetica root ID of the bridge-owned settings DB holding this login's
+    /// encrypted credentials. The bridge creates and fully manages that DB.
+    pub bridge_db_id: String,
 }
 
 impl AgentDbConfig {
@@ -259,11 +205,6 @@ impl AgentDbConfig {
             grants: cfg.grants.clone().unwrap_or_default(),
             default_memory_banks: cfg.default_memory_banks.clone().unwrap_or_default(),
             default_skill_banks: cfg.default_skill_banks.clone().unwrap_or_default(),
-            logins: cfg
-                .logins
-                .as_ref()
-                .map(|ls| ls.iter().map(AgentDbLogin::from_login_config).collect())
-                .unwrap_or_default(),
         }
     }
 }
@@ -532,6 +473,7 @@ impl AgentDb {
         txn.get_store::<Table<Skill>>(SKILLS_STORE).await?;
         txn.get_store::<Table<SkillBankRef>>(SKILL_BANKS_STORE)
             .await?;
+        txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
         txn.commit().await?;
         Ok(())
     }
@@ -590,6 +532,66 @@ impl AgentDb {
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Transport-login registry ([`LOGINS_STORE`])
+    //
+    // The unencrypted pointer layer: which logins this agent has and where
+    // each one's credentials live (a bridge-owned settings DB). Bridges
+    // self-register here after bootstrapping access. Mirrors the memory/skill
+    // bank-ref machinery — upsert-by-`identifier`, list, find, detach.
+    // -----------------------------------------------------------------
+
+    /// List every transport-login pointer registered for this agent.
+    pub async fn list_logins(&self) -> anyhow::Result<Vec<LoginRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
+        let rows = store.search(|_: &LoginRef| true).await?;
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// Add or update a login pointer. If a row with the same `identifier`
+    /// exists it's replaced, so a bridge re-registering (new settings DB, say)
+    /// updates in place rather than duplicating.
+    pub async fn register_login(&self, login: LoginRef) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
+        let existing = store
+            .search(|r: &LoginRef| r.identifier == login.identifier)
+            .await?;
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        store.insert(login).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Remove the login pointer with the given `identifier`. Returns true if a
+    /// row was removed; no-op (false) on an unknown identifier.
+    pub async fn deregister_login(&self, identifier: &str) -> anyhow::Result<bool> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
+        let existing = store
+            .search(|r: &LoginRef| r.identifier == identifier)
+            .await?;
+        let removed = !existing.is_empty();
+        for (id, _) in existing {
+            store.delete(&id).await?;
+        }
+        txn.commit().await?;
+        Ok(removed)
+    }
+
+    /// Find a single login pointer by its `identifier`.
+    pub async fn find_login(&self, identifier: &str) -> anyhow::Result<Option<LoginRef>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
+        let mut rows = store
+            .search(|r: &LoginRef| r.identifier == identifier)
+            .await?;
+        Ok(rows.pop().map(|(_, r)| r))
     }
 
     // -----------------------------------------------------------------
@@ -1454,69 +1456,64 @@ mod tests {
         );
     }
 
-    // ----- transport-login schema + encrypted secret store (Phase 1) -----
+    // ----- transport-login registry + encrypted secret store -----
 
-    fn matrix_login(
-        id: Option<&str>,
-        user: &str,
-        password: Option<&str>,
-    ) -> crate::config::LoginConfig {
-        use crate::config::{LoginConfig, MatrixLogin, TransportConfig};
-        LoginConfig {
-            id: id.map(str::to_string),
-            state_dir: None,
-            transport: TransportConfig::Matrix(MatrixLogin {
-                homeserver_url: "https://hs.example".into(),
-                username: user.into(),
-                password: password.map(str::to_string),
-                allow_list: None,
-                room_size_limit: None,
-            }),
+    fn login_ref(kind: &str, identifier: &str, bridge_db_id: &str) -> LoginRef {
+        LoginRef {
+            kind: kind.into(),
+            identifier: identifier.into(),
+            bridge_db_id: bridge_db_id.into(),
         }
     }
 
-    #[test]
-    fn login_metadata_drops_secret_and_resolves_id() {
-        let meta =
-            AgentDbLogin::from_login_config(&matrix_login(None, "@chaz:example", Some("hunter2")));
-        // login_id falls back to the MXID; transport tag carried over.
-        assert_eq!(meta.login_id(), "@chaz:example");
-        assert_eq!(meta.transport_kind(), "matrix");
-        // The DB-side type has no secret field; prove the credential never
-        // reaches the persisted form, and the `type` tag flattens in.
-        let json = serde_json::to_string(&meta).unwrap();
-        assert!(
-            !json.contains("hunter2"),
-            "secret leaked into metadata: {json}"
-        );
-        assert!(json.contains("\"type\":\"matrix\""), "got: {json}");
+    #[tokio::test]
+    async fn logins_empty_by_default() {
+        let (_user, db) = peer_with_agent_db().await;
+        assert!(db.list_logins().await.unwrap().is_empty());
+        assert!(db.find_login("@chaz:example").await.unwrap().is_none());
+        assert!(!db.deregister_login("@chaz:example").await.unwrap());
     }
 
     #[tokio::test]
-    async fn login_metadata_round_trips_in_config() {
-        let mut user = test_peer_user().await;
-        let cfg = AgentDbConfig {
-            logins: vec![AgentDbLogin::from_login_config(&matrix_login(
-                Some("primary"),
-                "@chaz:example",
-                Some("hunter2"),
-            ))],
-            ..Default::default()
-        };
-        let (db, _) = create_agent_db(
-            &mut user,
-            "chaz",
-            &cfg,
-            &AgentMeta {
-                display_name: Some("chaz".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let read = db.read_config().await.unwrap();
-        assert_eq!(read.logins, cfg.logins);
-        assert_eq!(read.logins[0].login_id(), "primary");
+    async fn register_and_find_login() {
+        let (_user, db) = peer_with_agent_db().await;
+        let m = login_ref("matrix", "@chaz:example", "sha256:bridgedb");
+        db.register_login(m.clone()).await.unwrap();
+
+        assert_eq!(db.list_logins().await.unwrap(), vec![m.clone()]);
+        assert_eq!(db.find_login("@chaz:example").await.unwrap(), Some(m));
+        // No credential material in the registry — only the pointer.
+        let json = serde_json::to_string(&db.list_logins().await.unwrap()).unwrap();
+        assert!(json.contains("sha256:bridgedb"));
+    }
+
+    #[tokio::test]
+    async fn register_replaces_by_identifier() {
+        // A bridge re-registering the same login (new settings DB) updates the
+        // pointer in place rather than leaving a duplicate.
+        let (_user, db) = peer_with_agent_db().await;
+        db.register_login(login_ref("matrix", "@chaz:example", "sha256:old"))
+            .await
+            .unwrap();
+        db.register_login(login_ref("matrix", "@chaz:example", "sha256:new"))
+            .await
+            .unwrap();
+
+        let all = db.list_logins().await.unwrap();
+        assert_eq!(all.len(), 1, "register must replace, not append");
+        assert_eq!(all[0].bridge_db_id, "sha256:new");
+    }
+
+    #[tokio::test]
+    async fn deregister_removes_and_reports_absence() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.register_login(login_ref("matrix", "@chaz:example", "sha256:b"))
+            .await
+            .unwrap();
+        assert!(db.deregister_login("@chaz:example").await.unwrap());
+        assert!(db.list_logins().await.unwrap().is_empty());
+        // Second deregister is a no-op; returns false.
+        assert!(!db.deregister_login("@chaz:example").await.unwrap());
     }
 
     #[tokio::test]

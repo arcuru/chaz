@@ -342,16 +342,6 @@ async fn reconcile_seeds_login_secret_into_encrypted_store() {
     let secret = db.read_login_secret("@chaz:example", &key).await.unwrap();
     assert_eq!(secret.as_deref(), Some("hunter2"));
 
-    // The metadata synced in the clear, without the password.
-    let cfg = db.read_config().await.unwrap();
-    assert_eq!(cfg.logins.len(), 1);
-    assert_eq!(cfg.logins[0].login_id(), "@chaz:example");
-    let json = serde_json::to_string(&cfg.logins[0]).unwrap();
-    assert!(
-        !json.contains("hunter2"),
-        "secret leaked into metadata: {json}"
-    );
-
     // Idempotent: a second reconcile neither errors nor clobbers the secret.
     server.reconcile_agent_from_yaml(&ac).await.unwrap();
     let again = db.read_login_secret("@chaz:example", &key).await.unwrap();
