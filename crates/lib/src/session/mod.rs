@@ -7,14 +7,15 @@
 //! - `meta`    (DocStore)            — session configuration (name, agent, model, ...)
 //!
 //! The registry (inside `chaz_group`) holds only indices: `sessions`,
-//! `external_channels`, `session_names`. Canonical per-session config lives
-//! in each session's own DB (`SessionMeta`) so it syncs with the session.
+//! `session_names`. Canonical per-session config lives in each session's own
+//! DB (`SessionMeta`) so it syncs with the session — including its transport
+//! bindings (`transport` module).
 //!
 //! Submodules split `impl SessionRegistry` blocks by concern:
-//! - `registry` — constructor, session CRUD, name index, accessors
-//! - `channels` — Matrix room ↔ session bindings
-//! - `agents`   — attach/detach agents + turn-taking resolution
-//! - `keys`     — agent DB helpers + ephemeral key lifecycle
+//! - `registry`  — constructor, session CRUD, name index, accessors
+//! - `transport` — channel ↔ session bindings (in the session DB) + lookup
+//! - `agents`    — attach/detach agents + turn-taking resolution
+//! - `keys`      — agent DB helpers + ephemeral key lifecycle
 
 use crate::types::ConversationId;
 
@@ -26,9 +27,9 @@ use std::collections::HashMap;
 use tracing::{error, info, warn};
 
 mod agents;
-mod channels;
 mod keys;
 mod registry;
+mod transport;
 pub mod usage;
 
 pub use keys::BootstrapOutcome;
@@ -36,6 +37,7 @@ pub use keys::BootstrapOutcome;
 mod test_helpers;
 
 pub use registry::SessionRegistry;
+pub use transport::{bind_transport, is_bound, transport_bindings, unbind_transport};
 
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
