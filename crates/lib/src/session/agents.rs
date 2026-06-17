@@ -7,12 +7,14 @@
 //! attachment.
 
 use crate::agent::Agent;
-use crate::agent_db::{AgentDb, SessionHistoryEntry};
+use crate::agent_db::{AgentDb, SessionHistoryEntry, SessionRef};
 use crate::hosted_index::DbEntry;
 
 use chrono::Utc;
 use eidetica::Database;
-use eidetica::auth::types::{AuthKey, Permission};
+use eidetica::auth::types::{
+    AuthKey, DelegatedTreeRef, Permission, PermissionBounds, TreeReference,
+};
 use eidetica::store::Table;
 use tracing::{info, warn};
 
@@ -78,6 +80,53 @@ impl SessionRegistry {
                 )
                 .await?;
             txn.commit().await?;
+        }
+
+        // 1b. Delegate the session's auth to the agent's DB. Any key authorized
+        //     on the agent DB — the daemon (Admin) and a dumb bridge (its
+        //     `bridge` key, Write) — thereby inherits authority on this session
+        //     via eidetica's delegation resolver, clamped to the bound below,
+        //     with no per-session key grant. This is what lets the daemon run
+        //     the agent on a session a bridge created, and a bridge proxy into a
+        //     session the daemon created. Keyed by the agent DB's root, so a
+        //     re-attach upserts (idempotent).
+        let agent_db = {
+            let user = self.user.lock().await;
+            user.open_database(&agent.db_id).await?
+        };
+        let agent_tips = agent_db.snapshot().await?.into_tips();
+        let tree_ref = DelegatedTreeRef {
+            permission_bounds: PermissionBounds {
+                max: Permission::Admin(0),
+                min: None,
+            },
+            tree: TreeReference {
+                root: agent_db.root_id().clone(),
+                tips: agent_tips,
+            },
+        };
+        {
+            let txn = session_db.new_transaction().await?;
+            let settings = txn.get_settings()?;
+            settings.add_delegated_tree(tree_ref).await?;
+            txn.commit().await?;
+        }
+
+        // 1c. List the session in the agent's synced session registry so peers
+        //     (notably the daemon) discover it. Non-clobbering: preserves any
+        //     bridge `exposed_on` a bridge has already recorded.
+        let agent_handle = AgentDb::from_database(agent_db);
+        if agent_handle
+            .find_session_ref(session_db_id)
+            .await?
+            .is_none()
+        {
+            agent_handle
+                .register_session_ref(SessionRef {
+                    session_db_id: session_db_id.to_string(),
+                    exposed_on: Vec::new(),
+                })
+                .await?;
         }
 
         // 2. SessionMeta: upsert the AgentRef (dedup by db_id).
@@ -445,7 +494,26 @@ mod tests {
         assert_eq!(meta.agents[0].display_name, "alpha");
         assert_eq!(meta.agents[0].db_id, agent.db_id.to_string());
 
-        // 3. Agent's history store has one entry for this session.
+        // 3. Session auth delegates to the agent's DB (any agent-DB keyholder
+        //    inherits authority on the session).
+        let settings_doc = session_db
+            .get_settings()
+            .await
+            .unwrap()
+            .get_auth_doc_for_validation()
+            .await
+            .unwrap();
+        let deleg_key = format!("delegations.{}", agent.db_id);
+        assert!(
+            matches!(
+                settings_doc.get(&deleg_key),
+                Some(eidetica::crdt::doc::Value::Doc(_))
+            ),
+            "session must delegate auth to the agent DB"
+        );
+
+        // 4. Agent's history store has one entry, and the session is listed in
+        //    the agent's synced session registry.
         let user = registry.user.lock().await;
         let agent_db = user.open_database(&agent.db_id).await.unwrap();
         let txn = agent_db.new_transaction().await.unwrap();
@@ -456,6 +524,17 @@ mod tests {
         let rows = history.search(|_| true).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.session_db_id, session_id);
+        drop(txn);
+
+        let agent_handle = AgentDb::from_database(agent_db);
+        let reg = agent_handle.find_session_ref(&session_id).await.unwrap();
+        assert_eq!(
+            reg,
+            Some(SessionRef {
+                session_db_id: session_id.clone(),
+                exposed_on: Vec::new(),
+            })
+        );
     }
 
     #[tokio::test]
