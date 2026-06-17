@@ -67,35 +67,17 @@ impl SessionRegistry {
         session_db_id: &str,
         agent: &DbEntry,
     ) -> anyhow::Result<()> {
-        // 1. Session DB: grant Write permission to the agent's pubkey.
         let (_conv, session_db) = self.open_session(session_db_id).await?;
         let agent_key_name = format!("agent:{}", agent.display_name);
-        {
-            let txn = session_db.new_transaction().await?;
-            let settings = txn.get_settings()?;
-            settings
-                .set_auth_key(
-                    &agent.pubkey,
-                    AuthKey::active(Some(&agent_key_name), Permission::Write(10)),
-                )
-                .await?;
-            txn.commit().await?;
-        }
 
-        // 1b. Delegate the session's auth to the agent's DB. Any key authorized
-        //     on the agent DB — the daemon (Admin) and a dumb bridge (its
-        //     `bridge` key, Write) — thereby inherits authority on this session
-        //     via eidetica's delegation resolver, clamped to the bound below,
-        //     with no per-session key grant. This is what lets the daemon run
-        //     the agent on a session a bridge created, and a bridge proxy into a
-        //     session the daemon created. Keyed by the agent DB's root, so a
-        //     re-attach upserts (idempotent).
+        // Open the agent DB up front: its tips feed the delegation below, and
+        // its handle records the registry listing afterward.
         let agent_db = {
             let user = self.user.lock().await;
             user.open_database(&agent.db_id).await?
         };
         let agent_tips = agent_db.snapshot().await?.into_tips();
-        let tree_ref = DelegatedTreeRef {
+        let delegation = DelegatedTreeRef {
             permission_bounds: PermissionBounds {
                 max: Permission::Admin(0),
                 min: None,
@@ -105,16 +87,33 @@ impl SessionRegistry {
                 tips: agent_tips,
             },
         };
+
+        // 1. Session auth, in one commit. Two distinct things:
+        //    - grant the agent's own pubkey Write — the authoritative membership
+        //      marker (an agent is on the session iff its pubkey has Write;
+        //      `SessionMeta.agents` mirrors it, resolution reads it).
+        //    - delegate to the agent DB so the agent DB's *other* keyholders —
+        //      the daemon (Admin) and a dumb bridge (its `bridge` key, Write) —
+        //      inherit authority via eidetica's delegation resolver, with no
+        //      per-session grant. This is what lets the daemon run the agent on a
+        //      session a bridge created, and a bridge proxy into a session the
+        //      daemon created. Keyed by the agent DB root → re-attach upserts.
         {
             let txn = session_db.new_transaction().await?;
             let settings = txn.get_settings()?;
-            settings.add_delegated_tree(tree_ref).await?;
+            settings
+                .set_auth_key(
+                    &agent.pubkey,
+                    AuthKey::active(Some(&agent_key_name), Permission::Write(10)),
+                )
+                .await?;
+            settings.add_delegated_tree(delegation).await?;
             txn.commit().await?;
         }
 
-        // 1c. List the session in the agent's synced session registry so peers
-        //     (notably the daemon) discover it. Non-clobbering: preserves any
-        //     bridge `exposed_on` a bridge has already recorded.
+        // 2. List the session in the agent's synced session registry so peers
+        //    (notably the daemon's watch loop) discover it. Non-clobbering:
+        //    preserves any bridge `exposed_on` already recorded.
         let agent_handle = AgentDb::from_database(agent_db);
         if agent_handle
             .find_session_ref(session_db_id)
@@ -129,7 +128,7 @@ impl SessionRegistry {
                 .await?;
         }
 
-        // 2. SessionMeta: upsert the AgentRef (dedup by db_id).
+        // 3. SessionMeta: upsert the AgentRef (dedup by db_id).
         //
         // `home_pubkey` defaults to the attaching peer's pubkey on the agent
         // DB — the attacher becomes the home peer for this (session, agent)
@@ -150,7 +149,7 @@ impl SessionRegistry {
         })
         .await?;
 
-        // 3. Agent DB: append history entry. Best-effort — a failure here
+        // 4. Agent DB: append history entry. Best-effort — a failure here
         //    doesn't unwind the attach (the session-side change has already
         //    committed and sync'd).
         if let Err(e) = self.append_agent_history(&agent.db_id, session_db_id).await {
@@ -216,6 +215,41 @@ impl SessionRegistry {
                 session_db_id,
                 "Detached agent was the session host — cleared host_agent_db_id"
             );
+        }
+
+        // Drop this session from the agent's synced registry — it's no longer
+        // one of the agent's sessions (other attached agents keep their own
+        // registry entries). Best-effort, like the history append: a failure
+        // here must not unwind the detach.
+        //
+        // NOTE: the auth *delegation* added to the session on attach is left in
+        // place. eidetica has no delegation-removal API
+        // (`add`/`get`/`get_all_delegated_trees` only), so a detached agent DB's
+        // keyholders retain a secondary access path to the session until one
+        // lands. Tracked in the eidetica friction notes.
+        {
+            let agent_db = {
+                let user = self.user.lock().await;
+                user.open_database(&agent.db_id).await
+            };
+            match agent_db {
+                Ok(db) => {
+                    if let Err(e) = AgentDb::from_database(db)
+                        .deregister_session_ref(session_db_id)
+                        .await
+                    {
+                        warn!(
+                            agent = %agent.display_name,
+                            session_db_id,
+                            "Failed to deregister session from agent registry on detach: {e}"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    agent = %agent.display_name,
+                    "Could not open agent DB to deregister session on detach: {e}"
+                ),
+            }
         }
 
         // No routine sweep needed — schedules are now agent-owned
@@ -534,6 +568,44 @@ mod tests {
                 session_db_id: session_id.clone(),
                 exposed_on: Vec::new(),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_removes_session_from_agent_registry() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+        let agent = make_agent_entry(&registry, "alpha").await;
+
+        registry
+            .attach_agent_to_session(&session_id, &agent)
+            .await
+            .unwrap();
+        // Attach listed it…
+        let handle = {
+            let user = registry.user.lock().await;
+            AgentDb::from_database(user.open_database(&agent.db_id).await.unwrap())
+        };
+        assert!(
+            handle
+                .find_session_ref(&session_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        registry
+            .detach_agent_from_session(&session_id, &agent)
+            .await
+            .unwrap();
+        // …detach drops it from the agent's registry.
+        assert!(
+            handle
+                .find_session_ref(&session_id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
