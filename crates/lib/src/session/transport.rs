@@ -145,6 +145,22 @@ impl SessionRegistry {
         let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? else {
             return Ok(None);
         };
+        self.find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
+            .await
+    }
+
+    /// Walk an already-opened agent DB's session registry for the session bound
+    /// to `(transport, login_id, channel)` and exposed on `bridge_label`. Split
+    /// from [`Self::find_channel_session`] so [`Self::get_or_create_channel_session`]
+    /// can open the agent DB once and re-check under its create lock.
+    async fn find_channel_session_in(
+        &self,
+        agent_db: &crate::agent_db::AgentDb,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+    ) -> anyhow::Result<Option<(ConversationId, Database)>> {
         for r in agent_db.list_session_refs().await? {
             if !r.exposed_on.iter().any(|b| b == bridge_label) {
                 continue;
@@ -179,8 +195,32 @@ impl SessionRegistry {
         login_id: &str,
         channel: &str,
     ) -> anyhow::Result<(ConversationId, Database)> {
+        // Open the agent DB once, up front. `None` → `find_key` so the bridge
+        // opens it under its own `bridge` key (it doesn't hold the agent's key);
+        // see find_channel_session. A `None` here means we hold no key for the
+        // agent DB yet (not synced / wrong peer) — bail rather than create:
+        // creating a session we can't register in the (unreadable) agent
+        // registry would fragment a channel that may already have one.
+        let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? else {
+            anyhow::bail!(
+                "agent DB {} not openable on this peer (key not synced yet?); \
+                 refusing to create a channel session that could duplicate an existing one",
+                agent.db_id
+            );
+        };
+
+        // Serialize get-or-create per channel: two concurrent inbound messages
+        // on a brand-new channel must not both miss the walk and both create a
+        // session. The lock spans the re-check below and the create.
+        let lock = self
+            .channel_create_lock(&channel_key(transport, login_id, channel))
+            .await;
+        let _guard = lock.lock().await;
+
+        // Look up under the lock — a racing caller may have created the session
+        // while we waited on the lock.
         if let Some(found) = self
-            .find_channel_session(agent, bridge_label, transport, login_id, channel)
+            .find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
             .await?
         {
             return Ok(found);
@@ -195,13 +235,9 @@ impl SessionRegistry {
         // session auth to the agent DB, and lists the session in the agent
         // registry (exposed_on empty until the expose below).
         self.ensure_session_host(&session_db_id, agent).await?;
-        // `None` → `find_key` so the bridge opens the agent DB under its own
-        // `bridge` key (it doesn't hold the agent's key); see find_channel_session.
-        if let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? {
-            agent_db
-                .expose_session_on(&session_db_id, bridge_label)
-                .await?;
-        }
+        agent_db
+            .expose_session_on(&session_db_id, bridge_label)
+            .await?;
         Ok((conv, db))
     }
 }

@@ -53,6 +53,12 @@ pub struct SessionRegistry {
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
+    /// Per-`(transport, login_id, channel)` locks serializing get-or-create in
+    /// [`super::transport`], so two concurrent inbound messages on a brand-new
+    /// channel can't both miss the registry walk and both create a session.
+    /// Keyed by `transport::channel_key`. Grows by distinct channel seen
+    /// (bounded; never pruned — entries are tiny).
+    pub(super) channel_create_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
 }
 
 pub(super) const STORE_SESSIONS: &str = "sessions";
@@ -113,7 +119,21 @@ impl SessionRegistry {
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
+            channel_create_locks: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Get (or create) the per-channel get-or-create lock for `key`
+    /// (`transport::channel_key`). Held across the find→create critical section
+    /// so concurrent inbound messages on a new channel serialize instead of
+    /// both creating a session.
+    pub(super) async fn channel_create_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        self.channel_create_locks
+            .lock()
+            .await
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Take the new-session event receiver. Can only be called once.
