@@ -153,6 +153,38 @@ written into the per-channel session DBs (which sync to the daemon), the daemon'
 agents respond, and the replies sync back for the bridge to deliver. Day-to-day
 commands (`!chaz …`) are documented on the per-transport pages.
 
+The bridge runs no agent of its own — it only carries messages. The daemon
+discovers each channel's session (the bridge marks it _exposed_ in the agent DB's
+synced session registry), runs the agent, and writes the reply back. The full
+data flow — session-DB bindings, the registry watch, the reconcile delivery, and
+the approval protocol below — is documented internally in
+[Dumb Transport Bridges](../design/transport_bridges.md).
+
+## Approving tools from a room
+
+When an agent wants to run a tool that requires approval (see
+[Security → Tool Approval](security.md#tool-approval)), the daemon posts a prompt
+into the room/channel the turn came from:
+
+```text
+🔒 Tool approval required
+Tool: shell
+Risk: High
+Args: rm -rf ./build
+React: ✅ approve · ❌ deny · ⏭ approve all
+Or reply: !chaz approve / !chaz deny
+```
+
+**React** ✅ / ❌ / ⏭ on the prompt (Discord seeds the reactions for you; on
+Matrix add them yourself), or reply `!chaz approve` / `!chaz deny` to resolve the
+oldest pending prompt in that room. The decision travels back to the daemon over
+the synced session DB and the turn continues.
+
+This is **fail-closed**: if no one responds within 30 minutes, or the bridge is
+offline when the agent asks, the tool is **denied** — a bridge-exposed session
+never runs an approval-required tool unsupervised. Which tools ask in the first
+place is set by `auto_approved_tools` / `tool_policies.*.approval` on the daemon.
+
 ## Running as a service
 
 Bridges are long-lived and operator-supervised — run them under `systemd` (or
@@ -208,6 +240,8 @@ syncing (see [Sharing & Sync → Troubleshooting](session_sharing.md#troubleshoo
 
 ## See also
 
+- [Dumb Transport Bridges](../design/transport_bridges.md) — the internal
+  architecture: how the daemon runs exposed sessions and the approval protocol
 - [Matrix Bot](matrix.md) — Matrix-specific config, commands, behavior
 - [Discord Bot](discord.md) — Discord-specific config and portal setup
 - [Sharing & Sync](session_sharing.md) — tickets, `/agent share`, the

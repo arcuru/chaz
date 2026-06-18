@@ -13,6 +13,8 @@ enum EntryType {
     Ack,        // Agent is processing (thinking indicator)
     Error,      // An error occurred
     Summary,    // Compacted summary of older messages (context-builder boundary)
+    ApprovalRequest,  // Tool approval requested (control entry, daemon → bridge)
+    ApprovalDecision, // Human's approval decision (control entry, bridge → daemon)
 }
 ```
 
@@ -25,6 +27,8 @@ Only `Message`, `Directive`, and `Summary` entries enter the conversation portio
 The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills, memory recall, …) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
 
 `ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its own in-memory tool call history for the ReAct loop. Session-level tool entries exist for audit trail and TUI display only.
+
+`ApprovalRequest` and `ApprovalDecision` are **control entries** for the tool-approval protocol a dumb bridge relays over the session DB — also excluded from the LLM context, from bridge message delivery, and from waking an agent turn. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db).
 
 ### Assistant `ResponseMetadata`
 

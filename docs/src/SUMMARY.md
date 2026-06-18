@@ -33,6 +33,7 @@
 
 - [Capability Tiers](design/capability_tiers.md)
 - [Session Messaging Primitive](design/session_messaging.md)
+- [Dumb Transport Bridges](design/transport_bridges.md)
 - [Autonomous Agents in Shared Sessions](design/autonomous_agents.md)
 - [Agent-Owned Schedules](design/agent_schedules.md)
 - [Agent State Admin Capability](design/agent_state_admin.md)

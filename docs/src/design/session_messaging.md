@@ -37,14 +37,17 @@ graph LR
     end
 ```
 
-| Type         | In LLM Context | Source                 | Purpose                            |
-| ------------ | :------------: | ---------------------- | ---------------------------------- |
-| `Message`    |      Yes       | Users, agents          | Chat messages                      |
-| `Directive`  |      Yes       | spawn_agent, scheduler | Task instructions to an agent      |
-| `ToolCall`   |       No       | Runtime event sink     | Audit: tool was invoked            |
-| `ToolResult` |       No       | Runtime event sink     | Audit: tool returned               |
-| `Ack`        |       No       | Server                 | Status: agent is processing        |
-| `Error`      |       No       | Server                 | Status: agent encountered an error |
+| Type               | In LLM Context | Source                  | Purpose                            |
+| ------------------ | :------------: | ----------------------- | ---------------------------------- |
+| `Message`          |      Yes       | Users, agents           | Chat messages                      |
+| `Directive`        |      Yes       | spawn_agent, scheduler  | Task instructions to an agent      |
+| `ToolCall`         |       No       | Runtime event sink      | Audit: tool was invoked            |
+| `ToolResult`       |       No       | Runtime event sink      | Audit: tool returned               |
+| `Ack`              |       No       | Server                  | Status: agent is processing        |
+| `Error`            |       No       | Server                  | Status: agent encountered an error |
+| `Summary`          |    Boundary    | /compact                | Context start boundary             |
+| `ApprovalRequest`  |       No       | Approval proxy (daemon) | Control: tool approval requested   |
+| `ApprovalDecision` |       No       | Bridge                  | Control: human's approval decision |
 
 `Directive` entries are included in the LLM context as `user` role messages. This is because they are instructions to the agent, functionally equivalent to a user message.
 

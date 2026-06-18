@@ -68,7 +68,10 @@ Approval levels:
 - **UnlessAutoApproved** -- runs if in `auto_approved_tools`, asks otherwise
 - **Always** -- always asks the user
 
-In the TUI, approval is an inline y/n/a prompt. In Matrix, unapproved tools time out (Matrix approval UX is planned).
+How you're asked depends on the surface:
+
+- **TUI** — an inline y/n/a prompt.
+- **Matrix / Discord** — the daemon posts a 🔒 approval prompt into the room/channel; **react** ✅ approve · ❌ deny · ⏭ approve-all, or reply `!chaz approve` / `!chaz deny`. The decision rides back to the daemon over the session DB. This is **fail-closed**: if no one answers within 30 minutes, or the bridge is down, the tool is **denied**, never run unsupervised. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db) for the mechanism.
 
 ## Capability Grants
 

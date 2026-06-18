@@ -32,7 +32,7 @@ kind and is active on the session.
 
 1. **Rate limiting**: If the tool's resolved policy carries a `rate_limit`, a sliding-window counter checks the call frequency. Excess calls are rejected before execution.
 
-2. **Approval gate**: Checks the tool's `ApprovalRequirement` against the `SecurityContext`. If approval is needed, sends an `ApprovalExchange` to the bridge and waits for the user's decision (`Approve`, `Deny`, `ApproveAll`). `ApproveAll` skips approval for the rest of the turn.
+2. **Approval gate**: Checks the tool's `ApprovalRequirement` against the `SecurityContext`. If approval is needed, sends an `ApprovalExchange` over `SecurityContext.approval_callback` and blocks on the decision (`Approve`, `Deny`, `ApproveAll`); `ApproveAll` skips approval for the rest of the turn. What consumes that channel depends on the session: an interactive TUI prompts inline; a bridge-exposed session's daemon proxies the request over the session DB to the bridge (see [Dumb Transport Bridges → Tool approvals](../design/transport_bridges.md#tool-approvals-over-the-session-db)); a session with no approval channel **denies** (fail-closed).
 
 3. **`tool_call` extension hook**: Extensions can mutate the arguments or return `ToolCallDecision::Block { reason }` to short-circuit the call (e.g. `path_normalizer` strips trailing `/` from path args; `security_warnings` is `tool_result`-only).
 
