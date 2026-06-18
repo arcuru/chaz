@@ -21,7 +21,9 @@ use chaz_core::security::SecretStore;
 use serde::Deserialize;
 
 /// The Matrix bridge's own config file.
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` is hand-written to redact `unlock_password` (a literal value is a
+/// valid config, so it can be a plaintext secret).
+#[derive(Clone, Deserialize)]
 pub struct MatrixBridgeConfig {
     /// State directory for the bridge's eidetica DB + key material. When unset
     /// the binary falls back to a platform default.
@@ -40,6 +42,17 @@ pub struct MatrixBridgeConfig {
     /// The per-agent logins this bridge manages.
     #[serde(default)]
     pub logins: Vec<MatrixLoginConfig>,
+}
+
+impl std::fmt::Debug for MatrixBridgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixBridgeConfig")
+            .field("state_dir", &self.state_dir)
+            .field("label", &self.label)
+            .field("unlock_password", &"<redacted>")
+            .field("logins", &self.logins)
+            .finish()
+    }
 }
 
 /// One login a Matrix bridge manages, tying Matrix credentials to the agent

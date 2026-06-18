@@ -22,7 +22,9 @@ use serde::Deserialize;
 use std::collections::HashSet;
 
 /// The Discord bridge's own config file.
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` is hand-written to redact `unlock_password` (a literal value is a
+/// valid config, so it can be a plaintext secret).
+#[derive(Clone, Deserialize)]
 pub struct DiscordBridgeConfig {
     /// State directory for the bridge's eidetica DB + key material. When unset
     /// the binary falls back to a platform default.
@@ -43,9 +45,22 @@ pub struct DiscordBridgeConfig {
     pub logins: Vec<DiscordLoginConfig>,
 }
 
+impl std::fmt::Debug for DiscordBridgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordBridgeConfig")
+            .field("state_dir", &self.state_dir)
+            .field("label", &self.label)
+            .field("unlock_password", &"<redacted>")
+            .field("logins", &self.logins)
+            .finish()
+    }
+}
+
 /// One login a Discord bridge manages, tying a bot token to the agent that
 /// owns it.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is hand-written to redact `bot_token`.
+#[derive(Clone, Deserialize)]
 pub struct DiscordLoginConfig {
     /// Display name of the agent this login belongs to. Its AgentDb is where
     /// the public `LoginRef` pointer gets registered.
@@ -70,6 +85,18 @@ pub struct DiscordLoginConfig {
     /// Empty means "allow everyone".
     #[serde(default)]
     pub allowed_users: HashSet<u64>,
+}
+
+impl std::fmt::Debug for DiscordLoginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordLoginConfig")
+            .field("agent", &self.agent)
+            .field("ticket", &self.ticket)
+            .field("login_id", &self.login_id)
+            .field("bot_token", &self.bot_token.as_ref().map(|_| "<redacted>"))
+            .field("allowed_users", &self.allowed_users)
+            .finish()
+    }
 }
 
 fn default_label() -> String {

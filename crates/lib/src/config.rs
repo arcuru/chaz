@@ -99,7 +99,10 @@ pub enum TransportConfig {
 }
 
 /// Matrix-transport credentials + per-login overrides.
-#[derive(Debug, Deserialize, Clone)]
+///
+/// `Debug` is hand-written to redact `password` — deriving it would let any
+/// `{:?}` of a containing config (`LoginConfig`, `Config`) print the secret.
+#[derive(Deserialize, Clone)]
 pub struct MatrixLogin {
     /// Matrix homeserver URL.
     pub homeserver_url: String,
@@ -111,6 +114,18 @@ pub struct MatrixLogin {
     pub allow_list: Option<String>,
     /// Per-login room size limit. Falls back to top-level `room_size_limit`.
     pub room_size_limit: Option<usize>,
+}
+
+impl std::fmt::Debug for MatrixLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixLogin")
+            .field("homeserver_url", &self.homeserver_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("allow_list", &self.allow_list)
+            .field("room_size_limit", &self.room_size_limit)
+            .finish()
+    }
 }
 
 impl LoginConfig {

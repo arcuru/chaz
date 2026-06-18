@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 /// already been expanded at seed time), so the bridge never has to re-resolve
 /// it at login. `allow_list` / `room_size_limit` are the runtime message
 /// filters this login enforces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` is hand-written to redact `password`; deriving it would print the
+/// resolved secret on any `{:?}`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixCredentials {
     /// Matrix homeserver URL to connect to.
     pub homeserver_url: String,
@@ -34,4 +36,37 @@ pub struct MatrixCredentials {
     /// Largest room (member count) this login will respond in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_size_limit: Option<usize>,
+}
+
+impl std::fmt::Debug for MatrixCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixCredentials")
+            .field("homeserver_url", &self.homeserver_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("allow_list", &self.allow_list)
+            .field("room_size_limit", &self.room_size_limit)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let creds = MatrixCredentials {
+            homeserver_url: "https://hs.example".to_string(),
+            username: "@bot:example".to_string(),
+            password: Some("hunter2-super-secret".to_string()),
+            allow_list: None,
+            room_size_limit: None,
+        };
+        let rendered = format!("{creds:?}");
+        assert!(!rendered.contains("hunter2"), "password leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+        // Non-secret fields still render, for debuggability.
+        assert!(rendered.contains("@bot:example"));
+    }
 }
