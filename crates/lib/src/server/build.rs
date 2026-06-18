@@ -875,8 +875,15 @@ pub(crate) async fn register_exposed_sessions(
             }
             match registry.open_session(&r.session_db_id).await {
                 Ok((_conv, sdb)) => {
+                    // Proxy tool approvals over the session DB: the runtime
+                    // blocks on this channel, the proxy writes a request entry,
+                    // and the exposing bridge renders it + writes the decision.
+                    let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
+                        sdb.clone(),
+                        entry.display_name.clone(),
+                    );
                     if let Err(e) = server
-                        .register_session(&sdb, default_backend.clone(), None, None)
+                        .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
                         .await
                     {
                         warn!(session_db_id = %r.session_db_id, "register exposed session failed: {e}");

@@ -20,7 +20,8 @@ use crate::session::{EntryRouting, EntryType, Session, SessionEntry, TransportRe
 use crate::tool::ToolApprovalInfo;
 use crate::types::ConversationId;
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tracing::error;
@@ -50,6 +51,150 @@ pub enum ApprovalDecision {
     Deny,
     /// Approve this and all remaining tool calls this turn
     ApproveAll,
+}
+
+impl ApprovalDecision {
+    /// Stable wire token for an [`EntryType::ApprovalDecision`] payload.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            ApprovalDecision::Approve => "approve",
+            ApprovalDecision::Deny => "deny",
+            ApprovalDecision::ApproveAll => "approve_all",
+        }
+    }
+
+    /// Parse a wire token back into a decision. Unknown tokens are `None`.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(ApprovalDecision::Approve),
+            "deny" => Some(ApprovalDecision::Deny),
+            "approve_all" => Some(ApprovalDecision::ApproveAll),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool-approval proxy over the session DB (transport-generic protocol)
+// ---------------------------------------------------------------------------
+//
+// A dumb bridge runs no agent, so the in-process approval callback can't reach
+// the human on the transport. Instead the daemon's runtime blocks on
+// `request_approval`; its per-session proxy writes an `ApprovalRequest` entry
+// into the session DB; the bridge renders it, captures the human's reaction,
+// and writes an `ApprovalDecision` entry; the proxy matches it back by
+// `request_id` and unblocks the runtime. Both entry kinds are control records:
+// excluded from LLM context and never delivered as chat. The payloads below are
+// the contract both peers serialize into `SessionEntry::content`.
+
+/// JSON payload of an [`EntryType::ApprovalRequest`] session entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalRequestPayload {
+    /// Correlates the request with its [`ApprovalDecisionPayload`]. A fresh
+    /// UUID per request.
+    pub request_id: String,
+    pub tool_name: String,
+    /// `RiskLevel` rendered for display (`{:?}`); informational only.
+    pub risk_level: String,
+    /// Redacted argument preview the human sees before deciding.
+    pub arguments_display: String,
+}
+
+/// JSON payload of an [`EntryType::ApprovalDecision`] session entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalDecisionPayload {
+    pub request_id: String,
+    /// One of [`ApprovalDecision::as_wire`].
+    pub decision: String,
+}
+
+/// Build a fresh `ApprovalRequest` session entry from a runtime approval ask.
+/// Returns the generated `request_id` alongside the entry so the caller can
+/// track the pending exchange.
+pub fn approval_request_entry(
+    agent_sender: &str,
+    info: &ToolApprovalInfo,
+) -> (String, SessionEntry) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let payload = ApprovalRequestPayload {
+        request_id: request_id.clone(),
+        tool_name: info.name.clone(),
+        risk_level: format!("{:?}", info.risk_level),
+        arguments_display: info.arguments_display.clone(),
+    };
+    let entry = SessionEntry {
+        sender: agent_sender.to_string(),
+        content: serde_json::to_string(&payload).unwrap_or_default(),
+        timestamp: Utc::now(),
+        entry_type: EntryType::ApprovalRequest,
+        metadata: None,
+        routing: None,
+    };
+    (request_id, entry)
+}
+
+/// Build an `ApprovalDecision` session entry resolving `request_id`.
+pub fn approval_decision_entry(
+    approver: &str,
+    request_id: &str,
+    decision: ApprovalDecision,
+) -> SessionEntry {
+    let payload = ApprovalDecisionPayload {
+        request_id: request_id.to_string(),
+        decision: decision.as_wire().to_string(),
+    };
+    SessionEntry {
+        sender: approver.to_string(),
+        content: serde_json::to_string(&payload).unwrap_or_default(),
+        timestamp: Utc::now(),
+        entry_type: EntryType::ApprovalDecision,
+        metadata: None,
+        routing: None,
+    }
+}
+
+/// Parse an [`EntryType::ApprovalRequest`] entry's payload, or `None` if it is
+/// a different entry kind or malformed.
+pub fn parse_approval_request(entry: &SessionEntry) -> Option<ApprovalRequestPayload> {
+    (entry.entry_type == EntryType::ApprovalRequest)
+        .then(|| serde_json::from_str(&entry.content).ok())
+        .flatten()
+}
+
+/// Parse an [`EntryType::ApprovalDecision`] entry's payload, or `None`.
+pub fn parse_approval_decision(entry: &SessionEntry) -> Option<ApprovalDecisionPayload> {
+    (entry.entry_type == EntryType::ApprovalDecision)
+        .then(|| serde_json::from_str(&entry.content).ok())
+        .flatten()
+}
+
+/// Map every resolved `request_id` to its decision. The daemon proxy uses this
+/// to match incoming decisions back to blocked requests.
+pub fn resolved_decisions(entries: &[SessionEntry]) -> HashMap<String, ApprovalDecision> {
+    entries
+        .iter()
+        .filter_map(parse_approval_decision)
+        .filter_map(|p| ApprovalDecision::from_wire(&p.decision).map(|d| (p.request_id, d)))
+        .collect()
+}
+
+/// Approval requests with no matching decision yet and not already in `seen`.
+/// The bridge renders these and adds their `request_id`s to `seen` so a request
+/// is prompted exactly once even as the session DB churns.
+pub fn unrendered_approval_requests(
+    entries: &[SessionEntry],
+    seen: &HashSet<String>,
+) -> Vec<ApprovalRequestPayload> {
+    let decided: HashSet<String> = entries
+        .iter()
+        .filter_map(parse_approval_decision)
+        .map(|p| p.request_id)
+        .collect();
+    entries
+        .iter()
+        .filter_map(parse_approval_request)
+        .filter(|p| !decided.contains(&p.request_id) && !seen.contains(&p.request_id))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +474,79 @@ mod tests {
         assert_eq!(src.channel, "chan-42");
         assert_eq!(src.sender.as_deref(), Some("@user:x"));
         assert_eq!(src.message_id.as_deref(), Some("msg-7"));
+    }
+
+    fn approval_info(name: &str) -> ToolApprovalInfo {
+        ToolApprovalInfo {
+            name: name.to_string(),
+            arguments_display: "{\"path\":\"/etc\"}".to_string(),
+            risk_level: crate::tool::RiskLevel::High,
+        }
+    }
+
+    #[test]
+    fn approval_request_and_decision_round_trip() {
+        let (request_id, req) = approval_request_entry("ava", &approval_info("shell"));
+        assert_eq!(req.entry_type, EntryType::ApprovalRequest);
+        assert_eq!(req.sender, "ava");
+        let parsed = parse_approval_request(&req).expect("request payload");
+        assert_eq!(parsed.request_id, request_id);
+        assert_eq!(parsed.tool_name, "shell");
+        assert_eq!(parsed.risk_level, "High");
+
+        let dec = approval_decision_entry("@human:x", &request_id, ApprovalDecision::ApproveAll);
+        assert_eq!(dec.entry_type, EntryType::ApprovalDecision);
+        let dp = parse_approval_decision(&dec).expect("decision payload");
+        assert_eq!(dp.request_id, request_id);
+        assert_eq!(dp.decision, "approve_all");
+
+        // The proxy's resolver view maps the request_id back to the decision.
+        let resolved = resolved_decisions(&[req, dec]);
+        assert_eq!(
+            resolved.get(&request_id),
+            Some(&ApprovalDecision::ApproveAll)
+        );
+    }
+
+    #[test]
+    fn wrong_entry_kind_parses_to_none() {
+        let msg = entry("ava", "hi", 1, EntryType::Message);
+        assert!(parse_approval_request(&msg).is_none());
+        assert!(parse_approval_decision(&msg).is_none());
+    }
+
+    #[test]
+    fn unrendered_skips_decided_and_seen_requests() {
+        let (rid_open, open) = approval_request_entry("ava", &approval_info("a"));
+        let (rid_done, done) = approval_request_entry("ava", &approval_info("b"));
+        let (rid_seen, seen_req) = approval_request_entry("ava", &approval_info("c"));
+        let done_decision = approval_decision_entry("@h:x", &rid_done, ApprovalDecision::Deny);
+
+        let entries = vec![open, done, seen_req, done_decision];
+        let mut seen = HashSet::new();
+        seen.insert(rid_seen.clone());
+
+        let got: Vec<String> = unrendered_approval_requests(&entries, &seen)
+            .into_iter()
+            .map(|p| p.request_id)
+            .collect();
+        // `rid_done` has a decision, `rid_seen` is already rendered → only the
+        // genuinely-open request surfaces.
+        assert_eq!(got, vec![rid_open]);
+        assert!(!got.contains(&rid_done));
+        assert!(!got.contains(&rid_seen));
+    }
+
+    #[test]
+    fn decision_wire_tokens_round_trip() {
+        for d in [
+            ApprovalDecision::Approve,
+            ApprovalDecision::Deny,
+            ApprovalDecision::ApproveAll,
+        ] {
+            assert_eq!(ApprovalDecision::from_wire(d.as_wire()), Some(d));
+        }
+        assert_eq!(ApprovalDecision::from_wire("garbage"), None);
     }
 
     /// A send closure backed by shared state: it records every body it

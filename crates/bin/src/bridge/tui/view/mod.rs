@@ -573,6 +573,24 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
                 }
                 lines.push(Line::from(""));
             }
+            EntryType::ApprovalRequest => {
+                let label = chaz_core::bridge::parse_approval_request(entry)
+                    .map(|p| format!("🔒 approval requested: {}", p.tool_name))
+                    .unwrap_or_else(|| "🔒 approval requested".to_string());
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}  {label}"),
+                    dim,
+                )]));
+            }
+            EntryType::ApprovalDecision => {
+                let label = chaz_core::bridge::parse_approval_decision(entry)
+                    .map(|p| format!("🔓 approval {}", p.decision))
+                    .unwrap_or_else(|| "🔓 approval decision".to_string());
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}  {label}"),
+                    dim,
+                )]));
+            }
         }
     }
 

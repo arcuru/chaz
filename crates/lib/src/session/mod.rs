@@ -59,6 +59,18 @@ pub enum EntryType {
     /// A compacted summary of older messages, written by /compact or the compact tool.
     /// Context builder treats the most recent Summary as the start boundary.
     Summary,
+    /// A tool-approval request the daemon proxies over the session DB: the
+    /// runtime blocks on it while a bridge renders the prompt and a human
+    /// decides. Content is a JSON [`crate::bridge::ApprovalRequestPayload`].
+    /// Excluded from LLM context and from bridge message delivery; never wakes
+    /// an agent turn.
+    ApprovalRequest,
+    /// A human's decision on an [`EntryType::ApprovalRequest`], written by the
+    /// bridge that captured the reaction/command. Content is a JSON
+    /// [`crate::bridge::ApprovalDecisionPayload`]. The daemon's approval proxy
+    /// matches it back to the blocked request by `request_id`. Same exclusions
+    /// as `ApprovalRequest`.
+    ApprovalDecision,
 }
 
 /// An entry in a session. Participants (human users and AI agents) are

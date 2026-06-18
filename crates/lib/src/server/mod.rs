@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, error, info};
 
+mod approval_proxy;
 mod build;
 mod schedule;
 
