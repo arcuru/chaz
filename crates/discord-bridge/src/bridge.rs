@@ -19,9 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chaz_core::backends::BackendManager;
-use chaz_core::bridge::{
-    ApprovalDecision, ApprovalExchange, Bridge, attach_reconciler, inbound_user_entry,
-};
+use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
 use chaz_core::commands::{self, CommandContext, CommandOutcome, Parsed};
 use chaz_core::config::Config;
 use chaz_core::hosted_index::DbEntry;
@@ -37,7 +35,7 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::credentials::DiscordCredentials;
@@ -79,7 +77,9 @@ impl Bridge for DiscordBridge {
         // Discord developer portal for the bot, or message bodies arrive empty.
         let intents = GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT;
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILD_MESSAGE_REACTIONS
+            | GatewayIntents::DIRECT_MESSAGE_REACTIONS;
 
         let handler = Handler {
             server,
@@ -89,6 +89,8 @@ impl Bridge for DiscordBridge {
             config: self.config.clone(),
             allowed_users: self.creds.allowed_users.clone(),
             attached: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            bot_id: Arc::new(Mutex::new(None)),
         };
 
         let mut client = Client::builder(&token, intents)
@@ -118,6 +120,12 @@ struct Handler {
     /// Session db ids that already have a reconciler installed — guards the
     /// `on_write` callback against double-install on later messages.
     attached: Arc<Mutex<HashSet<String>>>,
+    /// Posted tool-approval prompts awaiting a reaction/command, keyed by the
+    /// prompt message id.
+    pending: PendingApprovals,
+    /// This bot's user id, learned in `ready` — used to ignore its own seed
+    /// reactions on approval prompts.
+    bot_id: Arc<Mutex<Option<UserId>>>,
 }
 
 impl Handler {
@@ -221,6 +229,9 @@ impl Handler {
             return Ok(());
         }
         drop(attached);
+        // Same session DB, two watchers: deliver agent replies, and surface
+        // tool-approval prompts the daemon proxied here.
+        attach_approval_watcher(session_db, http.clone(), channel_id, self.pending.clone()).await?;
         attach_reconciler(
             session_db,
             self.server.agents_arc(),
@@ -318,6 +329,17 @@ impl Handler {
         let verb = inner.split_whitespace().next().unwrap_or("");
         if verb.is_empty() || verb == "help" {
             msg.channel_id.say(&ctx.http, help_text()).await?;
+            return Ok(());
+        }
+        if verb == "approve" || verb == "deny" {
+            resolve_pending_approval(
+                &ctx.http,
+                msg.channel_id,
+                &self.pending,
+                &msg.author.id.to_string(),
+                verb == "approve",
+            )
+            .await;
             return Ok(());
         }
 
@@ -439,127 +461,154 @@ fn help_text() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Parked approval scaffolding — reused in Stage 4 (TODO-7755e097).
+// Tool-approval relay over the session DB.
 //
-// The dumb bridge no longer runs the agent, so a tool-approval request no
-// longer arrives over an in-process mpsc from a co-located runtime — the trigger
-// (`register_session`'s approval channel) is gone. The render-the-prompt /
-// capture-the-reaction half below is transport code that comes back near
-// verbatim once approvals are proxied over the session DB (the daemon writes a
-// request entry → the bridge renders it + captures the reaction → the bridge
-// writes a decision entry → the daemon resolves the `ApprovalExchange`). Kept
-// compiling behind `allow(dead_code)` rather than resurrected from git history;
-// Stage 4 rewires it to the session-DB watcher.
+// The dumb bridge runs no agent, so an approval request arrives as an
+// `ApprovalRequest` entry the daemon's proxy writes into the (synced) session
+// DB. The watcher posts each new request to its channel with seeded ✅/❌/⏭️
+// reactions; a human's reaction (or `!chaz approve`/`deny`) writes an
+// `ApprovalDecision` entry back, which syncs to the daemon and unblocks the
+// runtime. The bridge holds no oneshot — the session DB is the whole channel.
 // ---------------------------------------------------------------------------
 
-/// Approval prompt message id → the channel waiting on a decision. A reaction
-/// on that message resolves it.
-#[allow(dead_code)]
-type PendingApprovals = Arc<Mutex<HashMap<MessageId, oneshot::Sender<ApprovalDecision>>>>;
-
-/// A tool-approval prompt routed to a specific channel.
-#[allow(dead_code)]
-struct ApprovalRequest {
+/// What a posted approval prompt resolves: the session DB to write the decision
+/// into, the request it answers, and the channel (so a `!chaz approve` command
+/// resolves the right channel's oldest pending prompt).
+struct PendingApproval {
+    session_db: eidetica::Database,
+    request_id: String,
     channel_id: ChannelId,
-    exchange: ApprovalExchange,
+}
+type PendingApprovals = Arc<Mutex<HashMap<MessageId, PendingApproval>>>;
+
+/// Render the approval prompt a human reacts to.
+fn approval_body(req: &chaz_core::bridge::ApprovalRequestPayload) -> String {
+    format!(
+        "🔒 **Tool approval required**\n\n\
+         **Tool:** `{}`\n\
+         **Risk:** {}\n\
+         **Args:** `{}`\n\n\
+         React: ✅ approve · ❌ deny · ⏭️ approve all\n\
+         Or reply: `!chaz approve` / `!chaz deny`",
+        req.tool_name, req.risk_level, req.arguments_display
+    )
 }
 
-/// Background task: turn each [`ApprovalRequest`] into a Discord prompt with
-/// seeded ✅/❌/⏭️ reactions, and remember the message so a reaction resolves
-/// the decision. Posting failure denies (safe default).
-#[allow(dead_code)]
-async fn approval_relay(
-    mut rx: mpsc::Receiver<ApprovalRequest>,
-    http: Arc<Http>,
-    pending: PendingApprovals,
+/// Write an `ApprovalDecision` entry resolving `request_id` into the session DB.
+/// The decision syncs to the daemon, whose proxy matches it back and unblocks
+/// the runtime's `request_approval`.
+async fn write_approval_decision(
+    session_db: &eidetica::Database,
+    approver: &str,
+    request_id: &str,
+    decision: ApprovalDecision,
 ) {
-    while let Some(req) = rx.recv().await {
-        let info = &req.exchange.info;
-        let body = format!(
-            "🔒 **Tool approval required**\n\n\
-             **Tool:** `{}`\n\
-             **Risk:** {:?}\n\
-             **Args:** `{}`\n\n\
-             React: ✅ approve · ❌ deny · ⏭️ approve all\n\
-             Or reply: `!chaz approve` / `!chaz deny`",
-            info.name, info.risk_level, info.arguments_display
-        );
-        match req.channel_id.say(&http, body).await {
-            Ok(msg) => {
-                for e in ["✅", "❌", "⏭️"] {
-                    let _ = msg.react(&http, ReactionType::Unicode(e.to_string())).await;
-                }
-                pending
-                    .lock()
-                    .await
-                    .insert(msg.id, req.exchange.decision_tx);
-            }
-            Err(e) => {
-                error!("Failed to post approval prompt: {e}");
-                let _ = req.exchange.decision_tx.send(ApprovalDecision::Deny);
-            }
-        }
-    }
+    let sid = session_db.root_id().to_string();
+    let mut session = Session::new(ConversationId(sid), session_db.clone()).await;
+    session
+        .add_entry(chaz_core::bridge::approval_decision_entry(
+            approver, request_id, decision,
+        ))
+        .await;
 }
 
-/// Per-channel forwarder: the runtime sends an [`ApprovalExchange`] here; this
-/// tags it with `channel_id` and relays it to the bridge's approval task.
-#[allow(dead_code)]
-fn make_channel_approval_tx(
+/// Install a per-session watcher that posts each new `ApprovalRequest` entry to
+/// `channel_id` (seeding the ✅/❌/⏭️ reactions) and records it in `pending` so
+/// a reaction/command can resolve it.
+///
+/// Renders only requests with no decision yet and not already posted this
+/// process (`seen`); a failed post is left unseen so the next session write
+/// retries it. Never commits to the session tree (the decision is written later
+/// from the reaction handler), so it is safe inside `on_write`.
+async fn attach_approval_watcher(
+    session_db: &eidetica::Database,
+    http: Arc<Http>,
     channel_id: ChannelId,
-    relay: mpsc::Sender<ApprovalRequest>,
-) -> mpsc::Sender<ApprovalExchange> {
-    let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
-    tokio::spawn(async move {
-        while let Some(exchange) = rx.recv().await {
-            if relay
-                .send(ApprovalRequest {
-                    channel_id,
-                    exchange,
-                })
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    tx
+    pending: PendingApprovals,
+) -> anyhow::Result<()> {
+    let sid = session_db.root_id().to_string();
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let db = session_db.clone();
+    session_db
+        .on_write(move |_event, _db| {
+            let http = http.clone();
+            let pending = pending.clone();
+            let seen = seen.clone();
+            let sid = sid.clone();
+            let db = db.clone();
+            Box::pin(async move {
+                let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+                let mut seen = seen.lock().await;
+                let requests =
+                    chaz_core::bridge::unrendered_approval_requests(session.entries(), &seen);
+                for req in requests {
+                    seen.insert(req.request_id.clone());
+                    match channel_id.say(&http, approval_body(&req)).await {
+                        Ok(posted) => {
+                            for e in ["✅", "❌", "⏭️"] {
+                                let _ = posted
+                                    .react(&http, ReactionType::Unicode(e.to_string()))
+                                    .await;
+                            }
+                            pending.lock().await.insert(
+                                posted.id,
+                                PendingApproval {
+                                    session_db: db.clone(),
+                                    request_id: req.request_id,
+                                    channel_id,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to post approval prompt: {e}");
+                            seen.remove(&req.request_id); // retry on next write
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })?
+        .detach();
+    Ok(())
 }
 
 /// Approve or deny the oldest pending tool-approval request for a channel — the
 /// `!chaz approve` / `!chaz deny` text path.
-#[allow(dead_code)]
 async fn resolve_pending_approval(
     http: &Http,
     channel_id: ChannelId,
     pending: &PendingApprovals,
+    approver: &str,
     approve: bool,
 ) {
-    let mut p = pending.lock().await;
-    let Some(message_id) = p.keys().next().copied() else {
+    let resolved = {
+        let mut p = pending.lock().await;
+        let message_id = p
+            .iter()
+            .find(|(_, pa)| pa.channel_id == channel_id)
+            .map(|(id, _)| *id);
+        message_id.and_then(|id| p.remove(&id))
+    };
+    let Some(req) = resolved else {
         let _ = channel_id.say(http, "No pending approval requests").await;
         return;
     };
-    if let Some(tx) = p.remove(&message_id) {
-        let decision = if approve {
-            ApprovalDecision::Approve
-        } else {
-            ApprovalDecision::Deny
-        };
-        let _ = tx.send(decision);
-        let label = if approve {
-            "✅ Approved"
-        } else {
-            "❌ Denied"
-        };
-        let _ = channel_id.say(http, label).await;
-    }
+    let decision = if approve {
+        ApprovalDecision::Approve
+    } else {
+        ApprovalDecision::Deny
+    };
+    write_approval_decision(&req.session_db, approver, &req.request_id, decision).await;
+    let label = if approve {
+        "✅ Approved"
+    } else {
+        "❌ Denied"
+    };
+    let _ = channel_id.say(http, label).await;
 }
 
 /// Resolve an approval decision arriving as an emoji reaction on a prompt,
 /// ignoring the bot's own seed reactions.
-#[allow(dead_code)]
 async fn handle_approval_reaction(
     add: Reaction,
     pending: &PendingApprovals,
@@ -577,10 +626,15 @@ async fn handle_approval_reaction(
         "⏭" | "⏭️" => ApprovalDecision::ApproveAll,
         _ => return,
     };
-    if let Some(tx) = pending.lock().await.remove(&add.message_id) {
-        info!(channel = %add.channel_id, ?decision, "Approval decision via reaction");
-        let _ = tx.send(decision);
-    }
+    let Some(req) = pending.lock().await.remove(&add.message_id) else {
+        return;
+    };
+    let approver = add
+        .user_id
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "discord-user".to_string());
+    info!(channel = %add.channel_id, request_id = %req.request_id, ?decision, "Approval decision via reaction");
+    write_approval_decision(&req.session_db, &approver, &req.request_id, decision).await;
 }
 
 /// Discord rejects messages longer than 2000 characters (counted as Unicode
@@ -692,9 +746,20 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(bot = %ready.user.name, "Discord bridge connected");
+        // Remember our own id so we ignore the seed reactions we post on
+        // approval prompts.
+        *self.bot_id.lock().await = Some(ready.user.id);
         // Reattach already-bound channels so the daemon's scheduled output
         // flows without an inbound message first.
         self.reattach_existing_channels(ctx.http.clone()).await;
+    }
+
+    /// ✅/❌/⏭️ on a posted approval prompt is the primary approve path. Look the
+    /// reacted-to message up in `pending` and write the decision back into its
+    /// session DB.
+    async fn reaction_add(&self, _ctx: Context, add: Reaction) {
+        let bot_id = *self.bot_id.lock().await;
+        handle_approval_reaction(add, &self.pending, bot_id).await;
     }
 }
 
