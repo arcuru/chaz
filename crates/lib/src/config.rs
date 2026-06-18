@@ -201,7 +201,9 @@ pub fn default_cli_auto_approved() -> Vec<String> {
 /// under `embeddings:<provider>/<model>` on the same DB, syncing with
 /// the memory data. Multiple model subtrees coexist — switching models
 /// later just leaves the old subtree dormant until reindexed.
-#[derive(Debug, Deserialize, Clone)]
+/// `Debug` is hand-written to redact `api_key`; it holds a plaintext key
+/// between config load and the startup extraction that clears it.
+#[derive(Deserialize, Clone)]
 pub struct EmbeddingConfig {
     /// Provider kind. Currently only `openai` (any OpenAI-compatible
     /// `/v1/embeddings` endpoint).
@@ -220,6 +222,19 @@ pub struct EmbeddingConfig {
     /// Opaque reference into SecretStore (set after api_key is extracted).
     #[serde(skip)]
     pub api_key_ref: Option<String>,
+}
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingConfig")
+            .field("backend", &self.backend)
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("api_base", &self.api_base)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_ref", &self.api_key_ref)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -266,7 +281,9 @@ pub struct WebSearchConfig {
 /// provider; `api_key` / `url` are keyed by the provider's needs (Kagi/
 /// Tavily/Brave/Serper need `api_key`; SearxNG needs `url`; DuckDuckGo
 /// needs neither).
-#[derive(Debug, Deserialize, Clone)]
+/// `Debug` is hand-written to redact `api_key`; it holds a plaintext key
+/// between config load and the startup extraction that clears it.
+#[derive(Deserialize, Clone)]
 pub struct WebSearchBackendEntry {
     #[serde(rename = "type")]
     pub kind: WebSearchBackendKind,
@@ -278,6 +295,17 @@ pub struct WebSearchBackendEntry {
     pub api_key_ref: Option<String>,
     /// Base URL for self-hosted backends (SearxNG). Ignored for other kinds.
     pub url: Option<String>,
+}
+
+impl std::fmt::Debug for WebSearchBackendEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSearchBackendEntry")
+            .field("kind", &self.kind)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_ref", &self.api_key_ref)
+            .field("url", &self.url)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -414,7 +442,10 @@ pub struct AgentPreset {
 }
 
 /// Configuration info for a backend
-#[derive(Debug, Deserialize, Clone)]
+///
+/// `Debug` is hand-written to redact `api_key`; it holds a plaintext key
+/// between config load and the startup extraction that clears it.
+#[derive(Deserialize, Clone)]
 pub struct Backend {
     /// The type of backend (kept for config compat, only "openaicompatible" supported)
     #[serde(rename = "type")]
@@ -439,6 +470,22 @@ pub struct Backend {
     pub request_timeout: Option<u64>,
     /// Maximum retry attempts for transient LLM errors (default: 3)
     pub max_retries: Option<u32>,
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backend")
+            .field("backend_type", &self.backend_type)
+            .field("api_base", &self.api_base)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_ref", &self.api_key_ref)
+            .field("models", &self.models)
+            .field("name", &self.name)
+            .field("config_dir", &self.config_dir)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
 }
 
 impl Backend {
@@ -646,6 +693,22 @@ mod tests {
         let cfg: Config = serde_yaml::from_str("").unwrap();
         assert!(cfg.allow_list.is_none());
         assert!(cfg.agents.is_none());
+    }
+
+    #[test]
+    fn debug_redacts_backend_api_key() {
+        // A backend carries a plaintext api_key between config load and the
+        // startup extraction that clears it; Debug must never print it.
+        let mut backend = Backend::new(BackendType::OpenAICompatible);
+        backend.api_key = Some("sk-super-secret-key".to_string());
+        backend.name = Some("openai".to_string());
+        let rendered = format!("{backend:?}");
+        assert!(
+            !rendered.contains("super-secret"),
+            "api_key leaked: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("openai")); // non-secret fields still render
     }
 
     #[test]
