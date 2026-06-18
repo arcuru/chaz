@@ -613,8 +613,16 @@ async fn handle_approval_reaction(
     add: Reaction,
     pending: &PendingApprovals,
     bot_id: Option<UserId>,
+    allowed_users: &HashSet<u64>,
 ) {
     if add.user_id == bot_id {
+        return;
+    }
+    // Same gate as the message path: when an allow-list is configured, only
+    // those users may resolve an approval. Without this, any channel member
+    // could ✅ a privileged tool call.
+    let reactor = add.user_id.map(|u| u.get());
+    if !allowed_users.is_empty() && !reactor.is_some_and(|u| allowed_users.contains(&u)) {
         return;
     }
     let ReactionType::Unicode(emoji) = &add.emoji else {
@@ -759,7 +767,7 @@ impl EventHandler for Handler {
     /// session DB.
     async fn reaction_add(&self, _ctx: Context, add: Reaction) {
         let bot_id = *self.bot_id.lock().await;
-        handle_approval_reaction(add, &self.pending, bot_id).await;
+        handle_approval_reaction(add, &self.pending, bot_id, &self.allowed_users).await;
     }
 }
 

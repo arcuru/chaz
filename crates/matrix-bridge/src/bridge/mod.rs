@@ -787,10 +787,22 @@ impl Bridge for MatrixBridge {
         // writes the decision back into that prompt's session DB.
         {
             let pending_approvals = pending_approvals.clone();
+            let allow_list = allow_list.clone();
             mc.client()
-                .add_event_handler(move |event: OriginalSyncReactionEvent, _room: Room| {
+                .add_event_handler(move |event: OriginalSyncReactionEvent, room: Room| {
                     let pending_approvals = pending_approvals.clone();
+                    let allow_list = allow_list.clone();
                     async move {
+                        // Same gate as the message path: only an allow-listed
+                        // sender (never the bot itself) can resolve an approval.
+                        // Without this, any room member could ✅ a privileged
+                        // tool call.
+                        let Some(bot_uid) = room.client().user_id().map(|u| u.to_string()) else {
+                            return;
+                        };
+                        if !is_allowed(allow_list.as_deref(), event.sender.as_str(), &bot_uid) {
+                            return;
+                        }
                         handle_approval_reaction(event, pending_approvals).await;
                     }
                 });
