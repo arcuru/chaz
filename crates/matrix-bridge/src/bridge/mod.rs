@@ -2,7 +2,7 @@ mod client;
 mod commands;
 mod history;
 
-use chaz_core::bridge::{ApprovalDecision, ApprovalExchange, Bridge};
+use chaz_core::bridge::{ApprovalDecision, Bridge};
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
@@ -22,7 +22,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::{Room, RoomState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
 use client::{Login, MatrixClient, is_allowed};
@@ -111,7 +111,11 @@ async fn attach_response_callback(
     room: Room,
     agents: Arc<chaz_core::agent::AgentRegistry>,
     owning_agent: String,
+    pending: PendingApprovals,
 ) -> anyhow::Result<()> {
+    // Same session DB, two watchers: deliver agent replies, and surface tool
+    // approval prompts the daemon proxied here.
+    attach_approval_watcher(session_db, room.clone(), pending).await?;
     chaz_core::bridge::attach_reconciler(session_db, agents, owning_agent, move |body| {
         let room = room.clone();
         async move {
@@ -227,6 +231,7 @@ fn help_text() -> String {
 /// `!chaz attach <session>` — bind this room to a specific session and install
 /// the response callback so future writes reach the room. Bridge-local because
 /// it touches the live `attached_sessions` set and matrix `Room`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     arg: &str,
     room: Room,
@@ -234,6 +239,7 @@ async fn handle_attach(
     login_id: &str,
     owning_agent: &str,
     attached_sessions: Arc<Mutex<HashSet<String>>>,
+    pending: PendingApprovals,
 ) {
     let arg = arg.trim();
     if arg.is_empty() {
@@ -292,6 +298,7 @@ async fn handle_attach(
             room.clone(),
             server.agents_arc(),
             owning_agent.to_string(),
+            pending.clone(),
         )
         .await
         {
@@ -396,6 +403,11 @@ impl Bridge for MatrixBridge {
         // multiple rooms (fan-out delivery).
         let attached_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+        // Posted tool-approval prompts awaiting a reaction/command, keyed by the
+        // prompt's event id. Shared across the startup attach, the message
+        // handler, and the reaction handler.
+        let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+
         // --- Startup: install response callbacks for every room this login
         //     already has a session bound to. This is what makes the daemon's
         //     replies (including scheduler fires) deliver when no user has
@@ -408,6 +420,7 @@ impl Bridge for MatrixBridge {
             let attached_sessions = attached_sessions.clone();
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
+            let pending_approvals = pending_approvals.clone();
             tokio::spawn(async move {
                 let Some(agent_entry) = owning_agent_entry(&server, &owning_agent) else {
                     info!("Owning agent not hosted yet; skipping startup channel attach");
@@ -445,6 +458,7 @@ impl Bridge for MatrixBridge {
                             &owning_agent,
                             &room_id,
                             &r.session_db_id,
+                            pending_approvals.clone(),
                         )
                         .await;
                     }
@@ -475,6 +489,7 @@ impl Bridge for MatrixBridge {
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
                 Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+            let pending_approvals = pending_approvals.clone();
 
             mc.client().add_event_handler(
                 move |event: OriginalSyncRoomMessageEvent, room: Room| {
@@ -488,6 +503,7 @@ impl Bridge for MatrixBridge {
                     let message_counts = message_counts.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
                     let seen_events = seen_events.clone();
+                    let pending_approvals = pending_approvals.clone();
                     async move {
                         if room.state() != RoomState::Joined {
                             return;
@@ -571,6 +587,16 @@ impl Bridge for MatrixBridge {
                                     .await;
                                     return;
                                 }
+                                "approve" | "deny" => {
+                                    resolve_pending_approval(
+                                        &pending_approvals,
+                                        &room,
+                                        event.sender.as_str(),
+                                        verb == "approve",
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 "attach" => {
                                     let arg = inner.strip_prefix("attach").unwrap_or("").trim();
                                     handle_attach(
@@ -580,6 +606,7 @@ impl Bridge for MatrixBridge {
                                         &login_id,
                                         &owning_agent,
                                         attached_sessions.clone(),
+                                        pending_approvals.clone(),
                                     )
                                     .await;
                                     return;
@@ -696,6 +723,7 @@ impl Bridge for MatrixBridge {
                                     room.clone(),
                                     server.agents_arc(),
                                     owning_agent.clone(),
+                                    pending_approvals.clone(),
                                 )
                                 .await
                                 {
@@ -752,6 +780,22 @@ impl Bridge for MatrixBridge {
             );
         }
 
+        // === Reaction handler ===
+        //
+        // ✅/❌/⏭ on a posted approval prompt is the primary approve path. The
+        // handler looks the reacted-to event up in `pending_approvals` and
+        // writes the decision back into that prompt's session DB.
+        {
+            let pending_approvals = pending_approvals.clone();
+            mc.client()
+                .add_event_handler(move |event: OriginalSyncReactionEvent, _room: Room| {
+                    let pending_approvals = pending_approvals.clone();
+                    async move {
+                        handle_approval_reaction(event, pending_approvals).await;
+                    }
+                });
+        }
+
         // Retry loop for transient sync errors. Returns Ok(()) on a clean
         // shutdown signal so the parent can drain background bridges
         // without surfacing a spurious error.
@@ -785,6 +829,7 @@ impl Bridge for MatrixBridge {
 /// bridge does not register the session for processing — the daemon does that
 /// when it sees the session exposed in the agent registry — so this only wires
 /// up outbound delivery.
+#[allow(clippy::too_many_arguments)]
 async fn attach_existing_channel(
     server: &Arc<Server>,
     client: &matrix_sdk::Client,
@@ -792,6 +837,7 @@ async fn attach_existing_channel(
     owning_agent: &str,
     room_id: &str,
     session_db_id: &str,
+    pending: PendingApprovals,
 ) {
     let Ok(room_id_parsed) = matrix_sdk::ruma::RoomId::parse(room_id) else {
         return;
@@ -818,6 +864,7 @@ async fn attach_existing_channel(
         room,
         server.agents_arc(),
         owning_agent.to_string(),
+        pending,
     )
     .await
     {
@@ -831,123 +878,159 @@ async fn attach_existing_channel(
 }
 
 // ---------------------------------------------------------------------------
-// Parked approval scaffolding — reused in Stage 4 (TODO-7755e097).
+// Tool-approval relay over the session DB.
 //
-// The dumb bridge no longer runs the agent, so a tool-approval request no
-// longer arrives over an in-process mpsc from a co-located runtime — the trigger
-// (`register_session`'s approval channel) is gone. The render-the-prompt /
-// capture-the-reaction half below is transport code that comes back near
-// verbatim once approvals are proxied over the session DB (the daemon writes a
-// request entry → the bridge renders it + captures the reaction → the bridge
-// writes a decision entry → the daemon resolves the `ApprovalExchange`). Kept
-// compiling behind `allow(dead_code)` rather than resurrected from git history;
-// Stage 4 rewires it to the session-DB watcher.
+// The dumb bridge runs no agent, so an approval request arrives not over an
+// in-process channel but as an `ApprovalRequest` entry the daemon's proxy
+// writes into the (synced) session DB. The watcher renders each new request to
+// its room; a human's reaction (or `!chaz approve`/`deny`) writes an
+// `ApprovalDecision` entry back, which syncs to the daemon and unblocks the
+// runtime. The bridge holds no oneshot — the session DB is the whole channel.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-type PendingApprovals = Arc<Mutex<HashMap<OwnedEventId, oneshot::Sender<ApprovalDecision>>>>;
-
-#[allow(dead_code)]
-struct RoomApprovalRequest {
+/// What a posted approval prompt resolves: the session DB to write the decision
+/// into, the request it answers, and the room (so a `!chaz approve` text
+/// command resolves the right room's oldest pending prompt).
+struct PendingApproval {
+    session_db: eidetica::Database,
+    request_id: String,
     room_id: String,
-    exchange: ApprovalExchange,
+}
+type PendingApprovals = Arc<Mutex<HashMap<OwnedEventId, PendingApproval>>>;
+
+/// Render the approval prompt a human reacts to.
+fn approval_notice(req: &chaz_core::bridge::ApprovalRequestPayload) -> String {
+    format!(
+        "🔒 **Tool approval required**\n\n\
+         **Tool:** `{}`\n\
+         **Risk:** {}\n\
+         **Args:** `{}`\n\n\
+         React: ✅ approve · ❌ deny · ⏭ approve all\n\
+         Or reply: `!chaz approve` / `!chaz deny`",
+        req.tool_name, req.risk_level, req.arguments_display
+    )
 }
 
-/// Per-room forwarder: the runtime sends an [`ApprovalExchange`] here; this tags
-/// it with the room and relays it to the bridge's approval task.
-#[allow(dead_code)]
-fn make_room_approval_tx(
-    room_id: String,
-    relay_tx: mpsc::Sender<RoomApprovalRequest>,
-) -> mpsc::Sender<ApprovalExchange> {
-    let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
-    tokio::spawn(async move {
-        while let Some(exchange) = rx.recv().await {
-            let _ = relay_tx
-                .send(RoomApprovalRequest {
-                    room_id: room_id.clone(),
-                    exchange,
-                })
-                .await;
-        }
-    });
-    tx
-}
-
-/// Background task: post each approval request to its room with seeded
-/// ✅/❌/⏭ reactions and remember the message so a reaction resolves it.
-/// Posting failure denies (safe default).
-#[allow(dead_code)]
-async fn run_approval_relay(
-    mut rx: mpsc::Receiver<RoomApprovalRequest>,
-    client: matrix_sdk::Client,
-    pending: PendingApprovals,
+/// Write an `ApprovalDecision` entry resolving `request_id` into the session DB.
+/// The decision syncs to the daemon, whose proxy matches it back and unblocks
+/// the runtime's `request_approval`.
+async fn write_approval_decision(
+    session_db: &eidetica::Database,
+    approver: &str,
+    request_id: &str,
+    decision: ApprovalDecision,
 ) {
-    while let Some(req) = rx.recv().await {
-        let Ok(room_id_parsed) = matrix_sdk::ruma::RoomId::parse(&req.room_id) else {
-            continue;
-        };
-        let Some(room) = client.get_room(&room_id_parsed) else {
-            continue;
-        };
-        let info = &req.exchange.info;
-        let notice = format!(
-            "🔒 **Tool approval required**\n\n\
-             **Tool:** `{}`\n\
-             **Risk:** {:?}\n\
-             **Args:** `{}`\n\n\
-             React: ✅ approve · ❌ deny · ⏭ approve all\n\
-             Or reply: `!chaz approve` / `!chaz deny`",
-            info.name, info.risk_level, info.arguments_display
-        );
-        let content = RoomMessageEventContent::text_markdown(notice);
-        match room.send(content).await {
-            Ok(result) => {
-                pending
-                    .lock()
-                    .await
-                    .insert(result.response.event_id, req.exchange.decision_tx);
-            }
-            Err(e) => {
-                tracing::error!("Failed to send approval request: {e}");
-                let _ = req.exchange.decision_tx.send(ApprovalDecision::Deny);
-            }
-        }
-    }
+    let sid = session_db.root_id().to_string();
+    let mut session = Session::new(chaz_core::types::ConversationId(sid), session_db.clone()).await;
+    session
+        .add_entry(chaz_core::bridge::approval_decision_entry(
+            approver, request_id, decision,
+        ))
+        .await;
+}
+
+/// Install a per-session watcher that posts each new `ApprovalRequest` entry to
+/// `room` and records it in `pending` so a reaction/command can resolve it.
+///
+/// Renders only requests with no decision yet and not already posted this
+/// process (`seen`); on a failed post the request is left unseen so the next
+/// session write retries it. Never commits to the session tree (the decision is
+/// written later, from the reaction handler), so it is safe inside `on_write`.
+async fn attach_approval_watcher(
+    session_db: &eidetica::Database,
+    room: Room,
+    pending: PendingApprovals,
+) -> anyhow::Result<()> {
+    let sid = session_db.root_id().to_string();
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let db = session_db.clone();
+    session_db
+        .on_write(move |_event, _db| {
+            let room = room.clone();
+            let pending = pending.clone();
+            let seen = seen.clone();
+            let sid = sid.clone();
+            let db = db.clone();
+            Box::pin(async move {
+                let session =
+                    Session::new(chaz_core::types::ConversationId(sid.clone()), db.clone()).await;
+                let mut seen = seen.lock().await;
+                let requests =
+                    chaz_core::bridge::unrendered_approval_requests(session.entries(), &seen);
+                for req in requests {
+                    seen.insert(req.request_id.clone());
+                    match room
+                        .send(RoomMessageEventContent::text_markdown(approval_notice(
+                            &req,
+                        )))
+                        .await
+                    {
+                        Ok(result) => {
+                            pending.lock().await.insert(
+                                result.response.event_id,
+                                PendingApproval {
+                                    session_db: db.clone(),
+                                    request_id: req.request_id,
+                                    room_id: room.room_id().to_string(),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to post approval request: {e}");
+                            seen.remove(&req.request_id); // retry on next write
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })?
+        .detach();
+    Ok(())
 }
 
 /// Resolve an approval decision arriving as an emoji reaction on a prompt.
-#[allow(dead_code)]
-async fn handle_approval_reaction(
-    event: OriginalSyncReactionEvent,
-    room: Room,
-    pending: PendingApprovals,
-) {
+async fn handle_approval_reaction(event: OriginalSyncReactionEvent, pending: PendingApprovals) {
     let relates_to = &event.content.relates_to;
     let decision = match relates_to.key.as_str() {
-        "✅" => Some(ApprovalDecision::Approve),
-        "❌" => Some(ApprovalDecision::Deny),
-        "⏭" | "⏭️" => Some(ApprovalDecision::ApproveAll),
-        _ => None,
+        "✅" => ApprovalDecision::Approve,
+        "❌" => ApprovalDecision::Deny,
+        "⏭" | "⏭️" => ApprovalDecision::ApproveAll,
+        _ => return,
     };
-    if let Some(decision) = decision
-        && let Some(tx) = pending.lock().await.remove(&relates_to.event_id)
-    {
-        info!(
-            "Approval decision via reaction in {}: {:?}",
-            room.room_id(),
-            decision
-        );
-        let _ = tx.send(decision);
-    }
+    let Some(req) = pending.lock().await.remove(&relates_to.event_id) else {
+        return;
+    };
+    info!(
+        room = %req.room_id, request_id = %req.request_id, ?decision,
+        "Approval decision via reaction"
+    );
+    write_approval_decision(
+        &req.session_db,
+        event.sender.as_str(),
+        &req.request_id,
+        decision,
+    )
+    .await;
 }
 
 /// Approve or deny the oldest pending tool-approval request in `room` — the
 /// `!chaz approve` / `!chaz deny` text path.
-#[allow(dead_code)]
-async fn resolve_pending_approval(pending: &PendingApprovals, room: &Room, approve: bool) {
-    let mut p = pending.lock().await;
-    let Some(event_id) = p.keys().next().cloned() else {
+async fn resolve_pending_approval(
+    pending: &PendingApprovals,
+    room: &Room,
+    approver: &str,
+    approve: bool,
+) {
+    let room_id = room.room_id().to_string();
+    let resolved = {
+        let mut p = pending.lock().await;
+        let event_id = p
+            .iter()
+            .find(|(_, pa)| pa.room_id == room_id)
+            .map(|(id, _)| id.clone());
+        event_id.and_then(|id| p.remove(&id))
+    };
+    let Some(req) = resolved else {
         let _ = room
             .send(RoomMessageEventContent::notice_plain(
                 "No pending approval requests",
@@ -955,20 +1038,18 @@ async fn resolve_pending_approval(pending: &PendingApprovals, room: &Room, appro
             .await;
         return;
     };
-    if let Some(tx) = p.remove(&event_id) {
-        let decision = if approve {
-            ApprovalDecision::Approve
-        } else {
-            ApprovalDecision::Deny
-        };
-        let _ = tx.send(decision);
-        let label = if approve {
-            "✅ Approved"
-        } else {
-            "❌ Denied"
-        };
-        let _ = room
-            .send(RoomMessageEventContent::notice_plain(label))
-            .await;
-    }
+    let decision = if approve {
+        ApprovalDecision::Approve
+    } else {
+        ApprovalDecision::Deny
+    };
+    write_approval_decision(&req.session_db, approver, &req.request_id, decision).await;
+    let label = if approve {
+        "✅ Approved"
+    } else {
+        "❌ Denied"
+    };
+    let _ = room
+        .send(RoomMessageEventContent::notice_plain(label))
+        .await;
 }
