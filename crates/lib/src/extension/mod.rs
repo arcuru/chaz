@@ -40,7 +40,7 @@ use eidetica::Database;
 use eidetica::store::{DocStore, Table};
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -643,6 +643,15 @@ pub struct ExtensionHub {
     /// `ScopeCtx` without rebuilding from scratch on every event.
     /// `None` until the host wires it via [`Self::set_peer_handles`].
     peer_handles: Option<Arc<instance::PeerHandles>>,
+
+    /// Extension-contributed status-bar segments, keyed
+    /// `{ext_name}:{key}`. A [`BTreeMap`] so consumers get pi's
+    /// alphabetical-by-key order for free. Written by extensions via
+    /// [`Self::set_status`]; read on the gateway render path (the TUI
+    /// status line) via [`Self::status_segments`]. A `std::sync::RwLock`
+    /// (not tokio's) so the synchronous TUI render path can read it
+    /// without an async context.
+    status_segments: std::sync::RwLock<BTreeMap<String, String>>,
 }
 
 impl Default for ExtensionHub {
@@ -676,7 +685,39 @@ impl ExtensionHub {
             agent_instances: tokio::sync::RwLock::new(HashMap::new()),
             session_instances: tokio::sync::RwLock::new(HashMap::new()),
             peer_handles: None,
+            status_segments: std::sync::RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// Set or clear one extension-contributed status segment. `key`
+    /// should already be namespaced (`{ext_name}:{key}`) by the caller so
+    /// segments from different extensions never collide. `Some(text)`
+    /// inserts/overwrites; `None` removes the segment. A poisoned lock is
+    /// recovered (status is cosmetic — never panic the agent over it).
+    pub fn set_status(&self, key: String, text: Option<String>) {
+        let mut map = self
+            .status_segments
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match text {
+            Some(t) => {
+                map.insert(key, t);
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
+    }
+
+    /// Snapshot the current status segments, ordered alphabetically by
+    /// key. Called from the synchronous gateway render path (the TUI
+    /// status line); clones so the caller holds no lock. A poisoned lock
+    /// is recovered rather than propagated.
+    pub fn status_segments(&self) -> BTreeMap<String, String> {
+        self.status_segments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Install the peer-handle bag used to construct

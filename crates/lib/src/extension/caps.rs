@@ -42,6 +42,7 @@ use crate::agent_db::AgentDb;
 use crate::hosted_index::DbEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -96,6 +97,11 @@ pub enum CapabilityKind {
     /// Extension-providable — extensions like 'memory' publish impls;
     /// the host collects and concatenates results at the end of context.
     ContextTail,
+    /// Contribute keyed text segments to a gateway's status surface (the
+    /// TUI status bar today; a `/status` command on other gateways).
+    /// Extension-providable — pure data, so it crosses the gateway
+    /// boundary cleanly. Modeled on pi's `setStatus` tier.
+    StatusSegment,
 }
 
 impl CapabilityKind {
@@ -133,6 +139,7 @@ impl CapabilityKind {
             Self::AgentStateAdmin => "agent_state_admin",
             Self::PromptAugmentation => "prompt_augmentation",
             Self::ContextTail => "context_tail",
+            Self::StatusSegment => "status_segment",
         }
     }
 }
@@ -188,6 +195,10 @@ pub enum CapabilityRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    StatusSegment {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
 }
 
 impl CapabilityRequest {
@@ -205,6 +216,7 @@ impl CapabilityRequest {
             Self::AgentStateAdmin { .. } => CapabilityKind::AgentStateAdmin,
             Self::PromptAugmentation { .. } => CapabilityKind::PromptAugmentation,
             Self::ContextTail { .. } => CapabilityKind::ContextTail,
+            Self::StatusSegment { .. } => CapabilityKind::StatusSegment,
         }
     }
 
@@ -216,7 +228,8 @@ impl CapabilityRequest {
             Self::Messenger { provider }
             | Self::Memory { provider }
             | Self::PromptAugmentation { provider }
-            | Self::ContextTail { provider } => provider.as_deref(),
+            | Self::ContextTail { provider }
+            | Self::StatusSegment { provider } => provider.as_deref(),
             _ => None,
         }
     }
@@ -370,6 +383,24 @@ pub trait ContextTail: Send + Sync {
     ) -> CapFuture<'a, Option<String>>;
 }
 
+/// Contribute keyed text segments to a gateway's status surface.
+///
+/// Extension-providable — modeled on pi's `setStatus` tier. The provider
+/// returns a map of `{key → text}`; the consumer (a TUI status line, a
+/// `/status` command) collects every provider's segments, sorts by key
+/// (the [`BTreeMap`] keeps them ordered for free), and renders them. The
+/// payload is plain data, so the same impl serves every gateway without
+/// owning a gateway-specific UI component (that would be pi's tier-2
+/// full-footer override, deliberately skipped here).
+pub trait StatusSegment: Send + Sync {
+    /// Return this extension's current status segments for `agent_name`,
+    /// keyed by a short label. An empty map means "nothing to show."
+    fn status_segments<'a>(
+        &'a self,
+        agent_name: &'a str,
+    ) -> CapFuture<'a, BTreeMap<String, String>>;
+}
+
 // =========================================================================
 // Tests
 // =========================================================================
@@ -392,7 +423,13 @@ mod tests {
             assert!(k.is_host_only(), "{k} should be host-only");
             assert!(!k.is_extension_providable(), "{k} should not be providable");
         }
-        let providable = [CapabilityKind::Messenger, CapabilityKind::Memory];
+        let providable = [
+            CapabilityKind::Messenger,
+            CapabilityKind::Memory,
+            CapabilityKind::PromptAugmentation,
+            CapabilityKind::ContextTail,
+            CapabilityKind::StatusSegment,
+        ];
         for k in providable {
             assert!(!k.is_host_only(), "{k} should not be host-only");
             assert!(k.is_extension_providable(), "{k} should be providable");

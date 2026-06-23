@@ -154,8 +154,17 @@ pub(super) fn ui(
         app.peer_mcp_servers = server.mcp_registry().snapshot();
     }
 
+    // Extension-contributed status segments (pi's `setStatus` tier).
+    // Pure data — collected here and handed to the chat view, which
+    // renders them on a dedicated second status line when non-empty.
+    let ext_segments: Vec<String> = server
+        .extensions()
+        .status_segments()
+        .into_values()
+        .collect();
+
     match app.mode {
-        TuiMode::Chat => ui_chat(f, app),
+        TuiMode::Chat => ui_chat(f, app, &ext_segments),
         TuiMode::SessionPicker => ui_picker(f, app),
         TuiMode::ModelPicker => ui_model_picker(f, app),
         TuiMode::Settings(scope) => settings::ui_settings(f, app, scope, server, backend, config),
@@ -335,16 +344,22 @@ fn ui_rename_overlay(f: &mut ratatui::Frame, app: &mut App) {
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
+fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     // 4-line approval panel when a tool is waiting on the user; 0 otherwise.
     let has_approval = app.active().pending_approval.is_some();
     let approval_h: u16 = if has_approval { 4 } else { 0 };
+    // Dedicated 1-line strip for extension-contributed status segments,
+    // sitting just above the core status bar so it never fights the
+    // `agent | model | messages` line. Hidden (height 0) when no
+    // extension has contributed a segment.
+    let ext_status_h: u16 = if ext_segments.is_empty() { 0 } else { 1 };
     // 1-line tab bar at the top. Always present even with one tab so the user
     // has a consistent affordance.
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(approval_h),
+        Constraint::Length(ext_status_h),
         Constraint::Length(1),
         Constraint::Length(3),
     ])
@@ -763,7 +778,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
 
     // If the full roster would overflow the status line, collapse it to a
     // count plus the host, leaving the per-agent detail to the Settings page.
-    if multi_agent && status_text.chars().count() > chunks[3].width as usize {
+    if multi_agent && status_text.chars().count() > chunks[4].width as usize {
         let collapsed = match roster.iter().find(|r| r.is_host) {
             Some(h) if !h.model.is_empty() => format!(
                 " | agents: {} · host {}→{}",
@@ -776,12 +791,28 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
         };
         status_text = make_status(&collapsed);
     }
+    // Extension status strip — only drawn when an extension contributed a
+    // segment (otherwise `ext_status_h` is 0 and `chunks[3]` is empty).
+    // Segments are already ordered alphabetically by key (BTreeMap on the
+    // hub side); join with a separator, width-truncate, and render dim on
+    // the same dark background as the core status bar below it.
+    if !ext_segments.is_empty() {
+        let joined = format!(" {}", ext_segments.join(" │ "));
+        let ext_text = truncate_chars(&joined, chunks[3].width as usize);
+        let ext_status = Paragraph::new(ext_text).style(
+            Style::default()
+                .bg(Color::Rgb(0x1a, 0x1d, 0x26))
+                .fg(COLOR_DIM),
+        );
+        f.render_widget(ext_status, chunks[3]);
+    }
+
     let status = Paragraph::new(status_text).style(
         Style::default()
             .bg(Color::Rgb(0x1a, 0x1d, 0x26))
             .fg(Color::White),
     );
-    f.render_widget(status, chunks[3]);
+    f.render_widget(status, chunks[4]);
 
     let input = Paragraph::new(app.input.as_str()).block(
         Block::bordered()
@@ -789,14 +820,14 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App) {
             .border_style(Style::default().fg(COLOR_DIM))
             .title(Span::styled(" > ", Style::default().fg(COLOR_ACCENT))),
     );
-    f.render_widget(input, chunks[4]);
+    f.render_widget(input, chunks[5]);
 
     // Completion popup floats just above the input box, over the bottom of
     // the transcript. Drawn after the transcript so it sits on top.
-    render_completion_popup(f, app, chunks[1], chunks[4]);
+    render_completion_popup(f, app, chunks[1], chunks[5]);
 
-    let cursor_x = chunks[4].x + app.cursor as u16 + 1;
-    let cursor_y = chunks[4].y + 1;
+    let cursor_x = chunks[5].x + app.cursor as u16 + 1;
+    let cursor_y = chunks[5].y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
