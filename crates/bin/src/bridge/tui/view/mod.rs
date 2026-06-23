@@ -154,14 +154,11 @@ pub(super) fn ui(
         app.peer_mcp_servers = server.mcp_registry().snapshot();
     }
 
-    // Extension-contributed status segments (pi's `setStatus` tier).
-    // Pure data — collected here and handed to the chat view, which
-    // renders them on a dedicated second status line when non-empty.
-    let ext_segments: Vec<String> = server
-        .extensions()
-        .status_segments()
-        .into_values()
-        .collect();
+    // Extension status segments rendered on a dedicated second status
+    // line. `app.status_segments` is refreshed by the run loop from the
+    // session's `extension_outputs` store (the daemon writes it at the turn
+    // boundary). Cloned so `ui_chat` can still take `&mut App`.
+    let ext_segments = app.status_segments.clone();
 
     match app.mode {
         TuiMode::Chat => ui_chat(f, app, &ext_segments),

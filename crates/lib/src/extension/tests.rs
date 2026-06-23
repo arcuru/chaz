@@ -108,6 +108,7 @@ struct TestParts {
     session_shutdown: Option<Arc<dyn handler::HookHandlerSessionShutdown>>,
     routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
     prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
+    status_segment: Option<Arc<dyn caps::StatusSegment>>,
     tools: Vec<Arc<dyn Tool>>,
     commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
 }
@@ -134,6 +135,10 @@ impl TestExt {
     }
     fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
         self.parts.prompt_augmentation = Some(p);
+        self
+    }
+    fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
+        self.parts.status_segment = Some(s);
         self
     }
     fn tool_call(mut self, h: Arc<dyn handler::HookHandlerToolCall>) -> Self {
@@ -217,6 +222,9 @@ impl instance::ExtensionInstance for TestInstance {
     fn prompt_augmentation(&self) -> Option<Arc<dyn caps::PromptAugmentation>> {
         self.parts.prompt_augmentation.clone()
     }
+    fn status_segment(&self) -> Option<Arc<dyn caps::StatusSegment>> {
+        self.parts.status_segment.clone()
+    }
 }
 
 fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandles> {
@@ -272,6 +280,17 @@ impl caps::PromptAugmentation for FixedAug {
     ) -> caps::CapFuture<'a, Option<String>> {
         let text = self.0.to_string();
         Box::pin(async move { Ok(Some(text)) })
+    }
+}
+
+struct FixedStatus(&'static str, &'static str);
+impl caps::StatusSegment for FixedStatus {
+    fn status_segments<'a>(
+        &'a self,
+        _agent_name: &'a str,
+    ) -> caps::CapFuture<'a, BTreeMap<String, String>> {
+        let (k, v) = (self.0.to_string(), self.1.to_string());
+        Box::pin(async move { Ok(BTreeMap::from([(k, v)])) })
     }
 }
 
@@ -384,6 +403,68 @@ async fn settings_overwrite_replaces_prior_value() {
         .await
         .unwrap();
     assert_eq!(read_settings(&db, "x").await, serde_json::json!({"b": 2}));
+}
+
+fn status_doc(key: &str, text: &str) -> ExtensionOutput {
+    ExtensionOutput {
+        status: BTreeMap::from([(key.to_string(), text.to_string())]),
+    }
+}
+
+#[tokio::test]
+async fn extension_outputs_round_trip_and_idempotent_write() {
+    let (_inst, db) = make_session_db().await;
+    let mut fresh = BTreeMap::new();
+    fresh.insert("core".to_string(), status_doc("mcp", "3 mcp"));
+
+    write_extension_outputs(&db, &fresh).await.unwrap();
+    assert_eq!(read_extension_outputs(&db).await, fresh);
+
+    // Write-on-change: rewriting the identical map is a no-op and the
+    // store still reads back the same value.
+    write_extension_outputs(&db, &fresh).await.unwrap();
+    assert_eq!(read_extension_outputs(&db).await, fresh);
+}
+
+#[tokio::test]
+async fn extension_outputs_drops_vanished_extension() {
+    let (_inst, db) = make_session_db().await;
+    let mut two = BTreeMap::new();
+    two.insert("core".to_string(), status_doc("mcp", "2 mcp"));
+    two.insert("memory".to_string(), status_doc("recall", "on"));
+    write_extension_outputs(&db, &two).await.unwrap();
+    assert_eq!(read_extension_outputs(&db).await.len(), 2);
+
+    // Re-collect with only one provider: the other's doc must be dropped,
+    // not left stale in the store.
+    let mut one = BTreeMap::new();
+    one.insert("core".to_string(), status_doc("mcp", "2 mcp"));
+    write_extension_outputs(&db, &one).await.unwrap();
+    assert_eq!(read_extension_outputs(&db).await, one);
+}
+
+#[tokio::test]
+async fn status_outputs_collects_from_global_instance() {
+    // Regression: status providers are Global-scoped (e.g. `core`), so the
+    // collector must walk global instances, not just agent/session ones.
+    let mut hub = test_hub().await;
+    hub.install_all(vec![Arc::new(
+        TestExt::new("statusy").status_segment(Arc::new(FixedStatus("mode", "online"))),
+    )])
+    .await
+    .unwrap();
+
+    let (_inst, db) = make_session_db().await;
+    hub.refresh_status_outputs("ava", &db).await;
+
+    let outputs = read_extension_outputs(&db).await;
+    assert_eq!(
+        outputs.get("statusy").map(|o| &o.status),
+        Some(&BTreeMap::from([(
+            "mode".to_string(),
+            "online".to_string()
+        )])),
+    );
 }
 
 #[tokio::test]

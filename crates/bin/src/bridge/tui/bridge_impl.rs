@@ -447,6 +447,16 @@ impl Bridge for TuiBridge {
                 }
             }
 
+            // Refresh the extension status strip after each event so it
+            // reflects the active session's latest outputs (the daemon
+            // rewrote the store on the turn just rendered, and a session
+            // switch points `active()` at a different store).
+            // coding: cheap local store read per event; gate on
+            // SessionChanged / tab-switch if it ever shows in a profile.
+            if matches!(app.mode, TuiMode::Chat) {
+                refresh_status_segments(&mut app).await;
+            }
+
             if app.should_quit {
                 break;
             }

@@ -499,6 +499,21 @@ impl Tab {
     }
 }
 
+/// Refresh `app.status_segments` from the active session's `extension_outputs`
+/// store (the daemon writes it at the turn boundary). Flattens every
+/// extension's status map into render-ready segment values, ordered by
+/// extension name then key. No-op when there's no active tab.
+pub(super) async fn refresh_status_segments(app: &mut App) {
+    let Some(db) = app.tabs.get(app.active_tab).map(|t| t.session_db.clone()) else {
+        return;
+    };
+    let outputs = chaz_core::extension::read_extension_outputs(&db).await;
+    app.status_segments = outputs
+        .into_values()
+        .flat_map(|o| o.status.into_values())
+        .collect();
+}
+
 pub(super) struct App {
     pub(super) mode: TuiMode,
     pub(super) overlay: Option<Overlay>,
@@ -617,6 +632,11 @@ pub(super) struct App {
     /// so the cursor row always points at the same server in both
     /// places.
     pub(super) peer_mcp_servers: Vec<chaz_core::mcp::McpRegistryEntry>,
+    /// Extension status segments flattened for the status strip, refreshed
+    /// by the run loop from the active session's `extension_outputs` store (the
+    /// daemon writes it at the turn boundary). Each entry is one
+    /// ready-to-render segment value, ordered by extension then key.
+    pub(super) status_segments: Vec<String>,
     /// Sub-cursor inside the Session → Models row list (row 0 =
     /// Session pin, rows 1..n = each attached agent). Drives which
     /// scope `Enter` opens the picker for. Clamped to live length
@@ -705,6 +725,7 @@ impl App {
             peer_defaults: Vec::new(),
             peer_defaults_cursor: 0,
             peer_mcp_servers: Vec::new(),
+            status_segments: Vec::new(),
             peer_mcp_cursor: 0,
             session_models_cursor: 0,
             session_agents_cursor: 0,

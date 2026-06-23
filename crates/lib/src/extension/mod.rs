@@ -127,6 +127,81 @@ pub async fn write_settings(
     Ok(())
 }
 
+/// Store name for extension-published outputs on the session DB. Keys are
+/// extension names; values are JSON-serialized [`ExtensionOutput`] blobs.
+/// The read-direction twin of [`EXTENSION_SETTINGS_STORE`]: the daemon
+/// writes, frontends read. Lives on the session DB so a split
+/// (out-of-process) frontend that already holds the session open consumes
+/// it with no extra transport.
+pub const EXTENSION_OUTPUTS_STORE: &str = "extension_outputs";
+
+/// One extension's published outputs, materialized into the session DB so
+/// a frontend — the in-process TUI today, an out-of-process bridge later —
+/// can render them. Pure data; no UI component crosses the boundary.
+///
+/// Phase 1 carries only `status` (status-bar segments). Further
+/// presentation kinds (progress, badges) slot in as new
+/// `#[serde(default)]` fields without breaking older readers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionOutput {
+    /// Status-bar segments keyed by a short label; rendered in key order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub status: BTreeMap<String, String>,
+}
+
+/// Read every extension's published outputs from this session's DB, keyed
+/// by extension name. Missing store / parse errors yield an empty map —
+/// absence is the normal "nothing published yet" state.
+pub async fn read_extension_outputs(session_db: &Database) -> BTreeMap<String, ExtensionOutput> {
+    let Ok(txn) = session_db.new_transaction().await else {
+        return BTreeMap::new();
+    };
+    let Ok(store) = txn.get_store::<DocStore>(EXTENSION_OUTPUTS_STORE).await else {
+        return BTreeMap::new();
+    };
+    let Ok(doc) = store.get_all().await else {
+        return BTreeMap::new();
+    };
+    doc.iter()
+        .filter_map(|(ext, value)| {
+            let json: String = value.try_into().ok()?;
+            let parsed = serde_json::from_str::<ExtensionOutput>(&json).ok()?;
+            Some((ext.clone(), parsed))
+        })
+        .collect()
+}
+
+/// Materialize the daemon-collected extension outputs into this session's
+/// DB, one JSON doc per extension. Write-on-change: reads the current
+/// store and only opens a write transaction when something differs, so an
+/// unchanged turn appends no entry to the session DAG.
+pub async fn write_extension_outputs(
+    session_db: &Database,
+    fresh: &BTreeMap<String, ExtensionOutput>,
+) -> anyhow::Result<()> {
+    let current = read_extension_outputs(session_db).await;
+    if current == *fresh {
+        return Ok(());
+    }
+    let txn = session_db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(EXTENSION_OUTPUTS_STORE).await?;
+    for (ext, output) in fresh {
+        if current.get(ext) != Some(output) {
+            store
+                .set_string(ext, serde_json::to_string(output)?)
+                .await?;
+        }
+    }
+    // Drop extensions that no longer publish anything.
+    for ext in current.keys() {
+        if !fresh.contains_key(ext) {
+            store.delete(ext).await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
 pub use hooks::{
     HookAgentEnd, HookBeforeAgentStart, HookSessionShutdown, HookSessionStart, HookToolCall,
     HookToolResult,
@@ -643,15 +718,6 @@ pub struct ExtensionHub {
     /// `ScopeCtx` without rebuilding from scratch on every event.
     /// `None` until the host wires it via [`Self::set_peer_handles`].
     peer_handles: Option<Arc<instance::PeerHandles>>,
-
-    /// Extension-contributed status-bar segments, keyed
-    /// `{ext_name}:{key}`. A [`BTreeMap`] so consumers get pi's
-    /// alphabetical-by-key order for free. Written by extensions via
-    /// [`Self::set_status`]; read on the gateway render path (the TUI
-    /// status line) via [`Self::status_segments`]. A `std::sync::RwLock`
-    /// (not tokio's) so the synchronous TUI render path can read it
-    /// without an async context.
-    status_segments: std::sync::RwLock<BTreeMap<String, String>>,
 }
 
 impl Default for ExtensionHub {
@@ -685,39 +751,7 @@ impl ExtensionHub {
             agent_instances: tokio::sync::RwLock::new(HashMap::new()),
             session_instances: tokio::sync::RwLock::new(HashMap::new()),
             peer_handles: None,
-            status_segments: std::sync::RwLock::new(BTreeMap::new()),
         }
-    }
-
-    /// Set or clear one extension-contributed status segment. `key`
-    /// should already be namespaced (`{ext_name}:{key}`) by the caller so
-    /// segments from different extensions never collide. `Some(text)`
-    /// inserts/overwrites; `None` removes the segment. A poisoned lock is
-    /// recovered (status is cosmetic — never panic the agent over it).
-    pub fn set_status(&self, key: String, text: Option<String>) {
-        let mut map = self
-            .status_segments
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        match text {
-            Some(t) => {
-                map.insert(key, t);
-            }
-            None => {
-                map.remove(&key);
-            }
-        }
-    }
-
-    /// Snapshot the current status segments, ordered alphabetically by
-    /// key. Called from the synchronous gateway render path (the TUI
-    /// status line); clones so the caller holds no lock. A poisoned lock
-    /// is recovered rather than propagated.
-    pub fn status_segments(&self) -> BTreeMap<String, String> {
-        self.status_segments
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Install the peer-handle bag used to construct
@@ -1575,6 +1609,45 @@ impl ExtensionHub {
             }
         }
         parts.join("\n\n")
+    }
+
+    /// Collect status segments from every live instance that publishes a
+    /// [`caps::StatusSegment`] endpoint and materialize them into the
+    /// session DB's `extension_outputs` store. Fires at the turn boundary
+    /// (beside [`Self::context_tails`]); a frontend reads the store back
+    /// to render the status strip.
+    ///
+    /// The hub is the sole writer — each extension's doc is built only
+    /// from that extension's own returned segments, so a provider can
+    /// neither forge nor clobber another's keys. Write-on-change keeps an
+    /// unchanged turn from growing the session DAG.
+    pub async fn refresh_status_outputs(&self, agent_name: &str, session_db: &Database) {
+        // Global instances (e.g. `core`) plus the turn's lazily-ensured
+        // agent/session instances. `context_instances` covers agent +
+        // session only, so global-scoped providers are folded in
+        // explicitly; per-session/agent instances win on name collision.
+        let mut instances: HashMap<String, Arc<dyn instance::ExtensionInstance>> = HashMap::new();
+        for (name, inst) in &self.global_instances {
+            instances.insert(name.clone(), inst.clone());
+        }
+        for inst in self.context_instances(agent_name, Some(session_db)).await {
+            instances.insert(inst.manifest().name.clone(), inst);
+        }
+
+        let mut outputs: BTreeMap<String, ExtensionOutput> = BTreeMap::new();
+        for inst in instances.into_values() {
+            // coding: status providers await inline on the turn-assembly
+            // path (same contract as context_tails) — keep them cheap.
+            if let Some(ss) = inst.status_segment()
+                && let Ok(status) = ss.status_segments(agent_name).await
+                && !status.is_empty()
+            {
+                outputs.insert(inst.manifest().name.clone(), ExtensionOutput { status });
+            }
+        }
+        if let Err(e) = write_extension_outputs(session_db, &outputs).await {
+            tracing::warn!(agent = %agent_name, "Failed to persist extension status outputs: {e}");
+        }
     }
 } // impl ExtensionHub
 

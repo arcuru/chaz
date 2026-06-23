@@ -11,12 +11,15 @@
 //! the same construction path as the other built-ins.
 
 use crate::backends::BackendManager;
+use crate::extension::caps::{CapFuture, StatusSegment};
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
+use crate::mcp::McpServerStatus;
 use crate::security::SecurityContext;
 use crate::server::Server;
 use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnWorker};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 pub struct CoreExtension {
@@ -102,5 +105,49 @@ impl ExtensionInstance for CoreInstance {
                 security: self.security.clone(),
             }),
         ]
+    }
+
+    fn status_segment(&self) -> Option<Arc<dyn StatusSegment>> {
+        Some(Arc::new(McpStatus {
+            server: self.spawn_server_cell.clone(),
+        }))
+    }
+}
+
+/// Publishes one `mcp` status segment: the count of running MCP servers
+/// (and any that failed to start), read live from the server's MCP
+/// registry. Global, not per-agent — the first producer for the
+/// extension-output-store path. Empty when no MCP servers are configured.
+struct McpStatus {
+    server: Arc<OnceLock<Arc<Server>>>,
+}
+
+impl StatusSegment for McpStatus {
+    fn status_segments<'a>(
+        &'a self,
+        _agent_name: &'a str,
+    ) -> CapFuture<'a, BTreeMap<String, String>> {
+        Box::pin(async move {
+            let mut out = BTreeMap::new();
+            let Some(server) = self.server.get() else {
+                return Ok(out);
+            };
+            let (mut running, mut failed) = (0u32, 0u32);
+            for entry in server.mcp_registry().snapshot() {
+                match entry.status {
+                    McpServerStatus::Running { .. } => running += 1,
+                    McpServerStatus::Failed { .. } => failed += 1,
+                }
+            }
+            if running + failed > 0 {
+                let text = if failed > 0 {
+                    format!("{running} mcp, {failed} down")
+                } else {
+                    format!("{running} mcp")
+                };
+                out.insert("mcp".to_string(), text);
+            }
+            Ok(out)
+        })
     }
 }

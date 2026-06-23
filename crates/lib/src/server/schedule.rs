@@ -653,6 +653,13 @@ impl Server {
         let session_db_id = session_db.root_id().to_string();
         let active_extensions = self.refresh_active_extensions(&session_db_id).await;
 
+        // Captured before the moves below so we can populate the session's
+        // extension status outputs at open time — not only at the first
+        // turn. The frontend's `on_write` → `SessionChanged` repaints from
+        // the store, so a fresh session shows status without a message.
+        let status_db = session_db.clone();
+        let status_agent = agent_name.clone();
+
         let conv_id = ConversationId(session_db_id);
         let session = Session::new(conv_id, session_db).await;
         let ctx = HookContext {
@@ -664,5 +671,8 @@ impl Server {
             routine_engine: self.routine_engine().cloned(),
         };
         self.extensions.fire_session_start(&ctx).await;
+        self.extensions
+            .refresh_status_outputs(&status_agent, &status_db)
+            .await;
     }
 }

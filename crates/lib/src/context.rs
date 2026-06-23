@@ -237,6 +237,12 @@ impl<'a> ContextBuilder<'a> {
         // messages to keep. Otherwise a large recall payload could push
         // the assembled context past the model's window.
         let tail_text = if let Some(ref hub) = self.extension_hub {
+            // Turn boundary: also refresh the extension status outputs the
+            // frontend renders. Orthogonal to the prompt, so kept out of
+            // the token budget below.
+            if let Some(db) = self.session_db {
+                hub.refresh_status_outputs(self.agent_name, db).await;
+            }
             let t = hub
                 .context_tails(self.agent_name, &recent_text, None, self.session_db)
                 .await;

@@ -34,7 +34,9 @@
 #![allow(dead_code)]
 
 use crate::extension::ExtensionCommand;
-use crate::extension::caps::{ContextTail, MemoryAccess, Messenger, PromptAugmentation};
+use crate::extension::caps::{
+    ContextTail, MemoryAccess, Messenger, PromptAugmentation, StatusSegment,
+};
 use crate::extension::handler::{
     HookHandlerAgentEnd, HookHandlerBeforeAgentStart, HookHandlerSessionShutdown,
     HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult, RoutineHandler,
@@ -172,6 +174,9 @@ pub trait ExtensionInstance: Send + Sync + 'static {
         None
     }
     fn context_tail(&self) -> Option<Arc<dyn ContextTail>> {
+        None
+    }
+    fn status_segment(&self) -> Option<Arc<dyn StatusSegment>> {
         None
     }
 
