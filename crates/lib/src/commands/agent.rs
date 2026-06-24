@@ -394,6 +394,11 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
         Ok(t) => t,
         Err(e) => return CommandOutcome::Error(format!("Failed to share agent DB: {e}")),
     };
+    // The ticket is printed in the TUI below, but the TUI captures the mouse so
+    // the long, wrapping string can't be selected. Mirror it to the log so it's
+    // recoverable with grep. The ticket is an approval-gated bootstrap
+    // capability (needs `/sharing approve`), not a bearer secret.
+    tracing::info!(agent = %entry.display_name, db = %entry.db_id, %ticket, "Shared agent DB; ticket logged for copy");
     CommandOutcome::Text(format!(
         "Share this ticket to sync agent '{}' (DB {}):\n\n{ticket}",
         entry.display_name, entry.db_id
