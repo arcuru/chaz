@@ -50,29 +50,85 @@ pub(super) async fn sharing_requests(ctx: &CommandContext<'_>) -> CommandOutcome
     }
     let mut lines: Vec<String> = Vec::with_capacity(requests.len() + 2);
     lines.push(format!("Pending bootstrap requests ({}):", requests.len()));
-    for (id, req) in &requests {
+    for (i, (id, req)) in requests.iter().enumerate() {
+        let short = &id[..8.min(id.len())];
         lines.push(format!(
-            "  {} — {} requested by {} as {} at {}",
-            id,
+            "  [{}] {} — {} requested by {} as {} at {}",
+            i + 1,
+            short,
             label_for_target(ctx, &req.tree_id),
             req.requesting_pubkey,
             permission_name(&req.requested_permission),
             req.timestamp,
         ));
     }
-    lines.push("Approve with /sharing approve <id>, reject with /sharing reject <id>.".to_string());
+    lines.push(
+        "Approve with /sharing approve <index|prefix>, reject with /sharing reject <index|prefix>."
+            .to_string(),
+    );
     CommandOutcome::Text(lines.join("\n"))
 }
 
-pub(super) async fn sharing_approve(request_id: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let trimmed = request_id.trim();
-    if trimmed.is_empty() {
-        return CommandOutcome::Error("Usage: /sharing approve <request_id>".to_string());
+/// Resolve a user-supplied prefix or 1-based index to an exact bootstrap
+/// request ID. If `prefix` parses as a number, it's treated as an index
+/// into the pending-request list. Otherwise it's matched as an ID prefix
+/// (case-sensitive). Returns the full request ID on success or an error
+/// string describing the failure.
+async fn resolve_request_prefix(prefix: &str, ctx: &CommandContext<'_>) -> Result<String, String> {
+    let requests = match ctx.server.registry().pending_bootstrap_requests().await {
+        Ok(r) => r,
+        Err(e) => return Err(format!("Failed to list pending requests: {e}")),
+    };
+
+    // Index-based lookup
+    if let Ok(idx) = prefix.parse::<usize>() {
+        if idx < 1 || idx > requests.len() {
+            return Err(format!(
+                "Index {} is out of range (1-{})",
+                idx,
+                requests.len()
+            ));
+        }
+        return Ok(requests[idx - 1].0.clone());
     }
+
+    // Prefix-based lookup
+    let matches: Vec<&(String, eidetica::sync::BootstrapRequest)> = requests
+        .iter()
+        .filter(|(id, _)| id.starts_with(prefix))
+        .collect();
+
+    match matches.len() {
+        0 => Err(format!("no pending request matches prefix '{prefix}'")),
+        1 => Ok(matches[0].0.clone()),
+        _ => {
+            let candidates: Vec<String> = matches
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _))| format!("  [{}] {}", i + 1, id))
+                .collect();
+            Err(format!(
+                "ambiguous prefix '{prefix}' — {} candidates:\n{}",
+                matches.len(),
+                candidates.join("\n")
+            ))
+        }
+    }
+}
+
+pub(super) async fn sharing_approve(args: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return CommandOutcome::Error("Usage: /sharing approve <index|prefix>".to_string());
+    }
+    let request_id = match resolve_request_prefix(trimmed, ctx).await {
+        Ok(id) => id,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
     match ctx
         .server
         .registry()
-        .approve_bootstrap_request(trimmed)
+        .approve_bootstrap_request(&request_id)
         .await
     {
         Ok((tree_id, req)) => CommandOutcome::Text(format!(
@@ -85,15 +141,19 @@ pub(super) async fn sharing_approve(request_id: &str, ctx: &CommandContext<'_>) 
     }
 }
 
-pub(super) async fn sharing_reject(request_id: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let trimmed = request_id.trim();
+pub(super) async fn sharing_reject(args: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    let trimmed = args.trim();
     if trimmed.is_empty() {
-        return CommandOutcome::Error("Usage: /sharing reject <request_id>".to_string());
+        return CommandOutcome::Error("Usage: /sharing reject <index|prefix>".to_string());
     }
+    let request_id = match resolve_request_prefix(trimmed, ctx).await {
+        Ok(id) => id,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
     match ctx
         .server
         .registry()
-        .reject_bootstrap_request(trimmed)
+        .reject_bootstrap_request(&request_id)
         .await
     {
         Ok((tree_id, req)) => CommandOutcome::Text(format!(
@@ -283,24 +343,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sharing_approve_unknown_id_errors() {
+    async fn sharing_approve_no_match_errors() {
         let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
         match dispatch(Command::SharingApprove("ghost-id".to_string()), &ctx).await {
             CommandOutcome::Error(msg) => {
-                assert!(msg.contains("No bootstrap request"), "got: {msg}");
+                assert!(
+                    msg.contains("no pending request matches prefix"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected Error, got {:?}", outcome_kind(&other)),
         }
     }
 
     #[tokio::test]
-    async fn sharing_reject_unknown_id_errors() {
+    async fn sharing_reject_no_match_errors() {
         let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
         match dispatch(Command::SharingReject("ghost-id".to_string()), &ctx).await {
             CommandOutcome::Error(msg) => {
-                assert!(msg.contains("No bootstrap request"), "got: {msg}");
+                assert!(
+                    msg.contains("no pending request matches prefix"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected Error, got {:?}", outcome_kind(&other)),
         }
@@ -312,6 +378,41 @@ mod tests {
         let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
         match dispatch(Command::SharingApprove("   ".to_string()), &ctx).await {
             CommandOutcome::Error(msg) => assert!(msg.contains("Usage"), "got: {msg}"),
+            other => panic!("expected Error, got {:?}", outcome_kind(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn sharing_reject_blank_id_errors() {
+        let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(Command::SharingReject("   ".to_string()), &ctx).await {
+            CommandOutcome::Error(msg) => assert!(msg.contains("Usage"), "got: {msg}"),
+            other => panic!("expected Error, got {:?}", outcome_kind(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn sharing_approve_index_out_of_range_errors() {
+        let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        // No pending requests, so index 1 is out of range.
+        match dispatch(Command::SharingApprove("1".to_string()), &ctx).await {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("out of range"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {:?}", outcome_kind(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn sharing_reject_index_out_of_range_errors() {
+        let (_i, server, secrets, backend, sid, sdb) = fixture(true).await;
+        let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+        match dispatch(Command::SharingReject("1".to_string()), &ctx).await {
+            CommandOutcome::Error(msg) => {
+                assert!(msg.contains("out of range"), "got: {msg}");
+            }
             other => panic!("expected Error, got {:?}", outcome_kind(&other)),
         }
     }
