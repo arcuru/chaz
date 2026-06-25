@@ -1193,3 +1193,167 @@ async fn watcher_registers_exposed_sessions_only() {
         "attached-but-unexposed session must be skipped"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Track A: transport/runtime split (`watch_session` + `claim_runtime`).
+// ---------------------------------------------------------------------------
+
+/// Make a fresh, registry-backed session and a no-op backend for the
+/// runtime-ownership tests.
+async fn fresh_session_and_backend(
+    registry: &Arc<crate::session::SessionRegistry>,
+) -> (eidetica::Database, crate::backends::BackendManager) {
+    let (_conv, session_db) = registry.create_session(Some("chat")).await.unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::new(&None, secrets);
+    (session_db, backend)
+}
+
+#[tokio::test]
+async fn watch_session_is_transport_only_no_runtime_claim() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (session_db, backend) = fresh_session_and_backend(&registry).await;
+    let session_db_id = session_db.root_id().to_string();
+
+    // Transport only: subscribes to I/O, but takes no runtime ownership.
+    server
+        .watch_session(&session_db, backend, Some("agent".to_string()), None)
+        .await
+        .unwrap();
+
+    assert!(
+        server.is_watching_session(&session_db_id).await,
+        "watch_session wires transport"
+    );
+    assert!(
+        server.runtime_owner_of(&session_db_id).is_none(),
+        "watch_session must NOT claim runtime — no agent, no status"
+    );
+}
+
+#[tokio::test]
+async fn claim_runtime_fires_exactly_once_second_caller_errors() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (session_db, backend) = fresh_session_and_backend(&registry).await;
+    let session_db_id = session_db.root_id().to_string();
+
+    server
+        .watch_session(&session_db, backend, Some("agent".to_string()), None)
+        .await
+        .unwrap();
+
+    // First claimant wins.
+    let claimed = server
+        .claim_runtime(
+            &session_db,
+            "agent".to_string(),
+            0,
+            crate::config::RuntimeMode::Always,
+        )
+        .await
+        .unwrap();
+    assert!(claimed, "first claim_runtime must take ownership");
+    assert!(
+        server.runtime_owner_of(&session_db_id).is_some(),
+        "ownership recorded after the first claim"
+    );
+
+    // A second distinct caller is refused under `Always`.
+    let second = server
+        .claim_runtime(
+            &session_db,
+            "agent".to_string(),
+            0,
+            crate::config::RuntimeMode::Always,
+        )
+        .await;
+    assert!(
+        second.is_err(),
+        "second claim_runtime under Always must error — ownership fires exactly once"
+    );
+}
+
+#[tokio::test]
+async fn claim_runtime_auto_skips_when_already_claimed() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (session_db, backend) = fresh_session_and_backend(&registry).await;
+
+    server
+        .watch_session(&session_db, backend, Some("agent".to_string()), None)
+        .await
+        .unwrap();
+
+    assert!(
+        server
+            .claim_runtime(
+                &session_db,
+                "agent".to_string(),
+                0,
+                crate::config::RuntimeMode::Auto
+            )
+            .await
+            .unwrap(),
+        "first Auto claim takes ownership"
+    );
+
+    // Auto gracefully skips (no error) when the session is already owned.
+    let again = server
+        .claim_runtime(
+            &session_db,
+            "agent".to_string(),
+            0,
+            crate::config::RuntimeMode::Auto,
+        )
+        .await
+        .unwrap();
+    assert!(!again, "Auto must skip (Ok(false)) when already claimed");
+}
+
+#[tokio::test]
+async fn claim_runtime_never_does_not_claim() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (session_db, backend) = fresh_session_and_backend(&registry).await;
+    let session_db_id = session_db.root_id().to_string();
+
+    server
+        .watch_session(&session_db, backend, Some("agent".to_string()), None)
+        .await
+        .unwrap();
+
+    let claimed = server
+        .claim_runtime(
+            &session_db,
+            "agent".to_string(),
+            0,
+            crate::config::RuntimeMode::Never,
+        )
+        .await
+        .unwrap();
+    assert!(!claimed, "Never must never claim");
+    assert!(
+        server.runtime_owner_of(&session_db_id).is_none(),
+        "Never leaves the session unowned — pure transport"
+    );
+}
+
+#[tokio::test]
+async fn deregister_session_releases_runtime_claim() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (session_db, backend) = fresh_session_and_backend(&registry).await;
+    let session_db_id = session_db.root_id().to_string();
+
+    server
+        .register_session(&session_db, backend, Some("agent".to_string()), None)
+        .await
+        .unwrap();
+    assert!(
+        server.runtime_owner_of(&session_db_id).is_some(),
+        "register_session (Auto default) claims runtime"
+    );
+
+    server.deregister_session(&session_db_id).await;
+    assert!(
+        server.runtime_owner_of(&session_db_id).is_none(),
+        "deregister_session releases the runtime claim so it can be re-claimed"
+    );
+}

@@ -66,6 +66,36 @@ pub struct Config {
     pub agent_state_allowlist: HashMap<String, Vec<String>>,
     /// Multi-agent chat-room tuning. Omit to use built-in defaults.
     pub multi_agent: Option<MultiAgentConfig>,
+    /// Runtime-ownership mode for this peer: who claims the right to *run*
+    /// the agent (fire the `session_start` hook, drive the routine engine,
+    /// publish extension status) for a session, as opposed to merely
+    /// transporting its I/O. See [`RuntimeMode`]. Omit to default to
+    /// [`RuntimeMode::Auto`]. A standalone transport bridge effectively runs
+    /// as [`RuntimeMode::Never`] (it owns no runtime; the daemon does).
+    pub runtime: Option<RuntimeMode>,
+}
+
+/// Who claims the right to *run* the agent for a session.
+///
+/// `register_session` splits into transport (`watch_session`, any client) and
+/// runtime (`claim_runtime`, single owner). This knob picks how a client
+/// acquires the runtime claim — the in-process analogue of a lease acquire
+/// mode (Track D swaps the local guard for a real eidetica lease without
+/// changing these semantics).
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeMode {
+    /// Claim-or-error: take runtime ownership on connect; error if another
+    /// owner already holds it. For a client that *must* be the runtime.
+    Always,
+    /// Claim-if-free: take ownership when the session is unclaimed; skip
+    /// gracefully if already owned. The default for frontends (TUI/CLI) and
+    /// the agent-running daemon.
+    #[default]
+    Auto,
+    /// Never claim: pure transport. The mode for bridges (Matrix, Discord) —
+    /// they expose the session and let the daemon run it.
+    Never,
 }
 
 /// One login on some transport, owned by exactly one agent (`login → agent`

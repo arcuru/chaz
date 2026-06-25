@@ -16,7 +16,7 @@
 use crate::agent::AgentRegistry;
 use crate::backends::{BackendManager, ModelInfo};
 use crate::bridge::ApprovalExchange;
-use crate::config::ContextConfig;
+use crate::config::{ContextConfig, RuntimeMode};
 use crate::context::ContextBuilder;
 use crate::extension::{ExtensionHub, HookContext};
 use crate::hosted_index::HostedIndex;
@@ -36,9 +36,11 @@ use tracing::{debug, error, info};
 
 mod approval_proxy;
 mod build;
+mod runtime_lease;
 mod schedule;
 
 pub use build::{BuildOptions, BuiltServer, build};
+pub use runtime_lease::{LeaseError, LocalRuntimeLease, OwnerId, RuntimeLease};
 
 /// Maximum number of concurrent LLM calls across all conversations.
 const MAX_CONCURRENT_LLM_CALLS: usize = 10;
@@ -344,6 +346,15 @@ pub struct Server {
     /// startup work releases the gate. Paired with `startup_ready_flag`
     /// (the flag is the source of truth; this just avoids a poll loop).
     startup_ready_notify: Arc<tokio::sync::Notify>,
+    /// Single-owner guard behind [`Server::claim_runtime`]. In-process today
+    /// (a [`LocalRuntimeLease`]); the seam a daemon-arbitrated eidetica lease
+    /// drops into later. See `server::runtime_lease`.
+    runtime_lease: Arc<dyn RuntimeLease>,
+    /// Default runtime-ownership mode applied by [`Server::register_session`]
+    /// (the back-compat wrapper). Set once at startup from `config.runtime`
+    /// via [`Server::set_runtime_mode`]; a dumb bridge runs `Never`. Defaults
+    /// to [`RuntimeMode::Auto`].
+    runtime_mode: std::sync::RwLock<RuntimeMode>,
 }
 
 impl Server {
@@ -400,6 +411,8 @@ impl Server {
             // tests) never gate.
             startup_ready_flag: Arc::new(AtomicBool::new(true)),
             startup_ready_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_lease: Arc::new(LocalRuntimeLease::new()),
+            runtime_mode: std::sync::RwLock::new(RuntimeMode::Auto),
         });
 
         // The agent-running path. `processing_loop` drains `notify_tx` and
@@ -516,6 +529,30 @@ impl Server {
     /// under `--print` and in tests.
     pub fn routine_engine(&self) -> Option<&Arc<crate::routine::RoutineEngine>> {
         self.routine_engine.get()
+    }
+
+    /// Set the default runtime-ownership mode used by the back-compat
+    /// [`Server::register_session`] wrapper. Called once at startup from
+    /// `config.runtime` (a dumb bridge passes [`RuntimeMode::Never`]).
+    pub fn set_runtime_mode(&self, mode: RuntimeMode) {
+        *self
+            .runtime_mode
+            .write()
+            .expect("runtime_mode lock poisoned") = mode;
+    }
+
+    /// The default runtime-ownership mode for this peer.
+    pub fn runtime_mode(&self) -> RuntimeMode {
+        *self
+            .runtime_mode
+            .read()
+            .expect("runtime_mode lock poisoned")
+    }
+
+    /// The current runtime owner of a session, if this peer has claimed it.
+    /// Test/observability accessor over the in-process lease.
+    pub fn runtime_owner_of(&self, session_db_id: &str) -> Option<OwnerId> {
+        self.runtime_lease.owner_of(session_db_id)
     }
 
     /// The per-process MCP server directory. Populated by
@@ -1092,18 +1129,23 @@ impl Server {
         }
     }
 
-    /// Register a session for callback-driven agent processing.
+    /// Subscribe this client to a session's I/O — the **transport** half of
+    /// the old `register_session`. Any client may call this; it takes on no
+    /// runtime duties.
     ///
     /// Installs an `on_write` callback on the session DB (if not already
-    /// present) that triggers agent processing when new entries appear,
-    /// whether written locally or via remote sync. Stores per-session runtime state (backend, agent
-    /// override, approval channel) keyed by the session DB ID.
+    /// present) that pings the processing loop when new entries appear,
+    /// whether written locally or via remote sync. Stores per-session runtime
+    /// state (backend, agent override, approval channel) keyed by the session
+    /// DB ID.
     ///
-    /// Bridges should register their own callbacks on the session DB to handle
-    /// response delivery.
+    /// Watching a session does *not* run the agent: the `session_start` hook,
+    /// the routine engine, and extension-status publication are gated behind
+    /// [`Server::claim_runtime`]. A pure transport bridge calls only this.
     ///
-    /// Safe to call multiple times — updates metadata, skips duplicate callback registration.
-    pub async fn register_session(
+    /// Safe to call multiple times — updates metadata, skips duplicate callback
+    /// registration.
+    pub async fn watch_session(
         &self,
         session_db: &eidetica::Database,
         backend: BackendManager,
@@ -1111,9 +1153,6 @@ impl Server {
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
         let session_db_id = session_db.root_id().to_string();
-        let agent_name_for_hook = agent_override
-            .clone()
-            .unwrap_or_else(|| "agent".to_string());
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -1152,11 +1191,93 @@ impl Server {
             })?
             .detach();
 
-        info!(session_db_id = %session_db_id, "Server watching session");
+        info!(session_db_id = %session_db_id, "Server watching session (transport)");
 
-        // Extension hook: session_start
-        self.fire_session_start_hook(session_db.clone(), agent_name_for_hook, 0)
+        Ok(())
+    }
+
+    /// Claim **runtime** ownership of a session — the runtime half of the old
+    /// `register_session`. Single-owner: gated by the runtime lease so only one
+    /// claimant per session runs the agent. When the claim is granted this
+    /// fires the `session_start` hook, which in turn drives the routine engine
+    /// (via the schedule extension's `on_session_start`) and publishes the
+    /// session's extension-status segments. None of that runs without a claim.
+    ///
+    /// Returns `Ok(true)` when this call took ownership, `Ok(false)` when it
+    /// did not (mode `Never`, or mode `Auto` and the session is already
+    /// owned). Mode `Always` returns `Err` if another owner already holds the
+    /// claim. The claim is released by [`Server::deregister_session`].
+    pub async fn claim_runtime(
+        &self,
+        session_db: &eidetica::Database,
+        agent_name: String,
+        call_depth: usize,
+        mode: RuntimeMode,
+    ) -> anyhow::Result<bool> {
+        let session_db_id = session_db.root_id().to_string();
+
+        if mode == RuntimeMode::Never {
+            debug!(session_db_id = %session_db_id, "runtime=never: not claiming runtime");
+            return Ok(false);
+        }
+
+        // A fresh owner token per call models distinct callers: the first to
+        // claim wins, a later different caller is refused. The local impl is a
+        // per-session `Mutex<Option<OwnerId>>`; a real eidetica lease drops in
+        // here later (Track D) with no caller changes.
+        let owner: OwnerId = uuid::Uuid::new_v4().to_string();
+        if let Err(LeaseError::Held(holder)) = self.runtime_lease.try_claim(&session_db_id, &owner)
+        {
+            return match mode {
+                RuntimeMode::Always => Err(anyhow::anyhow!(
+                    "runtime already claimed for session {session_db_id} by owner {holder}"
+                )),
+                RuntimeMode::Auto => {
+                    debug!(
+                        session_db_id = %session_db_id,
+                        "runtime=auto: session already owned, skipping runtime claim"
+                    );
+                    Ok(false)
+                }
+                // Handled above.
+                RuntimeMode::Never => unreachable!(),
+            };
+        }
+
+        info!(session_db_id = %session_db_id, ?mode, "Server claimed session runtime");
+
+        // Extension hook: session_start (also publishes extension status
+        // outputs and, via the schedule extension, seeds the routine engine).
+        self.fire_session_start_hook(session_db.clone(), agent_name, call_depth)
             .await;
+
+        Ok(true)
+    }
+
+    /// Register a session for callback-driven agent processing.
+    ///
+    /// Back-compat convenience over [`Server::watch_session`] +
+    /// [`Server::claim_runtime`]: wires transport, then claims runtime using
+    /// this peer's configured [`RuntimeMode`] (see [`Server::set_runtime_mode`]).
+    /// A dumb bridge configured `runtime = never` watches without claiming.
+    ///
+    /// Safe to call multiple times — transport metadata is refreshed and the
+    /// runtime claim is idempotent (a second call under `Auto` skips).
+    pub async fn register_session(
+        &self,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+        agent_override: Option<String>,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+    ) -> anyhow::Result<()> {
+        let agent_name_for_hook = agent_override
+            .clone()
+            .unwrap_or_else(|| "agent".to_string());
+
+        self.watch_session(session_db, backend, agent_override, approval_tx)
+            .await?;
+        self.claim_runtime(session_db, agent_name_for_hook, 0, self.runtime_mode())
+            .await?;
 
         Ok(())
     }
@@ -1241,9 +1362,16 @@ impl Server {
             drop(watched);
         }
 
-        // Extension hook: session_start (for child session)
-        self.fire_session_start_hook(session_db.clone(), agent_name.to_string(), call_depth)
-            .await;
+        // The spawning peer owns the child session's runtime — claim it
+        // (a fresh session id never contends, so `Always` always succeeds)
+        // so the `session_start` hook fires on the gated path.
+        self.claim_runtime(
+            &session_db,
+            agent_name.to_string(),
+            call_depth,
+            RuntimeMode::Always,
+        )
+        .await?;
 
         Ok((conversation_id, session_db, completion_rx))
     }
@@ -1289,6 +1417,10 @@ impl Server {
             engine.deregister_session(session_db_id).await;
         }
 
+        // Release the runtime claim so the session can be re-claimed (by this
+        // or a future owner). No-op if this peer never claimed it.
+        self.runtime_lease.release(session_db_id);
+
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_db_id);
     }
@@ -1314,6 +1446,13 @@ impl Server {
     /// Watch for new sessions appearing in the registry (local creates, sync, etc.)
     /// and log them. Bridges are responsible for calling `register_session` to
     /// wire up agent processing and response delivery for their channels.
+    ///
+    /// Log-only for now. This is the future `claim_runtime` driver: once an
+    /// auto-claiming daemon (Track D) watches registry-surfaced sessions, it
+    /// will call `watch_session` + `claim_runtime(RuntimeMode::Auto)` here so a
+    /// session exposed by a dumb bridge gets its runtime owner without a
+    /// per-bridge wiring path. Left log-only until the multi-process lease
+    /// lands — see `~/brain/ava/kb/chaz-runtime-ownership.md` (Track A4 / D2).
     async fn new_session_watcher(&self) {
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;

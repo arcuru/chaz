@@ -473,6 +473,18 @@ pub async fn build(
         "Spawn tool server cell already set"
     );
 
+    // Runtime-ownership mode for this peer. A dumb bridge (no agent loop)
+    // never claims runtime — it is pure transport. The daemon/frontend uses
+    // `config.runtime` (default Auto). Set before any session registration so
+    // `register_session`'s claim path sees the right mode.
+    let runtime_mode = if opts.run_agent_loop {
+        config.runtime.unwrap_or_default()
+    } else {
+        config::RuntimeMode::Never
+    };
+    server.set_runtime_mode(runtime_mode);
+    info!(?runtime_mode, "Applied runtime-ownership mode");
+
     // Apply operator multi-agent tuning before the bridge starts
     // delivering messages (set_agent_burst_budget is read by
     // process_session, which only fires on the first inbound notify).
