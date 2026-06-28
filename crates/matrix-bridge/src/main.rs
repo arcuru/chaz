@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
             identifier: login_id.clone(),
             bridge_db_id: bridge_db_id.clone(),
         };
-        match establish_login(&user, &bootstrap, &identity, &ticket, login_ref).await? {
+        match establish_login(&mut user, &bootstrap, &identity, &ticket, login_ref).await? {
             BootstrapOutcome::Approved => {
                 let creds: MatrixCredentials = bridge_db
                     .read_credentials(&login_id, &unlock)

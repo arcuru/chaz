@@ -459,8 +459,8 @@ pub(super) async fn agent_import(
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
-                "Bootstrap reported success on agent DB {db_id} but this peer still holds no key. \
-                 Likely an eidetica state mismatch — re-run the import to retry."
+                "Bootstrap reported success for agent DB {db_id} but open_agent_db returned None. \
+                 This is an unexpected state — check the eidetica backend."
             ));
         }
         Err(e) => return CommandOutcome::Error(format!("Failed to open synced agent DB: {e}")),

@@ -472,7 +472,7 @@ impl SessionRegistry {
             .instance
             .sync()
             .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
-        let user = self.user.lock().await;
+        let mut user = self.user.lock().await;
         let key_id = user.get_default_key()?;
         match user
             .request_database_access(&sync, ticket, &key_id, permission)

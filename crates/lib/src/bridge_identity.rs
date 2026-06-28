@@ -7,7 +7,7 @@
 //! 1. [`ensure_bridge_key`] — self-generate and persist that key on first run,
 //!    reuse it thereafter (stable identity across restarts).
 //! 2. [`AccessBootstrap`] — the seam over eidetica's ticket-based access
-//!    request. The live [`SyncBootstrap`] drives `bootstrap_with_ticket`
+//!    request. The live [`SyncBootstrap`] drives `User::request_database_access`
 //!    against the peer addresses carried in a [`DatabaseTicket`] (the same
 //!    path `/agent share` → `/agent import` uses); tests substitute a stub so
 //!    the orchestration is exercised without standing up P2P sync. The request
@@ -59,27 +59,27 @@ pub async fn ensure_bridge_key(user: &mut User, key_name: &str) -> anyhow::Resul
 }
 
 /// Seam over eidetica's ticket-based access request. The real implementation
-/// ([`SyncBootstrap`]) drives the live sync handshake; tests provide a stub so
-/// [`establish_login`] can be exercised without P2P sync.
+/// ([`SyncBootstrap`]) drives `User::request_database_access`; tests provide a
+/// stub so [`establish_login`] can be exercised without P2P sync.
 #[allow(async_fn_in_trait)]
 pub trait AccessBootstrap {
-    /// Request `permission` on the database the `ticket` points at,
-    /// authenticating as `(key, key_name)`. Resolves to
+    /// Request `permission` on the database `ticket` points at, authenticating
+    /// as the bridge `user`'s `key`. Resolves to
     /// [`BootstrapOutcome::Approved`] once access is in hand (the owning peer
     /// had pre-authorized the key and the DB synced locally), or
     /// [`BootstrapOutcome::Pending`] when the owner must approve the queued
     /// request first. Errors only on transport/protocol failure.
     async fn request_access(
         &self,
+        user: &mut User,
         ticket: &DatabaseTicket,
         key: &PublicKey,
-        key_name: &str,
         permission: Permission,
     ) -> anyhow::Result<BootstrapOutcome>;
 }
 
 /// Live `AccessBootstrap` over an eidetica `Sync` handle. Issues a single
-/// `bootstrap_with_ticket` (trying every address hint in the ticket); the
+/// `User::request_database_access` (trying every address hint in the ticket); the
 /// owner-side approval is the existing chaz `/sharing` flow. Retry-until-
 /// approved is the caller/binary's concern (the request stays queued on the
 /// owner, and a `Pending` outcome tells the binary to come back later).
@@ -96,16 +96,12 @@ impl SyncBootstrap {
 impl AccessBootstrap for SyncBootstrap {
     async fn request_access(
         &self,
+        user: &mut User,
         ticket: &DatabaseTicket,
         key: &PublicKey,
-        key_name: &str,
         permission: Permission,
     ) -> anyhow::Result<BootstrapOutcome> {
-        match self
-            .sync
-            .bootstrap_with_ticket(ticket, key, key_name, permission)
-            .await
-        {
+        match user.request_database_access(&self.sync, ticket, key, permission).await {
             Ok(()) => Ok(BootstrapOutcome::Approved),
             Err(e) => {
                 if let eidetica::Error::Sync(boxed) = &e
@@ -145,7 +141,7 @@ pub struct BridgeIdentity<'a> {
 /// The secret details were already seeded into the bridge's own DB (the
 /// bridge manages that); this step only publishes the non-secret pointer.
 pub async fn establish_login<B: AccessBootstrap>(
-    user: &User,
+    user: &mut User,
     bootstrap: &B,
     identity: &BridgeIdentity<'_>,
     ticket: &DatabaseTicket,
@@ -153,9 +149,9 @@ pub async fn establish_login<B: AccessBootstrap>(
 ) -> anyhow::Result<BootstrapOutcome> {
     let outcome = bootstrap
         .request_access(
+            user,
             ticket,
             identity.key,
-            identity.key_name,
             Permission::Write(BRIDGE_WRITE_PRIORITY),
         )
         .await?;
@@ -205,9 +201,9 @@ mod tests {
     impl AccessBootstrap for GrantedBootstrap {
         async fn request_access(
             &self,
+            _user: &mut User,
             _ticket: &DatabaseTicket,
             _key: &PublicKey,
-            _key_name: &str,
             _permission: Permission,
         ) -> anyhow::Result<BootstrapOutcome> {
             Ok(BootstrapOutcome::Approved)
@@ -220,9 +216,9 @@ mod tests {
     impl AccessBootstrap for PendingBootstrap {
         async fn request_access(
             &self,
+            _user: &mut User,
             _ticket: &DatabaseTicket,
             _key: &PublicKey,
-            _key_name: &str,
             _permission: Permission,
         ) -> anyhow::Result<BootstrapOutcome> {
             Ok(BootstrapOutcome::Pending {
@@ -238,9 +234,9 @@ mod tests {
     impl AccessBootstrap for DeniedBootstrap {
         async fn request_access(
             &self,
+            _user: &mut User,
             _ticket: &DatabaseTicket,
             _key: &PublicKey,
-            _key_name: &str,
             _permission: Permission,
         ) -> anyhow::Result<BootstrapOutcome> {
             anyhow::bail!("access denied")
@@ -280,7 +276,7 @@ mod tests {
         let settings_db_id = bridge_db.id();
 
         let outcome = establish_login(
-            &user,
+            &mut user,
             &GrantedBootstrap,
             &BridgeIdentity {
                 key: &bridge_key,
@@ -319,7 +315,7 @@ mod tests {
         let settings_db_id = bridge_db.id();
 
         let outcome = establish_login(
-            &user,
+            &mut user,
             &PendingBootstrap,
             &BridgeIdentity {
                 key: &bridge_key,
@@ -357,7 +353,7 @@ mod tests {
         let settings_db_id = bridge_db.id();
 
         let err = establish_login(
-            &user,
+            &mut user,
             &DeniedBootstrap,
             &BridgeIdentity {
                 key: &bridge_key,
