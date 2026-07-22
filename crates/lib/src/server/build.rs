@@ -473,18 +473,6 @@ pub async fn build(
         "Spawn tool server cell already set"
     );
 
-    // Runtime-ownership mode for this peer. A dumb bridge (no agent loop)
-    // never claims runtime — it is pure transport. The daemon/frontend uses
-    // `config.runtime` (default Auto). Set before any session registration so
-    // `register_session`'s claim path sees the right mode.
-    let runtime_mode = if opts.run_agent_loop {
-        config.runtime.unwrap_or_default()
-    } else {
-        config::RuntimeMode::Never
-    };
-    server.set_runtime_mode(runtime_mode);
-    info!(?runtime_mode, "Applied runtime-ownership mode");
-
     // Apply operator multi-agent tuning before the bridge starts
     // delivering messages (set_agent_burst_budget is read by
     // process_session, which only fires on the first inbound notify).
@@ -830,16 +818,14 @@ async fn watch_agent_session_registries(
             continue;
         };
         let tx = tx.clone();
-        match adb
-            .database()
-            .on_write(move |_event, _db| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    let _ = tx.send(()).await;
-                    Ok(())
-                })
+        match adb.database().on_write(move |_event, _db| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(()).await;
+                Ok(())
             })
-            .await
+        })
+        .await
         {
             Ok(sub) => {
                 sub.detach();
@@ -1015,9 +1001,10 @@ async fn pull_session_tree_from_agent_peers(
     // hosting agent's credentials: its pubkey was granted `Write(10)` on the
     // session at attach time under the name `agent:<display_name>`
     // (see `attach_agent_to_session`), so this authorizes the pull without any
-    // new grant/approval. The request is signed with the agent's own key —
-    // eidetica authorizes entry-serving against a *proven* key, so naming the
-    // pubkey is no longer enough to be served.
+    // new grant/approval.
+    // The request is signed with the agent's own key — eidetica authorizes
+    // entry-serving against a *proven* key, so naming the pubkey is no longer
+    // enough to be served.
     let signing_key = match registry.signing_key_for(&agent.pubkey).await {
         Ok(k) => k,
         Err(e) => {
@@ -1039,44 +1026,64 @@ async fn pull_session_tree_from_agent_peers(
             return;
         }
     };
-    for peer in peers {
-        // Stale peers from earlier bootstrap cycles time out here; the live
-        // bridge answers. One success makes the tree openable.
-        match sync
-            .sync_tree_with_peer_auth(
-                peer.public_key(),
-                &session_id,
-                Some(&signing_key),
-                Some(&key_name),
-                Some(permission.clone()),
-                None,
-            )
-            .await
-        {
-            Ok(()) => {
-                // The pull moves entries at the sync layer but establishes no
-                // User-layer SigKey mapping, so `open_session` would still fail
-                // "No key found for database". Track the session under the key
-                // we just authenticated with — the same call that turns on
-                // push-on-commit, so the agent's replies flow straight back to
-                // the exposing bridge once it starts running turns.
-                if let Err(e) = registry
-                    .enable_on_commit_sync_with_key(&session_id, &agent.pubkey)
-                    .await
-                {
-                    tracing::debug!(
-                        session_db_id,
-                        "tracking pulled session under the agent key failed: {e}"
-                    );
-                }
-                info!(session_db_id, peer = %peer, "Pulled exposed session tree from peer");
-                break;
-            }
-            Err(e) => {
-                tracing::debug!(session_db_id, peer = %peer, "pull from peer failed: {e}");
-            }
-        }
+    if peers.is_empty() {
+        tracing::debug!(session_db_id, "no peers sync this agent DB; cannot pull");
+        return;
     }
+    // Ask every peer at once and keep the first success. Peers from retired
+    // bridge identities are never pruned from the agent DB's peer set, and each
+    // one costs a full connect timeout — asking them in sequence turned a
+    // sub-second loopback sync into minutes, scaling with how often a bridge had
+    // been redeployed. Racing them makes the cost that of the slowest *success*.
+    let attempts: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            let sync = sync.clone();
+            let session_id = session_id.clone();
+            let key_name = key_name.clone();
+            let permission = permission.clone();
+            let peer_key = peer.public_key().clone();
+            let signing_key = signing_key.clone();
+            Box::pin(async move {
+                sync.sync_tree_with_peer_auth(
+                    &peer_key,
+                    &session_id,
+                    Some(&signing_key),
+                    Some(&key_name),
+                    Some(permission),
+                    None,
+                )
+                .await
+                .map(|()| peer_key)
+            })
+        })
+        .collect();
+    let winner = match futures::future::select_ok(attempts).await {
+        Ok((peer_key, _outstanding)) => peer_key,
+        Err(e) => {
+            tracing::debug!(session_db_id, "no peer served the session tree: {e}");
+            return;
+        }
+    };
+
+    // The pull moves entries at the sync layer but establishes no User-layer
+    // SigKey mapping, so `open_session` would still fail "No key found for
+    // database". Track the session under the key we just authenticated with —
+    // the same call that turns on push-on-commit, so the agent's replies flow
+    // straight back to the exposing bridge once it starts running turns.
+    if let Err(e) = registry
+        .enable_on_commit_sync_with_key(&session_id, &agent.pubkey)
+        .await
+    {
+        tracing::debug!(
+            session_db_id,
+            "tracking pulled session under the agent key failed: {e}"
+        );
+    }
+    // No `add_tree_sync` here: a successful `sync_tree_with_peer_auth` already
+    // records the (peer, tree) relationship itself, so the background engine
+    // picks this session up in its rounds with the serving bridge from now on.
+    info!(session_db_id, peer = %winner, "Pulled exposed session tree from peer");
 }
 
 /// Startup migration WARN: any locally-hosted agent that is co-owned
