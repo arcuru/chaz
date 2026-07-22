@@ -550,6 +550,18 @@ impl SessionRegistry {
     /// a queue. Resource names (agent/bank/session) are resolved by the
     /// caller via the hosted indices since eidetica's request only stores
     /// the DB id.
+    /// The private key this peer holds for `pubkey`, for operations that must
+    /// *prove* key possession rather than name it — eidetica authorizes
+    /// entry-serving sync requests against a proven key. Errors when this peer
+    /// holds no such key.
+    pub(crate) async fn signing_key_for(
+        &self,
+        pubkey: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<eidetica::auth::crypto::PrivateKey> {
+        let user = self.user.lock().await;
+        Ok(user.get_signing_key(pubkey)?)
+    }
+
     pub async fn pending_bootstrap_requests(
         &self,
     ) -> anyhow::Result<Vec<(String, BootstrapRequest)>> {

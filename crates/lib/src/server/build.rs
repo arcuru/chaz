@@ -889,8 +889,32 @@ pub(crate) async fn register_exposed_sessions(
             if r.exposed_on.is_empty() || server.is_watching_session(&r.session_db_id).await {
                 continue;
             }
-            match registry.open_session(&r.session_db_id).await {
+            // The registry entry is only a *pointer* to the session; its own tree
+            // is separate and, for a bridge-created session, has no sync-peer
+            // relationship with this daemon yet — so it never arrives on its own.
+            // Open it; if the tree isn't local, pull it from the peers we already
+            // sync this agent DB with (the exposing bridge is one of them), then
+            // retry. Best-effort — a miss just defers to the next registry rescan.
+            let mut opened = registry.open_session(&r.session_db_id).await;
+            if opened.is_err() {
+                pull_session_tree_from_agent_peers(registry, &entry, &adb, &r.session_db_id).await;
+                opened = registry.open_session(&r.session_db_id).await;
+            }
+            match opened {
                 Ok((_conv, sdb)) => {
+                    // Push the agent's replies straight back to the exposing
+                    // bridge on every commit, not just the 300s tick. The session
+                    // arrived via sync and may not be in the daemon's tracked
+                    // list, so provide the hosting agent's key explicitly.
+                    if let Err(e) = registry
+                        .enable_on_commit_sync_with_key(sdb.root_id(), &entry.pubkey)
+                        .await
+                    {
+                        warn!(
+                            session_db_id = %r.session_db_id,
+                            "enable on-commit sync for exposed session failed: {e}"
+                        );
+                    }
                     // Proxy tool approvals over the session DB: the runtime
                     // blocks on this channel, the proxy writes a request entry,
                     // and the exposing bridge renders it + writes the decision.
@@ -925,16 +949,131 @@ pub(crate) async fn register_exposed_sessions(
                         {
                             warn!(session_db_id = %r.session_db_id, "Failed to upsert session catalog: {e}");
                         }
+                        // A bridge-exposed session that names some other peer as
+                        // home will never run: the only other peer holding it is
+                        // the exposing bridge, which has no agent loop. The
+                        // session still syncs and registers, so it looks healthy
+                        // while being permanently mute — worth a WARN naming the
+                        // repair rather than a DEBUG on each skipped turn.
+                        if !server
+                            .peer_is_home_for(&r.session_db_id, &entry.display_name)
+                            .await
+                        {
+                            warn!(
+                                session_db_id = %r.session_db_id,
+                                agent = %entry.display_name,
+                                "Bridge-exposed session's home peer is not this daemon; no peer \
+                                 will run its turns. Repair with `/agent rehost` on that session."
+                            );
+                        }
                     }
                 }
                 Err(e) => {
-                    // Not synced over yet (or unreadable) — a later registry
-                    // sync-write will re-trigger this scan and retry.
+                    // Still not openable after a pull attempt (peer unreachable,
+                    // or the tree genuinely absent) — a later registry sync-write
+                    // re-triggers this scan and retries.
                     tracing::debug!(
                         session_db_id = %r.session_db_id,
-                        "Exposed session not yet openable; will retry on next registry write: {e}"
+                        "Exposed session not openable even after pull; will retry on next registry write: {e}"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Pull a bridge-exposed session's own tree onto this daemon.
+///
+/// The agent-DB registry only carries a *pointer* (the session root id); the
+/// session's data lives in a separate eidetica tree that a dumb bridge created
+/// and never established a sync-peer relationship for with the daemon. So the
+/// daemon can see the session exists (the agent DB syncs) but never receives its
+/// contents. Pull that tree from the peers we already sync the *agent* DB with —
+/// the exposing bridge is one of them — over the connection that already exists.
+/// The session DB is auth-gated, so a plain sync is rejected outright
+/// (`database requires authentication`). The pull presents the hosting agent's
+/// credentials instead: the session delegates to the agent DB, where that key
+/// holds authority, and eidetica's bootstrap path resolves the delegation. Any
+/// failure just leaves the session unopenable for the next rescan to retry.
+async fn pull_session_tree_from_agent_peers(
+    registry: &Arc<session::SessionRegistry>,
+    agent: &crate::hosted_index::DbEntry,
+    adb: &crate::agent_db::AgentDb,
+    session_db_id: &str,
+) {
+    let Some(sync) = registry.instance().sync() else {
+        return;
+    };
+    let session_id = match eidetica::entry::ID::parse(session_db_id) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::debug!(session_db_id, "invalid session id, cannot pull: {e}");
+            return;
+        }
+    };
+    // The session DB is auth-gated, so a plain sync is rejected. Present the
+    // hosting agent's credentials: its pubkey was granted `Write(10)` on the
+    // session at attach time under the name `agent:<display_name>`
+    // (see `attach_agent_to_session`), so this authorizes the pull without any
+    // new grant/approval. The request is signed with the agent's own key —
+    // eidetica authorizes entry-serving against a *proven* key, so naming the
+    // pubkey is no longer enough to be served.
+    let signing_key = match registry.signing_key_for(&agent.pubkey).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::debug!(
+                session_db_id,
+                agent = %agent.display_name,
+                "this peer holds no signing key for the agent; cannot pull: {e}"
+            );
+            return;
+        }
+    };
+    let key_name = format!("agent:{}", agent.display_name);
+    let permission = eidetica::auth::types::Permission::Write(10);
+    let agent_root = adb.database().root_id();
+    let peers = match sync.get_tree_peers(agent_root).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(session_db_id, "get_tree_peers failed: {e}");
+            return;
+        }
+    };
+    for peer in peers {
+        // Stale peers from earlier bootstrap cycles time out here; the live
+        // bridge answers. One success makes the tree openable.
+        match sync
+            .sync_tree_with_peer_auth(
+                peer.public_key(),
+                &session_id,
+                Some(&signing_key),
+                Some(&key_name),
+                Some(permission.clone()),
+                None,
+            )
+            .await
+        {
+            Ok(()) => {
+                // The pull moves entries at the sync layer but establishes no
+                // User-layer SigKey mapping, so `open_session` would still fail
+                // "No key found for database". Track the session under the key
+                // we just authenticated with — the same call that turns on
+                // push-on-commit, so the agent's replies flow straight back to
+                // the exposing bridge once it starts running turns.
+                if let Err(e) = registry
+                    .enable_on_commit_sync_with_key(&session_id, &agent.pubkey)
+                    .await
+                {
+                    tracing::debug!(
+                        session_db_id,
+                        "tracking pulled session under the agent key failed: {e}"
+                    );
+                }
+                info!(session_db_id, peer = %peer, "Pulled exposed session tree from peer");
+                break;
+            }
+            Err(e) => {
+                tracing::debug!(session_db_id, peer = %peer, "pull from peer failed: {e}");
             }
         }
     }
