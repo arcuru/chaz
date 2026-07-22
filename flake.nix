@@ -111,11 +111,13 @@
           pkgs.runCommand chaz-unwrapped.name {
             inherit (chaz-unwrapped) pname version;
             nativeBuildInputs = [pkgs.makeWrapper];
+            meta.mainProgram = "chaz";
           } ''
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz $out/bin
             wrapProgram $out/bin/chaz \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]}
+              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
         # The standalone Discord gateway (separate crate, same workspace build).
@@ -125,11 +127,29 @@
             inherit (chaz-unwrapped) version;
             pname = "chaz-discord";
             nativeBuildInputs = [pkgs.makeWrapper];
+            meta.mainProgram = "chaz-discord";
           } ''
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz-discord $out/bin
             wrapProgram $out/bin/chaz-discord \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]}
+              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
+          '';
+
+        # The standalone Matrix gateway (separate crate, same workspace build).
+        # Wrapped like chaz so it shares the backend toolchain (aichat) on PATH.
+        chaz-matrix =
+          pkgs.runCommand "chaz-matrix" {
+            inherit (chaz-unwrapped) version;
+            pname = "chaz-matrix";
+            nativeBuildInputs = [pkgs.makeWrapper];
+            meta.mainProgram = "chaz-matrix";
+          } ''
+            mkdir -p $out/bin
+            cp ${chaz-unwrapped}/bin/chaz-matrix $out/bin
+            wrapProgram $out/bin/chaz-matrix \
+              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
         # Lint packages
@@ -225,11 +245,16 @@
             bin = chaz-discord;
           };
 
+          # Standalone Matrix gateway
+          chaz-matrix = {
+            bin = chaz-matrix;
+          };
+
           default = chaz;
         };
 
         packages = {
-          inherit chaz chaz-unwrapped chaz-discord;
+          inherit chaz chaz-unwrapped chaz-discord chaz-matrix;
           default = chaz;
         };
 
@@ -259,6 +284,10 @@
           chaz-discord = {
             type = "app";
             program = "${chaz-discord}/bin/chaz-discord";
+          };
+          chaz-matrix = {
+            type = "app";
+            program = "${chaz-matrix}/bin/chaz-matrix";
           };
         };
 
