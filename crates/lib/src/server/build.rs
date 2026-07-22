@@ -906,6 +906,20 @@ pub(crate) async fn register_exposed_sessions(
                             exposed_on = ?r.exposed_on,
                             "Daemon registered bridge-exposed session"
                         );
+                        // Also register in the daemon's local session catalog
+                        // so the TUI `/sessions` list picks it up. Build the
+                        // source from the first transport binding so the
+                        // `BridgeKind::from_source` derivation is accurate.
+                        let source = session::transport_bindings(&sdb)
+                            .await
+                            .ok()
+                            .and_then(|b| b.first().map(|(t, _l, c)| format!("{t}:{c}")));
+                        if let Err(e) = registry
+                            .upsert_session_catalog(&r.session_db_id, source.as_deref())
+                            .await
+                        {
+                            warn!(session_db_id = %r.session_db_id, "Failed to upsert session catalog: {e}");
+                        }
                     }
                 }
                 Err(e) => {

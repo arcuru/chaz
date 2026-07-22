@@ -338,6 +338,45 @@ impl SessionRegistry {
         Ok(out)
     }
 
+    /// Upsert a session into the local catalog (both `STORE_SESSIONS` routing
+    /// index and `STORE_SESSION_CATALOG` entry). Used when the daemon adopts a
+    /// session created by another peer (e.g., a bridge-exposed session
+    /// discovered via the agent DB registry) so it appears in the local TUI
+    /// `/sessions` list.
+    ///
+    /// Idempotent — overwrites any existing row with the same `session_db_id`.
+    /// The catalog is peer-local (never syncs), so this doesn't conflict with
+    /// the bridge's own catalog entry.
+    pub async fn upsert_session_catalog(
+        &self,
+        session_db_id: &str,
+        source: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let catalog_entry = SessionCatalogEntry {
+            session_db_id: session_db_id.to_string(),
+            source: source.map(|s| s.to_string()),
+            bridge: BridgeKind::from_source(source),
+            created_at: chrono::Utc::now(),
+            status: SessionStatus::Active,
+        };
+        let txn = self.chaz_group.new_transaction().await?;
+        let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
+        sessions
+            .set_string(session_db_id, source.unwrap_or(""))
+            .await?;
+        let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let catalog_json = serde_json::to_string(&catalog_entry)?;
+        catalog.set_string(session_db_id, catalog_json).await?;
+        txn.commit().await?;
+
+        info!(
+            session_db_id,
+            source,
+            "Upserted session into local catalog (adopted from peer)"
+        );
+        Ok(())
+    }
+
     /// Mark a session as closed in the catalog (no row removal — Patrick's
     /// "find all sessions" design treats history as append-only).
     ///
