@@ -1080,9 +1080,26 @@ async fn pull_session_tree_from_agent_peers(
             "tracking pulled session under the agent key failed: {e}"
         );
     }
-    // No `add_tree_sync` here: a successful `sync_tree_with_peer_auth` already
-    // records the (peer, tree) relationship itself, so the background engine
-    // picks this session up in its rounds with the serving bridge from now on.
+    // A successful `sync_tree_with_peer_auth` records the (peer, tree) pair for
+    // the peer that answered, but a session can be exposed on more than one
+    // bridge and only one of them wins the race. Register the session against
+    // every peer of the agent DB and let the sync engine decide what to exchange
+    // with whom, rather than tracking exposures ourselves.
+    //
+    // This grants nothing: the relationship only asserts that we will exchange
+    // this tree with that peer. Every peer of the agent DB already holds
+    // authority over its sessions through the delegation the session carries, so
+    // there is nothing here they could not already read. Peers that are gone
+    // simply fail in the background, off the critical path.
+    for peer in &peers {
+        if let Err(e) = sync.add_tree_sync(peer.public_key(), &session_id).await {
+            tracing::debug!(
+                session_db_id,
+                peer = %peer,
+                "registering session sync relationship failed: {e}"
+            );
+        }
+    }
     info!(session_db_id, peer = %winner, "Pulled exposed session tree from peer");
 }
 
