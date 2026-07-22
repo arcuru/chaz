@@ -436,9 +436,37 @@ impl SessionRegistry {
     /// is already on, and errors with `DatabaseNotTracked` for DBs this user
     /// doesn't track (i.e. doesn't hold a key for).
     pub async fn enable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
+        use eidetica::user::types::SyncSettings;
         let mut user = self.user.lock().await;
-        user.enable_sync(db_id).await?;
-        info!(db_id = %db_id, "Enabled sync for DB");
+        // Push on every commit, not just the periodic interval, so cross-process
+        // peers (the standalone bridges) see writes immediately — `enable_sync`
+        // alone only flips `sync_enabled` and leaves `sync_on_commit` false, so
+        // inbound messages / agent replies would sit until the 300s tick.
+        // `track_database` upserts the settings; reuse the key already recorded.
+        let key_id = user.database(db_id).await?.key_id;
+        user.track_database(db_id.clone(), &key_id, SyncSettings::on_commit())
+            .await?;
+        info!(db_id = %db_id, "Enabled sync (on-commit) for DB");
+        Ok(())
+    }
+
+    /// Enable on-commit sync for `db_id` under an explicitly-provided `key_id`.
+    /// Unlike [`Self::enable_sync_for`] (which reads the key back from the
+    /// tracked list), this is for DBs that may not be tracked on this peer yet
+    /// — e.g. a bridge-exposed session the daemon just synced but never added to
+    /// its own tracked databases. `track_database` upserts, so it both tracks the
+    /// DB and turns on push-on-commit, letting the agent's replies flow straight
+    /// back to the exposing bridge instead of waiting for the periodic tick.
+    pub async fn enable_on_commit_sync_with_key(
+        &self,
+        db_id: &eidetica::entry::ID,
+        key_id: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<()> {
+        use eidetica::user::types::SyncSettings;
+        let mut user = self.user.lock().await;
+        user.track_database(db_id.clone(), key_id, SyncSettings::on_commit())
+            .await?;
+        info!(db_id = %db_id, "Enabled on-commit sync for DB (explicit key)");
         Ok(())
     }
 

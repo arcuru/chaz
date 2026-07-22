@@ -238,6 +238,18 @@ impl SessionRegistry {
         agent_db
             .expose_session_on(&session_db_id, bridge_label)
             .await?;
+        // Enable sync for the freshly created session DB. New DBs default to
+        // `sync_enabled = false`; without this the bridge won't serve the daemon's
+        // sync requests for this session, so the inbound message never reaches the
+        // agent and no reply comes back. Best-effort — a sync-serve failure
+        // shouldn't sink the inbound message path.
+        if let Err(e) = self.enable_sync_for(db.root_id()).await {
+            tracing::warn!(
+                session_db_id,
+                error = %e,
+                "failed to enable sync for channel session DB; daemon may not see inbound"
+            );
+        }
         Ok((conv, db))
     }
 }
