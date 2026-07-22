@@ -399,10 +399,39 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
     // recoverable with grep. The ticket is an approval-gated bootstrap
     // capability (needs `/sharing approve`), not a bearer secret.
     tracing::info!(agent = %entry.display_name, db = %entry.db_id, %ticket, "Shared agent DB; ticket logged for copy");
+
+    // Also drop the ticket to a file. A fullscreen TUI — especially under tmux or
+    // over SSH — makes hand-selecting a long ticket string painful; a file is
+    // copyable from any shell (`cat ~/.config/chaz/shares/<agent>.ticket`).
+    let file_note = write_share_ticket_file(&entry.display_name, &ticket.to_string())
+        .map(|p| format!("\n\nAlso written to {} — copyable from any shell.", p.display()))
+        .unwrap_or_default();
+
     CommandOutcome::Text(format!(
-        "Share this ticket to sync agent '{}' (DB {}):\n\n{ticket}",
+        "Share this ticket to sync agent '{}' (DB {}):\n\n{ticket}{file_note}",
         entry.display_name, entry.db_id
     ))
+}
+
+/// Best-effort: persist a share ticket under `$XDG_CONFIG_HOME/chaz/shares/` so
+/// it can be copied outside the TUI. Returns the path on success; any IO error
+/// is swallowed (the ticket is still rendered in the TUI regardless).
+fn write_share_ticket_file(agent_name: &str, ticket: &str) -> Option<std::path::PathBuf> {
+    let safe: String = agent_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = dirs::config_dir()?.join("chaz").join("shares");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{safe}.ticket"));
+    std::fs::write(&path, ticket).ok()?;
+    Some(path)
 }
 
 /// Disable sync on an agent DB so this peer stops serving it.
