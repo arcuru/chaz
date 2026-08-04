@@ -207,6 +207,21 @@ pub struct ReloadReport {
     pub considered: usize,
 }
 
+/// Outcome of [`Server::merge_agent_from_yaml`]. Distinguishes the
+/// "agent missing from yaml/DB" cases (so the TUI can message precisely)
+/// from "matched but the merge wrote nothing new".
+#[derive(Debug, Default, Clone)]
+pub struct MergeOutcome {
+    /// A yaml `agents:` entry by this name exists.
+    pub found_yaml: bool,
+    /// This peer hosts (holds a key for) the agent's DB.
+    pub found_db: bool,
+    /// The merge actually rewrote the DB config.
+    pub changed: bool,
+    /// Labels of the fields the merge wrote (empty when nothing applied).
+    pub applied: Vec<&'static str>,
+}
+
 /// Background half of "learn a model's context window on first use", shared by
 /// the schedule and worker turn paths (the latter runs inside a spawned task
 /// with no `&self`). No-op when `model` is empty, already has a known window,
@@ -935,6 +950,125 @@ impl Server {
         intended.applied_config_hash = Some(new_hash);
         db.write_config(&intended).await?;
         Ok(true)
+    }
+
+    /// Re-read the on-disk yaml and parse it. Shared by the diff/merge paths so
+    /// they observe the same config a `/agent reload` would.
+    fn read_config_from_disk(&self) -> anyhow::Result<crate::config::Config> {
+        let path = self
+            .config_path
+            .read()
+            .expect("config_path lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no config path set — config unavailable"))?;
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+        serde_yaml::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
+    }
+
+    /// Compute the field-level diff between an agent's yaml-declared config and
+    /// its DB-actual config. Powers the TUI Peer→Agents diff view. Returns
+    /// `Ok(None)` when the agent has no yaml entry or this peer doesn't host its
+    /// DB — both render as "nothing to diff" upstream.
+    pub async fn agent_diff(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::agent_diff::AgentDiff>> {
+        let config = self.read_config_from_disk()?;
+        let Some(ac) = config
+            .agents
+            .as_ref()
+            .and_then(|a| a.iter().find(|a| a.name == name))
+        else {
+            return Ok(None);
+        };
+        let Some(entry) = self.agent_index.find_by_name(name) else {
+            return Ok(None);
+        };
+        let Some(db) = self
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let db_cfg = db.read_config().await.unwrap_or_default();
+        let yaml_cfg = crate::agent_db::AgentDbConfig::from_agent_config(ac);
+        Ok(Some(crate::agent_diff::diff_agent(&yaml_cfg, &db_cfg)))
+    }
+
+    /// Apply a [`crate::agent_diff::AgentMergeMode`] for one agent: read the
+    /// yaml entry + DB config, merge the selected fields into the DB config,
+    /// refresh the prompt blob when a prompt field changed, persist, and upsert
+    /// the runtime registry so the edit is live on the next message.
+    ///
+    /// Unlike [`Self::reconcile_agent_from_yaml`] this is *not* hash-gated — the
+    /// caller explicitly asked to merge. The `applied_config_hash` gate is left
+    /// untouched (same stance as `/agent set`): a future startup reconcile still
+    /// re-fires only when the yaml block itself changed.
+    pub async fn merge_agent_from_yaml(
+        &self,
+        name: &str,
+        mode: &crate::agent_diff::AgentMergeMode,
+    ) -> anyhow::Result<MergeOutcome> {
+        let config = self.read_config_from_disk()?;
+        let Some(ac) = config
+            .agents
+            .as_ref()
+            .and_then(|a| a.iter().find(|a| a.name == name))
+        else {
+            return Ok(MergeOutcome::default());
+        };
+        let mut outcome = MergeOutcome {
+            found_yaml: true,
+            ..Default::default()
+        };
+        let Some(entry) = self.agent_index.find_by_name(name) else {
+            return Ok(outcome);
+        };
+        let Some(db) = self
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await?
+        else {
+            return Ok(outcome);
+        };
+        outcome.found_db = true;
+
+        let current = db.read_config().await.unwrap_or_default();
+        let yaml_cfg = crate::agent_db::AgentDbConfig::from_agent_config(ac);
+        let fields = mode.fields(&current);
+        if fields.is_empty() {
+            return Ok(outcome);
+        }
+
+        let mut merged = crate::agent_diff::apply_merge(&current, &yaml_cfg, mode);
+
+        // A prompt-affecting field must refresh the blob pointer, else a stale
+        // `system_prompt_ref` would mask the new inline text / files.
+        let touches_prompt = fields.iter().any(|f| {
+            matches!(
+                f,
+                crate::agent_diff::AgentField::SystemPrompt
+                    | crate::agent_diff::AgentField::SystemPromptFiles
+            )
+        });
+        if touches_prompt {
+            self.refresh_prompt_ref(&mut merged).await?;
+        }
+
+        if merged == current {
+            return Ok(outcome);
+        }
+
+        db.write_config(&merged).await?;
+        let runtime_agent = self.agents.build_from_db_config(name, &merged);
+        self.agents.upsert(runtime_agent);
+
+        outcome.changed = true;
+        outcome.applied = fields.iter().map(|f| f.label()).collect();
+        Ok(outcome)
     }
 
     /// Reconcile every agent declared in `config` from yaml into its DB. Run at

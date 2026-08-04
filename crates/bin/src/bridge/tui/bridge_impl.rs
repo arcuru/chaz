@@ -13,6 +13,10 @@ impl Bridge for TuiBridge {
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
+        // Async session-picker fill: the background walk streams one loaded
+        // row per session here. Buffered generously so a fast walk over a
+        // large catalog doesn't stall on the render cadence.
+        let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionInfo>(128);
 
         let (_conv_id, session_db) = default_tui_session(&server).await?;
         let session_db_id = session_db.root_id().to_string();
@@ -58,36 +62,23 @@ impl Bridge for TuiBridge {
         // skipped when an initial prompt was supplied — the user already
         // signalled "I want to send something now," not "show me sessions."
         if self.initial_prompt.is_none() {
-            let (sid, sdb, agent, sname) = {
-                let t = app.active();
-                (
-                    t.session_db_id.clone(),
-                    t.session_db.clone(),
-                    t.current_agent.clone(),
-                    t.session_name.clone(),
-                )
+            // Decide whether to auto-open the picker from the cheap catalog
+            // walk (one registry txn, no per-session DB opens) — a fresh
+            // install with only the just-created empty default session goes
+            // straight to chat. When there's prior history, open the picker
+            // via the async-fill path so a large catalog doesn't block launch.
+            // `entry_count > 0` on the lone default session also counts as
+            // "known" — its entries are already loaded on the active tab, so
+            // check them directly rather than opening the DB again.
+            let has_known = match server.registry().list_sessions().await {
+                Ok(indices) => indices.len() > 1 || !app.active().entries.is_empty(),
+                Err(_) => false,
             };
-            let ctx = CommandContext {
-                server: &server,
-                secrets: &self.secrets,
-                backend: &backend,
-                session_db_id: &sid,
-                session_db: &sdb,
-                current_agent: &agent,
-                session_name: sname.as_deref(),
-            };
-            if let CommandOutcome::SessionsList(list) =
-                commands::dispatch(Command::ListSessions, &ctx).await
-            {
-                let has_known = list.len() > 1 || list.iter().any(|s| s.entry_count > 0);
-                if has_known {
-                    app.session_list = list;
-                    app.session_list_fresh = true;
-                    // Always land on the "New session" row when the picker
-                    // first opens.
-                    app.picker_index = 0;
-                    app.mode = TuiMode::SessionPicker;
-                }
+            if has_known {
+                // Placeholder rows appear instantly; real counts / cost /
+                // names stream in as `Action::SessionRowReady`. Always land
+                // on the "New session" row when the picker first opens.
+                open_session_picker(&mut app, &server, &session_rows_tx).await;
             }
         }
 
@@ -105,6 +96,7 @@ impl Bridge for TuiBridge {
                 Some(id) = notify_rx.recv() => Action::SessionChanged(id),
                 Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                 Some(res) = models_rx.recv() => Action::ModelsFetched(res),
+                Some(info) = session_rows_rx.recv() => Action::SessionRowReady(info),
             };
 
             match action {
@@ -144,6 +136,7 @@ impl Bridge for TuiBridge {
                                     &approval_tx,
                                     &notify_tx,
                                     &models_tx,
+                                    &session_rows_tx,
                                 )
                                 .await;
                             }
@@ -168,6 +161,7 @@ impl Bridge for TuiBridge {
                                     &approval_tx,
                                     &notify_tx,
                                     &models_tx,
+                                    &session_rows_tx,
                                 )
                                 .await;
                             }
@@ -224,6 +218,7 @@ impl Bridge for TuiBridge {
                                         &approval_tx,
                                         &notify_tx,
                                         &models_tx,
+                                        &session_rows_tx,
                                     )
                                     .await;
                                 }
@@ -240,6 +235,12 @@ impl Bridge for TuiBridge {
                                         &notify_tx,
                                     )
                                     .await;
+                                } else {
+                                    // Navigation (or a no-op key) — bring the
+                                    // rows around the new cursor to the front
+                                    // of the fill queue so the visible window
+                                    // loads first.
+                                    app.reprioritize_session_fill();
                                 }
                             }
                             TuiMode::ModelPicker => {
@@ -281,6 +282,7 @@ impl Bridge for TuiBridge {
                                     &approval_tx,
                                     &notify_tx,
                                     &models_tx,
+                                    &session_rows_tx,
                                 )
                                 .await;
                             }
@@ -445,6 +447,39 @@ impl Bridge for TuiBridge {
                         }
                     }
                 }
+                Action::SessionRowReady(info) => {
+                    // Patch the placeholder row in place by id (not index) —
+                    // the user may have scrolled since the walk queued it, and
+                    // ordering is stable so a stale index would corrupt rows.
+                    if let Some(row) = app
+                        .session_list
+                        .iter_mut()
+                        .find(|s| s.session_db_id == info.session_db_id)
+                    {
+                        // Only a still-placeholder row counts toward the
+                        // remaining tally; a row already refreshed by
+                        // Action::SessionChanged (in-tab edit) shouldn't
+                        // double-decrement.
+                        if !row.loaded {
+                            app.session_fill_remaining =
+                                app.session_fill_remaining.saturating_sub(1);
+                        }
+                        *row = info;
+                    }
+                    // Whole catalog loaded — mark the cache fresh so the next
+                    // open short-circuits, and drop the (now-drained) worker.
+                    if app.session_fill_remaining == 0 {
+                        app.session_list_fresh = true;
+                        app.cancel_session_fill();
+                    }
+                }
+            }
+
+            // The picker owns the background fill; the moment we're not in it,
+            // stop opening session DBs the user isn't looking at. A re-open
+            // restarts the walk for whatever rows never finished.
+            if !matches!(app.mode, TuiMode::SessionPicker) {
+                app.cancel_session_fill();
             }
 
             // Refresh the extension status strip after each event so it

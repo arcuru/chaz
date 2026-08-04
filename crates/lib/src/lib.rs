@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod agent_db;
+pub mod agent_diff;
 pub mod anthropic;
 pub mod backends;
 pub mod bridge;

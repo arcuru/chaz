@@ -8,9 +8,9 @@ use chaz_core::commands::Parsed;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::{
-    App, ChatAction, ClickTarget, Completion, ModelPickerScope, Overlay, SettingsFocus,
-    SettingsPicker, SettingsPickerIntent, SettingsPrompt, SettingsPromptIntent, SettingsScope,
-    TuiMode, show_error, show_system_msg,
+    AgentDiffMode, App, ChatAction, ClickTarget, Completion, ModelPickerScope, Overlay,
+    SettingsFocus, SettingsPicker, SettingsPickerIntent, SettingsPrompt, SettingsPromptIntent,
+    SettingsScope, TuiMode, show_error, show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -822,12 +822,19 @@ pub(super) enum SettingsKey {
         intent: SettingsPromptIntent,
         value: String,
     },
-    /// Reload one agent's declarative fields from chaz yaml. Triggered by
-    /// `[r]` on the Peer→Agents detail. Payload is the agent display
-    /// name. Main loop re-reads the config file, builds an `Agent` from
-    /// the matching yaml entry, and upserts into the registry.
-    ReloadPeerAgent {
+    /// Open the yaml↔DB diff/merge modal for one agent. Triggered by `[r]`
+    /// on the Peer→Agents list. Payload is the agent display name; the main
+    /// loop computes the diff server-side and seeds `App::agent_diff`.
+    OpenAgentDiff {
         name: String,
+    },
+    /// Apply a merge mode for one agent's DB config from its yaml entry.
+    /// Triggered from inside the diff modal (`[r]`/`[R]`/`[a]`). The main
+    /// loop calls `Server::merge_agent_from_yaml`, reports the result, and
+    /// closes the modal.
+    ApplyAgentMerge {
+        name: String,
+        mode: chaz_core::agent_diff::AgentMergeMode,
     },
     /// Replace the persisted peer-level `default_agents` list. Triggered
     /// by [d] / Ctrl+↑↓ / submitted [a] prompt on Peer→Defaults. Main
@@ -850,6 +857,11 @@ pub(super) fn handle_settings_key(
     key: KeyEvent,
     scope: SettingsScope,
 ) -> SettingsKey {
+    // The agent diff/merge modal owns all keys while open — arrows move its
+    // row cursor, Esc closes it (not Settings), and r/R/a drive the merge.
+    if app.agent_diff.is_some() {
+        return handle_agent_diff_key(app, key);
+    }
     // When a bottom-strip prompt is active, route keys to it instead of
     // category navigation. Submit returns a PromptSubmit; Esc cancels.
     if app.settings_prompt.is_some() {
@@ -929,7 +941,7 @@ pub(super) fn handle_settings_key(
         && let KeyCode::Char('r') = key.code
     {
         if let Some(name) = app.peer_agents_names.get(app.peer_agents_cursor).cloned() {
-            return SettingsKey::ReloadPeerAgent { name };
+            return SettingsKey::OpenAgentDiff { name };
         }
         return SettingsKey::None;
     }
@@ -1111,6 +1123,131 @@ pub(super) fn handle_settings_key(
             SettingsKey::None
         }
         _ => SettingsKey::None,
+    }
+}
+
+/// Route a key while the Peer→Agents diff/merge modal is open. Three
+/// sub-modes:
+///   - **View** (default): `↑`/`↓` scroll the field cursor; `[r]` applies the
+///     additive drift merge, `[R]` arms reseed-confirm, `[a]` enters pick mode,
+///     `Esc` closes.
+///   - **Pick**: `↑`/`↓` move, `Space` toggles the row, `Enter` applies the
+///     selected fields, `Esc` returns to View.
+///   - **ConfirmReseed**: `y`/`Enter` commits the full overwrite; `n`/`Esc`
+///     backs out to View.
+///
+/// Merge-applying keys clear `app.agent_diff` and hand the work to the main
+/// loop via [`SettingsKey::ApplyAgentMerge`]; everything else mutates the
+/// modal in place and returns `None`.
+fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
+    use chaz_core::agent_diff::{AgentMergeMode, FieldStatus};
+    let Some(view) = app.agent_diff.as_mut() else {
+        return SettingsKey::None;
+    };
+    let row_count = view.diff.rows.len();
+    match view.mode {
+        AgentDiffMode::ConfirmReseed => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('R') | KeyCode::Enter => {
+                let name = view.agent_name.clone();
+                app.agent_diff = None;
+                SettingsKey::ApplyAgentMerge {
+                    name,
+                    mode: AgentMergeMode::Reseed,
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                view.mode = AgentDiffMode::View;
+                SettingsKey::None
+            }
+            _ => SettingsKey::None,
+        },
+        AgentDiffMode::Pick => match key.code {
+            KeyCode::Esc => {
+                view.mode = AgentDiffMode::View;
+                SettingsKey::None
+            }
+            KeyCode::Up => {
+                view.cursor = view.cursor.saturating_sub(1);
+                SettingsKey::None
+            }
+            KeyCode::Down => {
+                if view.cursor + 1 < row_count {
+                    view.cursor += 1;
+                }
+                SettingsKey::None
+            }
+            KeyCode::Char(' ') => {
+                if let Some(p) = view.picks.get_mut(view.cursor) {
+                    *p = !*p;
+                }
+                SettingsKey::None
+            }
+            KeyCode::Enter => {
+                let fields: Vec<chaz_core::agent_diff::AgentField> = view
+                    .diff
+                    .rows
+                    .iter()
+                    .zip(view.picks.iter())
+                    .filter(|(_, picked)| **picked)
+                    .map(|(row, _)| row.field)
+                    .collect();
+                let name = view.agent_name.clone();
+                app.agent_diff = None;
+                if fields.is_empty() {
+                    app.settings_status = Some("No fields picked — nothing applied".to_string());
+                    return SettingsKey::None;
+                }
+                SettingsKey::ApplyAgentMerge {
+                    name,
+                    mode: AgentMergeMode::Pick(fields),
+                }
+            }
+            _ => SettingsKey::None,
+        },
+        AgentDiffMode::View => match key.code {
+            KeyCode::Esc => {
+                app.agent_diff = None;
+                SettingsKey::None
+            }
+            KeyCode::Up => {
+                view.cursor = view.cursor.saturating_sub(1);
+                SettingsKey::None
+            }
+            KeyCode::Down => {
+                if view.cursor + 1 < row_count {
+                    view.cursor += 1;
+                }
+                SettingsKey::None
+            }
+            KeyCode::Char('r') => {
+                let name = view.agent_name.clone();
+                app.agent_diff = None;
+                SettingsKey::ApplyAgentMerge {
+                    name,
+                    mode: AgentMergeMode::Drift,
+                }
+            }
+            KeyCode::Char('R') => {
+                view.mode = AgentDiffMode::ConfirmReseed;
+                SettingsKey::None
+            }
+            KeyCode::Char('a') => {
+                // Only worth entering pick mode if something differs.
+                if view
+                    .diff
+                    .rows
+                    .iter()
+                    .any(|r| r.status != FieldStatus::Unchanged)
+                {
+                    view.mode = AgentDiffMode::Pick;
+                } else {
+                    app.settings_status = Some("No differences to pick".to_string());
+                    app.agent_diff = None;
+                }
+                SettingsKey::None
+            }
+            _ => SettingsKey::None,
+        },
     }
 }
 

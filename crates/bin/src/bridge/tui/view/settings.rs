@@ -378,6 +378,13 @@ fn render_peer_agents(
     server: &Arc<Server>,
     backend: &BackendManager,
 ) {
+    // The diff/merge modal, when open, takes over the whole Agents detail
+    // pane (keyboard-driven; no click regions).
+    if let Some(view) = app.agent_diff.as_ref() {
+        render_agent_diff(f, area, view);
+        return;
+    }
+
     // Use the per-frame cache populated by `ui()` so this matches what
     // the input handler indexed when computing `[r]`.
     let names = app.peer_agents_names.clone();
@@ -602,6 +609,148 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Peer→Agents yaml↔DB diff/merge modal. Takes over the entire Agents
+/// detail pane while [`App::agent_diff`] is `Some`. Renders the diff rows
+/// with field-level color coding (dim/green/yellow/accent), includes
+/// display-only worker diffs, and adapts the bottom hint strip for the
+/// active sub-mode ([`AgentDiffMode`]).
+fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
+    use chaz_core::agent_diff::FieldStatus;
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Min(1),    // diff body
+        Constraint::Length(1), // hints
+    ])
+    .split(area);
+
+    let status_style = |s: FieldStatus| -> Style {
+        match s {
+            FieldStatus::Unchanged => Style::default().fg(theme::DIM),
+            FieldStatus::Added => Style::default().fg(Color::Green),
+            FieldStatus::Removed => Style::default().fg(Color::Yellow),
+            FieldStatus::Changed => Style::default().fg(theme::ACCENT),
+        }
+    };
+
+    let status_symbol = |s: FieldStatus| -> &str {
+        match s {
+            FieldStatus::Unchanged => " ",
+            FieldStatus::Added => "+",
+            FieldStatus::Removed => "-",
+            FieldStatus::Changed => "~",
+        }
+    };
+
+    // ── header ──────────────────────────────────────────────────────
+    let header_text = match view.mode {
+        AgentDiffMode::View => format!("{}  —  yaml ↔ DB diff", view.agent_name),
+        AgentDiffMode::Pick => format!(
+            "{}  —  pick fields to apply  (Space=⏻, Enter=apply, Esc=back)",
+            view.agent_name
+        ),
+        AgentDiffMode::ConfirmReseed => format!(
+            "{}  —  reseed ALL fields from yaml?  (y=yes, n=no)",
+            view.agent_name
+        ),
+    };
+    let header_line = Line::from(vec![Span::styled(header_text, theme::accent_bold())]);
+    f.render_widget(Paragraph::new(header_line), chunks[0]);
+
+    // ── body ────────────────────────────────────────────────────────
+    let scroll = view
+        .cursor
+        .saturating_sub(chunks[1].height.saturating_sub(4) as usize);
+    let visible_rows = view
+        .diff
+        .rows
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(chunks[1].height.saturating_sub(1) as usize);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Field header
+    lines.push(Line::from(vec![
+        Span::styled("  Field", Style::default().fg(theme::DIM)),
+        Span::styled("          yaml declared", Style::default().fg(theme::DIM)),
+        Span::styled("          db actual", Style::default().fg(theme::DIM)),
+    ]));
+    lines.push(Line::from(""));
+
+    for (i, row) in visible_rows {
+        let sty = status_style(row.status);
+        let sym = status_symbol(row.status);
+        let cursor = if i == view.cursor { "▸" } else { " " };
+
+        // Pick mode: prepend a checkbox
+        let pick_mark = if view.mode == AgentDiffMode::Pick {
+            if view.picks.get(i).copied().unwrap_or(false) {
+                "[✓] "
+            } else {
+                "[ ] "
+            }
+        } else {
+            ""
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("{cursor} {pick_mark}{sym} {}", row.label),
+            sty,
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("         yaml: {}", row.yaml),
+            sty,
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("         db:   {}", row.db),
+            sty,
+        )]));
+        lines.push(Line::from(""));
+    }
+
+    // Workers section (display-only, not cursorable)
+    if !view.diff.workers.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  workers (yaml-owned, display-only)",
+            Style::default().fg(theme::DIM),
+        )]));
+        for w in &view.diff.workers {
+            let sty = status_style(w.status);
+            let sym = status_symbol(w.status);
+            lines.push(Line::from(vec![Span::styled(
+                format!("    {sym} {name}", name = w.name),
+                sty,
+            )]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if view.diff.rows.is_empty() && view.diff.workers.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (no fields to diff)",
+            Style::default().fg(theme::DIM),
+        )]));
+    }
+
+    let para = Paragraph::new(lines).scroll((0, 0));
+    f.render_widget(para, chunks[1]);
+
+    // ── hints ───────────────────────────────────────────────────────
+    let hint_text = match view.mode {
+        AgentDiffMode::View => "[r] bring drift back  [R] reseed all  [a] pick fields  [Esc] close",
+        AgentDiffMode::Pick => "[Space] toggle  [Enter] apply picked  [Esc] back",
+        AgentDiffMode::ConfirmReseed => "[y] confirm reseed  [n] cancel",
+    };
+    let hint_line = Line::from(vec![Span::styled(
+        hint_text,
+        Style::default().fg(theme::DIM),
+    )]);
+    f.render_widget(Paragraph::new(hint_line), chunks[2]);
 }
 
 /// Peer → MCP (read-only). Top half is a one-line-per-server list with

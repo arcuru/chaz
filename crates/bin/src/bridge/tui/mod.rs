@@ -16,6 +16,7 @@ use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, Session
 use chaz_core::config::Config;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
+use chaz_core::session::SessionIndex;
 use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
 
 use std::collections::HashMap;
@@ -27,8 +28,11 @@ use crossterm::event::{
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -82,7 +86,27 @@ enum Action {
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(Result<Vec<ModelInfo>, String>),
+    /// One session row finished loading in the async picker fill. Carries the
+    /// fully-loaded `SessionInfo`; the handler patches the matching
+    /// placeholder row in `session_list` by `session_db_id`.
+    SessionRowReady(SessionInfo),
 }
+
+/// Handle to an in-flight async session-picker fill. The background worker
+/// pops indices off `queue` (a shared priority deque the main loop reorders
+/// on scroll), opens each session DB, and streams the loaded row back as
+/// `Action::SessionRowReady`. Setting `cancel` stops the worker at the next
+/// checkpoint — the main loop does this whenever the picker closes so we
+/// don't keep opening DBs the user isn't looking at.
+pub(super) struct SessionFill {
+    queue: Arc<StdMutex<VecDeque<SessionIndex>>>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// How many rows on each side of the cursor count as "visible" for fill
+/// prioritization. A generous window so a page of scrolling still lands on
+/// already-prioritized rows.
+const SESSION_FILL_WINDOW: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TuiMode {
@@ -288,6 +312,37 @@ impl SettingsPicker {
             .and_then(|i| self.candidates.get(*i))
             .map(|s| s.as_str())
     }
+}
+
+/// Peer→Agents yaml↔DB diff/merge modal. Present (`App::agent_diff` is
+/// `Some`) while the user is inspecting one agent's drift and choosing a
+/// merge. Mutually exclusive with the prompt/picker — opening it from the
+/// Peer→Agents list takes over the detail pane. The actual diff data is
+/// computed server-side ([`Server::agent_diff`]); this just holds the
+/// snapshot plus per-row pick state for the interactive `[a]` flow.
+pub(super) struct AgentDiffView {
+    /// Display name of the agent being diffed.
+    pub agent_name: String,
+    /// Field + worker diff snapshot taken when the view opened.
+    pub diff: chaz_core::agent_diff::AgentDiff,
+    /// Which sub-mode is active (plain view / per-field pick / reseed confirm).
+    pub mode: AgentDiffMode,
+    /// Row cursor — indexes `diff.rows` (the mergeable field rows only;
+    /// workers are display-only and not cursorable).
+    pub cursor: usize,
+    /// Per-row accept flags for `[a]` pick mode. `picks.len() == diff.rows.len()`.
+    /// Seeded to the changed rows so Enter-without-toggling applies the drift.
+    pub picks: Vec<bool>,
+}
+
+/// Sub-mode of the [`AgentDiffView`]. Plain `View` lists the diff; `Pick`
+/// adds per-row checkboxes for `[a]`; `ConfirmReseed` gates the destructive
+/// `[R]` full overwrite behind a y/n.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AgentDiffMode {
+    View,
+    Pick,
+    ConfirmReseed,
 }
 
 /// Frozen view of an active session's meta + a few cached derivatives, taken
@@ -550,6 +605,14 @@ pub(super) struct App {
     /// perspective; remote sync writes won't invalidate the cache and the
     /// user can re-open the picker to refresh.
     pub(super) session_list_fresh: bool,
+    /// Handle to the background fill that streams loaded rows into
+    /// `session_list` while the picker is open. `None` when no fill is
+    /// running (cache was warm, or the fill finished / was cancelled).
+    pub(super) session_fill: Option<SessionFill>,
+    /// Count of placeholder rows still awaiting their loaded `SessionInfo`.
+    /// Decremented on each `Action::SessionRowReady`; when it reaches zero the
+    /// list is fully loaded and `session_list_fresh` flips to `true`.
+    pub(super) session_fill_remaining: usize,
     pub(super) picker_index: usize,
     /// Sorted snapshot of the model picker's contents — favorites
     /// (YAML-configured) followed by the live OpenRouter catalog when
@@ -656,6 +719,10 @@ pub(super) struct App {
     /// exclusive with `settings_prompt` — opening one clears the other.
     /// Keys route to the picker (filter typing + ↑↓ + Enter) when set.
     pub(super) settings_picker: Option<SettingsPicker>,
+    /// Peer→Agents yaml↔DB diff/merge modal. `Some` while open; takes over
+    /// the Agents detail pane and routes keys to its own handler. Mutually
+    /// exclusive with the prompt/picker.
+    pub(super) agent_diff: Option<AgentDiffView>,
     /// One-shot status line shown in the Settings status strip in place
     /// of the regular hints. Set by action keys (`[r]` reload, `[d]`
     /// remove, etc.) to confirm what just happened; cleared on the next
@@ -703,6 +770,8 @@ impl App {
             expand_all: false,
             session_list: Vec::new(),
             session_list_fresh: false,
+            session_fill: None,
+            session_fill_remaining: 0,
             picker_index: 0,
             model_list: Vec::new(),
             session_catalog: None,
@@ -731,6 +800,7 @@ impl App {
             session_agents_cursor: 0,
             settings_prompt: None,
             settings_picker: None,
+            agent_diff: None,
             settings_status: None,
             model_picker_caller: TuiMode::Chat,
             settings_focus: SettingsFocus::Sidebar,
@@ -754,6 +824,8 @@ impl App {
     pub(super) fn close_settings(&mut self) {
         let back = self.settings_return.take().unwrap_or(TuiMode::Chat);
         self.mode = back;
+        // Drop any transient Settings sub-state so re-entry starts clean.
+        self.agent_diff = None;
     }
 
     pub(super) fn settings_category_count(&self, scope: SettingsScope) -> usize {
@@ -801,6 +873,57 @@ impl App {
     /// session" row at index 0, then one row per known session.
     pub(super) fn picker_len(&self) -> usize {
         self.session_list.len() + 1
+    }
+
+    /// Cancel any in-flight async picker fill. Signals the worker to stop at
+    /// its next checkpoint and drops the handle. Idempotent — safe to call
+    /// every loop iteration the picker isn't open. Rows already patched into
+    /// `session_list` stay; the ones that never loaded remain placeholders
+    /// and a re-open restarts the fill for them.
+    pub(super) fn cancel_session_fill(&mut self) {
+        if let Some(fill) = self.session_fill.take() {
+            fill.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Re-order the fill work queue so the rows in the visible window around
+    /// the cursor jump to the front. Called as the user scrolls the picker so
+    /// whatever they're looking at loads first. No-op when no fill is running.
+    pub(super) fn reprioritize_session_fill(&self) {
+        let Some(fill) = &self.session_fill else {
+            return;
+        };
+        // Cursor maps to session_list index `picker_index - 1` (row 0 is the
+        // virtual "New session" row). Build the id set for the window.
+        let cur = self.picker_index.saturating_sub(1);
+        let lo = cur.saturating_sub(SESSION_FILL_WINDOW);
+        let hi = cur + SESSION_FILL_WINDOW;
+        let window: HashSet<&str> = self
+            .session_list
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= lo && *i <= hi)
+            .map(|(_, s)| s.session_db_id.as_str())
+            .collect();
+        if window.is_empty() {
+            return;
+        }
+        let Ok(mut q) = fill.queue.lock() else {
+            return;
+        };
+        // Stable partition: visible ids first (preserving queue order), then
+        // the remainder. Cheap — the queue only holds not-yet-loaded rows.
+        let mut front = VecDeque::with_capacity(q.len());
+        let mut back = VecDeque::with_capacity(q.len());
+        for ix in q.drain(..) {
+            if window.contains(ix.session_db_id.as_str()) {
+                front.push_back(ix);
+            } else {
+                back.push_back(ix);
+            }
+        }
+        front.extend(back);
+        *q = front;
     }
 
     /// Resolve the highlighted picker row to a dispatch token: the
@@ -1147,6 +1270,124 @@ fn spawn_catalog_load(
     });
 }
 
+/// Open the session picker with async fill. Does the cheap catalog walk (one
+/// registry transaction, no per-session DB opens), seeds `session_list` with
+/// placeholder rows in final display order, flips into `SessionPicker` mode
+/// immediately, then spawns a background worker to load each row's real
+/// entry-count / cost / name and stream them back as `Action::SessionRowReady`.
+///
+/// Honors the warm cache: when `session_list_fresh` and the list is non-empty,
+/// the fully-loaded rows from a prior open are reused instantly with no walk.
+/// Returns `false` when the catalog walk failed (caller can surface an error);
+/// `true` otherwise (picker opened, whether from cache or a fresh fill).
+async fn open_session_picker(
+    app: &mut App,
+    server: &Arc<Server>,
+    session_rows_tx: &mpsc::Sender<SessionInfo>,
+) -> bool {
+    // Warm-cache short-circuit: a completed prior fill left every row loaded,
+    // Action::SessionChanged patches in-tab rows in place, and NewSession
+    // invalidates wholesale — so a fresh-flagged cache mirrors a cold walk.
+    if app.session_list_fresh && !app.session_list.is_empty() {
+        app.cancel_session_fill();
+        app.picker_index = 0;
+        app.mode = TuiMode::SessionPicker;
+        return true;
+    }
+
+    let indices = match server.registry().list_sessions().await {
+        Ok(ix) => ix,
+        Err(_) => return false,
+    };
+
+    // Preserve any rows a prior (interrupted) fill already loaded so a re-open
+    // restarts only the unfinished ones — the picker was closed mid-walk, but
+    // the rows we did load are still valid this process lifetime.
+    let mut loaded_rows: HashMap<String, SessionInfo> = std::mem::take(&mut app.session_list)
+        .into_iter()
+        .filter(|s| s.loaded)
+        .map(|s| (s.session_db_id.clone(), s))
+        .collect();
+
+    // Build the display rows: reuse a loaded row when we have one, else a
+    // placeholder. Placeholders carry the cheap catalog metadata; sort into
+    // final display order so the async fill patches rows in place (by id)
+    // without ever reordering under the cursor.
+    let mut by_id: HashMap<String, SessionIndex> = indices
+        .iter()
+        .map(|ix| (ix.session_db_id.clone(), ix.clone()))
+        .collect();
+    let mut rows: Vec<SessionInfo> = indices
+        .iter()
+        .map(|ix| {
+            loaded_rows
+                .remove(&ix.session_db_id)
+                .unwrap_or_else(|| SessionInfo::placeholder(ix))
+        })
+        .collect();
+    commands::sort_session_infos(&mut rows);
+
+    // Work queue: only the still-unloaded rows, in display order so the top
+    // (initially visible) placeholders load first.
+    let ordered: VecDeque<SessionIndex> = rows
+        .iter()
+        .filter(|r| !r.loaded)
+        .filter_map(|r| by_id.remove(&r.session_db_id))
+        .collect();
+
+    app.session_fill_remaining = ordered.len();
+    app.session_list = rows;
+    app.session_list_fresh = false;
+    app.picker_index = 0;
+    app.mode = TuiMode::SessionPicker;
+
+    spawn_session_fill(app, server, ordered, session_rows_tx.clone());
+    true
+}
+
+/// Spawn the background worker that drains `queue`, loads each session's full
+/// `SessionInfo`, and streams it back over `session_rows_tx`. Cancels any
+/// prior fill first. The worker checks the shared cancel flag before every DB
+/// open and before every send, so closing the picker stops it promptly.
+fn spawn_session_fill(
+    app: &mut App,
+    server: &Arc<Server>,
+    queue: VecDeque<SessionIndex>,
+    session_rows_tx: mpsc::Sender<SessionInfo>,
+) {
+    app.cancel_session_fill();
+    if queue.is_empty() {
+        // Nothing to load — treat the (empty) list as fully fresh so a
+        // re-open short-circuits instead of re-walking.
+        app.session_list_fresh = true;
+        return;
+    }
+    let queue = Arc::new(StdMutex::new(queue));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let registry = server.registry_arc();
+    let worker_queue = queue.clone();
+    let worker_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            if worker_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let next = worker_queue.lock().ok().and_then(|mut q| q.pop_front());
+            let Some(index) = next else {
+                break;
+            };
+            let info = commands::load_single_session_info(&registry, index).await;
+            if worker_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if session_rows_tx.send(info).await.is_err() {
+                break;
+            }
+        }
+    });
+    app.session_fill = Some(SessionFill { queue, cancel });
+}
+
 /// Build a `Tab` for an already-registered session DB.
 async fn build_tab(
     server: &Server,
@@ -1227,6 +1468,7 @@ async fn handle_chat_action(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+    session_rows_tx: &mpsc::Sender<SessionInfo>,
 ) {
     match action {
         ChatAction::SendMessage(text) => {
@@ -1312,41 +1554,11 @@ async fn handle_chat_action(
             app.settings_focus = SettingsFocus::Detail;
         }
         ChatAction::OpenPicker => {
-            let tab = app.active();
-            let session_db_id = tab.session_db_id.clone();
-            // Warm cache short-circuit: skip the full walk when the cached
-            // list is still valid. Action::SessionChanged patches in-tab
-            // rows in place, and Command::NewSession invalidates wholesale,
-            // so a fresh-flagged cache mirrors what a cold fetch would
-            // produce. The cost rollup on each row was computed during the
-            // prior cold fetch.
-            if app.session_list_fresh && !app.session_list.is_empty() {
-                app.picker_index = 0;
-                app.mode = TuiMode::SessionPicker;
-                return;
-            }
-            let session_db = tab.session_db.clone();
-            let current_agent = tab.current_agent.clone();
-            let session_name = tab.session_name.clone();
-            let ctx = CommandContext {
-                server,
-                secrets,
-                backend,
-                session_db_id: &session_db_id,
-                session_db: &session_db,
-                current_agent: &current_agent,
-                session_name: session_name.as_deref(),
-            };
-            match commands::dispatch(Command::ListSessions, &ctx).await {
-                CommandOutcome::SessionsList(list) => {
-                    app.session_list = list;
-                    app.session_list_fresh = true;
-                    app.picker_index = 0;
-                    app.mode = TuiMode::SessionPicker;
-                }
-                other => {
-                    render_outcome(app, other, server, backend, approval_tx, notify_tx).await;
-                }
+            // Async fill: opens the picker immediately with placeholder rows
+            // and streams the loaded rows in off-thread. Honors the warm
+            // cache internally (skips the walk when the list is still fresh).
+            if !open_session_picker(app, server, session_rows_tx).await {
+                show_error(app, "Failed to list sessions".to_string());
             }
         }
         ChatAction::Dispatch(cmd) => {
@@ -1562,6 +1774,7 @@ async fn handle_settings_outcome(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+    session_rows_tx: &mpsc::Sender<SessionInfo>,
 ) {
     match outcome {
         input::SettingsKey::None => {}
@@ -1579,6 +1792,7 @@ async fn handle_settings_outcome(
                 approval_tx,
                 notify_tx,
                 models_tx,
+                session_rows_tx,
             )
             .await;
         }
@@ -1603,8 +1817,11 @@ async fn handle_settings_outcome(
                 add_peer_default(app, server, value).await;
             }
         },
-        input::SettingsKey::ReloadPeerAgent { name } => {
-            reload_peer_agent_from_yaml(app, server, &name).await;
+        input::SettingsKey::OpenAgentDiff { name } => {
+            open_agent_diff(app, server, &name).await;
+        }
+        input::SettingsKey::ApplyAgentMerge { name, mode } => {
+            apply_agent_merge(app, server, &name, mode).await;
         }
         input::SettingsKey::WritePeerDefaults(names) => {
             write_peer_defaults(app, server, names).await;
@@ -1658,35 +1875,69 @@ async fn write_peer_defaults(app: &mut App, server: &Arc<Server>, names: Vec<Str
     }
 }
 
-/// `[r]` on the Settings agent row — re-read the on-disk chaz yaml and
-/// re-run the server-side hash-gated reconcile for the named agent. This
-/// is the same path as the `/agent reload` command and the startup
-/// reconcile: yaml-declared fields and the resolved system prompt refresh
-/// into the agent's DB (the blob store), and a live `/agent set` edit
-/// survives when the yaml block and prompt files are unchanged. The change
-/// takes effect on the agent's next message via live hydration.
-///
-/// Earlier this only `build_from_yaml`+`upsert`'d the in-memory registry,
-/// which hydration overwrote on the next message — a no-op for DB-backed
-/// agents. Delegating to the server makes the edit durable.
-///
-/// Feedback lands in `app.settings_status`. `reload_config_for` owns the
-/// config-path / read / parse error reporting.
-async fn reload_peer_agent_from_yaml(app: &mut App, server: &Arc<Server>, name: &str) {
-    match server.reload_config_for(Some(name)).await {
-        Ok(report) if report.considered == 0 => {
-            app.settings_status = Some(format!("No yaml entry for {name} — nothing to reload"));
+/// `[r]` on the Peer→Agents list — open the yaml↔DB diff/merge modal for the
+/// named agent. Computes the field-level diff server-side and seeds
+/// `app.agent_diff`. A `None` diff (no yaml entry, or this peer doesn't host
+/// the agent's DB) lands a one-shot status instead of opening an empty modal.
+async fn open_agent_diff(app: &mut App, server: &Arc<Server>, name: &str) {
+    match server.agent_diff(name).await {
+        Ok(Some(diff)) => {
+            // Seed pick state to the changed rows so an immediate Enter in
+            // pick mode applies the visible drift.
+            let picks = diff
+                .rows
+                .iter()
+                .map(|r| r.status != chaz_core::agent_diff::FieldStatus::Unchanged)
+                .collect();
+            app.agent_diff = Some(AgentDiffView {
+                agent_name: name.to_string(),
+                diff,
+                mode: AgentDiffMode::View,
+                cursor: 0,
+                picks,
+            });
         }
-        Ok(report) if report.changed.is_empty() => {
-            app.settings_status = Some(format!("{name} already matched yaml — no change"));
-        }
-        Ok(_) => {
+        Ok(None) => {
             app.settings_status = Some(format!(
-                "Reloaded {name} from yaml (effective next message)"
+                "No yaml entry for '{name}', or this peer doesn't host it — nothing to diff"
             ));
         }
         Err(e) => {
-            app.settings_status = Some(format!("Reload failed — {e}"));
+            app.settings_status = Some(format!("Diff failed — {e}"));
+        }
+    }
+}
+
+/// Apply a merge mode chosen from inside the diff modal. Delegates to
+/// `Server::merge_agent_from_yaml`, which writes the merged DB config and
+/// upserts the runtime registry; the edit is live on the agent's next message.
+/// Feedback (and the precise "nothing changed" / "not hosted" cases) lands in
+/// `app.settings_status`.
+async fn apply_agent_merge(
+    app: &mut App,
+    server: &Arc<Server>,
+    name: &str,
+    mode: chaz_core::agent_diff::AgentMergeMode,
+) {
+    match server.merge_agent_from_yaml(name, &mode).await {
+        Ok(outcome) if !outcome.found_yaml => {
+            app.settings_status = Some(format!("No yaml entry for '{name}' — nothing applied"));
+        }
+        Ok(outcome) if !outcome.found_db => {
+            app.settings_status =
+                Some(format!("This peer holds no key for '{name}' — can't merge"));
+        }
+        Ok(outcome) if !outcome.changed => {
+            app.settings_status = Some(format!("{name}: nothing to apply — already in sync"));
+        }
+        Ok(outcome) => {
+            app.settings_status = Some(format!(
+                "{name}: merged {} (effective next message)",
+                outcome.applied.join(", ")
+            ));
+        }
+        Err(e) => {
+            app.settings_status = Some(format!("Merge failed — {e}"));
         }
     }
 }

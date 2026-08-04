@@ -17,6 +17,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
+use super::AgentDiffMode;
+use super::AgentDiffView;
 use super::App;
 use super::ClickRegion;
 use super::ClickTarget;
@@ -1243,16 +1245,27 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             } else {
                 String::new()
             };
-            let header = format!(
-                "{marker}{title}{current_marker} [{bridge}] {agent_str} • {} entries • {age}{cost_suffix}{closed_suffix}",
-                info.entry_count
-            );
+            // Placeholder rows (async fill not yet done for this session) show
+            // `…` for the fields that require a DB open, keeping the id, bridge
+            // and age (all cheap catalog metadata) so the row is still
+            // recognizable while it loads.
+            let header = if info.loaded {
+                format!(
+                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {} entries • {age}{cost_suffix}{closed_suffix}",
+                    info.entry_count
+                )
+            } else {
+                format!("{marker}{title}{current_marker} [{bridge}] … • … entries • {age}")
+            };
 
             let is_closed = matches!(info.status, chaz_core::session::SessionStatus::Closed);
             let style = if is_selected {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
+            } else if !info.loaded {
+                // Dim until loaded so the eye skips over rows still filling in.
+                Style::default().fg(COLOR_DIM)
             } else if is_closed {
                 Style::default().fg(COLOR_DIM)
             } else if is_current {
