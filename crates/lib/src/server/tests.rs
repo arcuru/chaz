@@ -1035,9 +1035,10 @@ async fn process_session_runs_when_home_pubkey_unset_legacy() {
 
     server.process_session(&sid).await.unwrap();
 
-    // Gate passed → spawn_agent_task was called → spawned tokio task
-    // is pending on current_thread runtime; lock is still held.
-    assert!(server.processing.lock().await.contains(&sid));
+    // Gate passed → no home-skip was recorded. Asserted on the skip counter
+    // rather than the `processing` set: the latter is cleared by the spawned
+    // task, so observing it holds only while that task is unpolled.
+    assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
 }
 
 #[tokio::test]
@@ -1067,7 +1068,9 @@ async fn process_session_runs_when_home_matches_self() {
 
     server.process_session(&sid).await.unwrap();
 
-    assert!(server.processing.lock().await.contains(&sid));
+    // Gate passed → no home-skip recorded. See the note in the legacy test
+    // above on why this is not asserted via the `processing` set.
+    assert_eq!(server.home_skip_count(&sid, "alpha").await, 0);
 }
 
 // ---- fire_agent_schedule gate ---------------------------------------

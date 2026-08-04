@@ -1188,7 +1188,8 @@ impl Server {
                     let _ = tx.send(sid).await;
                     Ok(())
                 })
-            })?
+            })
+            .await?
             .detach();
 
         info!(session_db_id = %session_db_id, "Server watching session (transport)");
@@ -1350,7 +1351,8 @@ impl Server {
                         let _ = tx.send(sid).await;
                         Ok(())
                     })
-                })?
+                })
+                .await?
                 .detach();
 
             info!(

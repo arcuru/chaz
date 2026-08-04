@@ -567,7 +567,8 @@ async fn attach_approval_watcher(
                 }
                 Ok(())
             })
-        })?
+        })
+        .await?
         .detach();
     Ok(())
 }

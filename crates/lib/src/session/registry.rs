@@ -108,7 +108,8 @@ impl SessionRegistry {
                     }
                     Ok(())
                 })
-            })?
+            })
+            .await?
             .detach();
 
         Ok(Self {
@@ -371,8 +372,7 @@ impl SessionRegistry {
 
         info!(
             session_db_id,
-            source,
-            "Upserted session into local catalog (adopted from peer)"
+            source, "Upserted session into local catalog (adopted from peer)"
         );
         Ok(())
     }

@@ -475,7 +475,7 @@ impl SessionRegistry {
         let mut user = self.user.lock().await;
         let key_id = user.get_default_key()?;
         match user
-            .request_database_access(&sync, ticket, &key_id, permission)
+            .request_database_access(&sync, ticket, &key_id, permission, None)
             .await
         {
             Ok(()) => Ok(BootstrapOutcome::Approved),

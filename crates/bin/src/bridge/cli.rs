@@ -107,7 +107,8 @@ impl Bridge for CliBridge {
                     let _ = tx.send(()).await;
                     Ok(())
                 })
-            })?
+            })
+            .await?
             .detach();
 
         let agent_names: HashSet<String> = server

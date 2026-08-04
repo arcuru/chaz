@@ -1044,7 +1044,8 @@ async fn setup_session(
                 let _ = tx.send(id).await;
                 Ok(())
             })
-        })?
+        })
+        .await?
         .detach();
 
     Ok(())

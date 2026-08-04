@@ -35,7 +35,7 @@ type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
 
 /// Spawn the approval proxy for one bridge-exposed session and return the
 /// `approval_tx` to hand to [`Server::register_session`](crate::server::Server::register_session).
-pub fn spawn_session_db_approval_proxy(
+pub async fn spawn_session_db_approval_proxy(
     session_db: Database,
     agent_name: String,
 ) -> mpsc::Sender<ApprovalExchange> {
@@ -45,13 +45,16 @@ pub fn spawn_session_db_approval_proxy(
 
     // Watch the session DB; every write pings the resolver to rescan decisions.
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(32);
-    match session_db.on_write(move |_event, _db| {
-        let ping_tx = ping_tx.clone();
-        Box::pin(async move {
-            let _ = ping_tx.send(()).await;
-            Ok(())
+    match session_db
+        .on_write(move |_event, _db| {
+            let ping_tx = ping_tx.clone();
+            Box::pin(async move {
+                let _ = ping_tx.send(()).await;
+                Ok(())
+            })
         })
-    }) {
+        .await
+    {
         Ok(sub) => sub.detach(),
         Err(e) => warn!(
             session = %sid,

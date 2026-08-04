@@ -830,13 +830,17 @@ async fn watch_agent_session_registries(
             continue;
         };
         let tx = tx.clone();
-        match adb.database().on_write(move |_event, _db| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send(()).await;
-                Ok(())
+        match adb
+            .database()
+            .on_write(move |_event, _db| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(())
+                })
             })
-        }) {
+            .await
+        {
             Ok(sub) => {
                 sub.detach();
                 watched_agents += 1;
@@ -893,7 +897,8 @@ pub(crate) async fn register_exposed_sessions(
                     let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
                         sdb.clone(),
                         entry.display_name.clone(),
-                    );
+                    )
+                    .await;
                     if let Err(e) = server
                         .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
                         .await

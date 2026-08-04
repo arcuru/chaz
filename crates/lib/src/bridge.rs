@@ -380,7 +380,8 @@ where
                 deliver_in_order(&pending, &owning_agent, &mut delivered, send.as_ref()).await;
                 Ok(())
             })
-        })?
+        })
+        .await?
         .detach();
     Ok(())
 }

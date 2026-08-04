@@ -101,7 +101,10 @@ impl AccessBootstrap for SyncBootstrap {
         key: &PublicKey,
         permission: Permission,
     ) -> anyhow::Result<BootstrapOutcome> {
-        match user.request_database_access(&self.sync, ticket, key, permission).await {
+        match user
+            .request_database_access(&self.sync, ticket, key, permission, None)
+            .await
+        {
             Ok(()) => Ok(BootstrapOutcome::Approved),
             Err(e) => {
                 if let eidetica::Error::Sync(boxed) = &e
