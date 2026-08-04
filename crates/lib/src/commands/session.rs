@@ -5,7 +5,7 @@
 //! scheduler pointers, and per-session LLM config (model/role/backend).
 
 use crate::backends::{ChatContext, Message, MessageRole};
-use crate::session::{EntryType, Session, SessionEntry};
+use crate::session::{EntryType, Session, SessionEntry, SessionIndex, SessionRegistry};
 use crate::types::ConversationId;
 
 use eidetica::store::Table;
@@ -22,60 +22,80 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
         Err(e) => return CommandOutcome::Error(format!("Failed to list sessions: {e}")),
     };
 
-    let mut sessions = Vec::new();
+    let registry = ctx.server.registry();
+    let mut sessions = Vec::with_capacity(indices.len());
     for index in indices {
-        let (entry_count, last_message, meta_name, meta_agent, cost_total, cost_reported, calls) =
-            match ctx
-                .server
-                .registry()
-                .open_session(&index.session_db_id)
-                .await
-            {
-                Ok((conv_id, db)) => {
-                    let session = Session::new(conv_id, db).await;
-                    let meta = session.read_meta().await;
-                    let entries = session.entries();
-                    let count = entries.len();
-                    let last = crate::session::summarize_last_message(entries);
-                    let (cost_total, cost_reported, calls) =
-                        crate::session::sum_session_cost(entries);
-                    (
-                        count,
-                        last,
-                        meta.name,
-                        meta.agent_name,
-                        cost_total,
-                        cost_reported,
-                        calls,
-                    )
-                }
-                Err(_) => (0, None, None, None, 0.0, false, 0),
-            };
-        sessions.push(SessionInfo {
-            session_db_id: index.session_db_id,
-            agent_name: meta_agent,
-            name: meta_name,
-            entry_count,
-            last_message,
-            bridge: index.bridge,
-            created_at: index.created_at,
-            status: index.status,
-            total_cost_usd: cost_total,
-            cost_reported,
-            llm_call_count: calls,
-        });
+        sessions.push(load_single_session_info(registry, index).await);
     }
 
-    // Most-recently created first, with legacy (created_at = None) sessions
-    // sorted to the end so fresh sessions are always near the top.
+    sort_session_infos(&mut sessions);
+
+    CommandOutcome::SessionsList(sessions)
+}
+
+/// Load the full per-session `SessionInfo` for one catalog index. Opens the
+/// session DB and folds its entries to compute entry_count, last_message,
+/// cost rollup, and reads meta for name/agent. This is the expensive part of
+/// listing — one DB open + entry fold per session.
+///
+/// Factored out of `list_sessions` so a bridge can fill picker rows one at a
+/// time (async fill): the synchronous `list_sessions` is now a thin loop over
+/// this helper, and the TUI walks the catalog off-thread calling it per row.
+/// A failed open yields a zeroed-but-`loaded` row rather than dropping the
+/// session, matching the pre-refactor behavior.
+pub async fn load_single_session_info(
+    registry: &SessionRegistry,
+    index: SessionIndex,
+) -> SessionInfo {
+    let (entry_count, last_message, meta_name, meta_agent, cost_total, cost_reported, calls) =
+        match registry.open_session(&index.session_db_id).await {
+            Ok((conv_id, db)) => {
+                let session = Session::new(conv_id, db).await;
+                let meta = session.read_meta().await;
+                let entries = session.entries();
+                let count = entries.len();
+                let last = crate::session::summarize_last_message(entries);
+                let (cost_total, cost_reported, calls) = crate::session::sum_session_cost(entries);
+                (
+                    count,
+                    last,
+                    meta.name,
+                    meta.agent_name,
+                    cost_total,
+                    cost_reported,
+                    calls,
+                )
+            }
+            Err(_) => (0, None, None, None, 0.0, false, 0),
+        };
+    SessionInfo {
+        session_db_id: index.session_db_id,
+        agent_name: meta_agent,
+        name: meta_name,
+        entry_count,
+        last_message,
+        bridge: index.bridge,
+        created_at: index.created_at,
+        status: index.status,
+        total_cost_usd: cost_total,
+        cost_reported,
+        llm_call_count: calls,
+        loaded: true,
+    }
+}
+
+/// Order sessions for display: most-recently created first, with legacy
+/// (`created_at = None`) sessions sorted to the end so fresh sessions are
+/// always near the top. Shared by the synchronous `list_sessions` and the
+/// TUI's async fill so placeholder rows and loaded rows land in the same
+/// stable order (rows patch in place by id, not by position).
+pub fn sort_session_infos(sessions: &mut [SessionInfo]) {
     sessions.sort_by(|a, b| match (a.created_at, b.created_at) {
         (Some(x), Some(y)) => y.cmp(&x),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.session_db_id.cmp(&b.session_db_id),
     });
-
-    CommandOutcome::SessionsList(sessions)
 }
 
 pub(super) async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {

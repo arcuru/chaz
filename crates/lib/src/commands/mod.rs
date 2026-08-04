@@ -33,6 +33,7 @@ mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
 pub use parse::{Parsed, parse};
+pub use session::{load_single_session_info, sort_session_infos};
 
 /// User-visible permission level for co-ownership grants on an Agent DB.
 /// Stays separate from eidetica's `Permission` so the CLI grammar is
@@ -309,6 +310,35 @@ pub struct SessionInfo {
     /// Number of assistant messages with recorded metadata. Useful for
     /// distinguishing "no LLM activity" from "LLM activity but uncosted".
     pub llm_call_count: u32,
+    /// `false` for a placeholder row emitted before its session DB has been
+    /// opened — the async picker fill shows these with `…` markers and
+    /// patches them to `true` once `load_single_session_info` completes.
+    /// The synchronous `list_sessions` path always produces `true` rows.
+    pub loaded: bool,
+}
+
+impl SessionInfo {
+    /// A not-yet-loaded row carrying only the cheap catalog metadata (id,
+    /// bridge, created_at, status). The DB-derived fields (entry_count,
+    /// name, agent, last_message, cost) are left blank and `loaded` is
+    /// `false` so the bridge can render `…` placeholders and patch the row
+    /// in place when the async fill emits the real `SessionInfo`.
+    pub fn placeholder(index: &crate::session::SessionIndex) -> Self {
+        SessionInfo {
+            session_db_id: index.session_db_id.clone(),
+            agent_name: None,
+            name: None,
+            entry_count: 0,
+            last_message: None,
+            bridge: index.bridge,
+            created_at: index.created_at,
+            status: index.status,
+            total_cost_usd: 0.0,
+            cost_reported: false,
+            llm_call_count: 0,
+            loaded: false,
+        }
+    }
 }
 
 /// Everything a command handler needs. Borrowed from the bridge.
