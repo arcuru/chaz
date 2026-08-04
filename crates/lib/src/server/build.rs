@@ -1043,7 +1043,6 @@ async fn pull_session_tree_from_agent_peers(
             let sync = sync.clone();
             let session_id = session_id.clone();
             let key_name = key_name.clone();
-            let permission = permission.clone();
             let peer_key = peer.public_key().clone();
             let signing_key = signing_key.clone();
             Box::pin(async move {
