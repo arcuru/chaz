@@ -818,14 +818,16 @@ async fn watch_agent_session_registries(
             continue;
         };
         let tx = tx.clone();
-        match adb.database().on_write(move |_event, _db| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.send(()).await;
-                Ok(())
+        match adb
+            .database()
+            .on_write(move |_event, _db| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
         {
             Ok(sub) => {
                 sub.detach();

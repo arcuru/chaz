@@ -404,7 +404,12 @@ pub(super) async fn agent_share(agent_ref: &str, ctx: &CommandContext<'_>) -> Co
     // over SSH — makes hand-selecting a long ticket string painful; a file is
     // copyable from any shell (`cat ~/.config/chaz/shares/<agent>.ticket`).
     let file_note = write_share_ticket_file(&entry.display_name, &ticket.to_string())
-        .map(|p| format!("\n\nAlso written to {} — copyable from any shell.", p.display()))
+        .map(|p| {
+            format!(
+                "\n\nAlso written to {} — copyable from any shell.",
+                p.display()
+            )
+        })
         .unwrap_or_default();
 
     CommandOutcome::Text(format!(
