@@ -98,8 +98,11 @@ on every boot, so editing the config and restarting is how you rotate them.
 
 ## Setup
 
-A bridge needs **Write** access to each agent DB it serves, and the daemon must
-approve that access once. The flow mirrors [`/agent import`](session_sharing.md#request-flow-default):
+A bridge needs **Read** access to each agent DB it serves, and the daemon must
+approve that access once. It writes nothing to the agent DB — its login pointer
+is carried on the access request and registered by the daemon at approval — so
+it holds no write authority on the agent's own database. (Write on the _session_
+DBs, where it proxies messages, is separate and granted by attachment.) The flow mirrors [`/agent import`](session_sharing.md#request-flow-default):
 
 1. **On the daemon**, share the agent the bridge will serve and copy the ticket:
 
@@ -122,9 +125,10 @@ approve that access once. The flow mirrors [`/agent import`](session_sharing.md#
    ```
 
    On first run the bridge generates its own key, seeds its encrypted credential
-   store, and requests Write on each agent DB via the ticket. If the daemon
-   hasn't yet authorized the bridge's key, the request is **queued** and that
-   login is skipped with a log line like:
+   store, and requests Read on each agent DB via the ticket, attaching the
+   login's pointer to the request. If the daemon hasn't yet authorized the
+   bridge's key, the request is **queued** and that login is skipped with a log
+   line like:
 
    ```text
    WARN login="@chaz:example" Access pending owner approval (...); skipping.

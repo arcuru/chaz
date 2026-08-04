@@ -169,7 +169,7 @@ impl WorkerDbConfig {
 /// This is what lets any peer enumerate which logins an agent has and locate
 /// the bridge that manages each, without being able to authenticate as them.
 /// It is a separate store (not a field on [`AgentDbConfig`]) so chaz's yaml
-/// reconcile never clobbers a bridge's self-registration.
+/// reconcile never clobbers a registered login.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoginRef {
     /// Transport kind (`"matrix"`, `"discord"`, …).
@@ -532,8 +532,10 @@ impl AgentDb {
     // Transport-login registry ([`LOGINS_STORE`])
     //
     // The unencrypted pointer layer: which logins this agent has and where
-    // each one's credentials live (a bridge-owned settings DB). Bridges
-    // self-register here after bootstrapping access. Mirrors the memory/skill
+    // each one's credentials live (a bridge-owned settings DB). The owner
+    // registers these on a bridge's behalf when it approves the bridge's
+    // access request, reading the pointer off the request's bootstrap
+    // metadata — a bridge holds only Read here. Mirrors the memory/skill
     // bank-ref machinery — upsert-by-`identifier`, list, find, detach.
     // -----------------------------------------------------------------
 
