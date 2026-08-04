@@ -8,13 +8,88 @@ use std::sync::{Arc, RwLock};
 use tracing::debug;
 
 use crate::{
-    config::Backend,
+    anthropic::Anthropic,
+    config::{Backend, BackendType},
     error::LlmError,
     openai::OpenAI,
     runtime::{LLMResponse, RuntimeMessage},
     security::SecretStore,
     tool::ToolDefinition,
 };
+
+/// Per-backend LLM client, selected by [`BackendType`]. [`LLMBackend`] is not
+/// dyn-compatible (native `async fn` in trait), so dispatch is an explicit
+/// enum rather than a boxed trait object; each arm forwards to the concrete
+/// backend. Constructed fresh per call from a `&Backend` (cheap — both arms
+/// just clone the config + secret-store handle), mirroring the old
+/// `OpenAI::new(...)` call sites.
+enum BackendClient {
+    OpenAI(OpenAI),
+    Anthropic(Anthropic),
+}
+
+impl BackendClient {
+    fn new(backend: &Backend, secrets: &SecretStore) -> Self {
+        match backend.backend_type {
+            BackendType::OpenAICompatible => BackendClient::OpenAI(OpenAI::new(backend, secrets)),
+            BackendType::Anthropic => BackendClient::Anthropic(Anthropic::new(backend, secrets)),
+        }
+    }
+
+    fn list_models(&self) -> Vec<String> {
+        match self {
+            BackendClient::OpenAI(b) => b.list_models(),
+            BackendClient::Anthropic(b) => b.list_models(),
+        }
+    }
+
+    fn list_models_with_info(&self) -> Vec<ModelInfo> {
+        match self {
+            BackendClient::OpenAI(b) => b.list_models_with_info(),
+            BackendClient::Anthropic(b) => b.list_models_with_info(),
+        }
+    }
+
+    async fn fetch_models_from_api(&self) -> Result<Vec<ModelInfo>, LlmError> {
+        match self {
+            BackendClient::OpenAI(b) => b.fetch_models_from_api().await,
+            BackendClient::Anthropic(b) => b.fetch_models_from_api().await,
+        }
+    }
+
+    fn default_model(&self) -> Option<String> {
+        match self {
+            BackendClient::OpenAI(b) => b.default_model(),
+            BackendClient::Anthropic(b) => b.default_model(),
+        }
+    }
+
+    async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
+        match self {
+            BackendClient::OpenAI(b) => b.execute(context).await,
+            BackendClient::Anthropic(b) => b.execute(context).await,
+        }
+    }
+
+    fn supports_tools(&self) -> bool {
+        match self {
+            BackendClient::OpenAI(b) => b.supports_tools(),
+            BackendClient::Anthropic(b) => b.supports_tools(),
+        }
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+    ) -> Result<LLMResponse, LlmError> {
+        match self {
+            BackendClient::OpenAI(b) => b.chat_with_tools(messages, tools, model).await,
+            BackendClient::Anthropic(b) => b.chat_with_tools(messages, tools, model).await,
+        }
+    }
+}
 
 /// Role of a message in a legacy `ChatContext`. Mirrors the OpenAI chat
 /// completions roles for System/User/Assistant conversations. The tool and
@@ -226,13 +301,13 @@ impl BackendManager {
     /// Models may be valid even if they aren't listed
     pub fn list_known_models(&self) -> Vec<String> {
         if self.backends.len() == 1 {
-            OpenAI::new(&self.backends[0], &self.secrets).list_models()
+            BackendClient::new(&self.backends[0], &self.secrets).list_models()
         } else {
             self.backends
                 .iter()
                 .flat_map(|backend| {
                     let prefix = backend.get_name();
-                    OpenAI::new(backend, &self.secrets)
+                    BackendClient::new(backend, &self.secrets)
                         .list_models()
                         .into_iter()
                         .map(move |model| format!("{}:{}", prefix, model))
@@ -246,13 +321,13 @@ impl BackendManager {
     /// when the backend config doesn't declare it.
     pub fn list_known_models_with_info(&self) -> Vec<ModelInfo> {
         if self.backends.len() == 1 {
-            OpenAI::new(&self.backends[0], &self.secrets).list_models_with_info()
+            BackendClient::new(&self.backends[0], &self.secrets).list_models_with_info()
         } else {
             self.backends
                 .iter()
                 .flat_map(|backend| {
                     let prefix = backend.get_name();
-                    OpenAI::new(backend, &self.secrets)
+                    BackendClient::new(backend, &self.secrets)
                         .list_models_with_info()
                         .into_iter()
                         .map(move |info| ModelInfo {
@@ -270,14 +345,14 @@ impl BackendManager {
     /// callers decide whether to fall back to the YAML-configured list.
     pub async fn fetch_models_with_info(&self) -> Result<Vec<ModelInfo>, crate::error::LlmError> {
         if self.backends.len() == 1 {
-            return OpenAI::new(&self.backends[0], &self.secrets)
+            return BackendClient::new(&self.backends[0], &self.secrets)
                 .fetch_models_from_api()
                 .await;
         }
         let mut out = Vec::new();
         for backend in &self.backends {
             let prefix = backend.get_name();
-            let models = OpenAI::new(backend, &self.secrets)
+            let models = BackendClient::new(backend, &self.secrets)
                 .fetch_models_from_api()
                 .await?;
             out.extend(models.into_iter().map(|info| ModelInfo {
@@ -357,7 +432,7 @@ impl BackendManager {
     /// Get the default model
     pub fn default_model(&self) -> Option<String> {
         let backend = self.backends.first()?;
-        let model = OpenAI::new(backend, &self.secrets).default_model()?;
+        let model = BackendClient::new(backend, &self.secrets).default_model()?;
         if self.backends.len() == 1 {
             Some(model)
         } else {
@@ -395,7 +470,9 @@ impl BackendManager {
             });
         }
         let backend = self.select_backend(context);
-        OpenAI::new(backend, &self.secrets).execute(context).await
+        BackendClient::new(backend, &self.secrets)
+            .execute(context)
+            .await
     }
 
     /// Whether the backend for the given model supports tool/function calling.
@@ -407,7 +484,7 @@ impl BackendManager {
             return false;
         }
         let backend = self.select_backend_for_model(model);
-        OpenAI::new(backend, &self.secrets).supports_tools()
+        BackendClient::new(backend, &self.secrets).supports_tools()
     }
 
     /// Resolve a model name: strip backend prefix, fall back to default.
@@ -422,7 +499,7 @@ impl BackendManager {
             .trim_start_matches(&format!("{model_prefix}:"))
             .to_string();
         if resolved.is_empty() {
-            resolved = OpenAI::new(backend, &self.secrets)
+            resolved = BackendClient::new(backend, &self.secrets)
                 .default_model()
                 .unwrap_or_default();
         }
@@ -460,7 +537,7 @@ impl BackendManager {
             });
         }
         let backend = self.select_backend_for_model(model);
-        OpenAI::new(backend, &self.secrets)
+        BackendClient::new(backend, &self.secrets)
             .chat_with_tools(messages, tools, resolved_model)
             .await
     }

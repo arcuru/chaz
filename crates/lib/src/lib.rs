@@ -7,11 +7,13 @@
 
 pub mod agent;
 pub mod agent_db;
+pub mod anthropic;
 pub mod backends;
 pub mod bridge;
 pub mod bridge_db;
 pub mod bridge_identity;
 pub mod bubblewrap_host;
+pub mod cache;
 pub mod commands;
 pub mod config;
 pub mod context;

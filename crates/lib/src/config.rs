@@ -500,6 +500,11 @@ pub struct Backend {
     pub request_timeout: Option<u64>,
     /// Maximum retry attempts for transient LLM errors (default: 3)
     pub max_retries: Option<u32>,
+    /// Maximum output tokens per response (default: 8192). Required by the
+    /// Anthropic-native backend (`type: anthropic`), whose API mandates an
+    /// explicit `max_tokens`; ignored by the OpenAI-compatible backend.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -514,6 +519,7 @@ impl std::fmt::Debug for Backend {
             .field("config_dir", &self.config_dir)
             .field("request_timeout", &self.request_timeout)
             .field("max_retries", &self.max_retries)
+            .field("max_tokens", &self.max_tokens)
             .finish()
     }
 }
@@ -530,6 +536,7 @@ impl Backend {
             config_dir: None,
             request_timeout: None,
             max_retries: None,
+            max_tokens: None,
         }
     }
 
@@ -541,6 +548,12 @@ impl Backend {
     /// Maximum retry attempts for transient errors (default: 3).
     pub fn max_retries(&self) -> u32 {
         self.max_retries.unwrap_or(3)
+    }
+
+    /// Maximum output tokens per response (default: 8192). Used by the
+    /// Anthropic-native backend, whose API requires an explicit `max_tokens`.
+    pub fn max_output_tokens(&self) -> u32 {
+        self.max_tokens.unwrap_or(8192)
     }
 
     /// Generate a SecretStore reference key for this backend's API key.
@@ -584,7 +597,11 @@ pub struct Model {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendType {
+    /// OpenAI chat-completions shape (`type: openaicompatible`): OpenAI,
+    /// OpenRouter, DeepSeek, Ollama, …
     OpenAICompatible,
+    /// Native Anthropic Messages API (`type: anthropic`, `api.anthropic.com`).
+    Anthropic,
 }
 
 /// Configuration for a scheduled task

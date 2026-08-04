@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     backends::{ChatContext, LLMBackend},
+    cache::{CacheControl, CacheRegion},
     config::Backend,
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
@@ -52,27 +53,6 @@ struct ChatRequest<'a> {
 #[derive(Debug, Clone, Copy, Serialize)]
 struct UsageOpts {
     include: bool,
-}
-
-/// Anthropic prompt-cache breakpoint marker. On the OpenRouter
-/// OpenAI-compatible endpoint this rides inside a content part (or on a tool
-/// object) and OpenRouter forwards it to Anthropic. `ttl` is omitted for the
-/// default 5-minute cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CacheControl {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ttl: Option<String>,
-}
-
-impl CacheControl {
-    fn ephemeral() -> Self {
-        CacheControl {
-            kind: "ephemeral".to_string(),
-            ttl: None,
-        }
-    }
 }
 
 /// One content part in the structured (array) message form. We only ever
@@ -816,12 +796,12 @@ fn anthropic_cache_control(backend: &Backend, model: &str) -> Option<CacheContro
 
 /// Stamp Anthropic prompt-cache breakpoints onto the assembled request.
 ///
-/// Three breakpoints — last tool → system → latest user message — allocated
-/// in that order (cache-invalidation order: the most stable region is covered
-/// first) under a hard cap of 4 (Anthropic rejects requests with more). No-op
-/// unless [`anthropic_cache_control`] says caching applies. This is the single
-/// place the breakpoint policy lives; the `cache_control` struct fields are
-/// inert serialization slots it writes into.
+/// Walks the shared [`crate::cache::CACHE_PLAN`] (last tool → system → latest
+/// user message, in cache-invalidation order) under the [`crate::cache`] cap.
+/// No-op unless [`anthropic_cache_control`] says inline markers apply — every
+/// other provider caches server-side and may 400 on unexpected markers. The
+/// breakpoint *policy* is shared with the native Anthropic backend; only this
+/// inline `content`/tool-object serialization is OpenAI-compatible-specific.
 fn apply_anthropic_cache_control(
     messages: &mut [ChatMessage],
     tools: &mut [ChatTool],
@@ -831,40 +811,49 @@ fn apply_anthropic_cache_control(
     let Some(cc) = anthropic_cache_control(backend, model) else {
         return;
     };
-    let mut remaining: u8 = 4;
-    let next = |remaining: &mut u8| -> Option<CacheControl> {
-        if *remaining == 0 {
-            return None;
+    let mut remaining = crate::cache::MAX_BREAKPOINTS;
+    for region in crate::cache::CACHE_PLAN {
+        if remaining == 0 {
+            break;
         }
-        *remaining -= 1;
-        Some(cc.clone())
-    };
-
-    // 1. End of the tool-schema block.
-    if let Some(last_tool) = tools.last_mut()
-        && let Some(c) = next(&mut remaining)
-    {
-        last_tool.cache_control = Some(c);
-    }
-    // 2. System prompt — head of the stable prefix.
-    if let Some(content) = messages
-        .iter_mut()
-        .find(|m| m.role == "system")
-        .and_then(|m| m.content.as_mut())
-        && let Some(c) = next(&mut remaining)
-    {
-        content.set_cache_control(c);
-    }
-    // 3. Latest user message — the conversation boundary that intra-turn
-    //    tool-call round-trips all share, so it's the best hit point.
-    if let Some(content) = messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.content.as_mut())
-        && let Some(c) = next(&mut remaining)
-    {
-        content.set_cache_control(c);
+        let placed = match region {
+            CacheRegion::LastTool => {
+                if let Some(last_tool) = tools.last_mut() {
+                    last_tool.cache_control = Some(cc.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            CacheRegion::System => {
+                if let Some(content) = messages
+                    .iter_mut()
+                    .find(|m| m.role == "system")
+                    .and_then(|m| m.content.as_mut())
+                {
+                    content.set_cache_control(cc.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            CacheRegion::LatestUser => {
+                if let Some(content) = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .and_then(|m| m.content.as_mut())
+                {
+                    content.set_cache_control(cc.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if placed {
+            remaining -= 1;
+        }
     }
 }
 
