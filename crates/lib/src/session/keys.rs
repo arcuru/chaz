@@ -23,6 +23,26 @@ pub enum BootstrapOutcome {
     Pending { request_id: String, message: String },
 }
 
+/// Register the bridge login pointer carried on a bootstrap request's
+/// `metadata`, if it carries one. Returns the registered identifier, or `None`
+/// when the request carries no login pointer — the ordinary case for every
+/// access request that isn't a bridge bringing a login online.
+///
+/// Split out from [`SessionRegistry::approve_bootstrap_request`] because
+/// seeding a real bootstrap request needs live two-peer sync, so this is where
+/// the behaviour is actually testable.
+pub(crate) async fn register_login_from_bootstrap_metadata(
+    agent_db: &crate::agent_db::AgentDb,
+    metadata: Option<&eidetica::crdt::Doc>,
+) -> anyhow::Result<Option<String>> {
+    let Some(login) = metadata.and_then(crate::agent_db::LoginRef::from_metadata) else {
+        return Ok(None);
+    };
+    let identifier = login.identifier.clone();
+    agent_db.register_login(login).await?;
+    Ok(Some(identifier))
+}
+
 impl SessionRegistry {
     /// Create a new Agent DB. Backs `/agent new`. Wraps
     /// `agent_db::create_agent_db` with the registry's user mutex and
@@ -548,6 +568,39 @@ impl SessionRegistry {
             permission = ?req.requested_permission,
             "Approved bootstrap request"
         );
+
+        // A bridge requesting access to an agent DB carries its LoginRef as
+        // bootstrap metadata precisely so it does not need Write here to
+        // publish its own pointer. Having just granted the access, register
+        // the pointer on its behalf. A failure here must not undo the
+        // committed grant — the bridge reports the missing pointer on its
+        // next run — so this logs rather than propagating.
+        match user.open_database(&req.tree_id).await {
+            Ok(database) => {
+                let agent_db = crate::agent_db::AgentDb::from_database(database);
+                match register_login_from_bootstrap_metadata(&agent_db, req.metadata.as_ref()).await
+                {
+                    Ok(Some(identifier)) => info!(
+                        request_id,
+                        tree_id = %req.tree_id,
+                        login = %identifier,
+                        "Registered bridge login pointer on the requester's behalf"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        request_id,
+                        tree_id = %req.tree_id,
+                        "Approved, but failed to register the bridge login pointer: {e}"
+                    ),
+                }
+            }
+            Err(e) => tracing::warn!(
+                request_id,
+                tree_id = %req.tree_id,
+                "Approved, but could not open the target DB to register a login pointer: {e}"
+            ),
+        }
+
         Ok((req.tree_id.clone(), req))
     }
 
@@ -814,6 +867,65 @@ mod tests {
             err.to_string().contains("Sync not enabled"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn approver_registers_the_login_pointer_from_metadata() {
+        use crate::agent_db::{AgentDbConfig, AgentMeta, LoginRef, create_agent_db};
+        let (_instance, registry) = make_registry_with_sync().await;
+        let mut user = registry.user.lock().await;
+        let (agent_db, _) = create_agent_db(
+            &mut user,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta::default(),
+        )
+        .await
+        .unwrap();
+
+        let login = LoginRef {
+            kind: "matrix".to_string(),
+            identifier: "@chaz:example".to_string(),
+            bridge_db_id: "bafyrbridgedb".to_string(),
+        };
+        let registered =
+            register_login_from_bootstrap_metadata(&agent_db, Some(&login.to_metadata().unwrap()))
+                .await
+                .unwrap();
+
+        assert_eq!(registered.as_deref(), Some("@chaz:example"));
+        let found = agent_db.find_login("@chaz:example").await.unwrap().unwrap();
+        assert_eq!(found.bridge_db_id, "bafyrbridgedb");
+    }
+
+    #[tokio::test]
+    async fn approver_registers_nothing_without_login_metadata() {
+        use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+        let (_instance, registry) = make_registry_with_sync().await;
+        let mut user = registry.user.lock().await;
+        let (agent_db, _) = create_agent_db(
+            &mut user,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta::default(),
+        )
+        .await
+        .unwrap();
+
+        // The common case: an ordinary access request, no login attached.
+        assert!(
+            register_login_from_bootstrap_metadata(&agent_db, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            register_login_from_bootstrap_metadata(&agent_db, Some(&eidetica::crdt::Doc::new()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(agent_db.list_logins().await.unwrap().is_empty());
     }
 
     #[tokio::test]

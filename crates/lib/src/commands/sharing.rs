@@ -61,6 +61,19 @@ pub(super) async fn sharing_requests(ctx: &CommandContext<'_>) -> CommandOutcome
             permission_name(&req.requested_permission),
             req.timestamp,
         ));
+        // Approving a login request also writes its pointer into the agent DB,
+        // replacing any existing pointer for the same identifier. Show what is
+        // being claimed so that is a decision rather than a side effect.
+        if let Some(login) = req
+            .metadata
+            .as_ref()
+            .and_then(crate::agent_db::LoginRef::from_metadata)
+        {
+            lines.push(format!(
+                "        registers {} login '{}' → bridge DB {}",
+                login.kind, login.identifier, login.bridge_db_id,
+            ));
+        }
     }
     lines.push(
         "Approve with /sharing approve <index|prefix>, reject with /sharing reject <index|prefix>."

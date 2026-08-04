@@ -182,6 +182,33 @@ pub struct LoginRef {
     pub bridge_db_id: String,
 }
 
+/// Key the [`LoginRef`] occupies inside a bootstrap request's metadata `Doc`.
+/// Namespaced so unrelated metadata can share the document and so a `Doc`
+/// carrying no login is simply absent rather than malformed.
+pub const LOGIN_REF_METADATA_KEY: &str = "chaz_login_ref";
+
+impl LoginRef {
+    /// Encode as bootstrap-request metadata, so a bridge asking for access to
+    /// an agent DB can tell the approver which login it is bringing online and
+    /// where that login's credentials live. The approver registers the pointer
+    /// on the bridge's behalf, which is what lets the bridge hold `Read` rather
+    /// than `Write` on the agent DB.
+    pub fn to_metadata(&self) -> anyhow::Result<Doc> {
+        let mut doc = Doc::new();
+        doc.set_json(LOGIN_REF_METADATA_KEY, self)?;
+        Ok(doc)
+    }
+
+    /// Recover a `LoginRef` from bootstrap-request metadata. `None` when the
+    /// document carries no login pointer (the ordinary case for every other
+    /// kind of access request) or when the value present does not decode —
+    /// this is remote-supplied data, so a malformed payload is ignored rather
+    /// than failing the approval.
+    pub fn from_metadata(metadata: &Doc) -> Option<Self> {
+        metadata.get_json::<Self>(LOGIN_REF_METADATA_KEY).ok()
+    }
+}
+
 /// Registry entry in the unencrypted [`SESSIONS_STORE`]: one session attached
 /// to this agent, plus the transport bridges currently exposing it.
 ///
