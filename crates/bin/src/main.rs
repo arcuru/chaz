@@ -261,8 +261,11 @@ async fn main() -> anyhow::Result<()> {
         tui_bridge.run(server).await
     };
 
+    // Propagate rather than swallow: the exit code is the only signal a calling
+    // script gets, and a bridge that failed did not do the work it was asked to.
     if let Err(e) = result {
         error!("Bridge error: {e}");
+        return Err(e);
     }
 
     Ok(())

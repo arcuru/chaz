@@ -140,9 +140,13 @@ impl Bridge for CliBridge {
                         println!("{}", latest.content);
                         return Ok(());
                     }
+                    // An agent error is a failed run, not a completed one. Print
+                    // mode is driven by scripts and timers that branch on the exit
+                    // code, so returning Ok here reports success for a request that
+                    // produced no answer, making a provider outage indistinguishable
+                    // from a clean run.
                     EntryType::Error if agent_names.contains(&latest.sender) => {
-                        eprintln!("{}", latest.content);
-                        return Ok(());
+                        anyhow::bail!("{}", latest.content);
                     }
                     _ => {}
                 }
