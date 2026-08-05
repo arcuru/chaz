@@ -906,6 +906,7 @@ pub(crate) async fn register_exposed_sessions(
             continue;
         };
         adopt_published_bridge_addresses(registry, &adb).await;
+        let bridge_pubkeys = published_bridge_pubkeys(&adb).await;
         let refs = adb.list_session_refs().await.unwrap_or_default();
         // What this peer can actually see in the agent DB registry. A
         // bridge-created session reaches the daemon only through this store, so
@@ -931,10 +932,19 @@ pub(crate) async fn register_exposed_sessions(
             use futures::StreamExt as _;
             let entry = &entry;
             let adb = &adb;
+            let bridge_pubkeys = &bridge_pubkeys;
             futures::stream::iter(refs)
                 .for_each_concurrent(MAX_CONCURRENT_SESSION_REGISTRATIONS, |r| async move {
-                    register_one_exposed_session(server, registry, default_backend, entry, adb, r)
-                        .await;
+                    register_one_exposed_session(
+                        server,
+                        registry,
+                        default_backend,
+                        entry,
+                        adb,
+                        bridge_pubkeys,
+                        r,
+                    )
+                    .await;
                 })
                 .await;
         }
@@ -952,6 +962,7 @@ async fn register_one_exposed_session(
     default_backend: &backends::BackendManager,
     entry: &crate::hosted_index::DbEntry,
     adb: &crate::agent_db::AgentDb,
+    bridge_pubkeys: &std::collections::HashSet<String>,
     r: crate::agent_db::SessionRef,
 ) {
     if r.exposed_on.is_empty() {
@@ -987,6 +998,11 @@ async fn register_one_exposed_session(
     }
     match opened {
         Ok((_conv, sdb)) => {
+            // Before anything else: a session the bridge created names the
+            // bridge as its home peer, and a bridge runs no agent loop. Take
+            // it over now, while adopting it, rather than registering a
+            // session that can only ever stay silent.
+            migrate_bridge_home_to_this_peer(&sdb, entry, bridge_pubkeys).await;
             // Push the agent's replies straight back to the exposing
             // bridge on every commit, not just the 300s tick. The session
             // arrived via sync and may not be in the daemon's tracked
@@ -1062,6 +1078,70 @@ async fn register_one_exposed_session(
                 "Exposed session not openable even after pull; will retry on next registry write: {e}"
             );
         }
+    }
+}
+
+/// The peer keys of every bridge that has registered a login in this agent DB.
+///
+/// A bridge publishes its own sync identity alongside its logins, which makes
+/// "that peer is a bridge" something this daemon can read rather than guess.
+/// Logins predating that field carry no key and simply do not contribute — a
+/// smaller set costs a missed migration, which is the status quo, whereas
+/// guessing costs seizing a session from a legitimate remote host.
+async fn published_bridge_pubkeys(
+    adb: &crate::agent_db::AgentDb,
+) -> std::collections::HashSet<String> {
+    adb.list_logins()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|l| l.peer_pubkey)
+        .collect()
+}
+
+/// Re-host a bridge-created session onto this daemon, if that is what it is.
+///
+/// Runs on the adoption path only. Re-attach preserves an existing home pubkey
+/// on purpose — that is what makes `/agent rehost` stick — so the repair has to
+/// live here, where the session is being taken on and the bridge identity is
+/// known, rather than in the attach path.
+///
+/// Redeploying a bridge with a fresh identity recreates the same situation, so
+/// this is a standing correction rather than a one-shot data migration.
+async fn migrate_bridge_home_to_this_peer(
+    sdb: &eidetica::Database,
+    entry: &crate::hosted_index::DbEntry,
+    bridge_pubkeys: &std::collections::HashSet<String>,
+) {
+    if bridge_pubkeys.is_empty() {
+        return;
+    }
+    let meta = session::read_meta_from_db(sdb).await;
+    let agent_db_id = entry.db_id.to_string();
+    let Some(stale) =
+        super::bridge_home_to_migrate(&meta.agents, &agent_db_id, &entry.pubkey, bridge_pubkeys)
+    else {
+        return;
+    };
+    let mine = entry.pubkey.to_string();
+    match session::update_meta_on_db(sdb, |m| {
+        if let Some(a) = m.agents.iter_mut().find(|a| a.db_id == agent_db_id) {
+            a.home_pubkey = Some(mine.clone());
+        }
+    })
+    .await
+    {
+        Ok(()) => info!(
+            session_db_id = %sdb.root_id(),
+            agent = %entry.display_name,
+            was = %stale,
+            "Session was hosted on a bridge, which runs no agents; re-hosted onto this daemon"
+        ),
+        Err(e) => warn!(
+            session_db_id = %sdb.root_id(),
+            agent = %entry.display_name,
+            "Failed to re-host a bridge-hosted session onto this daemon: {e}"
+        ),
     }
 }
 
