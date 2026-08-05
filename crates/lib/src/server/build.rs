@@ -881,10 +881,39 @@ pub(crate) async fn register_exposed_sessions(
             continue;
         };
         let refs = adb.list_session_refs().await.unwrap_or_default();
+        // What this peer can actually see in the agent DB registry. A
+        // bridge-created session reaches the daemon only through this store, so
+        // when a session never registers, the first question is whether the
+        // marker arrived at all — and that was previously unanswerable from the
+        // logs, since a rescan that saw nothing looked like a rescan that ran
+        // and found everything already handled.
+        tracing::debug!(
+            agent = %entry.display_name,
+            total = refs.len(),
+            exposed = refs.iter().filter(|r| !r.exposed_on.is_empty()).count(),
+            "Rescan: session refs visible in agent DB"
+        );
         for r in refs {
-            if r.exposed_on.is_empty() || server.is_watching_session(&r.session_db_id).await {
+            if r.exposed_on.is_empty() {
                 continue;
             }
+            // Both skips below are silent by nature and look identical to "no
+            // work to do", which is exactly what made a session that never
+            // registered impossible to trace: the counts moved, so the marker
+            // had clearly arrived, but nothing said which refs were seen or why
+            // each was passed over.
+            if server.is_watching_session(&r.session_db_id).await {
+                tracing::debug!(
+                    session_db_id = %r.session_db_id,
+                    "Rescan: exposed session already watched, skipping"
+                );
+                continue;
+            }
+            tracing::debug!(
+                session_db_id = %r.session_db_id,
+                exposed_on = ?r.exposed_on,
+                "Rescan: processing exposed session"
+            );
             // The registry entry is only a *pointer* to the session; its own tree
             // is separate and, for a bridge-created session, has no sync-peer
             // relationship with this daemon yet — so it never arrives on its own.
@@ -978,6 +1007,13 @@ pub(crate) async fn register_exposed_sessions(
     }
 }
 
+/// Deadline for one peer's attempt at serving a session tree.
+///
+/// WORKAROUND (eidetica): its sync calls carry no timeout, so a stale peer
+/// address yields a future that never resolves. Remove once eidetica bounds
+/// `sync_tree_with_peer_*` the way it already bounds ticket bootstrap.
+const PULL_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Pull a bridge-exposed session's own tree onto this daemon.
 ///
 /// The agent-DB registry only carries a *pointer* (the session root id); the
@@ -1054,16 +1090,32 @@ async fn pull_session_tree_from_agent_peers(
             let peer_key = peer.public_key().clone();
             let signing_key = signing_key.clone();
             Box::pin(async move {
-                sync.sync_tree_with_peer_auth(
-                    &peer_key,
-                    &session_id,
-                    Some(&signing_key),
-                    Some(&key_name),
-                    Some(permission),
-                    None,
+                // WORKAROUND (eidetica): `sync_tree_with_peer_auth` has no
+                // deadline, so a peer whose address is stale never resolves.
+                // Racing only helps when someone succeeds — `select_ok` waits
+                // for *all* futures when they all fail, so a session whose peers
+                // are all gone froze this whole rescan for ten minutes. Eidetica
+                // bounds its bootstrap path (ADDRESS_ATTEMPT_TIMEOUT) but not
+                // this one; delete this wrapper when it bounds both.
+                match tokio::time::timeout(
+                    PULL_ATTEMPT_TIMEOUT,
+                    sync.sync_tree_with_peer_auth(
+                        &peer_key,
+                        &session_id,
+                        Some(&signing_key),
+                        Some(&key_name),
+                        Some(permission),
+                        None,
+                    ),
                 )
                 .await
-                .map(|()| peer_key)
+                {
+                    Ok(res) => res.map(|()| peer_key),
+                    Err(_) => Err(eidetica::sync::SyncError::Network(format!(
+                        "peer did not answer within {PULL_ATTEMPT_TIMEOUT:?}"
+                    ))
+                    .into()),
+                }
             })
         })
         .collect();

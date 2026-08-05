@@ -670,7 +670,19 @@ impl AgentDb {
         if !entry.exposed_on.iter().any(|b| b == bridge_label) {
             entry.exposed_on.push(bridge_label.to_string());
         }
-        self.register_session_ref(entry).await
+        let exposed_on = entry.exposed_on.clone();
+        self.register_session_ref(entry).await?;
+        // The daemon discovers a bridge-created session through this write and
+        // nothing else, so it is the single point where the handoff can fail
+        // silently. Say it happened, and on whose behalf.
+        tracing::info!(
+            agent_db = %self.database().root_id(),
+            session_db_id,
+            bridge_label,
+            ?exposed_on,
+            "Exposed session in agent DB registry"
+        );
+        Ok(())
     }
 
     /// Stop exposing a session on `bridge_label`. Returns true if the label was
