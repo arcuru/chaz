@@ -115,11 +115,23 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
         }
     };
 
+    // A pass that syncs nothing looks identical to a pass that syncs everything
+    // if only failures are logged. Count what happened so an operator can tell
+    // "converging" from "no work found", which are the two states that matter.
+    let considered = tracked.len();
+    let mut sync_disabled = 0usize;
+    let mut device_keyed = 0usize;
+    let mut no_peers = 0usize;
+    let mut attempted = 0usize;
+    let mut failed = 0usize;
+
     for db in tracked {
         if !db.sync_settings.sync_enabled {
+            sync_disabled += 1;
             continue;
         }
         if device_pubkey.as_ref() == Some(&db.key_id) {
+            device_keyed += 1;
             continue;
         }
         let signing_key = match registry.signing_key_for(&db.key_id).await {
@@ -138,12 +150,18 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
                 continue;
             }
         };
+        if peers.is_empty() {
+            no_peers += 1;
+            continue;
+        }
         for peer in &peers {
             let peer_key: &PublicKey = peer.public_key();
+            attempted += 1;
             if let Err(e) = sync
                 .sync_tree_with_peer_as(peer_key, &db.database_id, Some(&signing_key))
                 .await
             {
+                failed += 1;
                 debug!(
                     db_id = %db.database_id,
                     peer = %peer,
@@ -152,6 +170,17 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
             }
         }
     }
+
+    debug!(
+        considered,
+        sync_disabled,
+        device_keyed,
+        no_peers,
+        attempted,
+        failed,
+        succeeded = attempted - failed,
+        "keyed sync pass complete"
+    );
 }
 
 #[cfg(test)]
