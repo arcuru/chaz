@@ -14,18 +14,29 @@
 //!    resolves to a [`BootstrapOutcome`]: `Approved` when the bridge's key was
 //!    already authorized, `Pending` when the owner must approve via
 //!    `/sharing approve` first (the bridge retries later).
-//! 3. [`establish_login`] — request `Read` on the owning agent's DB via a
+//! 3. [`establish_login`] — request `Write` on the owning agent's DB via a
 //!    ticket, carrying the public [`LoginRef`](crate::agent_db::LoginRef)
 //!    pointer as bootstrap metadata. The approving owner reads the pointer off
-//!    that metadata and registers it, so the bridge never writes to the agent
-//!    DB itself.
+//!    that metadata and registers it; the bridge falls back to registering it
+//!    itself when no request was ever queued for an owner to observe.
 //!
-//! `Read` suffices on the agent DB because the bridge no longer self-registers
-//! its pointer: eidetica carries free-form metadata on a bootstrap request, so
-//! the owner learns the bridge-created settings-DB id at request time and
-//! writes the registry entry. A proxy-writer holding `Write` on the agent's own
-//! DB was more authority than the design wanted. The bridge still needs `Write`
-//! on **session** DBs, to proxy-write inbound transport messages.
+//! ## Why `Write` and not `Read`
+//!
+//! A bridge held `Read` for a while, on the reasoning that pointer registration
+//! was the only thing needing write authority and bootstrap metadata had just
+//! made that unnecessary. That was true of the *login handshake* and false of
+//! everything after it: exposing a session writes to the agent DB's session
+//! registry (`AgentDb::expose_session_on`) on every new channel, and with `Read`
+//! that write fails, aborting the inbound-message path before the session is
+//! usable. Per-channel exposure is the ongoing equivalent of one-time pointer
+//! registration and has no metadata channel to ride.
+//!
+//! So the bridge asks for `Write` again. This is a deliberate reversal, not
+//! drift — a proxy-writer holding write authority on the agent's own database is
+//! more than the design wants, and moving exposure onto a channel the bridge
+//! already owns (its session DBs) is the change that would let `Read` return.
+//! `Write` on **session** DBs, where it proxies inbound transport messages, was
+//! never in question.
 
 #![allow(dead_code)]
 
@@ -42,6 +53,10 @@ use tracing::{info, warn};
 /// Display name carried by a bridge's own eidetica key — also the
 /// `requesting_key_name` used when bootstrapping access.
 pub const BRIDGE_KEY_NAME: &str = "bridge";
+
+/// Write priority granted to / requested by a bridge, matching the value chaz
+/// uses for agent and bank writes (`Permission::Write(10)`).
+const BRIDGE_WRITE_PRIORITY: u32 = 10;
 
 /// Ensure the bridge holds its own persistent eidetica key, generating and
 /// persisting one on first run. Idempotent: an existing key with `key_name`
@@ -170,18 +185,19 @@ pub struct BridgeIdentity<'a> {
 
 /// Bring one bridged login online against its owning agent:
 ///
-/// 1. request `Read` on the agent DB the `ticket` points at (via the
+/// 1. request `Write` on the agent DB the `ticket` points at (via the
 ///    [`AccessBootstrap`] seam), carrying the [`LoginRef`] as bootstrap
 ///    metadata,
 /// 2. if the request is still `Pending` owner approval, return that outcome —
 ///    nothing is registered yet and the binary retries after approval,
-/// 3. otherwise confirm the owner registered the pointer on our behalf.
+/// 3. otherwise confirm the pointer is registered, writing it ourselves if the
+///    owner never saw a request to read it off.
 ///
-/// The bridge holds `Read` here, not `Write`: it does not write its own
-/// pointer into the agent DB, the approving owner does, reading it off the
-/// bootstrap metadata. A proxy-writer needs no write authority on the agent's
-/// own database. `Write` on *session* DBs is separate and unchanged — that is
-/// where the bridge proxies inbound transport messages.
+/// The approving owner registering the pointer from metadata remains the
+/// preferred path — it is what lets `/sharing requests` show the operator which
+/// login a grant would claim, *before* granting it. Self-registration is the
+/// fallback for the one case that path cannot cover (see step 3), not a return
+/// to the bridge publishing its own pointer by default.
 ///
 /// The secret details were already seeded into the bridge's own DB (the
 /// bridge manages that); the pointer published here is non-secret.
@@ -197,7 +213,7 @@ pub async fn establish_login<B: AccessBootstrap>(
             user,
             ticket,
             identity.key,
-            Permission::Read,
+            Permission::Write(BRIDGE_WRITE_PRIORITY),
             Some(login.to_metadata()?),
         )
         .await?;
@@ -237,12 +253,12 @@ pub async fn establish_login<B: AccessBootstrap>(
         );
     }
 
-    // The owner writes the pointer when it approves a queued
-    // request, so on that path it is already there. A key the owner had
-    // pre-authorized (e.g. via `/agent invite`) is approved without ever
-    // queueing a request, so nothing observed our metadata — and holding only
-    // `Read` we cannot write the pointer ourselves. Say so plainly rather
-    // than leaving the login silently undiscoverable.
+    // The owner writes the pointer when it approves a queued request, so on
+    // that path it is already there. A key the owner had pre-authorized (e.g.
+    // via `/agent invite`) is approved without ever queueing a request, so
+    // nothing observed our metadata. Holding `Write` we can publish it
+    // ourselves rather than leaving the login silently undiscoverable — which
+    // is what a Read-only bridge had to do, and what it warned about here.
     let database = user.open_database(agent_db_id).await?;
     let agent_db = AgentDb::from_database(database);
     if agent_db.find_login(&login.identifier).await?.is_some() {
@@ -252,15 +268,13 @@ pub async fn establish_login<B: AccessBootstrap>(
             "Bridge login pointer present in agent DB"
         );
     } else {
-        warn!(
+        agent_db.register_login(login.clone()).await?;
+        info!(
             agent_db = %agent_db_id,
             login = %login.identifier,
             bridge_db = %login.bridge_db_id,
             "Access was pre-authorized, so no bootstrap request carried this \
-             login's pointer and the owner never registered it. The login works \
-             but peers cannot discover it. To publish the pointer, revoke this \
-             bridge's pre-authorization on the owning peer and let it bootstrap \
-             through the normal `/sharing approve` path."
+             login's pointer; registered it directly"
         );
     }
     Ok(outcome)
@@ -363,7 +377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn establish_login_requests_read_and_carries_the_pointer() {
+    async fn establish_login_requests_write_and_carries_the_pointer() {
         let mut user = test_user().await;
         let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
         let (agent_db, _) = create_agent_db(
@@ -406,14 +420,16 @@ mod tests {
             (seen.permission, seen.metadata.clone())
         };
 
-        // The bridge asks for Read, not Write: the owner writes the pointer.
+        // Write, because exposing a session writes to the agent DB's session
+        // registry on every new channel — `Read` aborts the inbound path there.
         assert_eq!(
             permission,
-            Some(Permission::Read),
-            "bridge must not request write authority on the agent DB"
+            Some(Permission::Write(BRIDGE_WRITE_PRIORITY)),
+            "bridge needs write authority for per-channel session exposure"
         );
 
-        // ...and hands the owner the pointer to register, via metadata.
+        // ...and still hands the owner the pointer to register, via metadata,
+        // so `/sharing requests` can show the claim before it is granted.
         let carried = LoginRef::from_metadata(
             metadata
                 .as_ref()
@@ -424,9 +440,13 @@ mod tests {
         assert_eq!(carried.identifier, "@chaz:example");
         assert_eq!(carried.bridge_db_id, settings_db_id.to_string());
 
-        // Nothing self-registered: this stub models a pre-authorized key, so
-        // no request was queued for an owner to approve and act on.
-        assert!(agent_db.list_logins().await.unwrap().is_empty());
+        // This stub models a pre-authorized key: no request was queued, so no
+        // owner ever saw the metadata. Holding Write, the bridge publishes the
+        // pointer itself rather than leaving the login undiscoverable.
+        let logins = agent_db.list_logins().await.unwrap();
+        assert_eq!(logins.len(), 1, "pre-authorized login must self-register");
+        assert_eq!(logins[0].identifier, "@chaz:example");
+        assert_eq!(logins[0].bridge_db_id, settings_db_id.to_string());
     }
 
     #[test]
