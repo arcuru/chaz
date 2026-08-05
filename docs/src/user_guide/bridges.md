@@ -242,6 +242,18 @@ it's truly lost, delete the bridge's settings DB and re-seed from config.
 session DB has to sync from the daemon back to the bridge. Confirm both peers are
 syncing (see [Sharing & Sync → Troubleshooting](session_sharing.md#troubleshooting)).
 
+**Sync is refused with "key … is not authorized to read …".** A bridge reaches
+its agent DB with its own named key, but eidetica's background sync engine signs
+every request with the *instance device key* instead — which the owner never
+authorized. chaz works around this with a reconciler that re-syncs each tracked
+database under the key actually recorded for it, so the round-trip completes on
+the next tick rather than immediately. The interval defaults to 5 seconds;
+`CHAZ_KEYED_SYNC_INTERVAL_SECS` overrides it, and `0` turns the reconciler off.
+Seeing this message in the log is therefore expected and harmless as long as
+messages do arrive a few seconds later. If they never arrive, the reconciler is
+not running or the peer relationship is missing — check for the
+`Keyed sync reconciler started` line at startup.
+
 ## See also
 
 - [Dumb Transport Bridges](../design/transport_bridges.md) — the internal

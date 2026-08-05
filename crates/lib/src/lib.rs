@@ -26,6 +26,7 @@ pub mod extension;
 pub mod extensions;
 pub mod grants;
 pub mod hosted_index;
+pub mod keyed_sync;
 pub mod mcp;
 pub mod memory_bank_db;
 pub mod model_info_store;

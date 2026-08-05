@@ -562,6 +562,16 @@ impl SessionRegistry {
         Ok(user.get_signing_key(pubkey)?)
     }
 
+    /// Every database this peer's user tracks, with the key recorded for each.
+    /// Used by [`crate::keyed_sync`] to sync a database under its own key
+    /// instead of the instance device key.
+    pub(crate) async fn tracked_databases(
+        &self,
+    ) -> anyhow::Result<Vec<eidetica::user::types::TrackedDatabase>> {
+        let user = self.user.lock().await;
+        Ok(user.databases().await?)
+    }
+
     pub async fn pending_bootstrap_requests(
         &self,
     ) -> anyhow::Result<Vec<(String, BootstrapRequest)>> {

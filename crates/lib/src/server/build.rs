@@ -28,7 +28,8 @@ use crate::config::{self, Config};
 use crate::server::Server;
 use crate::{
     agent, agent_db, backends, commands, db_kind, embedding, extension, extensions, grants,
-    hosted_index, mcp, memory_bank_db, routine, security, session, tool, tool_host, tools,
+    hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session, tool, tool_host,
+    tools,
 };
 
 /// Knobs [`build`] can't infer from [`Config`] — behavior a one-shot CLI run and
@@ -539,6 +540,13 @@ pub async fn build(
             .await;
         });
     }
+
+    // Sync every tracked database under the key it was actually granted, which
+    // eidetica's background engine does not do (it always signs with the device
+    // key). Without this, any database this peer reached by bootstrapping with a
+    // named user key — every bridge's agent DB — is refused on every pull.
+    // Delete this call with the module when eidetica signs with the tracked key.
+    keyed_sync::spawn(registry.clone());
 
     Ok(BuiltServer {
         server,
