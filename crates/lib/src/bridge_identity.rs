@@ -173,13 +173,38 @@ pub async fn establish_login<B: AccessBootstrap>(
         );
         return Ok(outcome);
     }
-    // Approved. The owner writes the pointer when it approves a queued
+    // Approved. `request_database_access` tracks the database with sync
+    // **disabled** by default, so without this the agent DB is openable but
+    // never converges — nothing looks at a database whose owner has not asked
+    // for sync. A bridge always wants its agent DB syncing; that is the whole
+    // point of bootstrapping it.
+    //
+    // Best-effort: `track_database` re-discovers the SigKey and fails if this
+    // key holds no authority on the database. That cannot happen on the path
+    // that just approved us, but a caller whose access arrived some other way
+    // should get a loud warning and a working login rather than a hard abort.
+    let agent_db_id = ticket.database_id();
+    if let Err(e) = user
+        .track_database(
+            agent_db_id.clone(),
+            identity.key,
+            eidetica::user::types::SyncSettings::on_commit(),
+        )
+        .await
+    {
+        warn!(
+            agent_db = %agent_db_id,
+            "Could not enable sync on the agent DB ({e}); it will open locally but \
+             never receive the daemon's writes"
+        );
+    }
+
+    // The owner writes the pointer when it approves a queued
     // request, so on that path it is already there. A key the owner had
     // pre-authorized (e.g. via `/agent invite`) is approved without ever
     // queueing a request, so nothing observed our metadata — and holding only
     // `Read` we cannot write the pointer ourselves. Say so plainly rather
     // than leaving the login silently undiscoverable.
-    let agent_db_id = ticket.database_id();
     let database = user.open_database(agent_db_id).await?;
     let agent_db = AgentDb::from_database(database);
     if agent_db.find_login(&login.identifier).await?.is_some() {
