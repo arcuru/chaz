@@ -244,7 +244,7 @@ syncing (see [Sharing & Sync → Troubleshooting](session_sharing.md#troubleshoo
 
 **Sync is refused with "key … is not authorized to read …".** A bridge reaches
 its agent DB with its own named key, but eidetica's background sync engine signs
-every request with the *instance device key* instead — which the owner never
+every request with the _instance device key_ instead — which the owner never
 authorized. chaz works around this with a reconciler that re-syncs each tracked
 database under the key actually recorded for it, so the round-trip completes on
 the next tick rather than immediately. The interval defaults to 5 seconds;

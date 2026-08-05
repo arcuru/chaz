@@ -77,11 +77,25 @@ pub trait AccessBootstrap {
     ) -> anyhow::Result<BootstrapOutcome>;
 }
 
-/// Live `AccessBootstrap` over an eidetica `Sync` handle. Issues a single
-/// `User::request_database_access` (trying every address hint in the ticket); the
-/// owner-side approval is the existing chaz `/sharing` flow. Retry-until-
-/// approved is the caller/binary's concern (the request stays queued on the
-/// owner, and a `Pending` outcome tells the binary to come back later).
+/// Live `AccessBootstrap` over an eidetica `Sync` handle. Drives
+/// `User::request_database_access`; the owner-side approval is the existing
+/// chaz `/sharing` flow. Retry-until-approved is the caller/binary's concern
+/// (the request stays queued on the owner, and a `Pending` outcome tells the
+/// binary to come back later).
+///
+/// Address hints are tried **one at a time**, in ticket order, rather than
+/// handing the whole ticket to eidetica at once. Eidetica races every hint
+/// concurrently — right for reachability, wrong for request filing: each racer
+/// runs a full bootstrap round-trip and files its own request, so a two-hint
+/// ticket leaves two entries in the owner's approval queue with identical
+/// `(database, key, permission)`. The requester keeps only the last outcome, so
+/// approving one leaves the other pending forever. Splitting the ticket costs
+/// the fallback's latency (a dead first hint must time out before the second is
+/// tried) and buys exactly one queue entry per bootstrap.
+///
+/// Only a transport failure advances to the next hint. A `Pending` outcome is a
+/// definitive answer — the request is filed — so we stop there rather than
+/// filing a duplicate against the same peer by another route.
 pub struct SyncBootstrap {
     pub sync: Arc<Sync>,
 }
@@ -101,27 +115,50 @@ impl AccessBootstrap for SyncBootstrap {
         permission: Permission,
         metadata: Option<Doc>,
     ) -> anyhow::Result<BootstrapOutcome> {
-        match user
-            .request_database_access(&self.sync, ticket, key, permission, metadata)
-            .await
-        {
-            Ok(()) => Ok(BootstrapOutcome::Approved),
-            Err(e) => {
-                if let eidetica::Error::Sync(boxed) = &e
-                    && let SyncError::BootstrapPending {
-                        request_id,
-                        message,
-                    } = boxed.as_ref()
-                {
-                    return Ok(BootstrapOutcome::Pending {
-                        request_id: request_id.clone(),
-                        message: message.clone(),
-                    });
+        let mut last_err = None;
+        for attempt in single_address_tickets(ticket) {
+            match user
+                .request_database_access(&self.sync, &attempt, key, permission, metadata.clone())
+                .await
+            {
+                Ok(()) => return Ok(BootstrapOutcome::Approved),
+                Err(e) => {
+                    if let eidetica::Error::Sync(boxed) = &e
+                        && let SyncError::BootstrapPending {
+                            request_id,
+                            message,
+                        } = boxed.as_ref()
+                    {
+                        // Filed. Stop — another hint would file a duplicate.
+                        return Ok(BootstrapOutcome::Pending {
+                            request_id: request_id.clone(),
+                            message: message.clone(),
+                        });
+                    }
+                    if let Some(addr) = attempt.addresses().first() {
+                        warn!(address = ?addr, "Bootstrap attempt failed, trying next hint: {e}");
+                    }
+                    last_err = Some(e);
                 }
-                Err(e.into())
             }
         }
+        Err(match last_err {
+            Some(e) => e.into(),
+            None => anyhow::anyhow!("ticket carries no address hints to bootstrap against"),
+        })
     }
+}
+
+/// Split a ticket into one single-hint ticket per address, preserving order.
+/// A ticket with no hints yields nothing — there is nothing to dial.
+fn single_address_tickets(ticket: &DatabaseTicket) -> Vec<DatabaseTicket> {
+    ticket
+        .addresses()
+        .iter()
+        .map(|addr| {
+            DatabaseTicket::with_addresses(ticket.database_id().clone(), vec![addr.clone()])
+        })
+        .collect()
 }
 
 /// Identity of the bridge issuing a bootstrap request: its own key plus the
@@ -175,9 +212,10 @@ pub async fn establish_login<B: AccessBootstrap>(
     }
     // Approved. `request_database_access` tracks the database with sync
     // **disabled** by default, so without this the agent DB is openable but
-    // never converges — nothing looks at a database whose owner has not asked
-    // for sync. A bridge always wants its agent DB syncing; that is the whole
-    // point of bootstrapping it.
+    // never converges — neither eidetica's background engine nor chaz's keyed
+    // reconciler looks at a database whose owner has not asked for sync. A
+    // bridge always wants its agent DB syncing; that is the whole point of
+    // bootstrapping it.
     //
     // Best-effort: `track_database` re-discovers the SigKey and fails if this
     // key holds no authority on the database. That cannot happen on the path
@@ -389,6 +427,47 @@ mod tests {
         // Nothing self-registered: this stub models a pre-authorized key, so
         // no request was queued for an owner to approve and act on.
         assert!(agent_db.list_logins().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_multi_hint_ticket_splits_into_one_ticket_per_hint() {
+        use eidetica::sync::Address;
+        let db_id = eidetica::entry::ID::parse(
+            "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y",
+        )
+        .unwrap();
+        let http = Address::http("127.0.0.1:9801");
+        let iroh = Address::iroh("endpointabx2tmyeynpdg27kdcu55gwrqgwavj66");
+        let ticket =
+            DatabaseTicket::with_addresses(db_id.clone(), vec![http.clone(), iroh.clone()]);
+
+        let split = single_address_tickets(&ticket);
+
+        // One dial per hint, so the owner sees at most one queued request per
+        // bootstrap instead of one per hint.
+        assert_eq!(split.len(), 2);
+        // Ticket order is preserved — the first hint is tried first, and the
+        // second is only reached if the first fails at the transport level.
+        assert_eq!(split[0].addresses(), &[http]);
+        assert_eq!(split[1].addresses(), &[iroh]);
+        for t in &split {
+            assert_eq!(t.database_id(), &db_id);
+        }
+    }
+
+    #[test]
+    fn a_ticket_with_no_hints_yields_no_attempts() {
+        // Nothing to dial: `request_access` must report that rather than
+        // silently reporting success or looping.
+        assert!(
+            single_address_tickets(&DatabaseTicket::new(
+                eidetica::entry::ID::parse(
+                    "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y"
+                )
+                .unwrap()
+            ))
+            .is_empty()
+        );
     }
 
     #[tokio::test]
