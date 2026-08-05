@@ -39,7 +39,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use eidetica::auth::crypto::PublicKey;
 use tracing::{debug, info, warn};
 
 use crate::session::SessionRegistry;
@@ -124,6 +123,7 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
     let mut no_peers = 0usize;
     let mut attempted = 0usize;
     let mut failed = 0usize;
+    let mut work = Vec::new();
 
     for db in tracked {
         if !db.sync_settings.sync_enabled {
@@ -154,20 +154,33 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
             no_peers += 1;
             continue;
         }
-        for peer in &peers {
-            let peer_key: &PublicKey = peer.public_key();
+        for peer in peers {
             attempted += 1;
-            if let Err(e) = sync
-                .sync_tree_with_peer_as(peer_key, &db.database_id, Some(&signing_key))
-                .await
-            {
-                failed += 1;
-                debug!(
-                    db_id = %db.database_id,
-                    peer = %peer,
-                    "keyed sync: sync failed: {e}"
-                );
-            }
+            work.push((db.database_id.clone(), signing_key.clone(), peer));
+        }
+    }
+
+    // Every (database, peer) sync at once. Sequentially, a pass costs the *sum*
+    // of every dead peer's connect timeout — and dead peers accumulate, because
+    // a tree's peer set keeps entries from retired bridge identities forever.
+    // Measured: passes stopped completing at all, minutes apart, so the tick
+    // interval became meaningless and databases stopped converging. Concurrent,
+    // a pass costs the slowest single peer.
+    let results = futures::future::join_all(work.into_iter().map(|(db_id, key, peer)| {
+        let sync = sync.clone();
+        async move {
+            let outcome = sync
+                .sync_tree_with_peer_as(peer.public_key(), &db_id, Some(&key))
+                .await;
+            (db_id, peer, outcome)
+        }
+    }))
+    .await;
+
+    for (db_id, peer, outcome) in results {
+        if let Err(e) = outcome {
+            failed += 1;
+            debug!(db_id = %db_id, peer = %peer, "keyed sync: sync failed: {e}");
         }
     }
 
