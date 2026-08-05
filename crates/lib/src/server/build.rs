@@ -851,9 +851,20 @@ async fn watch_agent_session_registries(
             continue;
         };
         let tx = tx.clone();
+        let agent_name = entry.display_name.clone();
         match adb
             .database()
-            .on_write(move |_event, _db| {
+            .on_write(move |event, _db| {
+                // Naming the source makes "did a bridge's write wake us, or only
+                // our own?" one grep. Without it a rescan that follows a bridge
+                // write is indistinguishable from a rescan that would have
+                // happened anyway, which is exactly the question that took a
+                // day to answer.
+                tracing::debug!(
+                    agent = %agent_name,
+                    source = ?event.source(),
+                    "Agent DB write; queueing a rescan"
+                );
                 let tx = tx.clone();
                 Box::pin(async move {
                     let _ = tx.send(()).await;
