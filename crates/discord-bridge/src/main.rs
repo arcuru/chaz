@@ -134,6 +134,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Bring each configured login online: ticket-bootstrap Write on its agent
     // DB, register the public pointer, and stash its resolved credentials.
+    // See `LoginRef`: the daemon's record of where this bridge lives goes stale
+    // on the first restart unless the bridge republishes it.
+    let peer_pubkey = sync.get_device_pubkey().ok().map(|k| k.to_string());
+    let sync_addresses = sync.get_all_server_addresses().await.unwrap_or_default();
+    info!(
+        pubkey = ?peer_pubkey,
+        addresses = ?sync_addresses,
+        "Publishing this bridge's sync identity with its logins"
+    );
+
     let bootstrap = SyncBootstrap::new(sync.clone());
     let identity = BridgeIdentity {
         key: &bridge_key,
@@ -150,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
             kind: "discord".to_string(),
             identifier: login_id.clone(),
             bridge_db_id: bridge_db_id.clone(),
+            peer_pubkey: peer_pubkey.clone(),
+            sync_addresses: sync_addresses.clone(),
         };
         match establish_login(&mut user, &bootstrap, &identity, &ticket, login_ref).await? {
             BootstrapOutcome::Approved => {

@@ -95,20 +95,45 @@ pub async fn build(
     if opts.enable_sync {
         instance.enable_sync().await?;
         if let Some(sync) = instance.sync() {
-            use eidetica::sync::transports::iroh::IrohTransport;
-            sync.register_transport("iroh", IrohTransport::builder())
-                .await?;
+            // Registering a transport under a name that already has one
+            // *replaces* it: the endpoint that was serving is dropped and a
+            // fresh one is minted under a different address. A caller that set
+            // sync up before calling build — the bridges do, because access
+            // bootstrap needs a live Sync handle — would therefore change its
+            // own address partway through startup, and every peer holding the
+            // old one would be left dialing an endpoint nobody is listening on.
+            // Nothing reports that: the peer is registered, the address is
+            // recorded, and requests simply go unanswered.
+            //
+            // So each transport is registered only if it is not already
+            // serving, which is what callers passing `enable_sync` on an
+            // already-synced instance have always assumed this does.
+            let mut registered_any = false;
 
-            if let Some(ref addr) = config.sync_listen {
+            if sync.get_server_address_for("iroh").await.is_err() {
+                use eidetica::sync::transports::iroh::IrohTransport;
+                sync.register_transport("iroh", IrohTransport::builder())
+                    .await?;
+                registered_any = true;
+            }
+
+            if let Some(ref addr) = config.sync_listen
+                && sync.get_server_address_for("http").await.is_err()
+            {
                 use eidetica::sync::transports::http::HttpTransport;
                 sync.register_transport("http", HttpTransport::builder().bind(addr))
                     .await?;
                 info!("Sync HTTP transport listening on {addr}");
+                registered_any = true;
             }
 
-            sync.accept_connections().await?;
-            if let Ok(addr) = sync.get_server_address().await {
-                info!("Eidetica sync address: {addr}");
+            if registered_any {
+                sync.accept_connections().await?;
+                if let Ok(addr) = sync.get_server_address().await {
+                    info!("Eidetica sync address: {addr}");
+                }
+            } else {
+                info!("Sync already accepting connections; keeping the existing address");
             }
         }
     }
@@ -880,6 +905,7 @@ pub(crate) async fn register_exposed_sessions(
         else {
             continue;
         };
+        adopt_published_bridge_addresses(registry, &adb).await;
         let refs = adb.list_session_refs().await.unwrap_or_default();
         // What this peer can actually see in the agent DB registry. A
         // bridge-created session reaches the daemon only through this store, so
@@ -1472,4 +1498,92 @@ async fn build_web_search_backends(
         .collect();
     info!(chain = ?chain, "web_search backends");
     built
+}
+
+/// Adopt the sync addresses each bridge publishes with its login pointer.
+///
+/// A peer's addresses are recorded when it is first registered and never
+/// revised. A bridge keeps its identity across restarts but takes a fresh
+/// transport address each time, so from the first restart onwards this daemon
+/// holds an address nobody is listening on — and the failure is silent, because
+/// the peer is registered and an address is known. Requests just go unanswered
+/// until they time out, which reads as "the peer is down" while the peer is in
+/// fact running and reachable at an address it has been publishing all along.
+///
+/// So take the bridge at its word: it is the only party that knows where its
+/// own identity is reachable. Adding an address is enough — eidetica keeps the
+/// set — and nothing here removes one, since an address that is merely idle is
+/// indistinguishable from one that is dead.
+async fn adopt_published_bridge_addresses(
+    registry: &Arc<session::SessionRegistry>,
+    adb: &crate::agent_db::AgentDb,
+) {
+    let Some(sync) = registry.instance().sync() else {
+        return;
+    };
+    let logins = adb.list_logins().await.unwrap_or_default();
+    for login in logins {
+        let Some(pubkey_str) = login.peer_pubkey.as_deref() else {
+            continue;
+        };
+        if login.sync_addresses.is_empty() {
+            continue;
+        }
+        let Ok(pubkey) = eidetica::auth::crypto::PublicKey::from_prefixed_string(pubkey_str) else {
+            tracing::debug!(
+                login = %login.identifier,
+                pubkey = %pubkey_str,
+                "published bridge pubkey did not parse; ignoring"
+            );
+            continue;
+        };
+        let published: Vec<eidetica::sync::peer_types::Address> = login
+            .sync_addresses
+            .iter()
+            .map(|(transport, address)| {
+                eidetica::sync::peer_types::Address::new(transport, address)
+            })
+            .collect();
+
+        for addr in &published {
+            if let Err(e) = sync.add_peer_address(&pubkey, addr.clone()).await {
+                tracing::debug!(
+                    login = %login.identifier,
+                    peer = %pubkey,
+                    "could not adopt published bridge address: {e}"
+                );
+            }
+        }
+
+        // Adding is not enough on its own. Addresses accumulate in the order
+        // they were learned and sync dials only the first, so a stale entry at
+        // the head keeps winning no matter how current the one behind it is.
+        // The bridge has just told us the complete set it answers on, so
+        // anything else recorded for this identity is from a run that has since
+        // gone away — drop it rather than leave it shadowing the live address.
+        let stale: Vec<_> = match sync.get_peer_info(&pubkey).await {
+            Ok(Some(info)) => info
+                .addresses
+                .into_iter()
+                .filter(|a| !published.contains(a))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for addr in stale {
+            if let Ok(true) = sync.remove_peer_address(&pubkey, &addr).await {
+                tracing::info!(
+                    login = %login.identifier,
+                    peer = %pubkey,
+                    address = ?addr,
+                    "Dropped a bridge address it no longer publishes"
+                );
+            }
+        }
+        tracing::debug!(
+            login = %login.identifier,
+            peer = %pubkey,
+            published = published.len(),
+            "Adopted a bridge's published sync addresses"
+        );
+    }
 }

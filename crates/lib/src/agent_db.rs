@@ -180,6 +180,27 @@ pub struct LoginRef {
     /// Eidetica root ID of the bridge-owned settings DB holding this login's
     /// encrypted credentials. The bridge creates and fully manages that DB.
     pub bridge_db_id: String,
+    /// Sync identity of the bridge process serving this login, as it currently
+    /// stands.
+    ///
+    /// A peer's addresses are recorded once, when it is first registered, and
+    /// nothing afterwards corrects them. A bridge takes a fresh transport
+    /// address whenever it restarts while keeping this identity, so the
+    /// daemon's record goes stale on the first restart and stays stale: it
+    /// dials an endpoint nobody is listening on and the requests simply go
+    /// unanswered. Nothing reports it, because as far as either side is
+    /// concerned the peer is registered and the address is known.
+    ///
+    /// The bridge is the only party that knows which address its identity is
+    /// reachable at, so it republishes both here on every startup and the
+    /// daemon adopts them. Optional so entries written before this existed —
+    /// and any writer that does not serve sync — still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_pubkey: Option<String>,
+    /// Transport addresses this bridge is currently reachable at, as
+    /// `(transport, address)` pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_addresses: Vec<(String, String)>,
 }
 
 /// Key the [`LoginRef`] occupies inside a bootstrap request's metadata `Doc`.
@@ -1574,6 +1595,8 @@ mod tests {
             kind: kind.into(),
             identifier: identifier.into(),
             bridge_db_id: bridge_db_id.into(),
+            peer_pubkey: None,
+            sync_addresses: Vec::new(),
         }
     }
 

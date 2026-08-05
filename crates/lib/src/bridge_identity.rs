@@ -261,12 +261,28 @@ pub async fn establish_login<B: AccessBootstrap>(
     // is what a Read-only bridge had to do, and what it warned about here.
     let database = user.open_database(agent_db_id).await?;
     let agent_db = AgentDb::from_database(database);
-    if agent_db.find_login(&login.identifier).await?.is_some() {
-        info!(
-            agent_db = %agent_db_id,
-            login = %login.identifier,
-            "Bridge login pointer present in agent DB"
-        );
+    if let Some(existing) = agent_db.find_login(&login.identifier).await? {
+        // The pointer already being there is not a reason to leave it alone.
+        // It carries where this bridge is reachable, and this process takes a
+        // fresh transport address every time it starts — so a pointer written
+        // by a previous run names an endpoint nobody is listening on, and the
+        // daemon dials it and waits for an answer that cannot come.
+        if existing.peer_pubkey != login.peer_pubkey
+            || existing.sync_addresses != login.sync_addresses
+        {
+            agent_db.register_login(login.clone()).await?;
+            info!(
+                agent_db = %agent_db_id,
+                login = %login.identifier,
+                "Refreshed this bridge's published sync identity in the agent DB"
+            );
+        } else {
+            info!(
+                agent_db = %agent_db_id,
+                login = %login.identifier,
+                "Bridge login pointer present in agent DB and already current"
+            );
+        }
     } else {
         agent_db.register_login(login.clone()).await?;
         info!(
@@ -408,6 +424,8 @@ mod tests {
                 kind: "matrix".to_string(),
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: None,
+                sync_addresses: Vec::new(),
             },
         )
         .await
@@ -496,6 +514,8 @@ mod tests {
             kind: "discord".to_string(),
             identifier: "chaz#4242".to_string(),
             bridge_db_id: "bafyrbridgedb".to_string(),
+            peer_pubkey: None,
+            sync_addresses: Vec::new(),
         };
         let decoded = LoginRef::from_metadata(&login.to_metadata().unwrap()).unwrap();
         assert_eq!(decoded, login);
@@ -540,6 +560,8 @@ mod tests {
                 kind: "matrix".to_string(),
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: None,
+                sync_addresses: Vec::new(),
             },
         )
         .await
@@ -578,6 +600,8 @@ mod tests {
                 kind: "matrix".to_string(),
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: None,
+                sync_addresses: Vec::new(),
             },
         )
         .await;

@@ -937,6 +937,8 @@ mod tests {
             kind: "matrix".to_string(),
             identifier: "@chaz:example".to_string(),
             bridge_db_id: "bafyrbridgedb".to_string(),
+            peer_pubkey: None,
+            sync_addresses: Vec::new(),
         };
         let registered =
             register_login_from_bootstrap_metadata(&agent_db, Some(&login.to_metadata().unwrap()))
