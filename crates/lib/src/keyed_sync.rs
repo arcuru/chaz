@@ -47,6 +47,15 @@ use crate::session::SessionRegistry;
 /// still feels immediate, since on-commit push is broken along with the rest.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Deadline for a single (database, peer) sync. Running the peers concurrently
+/// bounds a pass at the slowest one — which, for a peer whose transport address
+/// is stale, is however long that dial takes to give up. Observed to be long
+/// enough that passes stopped completing, so cap it: a sync that cannot finish
+/// within a few ticks is not helping this pass, and the next one retries.
+/// Comfortably above a loopback sync (sub-second) and well below an iroh dial
+/// to an endpoint that no longer exists.
+const PER_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Override for [`DEFAULT_INTERVAL`], in seconds. Deliberately an environment
 /// variable rather than a config field: this whole module is temporary, and
 /// keeping it out of the config schema means removing it breaks nobody's yaml.
@@ -123,6 +132,7 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
     let mut no_peers = 0usize;
     let mut attempted = 0usize;
     let mut failed = 0usize;
+    let mut timed_out = 0usize;
     let mut work = Vec::new();
 
     for db in tracked {
@@ -169,18 +179,33 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
     let results = futures::future::join_all(work.into_iter().map(|(db_id, key, peer)| {
         let sync = sync.clone();
         async move {
-            let outcome = sync
-                .sync_tree_with_peer_as(peer.public_key(), &db_id, Some(&key))
-                .await;
+            let outcome = tokio::time::timeout(
+                PER_SYNC_TIMEOUT,
+                sync.sync_tree_with_peer_as(peer.public_key(), &db_id, Some(&key)),
+            )
+            .await;
             (db_id, peer, outcome)
         }
     }))
     .await;
 
     for (db_id, peer, outcome) in results {
-        if let Err(e) = outcome {
-            failed += 1;
-            debug!(db_id = %db_id, peer = %peer, "keyed sync: sync failed: {e}");
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                failed += 1;
+                debug!(db_id = %db_id, peer = %peer, "keyed sync: sync failed: {e}");
+            }
+            Err(_) => {
+                failed += 1;
+                timed_out += 1;
+                debug!(
+                    db_id = %db_id,
+                    peer = %peer,
+                    timeout_secs = PER_SYNC_TIMEOUT.as_secs(),
+                    "keyed sync: sync timed out"
+                );
+            }
         }
     }
 
@@ -191,6 +216,7 @@ pub async fn reconcile_once(registry: &SessionRegistry) {
         no_peers,
         attempted,
         failed,
+        timed_out,
         succeeded = attempted - failed,
         "keyed sync pass complete"
     );
