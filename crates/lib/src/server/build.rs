@@ -1178,63 +1178,6 @@ const MAX_CONCURRENT_SESSION_REGISTRATIONS: usize = 8;
 
 const PULL_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long a single address gets to prove it is still alive.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Remove a peer's addresses that no longer answer, keeping the ones that do.
-///
-/// WORKAROUND (eidetica): tree sync dials `peer_info.addresses.first()` and
-/// never falls back to the rest, so a dead address at the head of the list
-/// silently disables a peer that is up and reachable elsewhere. Ticket
-/// bootstrap races every address; ordinary sync does not. Delete this once
-/// sync tries more than the first address.
-///
-/// Probing is the only way to tell which is which: `discover_peer_trees` takes
-/// an explicit address, so it answers "is this one alive" directly. Addresses
-/// are probed concurrently and an *inconclusive* probe keeps the address —
-/// removing one costs reachability, so this only drops what it has positively
-/// seen fail. Never removes the last remaining address.
-async fn prune_unreachable_peer_addresses(
-    sync: &eidetica::sync::Sync,
-    peer: &eidetica::auth::crypto::PublicKey,
-) {
-    let Ok(Some(info)) = sync.get_peer_info(peer).await else {
-        return;
-    };
-    if info.addresses.len() < 2 {
-        return; // Nothing to choose between; a lone address gets the benefit of the doubt.
-    }
-    let probes = info.addresses.iter().map(|addr| {
-        let sync = sync.clone();
-        let addr = addr.clone();
-        async move {
-            let alive = tokio::time::timeout(PROBE_TIMEOUT, sync.discover_peer_trees(&addr))
-                .await
-                .is_ok_and(|r| r.is_ok());
-            (addr, alive)
-        }
-    });
-    let results = futures::future::join_all(probes).await;
-    let live = results.iter().filter(|(_, alive)| *alive).count();
-    if live == 0 {
-        // Every address failed. That is more likely a peer that is simply down
-        // than a set of addresses that are all wrong, and pruning them all
-        // would strand it permanently. Leave the list alone.
-        tracing::debug!(peer = %peer, "no address answered; keeping all (peer may be down)");
-        return;
-    }
-    for (addr, alive) in results.into_iter().filter(|(_, alive)| !alive) {
-        let _ = alive;
-        match sync.remove_peer_address(peer, &addr).await {
-            Ok(true) => {
-                tracing::info!(peer = %peer, address = ?addr, "Dropped unreachable peer address")
-            }
-            Ok(false) => {}
-            Err(e) => tracing::debug!(peer = %peer, address = ?addr, "address removal failed: {e}"),
-        }
-    }
-}
-
 /// Pull a bridge-exposed session's own tree onto this daemon.
 ///
 /// The agent-DB registry only carries a *pointer* (the session root id); the
@@ -1296,18 +1239,6 @@ async fn pull_session_tree_from_agent_peers(
     if peers.is_empty() {
         tracing::debug!(session_db_id, "no peers sync this agent DB; cannot pull");
         return;
-    }
-    // Drop addresses that no longer answer, before asking anyone for anything.
-    //
-    // WORKAROUND (eidetica): `sync_tree_with_peer_*` uses `addresses.first()`
-    // and never tries another, so one stale entry at the head makes a peer
-    // permanently unreachable even though a working address sits right behind
-    // it. Addresses accumulate — a bridge gets a fresh iroh endpoint on every
-    // restart and nothing removes the old one — so this is the normal state
-    // after a few redeploys, not an edge case. Every pull below was timing out
-    // against a bridge that was running and reachable the whole time.
-    for peer in &peers {
-        prune_unreachable_peer_addresses(&sync, peer.public_key()).await;
     }
     // Ask every peer at once and keep the first success. Peers from retired
     // bridge identities are never pruned from the agent DB's peer set, and each
