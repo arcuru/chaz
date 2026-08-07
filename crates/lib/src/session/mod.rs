@@ -602,6 +602,29 @@ pub fn summarize_last_message(entries: &[SessionEntry]) -> Option<String> {
         })
 }
 
+/// What a session's own entries say about where it began: the timestamp of
+/// its earliest entry, and the `"{transport}:{channel}"` source tag of the
+/// first entry that arrived over a bridge.
+///
+/// The catalog caches both at creation, which works for a session this peer
+/// created and not at all for one adopted from another peer: the adopting
+/// peer knows only when *it* first saw the session, and re-derives that on
+/// every adoption. Entries carry the real values and never drift, so an
+/// adopted row can be seeded — and corrected — from them.
+///
+/// `entries` is expected in timestamp order, as [`Session::entries`] returns
+/// it. Returns `(started_at, source)`, either of which is `None` when the
+/// entries carry no evidence: an empty session, or one with no bridge-routed
+/// entry (a purely local TUI/CLI conversation).
+pub fn session_origin(entries: &[SessionEntry]) -> (Option<DateTime<Utc>>, Option<String>) {
+    let started_at = entries.iter().map(|e| e.timestamp).min();
+    let source = entries
+        .iter()
+        .find_map(|e| e.routing.as_ref()?.source.as_ref())
+        .map(|s| format!("{}:{}", s.transport, s.channel));
+    (started_at, source)
+}
+
 /// Sum `ResponseMetadata.usage.cost_usd` across an in-memory entry slice.
 /// Returns `(total_cost_usd, cost_reported, llm_call_count)`.
 ///
@@ -699,6 +722,81 @@ async fn find_or_create_db(
 mod tests {
     use super::test_helpers::*;
     use super::*;
+
+    fn entry_at(sender: &str, minutes_ago: i64, routing: Option<EntryRouting>) -> SessionEntry {
+        SessionEntry {
+            sender: sender.to_string(),
+            content: "hi".to_string(),
+            timestamp: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing,
+        }
+    }
+
+    fn matrix_source(room: &str) -> EntryRouting {
+        EntryRouting {
+            source: Some(TransportRef {
+                transport: "matrix".to_string(),
+                login_id: "@ava:example.com".to_string(),
+                channel: room.to_string(),
+                sender: Some("@patrick:example.com".to_string()),
+                sender_display: None,
+                message_id: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_origin_reads_start_and_transport_from_entries() {
+        let entries = vec![
+            entry_at(
+                "@patrick:example.com",
+                90,
+                Some(matrix_source("!room:example.com")),
+            ),
+            entry_at("ava", 89, None),
+        ];
+
+        let (started_at, source) = session_origin(&entries);
+        assert_eq!(started_at, Some(entries[0].timestamp));
+        assert_eq!(source.as_deref(), Some("matrix:!room:example.com"));
+        // The tag has to be one `BridgeKind::from_source` actually recognizes,
+        // or the picker still renders the session as `[other]`.
+        assert_eq!(
+            BridgeKind::from_source(source.as_deref()),
+            BridgeKind::Matrix
+        );
+    }
+
+    #[test]
+    fn session_origin_takes_the_earliest_entry_not_the_first_routed_one() {
+        // A local entry can precede the first bridge-routed one; the session
+        // still started at the local entry.
+        let entries = vec![
+            entry_at("ava", 200, None),
+            entry_at(
+                "@patrick:example.com",
+                100,
+                Some(matrix_source("!room:example.com")),
+            ),
+        ];
+
+        let (started_at, source) = session_origin(&entries);
+        assert_eq!(started_at, Some(entries[0].timestamp));
+        assert_eq!(source.as_deref(), Some("matrix:!room:example.com"));
+    }
+
+    #[test]
+    fn session_origin_yields_nothing_without_evidence() {
+        assert_eq!(session_origin(&[]), (None, None));
+
+        let local_only = vec![entry_at("ava", 5, None)];
+        let (started_at, source) = session_origin(&local_only);
+        assert_eq!(started_at, Some(local_only[0].timestamp));
+        assert_eq!(source, None, "a purely local session names no transport");
+    }
 
     #[tokio::test]
     async fn session_meta_agents_round_trip() {

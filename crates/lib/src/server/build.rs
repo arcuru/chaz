@@ -1008,7 +1008,7 @@ async fn register_one_exposed_session(
         opened = registry.open_session(&r.session_db_id).await;
     }
     match opened {
-        Ok((_conv, sdb)) => {
+        Ok((conv_id, sdb)) => {
             // Before anything else: a session the bridge created names the
             // bridge as its home peer, and a bridge runs no agent loop. Take
             // it over now, while adopting it, rather than registering a
@@ -1047,16 +1047,28 @@ async fn register_one_exposed_session(
                     exposed_on = ?r.exposed_on,
                     "Daemon registered bridge-exposed session"
                 );
-                // Also register in the daemon's local session catalog
-                // so the TUI `/sessions` list picks it up. Build the
-                // source from the first transport binding so the
-                // `BridgeKind::from_source` derivation is accurate.
+                // Also register in the daemon's local session catalog so the
+                // TUI `/sessions` list picks it up. Both the source tag (for
+                // `BridgeKind`) and the creation time have to come from the
+                // session itself: this peer did not create it, and its own
+                // clock only knows when it adopted it.
+                //
+                // The transport-bindings store is the direct answer but is
+                // not always populated by the time a pulled session first
+                // registers, and an empty read there is what leaves a Matrix
+                // conversation labelled `[other]`. The session's entries
+                // carry the same routing provenance and arrive with the tree,
+                // so they back-stop the bindings and supply the real start
+                // time in the same pass.
+                let adopted = session::Session::new(conv_id.clone(), sdb.clone()).await;
+                let (started_at, routed_source) = session::session_origin(adopted.entries());
                 let source = session::transport_bindings(&sdb)
                     .await
                     .ok()
-                    .and_then(|b| b.first().map(|(t, _l, c)| format!("{t}:{c}")));
+                    .and_then(|b| b.first().map(|(t, _l, c)| format!("{t}:{c}")))
+                    .or(routed_source);
                 if let Err(e) = registry
-                    .upsert_session_catalog(&r.session_db_id, source.as_deref())
+                    .upsert_session_catalog(&r.session_db_id, source.as_deref(), started_at)
                     .await
                 {
                     warn!(session_db_id = %r.session_db_id, "Failed to upsert session catalog: {e}");

@@ -4,6 +4,7 @@
 
 use crate::agent::AgentRegistry;
 use crate::types::ConversationId;
+use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
@@ -345,25 +346,48 @@ impl SessionRegistry {
     /// discovered via the agent DB registry) so it appears in the local TUI
     /// `/sessions` list.
     ///
-    /// Idempotent — overwrites any existing row with the same `session_db_id`.
+    /// Idempotent, and a *merge* rather than a blind overwrite: adoption runs
+    /// again on every rescan and every daemon restart, so anything derived
+    /// from "now" or from stores that may not have synced yet would be
+    /// rewritten each pass. Re-adopting a session must not change what the
+    /// catalog says about it.
+    ///
+    /// `started_at` is the session's real first-entry timestamp where the
+    /// caller could read one (see [`session_origin`]). It wins over a stored
+    /// value, so rows previously stamped with an adoption time heal on the
+    /// next pass; without it an existing `created_at` is preserved, and only
+    /// a genuinely new row falls back to now. Likewise a `None` source never
+    /// downgrades a known [`BridgeKind`] to `Other`, and an existing
+    /// `status` is carried forward so adoption can't resurrect a closed
+    /// session.
+    ///
     /// The catalog is peer-local (never syncs), so this doesn't conflict with
     /// the bridge's own catalog entry.
     pub async fn upsert_session_catalog(
         &self,
         session_db_id: &str,
         source: Option<&str>,
+        started_at: Option<DateTime<Utc>>,
     ) -> anyhow::Result<()> {
+        let existing = self.read_session_catalog_entry(session_db_id).await;
+        let source = source
+            .map(|s| s.to_string())
+            .or_else(|| existing.as_ref().and_then(|e| e.source.clone()));
         let catalog_entry = SessionCatalogEntry {
             session_db_id: session_db_id.to_string(),
-            source: source.map(|s| s.to_string()),
-            bridge: BridgeKind::from_source(source),
-            created_at: chrono::Utc::now(),
-            status: SessionStatus::Active,
+            bridge: BridgeKind::from_source(source.as_deref()),
+            created_at: started_at
+                .or_else(|| existing.as_ref().map(|e| e.created_at))
+                .unwrap_or_else(chrono::Utc::now),
+            status: existing
+                .as_ref()
+                .map_or(SessionStatus::Active, |e| e.status),
+            source,
         };
         let txn = self.chaz_group.new_transaction().await?;
         let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         sessions
-            .set_string(session_db_id, source.unwrap_or(""))
+            .set_string(session_db_id, catalog_entry.source.as_deref().unwrap_or(""))
             .await?;
         let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
         let catalog_json = serde_json::to_string(&catalog_entry)?;
@@ -372,9 +396,23 @@ impl SessionRegistry {
 
         info!(
             session_db_id,
-            source, "Upserted session into local catalog (adopted from peer)"
+            source = ?catalog_entry.source,
+            created_at = %catalog_entry.created_at,
+            "Upserted session into local catalog (adopted from peer)"
         );
         Ok(())
+    }
+
+    /// Read one row out of the session catalog, or `None` when the session has
+    /// no row yet or the stored JSON no longer parses.
+    async fn read_session_catalog_entry(&self, session_db_id: &str) -> Option<SessionCatalogEntry> {
+        let txn = self.chaz_group.new_transaction().await.ok()?;
+        let store = txn
+            .get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await
+            .ok()?;
+        let json = store.get_string(session_db_id).await.ok()?;
+        serde_json::from_str(&json).ok()
     }
 
     /// Mark a session as closed in the catalog (no row removal — Patrick's
@@ -562,6 +600,107 @@ mod tests {
         assert_eq!(bare.bridge, BridgeKind::Other);
         assert_eq!(bare.source, None);
         assert!(bare.created_at.is_some());
+    }
+
+    /// Adoption re-runs on every rescan and every daemon restart. It used to
+    /// rebuild the row from scratch each time, so a Matrix conversation's age
+    /// was really "time since this daemon last started" and the whole list
+    /// collapsed onto the same age — which also scrambled the ordering, since
+    /// the picker sorts on `created_at`.
+    #[tokio::test]
+    async fn re_adopting_a_session_preserves_its_catalog_row() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, db) = registry.create_session(None).await.unwrap();
+        let id = db.root_id().to_string();
+
+        let started_at = chrono::Utc::now() - chrono::Duration::days(9);
+        registry
+            .upsert_session_catalog(&id, Some("matrix:!room1:example.com"), Some(started_at))
+            .await
+            .unwrap();
+
+        // A later pass with no evidence — bindings not yet synced, no entries
+        // to read — must not overwrite what the first pass established.
+        registry
+            .upsert_session_catalog(&id, None, None)
+            .await
+            .unwrap();
+
+        let row = registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_db_id == id)
+            .expect("adopted session must be listed");
+        assert_eq!(
+            row.created_at,
+            Some(started_at),
+            "created_at was re-stamped"
+        );
+        assert_eq!(row.bridge, BridgeKind::Matrix, "bridge kind downgraded");
+        assert_eq!(row.source.as_deref(), Some("matrix:!room1:example.com"));
+    }
+
+    /// Rows already written with an adoption timestamp have to heal, not just
+    /// stop drifting — the fix is worthless if the existing catalog keeps
+    /// showing every Matrix session as minutes old forever.
+    #[tokio::test]
+    async fn real_start_time_corrects_a_row_stamped_at_adoption() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, db) = registry.create_session(None).await.unwrap();
+        let id = db.root_id().to_string();
+
+        // The old behavior: stamped with "now" because nothing better was known.
+        registry
+            .upsert_session_catalog(&id, Some("matrix:!r:example.com"), None)
+            .await
+            .unwrap();
+        let stamped = registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_db_id == id)
+            .and_then(|s| s.created_at)
+            .expect("row should exist");
+
+        let started_at = chrono::Utc::now() - chrono::Duration::days(3);
+        registry
+            .upsert_session_catalog(&id, None, Some(started_at))
+            .await
+            .unwrap();
+
+        let healed = registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_db_id == id)
+            .and_then(|s| s.created_at)
+            .expect("row should exist");
+        assert_ne!(healed, stamped);
+        assert_eq!(healed, started_at);
+    }
+
+    /// Adoption must not resurrect a session the user closed.
+    #[tokio::test]
+    async fn re_adopting_a_closed_session_keeps_it_closed() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let id = db.root_id().to_string();
+        registry.mark_session_closed(&id).await.unwrap();
+
+        registry
+            .upsert_session_catalog(&id, Some("cli"), None)
+            .await
+            .unwrap();
+
+        let list = registry.list_sessions().await.unwrap();
+        assert_eq!(
+            list.iter().find(|s| s.session_db_id == id).unwrap().status,
+            SessionStatus::Closed
+        );
     }
 
     #[tokio::test]
