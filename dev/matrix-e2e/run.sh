@@ -116,17 +116,21 @@ wait_for() {
 	fail "timed out after ${timeout}s waiting for $what"
 }
 
+# Start a process, log it into the workspace, and register it for cleanup. The
+# pid lands in SPAWNED_PID rather than on stdout: a command substitution would
+# run this in a subshell, where the PIDS append is discarded and the process
+# survives the run.
+SPAWNED_PID=""
 spawn() {
 	local name="$1"
 	shift
 	"$@" >"$WORKSPACE/$name.log" 2>&1 &
-	local pid=$!
-	PIDS+=("$pid")
+	SPAWNED_PID=$!
+	PIDS+=("$SPAWNED_PID")
 	if [[ $VERBOSE -eq 1 ]]; then
 		tail -f "$WORKSPACE/$name.log" | sed "s/^/[$name] /" >&2 &
 		PIDS+=($!)
 	fi
-	echo "$pid"
 }
 
 SERVER_NAME="e2e.test"
@@ -152,7 +156,7 @@ log "synapse :$SYNAPSE_PORT  stub-llm :$STUB_PORT  daemon-sync :$DAEMON_SYNC_POR
 
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
-spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER" >/dev/null
+spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER"
 wait_for "stub LLM" 30 curl -sf "http://127.0.0.1:$STUB_PORT/v1/models"
 
 # ----------------------------------------------------------------- synapse ---
@@ -236,7 +240,7 @@ with open(path, "w") as fh:
 PY
 
 log "starting synapse"
-spawn synapse synapse_homeserver --config-path "$SYNAPSE_DIR/homeserver.yaml" >/dev/null
+spawn synapse synapse_homeserver --config-path "$SYNAPSE_DIR/homeserver.yaml"
 wait_for "synapse" 120 curl -sf "$HOMESERVER/_matrix/client/versions"
 
 log "registering accounts"
@@ -340,11 +344,13 @@ EOF
 
 # ------------------------------------------------------------- processes -----
 log "starting daemon"
-spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon >/dev/null
+spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
 wait_for "daemon" 90 grep -q "daemon ready" "$WORKSPACE/daemon.log"
 
 log "starting bridge"
-spawn bridge "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" >/dev/null
+spawn bridge "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
 wait_for "bridge matrix login" 120 grep -q "Matrix login spawned" "$WORKSPACE/bridge.log"
 
 if grep -q "Pending" "$WORKSPACE/bridge.log"; then

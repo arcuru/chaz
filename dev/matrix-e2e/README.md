@@ -23,6 +23,43 @@ It is deliberately not a test of the model, the prompt, or the tools. The LLM
 is a stub that returns one fixed string, so a pass means the transport carried
 it and a failure is never someone else's outage.
 
+### The split it exercises
+
+The bridge and the agent are two separate peers, each with its own backend file
+and its own key. They share no process and no database handle; everything
+between them moves through eidetica sync.
+
+```
+@puppet ──Matrix──▶ Synapse ──▶ chaz-matrix ──┐
+                                  (bridge)     │  eidetica sync
+                                  no agents    │  over loopback HTTP
+                                  no LLM       ▼
+                                              chaz daemon
+                                              runs the agent ──▶ stub LLM
+                                              reply syncs back out
+```
+
+Four things have to hold for a run to pass, and each is a distinct failure:
+
+1. The bridge bootstraps into the agent's DB with the key it was granted.
+2. An inbound room message becomes an entry in a session DB.
+3. That session DB reaches the daemon, which notices and runs a turn.
+4. The reply syncs back and the bridge delivers it to the room.
+
+Because the harness waits on a specific observable at each step — the daemon's
+readiness line, the bridge's Matrix login, the agent's join, then the reply —
+the step that times out tells you which of the four broke, without reading a
+log first.
+
+Two constraints worth holding onto, because both have caused confusing
+failures:
+
+- **`chaz_group` and `chaz_peer` never sync.** Routing metadata and credentials
+  are peer-local by design. If a test seems to need one of those to cross
+  between the bridge and the daemon, the test is wrong, not the sync layer.
+- **A login belongs to exactly one agent.** There is no shared-login gateway,
+  so a second agent in a test needs its own Matrix account.
+
 ## What it stands up
 
 | Process       | Role                                                          |
@@ -67,6 +104,73 @@ sequence exists to protect.
   `/agent share` writes a copy of every ticket under the config directory.
 - **Ports are requested from the kernel**, not hardcoded, so a run does not
   collide with a daemon already running on the machine.
+
+## Writing a new case
+
+`run.sh` is deliberately a single linear script rather than a framework: it
+reads top to bottom, and a new case is usually a few lines inserted where the
+existing conversation happens. Four helpers carry most of the weight.
+
+| Helper                            | Use                                                                      |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| `spawn <name> <cmd...>`           | Start a process, log to `$WORKSPACE/<name>.log`, register it for cleanup |
+| `wait_for <what> <secs> <cmd>`    | Poll until `cmd` succeeds, or fail naming `<what>`                       |
+| `fail <message>`                  | Abort with a red message and exit 1                                      |
+| `mx <METHOD> <path> [tok] [body]` | One client-server API call against the throwaway homeserver              |
+
+Assert on an observable, never on a sleep. Every wait is bounded, because a
+harness that hangs is worse than one that fails — CI will sit on it until the
+job timeout, and locally it looks like a wedge rather than a bug.
+
+**A second turn in the same room**, to cover context rather than first contact:
+
+```bash
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"second"}')" >/dev/null
+wait_for "the second reply" 120 reply_arrived
+```
+
+Note that `reply_arrived` matches on the stub's fixed marker, so it is true the
+moment the _first_ reply is present. A second-turn assertion needs its own
+predicate — count matching messages and require two, rather than reusing this
+one and passing instantly.
+
+**A restart mid-conversation**, which is where the real bugs live:
+
+```bash
+kill -TERM "$BRIDGE_PID"          # set when the bridge was spawned
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+spawn bridge-restarted "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+wait_for "bridge back online" 120 grep -q "Matrix login spawned" "$WORKSPACE/bridge-restarted.log"
+```
+
+`spawn` leaves the new pid in `$SPAWNED_PID` rather than printing it, because a
+command substitution would run it in a subshell where the cleanup registration
+is discarded and the process outlives the run. `$DAEMON_PID` and `$BRIDGE_PID`
+are already captured that way.
+
+The bridge keeps its key across restarts, so it should come straight back
+without re-authorization. A restart that asks to be approved again is a
+regression in exactly the identity handling this harness pre-authorizes.
+
+**A different agent or model** means editing the daemon config heredoc. The
+`agents:` block there is a first-boot template — the agent DB is the runtime
+source of truth, so changing the YAML for an already-populated `state_dir`
+changes nothing. Test workspaces are fresh every run, so this only bites when
+reusing a `--keep` workspace.
+
+**A tool call** needs the stub to return a `tool_calls` response rather than a
+plain message; `stub_llm.py` currently answers every request identically and
+would need to branch on the request body to drive a ReAct loop.
+
+### Keep the stub boring
+
+The stub exists so a failure is never ambiguous. If a case starts needing the
+model to behave in a particular way, prefer asserting on what reached the stub
+(`stub-llm.log` records every request) over teaching the stub to be clever. A
+smart stub is a second implementation of the thing under test.
 
 ## When it fails
 
