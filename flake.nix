@@ -330,6 +330,19 @@
           # inputsFrom provides headers/pkg-config for compilation but not LD_LIBRARY_PATH.
           LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
         };
+
+        # Everything `dev/matrix-e2e/run.sh` needs to stand up a throwaway
+        # homeserver. Kept out of the default shell because Synapse is a large
+        # closure and nothing else in the repo wants it.
+        devShells.e2e = pkgs.mkShell {
+          name = "chaz-e2e";
+          nativeBuildInputs = with pkgs; [
+            curl
+            jq
+            matrix-synapse
+            (python3.withPackages (ps: [ps.pyyaml]))
+          ];
+        };
       };
     };
 }
