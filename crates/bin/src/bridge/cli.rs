@@ -51,7 +51,7 @@ impl CliBridge {
 /// Resolve the session to run against:
 /// - `Some(name)` → find-or-create a session with that name (reused across runs).
 /// - `None`       → create a fresh ephemeral session (no name, no reuse).
-async fn resolve_cli_session(
+pub(crate) async fn resolve_cli_session(
     server: &Server,
     session_name: Option<&str>,
 ) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {

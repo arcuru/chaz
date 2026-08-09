@@ -44,6 +44,16 @@ struct Args {
     /// chaz config the runtime needs (`backends`, `agents`, `security`).
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Print this bridge's public key and exit, generating it if this is the
+    /// first run.
+    ///
+    /// This is the identity the owning peer authorizes — feed it to `chaz cmd
+    /// '/agent invite <agent> <pubkey> write'` to pre-grant access, and the
+    /// bridge bootstraps on its next start with no approval round-trip. Run it
+    /// with the bridge stopped; it opens the bridge's own backend.
+    #[arg(long)]
+    print_pubkey: bool,
 }
 
 /// A login that bootstrapped access and has its credentials in hand, ready to
@@ -100,6 +110,16 @@ async fn main() -> anyhow::Result<()> {
         Some(u) => u,
         None => instance.login_user("chaz-matrix", None).await?,
     };
+
+    // `--print-pubkey` resolves the bridge's identity and stops here,
+    // deliberately ahead of sync: binding a transport is pointless for a
+    // question about a key, and it would make the lookup fail on an
+    // already-taken port.
+    if args.print_pubkey {
+        let key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await?;
+        println!("{key}");
+        return Ok(());
+    }
 
     // Enable sync up front — access bootstrap needs the live Sync handle, and
     // it must be reachable so the daemon can serve the agent DBs we request.

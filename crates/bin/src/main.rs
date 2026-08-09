@@ -43,6 +43,42 @@ enum Subcommand {
     /// Aggregate LLM usage and cost across all sessions, then exit.
     /// Reads the user-central session catalog; no bridge is started.
     Usage(UsageArgs),
+
+    /// Run one `/command` non-interactively, print its result, and exit.
+    ///
+    /// Reaches the same command grammar as the TUI and the Matrix bridge, so
+    /// peer administration is scriptable — notably the bridge bring-up
+    /// sequence (`/pubkey`, `/agent invite`, `/agent share`, `/sharing
+    /// approve`), which otherwise needs a human at a terminal.
+    ///
+    /// Exits non-zero when the command reports an error. Run it with the
+    /// daemon stopped: it opens the same state directory, and two processes
+    /// on one backend do not observe each other's writes.
+    Cmd(CmdArgs),
+
+    /// Run the agent peer with no user interface, until terminated.
+    ///
+    /// Same runtime as the TUI — sync, schedules, the routine engine, and the
+    /// agent loop — minus the terminal. This is the process transport bridges
+    /// (`chaz-matrix`, `chaz-discord`) sync against, and the form to run under
+    /// systemd, a container, or a test harness, none of which can offer the
+    /// TTY the TUI's raw mode requires.
+    ///
+    /// Logs to stdout. Stops cleanly on Ctrl-C or SIGTERM.
+    Daemon,
+}
+
+#[derive(clap::Args)]
+struct CmdArgs {
+    /// The command to run, including its leading `/` — e.g. '/sharing requests'.
+    #[arg(value_name = "COMMAND")]
+    command: String,
+
+    /// Named session to run the command against (find-or-create). Peer-scoped
+    /// commands ignore it; session-scoped ones (`/info`, `/share`) need it to
+    /// address anything but a fresh throwaway session.
+    #[arg(long, value_name = "NAME")]
+    session: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -85,7 +121,7 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = ChazArgs::parse();
+    let mut args = ChazArgs::parse();
 
     let config_path = resolve_config_path(args.config.as_deref())?;
 
@@ -105,41 +141,61 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
 
-    // Subcommand short-circuit: read-only utilities open the DB, do their
-    // work, and exit — no bridge, scheduler, MCP, or sync setup.
-    if let Some(sub) = args.subcommand {
-        // Bare stderr logging — stdout is reserved for the subcommand's
-        // own output (text or JSON) so it stays pipe-friendly.
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .init();
-        return match sub {
+    // Subcommand routing. `usage` is a read-only utility: it opens the DB,
+    // does its work, and exits without a bridge, scheduler, MCP, or sync.
+    // `cmd` needs the fully-wired server, so it falls through and is dispatched
+    // as a bridge below.
+    let mut cmd_args: Option<CmdArgs> = None;
+    let mut daemon_mode = false;
+    if let Some(sub) = args.subcommand.take() {
+        match sub {
+            Subcommand::Daemon => daemon_mode = true,
             Subcommand::Usage(usage_args) => {
-                run_usage_subcommand(usage_args, &config, state_dir.as_deref()).await
+                // Bare stderr logging — stdout is reserved for the subcommand's
+                // own output (text or JSON) so it stays pipe-friendly.
+                let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .init();
+                return run_usage_subcommand(usage_args, &config, state_dir.as_deref()).await;
             }
-        };
+            Subcommand::Cmd(a) => cmd_args = Some(a),
+        }
     }
+
+    // Both one-shot modes reserve stdout for their result, so neither can log
+    // to it.
+    let headless_oneshot = args.print || cmd_args.is_some();
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
     //
-    // - --no-tui (headless): logs go to stdout, where systemd / docker / etc.
+    // - daemon: logs go to stdout, where systemd / docker / a test harness
     //   collect them via their usual mechanisms.
-    // - TUI (default, including TUI + background Matrix): stdout belongs to
-    //   ratatui, so logs go to a rolling file (the alt-screen buffer gets
-    //   corrupted by stray writes).
-    // - --print: stdout is reserved for the model's reply so it can be piped
-    //   / captured cleanly. Logs go to a rolling file mirroring the TUI path.
+    // - TUI (default): stdout belongs to ratatui, so logs go to a rolling file
+    //   (the alt-screen buffer gets corrupted by stray writes).
+    // - --print / cmd: stdout is reserved for the model's reply (or the
+    //   command's result) so it can be piped / captured cleanly. Logs go to a
+    //   rolling file mirroring the TUI path.
     //
     // File-mode rotations: daily, keep the last 7 days. Tail the file in
     // another terminal to follow live.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _file_log_guard = {
+    let _file_log_guard = if daemon_mode {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stdout)
+            .init();
+        None
+    } else {
         let log_dir = state_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-        let prefix = if args.print { "chaz-cli" } else { "chaz-tui" };
+        let prefix = match (args.print, cmd_args.is_some()) {
+            (_, true) => "chaz-cmd",
+            (true, _) => "chaz-cli",
+            _ => "chaz-tui",
+        };
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(prefix)
@@ -153,17 +209,18 @@ async fn main() -> anyhow::Result<()> {
             .with_ansi(false)
             .init();
         eprintln!(
-            "chaz {} logs: {}/{}.log (daily, keeps 7 days)",
-            if args.print { "CLI" } else { "TUI" },
+            "chaz logs: {}/{}.log (daily, keeps 7 days)",
             log_dir.display(),
             prefix,
         );
-        guard
+        Some(guard)
     };
 
     info!(
         config = %config_path.display(),
         print = args.print,
+        cmd = cmd_args.is_some(),
+        daemon = daemon_mode,
         "Starting chaz"
     );
     info!("Config loaded from {}", config_path.display());
@@ -221,12 +278,16 @@ async fn main() -> anyhow::Result<()> {
         user,
         server::BuildOptions {
             config_path: config_path.clone(),
-            enable_sync: !args.print,
-            run_routine_engine: !args.print,
+            // Command mode needs sync even though it is one-shot: `/agent
+            // share` mints a ticket out of the sync layer and refuses outright
+            // without it, and minting tickets is most of the point.
+            enable_sync: cmd_args.is_some() || !args.print,
+            run_routine_engine: !headless_oneshot,
             // The chaz daemon owns its agents — mint their DBs from config.
             bootstrap_agents_from_config: true,
-            // The daemon is the peer that runs agents.
-            run_agent_loop: true,
+            // Command mode administers the peer; it never runs a turn, and
+            // starting the loop would risk billing one as a side effect.
+            run_agent_loop: cmd_args.is_none(),
             extra_auto_approved_tools,
         },
     )
@@ -239,16 +300,34 @@ async fn main() -> anyhow::Result<()> {
 
     // Bridge dispatch.
     //
+    // - `cmd`     : one-shot slash command
     // - `--print` : one-shot CLI
     // - default   : TUI
     //
     // Transport bridges (Matrix, Discord) are their own standalone peer
     // binaries (`chaz-matrix`, `chaz-discord`) — this process no longer spawns
     // any in-process.
-    let mode = if args.print { "cli" } else { "tui" };
+    let mode = match (args.print, cmd_args.is_some(), daemon_mode) {
+        (_, _, true) => "daemon",
+        (_, true, _) => "cmd",
+        (true, ..) => "cli",
+        _ => "tui",
+    };
     info!(mode, "Starting bridge");
 
-    let result = if args.print {
+    let result = if daemon_mode {
+        // No bridge: the server is already running sync, schedules, the
+        // routine engine, and the agent loop. Hold the process open so that
+        // work continues, and let the runtime shut down through the same
+        // `Drop` path any other mode uses.
+        info!("chaz daemon ready; waiting for shutdown signal");
+        wait_for_shutdown().await;
+        info!("Shutdown signal received; stopping");
+        Ok(())
+    } else if let Some(a) = cmd_args {
+        let bridge = bridge::cmd::CommandBridge::new(config, secret_store, a.command, a.session);
+        bridge.run(server).await
+    } else if args.print {
         // One-shot: no background bridges, no shutdown plumbing needed.
         let prompt = args.prompt.clone().expect("--print requires PROMPT");
         let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
@@ -269,6 +348,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Block until the process is asked to stop. Ctrl-C covers foreground and
+/// container use; SIGTERM is what systemd and a test harness's teardown send,
+/// and without it a stop degrades into the kill that follows the timeout.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to install SIGTERM handler, Ctrl-C only: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// `chaz usage` — open the eidetica DB read-only, walk the user-central
