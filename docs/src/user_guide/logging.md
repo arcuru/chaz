@@ -10,12 +10,15 @@ The sink depends on the bridge mode, because the TUI and print modes need to kee
 | ------------------ | -------------------------------------------------------- |
 | TUI (default)      | `<state_dir>/chaz-tui.log` (daily-rotated, keeps 7 days) |
 | `-p` / `--print`   | `<state_dir>/chaz-cli.log` (daily-rotated, keeps 7 days) |
-| `--no-tui`         | stdout (collected by systemd / docker / your supervisor) |
+| `cmd`              | `<state_dir>/chaz-cmd.log` (daily-rotated, keeps 7 days) |
+| `daemon`           | stdout (collected by systemd / docker / your supervisor) |
 | `chaz usage` (CLI) | stderr (stdout is the rollup output)                     |
 
-Background bridges (today: Matrix when configured alongside the TUI) log
-to the same destination as the foreground TUI — the TUI grabs stdout, so
-everything in-process goes to the rotated file.
+Every mode that reserves stdout for its own output — the TUI's screen, a
+`-p` reply, a `cmd` result — logs to the rotated file instead. `daemon`
+reserves nothing, so it logs to stdout.
+
+Transport bridges are separate processes and log on their own stderr.
 
 `state_dir` comes from `state_dir:` in the config or the platform XDG state dir (typically `~/.local/state/chaz`). The startup banner prints the exact log path for the TUI/print cases. Tail with `tail -f <state_dir>/chaz-tui.log`.
 
@@ -85,25 +88,25 @@ Verbose output useful for development and troubleshooting:
 
 ## Redirecting to a File
 
-For `--no-tui` (logs default to stdout), redirect to capture them:
+For `daemon` (logs default to stdout), redirect to capture them:
 
 ```bash
 # Background with log file
-RUST_LOG=info nohup chaz --config config.yaml --no-tui > chaz.log 2>&1 &
+RUST_LOG=info nohup chaz --config config.yaml daemon > chaz.log 2>&1 &
 
 # Follow logs
 tail -f chaz.log
 ```
 
-TUI and `-p` / `--print` modes already log to a daily-rotated file in `state_dir` (see above) — no redirect needed. To follow live, tail that file in another terminal.
+TUI, `-p` / `--print`, and `cmd` modes already log to a daily-rotated file in `state_dir` (see above) — no redirect needed. To follow live, tail that file in another terminal.
 
 ## Security Audit Trail
 
 For security auditing, `warn` level captures all enforcement actions. The exact pipeline depends on where the logs land for your bridge:
 
 ```bash
-# Headless mode (`--no-tui`) — logs are on stdout/stderr, filter live
-RUST_LOG=chaz_core::security=info,chaz_core::runtime=warn chaz --config config.yaml --no-tui 2>&1 | \
+# Daemon mode — logs are on stdout/stderr, filter live
+RUST_LOG=chaz_core::security=info,chaz_core::runtime=warn chaz --config config.yaml daemon 2>&1 | \
   grep -E "WARN|denied|blocked|SSRF|leak|Approval"
 
 # TUI / CLI mode — logs are in a rolling file, tail and filter
