@@ -6,10 +6,7 @@
 //!
 //! - `system` is a top-level field, not a `role: "system"` message.
 //! - Tool parameters live under `input_schema`, not `parameters`.
-//! - Tool names are stricter than OpenAI's, so chaz's `__`-separated MCP names
-//!   (`mcp__server__tool`) are sanitized to `-` on the way out and restored on
-//!   the way back via a per-request translation map (see [`sanitize_tool_name`]
-//!   and the `name_map` in [`Anthropic::chat_with_tools_impl`]).
+//! - MCP tool names with `__` separator are sent verbatim (Anthropic accepts them).
 //! - The response is a `content` block array (text + tool_use), not flat
 //!   `tool_calls`.
 //! - Prompt-cache breakpoints are first-class `cache_control` fields on
@@ -18,8 +15,6 @@
 //!
 //! Uses raw `reqwest` (no SDK) — the same transport `openai.rs` uses for its
 //! `/models` fetch — since there is no official Anthropic Rust SDK.
-
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -254,10 +249,7 @@ impl Anthropic {
         let api_key = self.api_key()?;
         let client = self.http_client()?;
 
-        // MCP name translation is a per-request wire-boundary concern: sanitize
-        // going out, restore on the response via `name_map` (sanitized → orig).
-        let mut name_map: HashMap<String, String> = HashMap::new();
-        let mut req_tools = convert_tool_definitions(tools, &mut name_map);
+        let mut req_tools = convert_tool_definitions(tools);
         let (mut system, mut req_messages) = convert_runtime_messages(messages);
         apply_cache_control(&mut system, &mut req_messages, &mut req_tools);
 
@@ -312,9 +304,7 @@ impl Anthropic {
                 RespBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ToolCallRequest {
                         id,
-                        // Restore chaz's original (unsanitized) tool name so the
-                        // runtime can dispatch it.
-                        name: name_map.get(&name).cloned().unwrap_or(name),
+                        name,
                         arguments: input.to_string(),
                     });
                 }
@@ -509,14 +499,6 @@ fn map_reqwest_err(e: reqwest::Error) -> LlmError {
     }
 }
 
-/// Sanitize a tool name for Anthropic's stricter grammar: chaz's `__` MCP
-/// separator (`mcp__server__tool`) is collapsed to `-`. Deterministic, so the
-/// same name always maps to the same wire name across turns — which is what
-/// keeps assistant-history `tool_use` names matching the `tools` array.
-fn sanitize_tool_name(name: &str) -> String {
-    name.replace("__", "-")
-}
-
 /// Append `blocks` to `turns`, coalescing into the last turn when it shares
 /// `role`. Anthropic wants all consecutive same-role content (e.g. several
 /// tool_result blocks after one assistant turn) in a single message.
@@ -572,7 +554,7 @@ fn convert_runtime_messages(
                 for tc in tool_calls {
                     blocks.push(ReqBlock::ToolUse {
                         id: tc.id.clone(),
-                        name: sanitize_tool_name(&tc.name),
+                        name: tc.name.clone(),
                         // coding: arguments should be valid JSON from the model;
                         // fall back to an empty object rather than 400 the turn.
                         input: serde_json::from_str(&tc.arguments)
@@ -607,23 +589,15 @@ fn convert_runtime_messages(
     (system, turns)
 }
 
-/// Convert ToolDefinitions to Anthropic's tool shape, recording each
-/// sanitized→original name mapping for response-time restoration.
-fn convert_tool_definitions(
-    tools: &[ToolDefinition],
-    name_map: &mut HashMap<String, String>,
-) -> Vec<ReqTool> {
+/// Convert ToolDefinitions to Anthropic's tool shape.
+fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<ReqTool> {
     tools
         .iter()
-        .map(|td| {
-            let wire_name = sanitize_tool_name(&td.name);
-            name_map.insert(wire_name.clone(), td.name.clone());
-            ReqTool {
-                name: wire_name,
-                description: td.description.clone(),
-                input_schema: td.parameters.clone(),
-                cache_control: None,
-            }
+        .map(|td| ReqTool {
+            name: td.name.clone(),
+            description: td.description.clone(),
+            input_schema: td.parameters.clone(),
+            cache_control: None,
         })
         .collect()
 }
@@ -711,29 +685,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_collapses_mcp_separator() {
-        assert_eq!(sanitize_tool_name("mcp__server__tool"), "mcp-server-tool");
-        // Single underscores (valid ordinary tool names) are left alone.
-        assert_eq!(sanitize_tool_name("web_search"), "web_search");
+    fn convert_tool_definitions_passes_mcp_names_verbatim() {
+        let defs = vec![ToolDefinition {
+            name: "mcp__server__tool".into(),
+            description: "test tool".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            strict: false,
+        }];
+        let wire = convert_tool_definitions(&defs);
+        assert_eq!(wire[0].name, "mcp__server__tool");
     }
 
     #[test]
-    fn tool_conversion_records_reverse_name_map() {
+    fn convert_tool_definitions_preserves_input_schema() {
         let defs = vec![ToolDefinition {
             name: "mcp__fs__read".into(),
             description: "read".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
             strict: false,
         }];
-        let mut map = HashMap::new();
-        let wire = convert_tool_definitions(&defs, &mut map);
-        assert_eq!(wire[0].name, "mcp-fs-read");
-        // input_schema carries the parameters (Anthropic's key, not `parameters`).
+        let wire = convert_tool_definitions(&defs);
+        assert_eq!(wire[0].name, "mcp__fs__read");
         assert_eq!(wire[0].input_schema, defs[0].parameters);
-        assert_eq!(
-            map.get("mcp-fs-read").map(String::as_str),
-            Some("mcp__fs__read")
-        );
     }
 
     #[test]
@@ -780,9 +753,9 @@ mod tests {
         assert_eq!(turns[2].role, "user");
         assert_eq!(turns[2].content.len(), 2, "tool results coalesced");
 
-        // tool_use names are sanitized on the wire.
+        // tool_use names are passed through verbatim.
         let v = serde_json::to_value(&turns[1]).unwrap();
-        assert_eq!(v["content"][0]["name"], "mcp-fs-read");
+        assert_eq!(v["content"][0]["name"], "mcp__fs__read");
         assert_eq!(v["content"][0]["input"]["path"], "x");
     }
 
@@ -812,24 +785,20 @@ mod tests {
             RuntimeMessage::Assistant("reply".into()),
             RuntimeMessage::User("latest".into()),
         ]);
-        let mut map = HashMap::new();
-        let mut tools = convert_tool_definitions(
-            &[
-                ToolDefinition {
-                    name: "a".into(),
-                    description: String::new(),
-                    parameters: Value::Null,
-                    strict: false,
-                },
-                ToolDefinition {
-                    name: "b".into(),
-                    description: String::new(),
-                    parameters: Value::Null,
-                    strict: false,
-                },
-            ],
-            &mut map,
-        );
+        let mut tools = convert_tool_definitions(&[
+            ToolDefinition {
+                name: "a".into(),
+                description: String::new(),
+                parameters: Value::Null,
+                strict: false,
+            },
+            ToolDefinition {
+                name: "b".into(),
+                description: String::new(),
+                parameters: Value::Null,
+                strict: false,
+            },
+        ]);
         apply_cache_control(&mut system, &mut messages, &mut tools);
 
         // Only the last tool is marked.
