@@ -39,6 +39,7 @@ use chrono::{DateTime, Utc};
 use eidetica::Database;
 use eidetica::store::{DocStore, Table};
 use futures::FutureExt;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -1420,7 +1421,19 @@ impl ExtensionHub {
     ///    here, not instantiated.
     ///
     /// Idempotent across calls: an extension already present in
-    /// `global_instances` is skipped.
+    /// `global_instances` is skipped. Deduplicated within a call too —
+    /// if two extensions in `extensions` share a manifest name, only
+    /// the first is instantiated, so a name maps to exactly one Global
+    /// instance and one set of drained hooks.
+    ///
+    /// Fail-open on instantiation: a Global `instantiate` that returns
+    /// `Err` is logged at warn level and skipped, and `install_all`
+    /// still returns `Ok(())` — one broken extension must not stop the
+    /// rest of the peer from booting. Callers get no programmatic
+    /// signal of a partial failure; the warning log is the surface.
+    /// The extension stays registered and, if it also declares a
+    /// non-Global scope, still instantiates at that scope's lifecycle
+    /// event.
     ///
     /// Without `peer_handles` set, the Global instantiation phase is a
     /// no-op (extensions are recorded but their tools/commands/hooks
@@ -1440,18 +1453,54 @@ impl ExtensionHub {
             return Ok(());
         };
 
-        for ext in extensions.iter() {
-            if !ext.scopes().contains(&instance::Scope::Global) {
-                continue;
+        // Collect Global-scope extensions that need instantiation:
+        // not already in the cache from an earlier call, and only the
+        // first occurrence of any name within this call. Run all
+        // instantiations concurrently so N MCP servers start in
+        // parallel — turns sum(servers) into max(server).
+        let mut seen: HashSet<String> = HashSet::new();
+        let to_instantiate: Vec<(String, Arc<dyn Extension>)> = extensions
+            .iter()
+            .filter_map(|ext| {
+                if !ext.scopes().contains(&instance::Scope::Global) {
+                    return None;
+                }
+                let name = ext.manifest().name;
+                if self.global_instances.contains_key(&name) || !seen.insert(name.clone()) {
+                    return None;
+                }
+                Some((name, ext.clone()))
+            })
+            .collect();
+
+        let futures: Vec<_> = to_instantiate
+            .into_iter()
+            .map(|(name, ext)| {
+                let peer = peer.clone();
+                async move {
+                    let scope_ctx = instance::ScopeCtx::Global { peer: &peer };
+                    let inst = ext.instantiate(scope_ctx).await;
+                    (name, inst)
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        for (name, result) in results {
+            match result {
+                Ok(inst) => {
+                    self.drain_global_instance(&name, &inst);
+                    self.global_instances.insert(name, inst);
+                }
+                Err(e) => {
+                    warn!(
+                        extension = %name,
+                        error = %e,
+                        "Global instantiation failed; extension contributes no global tools/commands/hooks"
+                    );
+                }
             }
-            let m = ext.manifest();
-            if self.global_instances.contains_key(&m.name) {
-                continue;
-            }
-            let scope_ctx = instance::ScopeCtx::Global { peer: &peer };
-            let inst = ext.instantiate(scope_ctx).await?;
-            self.drain_global_instance(&m.name, &inst);
-            self.global_instances.insert(m.name.clone(), inst);
         }
 
         Ok(())
