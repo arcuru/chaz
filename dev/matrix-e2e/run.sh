@@ -44,11 +44,19 @@ while [[ $# -gt 0 ]]; do
 	--keep) KEEP=1 ;;
 	--verbose) VERBOSE=1 ;;
 	--timeout)
+		[[ $# -ge 2 ]] || {
+			echo "--timeout requires a value" >&2
+			exit 2
+		}
 		REPLY_TIMEOUT="$2"
 		shift
 		;;
 	--transport)
-		TRANSPORT="${2:-http}"
+		[[ $# -ge 2 ]] || {
+			echo "--transport requires a value (http or iroh)" >&2
+			exit 2
+		}
+		TRANSPORT="$2"
 		if [[ $TRANSPORT != "http" && $TRANSPORT != "iroh" ]]; then
 			echo "invalid transport: $TRANSPORT (must be http or iroh)" >&2
 			exit 2
@@ -145,7 +153,12 @@ spawn() {
 	SPAWNED_PID=$!
 	PIDS+=("$SPAWNED_PID")
 	if [[ $VERBOSE -eq 1 ]]; then
-		tail -f "$WORKSPACE/$name.log" | sed "s/^/[$name] /" >&2 &
+		# Feed the prefixer through a process substitution rather than a
+		# pipeline: for a pipeline `$!` names the last command, so cleanup
+		# would kill the prefixer and leave `tail -f` alive, still holding
+		# this step's stderr. A CI step does not finish while a background
+		# process holds its output pipe.
+		tail -f "$WORKSPACE/$name.log" > >(sed "s/^/[$name] /" >&2) 2>/dev/null &
 		PIDS+=($!)
 	fi
 }

@@ -7,6 +7,9 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   ci:
     name: CI
@@ -39,3 +42,54 @@ jobs:
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.build'
+
+  # The Matrix bridge end-to-end test. Separate from the checks above because it
+  # pulls Synapse into the closure and stands up four processes, neither of which
+  # the fast checks should wait on. Needs no secrets — the homeserver, the
+  # accounts, and the model are all throwaway and local to the runner.
+  e2e:
+    name: Matrix E2E
+    runs-on: ubicloud-standard-8
+    # Fenced to the upstream repository, whose runner label this is: a fork
+    # running its own copy of this workflow would queue forever rather than
+    # fail. A pull request from a fork still schedules the job, because the
+    # check reads the owner of the base repository — which is fine, since
+    # `pull_request` hands fork code a read-only token and this job reads no
+    # secret.
+    if: github.repository_owner == 'arcuru'
+    # The two steps below budget 30 minutes between them. The rest is headroom
+    # for the checkout, the nix installer, and pulling the Synapse closure.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+
+      # Debug binaries, matching what `just e2e` builds locally. Split from the
+      # harness step so a slow cold compile does not eat the harness budget.
+      - name: Build binaries
+        run: |
+          nix develop .# --command cargo build --bin chaz --bin chaz-matrix
+        timeout-minutes: 20
+
+      # Every wait inside run.sh is bounded, so a passing run finishes in about a
+      # minute. This ceiling is the backstop for a Synapse that comes up wedged
+      # and never satisfies any of them. `--verbose` streams the component logs
+      # into the job output, because the harness deletes its workspace on exit
+      # and there is nothing to collect afterwards.
+      # Exit 2 means the harness never got far enough to test anything — a
+      # missing binary, a tool absent from the shell, a homeserver that would
+      # not start. That is a different problem from a failing assertion, and
+      # the job UI shows both as a red X, so say which one it was.
+      - name: Matrix E2E
+        run: |
+          set +e
+          nix develop .#e2e --command dev/matrix-e2e/run.sh --verbose
+          rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::harness could not start (exit 2) — see the log above"
+          fi
+          exit "$rc"
+        timeout-minutes: 10

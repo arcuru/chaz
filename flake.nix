@@ -342,6 +342,12 @@
             matrix-synapse
             (python3.withPackages (ps: [ps.pyyaml]))
           ];
+
+          # The chaz binaries are dynamically linked against openssl with no
+          # RUNPATH. Locally this shell is entered from inside the default one,
+          # which supplies the path; CI enters the two as siblings, and without
+          # this the loader falls back to whatever the host happens to have.
+          LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
         };
       };
     };
