@@ -4,9 +4,10 @@ Stands up a throwaway Matrix homeserver, drives a real conversation through the
 bridge, and asserts the reply comes back out of the room.
 
 ```bash
-just e2e                 # from inside `nix develop`
-just e2e --keep          # leave the workspace behind to poke at
-just e2e --verbose       # stream component logs while it runs
+just e2e                        # from inside `nix develop`
+just e2e --keep                 # leave the workspace behind to poke at
+just e2e --verbose              # stream component logs while it runs
+just e2e -- --transport iroh    # exercise P2P transport path
 ```
 
 Exit status is the result: `0` passed, `1` failed, `2` the harness could not
@@ -60,6 +61,29 @@ failures:
 - **A login belongs to exactly one agent.** There is no shared-login gateway,
   so a second agent in a test needs its own Matrix account.
 
+## Transport
+
+The harness supports two transport modes for eidetica sync between the daemon
+and bridge peers.
+
+| Flag               | Behavior                                                                                                                                                                                                                                                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--transport http` | **Default.** Both peers listen on loopback HTTP. The daemon's `sync_listen` is set and iroh hints are stripped from the ticket. Fast, reliable, good for CI iteration.                                                                                                                                                     |
+| `--transport iroh` | Neither peer binds a sync port. They discover each other through iroh's DHT/relay mechanism instead. Expected to be slower and less reliable — that's the point, it exercises the production transport path that unit tests and the default http mode can't reach. If it doesn't reliably connect, that's actionable data. |
+
+`--transport iroh` is the one mode that is **not hermetic**: iroh discovery
+reaches n0's public relay and DHT infrastructure, so the run needs the internet
+and can fail for reasons outside this repository. Everything else — the
+homeserver, the accounts, the model — stays on loopback in both modes, and CI
+runs http only.
+
+Pass transport flags after `--` so `just` forwards them to the script rather
+than consuming them:
+
+```bash
+just e2e -- --transport iroh
+```
+
 ## What it stands up
 
 | Process       | Role                                                          |
@@ -96,7 +120,8 @@ sequence exists to protect.
   cannot read. The puppet is plain HTTP against the client-server API for the
   same reason — no Olm, no client library, nothing to keep in sync with the
   bridge's capabilities.
-- **The ticket's `iroh:` hints are stripped.** The daemon mints a fresh iroh
+- **The ticket's `iroh:` hints are stripped** (in `--transport http` mode only;
+  `--transport iroh` keeps them). The daemon mints a fresh iroh
   endpoint on every start, so a recorded address is stale as soon as it is
   written, and sync pays a full timeout per dead address. Both processes are on
   loopback, where the `http:` hint is what connects.

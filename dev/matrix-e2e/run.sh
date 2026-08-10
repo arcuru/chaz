@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #
-# End-to-end test for the Matrix bridge, with nothing outside this machine
-# involved.
+# End-to-end test for the Matrix bridge.
+#
+# In the default `--transport http` mode nothing outside this machine is
+# involved. `--transport iroh` is the exception: iroh discovery reaches n0's
+# public relay and DHT infrastructure, so that mode needs the internet and can
+# fail for reasons that have nothing to do with chaz. CI runs http only.
 #
 # The test stands up a throwaway Synapse, registers two accounts on it, brings
 # up a chaz daemon and a chaz-matrix bridge against a stub LLM, then sends a
@@ -16,10 +20,13 @@
 #
 # Usage:
 #   dev/matrix-e2e/run.sh [--keep] [--timeout SECONDS] [--verbose]
+#                         [--transport http|iroh]
 #
 #   --keep      leave the workspace in place and print its path
 #   --timeout   seconds to wait for the reply (default 120)
 #   --verbose   stream component logs to stderr as they are written
+#   --transport eidetica sync transport between the two peers (default http).
+#               `iroh` reaches public relay infrastructure — see above.
 #
 # Requires `synapse_homeserver`, `register_new_matrix_user`, `curl`, `jq`, and
 # `python3` on PATH — `just e2e` supplies them. Binaries default to
@@ -30,12 +37,22 @@ set -euo pipefail
 KEEP=0
 VERBOSE=0
 REPLY_TIMEOUT=120
+TRANSPORT="http"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+	--) ;; # `just` passes -- to separate its flags from ours; fall through to outer shift
 	--keep) KEEP=1 ;;
 	--verbose) VERBOSE=1 ;;
 	--timeout)
 		REPLY_TIMEOUT="$2"
+		shift
+		;;
+	--transport)
+		TRANSPORT="${2:-http}"
+		if [[ $TRANSPORT != "http" && $TRANSPORT != "iroh" ]]; then
+			echo "invalid transport: $TRANSPORT (must be http or iroh)" >&2
+			exit 2
+		fi
 		shift
 		;;
 	*)
@@ -153,6 +170,15 @@ mkdir -p "$XDG_CONFIG_HOME"
 
 log "workspace: $WORKSPACE"
 log "synapse :$SYNAPSE_PORT  stub-llm :$STUB_PORT  daemon-sync :$DAEMON_SYNC_PORT  bridge-sync :$BRIDGE_SYNC_PORT"
+log "transport: $TRANSPORT"
+
+if [[ $TRANSPORT == "http" ]]; then
+	SYNC_LISTEN_DAEMON="sync_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
+	SYNC_LISTEN_BRIDGE="sync_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
+else
+	SYNC_LISTEN_DAEMON=""
+	SYNC_LISTEN_BRIDGE=""
+fi
 
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
@@ -263,7 +289,7 @@ BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
 
 cat >"$DAEMON_CONFIG" <<EOF
 state_dir: "$WORKSPACE/state-daemon"
-sync_listen: "127.0.0.1:$DAEMON_SYNC_PORT"
+$SYNC_LISTEN_DAEMON
 
 backends:
   - name: stub
@@ -291,7 +317,7 @@ cat >"$BRIDGE_CONFIG" <<EOF
 unlock_password: e2e-bridge-unlock
 label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
-sync_listen: "127.0.0.1:$BRIDGE_SYNC_PORT"
+$SYNC_LISTEN_BRIDGE
 logins: []
 agents:
   - name: chaz
@@ -310,24 +336,45 @@ TICKET="$("$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WOR
 	grep -o 'eidetica:[^[:space:]]*' | head -1)"
 [[ -n $TICKET ]] || fail "/agent share produced no ticket (see $WORKSPACE/bringup.log)"
 
-# Drop iroh hints: the daemon mints a fresh endpoint every start, so a recorded
-# one is already stale, and sync pays a full timeout per dead address. Both
-# processes are on loopback, where the http hint is what connects.
-#
-# Cut each hint at the next separator rather than with a shell glob. Globs are
-# greedy, so `&pr=iroh:*` deletes everything after the first iroh hint —
-# including the http hint, whenever the daemon happens to order iroh first.
-TICKET="$(printf '%s' "$TICKET" | sed 's/&pr=iroh:[^&]*//g')"
-case "$TICKET" in
-*"pr=http:"*) ;;
-*) fail "ticket carries no loopback address hint: $TICKET" ;;
-esac
+if [[ $TRANSPORT == "http" ]]; then
+	# Drop iroh hints: the daemon mints a fresh endpoint every start, so a recorded
+	# one is already stale, and sync pays a full timeout per dead address. Both
+	# processes are on loopback, where the http hint is what connects.
+	#
+	# Cut each hint at the next separator rather than with a shell glob. Globs are
+	# greedy, so `&pr=iroh:*` deletes everything after the first iroh hint —
+	# including the http hint, whenever the daemon happens to order iroh first.
+	#
+	# Three expressions because the hint's separator depends on its position: a
+	# hint in first query position is introduced by `?`, and the `?` has to
+	# survive if another hint follows it.
+	TICKET="$(printf '%s' "$TICKET" |
+		sed -e 's/&pr=iroh:[^&]*//g' \
+			-e 's/?pr=iroh:[^&]*&/?/' \
+			-e 's/?pr=iroh:[^&]*$//')"
+	case "$TICKET" in
+	*"pr=http:"*) ;;
+	*) fail "ticket carries no loopback address hint: $TICKET" ;;
+	esac
+else
+	# Assert the run is actually on the P2P path. Today the daemon only binds
+	# an http sync listener when `sync_listen` is set, which this mode leaves
+	# empty — but a future default that reintroduces a bind would turn this
+	# mode back into the http mode under a different name, silently.
+	case "$TICKET" in
+	*"pr=iroh:"*) ;;
+	*) fail "ticket carries no iroh address hint: $TICKET" ;;
+	esac
+	case "$TICKET" in
+	*"pr=http:"*) fail "ticket carries an http address hint in iroh mode: $TICKET" ;;
+	esac
+fi
 
 cat >"$BRIDGE_CONFIG" <<EOF
 unlock_password: e2e-bridge-unlock
 label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
-sync_listen: "127.0.0.1:$BRIDGE_SYNC_PORT"
+$SYNC_LISTEN_BRIDGE
 
 logins:
   - agent: chaz
