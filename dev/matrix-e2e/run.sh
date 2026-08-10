@@ -150,6 +150,18 @@ spawn() {
 	fi
 }
 
+# Drop a pid that has already exited from the cleanup list. A restart case
+# leaves the old pid behind otherwise, and cleanup would send KILL to a number
+# the kernel is free to have handed to something else by then.
+retire_pid() {
+	local target="$1" i
+	for i in "${!PIDS[@]}"; do
+		if [[ ${PIDS[$i]} == "$target" ]]; then
+			unset 'PIDS[i]'
+		fi
+	done
+}
+
 SERVER_NAME="e2e.test"
 SYNAPSE_PORT="$(free_port)"
 STUB_PORT="$(free_port)"
@@ -398,9 +410,9 @@ wait_for "daemon" 90 grep -q "daemon ready" "$WORKSPACE/daemon.log"
 log "starting bridge"
 spawn bridge "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
 BRIDGE_PID="$SPAWNED_PID"
-wait_for "bridge matrix login" 120 grep -q "Matrix login spawned" "$WORKSPACE/bridge.log"
+wait_for "bridge matrix login" 120 grep -q "The client is ready" "$WORKSPACE/bridge.log"
 
-if grep -q "Pending" "$WORKSPACE/bridge.log"; then
+if grep -qi "pending owner approval" "$WORKSPACE/bridge.log"; then
 	fail "bridge is waiting on manual approval — pre-authorization did not take (see $WORKSPACE/bridge.log)"
 fi
 
@@ -445,11 +457,71 @@ mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.r
 
 log "waiting up to ${REPLY_TIMEOUT}s for the reply"
 reply_arrived() {
-	mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/messages?dir=b&limit=50" \
+	mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/messages?dir=b&limit=200" \
 		"$PUPPET_TOKEN" |
 		jq -e --arg a "$AGENT_MXID" --arg m "$MARKER" \
 			'[.chunk[] | select(.sender == $a) | select(.content.body // "" | contains($m))] | length > 0'
 }
+
+# Counting predicate for multi-turn tests. reply_arrived uses length > 0,
+# which is true the moment the first reply exists — every subsequent turn
+# would pass instantly without testing anything. Use this instead.
+replies_at_least() {
+	local n="$1"
+	mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/messages?dir=b&limit=200" \
+		"$PUPPET_TOKEN" |
+		jq -e --arg a "$AGENT_MXID" --arg m "$MARKER" --argjson n "$n" \
+			'[.chunk[] | select(.sender == $a) | select(.content.body // "" | contains($m))] | length >= $n'
+}
 wait_for "the agent's reply in the room" "$REPLY_TIMEOUT" reply_arrived
 
-printf '\033[1;32mPASS\033[0m — the reply crossed Matrix, sync, the agent, and came back\n' >&2
+printf '\033[1;32mPASS\033[0m — cold boot: the reply crossed Matrix, sync, the agent, and came back\n' >&2
+
+# --------------------------------------------------------- restart cases ---
+# Case A — restart the bridge mid-conversation
+log "Case A: sending second message"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc --arg b "second turn" '{msgtype:"m.text",body:$b}')" >/dev/null
+
+log "waiting for the second reply"
+wait_for "second reply" "$REPLY_TIMEOUT" replies_at_least 2
+
+log "restarting the bridge"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+
+spawn bridge-restarted "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+wait_for "bridge to come back online" 120 grep -q "The client is ready" "$WORKSPACE/bridge-restarted.log"
+
+if grep -qi "pending owner approval" "$WORKSPACE/bridge-restarted.log"; then
+	fail "bridge asked for re-approval after restart — key persistence regression"
+fi
+
+log "Case A: sending third message after bridge restart"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc --arg b "third turn after bridge restart" '{msgtype:"m.text",body:$b}')" >/dev/null
+
+wait_for "third reply" "$REPLY_TIMEOUT" replies_at_least 3
+
+# Case B — restart the daemon mid-conversation
+log "Case B: restarting the daemon"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon to exit" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+
+spawn daemon-restarted "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon to come back online" 120 grep -q "daemon ready" "$WORKSPACE/daemon-restarted.log"
+
+log "Case B: sending fourth message after daemon restart"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc --arg b "fourth turn after daemon restart" '{msgtype:"m.text",body:$b}')" >/dev/null
+
+wait_for "fourth reply" "$REPLY_TIMEOUT" replies_at_least 4
+
+printf '\033[1;32mPASS\033[0m — all restart cases passed (bridge + daemon)\n' >&2

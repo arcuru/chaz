@@ -61,6 +61,25 @@ failures:
 - **A login belongs to exactly one agent.** There is no shared-login gateway,
   so a second agent in a test needs its own Matrix account.
 
+### Restart and reconnection
+
+Two restart cases follow the cold-boot conversation to catch regressions in
+persistence and reconnection:
+
+- **Bridge restart (Case A):** The bridge is killed and restarted
+  mid-conversation. The bridge key persists on disk, so it must reconnect
+  without asking for re-authorization — a pending-approval line in the
+  restarted bridge log is a hard failure. A third message is sent through the
+  restarted bridge and the reply is asserted.
+- **Daemon restart (Case B):** The daemon is killed and restarted
+  mid-conversation. The daemon must come back online and resume answering
+  messages in the same room. A fourth message is sent and the reply is
+  asserted.
+
+Both cases use `replies_at_least <n>` rather than `reply_arrived`, because
+`reply_arrived` checks `length > 0` and would pass instantly on the first
+reply without testing the restart.
+
 ## Transport
 
 The harness supports two transport modes for eidetica sync between the daemon
@@ -140,6 +159,7 @@ existing conversation happens. Four helpers carry most of the weight.
 | --------------------------------- | ------------------------------------------------------------------------ |
 | `spawn <name> <cmd...>`           | Start a process, log to `$WORKSPACE/<name>.log`, register it for cleanup |
 | `wait_for <what> <secs> <cmd>`    | Poll until `cmd` succeeds, or fail naming `<what>`                       |
+| `replies_at_least <n>`            | Assert at least `n` replies with the stub marker (multi-turn); see below |
 | `fail <message>`                  | Abort with a red message and exit 1                                      |
 | `mx <METHOD> <path> [tok] [body]` | One client-server API call against the throwaway homeserver              |
 
