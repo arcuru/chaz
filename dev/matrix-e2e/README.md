@@ -13,6 +13,10 @@ just e2e -- --transport iroh    # exercise P2P transport path
 Exit status is the result: `0` passed, `1` failed, `2` the harness could not
 start.
 
+CI runs the default `http` transport as the `Matrix E2E` job in
+`.github/workflows/ci.yml`, separate from the fast checks because it pulls
+Synapse into the closure. It needs no secrets.
+
 ## What it covers
 
 A message enters over Matrix, crosses into a session database, syncs to the
@@ -137,6 +141,10 @@ the bridge must refuse. Passwords are generated per run. Everything lives in
 one `mktemp -d` workspace and is removed on exit, including after a failure or
 a Ctrl-C.
 
+In the default `http` transport nothing here reaches off the machine. Under
+`--transport iroh` the two peers find each other through public relay
+infrastructure, so that mode alone needs the internet.
+
 ## Bring-up without a human
 
 The bridge normally needs its access request approved by hand. The harness
@@ -229,9 +237,12 @@ source of truth, so changing the YAML for an already-populated `state_dir`
 changes nothing. Test workspaces are fresh every run, so this only bites when
 reusing a `--keep` workspace.
 
-**A tool call** needs the stub to return a `tool_calls` response rather than a
-plain message; `stub_llm.py` currently answers every request identically and
-would need to branch on the request body to drive a ReAct loop.
+**A tool call** is driven by the message body. `stub_llm.py` answers with a
+`tool_calls` response when a user message asks for one, and with the
+fixed reply otherwise, so the ReAct case owns its own turn and every other turn
+stays on the plain path. Branch on content, never on a request counter — a
+counter attaches the special response to whichever turn arrives first, which is
+the cold-boot turn.
 
 **A case that asserts silence** needs a barrier, not a wait. Send the message
 that must be ignored, then one that must be answered, wait for the second

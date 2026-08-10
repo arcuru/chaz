@@ -707,3 +707,27 @@ group_said_count_is "$BACKENDS_MARKER" 1 \
 	"bridge answered a sender outside allow_list"
 
 printf '\033[1;32mPASS\033[0m — group room cases passed (bare ignored, !chaz prefix, @-mention, allow_list rejection)\n' >&2
+
+# -------------------------------------------------------- ReAct case ---
+# The stub answers a request whose user messages ask for a tool call with a
+# tool_calls response, and returns text only once a follow-up request carries
+# the result. If chaz's ReAct loop is broken — it doesn't process tool calls,
+# doesn't send results back, or hits an iteration limit — the stub never
+# returns the MARKER and this case times out.
+#
+# The trigger is the message body, not a request counter: a counter would hand
+# the tool call to the first turn of the run, which is the cold-boot case, and
+# leave this assertion matching a log line written before this case ran.
+
+log "ReAct case: sending message to trigger tool-call cycle"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"react test"}')" >/dev/null
+
+wait_for "fifth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 5
+
+if ! grep -q "detected tool result" "$WORKSPACE/stub-llm.log"; then
+	fail "ReAct loop did not complete: stub never received a tool result in a follow-up request"
+fi
+
+printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
