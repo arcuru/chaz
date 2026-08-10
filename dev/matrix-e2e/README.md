@@ -80,6 +80,24 @@ Both cases use `replies_at_least <n>` rather than `reply_arrived`, because
 `reply_arrived` checks `length > 0` and would pass instantly on the first
 reply without testing the restart.
 
+### Group rooms and allow_list
+
+A third room holds the cases about who the bridge answers, with the puppet, the
+stranger, and the agent all joined:
+
+- **Bare message (Case 1a):** unaddressed text in a group room must not become
+  a turn. Asserted on the line the bridge writes when it drops a message for
+  not being addressed to it, then on the stub's request count: the first says
+  the bridge made the decision, the second says no turn ran anyway. The bridge
+  runs with `chaz_matrix_bridge=debug` so that line is in its log.
+- **@-mention (Case 2):** the same text with the agent mentioned must be
+  answered.
+- **`!chaz` prefix (Case 1b):** the command channel is answered without a
+  mention.
+- **allow_list (Case 3):** the stranger sends `!chaz`, which clears the
+  addressing gate, so `allow_list` is the only thing left that can produce
+  silence. A bare message here would prove nothing Case 1a does not.
+
 ## Transport
 
 The harness supports two transport modes for eidetica sync between the daemon
@@ -113,10 +131,11 @@ just e2e -- --transport iroh
 | `chaz-matrix` | The bridge, logged in as `@agent:e2e.test`                    |
 | puppet        | `curl` against the client-server API, standing in for a human |
 
-Two accounts are registered per run — `@agent:e2e.test` for the bridge and
-`@puppet:e2e.test` for the human side. Passwords are generated per run.
-Everything lives in one `mktemp -d` workspace and is removed on exit, including
-after a failure or a Ctrl-C.
+Three accounts are registered per run — `@agent:e2e.test` for the bridge,
+`@puppet:e2e.test` for the human side, and `@stranger:e2e.test` for a sender
+the bridge must refuse. Passwords are generated per run. Everything lives in
+one `mktemp -d` workspace and is removed on exit, including after a failure or
+a Ctrl-C.
 
 ## Bring-up without a human
 
@@ -167,6 +186,10 @@ Assert on an observable, never on a sleep. Every wait is bounded, because a
 harness that hangs is worse than one that fails — CI will sit on it until the
 job timeout, and locally it looks like a wedge rather than a bug.
 
+Prefer an observable the component writes down itself over one inferred from
+what did not happen. A case that asserts nothing happened passes on a system
+that is merely slow, and passes just as well on one where the feature is gone.
+
 **A second turn in the same room**, to cover context rather than first contact:
 
 ```bash
@@ -209,6 +232,25 @@ reusing a `--keep` workspace.
 **A tool call** needs the stub to return a `tool_calls` response rather than a
 plain message; `stub_llm.py` currently answers every request identically and
 would need to branch on the request body to drive a ReAct loop.
+
+**A case that asserts silence** needs a barrier, not a wait. Send the message
+that must be ignored, then one that must be answered, wait for the second
+answer, and only then assert the first produced nothing. A fixed window asserts
+only that the bridge is slower than the window, and it costs that window on
+every green run.
+
+The barrier's answer has to be distinguishable from the forbidden one, or the
+assertion fires on whichever landed first and passes for the wrong reason.
+Every model reply carries the same fixed string, so two model replies cannot be
+told apart in the room. For the model path, wait on `stub-llm.log` — it logs
+one `request:` line per turn with the user messages that turn was given — and
+assert on how many turns ran. For the `!chaz` path, pick two commands whose
+replies differ.
+
+`stub-llm.log` also answers a question the room cannot: whether a message
+became a turn at all. The bridge backfills room history into the session, so an
+ignored message still appears in a later turn's context; the count of `request:`
+lines is what distinguishes context from a turn.
 
 ### Keep the stub boring
 

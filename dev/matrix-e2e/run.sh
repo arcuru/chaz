@@ -176,6 +176,7 @@ PROMPT="ping from the puppet"
 # worth not forming.
 AGENT_PASSWORD="$(head -c 18 /dev/urandom | base64)"
 PUPPET_PASSWORD="$(head -c 18 /dev/urandom | base64)"
+STRANGER_PASSWORD="$(head -c 18 /dev/urandom | base64)"
 
 export XDG_CONFIG_HOME="$WORKSPACE/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
@@ -282,7 +283,7 @@ spawn synapse synapse_homeserver --config-path "$SYNAPSE_DIR/homeserver.yaml"
 wait_for "synapse" 120 curl -sf "$HOMESERVER/_matrix/client/versions"
 
 log "registering accounts"
-for pair in "agent:$AGENT_PASSWORD" "puppet:$PUPPET_PASSWORD"; do
+for pair in "agent:$AGENT_PASSWORD" "puppet:$PUPPET_PASSWORD" "stranger:$STRANGER_PASSWORD"; do
 	user="${pair%%:*}"
 	pass="${pair#*:}"
 	register_new_matrix_user \
@@ -294,6 +295,7 @@ done
 
 AGENT_MXID="@agent:$SERVER_NAME"
 PUPPET_MXID="@puppet:$SERVER_NAME"
+STRANGER_MXID="@stranger:$SERVER_NAME"
 
 # ------------------------------------------------------------ chaz configs ---
 DAEMON_CONFIG="$WORKSPACE/daemon.yaml"
@@ -407,8 +409,19 @@ spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
 DAEMON_PID="$SPAWNED_PID"
 wait_for "daemon" 90 grep -q "daemon ready" "$WORKSPACE/daemon.log"
 
+# The bridge's own crate runs at debug so its message-routing decisions are
+# visible; everything else stays at info. A case about a message that must be
+# ignored asserts on the line the bridge writes when it drops one, which is the
+# only direct evidence that the drop happened — and the rest of the tree at
+# debug would bury it under matrix-sdk's sync traffic.
+BRIDGE_RUST_LOG="info,chaz_matrix_bridge=debug"
+
+# Which log file the live bridge is writing to. The restart case respawns it
+# under a second name, and the group-room cases run after that.
+BRIDGE_LOG="$WORKSPACE/bridge.log"
+
 log "starting bridge"
-spawn bridge "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+spawn bridge env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
 BRIDGE_PID="$SPAWNED_PID"
 wait_for "bridge matrix login" 120 grep -q "The client is ready" "$WORKSPACE/bridge.log"
 
@@ -492,9 +505,10 @@ kill -TERM "$BRIDGE_PID"
 wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
 retire_pid "$BRIDGE_PID"
 
-spawn bridge-restarted "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+spawn bridge-restarted env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
 BRIDGE_PID="$SPAWNED_PID"
-wait_for "bridge to come back online" 120 grep -q "The client is ready" "$WORKSPACE/bridge-restarted.log"
+BRIDGE_LOG="$WORKSPACE/bridge-restarted.log"
+wait_for "bridge to come back online" 120 grep -q "The client is ready" "$BRIDGE_LOG"
 
 if grep -qi "pending owner approval" "$WORKSPACE/bridge-restarted.log"; then
 	fail "bridge asked for re-approval after restart — key persistence regression"
@@ -525,3 +539,171 @@ mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.r
 wait_for "fourth reply" "$REPLY_TIMEOUT" replies_at_least 4
 
 printf '\033[1;32mPASS\033[0m — all restart cases passed (bridge + daemon)\n' >&2
+
+# -------------------------------------------------------- group-room cases ---
+# Case 1a — a bare message in a group room is ignored
+# Case 2  — an @-mention in a group room is answered
+# Case 1b — the `!chaz` prefix is answered without a mention
+# Case 3  — a sender outside allow_list is ignored even with the `!chaz` prefix
+#
+# Each "must be ignored" case is asserted with a barrier rather than a fixed
+# wait: send the message that must not be answered, then one that must be, and
+# wait for the second to be answered before requiring the first produced
+# nothing. Both travel the same path in that order, so the second answer is
+# proof the first had its chance. A fixed window instead asserts only that the
+# bridge is slower than the window.
+#
+# The barrier's answer has to be distinguishable from the forbidden one, or the
+# assertion fires on whichever landed first and passes for the wrong reason. So
+# each pair is asserted on a different observable: the stub's request log for
+# the model path, and two different command replies for the `!chaz` path.
+
+log "group room: stranger logging in"
+STRANGER_TOKEN="$(mx POST /_matrix/client/v3/login "" "$(jq -nc \
+	--arg u stranger --arg p "$STRANGER_PASSWORD" \
+	'{type:"m.login.password",identifier:{type:"m.id.user",user:$u},password:$p}')" |
+	jq -r '.access_token // empty')"
+[[ -n $STRANGER_TOKEN ]] || fail "stranger could not log in"
+
+# The stranger joins before the agent is invited. The bridge treats a room as a
+# group room on `joined_members_count() >= 3`, which is its own synced view — so
+# the third member has to already be there when the bridge first sees the room.
+# Inviting everyone at once instead leaves a race the harness cannot observe,
+# and losing it makes the @-mention case pass as a direct chat.
+GROUP_ROOM_ID="$(mx POST /_matrix/client/v3/createRoom "$PUPPET_TOKEN" "$(jq -nc \
+	--arg stranger "$STRANGER_MXID" \
+	'{preset:"trusted_private_chat",invite:[$stranger]}')" |
+	jq -r '.room_id // empty')"
+[[ -n $GROUP_ROOM_ID ]] || fail "could not create group room"
+log "group room: $GROUP_ROOM_ID"
+
+GROUP_URI="$(jq -rn --arg r "$GROUP_ROOM_ID" '$r|@uri')"
+
+mx POST "/_matrix/client/v3/rooms/$GROUP_URI/join" "$STRANGER_TOKEN" "" >/dev/null
+
+group_member_joined() {
+	mx GET "/_matrix/client/v3/rooms/$GROUP_URI/joined_members" "$PUPPET_TOKEN" |
+		jq -e --arg u "$1" '.joined | has($u)'
+}
+wait_for "the stranger to join the group room" 90 group_member_joined "$STRANGER_MXID"
+
+# The bridge auto-joins when invited by a user in its allow_list.
+mx POST "/_matrix/client/v3/rooms/$GROUP_URI/invite" "$PUPPET_TOKEN" \
+	"$(jq -nc --arg a "$AGENT_MXID" '{user_id:$a}')" >/dev/null
+wait_for "the agent to join the group room" 90 group_member_joined "$AGENT_MXID"
+
+# Count what the agent actually said in the group room. Restricted to
+# `m.room.message`: /messages returns state events too, and the agent's own
+# join is one of them, so a sender-only filter is already true before the agent
+# has said anything at all.
+group_agent_said() {
+	mx GET "/_matrix/client/v3/rooms/$GROUP_URI/messages?dir=b&limit=200" \
+		"$PUPPET_TOKEN" |
+		jq --arg a "$AGENT_MXID" --arg s "$1" \
+			'[.chunk[]
+			  | select(.type == "m.room.message")
+			  | select(.sender == $a)
+			  | select(.content.body // "" | contains($s))] | length'
+}
+
+# `group_agent_said` returns empty if the request fails, and an empty string is
+# 0 to `-gt`. Require a number before comparing, so a broken request reads as
+# "not yet" rather than as a passing negative assertion.
+group_said_count_is() {
+	local got
+	got="$(group_agent_said "$1")"
+	[[ $got =~ ^[0-9]+$ ]] || fail "could not count agent messages in the group room"
+	[[ $got -eq $2 ]] || fail "$3 (expected $2 matching messages, found $got)"
+}
+
+group_said_at_least() {
+	local got
+	got="$(group_agent_said "$1")"
+	[[ $got =~ ^[0-9]+$ ]] && [[ $got -ge $2 ]]
+}
+
+group_send() {
+	local token="$1" body="$2"
+	TXN="e2e-$(date +%s%N)"
+	mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+		"$token" "$body" >/dev/null
+}
+
+# Both `!chaz` commands used below are answered by the bridge itself, so their
+# replies do not depend on the daemon or the stub, and each reply carries a
+# string the other does not.
+BACKENDS_MARKER="Known Models"
+HELP_MARKER="chaz commands"
+
+MENTION_BODY="mentioning the agent"
+
+# How many turns the model has been asked to run. The bridge backfills room
+# history into the session, so the text of an ignored message still shows up in
+# a later turn's context — the count of requests is what says whether it became
+# a turn of its own.
+stub_requests() { grep -c "^stub_llm: request:" "$WORKSPACE/stub-llm.log" || true; }
+
+# The bridge writes a line for every message it drops for not being addressed
+# to it. That line is the observable for a message that must be ignored: the
+# absence of a reply is not, because absence is also what a reply that has not
+# arrived yet looks like, and it stays true with the gate deleted.
+gate_drops() { grep -c "not addressed to the bot" "$BRIDGE_LOG" || true; }
+gate_dropped_more_than() { [[ "$(gate_drops)" -gt "$1" ]]; }
+
+# Case 1a + Case 2 — the bare message must be ignored, the mention answered.
+#
+# The bare message is asserted on the bridge's drop line, and waiting for it
+# also orders the pair: the mention is not sent until the bridge has finished
+# with the message before it. The bridge decides this per event, before
+# anything crosses into a session, so neither the assertion nor the ordering
+# depends on how the daemon batches the turns it is handed.
+#
+# The turn count is the second half of the pair, and it is what catches a drop
+# that is logged but not performed. Counting requests rather than replies in
+# the room is deliberate: every reply this stub sends is the same string, so a
+# wrongly sent first reply reads exactly like the mention's.
+log "Case 1a: bare message in the group room (must be ignored)"
+TURNS_BEFORE="$(stub_requests)"
+DROPS_BEFORE="$(gate_drops)"
+group_send "$PUPPET_TOKEN" \
+	"$(jq -nc '{msgtype:"m.text",body:"bare message with no prefix and no mention"}')"
+wait_for "the bridge to drop the bare group message as unaddressed" 60 \
+	gate_dropped_more_than "$DROPS_BEFORE"
+
+log "Case 2: @-mention in the group room (must be answered)"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" --arg b "$MENTION_BODY" \
+	'{msgtype:"m.text",body:$b} + {"m.mentions":{user_ids:[$a]}}')"
+
+mention_reached_the_model() {
+	grep "^stub_llm: request:" "$WORKSPACE/stub-llm.log" | grep -qF "$MENTION_BODY"
+}
+wait_for "the mention to reach the model" "$REPLY_TIMEOUT" mention_reached_the_model
+
+TURNS_AFTER="$(stub_requests)"
+if [[ $((TURNS_AFTER - TURNS_BEFORE)) -ne 1 ]]; then
+	fail "bridge ran $((TURNS_AFTER - TURNS_BEFORE)) turns for the group room, expected 1 — a bare message was answered"
+fi
+
+wait_for "the mention reply in the group room" "$REPLY_TIMEOUT" \
+	group_said_at_least "$MARKER" 1
+
+# Case 1b — the `!chaz` prefix is answered without a mention.
+log "Case 1b: !chaz command in the group room (must be answered)"
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz backends"}')"
+wait_for "the !chaz reply in the group room" "$REPLY_TIMEOUT" \
+	group_said_at_least "$BACKENDS_MARKER" 1
+
+# Case 3 — allow_list rejection. The stranger uses the `!chaz` prefix on
+# purpose: the prefix clears the "only engage when addressed" gate that Case 1a
+# already covers, which leaves allow_list as the only thing that can produce
+# silence. A bare message here would be dropped by the addressing gate, and the
+# case would still pass with allow_list deleted entirely.
+log "Case 3: stranger sends !chaz (must be ignored — not in allow_list)"
+group_send "$STRANGER_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz backends"}')"
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz help"}')"
+wait_for "the !chaz help reply in the group room" "$REPLY_TIMEOUT" \
+	group_said_at_least "$HELP_MARKER" 1
+group_said_count_is "$BACKENDS_MARKER" 1 \
+	"bridge answered a sender outside allow_list"
+
+printf '\033[1;32mPASS\033[0m — group room cases passed (bare ignored, !chaz prefix, @-mention, allow_list rejection)\n' >&2
