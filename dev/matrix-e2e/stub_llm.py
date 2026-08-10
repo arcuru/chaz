@@ -92,6 +92,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
+        # Only chat completions are served. Answering every path would make any
+        # other POST the daemon learns to send — an embedding request, say —
+        # arrive as a chat completion and land in the request log, where the
+        # harness counts model turns.
+        if not self.path.rstrip("/").endswith("/chat/completions"):
+            self._send({"error": "not found"}, status=404)
+            return
+
         messages = []
         try:
             messages = json.loads(body).get("messages", [])

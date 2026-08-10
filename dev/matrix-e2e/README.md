@@ -175,6 +175,9 @@ sequence exists to protect.
   `/agent share` writes a copy of every ticket under the config directory.
 - **Ports are requested from the kernel**, not hardcoded, so a run does not
   collide with a daemon already running on the machine.
+- **Every `curl` carries `--max-time`.** A poll loop is only bounded if each
+  attempt is, and a server that accepts a connection and then stops answering
+  is otherwise an attempt that never returns.
 
 ## Writing a new case
 

@@ -49,6 +49,13 @@ while [[ $# -gt 0 ]]; do
 			exit 2
 		}
 		REPLY_TIMEOUT="$2"
+		if [[ ! $REPLY_TIMEOUT =~ ^[0-9]+$ ]]; then
+			# Checked here rather than at first use: `wait_for` does arithmetic
+			# on it, and a non-number there dies with a shell error that names
+			# neither the flag nor the value.
+			echo "--timeout requires a whole number of seconds, got: $REPLY_TIMEOUT" >&2
+			exit 2
+		fi
 		shift
 		;;
 	--transport)
@@ -127,6 +134,12 @@ trap cleanup EXIT INT TERM
 free_port() {
 	python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
 }
+
+# Every curl in this script carries this cap. All of them talk to loopback,
+# where a healthy answer takes milliseconds, so ten seconds only ever fires for
+# a server that accepted the connection and then stopped responding — which is
+# what turns a bounded poll loop into an unbounded one.
+CURL_MAX_TIME=10
 
 # Poll until a command succeeds. Every wait in this script is bounded: a
 # harness that hangs is worse than one that fails, because CI will sit on it
@@ -209,7 +222,7 @@ fi
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
 spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER"
-wait_for "stub LLM" 30 curl -sf "http://127.0.0.1:$STUB_PORT/v1/models"
+wait_for "stub LLM" 30 curl -sf --max-time "$CURL_MAX_TIME" "http://127.0.0.1:$STUB_PORT/v1/models"
 
 # ----------------------------------------------------------------- synapse ---
 log "generating synapse config"
@@ -293,7 +306,7 @@ PY
 
 log "starting synapse"
 spawn synapse synapse_homeserver --config-path "$SYNAPSE_DIR/homeserver.yaml"
-wait_for "synapse" 120 curl -sf "$HOMESERVER/_matrix/client/versions"
+wait_for "synapse" 120 curl -sf --max-time "$CURL_MAX_TIME" "$HOMESERVER/_matrix/client/versions"
 
 log "registering accounts"
 for pair in "agent:$AGENT_PASSWORD" "puppet:$PUPPET_PASSWORD" "stranger:$STRANGER_PASSWORD"; do
@@ -445,7 +458,7 @@ fi
 # --------------------------------------------------------------- puppet ------
 mx() {
 	local method="$1" path="$2" token="${3:-}" body="${4:-}"
-	local args=(-sS -X "$method" -H 'Content-Type: application/json')
+	local args=(-sS --max-time "$CURL_MAX_TIME" -X "$method" -H 'Content-Type: application/json')
 	[[ -n $token ]] && args+=(-H "Authorization: Bearer $token")
 	[[ -n $body ]] && args+=(-d "$body")
 	curl "${args[@]}" "$HOMESERVER$path"
