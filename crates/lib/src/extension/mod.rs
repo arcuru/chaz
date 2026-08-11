@@ -1479,8 +1479,10 @@ impl ExtensionHub {
                 let peer = peer.clone();
                 async move {
                     let scope_ctx = instance::ScopeCtx::Global { peer: &peer };
-                    let inst = ext.instantiate(scope_ctx).await;
-                    (name, inst)
+                    let result = AssertUnwindSafe(ext.instantiate(scope_ctx))
+                        .catch_unwind()
+                        .await;
+                    (name, result)
                 }
             })
             .collect();
@@ -1489,15 +1491,21 @@ impl ExtensionHub {
 
         for (name, result) in results {
             match result {
-                Ok(inst) => {
+                Ok(Ok(inst)) => {
                     self.drain_global_instance(&name, &inst);
                     self.global_instances.insert(name, inst);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(
                         extension = %name,
                         error = %e,
                         "Global instantiation failed; extension contributes no global tools/commands/hooks"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        extension = %name,
+                        "Global instantiation panicked; extension contributes no global tools/commands/hooks"
                     );
                 }
             }
