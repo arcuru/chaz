@@ -64,7 +64,7 @@ mcp/                 MCP integration (parse, transport, server) — stdio + Stre
 tools/               Built-in tools: agent, task, compact, describe, time, calculate, shell, file, web, search, memory
 security/            SecurityContext, SecretStore, LeakDetector, NetworkPolicy, Sanitizer
 runtime.rs           ReAct loop: approval, timeouts, leak/injection scanning, retry, loop detection
-server.rs            Callback-driven Server: on_local_write → process_session → spawn agent → deliver response
+server.rs            Callback-driven Server: on_write → process_session → spawn agent → deliver response
 bridge.rs            Bridge trait + ApprovalExchange + ApprovalDecision — concrete impls live in the bin crate
 error.rs             Error + LlmError (retryable/permanent classification)
 backends.rs          BackendManager, LLMBackend trait, ChatContext, Message

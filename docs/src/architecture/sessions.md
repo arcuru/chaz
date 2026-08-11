@@ -46,14 +46,14 @@ sequenceDiagram
     participant A as Agent Task
 
     U->>S: write Message entry
-    S-->>SV: on_local_write callback
+    S-->>SV: on_write callback
     SV->>SV: check latest entry
     SV->>A: spawn agent task
     A->>S: write Ack entry
     A->>S: write ToolCall entry
     A->>S: write ToolResult entry
     A->>S: write Message entry (response)
-    S-->>U: on_local_write callback
+    S-->>U: on_write callback
 ```
 
 ## Session Registry
@@ -106,7 +106,7 @@ The `compact` tool and `/compact` TUI command write a `Summary` entry to the ses
 
 Because each session is a standalone eidetica database, sessions can be synced between chaz instances. The `/share` command generates a `DatabaseTicket` URL, and `/sync` pulls a remote session. Eidetica handles the Merkle-CRDT synchronization protocol.
 
-Synced sessions receive remote writes via eidetica's `on_local_write` callbacks with `WriteSource::Remote`, triggering the same bridge notification path as local writes.
+Synced sessions receive remote writes via eidetica's `on_write` callbacks with `WriteSource::Remote`, triggering the same bridge notification path as local writes.
 
 ## Home Peer (Per-Session, with Agent-Level Fresh-Timer Default)
 

@@ -414,7 +414,7 @@ When an agent calls `spawn_agent`:
 
 1. A new session database is created via the server's `register_child_session`.
 2. A `Directive` entry is written to the child session.
-3. The server's `on_local_write` callback detects the directive and spawns an agent task.
+3. The server's `on_write` callback detects the directive and spawns an agent task.
 4. The agent runs the ReAct loop, writing Ack, ToolCall, ToolResult, and response entries.
 5. A completion signal notifies the parent (for synchronous spawns).
 6. The parent reads the response from the child session.
@@ -543,10 +543,10 @@ sequenceDiagram
     participant R as researcher (ReAct)
 
     U->>S: Message "@coder …"
-    S-->>C: on_local_write → dispatch
+    S-->>C: on_write → dispatch
     C->>C: spawn_agent(researcher, task)
     C->>CS: register_child_session + Directive
-    CS-->>R: on_local_write → dispatch
+    CS-->>R: on_write → dispatch
     R->>CS: Ack → ToolCall/ToolResult… → response
     CS-->>C: completion signal
     C->>S: final response
