@@ -7,7 +7,7 @@ use chaz_core::{agent, config, server, session};
 use clap::Parser;
 use std::time::Instant;
 use std::{fs::File, io::Read, path::PathBuf};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -130,6 +130,17 @@ async fn main() -> anyhow::Result<()> {
     file.read_to_string(&mut contents)?;
 
     let mut config: Config = serde_yaml::from_str(&contents)?;
+
+    // Warn about unrecognised YAML keys before proceeding.
+    let unknown = config::check_unknown_config_keys(&contents);
+    if !unknown.is_empty() {
+        warn!(
+            config = %config_path.display(),
+            count = unknown.len(),
+            keys = %unknown.join(", "),
+            "Unrecognised config key(s)"
+        );
+    }
 
     // Resolve state directory for persistence
     let state_dir = config

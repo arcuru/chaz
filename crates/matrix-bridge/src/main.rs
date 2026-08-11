@@ -84,6 +84,19 @@ async fn main() -> anyhow::Result<()> {
     let mut config: Config = serde_yaml::from_str(&contents)?;
     let bridge_cfg: MatrixBridgeConfig = serde_yaml::from_str(&contents)?;
 
+    // Warn about unrecognised YAML keys — the known set is the union of
+    // Config + MatrixBridgeConfig fields, so the double-parse doesn't
+    // produce cross-noise.
+    let unknown = chaz_core::config::check_unknown_config_keys(&contents);
+    if !unknown.is_empty() {
+        warn!(
+            config = %config_path.display(),
+            count = unknown.len(),
+            keys = %unknown.join(", "),
+            "Unrecognised config key(s)"
+        );
+    }
+
     info!(config = %config_path.display(), label = %bridge_cfg.label, "Starting chaz-matrix");
 
     // The bridge's OWN state dir — distinct from the chaz daemon's, since it is
