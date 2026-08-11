@@ -197,6 +197,28 @@ pub fn unrendered_approval_requests(
         .collect()
 }
 
+/// The prompt an untargeted `approve`/`deny` answers in `channel`: the oldest
+/// one still open there, by the order the bridge posted them.
+///
+/// A bridge keeps its posted prompts in a map keyed by the transport's message
+/// id, and that map's iteration order is arbitrary — with two prompts open in
+/// one channel, picking the first match answers whichever the map happened to
+/// yield, so the same words resolve a different tool call each time. `seq` is
+/// the bridge's post counter, and the lowest one is the request the human has
+/// been looking at longest. Prompts in other channels are never candidates.
+///
+/// Pure, so the ordering rule is testable without a live transport.
+pub fn oldest_pending<K, C: PartialEq>(
+    prompts: impl IntoIterator<Item = (K, C, u64)>,
+    channel: &C,
+) -> Option<K> {
+    prompts
+        .into_iter()
+        .filter(|(_, c, _)| c == channel)
+        .min_by_key(|(_, _, seq)| *seq)
+        .map(|(key, _, _)| key)
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile / translate helpers (transport-generic)
 // ---------------------------------------------------------------------------
@@ -399,6 +421,22 @@ mod tests {
             metadata: None,
             routing: None,
         }
+    }
+
+    #[test]
+    fn approve_answers_the_oldest_prompt_in_the_channel() {
+        // Posted second, first, third — as a HashMap would hand them over.
+        let prompts = [("m2", "chan", 1), ("m1", "chan", 0), ("m3", "chan", 2)];
+        assert_eq!(oldest_pending(prompts, &"chan"), Some("m1"));
+    }
+
+    #[test]
+    fn a_prompt_in_another_channel_is_never_answered() {
+        // The only older prompt belongs to a different channel.
+        let prompts = [("elsewhere", "other", 0), ("here", "chan", 1)];
+        assert_eq!(oldest_pending(prompts, &"chan"), Some("here"));
+        assert_eq!(oldest_pending(prompts, &"empty"), None);
+        assert_eq!(oldest_pending([] as [(&str, &str, u64); 0], &"chan"), None);
     }
 
     #[test]

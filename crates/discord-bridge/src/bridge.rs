@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chaz_core::backends::BackendManager;
 use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
@@ -545,8 +546,15 @@ struct PendingApproval {
     session_db: eidetica::Database,
     request_id: String,
     channel_id: ChannelId,
+    /// Post order, so an untargeted `!chaz approve` answers the prompt the
+    /// channel has had open longest rather than an arbitrary map entry.
+    seq: u64,
 }
 type PendingApprovals = Arc<Mutex<HashMap<MessageId, PendingApproval>>>;
+
+/// Stamps [`PendingApproval::seq`]. Process-wide: prompts from every channel
+/// share one order, and only their relative order matters.
+static NEXT_PROMPT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Render the approval prompt a human reacts to.
 fn approval_body(req: &chaz_core::bridge::ApprovalRequestPayload) -> String {
@@ -623,6 +631,7 @@ async fn attach_approval_watcher(
                                     session_db: db.clone(),
                                     request_id: req.request_id,
                                     channel_id,
+                                    seq: NEXT_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed),
                                 },
                             );
                         }
@@ -651,10 +660,10 @@ async fn resolve_pending_approval(
 ) {
     let resolved = {
         let mut p = pending.lock().await;
-        let message_id = p
-            .iter()
-            .find(|(_, pa)| pa.channel_id == channel_id)
-            .map(|(id, _)| *id);
+        let message_id = chaz_core::bridge::oldest_pending(
+            p.iter().map(|(id, pa)| (*id, pa.channel_id, pa.seq)),
+            &channel_id,
+        );
         message_id.and_then(|id| p.remove(&id))
     };
     let Some(req) = resolved else {
