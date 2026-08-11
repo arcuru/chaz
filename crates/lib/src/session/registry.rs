@@ -418,10 +418,52 @@ impl SessionRegistry {
     /// Mark a session as closed in the catalog (no row removal — Patrick's
     /// "find all sessions" design treats history as append-only).
     ///
-    /// Stub for the future session-deletion pathway. No-op for sessions that
-    /// have no catalog row yet (legacy entries); call after `create_session`
-    /// or rely on backfill if needed.
+    /// Also cleans up any tree-sync relationships that were registered during
+    /// session pull (via [`crate::server::build::pull_and_register_trees`]).
+    /// Sync cleanup runs even when the session is already closed (remove_tree_sync
+    /// on a non-existent relationship is a no-op).
     pub async fn mark_session_closed(&self, session_db_id: &str) -> anyhow::Result<()> {
+        // Tree-sync cleanup: unregister the (peer, session) pairs so dead
+        // relationships don't accumulate in the sync engine over time.
+        // Scope fence: tree half only — no peer-identity reaping here.
+        if let Some(sync) = self.instance.sync() {
+            if let Ok(session_id) = eidetica::entry::ID::parse(session_db_id) {
+                match sync.get_tree_peers(&session_id).await {
+                    Ok(peers) => {
+                        for peer in &peers {
+                            match sync.remove_tree_sync(peer.public_key(), &session_id).await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        session_db_id,
+                                        peer = %peer,
+                                        "Removed tree sync relationship for closed session"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        session_db_id,
+                                        peer = %peer,
+                                        "Failed to remove tree sync for closed session: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            session_db_id,
+                            "Failed to get tree peers for closed session: {e}"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    session_db_id,
+                    "Invalid session id, cannot clean up tree sync"
+                );
+            }
+        }
+
         let txn = self.chaz_group.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
         let Ok(json) = store.get_string(session_db_id).await else {
@@ -735,6 +777,44 @@ mod tests {
             .mark_session_closed("sha256:deadbeefcafe")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mark_session_closed_removes_tree_sync_relationships() {
+        let (_instance, registry) = make_registry_with_sync().await;
+        let (_conv, db) = registry.create_session(Some("test")).await.unwrap();
+        let id = db.root_id().to_string();
+        let session_eid = eidetica::entry::ID::parse(&id).unwrap();
+
+        // Verify sync is enabled
+        let sync = registry.instance().sync().expect("sync must be enabled");
+
+        // Register a fake tree sync relationship to simulate what happens
+        // during session pull (the build.rs registration loop).
+        // add_tree_sync requires the peer to exist first.
+        let (_privkey, pubkey) = eidetica::auth::crypto::generate_keypair();
+
+        sync.register_peer(&pubkey, Some("test-peer"))
+            .await
+            .unwrap();
+        sync.add_tree_sync(&pubkey, &session_eid).await.unwrap();
+
+        // Verify the relationship exists before close
+        let peers_before = sync.get_tree_peers(&session_eid).await.unwrap();
+        assert!(
+            !peers_before.is_empty(),
+            "peer should be registered before close"
+        );
+
+        // Close the session
+        registry.mark_session_closed(&id).await.unwrap();
+
+        // Verify the relationship is gone
+        let peers_after = sync.get_tree_peers(&session_eid).await.unwrap();
+        assert!(
+            peers_after.is_empty(),
+            "tree sync relationships should be removed after close, got {peers_after:?}"
+        );
     }
 
     #[tokio::test]
