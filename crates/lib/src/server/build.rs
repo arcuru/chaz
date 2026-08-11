@@ -1168,14 +1168,15 @@ async fn migrate_bridge_home_to_this_peer(
     }
 }
 
-/// Deadline for one peer's attempt at serving a session tree.
-///
-/// WORKAROUND (eidetica): its sync calls carry no timeout, so a stale peer
-/// address yields a future that never resolves. Remove once eidetica bounds
-/// `sync_tree_with_peer_*` the way it already bounds ticket bootstrap.
 /// How many exposed sessions are registered at once during a rescan.
 const MAX_CONCURRENT_SESSION_REGISTRATIONS: usize = 8;
 
+/// Deadline for one peer's attempt at serving a session tree.
+///
+/// WORKAROUND (eidetica): `sync_tree_with_peer_*` exposes no deadline of its
+/// own. Its transports do bound a single attempt internally, but a caller
+/// cannot observe that bound, so we keep one here. Remove once the sync API
+/// takes a deadline the way ticket bootstrap already does.
 const PULL_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Pull a bridge-exposed session's own tree onto this daemon.
@@ -1240,75 +1241,107 @@ async fn pull_session_tree_from_agent_peers(
         tracing::debug!(session_db_id, "no peers sync this agent DB; cannot pull");
         return;
     }
-    // Ask every peer at once and keep the first success. Peers from retired
-    // bridge identities are never pruned from the agent DB's peer set, and each
-    // one costs a full connect timeout — asking them in sequence turned a
-    // sub-second loopback sync into minutes, scaling with how often a bridge had
-    // been redeployed. Racing them makes the cost that of the slowest *success*.
-    let attempts: Vec<_> = peers
-        .iter()
-        .map(|peer| {
-            let sync = sync.clone();
-            let session_id = session_id.clone();
-            let key_name = key_name.clone();
-            let peer_key = peer.public_key().clone();
-            let signing_key = signing_key.clone();
-            Box::pin(async move {
-                // WORKAROUND (eidetica): `sync_tree_with_peer_auth` has no
-                // deadline, so a peer whose address is stale never resolves.
-                // Racing only helps when someone succeeds — `select_ok` waits
-                // for *all* futures when they all fail, so a session whose peers
-                // are all gone froze this whole rescan for ten minutes. Eidetica
-                // bounds its bootstrap path (ADDRESS_ATTEMPT_TIMEOUT) but not
-                // this one; delete this wrapper when it bounds both.
-                match tokio::time::timeout(
-                    PULL_ATTEMPT_TIMEOUT,
-                    sync.sync_tree_with_peer_auth(
-                        &peer_key,
-                        &session_id,
-                        Some(&signing_key),
-                        Some(&key_name),
-                        Some(permission),
-                        None,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(())) => Ok(peer_key),
-                    // `select_ok` keeps only the last error, so without this
-                    // every peer's actual refusal is discarded and the caller
-                    // sees one generic "nobody served it". The distinction
-                    // between "refused", "not found", and "never answered" is
-                    // the whole diagnosis.
-                    Ok(Err(e)) => {
-                        tracing::debug!(
-                            peer = %peer_key,
-                            session_db_id = %session_id,
-                            "pull attempt refused by peer: {e}"
-                        );
-                        Err(e)
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            peer = %peer_key,
-                            session_db_id = %session_id,
-                            "pull attempt timed out after {PULL_ATTEMPT_TIMEOUT:?}"
-                        );
-                        Err(eidetica::sync::SyncError::Network(format!(
-                            "peer did not answer within {PULL_ATTEMPT_TIMEOUT:?}"
-                        ))
-                        .into())
-                    }
+    // Ask the peer most likely to answer first, and ask one at a time.
+    //
+    // Asking them concurrently does not overlap the work. Eidetica awaits each
+    // `SendRequest` inline in its background sync engine's single command loop,
+    // so requests issued together still execute strictly one after another. A
+    // concurrent race therefore buys nothing and costs the diagnosis: every
+    // peer's deadline runs against the moment the batch was issued, not the
+    // moment its own request reached the wire, so peers queued behind a
+    // dead one time out having never been asked at all.
+    //
+    // That is fatal here rather than merely slow. Retired bridge identities are
+    // never pruned from the agent DB's peer set, and a dead address costs its
+    // full transport timeout while the engine is blocked on it. With several
+    // dead peers ahead of the live one, the live peer's request is still sitting
+    // in the queue when its deadline expires — so the pull fails no matter how
+    // large the deadline is, and reports "did not answer" for a request it never
+    // sent.
+    //
+    // Ordering by most-recent successful sync, then by last seen, puts the peer
+    // that is actually serving this agent DB first, so the common case succeeds
+    // on the first attempt and never pays for the dead ones at all.
+    let mut ranked: Vec<(Option<String>, String, eidetica::PublicKey)> =
+        Vec::with_capacity(peers.len());
+    for peer in &peers {
+        let peer_key = peer.public_key().clone();
+        match sync.get_peer_info(&peer_key).await {
+            Ok(Some(info)) => {
+                // A peer we have been told to stop talking to is not a candidate.
+                if matches!(info.status, eidetica::sync::PeerStatus::Blocked) {
+                    continue;
                 }
-            })
-        })
-        .collect();
-    let winner = match futures::future::select_ok(attempts).await {
-        Ok((peer_key, _outstanding)) => peer_key,
-        Err(e) => {
-            tracing::debug!(session_db_id, "no peer served the session tree: {e}");
-            return;
+                ranked.push((info.last_successful_sync, info.last_seen, peer_key));
+            }
+            // No stored info is not a reason to skip it — it just sorts last.
+            _ => ranked.push((None, String::new(), peer_key)),
         }
+    }
+    if ranked.is_empty() {
+        tracing::debug!(session_db_id, "no eligible peers to pull from");
+        return;
+    }
+    // ISO-8601 timestamps sort lexicographically, and `None` sorts before
+    // `Some`, so reversing puts "synced most recently" at the front.
+    ranked.sort_by(|a, b| (&b.0, &b.1).cmp(&(&a.0, &a.1)));
+
+    info!(
+        session_db_id,
+        peer_count = ranked.len(),
+        peers = ?ranked.iter().map(|(_, _, k)| k.to_string()).collect::<Vec<_>>(),
+        "Pulling exposed session tree; trying peers in order of most recent sync"
+    );
+
+    let mut winner = None;
+    let mut tried = Vec::with_capacity(ranked.len());
+    for (_, _, peer_key) in &ranked {
+        tried.push(peer_key.to_string());
+        // WORKAROUND (eidetica): `sync_tree_with_peer_auth` carries no deadline
+        // of its own. The transports below it do bound a single attempt, but a
+        // caller cannot see that bound, so keep a deadline here. Note it cannot
+        // cancel the queued command — the background engine runs it to
+        // completion regardless — it only stops us waiting on it.
+        let outcome = tokio::time::timeout(
+            PULL_ATTEMPT_TIMEOUT,
+            sync.sync_tree_with_peer_auth(
+                peer_key,
+                &session_id,
+                Some(&signing_key),
+                Some(&key_name),
+                Some(permission),
+                None,
+            ),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(())) => {
+                winner = Some(peer_key.clone());
+                break;
+            }
+            // "Refused", "not found", and "never answered" are different
+            // diagnoses and only one of them is an authorization problem, so
+            // each peer's own outcome is worth a line of its own.
+            Ok(Err(e)) => info!(
+                peer = %peer_key,
+                session_db_id,
+                "Pull attempt refused by peer: {e}"
+            ),
+            Err(_) => info!(
+                peer = %peer_key,
+                session_db_id,
+                "Pull attempt timed out after {PULL_ATTEMPT_TIMEOUT:?}"
+            ),
+        }
+    }
+    let Some(winner) = winner else {
+        warn!(
+            session_db_id,
+            peers_tried = tried.len(),
+            peers = ?tried,
+            "No peer served the session tree"
+        );
+        return;
     };
 
     // The pull moves entries at the sync layer but establishes no User-layer
