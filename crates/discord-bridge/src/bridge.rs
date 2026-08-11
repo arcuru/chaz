@@ -90,6 +90,7 @@ impl Bridge for DiscordBridge {
             allowed_users: self.creds.allowed_users.clone(),
             attached: Arc::new(Mutex::new(HashSet::new())),
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            message_counts: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             bot_id: Arc::new(Mutex::new(None)),
         };
@@ -125,6 +126,9 @@ struct Handler {
     /// when the connection is resumed, and a replay must not write the inbound
     /// entry a second time or re-run a `!chaz approve` against a later prompt.
     seen_messages: Arc<Mutex<HashSet<MessageId>>>,
+    /// Messages each Discord user has spent against `message_limit`, counted
+    /// for the life of the process.
+    message_counts: Arc<Mutex<HashMap<u64, u64>>>,
     /// Posted tool-approval prompts awaiting a reaction/command, keyed by the
     /// prompt message id.
     pending: PendingApprovals,
@@ -168,6 +172,28 @@ impl Handler {
             })
         {
             return self.handle_command(ctx, msg, &inner).await;
+        }
+
+        // Per-user quota, the same `message_limit` the Matrix bridge enforces:
+        // without it a single chatty channel can grow the session DB without
+        // bound. Commands are exempt, as they are on Matrix.
+        if let Some(limit) = charge_message_quota(
+            &self.message_counts,
+            msg.author.id.get(),
+            self.config.message_limit,
+        )
+        .await
+        {
+            error!(user = %msg.author.id, "Discord user is over their message limit of {limit}");
+            msg.channel_id
+                .say(
+                    &ctx.http,
+                    format!(
+                        "!chaz Error: you have used up your message limit of {limit} messages."
+                    ),
+                )
+                .await?;
+            return Ok(());
         }
 
         let channel = msg.channel_id.get().to_string();
@@ -457,6 +483,26 @@ impl Handler {
 /// replay is dropped here.
 async fn first_delivery(seen: &Mutex<HashSet<MessageId>>, id: MessageId) -> bool {
     seen.lock().await.insert(id)
+}
+
+/// Spend one message from `user`'s `message_limit` quota.
+///
+/// Returns `None` when the message is within the cap — which also counts it —
+/// and `Some(limit)` once the user has spent the cap, so the caller can name
+/// the number it reports back to the channel. An unset limit never rejects.
+async fn charge_message_quota(
+    counts: &Mutex<HashMap<u64, u64>>,
+    user: u64,
+    limit: Option<u64>,
+) -> Option<u64> {
+    let limit = limit?;
+    let mut counts = counts.lock().await;
+    let spent = counts.entry(user).or_insert(0);
+    if *spent < limit {
+        *spent += 1;
+        return None;
+    }
+    Some(limit)
 }
 
 /// Small helper so the various send sites read uniformly.
@@ -795,10 +841,32 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_message, first_delivery, hard_split};
+    use super::{charge_message_quota, chunk_message, first_delivery, hard_split};
     use serenity::model::id::MessageId;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn a_user_spends_their_message_quota_and_is_then_refused() {
+        let counts = Mutex::new(HashMap::new());
+
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, None);
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, None);
+        // Third message is over the cap, and stays over.
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, Some(2));
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, Some(2));
+        // The quota is per user, so a second user still has their own.
+        assert_eq!(charge_message_quota(&counts, 2, Some(2)).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_unset_limit_never_refuses_and_a_zero_limit_always_does() {
+        let counts = Mutex::new(HashMap::new());
+        for _ in 0..100 {
+            assert_eq!(charge_message_quota(&counts, 1, None).await, None);
+        }
+        assert_eq!(charge_message_quota(&counts, 1, Some(0)).await, Some(0));
+    }
 
     #[tokio::test]
     async fn a_replayed_message_is_only_delivered_once() {

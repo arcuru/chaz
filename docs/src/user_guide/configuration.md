@@ -10,8 +10,8 @@ homeserver_url: https://matrix.org
 username: "chaz"
 password: "hunter2" # If unset, prompted on first run
 allow_list: "@user:matrix.org|@other:matrix.org" # Regex matched against the sender's Matrix ID
-# message_limit: 500           # Optional: per-account message cap while the bot runs
-# room_size_limit: 100         # Optional: refuse to respond in rooms with more than N members
+# message_limit: 500           # Optional: per-account message cap while the bot runs (Matrix and Discord)
+# room_size_limit: 100         # Optional: refuse to respond in rooms with more than N members (Matrix only)
 # chat_summary_model: "gpt-4o-mini"  # Optional: separate model for chat summarization
 
 # Persistence
