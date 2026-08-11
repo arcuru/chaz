@@ -673,6 +673,10 @@ impl Bridge for MatrixBridge {
                             })
                             .unwrap_or(false);
                         if !(is_direct || mentions_bot) {
+                            tracing::debug!(
+                                room_id = %room.room_id(),
+                                "Message is not addressed to the bot; ignoring"
+                            );
                             return;
                         }
 

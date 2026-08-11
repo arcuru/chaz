@@ -41,6 +41,11 @@ build mode='debug':
 test *args='':
     cargo test {{ args }}
 
+# Matrix bridge end-to-end test against a throwaway homeserver
+e2e *args='':
+    cargo build --quiet --bin chaz --bin chaz-matrix
+    nix develop .#e2e --command dev/matrix-e2e/run.sh {{ args }}
+
 # =============================================================================
 # Coverage
 # =============================================================================

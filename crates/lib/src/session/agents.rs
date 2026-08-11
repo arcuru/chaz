@@ -130,14 +130,38 @@ impl SessionRegistry {
 
         // 3. SessionMeta: upsert the AgentRef (dedup by db_id).
         //
-        // `home_pubkey` defaults to the attaching peer's pubkey on the agent
-        // DB — the attacher becomes the home peer for this (session, agent)
-        // pair. Re-attach intentionally preserves a previously-set
-        // home_pubkey (that's `/agent rehost`'s job).
+        // `home_pubkey` names the one peer that runs this (session, agent)
+        // pair's turns. It comes from the *agent DB's* own meta — the peer that
+        // created the agent — not from whoever happens to be attaching.
+        //
+        // The attacher is not always a peer that can run anything. A standalone
+        // bridge attaches every session it creates for an inbound message, and
+        // it runs `run_agent_loop=false`; naming it home meant a bridge-created
+        // session had a home peer that would never take a turn, and no other
+        // peer would either, because `is_home_for_agent_ref` matches on exactly
+        // this field. Messages arrived, synced, and were never answered.
+        //
+        // Fall back to the attacher only when the agent DB carries no
+        // agent-level home — an agent predating that field, where the attacher
+        // is the best guess available and `/agent rehost` is the repair.
+        let home_pubkey =
+            match crate::db_kind::read_agent_home_pubkey(agent_handle.database()).await {
+                Some(home) => home.to_string(),
+                None => {
+                    warn!(
+                        agent = %agent.display_name,
+                        agent_db_id = %agent.db_id,
+                        session_db_id,
+                        "Agent DB has no agent-level home_pubkey; falling back to this peer. \
+                         If this peer does not run agents, repair with `/agent rehost`."
+                    );
+                    agent.pubkey.to_string()
+                }
+            };
         let agent_ref = AgentRef {
             db_id: agent.db_id.to_string(),
             display_name: agent.display_name.clone(),
-            home_pubkey: Some(agent.pubkey.to_string()),
+            home_pubkey: Some(home_pubkey),
         };
         update_meta_on_db(&session_db, |m| {
             if let Some(existing) = m.agents.iter_mut().find(|a| a.db_id == agent_ref.db_id) {
@@ -571,6 +595,59 @@ mod tests {
         );
     }
 
+    /// A bridge attaches every session it creates for an inbound message, but
+    /// runs no agent loop. Naming *it* home meant nobody ran the turn — the
+    /// message synced and was never answered. Home must come from the agent
+    /// DB's own meta (the peer that created the agent), not from the attacher.
+    ///
+    /// Modelled the way it actually happens: `DbEntry.pubkey` is the *local*
+    /// tracked key, so on a bridge it is the bridge's key while the agent DB
+    /// still carries the daemon's.
+    #[tokio::test]
+    async fn attach_names_the_agent_dbs_home_peer_not_the_attacher() {
+        let (_instance, registry) = make_registry().await;
+        let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = session_db.root_id().to_string();
+
+        // Created by this peer, so the agent DB's home is the creator's key.
+        let agent = make_agent_entry(&registry, "alpha").await;
+        let creator_pubkey = agent.pubkey.clone();
+
+        // A different key stands in for the attaching bridge.
+        let attacher_pubkey = {
+            let mut user = registry.user.lock().await;
+            user.add_private_key(Some("bridge")).await.unwrap()
+        };
+        assert_ne!(
+            attacher_pubkey, creator_pubkey,
+            "test is meaningless unless the attacher differs from the creator"
+        );
+
+        registry
+            .attach_agent_to_session(
+                &session_id,
+                &DbEntry {
+                    pubkey: attacher_pubkey.clone(),
+                    ..agent.clone()
+                },
+            )
+            .await
+            .unwrap();
+
+        let meta = read_meta_from_db(&session_db).await;
+        assert_eq!(meta.agents.len(), 1);
+        assert_eq!(
+            meta.agents[0].home_pubkey.as_deref(),
+            Some(creator_pubkey.to_string().as_str()),
+            "home must be the agent DB's home peer, not whoever attached"
+        );
+        assert_ne!(
+            meta.agents[0].home_pubkey.as_deref(),
+            Some(attacher_pubkey.to_string().as_str()),
+            "naming the attacher home is the bug: a bridge runs no turns"
+        );
+    }
+
     #[tokio::test]
     async fn detach_removes_session_from_agent_registry() {
         let (_instance, registry) = make_registry().await;
@@ -975,7 +1052,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_sets_home_pubkey_to_attacher() {
+    /// The ordinary single-peer case: this peer created the agent and attaches
+    /// it, so the agent DB's home and the attacher are the same key and home
+    /// lands on this peer either way. Kept as the companion to
+    /// [`attach_names_the_agent_dbs_home_peer_not_the_attacher`], which is
+    /// where the two keys diverge.
+    async fn attach_sets_home_pubkey_to_the_creating_peer() {
         let (_instance, registry) = make_registry().await;
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_id = session_db.root_id().to_string();

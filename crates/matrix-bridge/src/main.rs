@@ -44,6 +44,16 @@ struct Args {
     /// chaz config the runtime needs (`backends`, `agents`, `security`).
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Print this bridge's public key and exit, generating it if this is the
+    /// first run.
+    ///
+    /// This is the identity the owning peer authorizes — feed it to `chaz cmd
+    /// '/agent invite <agent> <pubkey> write'` to pre-grant access, and the
+    /// bridge bootstraps on its next start with no approval round-trip. Run it
+    /// with the bridge stopped; it opens the bridge's own backend.
+    #[arg(long)]
+    print_pubkey: bool,
 }
 
 /// A login that bootstrapped access and has its credentials in hand, ready to
@@ -101,6 +111,16 @@ async fn main() -> anyhow::Result<()> {
         None => instance.login_user("chaz-matrix", None).await?,
     };
 
+    // `--print-pubkey` resolves the bridge's identity and stops here,
+    // deliberately ahead of sync: binding a transport is pointless for a
+    // question about a key, and it would make the lookup fail on an
+    // already-taken port.
+    if args.print_pubkey {
+        let key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await?;
+        println!("{key}");
+        return Ok(());
+    }
+
     // Enable sync up front — access bootstrap needs the live Sync handle, and
     // it must be reachable so the daemon can serve the agent DBs we request.
     instance.enable_sync().await?;
@@ -136,6 +156,17 @@ async fn main() -> anyhow::Result<()> {
     // Bring each configured login online: ticket-bootstrap Write on its agent
     // DB, register the public pointer, and stash its resolved credentials.
     // Logins still pending owner approval are skipped until a re-run.
+    // Where this bridge's sync identity is currently reachable. Published with
+    // every login pointer so the daemon can correct a record that would
+    // otherwise still name the address of a previous run — see `LoginRef`.
+    let peer_pubkey = sync.get_device_pubkey().ok().map(|k| k.to_string());
+    let sync_addresses = sync.get_all_server_addresses().await.unwrap_or_default();
+    info!(
+        pubkey = ?peer_pubkey,
+        addresses = ?sync_addresses,
+        "Publishing this bridge's sync identity with its logins"
+    );
+
     let bootstrap = SyncBootstrap::new(sync.clone());
     let identity = BridgeIdentity {
         key: &bridge_key,
@@ -152,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
             kind: "matrix".to_string(),
             identifier: login_id.clone(),
             bridge_db_id: bridge_db_id.clone(),
+            peer_pubkey: peer_pubkey.clone(),
+            sync_addresses: sync_addresses.clone(),
         };
         match establish_login(&mut user, &bootstrap, &identity, &ticket, login_ref).await? {
             BootstrapOutcome::Approved => {

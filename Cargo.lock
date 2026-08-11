@@ -1901,7 +1901,7 @@ dependencies = [
 [[package]]
 name = "eidetica"
 version = "0.2.0"
-source = "git+https://github.com/arcuru/eidetica?rev=4095d48226f0b0c29d18ac8bc8b178515274de20#4095d48226f0b0c29d18ac8bc8b178515274de20"
+source = "git+https://github.com/arcuru/eidetica?rev=17284e742e9a0ab640f3c3870b8d8c0f9bbfb34f#17284e742e9a0ab640f3c3870b8d8c0f9bbfb34f"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1911,6 +1911,7 @@ dependencies = [
  "chrono",
  "cid",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "handle_trait",
  "hex",
  "instability",

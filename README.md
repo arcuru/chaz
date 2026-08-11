@@ -70,21 +70,17 @@ Each invocation creates a fresh ephemeral session by default. Pass
 
 ### Matrix bridge
 
-When the `matrix:` block in your config is populated, the Matrix bridge
-spawns automatically in the background alongside the TUI — a TUI user and
-Matrix room users can drive the same hosted session at the same time. To
-opt out of the background bridge for a single run:
+The Matrix bridge is its own binary and its own peer. Run the agent process
+and the bridge side by side; they find each other over eidetica sync, and a
+TUI user and Matrix room users can drive the same hosted session at once.
 
 ```bash
-chaz --config config.yaml --no-matrix
+chaz --config config.yaml daemon &          # agent peer, no terminal needed
+chaz-matrix --config matrix-bridge.yaml     # Matrix transport only
 ```
 
-To run Matrix as the only bridge (headless, no TUI — for daemons /
-containers):
-
-```bash
-chaz --config config.yaml --no-tui
-```
+Swap `daemon` for the bare TUI invocation if you want a local interface
+alongside the bridge.
 
 #### TUI Commands
 

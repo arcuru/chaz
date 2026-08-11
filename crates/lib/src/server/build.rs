@@ -28,7 +28,8 @@ use crate::config::{self, Config};
 use crate::server::Server;
 use crate::{
     agent, agent_db, backends, commands, db_kind, embedding, extension, extensions, grants,
-    hosted_index, mcp, memory_bank_db, routine, security, session, tool, tool_host, tools,
+    hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session, tool, tool_host,
+    tools,
 };
 
 /// Knobs [`build`] can't infer from [`Config`] — behavior a one-shot CLI run and
@@ -94,20 +95,45 @@ pub async fn build(
     if opts.enable_sync {
         instance.enable_sync().await?;
         if let Some(sync) = instance.sync() {
-            use eidetica::sync::transports::iroh::IrohTransport;
-            sync.register_transport("iroh", IrohTransport::builder())
-                .await?;
+            // Registering a transport under a name that already has one
+            // *replaces* it: the endpoint that was serving is dropped and a
+            // fresh one is minted under a different address. A caller that set
+            // sync up before calling build — the bridges do, because access
+            // bootstrap needs a live Sync handle — would therefore change its
+            // own address partway through startup, and every peer holding the
+            // old one would be left dialing an endpoint nobody is listening on.
+            // Nothing reports that: the peer is registered, the address is
+            // recorded, and requests simply go unanswered.
+            //
+            // So each transport is registered only if it is not already
+            // serving, which is what callers passing `enable_sync` on an
+            // already-synced instance have always assumed this does.
+            let mut registered_any = false;
 
-            if let Some(ref addr) = config.sync_listen {
+            if sync.get_server_address_for("iroh").await.is_err() {
+                use eidetica::sync::transports::iroh::IrohTransport;
+                sync.register_transport("iroh", IrohTransport::builder())
+                    .await?;
+                registered_any = true;
+            }
+
+            if let Some(ref addr) = config.sync_listen
+                && sync.get_server_address_for("http").await.is_err()
+            {
                 use eidetica::sync::transports::http::HttpTransport;
                 sync.register_transport("http", HttpTransport::builder().bind(addr))
                     .await?;
                 info!("Sync HTTP transport listening on {addr}");
+                registered_any = true;
             }
 
-            sync.accept_connections().await?;
-            if let Ok(addr) = sync.get_server_address().await {
-                info!("Eidetica sync address: {addr}");
+            if registered_any {
+                sync.accept_connections().await?;
+                if let Ok(addr) = sync.get_server_address().await {
+                    info!("Eidetica sync address: {addr}");
+                }
+            } else {
+                info!("Sync already accepting connections; keeping the existing address");
             }
         }
     }
@@ -540,6 +566,13 @@ pub async fn build(
         });
     }
 
+    // Sync every tracked database under the key it was actually granted, which
+    // eidetica's background engine does not do (it always signs with the device
+    // key). Without this, any database this peer reached by bootstrapping with a
+    // named user key — every bridge's agent DB — is refused on every pull.
+    // Delete this call with the module when eidetica signs with the tracked key.
+    keyed_sync::spawn(registry.clone());
+
     Ok(BuiltServer {
         server,
         registry,
@@ -818,9 +851,20 @@ async fn watch_agent_session_registries(
             continue;
         };
         let tx = tx.clone();
+        let agent_name = entry.display_name.clone();
         match adb
             .database()
-            .on_write(move |_event, _db| {
+            .on_write(move |event, _db| {
+                // Naming the source makes "did a bridge's write wake us, or only
+                // our own?" one grep. Without it a rescan that follows a bridge
+                // write is indistinguishable from a rescan that would have
+                // happened anyway, which is exactly the question that took a
+                // day to answer.
+                tracing::debug!(
+                    agent = %agent_name,
+                    source = ?event.source(),
+                    "Agent DB write; queueing a rescan"
+                );
                 let tx = tx.clone();
                 Box::pin(async move {
                     let _ = tx.send(()).await;
@@ -872,103 +916,267 @@ pub(crate) async fn register_exposed_sessions(
         else {
             continue;
         };
+        adopt_published_bridge_addresses(registry, &adb).await;
+        let bridge_pubkeys = published_bridge_pubkeys(&adb).await;
         let refs = adb.list_session_refs().await.unwrap_or_default();
-        for r in refs {
-            if r.exposed_on.is_empty() || server.is_watching_session(&r.session_db_id).await {
-                continue;
-            }
-            // The registry entry is only a *pointer* to the session; its own tree
-            // is separate and, for a bridge-created session, has no sync-peer
-            // relationship with this daemon yet — so it never arrives on its own.
-            // Open it; if the tree isn't local, pull it from the peers we already
-            // sync this agent DB with (the exposing bridge is one of them), then
-            // retry. Best-effort — a miss just defers to the next registry rescan.
-            let mut opened = registry.open_session(&r.session_db_id).await;
-            if opened.is_err() {
-                pull_session_tree_from_agent_peers(registry, &entry, &adb, &r.session_db_id).await;
-                opened = registry.open_session(&r.session_db_id).await;
-            }
-            match opened {
-                Ok((_conv, sdb)) => {
-                    // Push the agent's replies straight back to the exposing
-                    // bridge on every commit, not just the 300s tick. The session
-                    // arrived via sync and may not be in the daemon's tracked
-                    // list, so provide the hosting agent's key explicitly.
-                    if let Err(e) = registry
-                        .enable_on_commit_sync_with_key(sdb.root_id(), &entry.pubkey)
-                        .await
-                    {
-                        warn!(
-                            session_db_id = %r.session_db_id,
-                            "enable on-commit sync for exposed session failed: {e}"
-                        );
-                    }
-                    // Proxy tool approvals over the session DB: the runtime
-                    // blocks on this channel, the proxy writes a request entry,
-                    // and the exposing bridge renders it + writes the decision.
-                    let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
-                        sdb.clone(),
-                        entry.display_name.clone(),
+        // What this peer can actually see in the agent DB registry. A
+        // bridge-created session reaches the daemon only through this store, so
+        // when a session never registers, the first question is whether the
+        // marker arrived at all — and that was previously unanswerable from the
+        // logs, since a rescan that saw nothing looked like a rescan that ran
+        // and found everything already handled.
+        tracing::debug!(
+            agent = %entry.display_name,
+            total = refs.len(),
+            exposed = refs.iter().filter(|r| !r.exposed_on.is_empty()).count(),
+            "Rescan: session refs visible in agent DB"
+        );
+        // Sessions are independent, and each one whose tree must be pulled
+        // costs a full peer deadline. Handled in sequence those costs add up,
+        // so the newest session — the one someone is actually waiting on —
+        // sits behind every older session nobody is asking about. A registry
+        // holding a couple of dozen sessions put it minutes back.
+        //
+        // Bounded rather than unbounded so a large registry cannot open an
+        // arbitrary number of connections at once.
+        {
+            use futures::StreamExt as _;
+            let entry = &entry;
+            let adb = &adb;
+            let bridge_pubkeys = &bridge_pubkeys;
+            futures::stream::iter(refs)
+                .for_each_concurrent(MAX_CONCURRENT_SESSION_REGISTRATIONS, |r| async move {
+                    register_one_exposed_session(
+                        server,
+                        registry,
+                        default_backend,
+                        entry,
+                        adb,
+                        bridge_pubkeys,
+                        r,
                     )
                     .await;
-                    if let Err(e) = server
-                        .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
-                        .await
-                    {
-                        warn!(session_db_id = %r.session_db_id, "register exposed session failed: {e}");
-                    } else {
-                        info!(
-                            session_db_id = %r.session_db_id,
-                            agent = %entry.display_name,
-                            exposed_on = ?r.exposed_on,
-                            "Daemon registered bridge-exposed session"
-                        );
-                        // Also register in the daemon's local session catalog
-                        // so the TUI `/sessions` list picks it up. Build the
-                        // source from the first transport binding so the
-                        // `BridgeKind::from_source` derivation is accurate.
-                        let source = session::transport_bindings(&sdb)
-                            .await
-                            .ok()
-                            .and_then(|b| b.first().map(|(t, _l, c)| format!("{t}:{c}")));
-                        if let Err(e) = registry
-                            .upsert_session_catalog(&r.session_db_id, source.as_deref())
-                            .await
-                        {
-                            warn!(session_db_id = %r.session_db_id, "Failed to upsert session catalog: {e}");
-                        }
-                        // A bridge-exposed session that names some other peer as
-                        // home will never run: the only other peer holding it is
-                        // the exposing bridge, which has no agent loop. The
-                        // session still syncs and registers, so it looks healthy
-                        // while being permanently mute — worth a WARN naming the
-                        // repair rather than a DEBUG on each skipped turn.
-                        if !server
-                            .peer_is_home_for(&r.session_db_id, &entry.display_name)
-                            .await
-                        {
-                            warn!(
-                                session_db_id = %r.session_db_id,
-                                agent = %entry.display_name,
-                                "Bridge-exposed session's home peer is not this daemon; no peer \
-                                 will run its turns. Repair with `/agent rehost` on that session."
-                            );
-                        }
-                    }
+                })
+                .await;
+        }
+    }
+}
+
+/// Register one bridge-exposed session on this daemon.
+///
+/// Split out of the rescan so sessions can be handled concurrently: each one
+/// that has to be pulled costs a full peer deadline, and those costs are
+/// independent of each other.
+async fn register_one_exposed_session(
+    server: &Arc<Server>,
+    registry: &Arc<session::SessionRegistry>,
+    default_backend: &backends::BackendManager,
+    entry: &crate::hosted_index::DbEntry,
+    adb: &crate::agent_db::AgentDb,
+    bridge_pubkeys: &std::collections::HashSet<String>,
+    r: crate::agent_db::SessionRef,
+) {
+    if r.exposed_on.is_empty() {
+        return;
+    }
+    // Both skips below are silent by nature and look identical to "no
+    // work to do", which is exactly what made a session that never
+    // registered impossible to trace: the counts moved, so the marker
+    // had clearly arrived, but nothing said which refs were seen or why
+    // each was passed over.
+    if server.is_watching_session(&r.session_db_id).await {
+        tracing::debug!(
+            session_db_id = %r.session_db_id,
+            "Rescan: exposed session already watched, skipping"
+        );
+        return;
+    }
+    tracing::debug!(
+        session_db_id = %r.session_db_id,
+        exposed_on = ?r.exposed_on,
+        "Rescan: processing exposed session"
+    );
+    // The registry entry is only a *pointer* to the session; its own tree
+    // is separate and, for a bridge-created session, has no sync-peer
+    // relationship with this daemon yet — so it never arrives on its own.
+    // Open it; if the tree isn't local, pull it from the peers we already
+    // sync this agent DB with (the exposing bridge is one of them), then
+    // retry. Best-effort — a miss just defers to the next registry rescan.
+    let mut opened = registry.open_session(&r.session_db_id).await;
+    if opened.is_err() {
+        pull_session_tree_from_agent_peers(registry, entry, adb, &r.session_db_id).await;
+        opened = registry.open_session(&r.session_db_id).await;
+    }
+    match opened {
+        Ok((conv_id, sdb)) => {
+            // Before anything else: a session the bridge created names the
+            // bridge as its home peer, and a bridge runs no agent loop. Take
+            // it over now, while adopting it, rather than registering a
+            // session that can only ever stay silent.
+            migrate_bridge_home_to_this_peer(&sdb, entry, bridge_pubkeys).await;
+            // Push the agent's replies straight back to the exposing
+            // bridge on every commit, not just the 300s tick. The session
+            // arrived via sync and may not be in the daemon's tracked
+            // list, so provide the hosting agent's key explicitly.
+            if let Err(e) = registry
+                .enable_on_commit_sync_with_key(sdb.root_id(), &entry.pubkey)
+                .await
+            {
+                warn!(
+                    session_db_id = %r.session_db_id,
+                    "enable on-commit sync for exposed session failed: {e}"
+                );
+            }
+            // Proxy tool approvals over the session DB: the runtime
+            // blocks on this channel, the proxy writes a request entry,
+            // and the exposing bridge renders it + writes the decision.
+            let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
+                sdb.clone(),
+                entry.display_name.clone(),
+            )
+            .await;
+            if let Err(e) = server
+                .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
+                .await
+            {
+                warn!(session_db_id = %r.session_db_id, "register exposed session failed: {e}");
+            } else {
+                info!(
+                    session_db_id = %r.session_db_id,
+                    agent = %entry.display_name,
+                    exposed_on = ?r.exposed_on,
+                    "Daemon registered bridge-exposed session"
+                );
+                // Also register in the daemon's local session catalog so the
+                // TUI `/sessions` list picks it up. Both the source tag (for
+                // `BridgeKind`) and the creation time have to come from the
+                // session itself: this peer did not create it, and its own
+                // clock only knows when it adopted it.
+                //
+                // The transport-bindings store is the direct answer but is
+                // not always populated by the time a pulled session first
+                // registers, and an empty read there is what leaves a Matrix
+                // conversation labelled `[other]`. The session's entries
+                // carry the same routing provenance and arrive with the tree,
+                // so they back-stop the bindings and supply the real start
+                // time in the same pass.
+                let adopted = session::Session::new(conv_id.clone(), sdb.clone()).await;
+                let (started_at, routed_source) = session::session_origin(adopted.entries());
+                let source = session::transport_bindings(&sdb)
+                    .await
+                    .ok()
+                    .and_then(|b| b.first().map(|(t, _l, c)| format!("{t}:{c}")))
+                    .or(routed_source);
+                if let Err(e) = registry
+                    .upsert_session_catalog(&r.session_db_id, source.as_deref(), started_at)
+                    .await
+                {
+                    warn!(session_db_id = %r.session_db_id, "Failed to upsert session catalog: {e}");
                 }
-                Err(e) => {
-                    // Still not openable after a pull attempt (peer unreachable,
-                    // or the tree genuinely absent) — a later registry sync-write
-                    // re-triggers this scan and retries.
-                    tracing::debug!(
+                // A bridge-exposed session that names some other peer as
+                // home will never run: the only other peer holding it is
+                // the exposing bridge, which has no agent loop. The
+                // session still syncs and registers, so it looks healthy
+                // while being permanently mute — worth a WARN naming the
+                // repair rather than a DEBUG on each skipped turn.
+                if !server
+                    .peer_is_home_for(&r.session_db_id, &entry.display_name)
+                    .await
+                {
+                    warn!(
                         session_db_id = %r.session_db_id,
-                        "Exposed session not openable even after pull; will retry on next registry write: {e}"
+                        agent = %entry.display_name,
+                        "Bridge-exposed session's home peer is not this daemon; no peer \
+                         will run its turns. Repair with `/agent rehost` on that session."
                     );
                 }
             }
         }
+        Err(e) => {
+            // Still not openable after a pull attempt (peer unreachable,
+            // or the tree genuinely absent) — a later registry sync-write
+            // re-triggers this scan and retries.
+            tracing::debug!(
+                session_db_id = %r.session_db_id,
+                "Exposed session not openable even after pull; will retry on next registry write: {e}"
+            );
+        }
     }
 }
+
+/// The peer keys of every bridge that has registered a login in this agent DB.
+///
+/// A bridge publishes its own sync identity alongside its logins, which makes
+/// "that peer is a bridge" something this daemon can read rather than guess.
+/// Logins predating that field carry no key and simply do not contribute — a
+/// smaller set costs a missed migration, which is the status quo, whereas
+/// guessing costs seizing a session from a legitimate remote host.
+async fn published_bridge_pubkeys(
+    adb: &crate::agent_db::AgentDb,
+) -> std::collections::HashSet<String> {
+    adb.list_logins()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|l| l.peer_pubkey)
+        .collect()
+}
+
+/// Re-host a bridge-created session onto this daemon, if that is what it is.
+///
+/// Runs on the adoption path only. Re-attach preserves an existing home pubkey
+/// on purpose — that is what makes `/agent rehost` stick — so the repair has to
+/// live here, where the session is being taken on and the bridge identity is
+/// known, rather than in the attach path.
+///
+/// Redeploying a bridge with a fresh identity recreates the same situation, so
+/// this is a standing correction rather than a one-shot data migration.
+async fn migrate_bridge_home_to_this_peer(
+    sdb: &eidetica::Database,
+    entry: &crate::hosted_index::DbEntry,
+    bridge_pubkeys: &std::collections::HashSet<String>,
+) {
+    if bridge_pubkeys.is_empty() {
+        return;
+    }
+    let meta = session::read_meta_from_db(sdb).await;
+    let agent_db_id = entry.db_id.to_string();
+    let Some(stale) =
+        super::bridge_home_to_migrate(&meta.agents, &agent_db_id, &entry.pubkey, bridge_pubkeys)
+    else {
+        return;
+    };
+    let mine = entry.pubkey.to_string();
+    match session::update_meta_on_db(sdb, |m| {
+        if let Some(a) = m.agents.iter_mut().find(|a| a.db_id == agent_db_id) {
+            a.home_pubkey = Some(mine.clone());
+        }
+    })
+    .await
+    {
+        Ok(()) => info!(
+            session_db_id = %sdb.root_id(),
+            agent = %entry.display_name,
+            was = %stale,
+            "Session was hosted on a bridge, which runs no agents; re-hosted onto this daemon"
+        ),
+        Err(e) => warn!(
+            session_db_id = %sdb.root_id(),
+            agent = %entry.display_name,
+            "Failed to re-host a bridge-hosted session onto this daemon: {e}"
+        ),
+    }
+}
+
+/// Deadline for one peer's attempt at serving a session tree.
+///
+/// WORKAROUND (eidetica): its sync calls carry no timeout, so a stale peer
+/// address yields a future that never resolves. Remove once eidetica bounds
+/// `sync_tree_with_peer_*` the way it already bounds ticket bootstrap.
+/// How many exposed sessions are registered at once during a rescan.
+const MAX_CONCURRENT_SESSION_REGISTRATIONS: usize = 8;
+
+const PULL_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Pull a bridge-exposed session's own tree onto this daemon.
 ///
@@ -1046,16 +1254,52 @@ async fn pull_session_tree_from_agent_peers(
             let peer_key = peer.public_key().clone();
             let signing_key = signing_key.clone();
             Box::pin(async move {
-                sync.sync_tree_with_peer_auth(
-                    &peer_key,
-                    &session_id,
-                    Some(&signing_key),
-                    Some(&key_name),
-                    Some(permission),
-                    None,
+                // WORKAROUND (eidetica): `sync_tree_with_peer_auth` has no
+                // deadline, so a peer whose address is stale never resolves.
+                // Racing only helps when someone succeeds — `select_ok` waits
+                // for *all* futures when they all fail, so a session whose peers
+                // are all gone froze this whole rescan for ten minutes. Eidetica
+                // bounds its bootstrap path (ADDRESS_ATTEMPT_TIMEOUT) but not
+                // this one; delete this wrapper when it bounds both.
+                match tokio::time::timeout(
+                    PULL_ATTEMPT_TIMEOUT,
+                    sync.sync_tree_with_peer_auth(
+                        &peer_key,
+                        &session_id,
+                        Some(&signing_key),
+                        Some(&key_name),
+                        Some(permission),
+                        None,
+                    ),
                 )
                 .await
-                .map(|()| peer_key)
+                {
+                    Ok(Ok(())) => Ok(peer_key),
+                    // `select_ok` keeps only the last error, so without this
+                    // every peer's actual refusal is discarded and the caller
+                    // sees one generic "nobody served it". The distinction
+                    // between "refused", "not found", and "never answered" is
+                    // the whole diagnosis.
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            peer = %peer_key,
+                            session_db_id = %session_id,
+                            "pull attempt refused by peer: {e}"
+                        );
+                        Err(e)
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            peer = %peer_key,
+                            session_db_id = %session_id,
+                            "pull attempt timed out after {PULL_ATTEMPT_TIMEOUT:?}"
+                        );
+                        Err(eidetica::sync::SyncError::Network(format!(
+                            "peer did not answer within {PULL_ATTEMPT_TIMEOUT:?}"
+                        ))
+                        .into())
+                    }
+                }
             })
         })
         .collect();
@@ -1288,4 +1532,92 @@ async fn build_web_search_backends(
         .collect();
     info!(chain = ?chain, "web_search backends");
     built
+}
+
+/// Adopt the sync addresses each bridge publishes with its login pointer.
+///
+/// A peer's addresses are recorded when it is first registered and never
+/// revised. A bridge keeps its identity across restarts but takes a fresh
+/// transport address each time, so from the first restart onwards this daemon
+/// holds an address nobody is listening on — and the failure is silent, because
+/// the peer is registered and an address is known. Requests just go unanswered
+/// until they time out, which reads as "the peer is down" while the peer is in
+/// fact running and reachable at an address it has been publishing all along.
+///
+/// So take the bridge at its word: it is the only party that knows where its
+/// own identity is reachable. Adding an address is enough — eidetica keeps the
+/// set — and nothing here removes one, since an address that is merely idle is
+/// indistinguishable from one that is dead.
+async fn adopt_published_bridge_addresses(
+    registry: &Arc<session::SessionRegistry>,
+    adb: &crate::agent_db::AgentDb,
+) {
+    let Some(sync) = registry.instance().sync() else {
+        return;
+    };
+    let logins = adb.list_logins().await.unwrap_or_default();
+    for login in logins {
+        let Some(pubkey_str) = login.peer_pubkey.as_deref() else {
+            continue;
+        };
+        if login.sync_addresses.is_empty() {
+            continue;
+        }
+        let Ok(pubkey) = eidetica::auth::crypto::PublicKey::from_prefixed_string(pubkey_str) else {
+            tracing::debug!(
+                login = %login.identifier,
+                pubkey = %pubkey_str,
+                "published bridge pubkey did not parse; ignoring"
+            );
+            continue;
+        };
+        let published: Vec<eidetica::sync::peer_types::Address> = login
+            .sync_addresses
+            .iter()
+            .map(|(transport, address)| {
+                eidetica::sync::peer_types::Address::new(transport, address)
+            })
+            .collect();
+
+        for addr in &published {
+            if let Err(e) = sync.add_peer_address(&pubkey, addr.clone()).await {
+                tracing::debug!(
+                    login = %login.identifier,
+                    peer = %pubkey,
+                    "could not adopt published bridge address: {e}"
+                );
+            }
+        }
+
+        // Adding is not enough on its own. Addresses accumulate in the order
+        // they were learned and sync dials only the first, so a stale entry at
+        // the head keeps winning no matter how current the one behind it is.
+        // The bridge has just told us the complete set it answers on, so
+        // anything else recorded for this identity is from a run that has since
+        // gone away — drop it rather than leave it shadowing the live address.
+        let stale: Vec<_> = match sync.get_peer_info(&pubkey).await {
+            Ok(Some(info)) => info
+                .addresses
+                .into_iter()
+                .filter(|a| !published.contains(a))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for addr in stale {
+            if let Ok(true) = sync.remove_peer_address(&pubkey, &addr).await {
+                tracing::info!(
+                    login = %login.identifier,
+                    peer = %pubkey,
+                    address = ?addr,
+                    "Dropped a bridge address it no longer publishes"
+                );
+            }
+        }
+        tracing::debug!(
+            login = %login.identifier,
+            peer = %pubkey,
+            published = published.len(),
+            "Adopted a bridge's published sync addresses"
+        );
+    }
 }

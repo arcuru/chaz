@@ -80,7 +80,7 @@ test_support/        #[cfg(test)] harness: MockBackend, MockHost, fresh_session,
 ```
 main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, bridge dispatch
 bridge/cli.rs        CliBridge — one-shot `-p` / `--print` prompt runner
-bridge/matrix/       MatrixBridge — matrix-sdk login/sync + session bridging (background bridge when `matrix:` configured; `--no-tui` to run headless)
+bridge/cmd.rs        CommandBridge — one-shot `cmd` slash-command runner (non-zero exit on error)
 bridge/tui/          TuiBridge — ratatui-based local interactive surface (default)
 ```
 
@@ -94,7 +94,7 @@ bridge/tui/          TuiBridge — ratatui-based local interactive surface (defa
 - **Tools access system resources through `ToolHost`.** The host (`ctx.host()`) enforces grants at the capability boundary. Tools request capabilities (Shell, FileRead, FileWrite, HttpRequest) rather than calling OS APIs directly. New capability types go in `tool_host.rs`.
 - **Context entries**: only `Message`, `Directive`, and `Summary` enter the LLM context window. `ToolCall`/`ToolResult`/`Ack`/`Error` are audit-only.
 - **System prompts rebuild every turn from `AgentDbConfig`.** `system_prompt` + `system_prompt_files` live on the agent's DB config; ContextBuilder assembles them fresh on each turn, plus any `PromptAugmentation` contributions from the extension hub (skills, memory recall, …). Disk edits to a `system_prompt_files` path require a re-write via `/agent set` to be re-read. No per-session snapshot layer — the previous `PersonaSnapshot` entry type, `persona.rs`, and `role.rs` were all deleted; legacy `role:` configs surface a deprecation message pointing to `/agent set <name> system_prompt <text>`.
-- **A bridge is a transport, not a CLI mode.** Matrix exposes a session to a room; CLI prints one turn; TUI is the local user interface. The flag surface picks the _user interface_; bridges activate based on what they expose. Background bridges (today: Matrix) auto-spawn alongside the TUI when configured. `main.rs` collects them into a `Vec<JoinHandle>` and drains them on TUI exit via an `Arc<Notify>`; the plural shape lets per-agent Matrix logins (one bridge per login; a login belongs to one agent, declared in that agent's `type`-tagged `logins:` list) drop in as a loop body, not a dispatch rewrite. Opt-out via `--no-matrix`; headless via `--no-tui`.
+- **A bridge is a transport, not a CLI mode.** Matrix exposes a session to a room; CLI prints one turn; `cmd` runs one slash command; TUI is the local user interface; `daemon` is all of the runtime and none of the interface. Transport bridges do not live in this binary at all — `chaz-matrix` and `chaz-discord` are separate binaries running as their own peers, each holding its own key and bootstrapping into an agent's DB through a ticket. One bridge process per login; a login belongs to one agent, declared in that agent's `type`-tagged `logins:` list.
 
 ## Test Instance
 

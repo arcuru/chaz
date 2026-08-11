@@ -118,6 +118,8 @@ struct TestExt {
     supported: Vec<HookKind>,
     scopes: Vec<instance::Scope>,
     parts: TestParts,
+    instantiations: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    fail_instantiate: bool,
 }
 
 impl TestExt {
@@ -127,7 +129,22 @@ impl TestExt {
             supported: Vec::new(),
             scopes: vec![instance::Scope::Global],
             parts: TestParts::default(),
+            instantiations: None,
+            fail_instantiate: false,
         }
+    }
+    /// Bump `counter` on every `instantiate` call, so tests can assert
+    /// how many instances the hub actually built.
+    fn instantiation_counter(mut self, counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.instantiations = Some(counter);
+        self
+    }
+    /// Fail `instantiate` *after* the parts are configured, so tests
+    /// can assert that the parts a successful instantiation would have
+    /// published never reach the hub's registries.
+    fn fails_instantiate(mut self) -> Self {
+        self.fail_instantiate = true;
+        self
     }
     fn scopes(mut self, scopes: Vec<instance::Scope>) -> Self {
         self.scopes = scopes;
@@ -178,7 +195,15 @@ impl Extension for TestExt {
     ) -> instance::InstantiateFuture<'a> {
         let manifest = self.manifest();
         let parts = self.parts.clone();
+        let instantiations = self.instantiations.clone();
+        let fail = self.fail_instantiate;
         Box::pin(async move {
+            if let Some(counter) = instantiations {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if fail {
+                return Err(anyhow::anyhow!("simulated instantiation failure"));
+            }
             Ok(Arc::new(TestInstance { manifest, parts }) as Arc<dyn instance::ExtensionInstance>)
         })
     }
@@ -1057,6 +1082,130 @@ async fn install_all_is_idempotent() {
     // Re-installing the same Global extension doesn't double its
     // instance.
     assert!(hub.global_instances.contains_key("solo"));
+}
+
+#[tokio::test]
+async fn install_all_skips_failing_extension_and_installs_the_rest() {
+    let mut hub = test_hub().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // "broken" is configured exactly like a healthy extension — a
+    // command and a before_agent_start hook — and fails only at
+    // instantiate, so anything of its still present in the hub proves
+    // the drain ran on a failed instantiation.
+    let broken = TestExt::new("broken")
+        .command("boom", Arc::new(DummyCmd))
+        .before_agent_start(Arc::new(CountingHook {
+            calls: calls.clone(),
+        }))
+        .fails_instantiate();
+    hub.install_all(vec![
+        cmd_ext("healthy_first", "one"),
+        Arc::new(broken),
+        cmd_ext("healthy_second", "two"),
+    ])
+    .await
+    .expect("one failing instantiation must not fail install_all");
+
+    // Healthy extensions installed normally.
+    assert!(hub.global_instances.contains_key("healthy_first"));
+    assert!(hub.global_instances.contains_key("healthy_second"));
+    assert_eq!(hub.command_owner("one"), Some("healthy_first"));
+    assert_eq!(hub.command_owner("two"), Some("healthy_second"));
+
+    // The failing one is registered but contributes nothing.
+    assert!(hub.extension_names().contains(&"broken"));
+    assert!(!hub.global_instances.contains_key("broken"));
+    assert!(hub.commands_for("broken").is_empty());
+    assert_eq!(hub.command_owner("boom"), None);
+    assert!(hub.hooks_for("broken").is_empty());
+    let ctx = fixture_ctx_with_active(all_active(&["broken"])).await;
+    assert!(hub.fire_before_agent_start(&ctx).await.is_empty());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn install_all_instantiates_duplicate_names_once() {
+    let mut hub = test_hub().await;
+    let instantiations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dup = || {
+        Arc::new(
+            TestExt::new("dup")
+                .before_agent_start(Arc::new(CountingHook {
+                    calls: calls.clone(),
+                }))
+                .instantiation_counter(instantiations.clone()),
+        ) as Arc<dyn Extension>
+    };
+    hub.install_all(vec![dup(), dup()]).await.unwrap();
+
+    // Only the first occurrence of the name instantiates.
+    assert_eq!(instantiations.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // ...and its hook is registered exactly once, so it fires once
+    // per turn.
+    assert_eq!(hub.before_agent_start.len(), 1);
+    let ctx = fixture_ctx_with_active(all_active(&["dup"])).await;
+    let injected = hub.fire_before_agent_start(&ctx).await;
+    assert_eq!(injected.len(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Global extension that parks in `instantiate` until a shared barrier
+/// releases it. Two of these complete only if the hub has both
+/// instantiations in flight at the same time.
+struct BarrierExt {
+    name: &'static str,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+impl Extension for BarrierExt {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn supported_hooks(&self) -> &[HookKind] {
+        &[]
+    }
+    fn instantiate<'a>(
+        &'a self,
+        _scope_ctx: instance::ScopeCtx<'a>,
+    ) -> instance::InstantiateFuture<'a> {
+        let manifest = self.manifest();
+        let barrier = self.barrier.clone();
+        Box::pin(async move {
+            barrier.wait().await;
+            Ok(Arc::new(TestInstance {
+                manifest,
+                parts: TestParts::default(),
+            }) as Arc<dyn instance::ExtensionInstance>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn install_all_instantiates_global_extensions_concurrently() {
+    let mut hub = test_hub().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    // A serial install_all parks "left" on a barrier that "right"
+    // never reaches, and the timeout fires.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        hub.install_all(vec![
+            Arc::new(BarrierExt {
+                name: "left",
+                barrier: barrier.clone(),
+            }),
+            Arc::new(BarrierExt {
+                name: "right",
+                barrier: barrier.clone(),
+            }),
+        ]),
+    )
+    .await
+    .expect("Global instantiations must run concurrently")
+    .unwrap();
+
+    assert!(hub.global_instances.contains_key("left"));
+    assert!(hub.global_instances.contains_key("right"));
 }
 
 // -----------------------------------------------------------------

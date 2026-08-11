@@ -82,6 +82,49 @@ pub(crate) fn is_home_for_agent_ref(
     }
 }
 
+/// Pure decider for migrating a session whose home peer is a bridge.
+///
+/// A session created by a standalone bridge records the *bridge* as its home
+/// peer, because whoever attaches the agent writes their own key and re-attach
+/// deliberately preserves it. Bridges run no agent loop, so such a session is
+/// permanently mute: it syncs, registers, and looks healthy while nothing will
+/// ever take a turn on it.
+///
+/// Returns the stale home pubkey to replace, or `None` to leave the session
+/// alone. `None` covers every case that is not provably a bridge: an unset
+/// home (legacy — any keyholder runs), a home that is already this peer, an
+/// unparseable value, and — importantly — a home naming some other *agent*
+/// peer, which is a legitimate remote host whose turns are not ours to seize.
+///
+/// `bridge_pubkeys` are the peer keys published by the bridges registered in
+/// this agent's DB, which is what makes "this home is a bridge" a fact rather
+/// than an inference.
+///
+/// Split out as a free function so it can be tested without a `Server`.
+pub(crate) fn bridge_home_to_migrate(
+    agents: &[crate::session::AgentRef],
+    agent_db_id: &str,
+    my_pubkey_on_agent: &eidetica::auth::crypto::PublicKey,
+    bridge_pubkeys: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let agent_ref = agents.iter().find(|a| a.db_id == agent_db_id)?;
+    let home_str = agent_ref.home_pubkey.as_deref()?;
+    let home_pk = eidetica::auth::crypto::PublicKey::from_prefixed_string(home_str).ok()?;
+    if &home_pk == my_pubkey_on_agent {
+        return None;
+    }
+    // Compare in the parsed key's canonical form: the stored string and the
+    // published one are both written by `to_string()`, but a value that
+    // round-trips differently must not read as "not a bridge" and strand the
+    // session, so normalise both sides rather than trusting the text.
+    let home_canonical = home_pk.to_string();
+    bridge_pubkeys
+        .iter()
+        .filter_map(|k| eidetica::auth::crypto::PublicKey::from_prefixed_string(k).ok())
+        .any(|k| k.to_string() == home_canonical)
+        .then(|| home_str.to_string())
+}
+
 /// Per-session runtime state needed for agent processing.
 /// Keyed by `session_db_id` in `Server::sessions`.
 struct SessionRuntime {

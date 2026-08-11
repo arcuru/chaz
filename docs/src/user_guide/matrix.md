@@ -61,6 +61,40 @@ configuration and behavior.
 
 The bot then logs in, accepts invites from allowed users, and starts responding.
 
+### Scripted bring-up
+
+The approval round-trip in step 5 exists because the bridge's key is unknown
+until it first asks. Ask it directly instead, and the whole sequence runs
+unattended — useful for provisioning and required for automated tests.
+
+Run these with both processes stopped: each opens a state directory, and two
+processes on one backend do not observe each other's writes.
+
+```bash
+# 1. The bridge's identity, generated on first call and stable thereafter.
+KEY=$(chaz-matrix --config matrix-bridge.yaml --print-pubkey)
+
+# 2. Pre-authorize it on the daemon, so there is nothing left to approve.
+chaz --config config.yaml cmd "/agent invite chaz $KEY write"
+
+# 3. Mint the ticket.
+chaz --config config.yaml cmd '/agent share chaz'
+```
+
+Put that ticket in the bridge config, then start the daemon and the bridge.
+The bridge logs `Access was pre-authorized` and comes straight up.
+
+Two things worth knowing:
+
+- **Strip `&pr=iroh:` hints from the ticket when the two processes share a
+  host.** The daemon mints a fresh iroh endpoint on every restart and nothing
+  revises what was already recorded, so a pasted iroh address outlives the run
+  that published it. Sync tries every recorded address, and each dead one costs
+  a full timeout on every pass. A `pr=http:` hint pointing at the daemon's
+  `sync_listen` is what actually connects host-local.
+- **`/agent share` also writes the ticket to `$XDG_CONFIG_HOME/chaz/shares/`.**
+  Point `XDG_CONFIG_HOME` somewhere disposable if you do not want that.
+
 ## Message Handling
 
 - **DMs**: The bot responds to every message

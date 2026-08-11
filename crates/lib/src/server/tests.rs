@@ -902,6 +902,100 @@ async fn peer_is_home_for_returns_false_when_home_is_another_peer() {
     assert!(!server.peer_is_home_for(&sid, "alpha").await);
 }
 
+// ---- Bridge-home migration ------------------------------------------
+
+fn bridge_set(keys: &[&eidetica::auth::crypto::PublicKey]) -> std::collections::HashSet<String> {
+    keys.iter().map(|k| k.to_string()).collect()
+}
+
+#[tokio::test]
+async fn a_session_hosted_on_a_bridge_is_migrated() {
+    let (_inst, _server, registry) = server_fixture().await;
+    let me = registry.new_ephemeral_key("me").await.unwrap();
+    let bridge = registry.new_ephemeral_key("bridge").await.unwrap();
+    let agents = vec![make_agent_ref("sha256:agent", Some(&bridge.to_string()))];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(
+            &agents,
+            "sha256:agent",
+            &me,
+            &bridge_set(&[&bridge])
+        ),
+        Some(bridge.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_session_hosted_on_another_agent_peer_is_left_alone() {
+    // The case that must not regress: a legitimate remote host is not a
+    // bridge, and seizing its sessions would break the single-owner
+    // guarantee the home pubkey exists to provide.
+    let (_inst, _server, registry) = server_fixture().await;
+    let me = registry.new_ephemeral_key("me").await.unwrap();
+    let bridge = registry.new_ephemeral_key("bridge").await.unwrap();
+    let peer = registry.new_ephemeral_key("other-daemon").await.unwrap();
+    let agents = vec![make_agent_ref("sha256:agent", Some(&peer.to_string()))];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(
+            &agents,
+            "sha256:agent",
+            &me,
+            &bridge_set(&[&bridge])
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_session_already_hosted_here_is_left_alone() {
+    let (_inst, _server, registry) = server_fixture().await;
+    let me = registry.new_ephemeral_key("me").await.unwrap();
+    let agents = vec![make_agent_ref("sha256:agent", Some(&me.to_string()))];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(&agents, "sha256:agent", &me, &bridge_set(&[&me])),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_or_corrupt_home_is_left_alone() {
+    // Both fall through to the existing "any keyholder runs" behaviour
+    // rather than being rewritten on a guess.
+    let (_inst, _server, registry) = server_fixture().await;
+    let me = registry.new_ephemeral_key("me").await.unwrap();
+    let bridge = registry.new_ephemeral_key("bridge").await.unwrap();
+    let set = bridge_set(&[&bridge]);
+    let legacy = vec![make_agent_ref("sha256:agent", None)];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(&legacy, "sha256:agent", &me, &set),
+        None
+    );
+    let corrupt = vec![make_agent_ref("sha256:agent", Some("not-a-pubkey"))];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(&corrupt, "sha256:agent", &me, &set),
+        None
+    );
+}
+
+#[tokio::test]
+async fn no_published_bridge_keys_migrates_nothing() {
+    // Logins predating the published-identity field leave the set empty.
+    // That must cost a missed migration, never a wrong one.
+    let (_inst, _server, registry) = server_fixture().await;
+    let me = registry.new_ephemeral_key("me").await.unwrap();
+    let bridge = registry.new_ephemeral_key("bridge").await.unwrap();
+    let agents = vec![make_agent_ref("sha256:agent", Some(&bridge.to_string()))];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(
+            &agents,
+            "sha256:agent",
+            &me,
+            &std::collections::HashSet::new()
+        ),
+        None
+    );
+}
+
 // ---- process_session gate -------------------------------------------
 
 /// Register an Agent in the in-memory registry so resolve_agent_for_entry

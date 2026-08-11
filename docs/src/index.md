@@ -25,13 +25,16 @@ chaz --config config.yaml "Summarize today's stand-up."
 # Single-shot print mode (scriptable; one ReAct turn then exit)
 chaz --config config.yaml -p "Summarize today's stand-up."
 
-# Headless Matrix bot (no TUI; for daemons / containers)
-chaz --config config.yaml --no-tui
+# Run one /command and exit (scriptable; exits non-zero on error)
+chaz --config config.yaml cmd '/agents'
+
+# Headless daemon (no TUI; for systemd / containers / tests)
+chaz --config config.yaml daemon
 ```
 
-When `matrix:` is configured, the Matrix bridge also runs in the
-background alongside the TUI by default. Pass `--no-matrix` to suppress it
-for a single run.
+Transport bridges are separate binaries running as their own peers —
+start `chaz-matrix` alongside the daemon rather than expecting the agent
+process to spawn it.
 
 `--config` is optional: when omitted, chaz falls back to
 `$XDG_CONFIG_HOME/chaz/config.yaml` (typically `~/.config/chaz/config.yaml`).

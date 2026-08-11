@@ -93,23 +93,54 @@ chaz --config config.yaml "Summarize the last meeting notes."
 
 Type `/help` to see available commands.
 
-## Running the Matrix Bot
+## Running as a daemon
 
-When `matrix:` is configured, the Matrix bridge spawns automatically in
-the background alongside the TUI — you can drive a session locally while
-Matrix room users chat into the same session. To run headless (no TUI;
-intended for daemons or containers):
+The TUI needs a terminal — it puts one into raw mode and takes over the
+alternate screen. To run the same peer without one, use the `daemon`
+subcommand:
 
 ```bash
-chaz --config config.yaml --no-tui
+chaz --config config.yaml daemon
 ```
 
-To suppress the background Matrix bridge for a single TUI run, pass
-`--no-matrix`.
+This runs sync, schedules, the routine engine, and the agent loop with no user
+interface, logging to stdout for systemd, a container, or a supervisor to
+collect. It stops cleanly on Ctrl-C or `SIGTERM`.
 
-The bot will log in to Matrix, accept room invites from allowed users, and respond to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages or messages that @-mention the bot.
+This is also the process transport bridges sync against.
 
-See [Matrix Bot](matrix.md) for details.
+## Running the Matrix Bot
+
+The Matrix bridge is its own binary and its own peer — `chaz-matrix`, started
+separately from the agent process rather than spawned inside it:
+
+```bash
+chaz --config config.yaml daemon &          # the peer that runs agents
+chaz-matrix --config matrix-bridge.yaml     # pure Matrix transport
+```
+
+The bridge holds the Matrix login, and reaches the agent's database through an
+access ticket. It runs no agents and calls no LLM itself: inbound messages are
+written into session databases, and the daemon's replies sync back out to the
+room.
+
+The bot logs in to Matrix, accepts room invites from allowed users, and responds to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages or messages that @-mention the bot.
+
+See [Matrix Bot](matrix.md) for setup, including a scripted bring-up.
+
+## Running one command
+
+Any `/command` the TUI accepts can be run non-interactively:
+
+```bash
+chaz --config config.yaml cmd '/agents'
+chaz --config config.yaml cmd '/sharing requests'
+```
+
+The result goes to stdout, and a command that reports an error exits non-zero,
+so scripts can branch on it. Run it with the daemon stopped — it opens the same
+state directory, and two processes on one backend do not observe each other's
+writes.
 
 ## Single-shot print mode
 

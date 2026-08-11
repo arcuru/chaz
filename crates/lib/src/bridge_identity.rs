@@ -14,18 +14,29 @@
 //!    resolves to a [`BootstrapOutcome`]: `Approved` when the bridge's key was
 //!    already authorized, `Pending` when the owner must approve via
 //!    `/sharing approve` first (the bridge retries later).
-//! 3. [`establish_login`] — request `Read` on the owning agent's DB via a
+//! 3. [`establish_login`] — request `Write` on the owning agent's DB via a
 //!    ticket, carrying the public [`LoginRef`](crate::agent_db::LoginRef)
 //!    pointer as bootstrap metadata. The approving owner reads the pointer off
-//!    that metadata and registers it, so the bridge never writes to the agent
-//!    DB itself.
+//!    that metadata and registers it; the bridge falls back to registering it
+//!    itself when no request was ever queued for an owner to observe.
 //!
-//! `Read` suffices on the agent DB because the bridge no longer self-registers
-//! its pointer: eidetica carries free-form metadata on a bootstrap request, so
-//! the owner learns the bridge-created settings-DB id at request time and
-//! writes the registry entry. A proxy-writer holding `Write` on the agent's own
-//! DB was more authority than the design wanted. The bridge still needs `Write`
-//! on **session** DBs, to proxy-write inbound transport messages.
+//! ## Why `Write` and not `Read`
+//!
+//! A bridge held `Read` for a while, on the reasoning that pointer registration
+//! was the only thing needing write authority and bootstrap metadata had just
+//! made that unnecessary. That was true of the *login handshake* and false of
+//! everything after it: exposing a session writes to the agent DB's session
+//! registry (`AgentDb::expose_session_on`) on every new channel, and with `Read`
+//! that write fails, aborting the inbound-message path before the session is
+//! usable. Per-channel exposure is the ongoing equivalent of one-time pointer
+//! registration and has no metadata channel to ride.
+//!
+//! So the bridge asks for `Write` again. This is a deliberate reversal, not
+//! drift — a proxy-writer holding write authority on the agent's own database is
+//! more than the design wants, and moving exposure onto a channel the bridge
+//! already owns (its session DBs) is the change that would let `Read` return.
+//! `Write` on **session** DBs, where it proxies inbound transport messages, was
+//! never in question.
 
 #![allow(dead_code)]
 
@@ -42,6 +53,10 @@ use tracing::{info, warn};
 /// Display name carried by a bridge's own eidetica key — also the
 /// `requesting_key_name` used when bootstrapping access.
 pub const BRIDGE_KEY_NAME: &str = "bridge";
+
+/// Write priority granted to / requested by a bridge, matching the value chaz
+/// uses for agent and bank writes (`Permission::Write(10)`).
+const BRIDGE_WRITE_PRIORITY: u32 = 10;
 
 /// Ensure the bridge holds its own persistent eidetica key, generating and
 /// persisting one on first run. Idempotent: an existing key with `key_name`
@@ -77,11 +92,25 @@ pub trait AccessBootstrap {
     ) -> anyhow::Result<BootstrapOutcome>;
 }
 
-/// Live `AccessBootstrap` over an eidetica `Sync` handle. Issues a single
-/// `User::request_database_access` (trying every address hint in the ticket); the
-/// owner-side approval is the existing chaz `/sharing` flow. Retry-until-
-/// approved is the caller/binary's concern (the request stays queued on the
-/// owner, and a `Pending` outcome tells the binary to come back later).
+/// Live `AccessBootstrap` over an eidetica `Sync` handle. Drives
+/// `User::request_database_access`; the owner-side approval is the existing
+/// chaz `/sharing` flow. Retry-until-approved is the caller/binary's concern
+/// (the request stays queued on the owner, and a `Pending` outcome tells the
+/// binary to come back later).
+///
+/// Address hints are tried **one at a time**, in ticket order, rather than
+/// handing the whole ticket to eidetica at once. Eidetica races every hint
+/// concurrently — right for reachability, wrong for request filing: each racer
+/// runs a full bootstrap round-trip and files its own request, so a two-hint
+/// ticket leaves two entries in the owner's approval queue with identical
+/// `(database, key, permission)`. The requester keeps only the last outcome, so
+/// approving one leaves the other pending forever. Splitting the ticket costs
+/// the fallback's latency (a dead first hint must time out before the second is
+/// tried) and buys exactly one queue entry per bootstrap.
+///
+/// Only a transport failure advances to the next hint. A `Pending` outcome is a
+/// definitive answer — the request is filed — so we stop there rather than
+/// filing a duplicate against the same peer by another route.
 pub struct SyncBootstrap {
     pub sync: Arc<Sync>,
 }
@@ -101,27 +130,50 @@ impl AccessBootstrap for SyncBootstrap {
         permission: Permission,
         metadata: Option<Doc>,
     ) -> anyhow::Result<BootstrapOutcome> {
-        match user
-            .request_database_access(&self.sync, ticket, key, permission, metadata)
-            .await
-        {
-            Ok(()) => Ok(BootstrapOutcome::Approved),
-            Err(e) => {
-                if let eidetica::Error::Sync(boxed) = &e
-                    && let SyncError::BootstrapPending {
-                        request_id,
-                        message,
-                    } = boxed.as_ref()
-                {
-                    return Ok(BootstrapOutcome::Pending {
-                        request_id: request_id.clone(),
-                        message: message.clone(),
-                    });
+        let mut last_err = None;
+        for attempt in single_address_tickets(ticket) {
+            match user
+                .request_database_access(&self.sync, &attempt, key, permission, metadata.clone())
+                .await
+            {
+                Ok(()) => return Ok(BootstrapOutcome::Approved),
+                Err(e) => {
+                    if let eidetica::Error::Sync(boxed) = &e
+                        && let SyncError::BootstrapPending {
+                            request_id,
+                            message,
+                        } = boxed.as_ref()
+                    {
+                        // Filed. Stop — another hint would file a duplicate.
+                        return Ok(BootstrapOutcome::Pending {
+                            request_id: request_id.clone(),
+                            message: message.clone(),
+                        });
+                    }
+                    if let Some(addr) = attempt.addresses().first() {
+                        warn!(address = ?addr, "Bootstrap attempt failed, trying next hint: {e}");
+                    }
+                    last_err = Some(e);
                 }
-                Err(e.into())
             }
         }
+        Err(match last_err {
+            Some(e) => e.into(),
+            None => anyhow::anyhow!("ticket carries no address hints to bootstrap against"),
+        })
     }
+}
+
+/// Split a ticket into one single-hint ticket per address, preserving order.
+/// A ticket with no hints yields nothing — there is nothing to dial.
+fn single_address_tickets(ticket: &DatabaseTicket) -> Vec<DatabaseTicket> {
+    ticket
+        .addresses()
+        .iter()
+        .map(|addr| {
+            DatabaseTicket::with_addresses(ticket.database_id().clone(), vec![addr.clone()])
+        })
+        .collect()
 }
 
 /// Identity of the bridge issuing a bootstrap request: its own key plus the
@@ -133,18 +185,19 @@ pub struct BridgeIdentity<'a> {
 
 /// Bring one bridged login online against its owning agent:
 ///
-/// 1. request `Read` on the agent DB the `ticket` points at (via the
+/// 1. request `Write` on the agent DB the `ticket` points at (via the
 ///    [`AccessBootstrap`] seam), carrying the [`LoginRef`] as bootstrap
 ///    metadata,
 /// 2. if the request is still `Pending` owner approval, return that outcome —
 ///    nothing is registered yet and the binary retries after approval,
-/// 3. otherwise confirm the owner registered the pointer on our behalf.
+/// 3. otherwise confirm the pointer is registered, writing it ourselves if the
+///    owner never saw a request to read it off.
 ///
-/// The bridge holds `Read` here, not `Write`: it does not write its own
-/// pointer into the agent DB, the approving owner does, reading it off the
-/// bootstrap metadata. A proxy-writer needs no write authority on the agent's
-/// own database. `Write` on *session* DBs is separate and unchanged — that is
-/// where the bridge proxies inbound transport messages.
+/// The approving owner registering the pointer from metadata remains the
+/// preferred path — it is what lets `/sharing requests` show the operator which
+/// login a grant would claim, *before* granting it. Self-registration is the
+/// fallback for the one case that path cannot cover (see step 3), not a return
+/// to the bridge publishing its own pointer by default.
 ///
 /// The secret details were already seeded into the bridge's own DB (the
 /// bridge manages that); the pointer published here is non-secret.
@@ -160,7 +213,7 @@ pub async fn establish_login<B: AccessBootstrap>(
             user,
             ticket,
             identity.key,
-            Permission::Read,
+            Permission::Write(BRIDGE_WRITE_PRIORITY),
             Some(login.to_metadata()?),
         )
         .await?;
@@ -173,31 +226,71 @@ pub async fn establish_login<B: AccessBootstrap>(
         );
         return Ok(outcome);
     }
-    // Approved. The owner writes the pointer when it approves a queued
-    // request, so on that path it is already there. A key the owner had
-    // pre-authorized (e.g. via `/agent invite`) is approved without ever
-    // queueing a request, so nothing observed our metadata — and holding only
-    // `Read` we cannot write the pointer ourselves. Say so plainly rather
-    // than leaving the login silently undiscoverable.
+    // Approved. `request_database_access` tracks the database with sync
+    // **disabled** by default, so without this the agent DB is openable but
+    // never converges — neither eidetica's background engine nor chaz's keyed
+    // reconciler looks at a database whose owner has not asked for sync. A
+    // bridge always wants its agent DB syncing; that is the whole point of
+    // bootstrapping it.
+    //
+    // Best-effort: `track_database` re-discovers the SigKey and fails if this
+    // key holds no authority on the database. That cannot happen on the path
+    // that just approved us, but a caller whose access arrived some other way
+    // should get a loud warning and a working login rather than a hard abort.
     let agent_db_id = ticket.database_id();
+    if let Err(e) = user
+        .track_database(
+            agent_db_id.clone(),
+            identity.key,
+            eidetica::user::types::SyncSettings::on_commit(),
+        )
+        .await
+    {
+        warn!(
+            agent_db = %agent_db_id,
+            "Could not enable sync on the agent DB ({e}); it will open locally but \
+             never receive the daemon's writes"
+        );
+    }
+
+    // The owner writes the pointer when it approves a queued request, so on
+    // that path it is already there. A key the owner had pre-authorized (e.g.
+    // via `/agent invite`) is approved without ever queueing a request, so
+    // nothing observed our metadata. Holding `Write` we can publish it
+    // ourselves rather than leaving the login silently undiscoverable — which
+    // is what a Read-only bridge had to do, and what it warned about here.
     let database = user.open_database(agent_db_id).await?;
     let agent_db = AgentDb::from_database(database);
-    if agent_db.find_login(&login.identifier).await?.is_some() {
-        info!(
-            agent_db = %agent_db_id,
-            login = %login.identifier,
-            "Bridge login pointer present in agent DB"
-        );
+    if let Some(existing) = agent_db.find_login(&login.identifier).await? {
+        // The pointer already being there is not a reason to leave it alone.
+        // It carries where this bridge is reachable, and this process takes a
+        // fresh transport address every time it starts — so a pointer written
+        // by a previous run names an endpoint nobody is listening on, and the
+        // daemon dials it and waits for an answer that cannot come.
+        if existing.peer_pubkey != login.peer_pubkey
+            || existing.sync_addresses != login.sync_addresses
+        {
+            agent_db.register_login(login.clone()).await?;
+            info!(
+                agent_db = %agent_db_id,
+                login = %login.identifier,
+                "Refreshed this bridge's published sync identity in the agent DB"
+            );
+        } else {
+            info!(
+                agent_db = %agent_db_id,
+                login = %login.identifier,
+                "Bridge login pointer present in agent DB and already current"
+            );
+        }
     } else {
-        warn!(
+        agent_db.register_login(login.clone()).await?;
+        info!(
             agent_db = %agent_db_id,
             login = %login.identifier,
             bridge_db = %login.bridge_db_id,
             "Access was pre-authorized, so no bootstrap request carried this \
-             login's pointer and the owner never registered it. The login works \
-             but peers cannot discover it. To publish the pointer, revoke this \
-             bridge's pre-authorization on the owning peer and let it bootstrap \
-             through the normal `/sharing approve` path."
+             login's pointer; registered it directly"
         );
     }
     Ok(outcome)
@@ -300,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn establish_login_requests_read_and_carries_the_pointer() {
+    async fn establish_login_requests_write_and_carries_the_pointer() {
         let mut user = test_user().await;
         let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
         let (agent_db, _) = create_agent_db(
@@ -331,6 +424,8 @@ mod tests {
                 kind: "matrix".to_string(),
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: None,
+                sync_addresses: Vec::new(),
             },
         )
         .await
@@ -343,14 +438,16 @@ mod tests {
             (seen.permission, seen.metadata.clone())
         };
 
-        // The bridge asks for Read, not Write: the owner writes the pointer.
+        // Write, because exposing a session writes to the agent DB's session
+        // registry on every new channel — `Read` aborts the inbound path there.
         assert_eq!(
             permission,
-            Some(Permission::Read),
-            "bridge must not request write authority on the agent DB"
+            Some(Permission::Write(BRIDGE_WRITE_PRIORITY)),
+            "bridge needs write authority for per-channel session exposure"
         );
 
-        // ...and hands the owner the pointer to register, via metadata.
+        // ...and still hands the owner the pointer to register, via metadata,
+        // so `/sharing requests` can show the claim before it is granted.
         let carried = LoginRef::from_metadata(
             metadata
                 .as_ref()
@@ -361,9 +458,54 @@ mod tests {
         assert_eq!(carried.identifier, "@chaz:example");
         assert_eq!(carried.bridge_db_id, settings_db_id.to_string());
 
-        // Nothing self-registered: this stub models a pre-authorized key, so
-        // no request was queued for an owner to approve and act on.
-        assert!(agent_db.list_logins().await.unwrap().is_empty());
+        // This stub models a pre-authorized key: no request was queued, so no
+        // owner ever saw the metadata. Holding Write, the bridge publishes the
+        // pointer itself rather than leaving the login undiscoverable.
+        let logins = agent_db.list_logins().await.unwrap();
+        assert_eq!(logins.len(), 1, "pre-authorized login must self-register");
+        assert_eq!(logins[0].identifier, "@chaz:example");
+        assert_eq!(logins[0].bridge_db_id, settings_db_id.to_string());
+    }
+
+    #[test]
+    fn a_multi_hint_ticket_splits_into_one_ticket_per_hint() {
+        use eidetica::sync::Address;
+        let db_id = eidetica::entry::ID::parse(
+            "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y",
+        )
+        .unwrap();
+        let http = Address::http("127.0.0.1:9801");
+        let iroh = Address::iroh("endpointabx2tmyeynpdg27kdcu55gwrqgwavj66");
+        let ticket =
+            DatabaseTicket::with_addresses(db_id.clone(), vec![http.clone(), iroh.clone()]);
+
+        let split = single_address_tickets(&ticket);
+
+        // One dial per hint, so the owner sees at most one queued request per
+        // bootstrap instead of one per hint.
+        assert_eq!(split.len(), 2);
+        // Ticket order is preserved — the first hint is tried first, and the
+        // second is only reached if the first fails at the transport level.
+        assert_eq!(split[0].addresses(), &[http]);
+        assert_eq!(split[1].addresses(), &[iroh]);
+        for t in &split {
+            assert_eq!(t.database_id(), &db_id);
+        }
+    }
+
+    #[test]
+    fn a_ticket_with_no_hints_yields_no_attempts() {
+        // Nothing to dial: `request_access` must report that rather than
+        // silently reporting success or looping.
+        assert!(
+            single_address_tickets(&DatabaseTicket::new(
+                eidetica::entry::ID::parse(
+                    "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y"
+                )
+                .unwrap()
+            ))
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -372,6 +514,8 @@ mod tests {
             kind: "discord".to_string(),
             identifier: "chaz#4242".to_string(),
             bridge_db_id: "bafyrbridgedb".to_string(),
+            peer_pubkey: None,
+            sync_addresses: Vec::new(),
         };
         let decoded = LoginRef::from_metadata(&login.to_metadata().unwrap()).unwrap();
         assert_eq!(decoded, login);
@@ -416,6 +560,8 @@ mod tests {
                 kind: "matrix".to_string(),
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: None,
+                sync_addresses: Vec::new(),
             },
         )
         .await
@@ -454,6 +600,8 @@ mod tests {
                 kind: "matrix".to_string(),
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: None,
+                sync_addresses: Vec::new(),
             },
         )
         .await;
