@@ -360,7 +360,12 @@ where
     };
     let send = Arc::new(send);
     session_db
-        .on_write(move |_event, db| {
+        .on_write(move |event, db| {
+            // Fires for local commits and for sync ingest alike: a co-owner's
+            // agent replying into a shared session has to reach this
+            // transport too, and the delta pass below handles a batch that
+            // lands several entries at once.
+            tracing::trace!(session = %sid, source = ?event.source(), "Session write; reconciling the transport");
             let agents = agents.clone();
             let owning_agent = owning_agent.clone();
             let db = db.clone();

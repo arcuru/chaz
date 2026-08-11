@@ -1160,7 +1160,10 @@ async fn setup_session(
 
     let notify_id = session_db_id;
     session_db
-        .on_write(move |_event, _db| {
+        .on_write(move |event, _db| {
+            // Source-agnostic: a co-owner's message landing over sync should
+            // redraw the tab as readily as one typed here.
+            tracing::trace!(session = %notify_id, source = ?event.source(), "Session write; redrawing the tab");
             let tx = notify_tx.clone();
             let id = notify_id.clone();
             Box::pin(async move {

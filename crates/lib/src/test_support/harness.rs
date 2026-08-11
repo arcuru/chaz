@@ -30,6 +30,24 @@ pub(crate) async fn fresh_eidetica() -> (Instance, User) {
     (instance, user)
 }
 
+/// Re-deliver a database's current tips as if they had arrived from a peer:
+/// demote them to `Unverified`, then re-run the local verification pass.
+///
+/// That is the same two-step `Instance::put_remote_entries` performs on sync
+/// ingest — store unverified, verify inline — so subscribers observe one
+/// batched write event carrying `WriteSource::Remote`. It buys a
+/// remote-sourced event without standing up a second peer and a transport.
+pub(crate) async fn replay_tips_as_remote(instance: &Instance, db: &eidetica::Database) {
+    let tips = db.snapshot().await.unwrap().into_tips();
+    for id in &tips {
+        instance
+            .demote_to_unverified(db.root_id(), id)
+            .await
+            .unwrap();
+    }
+    db.verify().await.unwrap();
+}
+
 /// Build an empty `SecretStore` backed by a fresh in-memory eidetica DB.
 /// Used by `BackendManager::with_mock` (which holds the store for type
 /// compatibility but never reads it on the mock dispatch path).

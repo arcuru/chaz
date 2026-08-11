@@ -46,7 +46,11 @@ pub async fn spawn_session_db_approval_proxy(
     // Watch the session DB; every write pings the resolver to rescan decisions.
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(32);
     match session_db
-        .on_write(move |_event, _db| {
+        .on_write(move |event, _db| {
+            // Source-agnostic on purpose: the decision this proxy is waiting
+            // for is written by the bridge, which on a split deployment is a
+            // separate peer — so it reaches this DB as a `Remote` write.
+            debug!(source = ?event.source(), "Session write; rescanning approval decisions");
             let ping_tx = ping_tx.clone();
             Box::pin(async move {
                 let _ = ping_tx.send(()).await;

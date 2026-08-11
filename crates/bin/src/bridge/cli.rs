@@ -101,7 +101,12 @@ impl Bridge for CliBridge {
         // listener for response detection.
         let (notify_tx, mut notify_rx) = mpsc::channel::<()>(8);
         session_db
-            .on_write(move |_event, _db| {
+            .on_write(move |event, _db| {
+                // Not gated on `Local`. `chaz cmd` against a session whose
+                // agent runs on the daemon sees the reply arrive over sync,
+                // so a Local-only listener would wait out the whole run and
+                // print nothing.
+                tracing::trace!(source = ?event.source(), "Session write; checking for a reply");
                 let tx = notify_tx.clone();
                 Box::pin(async move {
                     let _ = tx.send(()).await;

@@ -961,7 +961,11 @@ async fn attach_approval_watcher(
     let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let db = session_db.clone();
     session_db
-        .on_write(move |_event, _db| {
+        .on_write(move |event, _db| {
+            // Must not be gated on `Local`: the request this renders is
+            // written by the daemon running the agent, which on a split
+            // deployment is a different peer and arrives via sync.
+            tracing::trace!(session = %sid, source = ?event.source(), "Session write; rescanning approval requests");
             let room = room.clone();
             let pending = pending.clone();
             let seen = seen.clone();
