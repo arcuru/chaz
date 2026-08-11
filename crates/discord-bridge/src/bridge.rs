@@ -89,6 +89,7 @@ impl Bridge for DiscordBridge {
             config: self.config.clone(),
             allowed_users: self.creds.allowed_users.clone(),
             attached: Arc::new(Mutex::new(HashSet::new())),
+            seen_messages: Arc::new(Mutex::new(HashSet::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             bot_id: Arc::new(Mutex::new(None)),
         };
@@ -120,6 +121,10 @@ struct Handler {
     /// Session db ids that already have a reconciler installed — guards the
     /// `on_write` callback against double-install on later messages.
     attached: Arc<Mutex<HashSet<String>>>,
+    /// Message ids already ingested this process. The gateway replays messages
+    /// when the connection is resumed, and a replay must not write the inbound
+    /// entry a second time or re-run a `!chaz approve` against a later prompt.
+    seen_messages: Arc<Mutex<HashSet<MessageId>>>,
     /// Posted tool-approval prompts awaiting a reaction/command, keyed by the
     /// prompt message id.
     pending: PendingApprovals,
@@ -140,6 +145,11 @@ impl Handler {
     async fn handle_message(&self, ctx: &Context, msg: &Message) -> anyhow::Result<()> {
         // Never react to bots (covers our own messages and other integrations).
         if msg.author.bot {
+            return Ok(());
+        }
+        // Gateway redelivery: everything below this point either writes to the
+        // session DB or resolves an approval, and neither is idempotent.
+        if !first_delivery(&self.seen_messages, msg.id).await {
             return Ok(());
         }
         // Allow-list, when configured.
@@ -436,6 +446,17 @@ impl Handler {
             error!("Failed to send command response: {e}");
         }
     }
+}
+
+/// Record `id` as handled, reporting whether this is its first delivery.
+///
+/// serenity replays gateway events when a dropped connection is resumed, so the
+/// same message can arrive more than once. The inbound path is not idempotent —
+/// it appends a session entry, and a replayed `!chaz approve` would resolve
+/// whatever prompt is pending *now* rather than the one it answered — so a
+/// replay is dropped here.
+async fn first_delivery(seen: &Mutex<HashSet<MessageId>>, id: MessageId) -> bool {
+    seen.lock().await.insert(id)
 }
 
 /// Small helper so the various send sites read uniformly.
@@ -774,7 +795,23 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_message, hard_split};
+    use super::{chunk_message, first_delivery, hard_split};
+    use serenity::model::id::MessageId;
+    use std::collections::HashSet;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn a_replayed_message_is_only_delivered_once() {
+        let seen = Mutex::new(HashSet::new());
+        let replayed = MessageId::new(42);
+
+        assert!(first_delivery(&seen, replayed).await);
+        // Resuming the gateway session redelivers the same event.
+        assert!(!first_delivery(&seen, replayed).await);
+        // A different message is unaffected.
+        assert!(first_delivery(&seen, MessageId::new(43)).await);
+        assert!(!first_delivery(&seen, MessageId::new(43)).await);
+    }
 
     /// Every chunk must respect the char ceiling — the whole point of the split.
     fn assert_within_limit(chunks: &[String], limit: usize) {
