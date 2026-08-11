@@ -315,6 +315,97 @@ async fn unknown_tool_name_returns_synthetic_message_to_llm() {
 }
 
 #[tokio::test]
+async fn tool_from_a_still_starting_source_is_reported_as_not_yet_loaded() {
+    // A name in a still-loading namespace is a race, not a bad name. The
+    // model has to be able to tell them apart: one is worth retrying, the
+    // other is worth giving up on.
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool::new());
+    registry.announce_pending_source("filesystem");
+    let ctx = tool_context(session, Arc::new(registry));
+    let security = permissive_security();
+    let policies = ToolPolicyRegistry::empty();
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "c1".into(),
+        "filesystem__read_file".into(),
+        json!({}).to_string(),
+    )]);
+    mock.push_text("waited it out");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+
+    let outcome = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("read a file".into())],
+        &backend,
+        &security,
+        &ctx,
+        &policies,
+        None,
+        None,
+    )
+    .await
+    .expect("ok");
+
+    assert_eq!(outcome.body, "waited it out");
+    let content = calls_tool_result_content(&mock.recorded_calls()[1].messages)
+        .expect("the miss surfaces as a ToolResult");
+    assert!(
+        content.contains("not available yet") && content.contains("filesystem"),
+        "a pending source must be named as still starting, got: {content}"
+    );
+    assert!(
+        !content.contains("Unknown tool"),
+        "a pending source must not be reported as an unknown tool, got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn tool_registered_after_scoping_is_advertised_on_the_next_turn() {
+    // The load-bearing property of background MCP startup: a session built
+    // before a server finished still advertises that server's tools once
+    // they land, with no reload and no invalidation protocol. `ScopedTools`
+    // holds an `Arc<ToolRegistry>` and reads through it per turn.
+    let registry = Arc::new(ToolRegistry::new());
+    let scoped = crate::tool::ScopedTools::new(registry.clone(), None);
+    let profile = crate::tool::ToolProfile::default();
+
+    assert!(
+        scoped.definitions(&profile).is_empty(),
+        "nothing registered yet"
+    );
+
+    // Registration happens through the same `&self` path a background MCP
+    // startup task uses, against a handle that was already scoped.
+    registry.register(EchoTool::new());
+
+    let names: Vec<String> = scoped
+        .definitions(&profile)
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "echo"),
+        "a late registration must be visible to an already-built scope, got: {names:?}"
+    );
+    assert!(
+        scoped.get("echo").is_some(),
+        "and callable through the same scope"
+    );
+}
+
+/// First `ToolResult` content in a recorded message list, if any.
+fn calls_tool_result_content(messages: &[RuntimeMessage]) -> Option<String> {
+    messages.iter().find_map(|m| match m {
+        RuntimeMessage::ToolResult { content, .. } => Some(content.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
 async fn tool_execution_error_surfaces_to_llm_and_run_continues() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;

@@ -494,8 +494,15 @@ impl RegistryEntry {
 /// can share ownership of each tool with the registry — built from the hub
 /// at startup in `main.rs`. Owner attribution lets `ScopedTools` filter by
 /// per-session active-extension set.
+///
+/// The registry is interior-mutable, so its contents grow over the peer's
+/// lifetime: MCP servers start off the boot path and register their tools
+/// whenever they finish. `pending_sources` names the namespaces that have
+/// been announced but have not registered yet, so a lookup miss can be
+/// answered with "still starting" instead of "no such tool".
 pub struct ToolRegistry {
     tools: RwLock<Vec<RegistryEntry>>,
+    pending_sources: RwLock<std::collections::HashSet<String>>,
 }
 
 impl Default for ToolRegistry {
@@ -594,6 +601,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(Vec::new()),
+            pending_sources: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -687,6 +695,41 @@ impl ToolRegistry {
             .iter()
             .find(|e| e.tool.descriptor().name == name)
             .and_then(|e| e.owner)
+    }
+
+    /// Announce that `source` will contribute tools under the `source__*`
+    /// namespace but has not registered them yet. Paired with
+    /// [`Self::finish_pending_source`], which every announcement reaches
+    /// exactly once — on success, on failure, and on timeout alike.
+    pub fn announce_pending_source(&self, source: &str) {
+        self.pending_sources
+            .write()
+            .expect("ToolRegistry pending_sources lock poisoned")
+            .insert(source.to_string());
+    }
+
+    /// Retire an announcement made by [`Self::announce_pending_source`].
+    pub fn finish_pending_source(&self, source: &str) {
+        self.pending_sources
+            .write()
+            .expect("ToolRegistry pending_sources lock poisoned")
+            .remove(source);
+    }
+
+    /// The still-loading source a missing tool name would have come from,
+    /// if any. Splits on the `__` namespace separator, so
+    /// `"filesystem__read_file"` resolves to `"filesystem"`.
+    ///
+    /// Callers use this to tell "not loaded *yet*" apart from "no such
+    /// tool" — the two are indistinguishable from a bare lookup miss once
+    /// tool registration is asynchronous.
+    pub fn pending_source_for(&self, tool_name: &str) -> Option<String> {
+        let (source, _) = tool_name.split_once("__")?;
+        let pending = self
+            .pending_sources
+            .read()
+            .expect("ToolRegistry pending_sources lock poisoned");
+        pending.contains(source).then(|| source.to_string())
     }
 }
 
@@ -859,6 +902,15 @@ impl ScopedTools {
             return None;
         }
         self.registry.get(name)
+    }
+
+    /// The still-loading source a [`Self::get`] miss would have come from.
+    /// Delegates to [`ToolRegistry::pending_source_for`]; the allowlist and
+    /// extension filters are deliberately not applied, because a name the
+    /// scope would reject is still better explained as "not loaded yet"
+    /// than as "no such tool" — both end in the same refusal either way.
+    pub fn pending_source_for(&self, tool_name: &str) -> Option<String> {
+        self.registry.pending_source_for(tool_name)
     }
 }
 

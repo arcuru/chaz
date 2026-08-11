@@ -132,19 +132,25 @@ impl StatusSegment for McpStatus {
             let Some(server) = self.server.get() else {
                 return Ok(out);
             };
-            let (mut running, mut failed) = (0u32, 0u32);
+            let (mut running, mut failed, mut starting) = (0u32, 0u32, 0u32);
             for entry in server.mcp_registry().snapshot() {
                 match entry.status {
+                    McpServerStatus::Starting => starting += 1,
                     McpServerStatus::Running { .. } => running += 1,
                     McpServerStatus::Failed { .. } => failed += 1,
                 }
             }
-            if running + failed > 0 {
-                let text = if failed > 0 {
-                    format!("{running} mcp, {failed} down")
-                } else {
-                    format!("{running} mcp")
-                };
+            if running + failed + starting > 0 {
+                // Servers still starting are called out separately: they
+                // are neither working nor broken, and reporting them as
+                // either would misread a boot in progress.
+                let mut text = format!("{running} mcp");
+                if starting > 0 {
+                    text.push_str(&format!(", {starting} starting"));
+                }
+                if failed > 0 {
+                    text.push_str(&format!(", {failed} down"));
+                }
                 out.insert("mcp".to_string(), text);
             }
             Ok(out)

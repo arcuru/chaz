@@ -40,28 +40,43 @@ mcp_servers:
 
 ### Fields
 
-| Field            | Required | Description                                                                 |
-| ---------------- | -------- | --------------------------------------------------------------------------- |
-| `name`           | Yes      | Namespace prefix for tools (e.g., `filesystem` → `filesystem.read_file`)    |
-| `command`        | Stdio    | Command to spawn the MCP server subprocess                                  |
-| `args`           | No       | Arguments for the command (stdio only)                                      |
-| `env`            | No       | Environment variables (supports `${VAR}` references; stdio only)            |
-| `url`            | HTTP     | Endpoint URL for Streamable HTTP transport — when set, `command` is ignored |
-| `default_policy` | No       | Default `ToolPolicy` for every tool from this server                        |
+| Field                  | Required | Description                                                                                     |
+| ---------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `name`                 | Yes      | Namespace prefix for tools (e.g., `filesystem` → `filesystem.read_file`)                        |
+| `command`              | Stdio    | Command to spawn the MCP server subprocess                                                      |
+| `args`                 | No       | Arguments for the command (stdio only)                                                          |
+| `env`                  | No       | Environment variables (supports `${VAR}` references; stdio only)                                |
+| `url`                  | HTTP     | Endpoint URL for Streamable HTTP transport — when set, `command` is ignored                     |
+| `default_policy`       | No       | Default `ToolPolicy` for every tool from this server                                            |
+| `startup_timeout_secs` | No       | Seconds to allow for handshake + tool discovery before marking the server failed (default `30`) |
 
 Set exactly one of `command` (stdio) or `url` (HTTP) per server. You can also drop one MCP server config per file into `mcp_server_dir` (see [Configuration](configuration.md)); those entries are merged with the inline list at startup.
 
 ## Tool Discovery and Namespacing
 
-At startup, chaz:
+For each configured server, chaz:
 
-1. Spawns each MCP server subprocess
+1. Spawns the MCP server subprocess
 2. Performs the MCP `initialize` handshake — records which primitives (tools, resources, prompts) the server advertises
 3. Calls `tools/list` to discover available tools (only when the server claims the `tools` capability)
 4. Registers each tool as `server_name__tool_name` (e.g., `filesystem__read_file`)
 5. Adds capability wrapper tools for any other primitives the server claimed (see [Resources and Prompts](#resources-and-prompts))
 
-Failed servers are logged and skipped — they don't block startup. Name collisions across servers are detected and duplicates are skipped with a warning.
+Failed servers are logged and skipped. Name collisions across servers are detected and duplicates are skipped with a warning.
+
+## Background Startup
+
+Servers start **in the background**, concurrently with each other, and chaz does not wait for any of them. The peer is interactive from the first frame whether a server takes 40 ms or 20 seconds.
+
+Tools become available as their server finishes. A turn's tool list is assembled when the turn starts, so a server that lands mid-conversation is advertised on the next turn — no restart, no reload. A server that lands mid-_turn_ is callable but not yet advertised; the model will not know to ask for it until the turn after.
+
+If the model calls a tool whose server is still starting — from a resumed conversation, say, where the name appears earlier in the transcript — it is told the server is still starting and that the call is worth retrying, rather than being told the tool does not exist.
+
+`startup_timeout_secs` (default `30`) bounds one server's handshake and discovery. A server that overruns it is marked failed and contributes no tools; it does not hold anything else up.
+
+**One-shot runs are the exception.** `chaz --print` gets exactly one turn, so it waits for every server to settle before running it — deferring a load that single turn needs would produce an answer with no MCP tools rather than a faster one. This costs no more than blocking startup used to, since servers start concurrently. `chaz cmd` runs no turn at all and never waits.
+
+Server state is visible in the TUI under **Peer → MCP**, where every configured server appears immediately as `starting…` and then resolves to running or failed. `starting` is not a failure — it means the connection is still in flight.
 
 ## Resources and Prompts
 
@@ -181,7 +196,7 @@ The shortest "agent reads a file through MCP" path:
        args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"]
    ```
 
-2. Confirm registration. On startup chaz logs the handshake and discovered tool count per server (look for `MCP '<name>'` lines). A failed handshake is logged and the server is skipped — chaz keeps running with whatever did register.
+2. Confirm registration. Chaz logs each server's handshake and discovered tool count as it finishes (look for `MCP '<name>'` lines); the TUI's **Peer → MCP** page shows the same thing live. A failed handshake is logged and the server is skipped — chaz keeps running with whatever did register.
 
    In a session you can ask the agent itself:
 
@@ -199,7 +214,7 @@ The shortest "agent reads a file through MCP" path:
 
    The agent calls `filesystem__list_directory` then `filesystem__read_file`. Each call runs under chaz's policy layer — risk tier, approval, leak detection, timeout.
 
-4. **If something fails**: chaz logs the handshake failure and skips the server (it does not block startup). Check the log for `MCP '<name>'` lines. For stdio servers, fix the command/args and restart; for HTTP, verify the URL and reachability.
+4. **If something fails**: chaz logs the handshake failure and skips the server. Check the log for `MCP '<name>'` lines, or open **Peer → MCP** and select the server for the error text. For stdio servers, fix the command/args and restart; for HTTP, verify the URL and reachability. A server stuck on `starting…` is still within its `startup_timeout_secs`; it will resolve to failed when that elapses.
 
 5. To narrow which agents can see an MCP namespace, add a glob to the agent's `allowed_tools`:
 

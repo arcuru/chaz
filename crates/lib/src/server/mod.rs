@@ -39,7 +39,7 @@ mod build;
 mod runtime_lease;
 mod schedule;
 
-pub use build::{BuildOptions, BuiltServer, build};
+pub use build::{BuildOptions, BuiltServer, McpReadiness, build};
 pub use runtime_lease::{LeaseError, LocalRuntimeLease, OwnerId, RuntimeLease};
 
 /// Maximum number of concurrent LLM calls across all conversations.

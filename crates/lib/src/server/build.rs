@@ -63,6 +63,30 @@ pub struct BuildOptions {
     /// CLI passes its non-interactive allowlist here so `shell`/`write_file`
     /// work under `--print` where there is no interactive approval.
     pub extra_auto_approved_tools: Vec<String>,
+    /// Whether a turn may run before the configured MCP servers have
+    /// finished starting. See [`McpReadiness`].
+    pub mcp_readiness: McpReadiness,
+}
+
+/// When MCP tools have to exist, relative to the first turn.
+///
+/// MCP servers always start off the critical path — [`build`] returns
+/// without waiting on any of them. This decides only whether the *turn*
+/// gate waits, and the answer differs by how long the process lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpReadiness {
+    /// Don't wait. Tools appear in the tool list of whichever turn starts
+    /// after their server finishes. Correct for anything long-lived — the
+    /// peer is interactive from the first frame, and a user who does need
+    /// an MCP tool in the first second is far rarer than one who wants to
+    /// type immediately.
+    Deferred,
+    /// Hold the first turn until every server has settled. Correct for a
+    /// one-shot run, which gets exactly one turn: deferring a load it
+    /// immediately needs would silently produce an answer with no MCP
+    /// tools, which is a wrong answer rather than a fast one. Costs no more
+    /// than the previous blocking boot did, since startup is concurrent.
+    AwaitReady,
 }
 
 /// A fully-wired [`Server`] plus the handles a bridge needs beside it.
@@ -440,7 +464,7 @@ pub async fn build(
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         mcp_servers = mcp_configs.len(),
-        "Extensions installed (MCP servers started)"
+        "Extensions installed (MCP servers starting in background)"
     );
     let extension_names = extension_hub.extension_names();
     if !extension_names.is_empty() {
@@ -557,6 +581,8 @@ pub async fn build(
         let deferred_config = config.clone();
         let run_routine_engine = opts.run_routine_engine;
         let run_agent_loop = opts.run_agent_loop;
+        let mcp_readiness = opts.mcp_readiness;
+        let mcp_registry = mcp_registry.clone();
         tokio::spawn(async move {
             run_deferred_startup(
                 server,
@@ -565,6 +591,8 @@ pub async fn build(
                 default_backend,
                 run_routine_engine,
                 run_agent_loop,
+                mcp_readiness,
+                mcp_registry,
             )
             .await;
         });
@@ -600,6 +628,7 @@ pub async fn build(
 ///
 /// Errors are logged, not propagated: the gateway is already live, so a
 /// failure here degrades a feature rather than aborting the process.
+#[allow(clippy::too_many_arguments)]
 async fn run_deferred_startup(
     server: Arc<Server>,
     registry: Arc<session::SessionRegistry>,
@@ -607,6 +636,8 @@ async fn run_deferred_startup(
     default_backend: backends::BackendManager,
     run_routine_engine: bool,
     run_agent_loop: bool,
+    mcp_readiness: McpReadiness,
+    mcp_registry: Arc<mcp::McpRegistry>,
 ) {
     let deferred_start = Instant::now();
 
@@ -627,6 +658,24 @@ async fn run_deferred_startup(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Deferred: reconciled agents from config"
     );
+    // 2b. A one-shot run gets a single turn, so it must not start that turn
+    //     against a half-loaded tool list. Reuse the turn gate rather than
+    //     adding a second one: `process_session` already parks here, so the
+    //     one-shot bridge needs no readiness logic of its own. Each server's
+    //     startup timeout bounds this wait.
+    if mcp_readiness == McpReadiness::AwaitReady {
+        let t = Instant::now();
+        let pending = mcp_registry.pending_count();
+        if pending > 0 {
+            info!(pending, "Deferred: holding startup gate for MCP servers");
+            mcp_registry.wait_ready().await;
+            info!(
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                "Deferred: MCP servers settled"
+            );
+        }
+    }
+
     server.mark_startup_ready();
     info!(
         ready_after_ms = deferred_start.elapsed().as_millis() as u64,

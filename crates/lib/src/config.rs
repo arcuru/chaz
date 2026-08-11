@@ -689,6 +689,20 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     /// Default policy for all tools from this server (overrides MCP baseline)
     pub default_policy: Option<crate::tool::ToolPolicy>,
+    /// Seconds to allow for starting the server and discovering its tools
+    /// before giving up and marking it failed. Startup runs off the boot
+    /// path, so without a bound a wedged server would sit in `Starting`
+    /// forever and hold the one-shot readiness wait open with it.
+    /// Defaults to [`default_mcp_startup_timeout_secs`].
+    #[serde(default = "default_mcp_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+}
+
+/// Thirty seconds, matching the Claude Code `MCP_TIMEOUT` default for the
+/// same job. Generous for a local stdio server, and a slow remote one is
+/// better reported as failed than left indefinitely pending.
+pub fn default_mcp_startup_timeout_secs() -> u64 {
+    30
 }
 
 /// An allowed endpoint for network policy
