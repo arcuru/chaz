@@ -776,6 +776,7 @@ async fn save_last_fired(db: &Database, id: &RoutineId, when: DateTime<Utc>) -> 
 mod tests {
     use super::super::types::RoutineTarget;
     use super::*;
+    use crate::tool::ToolRegistry;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::{Instance, NewUser};
@@ -1097,6 +1098,7 @@ mod tests {
             server_cell: Arc::new(std::sync::OnceLock::new()),
             mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
+            tool_registry: Arc::new(ToolRegistry::new()),
         }));
         hub.install_all(vec![Arc::new(EchoExt { seen: seen.clone() })])
             .await

@@ -374,6 +374,11 @@ pub async fn build(
     // fallback when a Pinned session has no registered SessionRuntime.
     let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
 
+    // Create the ToolRegistry early — before extension install — so
+    // MCP extensions can register tools asynchronously off the critical
+    // path via their `PeerHandles::tool_registry` handle.
+    let tool_registry = Arc::new(tool::ToolRegistry::new());
+
     // Set up extension hub infrastructure before install_all.
     // Tools and commands flow through per-extension caps;
     // install_all drains them into owner-attributed registries.
@@ -390,6 +395,7 @@ pub async fn build(
         server_cell: spawn_server_cell.clone(),
         mcp_registry: mcp_registry.clone(),
         agent_state_allowlist: config.agent_state_allowlist.clone(),
+        tool_registry: tool_registry.clone(),
     }));
 
     // Collect MCP server configs from inline config + directory scanning.
@@ -441,10 +447,9 @@ pub async fn build(
         info!(?extension_names, "Extensions registered");
     }
 
-    // Build the legacy ToolRegistry from extension-contributed tools.
-    // MCP tools now arrive through the same path as built-in tools
-    // (McpExtension contributes them via ToolRegistration cap).
-    let mut tool_registry = tool::ToolRegistry::new();
+    // Drain extension-contributed tools (builtins) into the shared
+    // ToolRegistry. MCP tools register asynchronously via background
+    // tasks spawned by McpExtension::instantiate.
     for (owner, _name, tool) in extension_hub.tools_for_registry() {
         tool_registry.register_arc_owned(tool, Some(owner));
     }
@@ -452,7 +457,6 @@ pub async fn build(
     let extension_hub = std::sync::Arc::new(extension_hub);
 
     info!("Tool registry initialized");
-    let tool_registry = std::sync::Arc::new(tool_registry);
 
     // Build tool profiles from config
     let tool_profiles: std::collections::HashMap<String, tool::ToolProfile> = config

@@ -42,7 +42,7 @@ use crate::extension::handler::{
     HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult, RoutineHandler,
 };
 use crate::extension::manifest::ExtensionManifest;
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolRegistry};
 use eidetica::Database;
 use std::any::Any;
 use std::collections::HashMap;
@@ -99,6 +99,10 @@ pub struct PeerHandles {
     /// `ScopedAgentStateAdmin` apply this map themselves rather than
     /// going through hub-side cap resolution.
     pub agent_state_allowlist: HashMap<String, Vec<String>>,
+    /// Shared `ToolRegistry` used by extensions (e.g., MCP) that register
+    /// tools asynchronously after the critical-path build is complete.
+    /// Thread-safe via internal `RwLock`.
+    pub tool_registry: Arc<ToolRegistry>,
 }
 
 /// Context handed to [`crate::extension::Extension::instantiate`]. The

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::runtime::RuntimeMessage;
+use crate::tool::ToolRegistry;
 use crate::types::ConversationId;
 use eidetica::backend::database::InMemory;
 use eidetica::crdt::Doc;
@@ -263,6 +264,7 @@ fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandle
         server_cell: Arc::new(std::sync::OnceLock::new()),
         mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
         agent_state_allowlist: Default::default(),
+        tool_registry: Arc::new(ToolRegistry::new()),
     })
 }
 

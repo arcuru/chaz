@@ -663,6 +663,7 @@ pub async fn execute(
 
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
+                            let tool: &dyn crate::tool::Tool = &*tool;
                             let policy = policies.resolve(tool);
                             let mut args: serde_json::Value =
                                 serde_json::from_str(&call.arguments).unwrap_or_default();

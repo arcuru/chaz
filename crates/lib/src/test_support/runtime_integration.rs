@@ -152,7 +152,7 @@ async fn react_loop_dispatches_tool_call_and_returns_final_text() {
 
     let echo = EchoTool::new();
     let call_counter = echo.calls.clone();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -239,7 +239,7 @@ async fn empty_tool_registry_uses_no_tools_fast_path() {
 async fn backend_supports_tools_false_uses_no_tools_path() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -274,7 +274,7 @@ async fn backend_supports_tools_false_uses_no_tools_path() {
 async fn unknown_tool_name_returns_synthetic_message_to_llm() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -318,7 +318,7 @@ async fn unknown_tool_name_returns_synthetic_message_to_llm() {
 async fn tool_execution_error_surfaces_to_llm_and_run_continues() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -360,7 +360,7 @@ async fn tool_execution_error_surfaces_to_llm_and_run_continues() {
 async fn approval_required_tool_dispatches_when_approved() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(GatedTool);
     let ctx = tool_context(session, Arc::new(registry));
     let (security, _approver) = security_with_decision(ApprovalDecision::Approve);
@@ -401,7 +401,7 @@ async fn approval_required_tool_dispatches_when_approved() {
 async fn approval_required_tool_blocked_when_denied() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(GatedTool);
     let ctx = tool_context(session, Arc::new(registry));
     let (security, _denier) = security_with_decision(ApprovalDecision::Deny);
@@ -454,7 +454,7 @@ async fn approval_required_tool_blocked_when_denied() {
 async fn leak_detector_redacts_secret_in_tool_output() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(LeakyTool);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -505,7 +505,7 @@ async fn loop_detection_breaks_when_same_tool_call_repeats() {
     let secrets = empty_secrets().await;
     let echo = EchoTool::new();
     let call_counter = echo.calls.clone();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -566,7 +566,7 @@ async fn multiple_tool_calls_in_one_turn_all_dispatched() {
     let secrets = empty_secrets().await;
     let echo = EchoTool::new();
     let call_counter = echo.calls.clone();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -666,7 +666,7 @@ async fn non_retryable_llm_error_propagates_as_runtime_error() {
 async fn empty_text_after_tool_call_falls_back_to_last_tool_result() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -710,7 +710,7 @@ async fn tool_result_messages_use_xml_wrapper_for_injection_safety() {
     // malicious tool output from being interpreted as an instruction.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -761,7 +761,7 @@ async fn max_iterations_forces_no_tools_summary_call() {
     // final summary text — the runtime should still terminate.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -819,7 +819,7 @@ async fn metadata_accumulator_sums_token_usage_across_calls() {
     // so we use a fresh MockBackend constructed manually.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
