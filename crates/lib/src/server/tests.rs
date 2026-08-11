@@ -996,6 +996,74 @@ async fn no_published_bridge_keys_migrates_nothing() {
     );
 }
 
+/// Helper mirroring what a bridge actually registers: a login carrying *both*
+/// of its identities, which are different keys.
+fn bridge_login(
+    agent_pubkey: Option<&eidetica::auth::crypto::PublicKey>,
+    peer_pubkey: Option<&eidetica::auth::crypto::PublicKey>,
+) -> crate::agent_db::LoginRef {
+    crate::agent_db::LoginRef {
+        kind: "matrix".to_string(),
+        identifier: "@chaz:example".to_string(),
+        bridge_db_id: "sha256:bridgedb".to_string(),
+        peer_pubkey: peer_pubkey.map(|k| k.to_string()),
+        agent_pubkey: agent_pubkey.map(|k| k.to_string()),
+        sync_addresses: Vec::new(),
+    }
+}
+
+/// A bridge holds two unrelated keys, and only one of them can ever match a
+/// session's home pubkey.
+///
+/// It authenticates to an agent DB with its bootstrapped *user* key — the one
+/// `--print-pubkey` reports and an operator pre-authorizes — and that is the
+/// key `attach` records as `home_pubkey`. Its *device* key is a separate
+/// identity naming only where it is reachable on the transport. Publishing the
+/// device key and comparing it against a home pubkey compares two disjoint key
+/// spaces, so the migration cannot fire on any real deployment no matter how
+/// many unit tests pass with a single key standing in for both.
+#[tokio::test]
+async fn the_published_bridge_key_is_the_one_sessions_are_homed_on() {
+    let (_inst, _server, registry) = server_fixture().await;
+    let me = registry.new_ephemeral_key("me").await.unwrap();
+    // What the bridge bootstraps with, and what `attach` writes as home.
+    let bridge_user_key = registry.new_ephemeral_key("bridge").await.unwrap();
+    // The bridge's separate transport identity.
+    let bridge_device_key = registry.new_ephemeral_key("bridge-device").await.unwrap();
+    assert_ne!(bridge_user_key, bridge_device_key);
+
+    let published = crate::server::build::bridge_pubkeys_from_logins(vec![bridge_login(
+        Some(&bridge_user_key),
+        Some(&bridge_device_key),
+    )]);
+
+    // The device key must not be what the daemon compares against...
+    assert!(!published.contains(&bridge_device_key.to_string()));
+    // ...and a session homed on the bridge's authorization key is recognised.
+    let agents = vec![make_agent_ref(
+        "sha256:agent",
+        Some(&bridge_user_key.to_string()),
+    )];
+    assert_eq!(
+        crate::server::bridge_home_to_migrate(&agents, "sha256:agent", &me, &published),
+        Some(bridge_user_key.to_string())
+    );
+}
+
+/// A login written before the bridge published its authorization key
+/// contributes nothing, rather than falling back to the device key and
+/// comparing across key spaces again.
+#[tokio::test]
+async fn a_login_without_a_published_agent_key_contributes_nothing() {
+    let (_inst, _server, registry) = server_fixture().await;
+    let bridge_device_key = registry.new_ephemeral_key("bridge-device").await.unwrap();
+    let published = crate::server::build::bridge_pubkeys_from_logins(vec![bridge_login(
+        None,
+        Some(&bridge_device_key),
+    )]);
+    assert!(published.is_empty());
+}
+
 // ---- process_session gate -------------------------------------------
 
 /// Register an Agent in the in-memory registry so resolve_agent_for_entry

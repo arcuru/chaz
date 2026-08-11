@@ -1104,22 +1104,24 @@ async fn register_one_exposed_session(
     }
 }
 
-/// The peer keys of every bridge that has registered a login in this agent DB.
+/// The keys of every bridge that has registered a login in this agent DB, in
+/// the key space session home pubkeys are written in.
 ///
-/// A bridge publishes its own sync identity alongside its logins, which makes
-/// "that peer is a bridge" something this daemon can read rather than guess.
-/// Logins predating that field carry no key and simply do not contribute — a
-/// smaller set costs a missed migration, which is the status quo, whereas
-/// guessing costs seizing a session from a legitimate remote host.
-async fn published_bridge_pubkeys(
+/// A bridge publishes its own identity alongside its logins, which makes "that
+/// peer is a bridge" something this daemon can read rather than guess. Logins
+/// predating that field carry no key and simply do not contribute — a smaller
+/// set costs a missed migration, which is the status quo, whereas guessing
+/// costs seizing a session from a legitimate remote host.
+pub(super) fn bridge_pubkeys_from_logins(
+    logins: Vec<crate::agent_db::LoginRef>,
+) -> std::collections::HashSet<String> {
+    logins.into_iter().filter_map(|l| l.agent_pubkey).collect()
+}
+
+pub(super) async fn published_bridge_pubkeys(
     adb: &crate::agent_db::AgentDb,
 ) -> std::collections::HashSet<String> {
-    adb.list_logins()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|l| l.peer_pubkey)
-        .collect()
+    bridge_pubkeys_from_logins(adb.list_logins().await.unwrap_or_default())
 }
 
 /// Re-host a bridge-created session onto this daemon, if that is what it is.

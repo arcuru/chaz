@@ -206,8 +206,15 @@ pub async fn establish_login<B: AccessBootstrap>(
     bootstrap: &B,
     identity: &BridgeIdentity<'_>,
     ticket: &DatabaseTicket,
-    login: LoginRef,
+    mut login: LoginRef,
 ) -> anyhow::Result<BootstrapOutcome> {
+    // Stamped here rather than by each bridge binary: this is the one place
+    // that both knows the key being bootstrapped and writes the pointer, so
+    // stamping it here is what makes "the published key is the key we
+    // authenticate with" true by construction instead of by every caller
+    // remembering. A bridge's device key is a different identity and is
+    // published separately as `peer_pubkey`.
+    login.agent_pubkey = Some(identity.key.to_string());
     let outcome = bootstrap
         .request_access(
             user,
@@ -268,6 +275,7 @@ pub async fn establish_login<B: AccessBootstrap>(
         // by a previous run names an endpoint nobody is listening on, and the
         // daemon dials it and waits for an answer that cannot come.
         if existing.peer_pubkey != login.peer_pubkey
+            || existing.agent_pubkey != login.agent_pubkey
             || existing.sync_addresses != login.sync_addresses
         {
             agent_db.register_login(login.clone()).await?;
@@ -425,6 +433,7 @@ mod tests {
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
                 peer_pubkey: None,
+                agent_pubkey: None,
                 sync_addresses: Vec::new(),
             },
         )
@@ -465,6 +474,84 @@ mod tests {
         assert_eq!(logins.len(), 1, "pre-authorized login must self-register");
         assert_eq!(logins[0].identifier, "@chaz:example");
         assert_eq!(logins[0].bridge_db_id, settings_db_id.to_string());
+    }
+
+    /// Pins *which* key the bridge publishes as its agent-DB identity.
+    ///
+    /// The daemon compares this value against a session's `home_pubkey` to
+    /// decide whether a session is stranded on a bridge. That comparison is
+    /// only meaningful if this is the key the bridge authenticates to the agent
+    /// DB with — the bootstrapped one. A bridge also holds a device key, which
+    /// lives in a different key space entirely, and publishing that one instead
+    /// makes the comparison silently unsatisfiable rather than wrong-looking.
+    /// Both the caller-supplied value and the device key must lose to the
+    /// bootstrapped key here, so no bridge binary can publish the wrong one by
+    /// passing it in.
+    #[tokio::test]
+    async fn establish_login_publishes_the_bootstrapped_key_not_the_caller_s() {
+        let mut user = test_user().await;
+        let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
+        // Stands in for the bridge's device key: a real, valid, *other* key.
+        let device_key = user.add_private_key(Some("device")).await.unwrap();
+        assert_ne!(bridge_key, device_key);
+
+        let (agent_db, _) = create_agent_db(
+            &mut user,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some("chaz".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let agent_db_id = agent_db.id();
+        let (bridge_db, _) = create_bridge_db(&mut user, "matrix").await.unwrap();
+
+        let bootstrap = GrantedBootstrap::default();
+        establish_login(
+            &mut user,
+            &bootstrap,
+            &BridgeIdentity {
+                key: &bridge_key,
+                key_name: BRIDGE_KEY_NAME,
+            },
+            &DatabaseTicket::new(agent_db_id),
+            LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: bridge_db.id().to_string(),
+                peer_pubkey: Some(device_key.to_string()),
+                // A caller getting this wrong must not be able to publish it.
+                agent_pubkey: Some(device_key.to_string()),
+                sync_addresses: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let logins = agent_db.list_logins().await.unwrap();
+        assert_eq!(
+            logins[0].agent_pubkey.as_deref(),
+            Some(bridge_key.to_string().as_str()),
+            "the published agent key must be the key the bridge bootstrapped with"
+        );
+        // The device key still rides along, under the field that means it.
+        assert_eq!(
+            logins[0].peer_pubkey.as_deref(),
+            Some(device_key.to_string().as_str()),
+            "the transport identity must still be published, separately"
+        );
+
+        // The owner-facing copy carries the same claim, so `/sharing requests`
+        // shows the key a grant would actually be authenticating.
+        let metadata = bootstrap.seen.lock().unwrap().metadata.clone();
+        let carried = LoginRef::from_metadata(&metadata.expect("metadata")).unwrap();
+        assert_eq!(
+            carried.agent_pubkey.as_deref(),
+            Some(bridge_key.to_string().as_str())
+        );
     }
 
     #[test]
@@ -515,6 +602,7 @@ mod tests {
             identifier: "chaz#4242".to_string(),
             bridge_db_id: "bafyrbridgedb".to_string(),
             peer_pubkey: None,
+            agent_pubkey: None,
             sync_addresses: Vec::new(),
         };
         let decoded = LoginRef::from_metadata(&login.to_metadata().unwrap()).unwrap();
@@ -561,6 +649,7 @@ mod tests {
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
                 peer_pubkey: None,
+                agent_pubkey: None,
                 sync_addresses: Vec::new(),
             },
         )
@@ -601,6 +690,7 @@ mod tests {
                 identifier: "@chaz:example".to_string(),
                 bridge_db_id: settings_db_id.to_string(),
                 peer_pubkey: None,
+                agent_pubkey: None,
                 sync_addresses: Vec::new(),
             },
         )
