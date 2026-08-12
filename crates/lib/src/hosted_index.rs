@@ -187,6 +187,7 @@ pub async fn build_from_user(
             crate::db_kind::KIND_BANK => memory_banks.register(entry),
             crate::db_kind::KIND_SKILL_BANK => skill_banks.register(entry),
             crate::db_kind::KIND_SESSION => {} // Sessions aren't cached here.
+            crate::db_kind::KIND_BRIDGE => {}  // Bridge settings — holds credentials; not hosted.
             other => {
                 warn!(db_id = %td.database_id, kind = %other, "Unknown entity kind, skipping");
             }
