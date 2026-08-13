@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chaz_core::backends::BackendManager;
 use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
@@ -89,6 +90,8 @@ impl Bridge for DiscordBridge {
             config: self.config.clone(),
             allowed_users: self.creds.allowed_users.clone(),
             attached: Arc::new(Mutex::new(HashSet::new())),
+            seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            message_counts: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             bot_id: Arc::new(Mutex::new(None)),
         };
@@ -120,6 +123,13 @@ struct Handler {
     /// Session db ids that already have a reconciler installed — guards the
     /// `on_write` callback against double-install on later messages.
     attached: Arc<Mutex<HashSet<String>>>,
+    /// Message ids already ingested this process. The gateway replays messages
+    /// when the connection is resumed, and a replay must not write the inbound
+    /// entry a second time or re-run a `!chaz approve` against a later prompt.
+    seen_messages: Arc<Mutex<HashSet<MessageId>>>,
+    /// Messages each Discord user has spent against `message_limit`, counted
+    /// for the life of the process.
+    message_counts: Arc<Mutex<HashMap<u64, u64>>>,
     /// Posted tool-approval prompts awaiting a reaction/command, keyed by the
     /// prompt message id.
     pending: PendingApprovals,
@@ -142,6 +152,11 @@ impl Handler {
         if msg.author.bot {
             return Ok(());
         }
+        // Gateway redelivery: everything below this point either writes to the
+        // session DB or resolves an approval, and neither is idempotent.
+        if !first_delivery(&self.seen_messages, msg.id).await {
+            return Ok(());
+        }
         // Allow-list, when configured.
         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
             return Ok(());
@@ -158,6 +173,28 @@ impl Handler {
             })
         {
             return self.handle_command(ctx, msg, &inner).await;
+        }
+
+        // Per-user quota, the same `message_limit` the Matrix bridge enforces:
+        // without it a single chatty channel can grow the session DB without
+        // bound. Commands are exempt, as they are on Matrix.
+        if let Some(limit) = charge_message_quota(
+            &self.message_counts,
+            msg.author.id.get(),
+            self.config.message_limit,
+        )
+        .await
+        {
+            error!(user = %msg.author.id, "Discord user is over their message limit of {limit}");
+            msg.channel_id
+                .say(
+                    &ctx.http,
+                    format!(
+                        "!chaz Error: you have used up your message limit of {limit} messages."
+                    ),
+                )
+                .await?;
+            return Ok(());
         }
 
         let channel = msg.channel_id.get().to_string();
@@ -438,6 +475,37 @@ impl Handler {
     }
 }
 
+/// Record `id` as handled, reporting whether this is its first delivery.
+///
+/// serenity replays gateway events when a dropped connection is resumed, so the
+/// same message can arrive more than once. The inbound path is not idempotent —
+/// it appends a session entry, and a replayed `!chaz approve` would resolve
+/// whatever prompt is pending *now* rather than the one it answered — so a
+/// replay is dropped here.
+async fn first_delivery(seen: &Mutex<HashSet<MessageId>>, id: MessageId) -> bool {
+    seen.lock().await.insert(id)
+}
+
+/// Spend one message from `user`'s `message_limit` quota.
+///
+/// Returns `None` when the message is within the cap — which also counts it —
+/// and `Some(limit)` once the user has spent the cap, so the caller can name
+/// the number it reports back to the channel. An unset limit never rejects.
+async fn charge_message_quota(
+    counts: &Mutex<HashMap<u64, u64>>,
+    user: u64,
+    limit: Option<u64>,
+) -> Option<u64> {
+    let limit = limit?;
+    let mut counts = counts.lock().await;
+    let spent = counts.entry(user).or_insert(0);
+    if *spent < limit {
+        *spent += 1;
+        return None;
+    }
+    Some(limit)
+}
+
 /// Small helper so the various send sites read uniformly.
 async fn msg_say(ctx: &Context, channel_id: ChannelId, text: String) -> serenity::Result<()> {
     channel_id.say(&ctx.http, text).await.map(|_| ())
@@ -478,8 +546,15 @@ struct PendingApproval {
     session_db: eidetica::Database,
     request_id: String,
     channel_id: ChannelId,
+    /// Post order, so an untargeted `!chaz approve` answers the prompt the
+    /// channel has had open longest rather than an arbitrary map entry.
+    seq: u64,
 }
 type PendingApprovals = Arc<Mutex<HashMap<MessageId, PendingApproval>>>;
+
+/// Stamps [`PendingApproval::seq`]. Process-wide: prompts from every channel
+/// share one order, and only their relative order matters.
+static NEXT_PROMPT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Render the approval prompt a human reacts to.
 fn approval_body(req: &chaz_core::bridge::ApprovalRequestPayload) -> String {
@@ -556,6 +631,7 @@ async fn attach_approval_watcher(
                                     session_db: db.clone(),
                                     request_id: req.request_id,
                                     channel_id,
+                                    seq: NEXT_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed),
                                 },
                             );
                         }
@@ -584,10 +660,10 @@ async fn resolve_pending_approval(
 ) {
     let resolved = {
         let mut p = pending.lock().await;
-        let message_id = p
-            .iter()
-            .find(|(_, pa)| pa.channel_id == channel_id)
-            .map(|(id, _)| *id);
+        let message_id = chaz_core::bridge::oldest_pending(
+            p.iter().map(|(id, pa)| (*id, pa.channel_id, pa.seq)),
+            &channel_id,
+        );
         message_id.and_then(|id| p.remove(&id))
     };
     let Some(req) = resolved else {
@@ -774,7 +850,45 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_message, hard_split};
+    use super::{charge_message_quota, chunk_message, first_delivery, hard_split};
+    use serenity::model::id::MessageId;
+    use std::collections::{HashMap, HashSet};
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn a_user_spends_their_message_quota_and_is_then_refused() {
+        let counts = Mutex::new(HashMap::new());
+
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, None);
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, None);
+        // Third message is over the cap, and stays over.
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, Some(2));
+        assert_eq!(charge_message_quota(&counts, 1, Some(2)).await, Some(2));
+        // The quota is per user, so a second user still has their own.
+        assert_eq!(charge_message_quota(&counts, 2, Some(2)).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_unset_limit_never_refuses_and_a_zero_limit_always_does() {
+        let counts = Mutex::new(HashMap::new());
+        for _ in 0..100 {
+            assert_eq!(charge_message_quota(&counts, 1, None).await, None);
+        }
+        assert_eq!(charge_message_quota(&counts, 1, Some(0)).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_replayed_message_is_only_delivered_once() {
+        let seen = Mutex::new(HashSet::new());
+        let replayed = MessageId::new(42);
+
+        assert!(first_delivery(&seen, replayed).await);
+        // Resuming the gateway session redelivers the same event.
+        assert!(!first_delivery(&seen, replayed).await);
+        // A different message is unaffected.
+        assert!(first_delivery(&seen, MessageId::new(43)).await);
+        assert!(!first_delivery(&seen, MessageId::new(43)).await);
+    }
 
     /// Every chunk must respect the char ceiling — the whole point of the split.
     fn assert_within_limit(chunks: &[String], limit: usize) {

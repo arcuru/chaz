@@ -22,6 +22,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::{Room, RoomState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
@@ -911,8 +912,15 @@ struct PendingApproval {
     session_db: eidetica::Database,
     request_id: String,
     room_id: String,
+    /// Post order, so an untargeted `!chaz approve` answers the prompt the room
+    /// has had open longest rather than an arbitrary map entry.
+    seq: u64,
 }
 type PendingApprovals = Arc<Mutex<HashMap<OwnedEventId, PendingApproval>>>;
+
+/// Stamps [`PendingApproval::seq`]. Process-wide: prompts from every room share
+/// one order, and only their relative order matters.
+static NEXT_PROMPT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Render the approval prompt a human reacts to.
 fn approval_notice(req: &chaz_core::bridge::ApprovalRequestPayload) -> String {
@@ -988,6 +996,7 @@ async fn attach_approval_watcher(
                                     session_db: db.clone(),
                                     request_id: req.request_id,
                                     room_id: room.room_id().to_string(),
+                                    seq: NEXT_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed),
                                 },
                             );
                         }
@@ -1041,10 +1050,11 @@ async fn resolve_pending_approval(
     let room_id = room.room_id().to_string();
     let resolved = {
         let mut p = pending.lock().await;
-        let event_id = p
-            .iter()
-            .find(|(_, pa)| pa.room_id == room_id)
-            .map(|(id, _)| id.clone());
+        let event_id = chaz_core::bridge::oldest_pending(
+            p.iter()
+                .map(|(id, pa)| (id.clone(), pa.room_id.as_str(), pa.seq)),
+            &room_id.as_str(),
+        );
         event_id.and_then(|id| p.remove(&id))
     };
     let Some(req) = resolved else {

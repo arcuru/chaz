@@ -75,6 +75,18 @@ Each Discord channel is bound to its own session, fixed per channel (unlike
 Matrix, you don't rebind a channel to a different session from within Discord).
 The first message in a channel auto-creates the session.
 
+## Rate limiting
+
+`message_limit` caps how many messages one Discord user may send the bot for
+the life of the bridge process; over the cap the bridge answers with an error
+and writes nothing to the session. `!chaz` commands are exempt. The limit is
+unset by default, and it is a per-process counter, not a per-hour rate — it
+exists to keep a chatty channel from growing the session DB without bound.
+
+`room_size_limit` is Matrix-only: it counts joined room members, which has no
+Discord analogue worth the gateway calls. Use `allowed_users` to bound who can
+reach the bot in a large server.
+
 ## Commands
 
 Commands are sent as Discord messages prefixed with `!chaz`, routed through the
