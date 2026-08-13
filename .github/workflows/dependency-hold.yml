@@ -8,6 +8,11 @@ on:
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # Required checks must also report on a merge group or the queue stalls. The
+  # gate passes there on its own: a merge group has no head_ref, so the
+  # ^deps/ test in the reusable workflow exits early. The hold gates entry
+  # into the queue, not the queue itself.
+  merge_group:
 
 permissions:
   contents: read
