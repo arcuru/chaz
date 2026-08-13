@@ -16,6 +16,12 @@
 use eidetica::auth::types::Permission;
 
 use super::{CommandContext, CommandOutcome};
+use crate::agent_db::LoginRef;
+use crate::security::approval_display::{pubkey_fingerprint, quarantine, quarantine_capped};
+
+/// Display cap for a peer-supplied timestamp — long enough for RFC 3339, short
+/// enough that padding it cannot push the rest of the line out of view.
+const TIMESTAMP_CAP: usize = 32;
 
 /// Render a short label for a target DB by walking the hosted indices.
 /// Sessions don't appear in either index, so any tree_id we don't recognize
@@ -40,6 +46,106 @@ fn permission_name(p: &Permission) -> String {
     }
 }
 
+/// Everything one pending request contributes to the prompt, with the
+/// attested and the claimed parts already separated. Split out from
+/// [`sharing_requests`] because seeding a real bootstrap request needs live
+/// two-peer sync, so this is where the rendering is actually testable.
+struct RequestView<'a> {
+    /// 1-based position in the printed list, which is also what
+    /// `/sharing approve <index>` takes.
+    index: usize,
+    /// Locally assigned request ID, shortened.
+    request_id_short: &'a str,
+    /// Fingerprint of the key that signed the request — the attested anchor.
+    fingerprint: &'a str,
+    /// Locally resolved label for the target DB.
+    target_label: &'a str,
+    /// Permission being asked for, as recorded by the local sync layer.
+    permission: &'a str,
+    /// Timestamp as claimed by the requester.
+    timestamp: &'a str,
+    /// Login pointer the request asks the approver to register, if any.
+    claimed: Option<&'a LoginRef>,
+    /// Pointer already registered under the claimed identifier, if any.
+    /// Approving replaces it.
+    existing: Option<&'a LoginRef>,
+}
+
+/// Render one pending request.
+///
+/// The layout is deliberate: the fingerprint of the requesting key comes
+/// first, because it is the only field the requester cannot choose, and
+/// everything the requester *did* choose sits below it in an indented
+/// `claimed:` block that is quarantined for display. A reader who stops after
+/// the first line has still read something attested.
+fn render_request(view: &RequestView<'_>) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("  [{}] {}", view.index, view.fingerprint));
+    lines.push(format!(
+        "       wants {} on {}",
+        view.permission, view.target_label
+    ));
+    let ts = quarantine_capped(view.timestamp, TIMESTAMP_CAP);
+    lines.push(format!(
+        "       request {}, claimed time {}{}",
+        view.request_id_short,
+        ts,
+        ts.note()
+    ));
+
+    // Approving a login request also writes its pointer into the agent DB,
+    // replacing any existing pointer for the same identifier. Show what is
+    // being claimed so that is a decision rather than a side effect.
+    if let Some(login) = view.claimed {
+        let kind = quarantine(&login.kind);
+        let identifier = quarantine(&login.identifier);
+        let bridge_db = quarantine(&login.bridge_db_id);
+        lines.push("       claimed by the requester — unverified:".to_string());
+        lines.push(format!("         kind:        {}{}", kind, kind.note()));
+        lines.push(format!(
+            "         identifier:  {}{}",
+            identifier,
+            identifier.note()
+        ));
+        lines.push(format!(
+            "         bridge DB:   {}{}",
+            bridge_db,
+            bridge_db.note()
+        ));
+
+        if let Some(existing) = view.existing {
+            let old_kind = quarantine(&existing.kind);
+            let old_db = quarantine(&existing.bridge_db_id);
+            lines.push(
+                "       approving REPLACES the login already registered under that identifier:"
+                    .to_string(),
+            );
+            lines.push(format!("         old: {} → bridge DB {}", old_kind, old_db));
+            lines.push(format!("         new: {} → bridge DB {}", kind, bridge_db));
+        }
+    }
+    lines
+}
+
+/// The pointer already registered under `identifier` on the target agent DB,
+/// if this peer hosts that DB and holds a key for it. `None` covers every
+/// case where nothing would be replaced *and* every case where we cannot
+/// tell — the caller only uses it to add a warning, never to suppress one.
+async fn existing_login_for(
+    ctx: &CommandContext<'_>,
+    tree_id: &eidetica::entry::ID,
+    identifier: &str,
+) -> Option<LoginRef> {
+    let entry = ctx.server.agent_index().find_by_id(tree_id)?;
+    let db = ctx
+        .server
+        .registry()
+        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+        .await
+        .ok()??;
+    db.find_login(identifier).await.ok()?
+}
+
 pub(super) async fn sharing_requests(ctx: &CommandContext<'_>) -> CommandOutcome {
     let requests = match ctx.server.registry().pending_bootstrap_requests().await {
         Ok(r) => r,
@@ -48,32 +154,34 @@ pub(super) async fn sharing_requests(ctx: &CommandContext<'_>) -> CommandOutcome
     if requests.is_empty() {
         return CommandOutcome::Text("No pending bootstrap requests.".to_string());
     }
-    let mut lines: Vec<String> = Vec::with_capacity(requests.len() + 2);
+    let mut lines: Vec<String> = Vec::with_capacity(requests.len() * 4 + 3);
     lines.push(format!("Pending bootstrap requests ({}):", requests.len()));
+    lines.push(
+        "Each entry opens with the SHA256 fingerprint of the requesting key; everything under \
+         'claimed' is supplied by the requester."
+            .to_string(),
+    );
     for (i, (id, req)) in requests.iter().enumerate() {
-        let short = &id[..8.min(id.len())];
-        lines.push(format!(
-            "  [{}] {} — {} requested by {} as {} at {}",
-            i + 1,
-            short,
-            label_for_target(ctx, &req.tree_id),
-            req.requesting_pubkey,
-            permission_name(&req.requested_permission),
-            req.timestamp,
-        ));
-        // Approving a login request also writes its pointer into the agent DB,
-        // replacing any existing pointer for the same identifier. Show what is
-        // being claimed so that is a decision rather than a side effect.
-        if let Some(login) = req
+        let claimed = req
             .metadata
             .as_ref()
-            .and_then(crate::agent_db::LoginRef::from_metadata)
-        {
-            lines.push(format!(
-                "        registers {} login '{}' → bridge DB {}",
-                login.kind, login.identifier, login.bridge_db_id,
-            ));
-        }
+            .and_then(crate::agent_db::LoginRef::from_metadata);
+        // Look the existing pointer up by the raw identifier: the registry
+        // dedups on the stored string, not on the quarantined rendering.
+        let existing = match claimed.as_ref() {
+            Some(login) => existing_login_for(ctx, &req.tree_id, &login.identifier).await,
+            None => None,
+        };
+        lines.extend(render_request(&RequestView {
+            index: i + 1,
+            request_id_short: &id[..8.min(id.len())],
+            fingerprint: &pubkey_fingerprint(&req.requesting_pubkey),
+            target_label: &label_for_target(ctx, &req.tree_id),
+            permission: &permission_name(&req.requested_permission),
+            timestamp: &req.timestamp,
+            claimed: claimed.as_ref(),
+            existing: existing.as_ref(),
+        }));
     }
     lines.push(
         "Approve with /sharing approve <index|prefix>, reject with /sharing reject <index|prefix>."
@@ -147,7 +255,7 @@ pub(super) async fn sharing_approve(args: &str, ctx: &CommandContext<'_>) -> Com
         Ok((tree_id, req)) => CommandOutcome::Text(format!(
             "Approved {} for {} as {}. The requester must re-run their import to pull entries.",
             label_for_target(ctx, &tree_id),
-            req.requesting_pubkey,
+            pubkey_fingerprint(&req.requesting_pubkey),
             permission_name(&req.requested_permission),
         )),
         Err(e) => CommandOutcome::Error(format!("Failed to approve request: {e}")),
@@ -171,7 +279,7 @@ pub(super) async fn sharing_reject(args: &str, ctx: &CommandContext<'_>) -> Comm
     {
         Ok((tree_id, req)) => CommandOutcome::Text(format!(
             "Rejected request from {} for {}.",
-            req.requesting_pubkey,
+            pubkey_fingerprint(&req.requesting_pubkey),
             label_for_target(ctx, &tree_id),
         )),
         Err(e) => CommandOutcome::Error(format!("Failed to reject request: {e}")),
@@ -228,6 +336,165 @@ pub(super) async fn sharing_status(ctx: &CommandContext<'_>) -> CommandOutcome {
     }
 
     CommandOutcome::Text(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::{RequestView, render_request};
+    use crate::agent_db::LoginRef;
+
+    fn login(kind: &str, identifier: &str, bridge_db_id: &str) -> LoginRef {
+        LoginRef {
+            kind: kind.into(),
+            identifier: identifier.into(),
+            bridge_db_id: bridge_db_id.into(),
+            peer_pubkey: None,
+            sync_addresses: Vec::new(),
+        }
+    }
+
+    fn view<'a>(
+        claimed: Option<&'a LoginRef>,
+        existing: Option<&'a LoginRef>,
+        timestamp: &'a str,
+    ) -> RequestView<'a> {
+        RequestView {
+            index: 1,
+            request_id_short: "1a2b3c4d",
+            fingerprint: "SHA256:0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
+            target_label: "agent 'chaz'",
+            permission: "write(bridge)",
+            timestamp,
+            claimed,
+            existing,
+        }
+    }
+
+    fn render(claimed: Option<&LoginRef>, existing: Option<&LoginRef>) -> String {
+        render_request(&view(claimed, existing, "2026-08-13T00:00:00Z")).join("\n")
+    }
+
+    #[test]
+    fn fingerprint_is_the_first_thing_on_the_first_line() {
+        let out = render(None, None);
+        let first = out.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "  [1] SHA256:0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+        );
+        // The claimed block only appears when a login is actually claimed.
+        assert!(!out.contains("claimed by the requester"), "got: {out}");
+    }
+
+    #[test]
+    fn claimed_values_are_labelled_and_indented_below_the_fingerprint() {
+        let l = login("matrix", "@chaz:example", "ab12cd34");
+        let out = render(Some(&l), None);
+        let claimed_at = out.find("claimed by the requester").expect("claimed block");
+        let fp_at = out.find("SHA256:").expect("fingerprint");
+        assert!(fp_at < claimed_at, "fingerprint must come first: {out}");
+        assert!(out.contains("         identifier:  @chaz:example"), "{out}");
+        assert!(out.contains("         kind:        matrix"), "{out}");
+        assert!(out.contains("         bridge DB:   ab12cd34"), "{out}");
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_prompt() {
+        let l = login("mat\u{0}rix", "@chaz\u{7}:example", "ab\u{1}12\u{7f}cd");
+        let out = render(Some(&l), None);
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "control character survived: {out:?}"
+        );
+        assert!(out.contains("kind:        matrix"), "{out}");
+    }
+
+    #[test]
+    fn an_embedded_newline_cannot_forge_a_second_request_line() {
+        let l = login(
+            "matrix",
+            "@chaz:example\n  [2] SHA256:trustme wants admin",
+            "ab12",
+        );
+        let out = render(Some(&l), None);
+        // Every rendered line for a single request is one of ours; a claimed
+        // newline shows up escaped instead of breaking the line.
+        assert!(out.contains("\\n  [2] SHA256:trustme"), "{out}");
+        assert!(
+            !out.lines().any(|line| line.starts_with("  [2] ")),
+            "claim forged a request line: {out}"
+        );
+        assert!(out.contains("(escaped for display)"), "{out}");
+    }
+
+    #[test]
+    fn escape_sequences_are_neutralized() {
+        let l = login("matrix", "@chaz:example\u{1b}[2K\u{1b}]0;pwn\u{7}", "ab12");
+        let out = render(Some(&l), None);
+        assert!(!out.contains('\u{1b}'), "escape survived: {out:?}");
+        assert!(out.contains('\u{fffd}'), "{out}");
+    }
+
+    #[test]
+    fn bidi_overrides_are_neutralized() {
+        let l = login("matrix", "@chaz\u{202e}elpmaxe:\u{202c}", "ab12");
+        let out = render(Some(&l), None);
+        assert!(!out.contains('\u{202e}'), "bidi override survived: {out:?}");
+        assert!(!out.contains('\u{202c}'), "bidi pop survived: {out:?}");
+    }
+
+    #[test]
+    fn over_length_claims_are_capped() {
+        let long = format!("@{}:example", "a".repeat(200));
+        let l = login("matrix", &long, &"b".repeat(300));
+        let out = render(Some(&l), None);
+        for line in out.lines() {
+            assert!(
+                line.chars().count() < 100,
+                "line ran long ({}): {line}",
+                line.chars().count()
+            );
+        }
+        assert!(out.contains('…'), "{out}");
+        assert!(out.contains("(truncated)"), "{out}");
+    }
+
+    #[test]
+    fn a_hostile_timestamp_is_quarantined_too() {
+        let out = render_request(&view(None, None, "2026\u{1b}[31m-08-13\nfake")).join("\n");
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(out.contains("\\nfake"), "{out}");
+    }
+
+    #[test]
+    fn replacing_an_existing_pointer_renders_an_old_new_diff() {
+        let claimed = login("matrix", "@chaz:example", "newbridgedb");
+        let existing = login("matrix", "@chaz:example", "oldbridgedb");
+        let out = render(Some(&claimed), Some(&existing));
+        assert!(out.contains("approving REPLACES"), "{out}");
+        assert!(out.contains("old: matrix → bridge DB oldbridgedb"), "{out}");
+        assert!(out.contains("new: matrix → bridge DB newbridgedb"), "{out}");
+        let old_at = out.find("old: ").unwrap();
+        let new_at = out.find("new: ").unwrap();
+        assert!(old_at < new_at, "{out}");
+    }
+
+    #[test]
+    fn a_first_registration_renders_no_replace_warning() {
+        let claimed = login("matrix", "@chaz:example", "newbridgedb");
+        let out = render(Some(&claimed), None);
+        assert!(!out.contains("REPLACES"), "{out}");
+        assert!(!out.contains("old: "), "{out}");
+    }
+
+    #[test]
+    fn the_replace_diff_quarantines_the_stored_side_as_well() {
+        let claimed = login("matrix", "@chaz:example", "newbridgedb");
+        let existing = login("mat\u{1b}[31mrix", "@chaz:example", "old\u{202e}db");
+        let out = render(Some(&claimed), Some(&existing));
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(!out.contains('\u{202e}'), "{out:?}");
+    }
 }
 
 #[cfg(test)]

@@ -142,9 +142,25 @@ is separate and granted by attachment.) The flow mirrors [`/agent import`](sessi
 
    ```text
    /sharing requests
-   # <id> — agent 'chaz' requested by ed25519:... as write(10) at <ts>
+   #   [1] SHA256:<fingerprint of the bridge's key>
+   #        wants write(10) on agent 'chaz'
+   #        request <id>, claimed time <ts>
+   #        claimed by the requester — unverified:
+   #          kind:        matrix
+   #          identifier:  @chaz:example
+   #          bridge DB:   <bridge settings DB id>
    /sharing approve <id>
    ```
+
+   **Read the fingerprint, not the claim.** The `SHA256:` fingerprint is a digest
+   of the key that signed the request, and it is the only part the requester
+   cannot choose — compare it against the key the bridge logs on startup (or the
+   one you preseeded). Everything under `claimed` comes from the requester: it is
+   escaped, length-capped and stripped of control and bidi characters before it is
+   printed, so what you read cannot repaint the prompt, but it is still only a
+   claim. If approving would replace a login pointer already registered under that
+   identifier, the entry says so and shows `old:` and `new:` side by side —
+   approving is what performs the replacement.
 
 6. **Restart the bridge.** Now the request resolves immediately: the bridge
    registers its `LoginRef` pointer in the agent DB, reads its credentials, and
