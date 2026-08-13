@@ -212,8 +212,19 @@ impl<'a> ContextBuilder<'a> {
             .map(|e| e.content.clone())
             .collect();
         if let Some(ref hub) = self.extension_hub {
+            let available_tool_names: Vec<String> = self
+                .tool_defs
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect();
             let augmentation = hub
-                .augment_system_prompt(self.agent_name, &recent_text, None, self.session_db)
+                .augment_system_prompt(
+                    self.agent_name,
+                    &recent_text,
+                    &available_tool_names,
+                    None,
+                    self.session_db,
+                )
                 .await;
             if !augmentation.is_empty() {
                 system_prompt.push_str("\n\n");

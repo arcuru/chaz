@@ -29,6 +29,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub triggers: Vec<String>,
+    pub requires_tools: Vec<String>,
     pub body: String,
     #[allow(dead_code)]
     pub source_dir: PathBuf,
@@ -136,6 +137,7 @@ fn parse_skill_md(path: &PathBuf) -> anyhow::Result<Skill> {
         name: fm.name,
         description: fm.description.unwrap_or_default(),
         triggers: fm.triggers.unwrap_or_default(),
+        requires_tools: fm.requires_tools.unwrap_or_default(),
         body: body.trim().to_string(),
         source_dir: path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf(),
     })
@@ -148,6 +150,8 @@ struct SkillFrontmatter {
     description: Option<String>,
     #[serde(default)]
     triggers: Option<Vec<String>>,
+    #[serde(default)]
+    requires_tools: Option<Vec<String>>,
 }
 
 // ── Extension implementation ────────────────────────────────────────
@@ -367,6 +371,7 @@ impl crate::extension::ExtensionInstance for SkillsInstance {
 pub(crate) struct CatalogEntry {
     pub name: String,
     pub description: String,
+    pub requires_tools: Vec<String>,
     pub body: String,
     /// Provenance label — kept for future UI / debugging surfaces.
     /// Not part of the agentskills.io spec and deliberately not
@@ -414,6 +419,7 @@ async fn compose_catalog(
                 entries.push(CatalogEntry {
                     name: s.name.clone(),
                     description: s.description.clone(),
+                    requires_tools: s.requires_tools.clone(),
                     body: s.body.clone(),
                     source: SkillSource::Disk,
                 });
@@ -432,6 +438,7 @@ async fn compose_catalog(
                 entries.push(CatalogEntry {
                     name: s.name,
                     description: s.description,
+                    requires_tools: Vec::new(),
                     body: s.body,
                     source: SkillSource::Agent,
                 });
@@ -455,6 +462,7 @@ async fn compose_catalog(
                         entries.push(CatalogEntry {
                             name: s.name,
                             description: s.description,
+                            requires_tools: Vec::new(),
                             body: s.body,
                             source: SkillSource::Bank {
                                 name: bref.name.clone(),
@@ -482,6 +490,7 @@ async fn compose_catalog(
                 entries.push(CatalogEntry {
                     name: s.name,
                     description: s.description,
+                    requires_tools: Vec::new(),
                     body: s.body,
                     source: SkillSource::SessionBank {
                         name: bank_name.clone(),
@@ -516,7 +525,16 @@ async fn read_skill_rows(db: &eidetica::Database) -> Vec<crate::agent_db::Skill>
 
 /// Format the catalog as the Markdown block injected into the system
 /// prompt. Discovery-only — names + descriptions, no bodies.
-fn format_catalog(entries: &[CatalogEntry]) -> Option<String> {
+fn format_catalog(entries: &[CatalogEntry], available_tool_names: &[String]) -> Option<String> {
+    let entries: Vec<&CatalogEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .requires_tools
+                .iter()
+                .all(|tool| available_tool_names.contains(tool))
+        })
+        .collect();
     if entries.is_empty() {
         return None;
     }
@@ -575,12 +593,14 @@ impl PromptAugmentation for SkillsPromptAugmentation {
         &'a self,
         agent_name: &'a str,
         _recent_message_text: &'a [String],
+        available_tool_names: &'a [String],
     ) -> crate::extension::caps::CapFuture<'a, Option<String>> {
         let inputs = self.inputs.clone();
         let agent = agent_name.to_string();
+        let available_tool_names = available_tool_names.to_vec();
         Box::pin(async move {
             let entries = inputs.catalog_for(&agent).await;
-            Ok(format_catalog(&entries))
+            Ok(format_catalog(&entries, &available_tool_names))
         })
     }
 }
@@ -1402,6 +1422,7 @@ mod tests {
             name: name.into(),
             description: description.into(),
             triggers: triggers.iter().map(|s| (*s).into()).collect(),
+            requires_tools: Vec::new(),
             body: body.into(),
             source_dir: PathBuf::from("/test"),
         }
@@ -1430,7 +1451,20 @@ mod tests {
         assert_eq!(s.name, "nix");
         assert_eq!(s.description, "Nix tips");
         assert_eq!(s.triggers, vec!["nix".to_string(), "nixos".into()]);
+        assert!(s.requires_tools.is_empty());
         assert!(s.body.starts_with("Use `nix develop"));
+    }
+
+    #[test]
+    fn parse_skill_requires_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_skill(
+            dir.path(),
+            "shell.md",
+            "---\nname: shell\nrequires_tools: [shell, file_read]\n---\nbody\n",
+        );
+        let s = parse_skill_md(&p).expect("parses");
+        assert_eq!(s.requires_tools, ["shell", "file_read"]);
     }
 
     #[test]
@@ -1496,6 +1530,7 @@ mod tests {
         assert_eq!(s.name, "bare");
         assert_eq!(s.description, "");
         assert!(s.triggers.is_empty());
+        assert!(s.requires_tools.is_empty());
         assert_eq!(s.body, "body only");
     }
 
@@ -1580,13 +1615,14 @@ mod tests {
 
     #[test]
     fn format_catalog_empty_returns_none() {
-        assert!(format_catalog(&[]).is_none());
+        assert!(format_catalog(&[], &[]).is_none());
     }
 
-    fn cat_entry(name: &str, description: &str) -> CatalogEntry {
+    fn cat_entry(name: &str, description: &str, requires_tools: &[&str]) -> CatalogEntry {
         CatalogEntry {
             name: name.into(),
             description: description.into(),
+            requires_tools: requires_tools.iter().map(|tool| (*tool).into()).collect(),
             body: String::new(),
             source: SkillSource::Disk,
         }
@@ -1594,7 +1630,7 @@ mod tests {
 
     #[test]
     fn format_catalog_single_entry_has_header_and_line() {
-        let out = format_catalog(&[cat_entry("nix", "Nix tips")]).unwrap();
+        let out = format_catalog(&[cat_entry("nix", "Nix tips", &[])], &[]).unwrap();
         assert!(out.starts_with("## Available skills\n"));
         assert!(out.contains("`name` to load its full instructions"));
         assert!(out.contains("- **nix** — Nix tips"));
@@ -1602,11 +1638,14 @@ mod tests {
 
     #[test]
     fn format_catalog_preserves_input_order() {
-        let out = format_catalog(&[
-            cat_entry("zebra", "Z"),
-            cat_entry("apple", "A"),
-            cat_entry("mango", "M"),
-        ])
+        let out = format_catalog(
+            &[
+                cat_entry("zebra", "Z", &[]),
+                cat_entry("apple", "A", &[]),
+                cat_entry("mango", "M", &[]),
+            ],
+            &[],
+        )
         .unwrap();
         let z = out.find("zebra").unwrap();
         let a = out.find("apple").unwrap();
@@ -1616,14 +1655,44 @@ mod tests {
 
     #[test]
     fn format_catalog_emits_one_line_per_entry() {
-        let out = format_catalog(&[
-            cat_entry("a", "one"),
-            cat_entry("b", "two"),
-            cat_entry("c", "three"),
-        ])
+        let out = format_catalog(
+            &[
+                cat_entry("a", "one", &[]),
+                cat_entry("b", "two", &[]),
+                cat_entry("c", "three", &[]),
+            ],
+            &[],
+        )
         .unwrap();
         let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("- **")).collect();
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn format_catalog_suppresses_entry_with_unavailable_required_tool() {
+        let entries = [
+            cat_entry("always", "Always available", &[]),
+            cat_entry("shell", "Needs shell", &["shell"]),
+        ];
+        let out = format_catalog(&entries, &[]).unwrap();
+        assert!(out.contains("- **always** — Always available"));
+        assert!(!out.contains("- **shell** — Needs shell"));
+    }
+
+    #[test]
+    fn format_catalog_includes_entry_when_all_required_tools_are_available() {
+        let entries = [
+            cat_entry("always", "Always available", &[]),
+            cat_entry(
+                "workspace",
+                "Needs workspace tools",
+                &["shell", "file_read"],
+            ),
+        ];
+        let tools = ["shell".to_string(), "file_read".to_string()];
+        let out = format_catalog(&entries, &tools).unwrap();
+        assert!(out.contains("- **always** — Always available"));
+        assert!(out.contains("- **workspace** — Needs workspace tools"));
     }
 
     // ── tools (6) ────────────────────────────────────────────────────
@@ -1737,7 +1806,7 @@ mod tests {
         let inputs = Arc::new(session_skills_with_disk(shared_registry(vec![]), registry));
         let aug = SkillsPromptAugmentation { inputs };
         let out = aug
-            .augment_system_prompt("test-agent", &[])
+            .augment_system_prompt("test-agent", &[], &[])
             .await
             .expect("cap call succeeds");
         assert!(out.is_none(), "expected no augmentation, got {out:?}");
@@ -1753,7 +1822,7 @@ mod tests {
         let inputs = Arc::new(session_skills_with_disk(disk, registry));
         let aug = SkillsPromptAugmentation { inputs };
         let out = aug
-            .augment_system_prompt("test-agent", &[])
+            .augment_system_prompt("test-agent", &[], &[])
             .await
             .expect("cap call succeeds")
             .expect("non-empty augmentation");

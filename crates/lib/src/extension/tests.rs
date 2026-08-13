@@ -316,6 +316,7 @@ impl caps::PromptAugmentation for FixedAug {
         &'a self,
         _agent_name: &'a str,
         _recent: &'a [String],
+        _available_tool_names: &'a [String],
     ) -> caps::CapFuture<'a, Option<String>> {
         let text = self.0.to_string();
         Box::pin(async move { Ok(Some(text)) })

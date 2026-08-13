@@ -1610,6 +1610,7 @@ impl ExtensionHub {
         &self,
         agent_name: &str,
         recent_message_text: &[String],
+        available_tool_names: &[String],
         active_extensions: Option<&[String]>,
         session_db: Option<&Database>,
     ) -> String {
@@ -1624,7 +1625,7 @@ impl ExtensionHub {
             }
             if let Some(pa) = inst.prompt_augmentation()
                 && let Ok(Some(text)) = pa
-                    .augment_system_prompt(agent_name, recent_message_text)
+                    .augment_system_prompt(agent_name, recent_message_text, available_tool_names)
                     .await
                 && !text.trim().is_empty()
             {

@@ -364,6 +364,7 @@ pub trait PromptAugmentation: Send + Sync {
         &'a self,
         agent_name: &'a str,
         recent_message_text: &'a [String],
+        available_tool_names: &'a [String],
     ) -> CapFuture<'a, Option<String>>;
 }
 
