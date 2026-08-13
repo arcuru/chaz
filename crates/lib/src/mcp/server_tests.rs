@@ -873,6 +873,7 @@ while True:
         env: None,
         url: None,
         default_policy: None,
+        startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
     };
 
     // Start the server (runs initialize handshake)
@@ -956,6 +957,7 @@ while True:
         env: None,
         url: None,
         default_policy: None,
+        startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
     };
 
     let server = McpServer::start(&config)
@@ -1007,6 +1009,7 @@ while True:
         env: None,
         url: None,
         default_policy: None,
+        startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
     };
 
     let server = McpServer::start(&config).await.unwrap();
@@ -1050,6 +1053,7 @@ fn http_config(url: &str) -> McpServerConfig {
         env: None,
         url: Some(url.to_string()),
         default_policy: None,
+        startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
     }
 }
 

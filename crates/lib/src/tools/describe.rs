@@ -152,7 +152,7 @@ mod tests {
 
     async fn ctx_with(tools: Vec<Box<dyn Tool>>) -> (eidetica::Instance, ToolContext) {
         let (instance, session) = fresh_session().await;
-        let mut reg = ToolRegistry::new();
+        let reg = ToolRegistry::new();
         for t in tools {
             reg.register_boxed(t);
         }

@@ -770,12 +770,18 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .iter()
         .filter(|e| matches!(e.status, McpServerStatus::Running { .. }))
         .count();
-    let failed = servers.len() - running;
-    let header_count = if failed == 0 {
-        format!("    {running} running")
-    } else {
-        format!("    {running} running · {failed} failed")
-    };
+    let starting = servers
+        .iter()
+        .filter(|e| matches!(e.status, McpServerStatus::Starting))
+        .count();
+    let failed = servers.len() - running - starting;
+    let mut header_count = format!("    {running} running");
+    if starting > 0 {
+        header_count.push_str(&format!(" · {starting} starting"));
+    }
+    if failed > 0 {
+        header_count.push_str(&format!(" · {failed} failed"));
+    }
 
     let mut lines: Vec<Line> = Vec::with_capacity(servers.len() + 3);
     lines.push(Line::from(""));
@@ -807,7 +813,12 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 Style::default().fg(Color::White)
             };
             let suffix = match &entry.status {
-                McpServerStatus::Running { server } => mcp_row_suffix(server),
+                McpServerStatus::Starting => "  starting…".to_string(),
+                McpServerStatus::Running {
+                    discovery_error: Some(_),
+                    ..
+                } => "  running · no tools".to_string(),
+                McpServerStatus::Running { server, .. } => mcp_row_suffix(server),
                 McpServerStatus::Failed { .. } => "  failed".to_string(),
             };
             row_offsets.push(lines.len() as u16);
@@ -893,10 +904,30 @@ fn mcp_detail_lines(entry: &McpRegistryEntry) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     match &entry.status {
-        McpServerStatus::Running { server } => {
+        McpServerStatus::Starting => {
+            lines.push(about_kv("    status", "starting"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "    Connecting in the background. Its tools join the next turn",
+                Style::default().fg(theme::DIM),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "    once it is ready.",
+                Style::default().fg(theme::DIM),
+            )]));
+        }
+        McpServerStatus::Running {
+            server,
+            discovery_error,
+        } => {
             let caps = server.capabilities();
             let tool_count = server.tool_count();
-            let tools_value = if caps.tools {
+            // A discovery failure and a genuinely tool-less server both
+            // show zero tools, so name the failure rather than let the
+            // count imply the server simply has none.
+            let tools_value = if let Some(e) = discovery_error {
+                format!("discovery failed · {e}")
+            } else if caps.tools {
                 format!("supported · {tool_count} cached")
             } else {
                 "not supported".to_string()

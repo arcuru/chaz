@@ -152,7 +152,7 @@ async fn react_loop_dispatches_tool_call_and_returns_final_text() {
 
     let echo = EchoTool::new();
     let call_counter = echo.calls.clone();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -239,7 +239,7 @@ async fn empty_tool_registry_uses_no_tools_fast_path() {
 async fn backend_supports_tools_false_uses_no_tools_path() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -274,7 +274,7 @@ async fn backend_supports_tools_false_uses_no_tools_path() {
 async fn unknown_tool_name_returns_synthetic_message_to_llm() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -315,10 +315,101 @@ async fn unknown_tool_name_returns_synthetic_message_to_llm() {
 }
 
 #[tokio::test]
+async fn tool_from_a_still_starting_source_is_reported_as_not_yet_loaded() {
+    // A name in a still-loading namespace is a race, not a bad name. The
+    // model has to be able to tell them apart: one is worth retrying, the
+    // other is worth giving up on.
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool::new());
+    registry.announce_pending_source("filesystem");
+    let ctx = tool_context(session, Arc::new(registry));
+    let security = permissive_security();
+    let policies = ToolPolicyRegistry::empty();
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "c1".into(),
+        "filesystem__read_file".into(),
+        json!({}).to_string(),
+    )]);
+    mock.push_text("waited it out");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+
+    let outcome = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("read a file".into())],
+        &backend,
+        &security,
+        &ctx,
+        &policies,
+        None,
+        None,
+    )
+    .await
+    .expect("ok");
+
+    assert_eq!(outcome.body, "waited it out");
+    let content = calls_tool_result_content(&mock.recorded_calls()[1].messages)
+        .expect("the miss surfaces as a ToolResult");
+    assert!(
+        content.contains("not available yet") && content.contains("filesystem"),
+        "a pending source must be named as still starting, got: {content}"
+    );
+    assert!(
+        !content.contains("Unknown tool"),
+        "a pending source must not be reported as an unknown tool, got: {content}"
+    );
+}
+
+#[tokio::test]
+async fn tool_registered_after_scoping_is_advertised_on_the_next_turn() {
+    // The load-bearing property of background MCP startup: a session built
+    // before a server finished still advertises that server's tools once
+    // they land, with no reload and no invalidation protocol. `ScopedTools`
+    // holds an `Arc<ToolRegistry>` and reads through it per turn.
+    let registry = Arc::new(ToolRegistry::new());
+    let scoped = crate::tool::ScopedTools::new(registry.clone(), None);
+    let profile = crate::tool::ToolProfile::default();
+
+    assert!(
+        scoped.definitions(&profile).is_empty(),
+        "nothing registered yet"
+    );
+
+    // Registration happens through the same `&self` path a background MCP
+    // startup task uses, against a handle that was already scoped.
+    registry.register(EchoTool::new());
+
+    let names: Vec<String> = scoped
+        .definitions(&profile)
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "echo"),
+        "a late registration must be visible to an already-built scope, got: {names:?}"
+    );
+    assert!(
+        scoped.get("echo").is_some(),
+        "and callable through the same scope"
+    );
+}
+
+/// First `ToolResult` content in a recorded message list, if any.
+fn calls_tool_result_content(messages: &[RuntimeMessage]) -> Option<String> {
+    messages.iter().find_map(|m| match m {
+        RuntimeMessage::ToolResult { content, .. } => Some(content.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
 async fn tool_execution_error_surfaces_to_llm_and_run_continues() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(FailingTool);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -360,7 +451,7 @@ async fn tool_execution_error_surfaces_to_llm_and_run_continues() {
 async fn approval_required_tool_dispatches_when_approved() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(GatedTool);
     let ctx = tool_context(session, Arc::new(registry));
     let (security, _approver) = security_with_decision(ApprovalDecision::Approve);
@@ -401,7 +492,7 @@ async fn approval_required_tool_dispatches_when_approved() {
 async fn approval_required_tool_blocked_when_denied() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(GatedTool);
     let ctx = tool_context(session, Arc::new(registry));
     let (security, _denier) = security_with_decision(ApprovalDecision::Deny);
@@ -454,7 +545,7 @@ async fn approval_required_tool_blocked_when_denied() {
 async fn leak_detector_redacts_secret_in_tool_output() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(LeakyTool);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -505,7 +596,7 @@ async fn loop_detection_breaks_when_same_tool_call_repeats() {
     let secrets = empty_secrets().await;
     let echo = EchoTool::new();
     let call_counter = echo.calls.clone();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -566,7 +657,7 @@ async fn multiple_tool_calls_in_one_turn_all_dispatched() {
     let secrets = empty_secrets().await;
     let echo = EchoTool::new();
     let call_counter = echo.calls.clone();
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -666,7 +757,7 @@ async fn non_retryable_llm_error_propagates_as_runtime_error() {
 async fn empty_text_after_tool_call_falls_back_to_last_tool_result() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -710,7 +801,7 @@ async fn tool_result_messages_use_xml_wrapper_for_injection_safety() {
     // malicious tool output from being interpreted as an instruction.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -761,7 +852,7 @@ async fn max_iterations_forces_no_tools_summary_call() {
     // final summary text — the runtime should still terminate.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
@@ -819,7 +910,7 @@ async fn metadata_accumulator_sums_token_usage_across_calls() {
     // so we use a fresh MockBackend constructed manually.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();

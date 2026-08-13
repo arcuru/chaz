@@ -663,6 +663,7 @@ pub async fn execute(
 
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
+                            let tool: &dyn crate::tool::Tool = &*tool;
                             let policy = policies.resolve(tool);
                             let mut args: serde_json::Value =
                                 serde_json::from_str(&call.arguments).unwrap_or_default();
@@ -794,10 +795,30 @@ pub async fn execute(
                                 }
                             }
                         }
-                        None => {
-                            warn!(tool = %call.name, "Unknown tool requested by LLM");
-                            format!("Unknown tool: {}", call.name)
-                        }
+                        None => match tools.pending_source_for(&call.name) {
+                            // The tool's namespace belongs to a source that
+                            // is still starting, so the miss is a race, not a
+                            // bad name. Say which, and say it is worth
+                            // retrying — a bare "Unknown tool" would send the
+                            // model off to find a substitute for something
+                            // that is about to exist.
+                            Some(source) => {
+                                info!(
+                                    tool = %call.name,
+                                    source = %source,
+                                    "Tool requested before its source finished loading"
+                                );
+                                format!(
+                                    "Tool {} is not available yet: MCP server '{}' is still \
+                                     starting. Retry this call, or continue without it.",
+                                    call.name, source
+                                )
+                            }
+                            None => {
+                                warn!(tool = %call.name, "Unknown tool requested by LLM");
+                                format!("Unknown tool: {}", call.name)
+                            }
+                        },
                     };
 
                     // Emit tool result event

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Risk level for a tool invocation. Influences logging and approval requirements.
@@ -494,8 +494,15 @@ impl RegistryEntry {
 /// can share ownership of each tool with the registry — built from the hub
 /// at startup in `main.rs`. Owner attribution lets `ScopedTools` filter by
 /// per-session active-extension set.
+///
+/// The registry is interior-mutable, so its contents grow over the peer's
+/// lifetime: MCP servers start off the boot path and register their tools
+/// whenever they finish. `pending_sources` names the namespaces that have
+/// been announced but have not registered yet, so a lookup miss can be
+/// answered with "still starting" instead of "no such tool".
 pub struct ToolRegistry {
-    tools: Vec<RegistryEntry>,
+    tools: RwLock<Vec<RegistryEntry>>,
+    pending_sources: RwLock<std::collections::HashSet<String>>,
 }
 
 impl Default for ToolRegistry {
@@ -592,10 +599,13 @@ fn validate_strict_schema(name: &str, params: &Value) -> Result<(), String> {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: RwLock::new(Vec::new()),
+            pending_sources: RwLock::new(std::collections::HashSet::new()),
+        }
     }
 
-    pub fn register(&mut self, tool: impl Tool + 'static) {
+    pub fn register(&self, tool: impl Tool + 'static) {
         let desc = tool.descriptor();
         debug_assert_valid_parameters(&desc);
         if tool.strict_schema() {
@@ -606,13 +616,16 @@ impl ToolRegistry {
                 validate_strict_schema(&desc.name, &desc.parameters).unwrap_err()
             );
         }
-        self.tools.push(RegistryEntry {
-            tool: std::sync::Arc::new(tool),
-            owner: None,
-        });
+        self.tools
+            .write()
+            .expect("ToolRegistry lock poisoned")
+            .push(RegistryEntry {
+                tool: std::sync::Arc::new(tool),
+                owner: None,
+            });
     }
 
-    pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
+    pub fn register_boxed(&self, tool: Box<dyn Tool>) {
         let desc = tool.descriptor();
         debug_assert_valid_parameters(&desc);
         if tool.strict_schema() {
@@ -623,20 +636,24 @@ impl ToolRegistry {
                 validate_strict_schema(&desc.name, &desc.parameters).unwrap_err()
             );
         }
-        self.tools.push(RegistryEntry {
-            tool: std::sync::Arc::from(tool),
-            owner: None,
-        });
+        self.tools
+            .write()
+            .expect("ToolRegistry lock poisoned")
+            .push(RegistryEntry {
+                tool: std::sync::Arc::from(tool),
+                owner: None,
+            });
     }
 
-    /// Add a tool already wrapped in an `Arc` (e.g. one held by the
-    /// extension hub) attributed to its owner extension. `None` owner
-    /// means "always available regardless of per-session active set".
-    pub fn register_arc_owned(
-        &mut self,
-        tool: std::sync::Arc<dyn Tool>,
-        owner: Option<&'static str>,
-    ) {
+    /// Register an already-Arc-wrapped tool with an optional owner.
+    ///
+    /// # Invariant
+    /// This is a linear-scan push — it does **not** check for duplicate names.
+    /// Re-registering the same name would silently shadow the earlier entry
+    /// (the first match wins at lookup time, but both remain in the vec).
+    /// Callers are responsible for ensuring names are unique across all
+    /// registrants (extensions, MCP servers, and builtins).
+    pub fn register_arc_owned(&self, tool: std::sync::Arc<dyn Tool>, owner: Option<&'static str>) {
         let desc = tool.descriptor();
         debug_assert_valid_parameters(&desc);
         if tool.strict_schema() {
@@ -647,27 +664,72 @@ impl ToolRegistry {
                 validate_strict_schema(&desc.name, &desc.parameters).unwrap_err()
             );
         }
-        self.tools.push(RegistryEntry { tool, owner });
+        self.tools
+            .write()
+            .expect("ToolRegistry lock poisoned")
+            .push(RegistryEntry { tool, owner });
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools
+            .read()
+            .expect("ToolRegistry lock poisoned")
+            .is_empty()
     }
 
     /// Look up a tool by name
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools
+            .read()
+            .expect("ToolRegistry lock poisoned")
             .iter()
             .find(|e| e.tool.descriptor().name == name)
-            .map(|e| e.tool.as_ref())
+            .map(|e| e.tool.clone())
     }
 
     /// Owner extension of a tool, if any. `None` for MCP/un-attributed.
     pub fn owner_of(&self, name: &str) -> Option<&'static str> {
         self.tools
+            .read()
+            .expect("ToolRegistry lock poisoned")
             .iter()
             .find(|e| e.tool.descriptor().name == name)
             .and_then(|e| e.owner)
+    }
+
+    /// Announce that `source` will contribute tools under the `source__*`
+    /// namespace but has not registered them yet. Paired with
+    /// [`Self::finish_pending_source`], which every announcement reaches
+    /// exactly once — on success, on failure, and on timeout alike.
+    pub fn announce_pending_source(&self, source: &str) {
+        self.pending_sources
+            .write()
+            .expect("ToolRegistry pending_sources lock poisoned")
+            .insert(source.to_string());
+    }
+
+    /// Retire an announcement made by [`Self::announce_pending_source`].
+    pub fn finish_pending_source(&self, source: &str) {
+        self.pending_sources
+            .write()
+            .expect("ToolRegistry pending_sources lock poisoned")
+            .remove(source);
+    }
+
+    /// The still-loading source a missing tool name would have come from,
+    /// if any. Splits on the `__` namespace separator, so
+    /// `"filesystem__read_file"` resolves to `"filesystem"`.
+    ///
+    /// Callers use this to tell "not loaded *yet*" apart from "no such
+    /// tool" — the two are indistinguishable from a bare lookup miss once
+    /// tool registration is asynchronous.
+    pub fn pending_source_for(&self, tool_name: &str) -> Option<String> {
+        let (source, _) = tool_name.split_once("__")?;
+        let pending = self
+            .pending_sources
+            .read()
+            .expect("ToolRegistry pending_sources lock poisoned");
+        pending.contains(source).then(|| source.to_string())
     }
 }
 
@@ -759,7 +821,13 @@ impl ScopedTools {
                 for child_pattern in child {
                     if child_pattern.ends_with("__*") {
                         // Child glob: expand to matching registry tools, keep if parent allows
-                        for entry in &self.registry.tools {
+                        for entry in self
+                            .registry
+                            .tools
+                            .read()
+                            .expect("ToolRegistry lock poisoned")
+                            .iter()
+                        {
                             let name = entry.descriptor().name;
                             if pattern_matches(child_pattern, &name)
                                 && is_allowed_by(parent, &name)
@@ -788,6 +856,8 @@ impl ScopedTools {
     pub fn is_empty(&self) -> bool {
         self.registry
             .tools
+            .read()
+            .expect("ToolRegistry lock poisoned")
             .iter()
             .filter(|e| match &self.allowed {
                 None => true,
@@ -801,6 +871,8 @@ impl ScopedTools {
     pub fn definitions(&self, profile: &ToolProfile) -> Vec<ToolDefinition> {
         self.registry
             .tools
+            .read()
+            .expect("ToolRegistry lock poisoned")
             .iter()
             .filter(|e| match &self.allowed {
                 None => true,
@@ -820,7 +892,7 @@ impl ScopedTools {
             .collect()
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         if let Some(allowed) = &self.allowed
             && !is_allowed_by(allowed, name)
         {
@@ -830,6 +902,15 @@ impl ScopedTools {
             return None;
         }
         self.registry.get(name)
+    }
+
+    /// The still-loading source a [`Self::get`] miss would have come from.
+    /// Delegates to [`ToolRegistry::pending_source_for`]; the allowlist and
+    /// extension filters are deliberately not applied, because a name the
+    /// scope would reject is still better explained as "not loaded yet"
+    /// than as "no such tool" — both end in the same refusal either way.
+    pub fn pending_source_for(&self, tool_name: &str) -> Option<String> {
+        self.registry.pending_source_for(tool_name)
     }
 }
 

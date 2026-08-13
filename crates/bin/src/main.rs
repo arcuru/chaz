@@ -289,6 +289,15 @@ async fn main() -> anyhow::Result<()> {
             // starting the loop would risk billing one as a side effect.
             run_agent_loop: cmd_args.is_none(),
             extra_auto_approved_tools,
+            // `--print` runs exactly one turn, so its tool list has to be
+            // complete before that turn starts. Long-lived modes take the
+            // tools whenever they land. `chaz cmd` runs no turn at all and
+            // so never reaches the gate either way.
+            mcp_readiness: if args.print {
+                server::McpReadiness::AwaitReady
+            } else {
+                server::McpReadiness::Deferred
+            },
         },
     )
     .await?;

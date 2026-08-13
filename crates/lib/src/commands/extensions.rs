@@ -420,6 +420,7 @@ mod tests {
             server_cell: spawn_cell.clone(),
             mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
+            tool_registry: Arc::new(ToolRegistry::new()),
         }));
         let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
@@ -436,7 +437,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        let mut tool_registry = ToolRegistry::new();
+        let tool_registry = ToolRegistry::new();
         for (owner, _name, tool) in hub.tools_for_registry() {
             tool_registry.register_arc_owned(tool, Some(owner));
         }
