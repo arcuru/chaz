@@ -1,6 +1,6 @@
 use crate::tool::PresentationMode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for the chaz bot
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -744,6 +744,388 @@ impl Default for ContextConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unknown-key detection
+// ---------------------------------------------------------------------------
+//
+// chaz parses the same YAML file twice (daemon Config + bridge config), and
+// serde silently ignores keys it doesn't recognise. A typo or a drifted key
+// (like `agents[].logins` in the daemon config) looks live but does nothing.
+//
+// We warn about unrecognised keys at startup by comparing the YAML key paths
+// against a static registry of every field the schema knows about. The
+// registry is the union of Config + MatrixBridgeConfig + DiscordBridgeConfig
+// so the double-parse doesn't produce cross-noise.
+
+/// Walk a [`serde_yaml::Value`] tree and return every dotted key path,
+/// normalising array indices to `[]` wildcards.
+///
+/// A scalar (string, number, bool, null) contributes no path entry.
+/// Maps contribute their immediate key and recurse into values.
+/// Sequences contribute a `[]` marker and recurse into each element.
+///
+/// # Example
+///
+/// ```yaml
+/// agents:
+///   - name: foo
+///     model: gpt-4
+/// ```
+///
+/// Returns: `["agents", "agents[].name", "agents[].model"]`
+fn collect_yaml_paths(value: &serde_yaml::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_yaml_paths_impl(value, String::new(), &mut paths);
+    paths
+}
+
+fn collect_yaml_paths_impl(value: &serde_yaml::Value, prefix: String, out: &mut Vec<String>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (k, v) in map {
+                let key = k.as_str().unwrap_or_default();
+                if key.is_empty() {
+                    continue;
+                }
+                let full_key = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                out.push(full_key.clone());
+                if matches!(
+                    v,
+                    serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)
+                ) {
+                    collect_yaml_paths_impl(v, full_key, out);
+                }
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            let array_prefix = format!("{prefix}[]");
+            for item in seq {
+                if matches!(
+                    item,
+                    serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)
+                ) {
+                    collect_yaml_paths_impl(item, array_prefix.clone(), out);
+                }
+            }
+        }
+        _ => {} // scalars — no path entry, their parent key already covers them
+    }
+}
+
+/// Every YAML key path that `Config`, `MatrixBridgeConfig`, or
+/// `DiscordBridgeConfig` recognises.  The set is deliberately the union so
+/// the bridge's double-parse (`Config` + bridge config from the same bytes)
+/// doesn't report the other struct's keys as unknown.
+///
+/// When you add a new field to any config struct, add its path here.
+fn known_config_keys() -> HashSet<&'static str> {
+    let mut keys = HashSet::new();
+
+    // ── Top-level Config keys ──
+    for k in [
+        "allow_list",
+        "message_limit",
+        "room_size_limit",
+        "state_dir",
+        "chat_summary_model",
+        "backends",
+        "agents",
+        "default_agents",
+        "security",
+        "schedules",
+        "mcp_servers",
+        "tool_profiles",
+        "mcp_server_dir",
+        "context",
+        "web_search",
+        "sync_listen",
+        "embedding",
+        "cli",
+        "agent_state_allowlist",
+        "multi_agent",
+        "runtime",
+        // Bridge-only top-level keys (MatrixBridgeConfig + DiscordBridgeConfig).
+        // Config doesn't own these, but they're legit when the bridge
+        // double-parses the same file.
+        "label",
+        "unlock_password",
+        "logins",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── backends[] ──
+    for k in [
+        "backends[].type",
+        "backends[].api_base",
+        "backends[].api_key",
+        "backends[].models",
+        "backends[].name",
+        "backends[].config_dir",
+        "backends[].request_timeout",
+        "backends[].max_retries",
+        "backends[].max_tokens",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── backends[].models[] ──
+    for k in [
+        "backends[].models[].name",
+        "backends[].models[].price_input",
+        "backends[].models[].price_output",
+        "backends[].models[].price_cache_read",
+        "backends[].models[].context_window",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── agents[] ──
+    for k in [
+        "agents[].name",
+        "agents[].system_prompt",
+        "agents[].system_prompt_files",
+        "agents[].model",
+        "agents[].tools",
+        "agents[].workers",
+        "agents[].max_iterations",
+        "agents[].autonomous",
+        "agents[].presets",
+        "agents[].tool_profile",
+        "agents[].max_context_tokens",
+        "agents[].capabilities",
+        "agents[].grants",
+        "agents[].default_memory_banks",
+        "agents[].default_skill_banks",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── agents[].workers[] ──
+    for k in [
+        "agents[].workers[].name",
+        "agents[].workers[].system_prompt",
+        "agents[].workers[].system_prompt_files",
+        "agents[].workers[].model",
+        "agents[].workers[].tools",
+        "agents[].workers[].max_iterations",
+        "agents[].workers[].presets",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── agents[].presets.<name> ── (dynamic keys — any name is valid)
+    keys.insert("agents[].presets.");
+
+    // ── agents[].workers[].presets.<name> ──
+    keys.insert("agents[].workers[].presets.");
+
+    // ── agents[].capabilities.* ── (Grants — all fields are dynamic)
+    keys.insert("agents[].capabilities.");
+
+    // ── agents[].grants.<tool_name>.* ── (dynamic per-tool grants)
+    keys.insert("agents[].grants.");
+
+    // ── security ──
+    for k in [
+        "security.allowed_endpoints",
+        "security.shell_allowlist",
+        "security.shell_denylist",
+        "security.leak_policy",
+        "security.auto_approved_tools",
+        "security.tool_policies",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── security.allowed_endpoints[] ──
+    for k in [
+        "security.allowed_endpoints[].host",
+        "security.allowed_endpoints[].path_prefix",
+        "security.allowed_endpoints[].methods",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── security.tool_policies.<tool_name> ── (dynamic keys)
+    keys.insert("security.tool_policies.");
+
+    // ── schedules[] ──
+    for k in [
+        "schedules[].name",
+        "schedules[].session",
+        "schedules[].agent",
+        "schedules[].task",
+        "schedules[].cron",
+        "schedules[].enabled",
+        "schedules[].max_fires",
+        "schedules[].expires_at",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── mcp_servers[] ──
+    for k in [
+        "mcp_servers[].name",
+        "mcp_servers[].command",
+        "mcp_servers[].args",
+        "mcp_servers[].env",
+        "mcp_servers[].url",
+        "mcp_servers[].default_policy",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── mcp_servers[].env.<var_name> ── (dynamic keys)
+    keys.insert("mcp_servers[].env.");
+
+    // ── tool_profiles.<profile_name> ── (dynamic keys)
+    keys.insert("tool_profiles.");
+
+    // ── tool_profiles.<name>.tools.<tool_name> ── (dynamic keys)
+    keys.insert("tool_profiles..tools.");
+
+    // ── context ──
+    for k in [
+        "context.max_context_tokens",
+        "context.reserved_output_tokens",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── web_search ──
+    keys.insert("web_search.backends");
+
+    // ── web_search.backends[] ──
+    for k in [
+        "web_search.backends[].type",
+        "web_search.backends[].api_key",
+        "web_search.backends[].url",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── embedding ──
+    for k in [
+        "embedding.backend",
+        "embedding.model",
+        "embedding.provider",
+        "embedding.api_base",
+        "embedding.api_key",
+    ] {
+        keys.insert(k);
+    }
+
+    // ── cli ──
+    keys.insert("cli.auto_approved_tools");
+
+    // ── agent_state_allowlist.<extension_name> ── (dynamic keys)
+    keys.insert("agent_state_allowlist.");
+
+    // ── multi_agent ──
+    keys.insert("multi_agent.burst_budget");
+
+    // ── logins[] (bridge-owned, in MatrixBridgeConfig + DiscordBridgeConfig) ──
+    for k in [
+        "logins[].agent",
+        "logins[].ticket",
+        "logins[].type",
+        "logins[].homeserver_url",
+        "logins[].username",
+        "logins[].password",
+        "logins[].allow_list",
+        "logins[].room_size_limit",
+        "logins[].id",
+        "logins[].state_dir",
+        "logins[].token",
+    ] {
+        keys.insert(k);
+    }
+
+    keys
+}
+
+/// Compare the YAML document's key paths against the known registry and
+/// return unrecognised paths as a sorted, deduplicated list.  Empty when
+/// every key is recognised or the document can't be parsed as YAML.
+///
+/// Paths are normalised to `[]` wildcards so `agents[0].logins` and
+/// `agents[1].logins` both match `agents[].logins` (or not, and get reported
+/// once as `agents[].logins`).
+pub fn check_unknown_config_keys(yaml: &str) -> Vec<String> {
+    let known = known_config_keys();
+    let value: serde_yaml::Value = match serde_yaml::from_str(yaml) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(), // let the real parse return the error
+    };
+    let mut paths = collect_yaml_paths(&value);
+    // Filter: keep paths not in the known set.
+    // Dynamic keys are flagged by a trailing `.` in the known set (e.g.
+    // "tool_profiles." matches "tool_profiles.brief").
+    paths.retain(|p| !path_is_known(p, &known));
+    paths.sort();
+    paths.dedup();
+    // If a parent path is unknown, skip its children — reporting just
+    // `agentz` is clearer than `agentz` + `agentz[].name` + ….
+    paths = remove_descendants_of_unknown(paths);
+    paths
+}
+
+/// A path is "known" if it appears literally in `known`, or if any ancestor
+/// with a trailing `.` is in `known` (marking a subtree of dynamic keys).
+fn path_is_known(path: &str, known: &HashSet<&str>) -> bool {
+    if known.contains(path) {
+        return true;
+    }
+    // Check dynamic-key prefixes: "tool_profiles.brief" → known if
+    // "tool_profiles." is registered.
+    let mut probe = String::new();
+    let mut chars = path.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '.' {
+            probe.push('.');
+            if known.contains(probe.as_str()) {
+                return true;
+            }
+        } else if ch == '[' {
+            probe.push_str("[]");
+            // Skip past the matching ']' (and any chars inside like index digits).
+            for c in chars.by_ref() {
+                if c == ']' {
+                    break;
+                }
+            }
+        } else {
+            probe.push(ch);
+        }
+    }
+    false
+}
+
+/// Given a sorted list of unknown paths, drop any path that is a descendant
+/// of another — reporting just `agentz` instead of `agentz` + `agentz[].name`.
+fn remove_descendants_of_unknown(paths: Vec<String>) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    for p in paths {
+        let is_descendant = result.iter().any(|ancestor| {
+            if !p.starts_with(ancestor.as_str()) {
+                return false;
+            }
+            let after = &p.as_bytes()[ancestor.len()..];
+            // Descendant separator is `.` or `[`
+            matches!(after.first(), Some(b'.' | b'['))
+        });
+        if !is_descendant {
+            result.push(p);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,5 +1513,214 @@ username: "@u:s"
         assert!(defaults.contains(&"shell".to_string()));
         assert!(defaults.contains(&"write_file".to_string()));
         assert_eq!(defaults.len(), 2);
+    }
+
+    // ── Unknown-key detection tests ──
+
+    #[test]
+    fn collect_yaml_paths_flat() {
+        let yaml = r#"
+allow_list: "foo"
+agents:
+  - name: ava
+    model: gpt-4
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let mut paths = collect_yaml_paths(&value);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["agents", "agents[].model", "agents[].name", "allow_list",]
+        );
+    }
+
+    #[test]
+    fn no_warning_for_known_config() {
+        // A config with only recognised keys — no warnings expected.
+        let yaml = r#"
+allow_list: "@alice:matrix.org"
+agents:
+  - name: chaz
+    system_prompt: "You are chaz."
+    model: gpt-4
+    autonomous: true
+context:
+  max_context_tokens: 32000
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert!(
+            unknown.is_empty(),
+            "expected no unknown keys, got: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn warns_on_top_level_typo() {
+        // `agentz` instead of `agents` — should warn.
+        let yaml = r#"
+allow_list: "@alice:matrix.org"
+agentz:
+  - name: chaz
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert_eq!(unknown, vec!["agentz"]);
+    }
+
+    #[test]
+    fn warns_on_nested_typo_in_agent() {
+        // `modle` instead of `model` inside an agent entry.
+        let yaml = r#"
+agents:
+  - name: chaz
+    modle: gpt-4
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert_eq!(unknown, vec!["agents[].modle"]);
+    }
+
+    #[test]
+    fn warns_on_logins_under_agents() {
+        // `agents[].logins` is the concrete instance that prompted this
+        // work — the daemon doesn't read it but it looks live.
+        let yaml = r#"
+agents:
+  - name: chaz
+    system_prompt: "You are chaz."
+    logins:
+      - type: matrix
+        homeserver_url: https://matrix.example
+        username: "@chaz:example"
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert_eq!(unknown, vec!["agents[].logins"]);
+    }
+
+    #[test]
+    fn bridge_only_keys_are_not_unknown() {
+        // Top-level bridge keys (label, unlock_password, logins) are in the
+        // known set — the daemon sees them during the double-parse and should
+        // NOT warn about them.
+        let yaml = r#"
+label: matrix
+unlock_password: "${UNLOCK}"
+logins:
+  - agent: chaz
+    ticket: "eidetica:?db=..."
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@chaz:example"
+    password: "${PW}"
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert!(
+            unknown.is_empty(),
+            "bridge keys should not be unknown, got: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_inside_bridge_logins() {
+        // A typo inside a bridge login entry — should still fire.
+        let yaml = r#"
+logins:
+  - agent: chaz
+    ticket: "eidetica:?db=..."
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@chaz:example"
+    password: "${PW}"
+    bogus_key: 42
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert_eq!(unknown, vec!["logins[].bogus_key"]);
+    }
+
+    #[test]
+    fn empty_yaml_no_warning() {
+        let unknown = check_unknown_config_keys("");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn invalid_yaml_no_warning() {
+        // Truly invalid YAML — let the real parse error surface; don't add noise.
+        let unknown = check_unknown_config_keys(":invalid: yaml: [");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn dynamic_keys_tool_profiles_are_known() {
+        let yaml = r#"
+tool_profiles:
+  brief:
+    default: Minimal
+    tools:
+      shell: Full
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert!(
+            unknown.is_empty(),
+            "dynamic keys under tool_profiles should be known, got: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_in_web_search_backends() {
+        let yaml = r#"
+web_search:
+  backends:
+    - type: tavily
+      api_key: "${KEY}"
+      wrong_field: true
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert_eq!(unknown, vec!["web_search.backends[].wrong_field"]);
+    }
+
+    #[test]
+    fn unknown_in_security_section() {
+        let yaml = r#"
+security:
+  leak_policy: block
+  nonexistent_policy: strict
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        assert_eq!(unknown, vec!["security.nonexistent_policy"]);
+    }
+
+    #[test]
+    fn known_config_keys_is_non_empty() {
+        // Sanity: the registry has entries.
+        let known = known_config_keys();
+        assert!(!known.is_empty());
+        // Every top-level Config field name should be present.
+        for field in [
+            "agents",
+            "backends",
+            "security",
+            "context",
+            "web_search",
+            "embedding",
+            "schedules",
+        ] {
+            assert!(
+                known.contains(field),
+                "top-level field '{field}' missing from known_config_keys()"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_unknown_keys_deduped() {
+        let yaml = r#"
+agents:
+  - name: a
+    bogus: 1
+  - name: b
+    bogus: 2
+"#;
+        let unknown = check_unknown_config_keys(yaml);
+        // `bogus` appears in two agent entries but should be reported once.
+        assert_eq!(unknown, vec!["agents[].bogus"]);
     }
 }

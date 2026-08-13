@@ -918,6 +918,17 @@ impl Server {
         let config: crate::config::Config = serde_yaml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
 
+        // Warn about unrecognised keys on each reload (config may change).
+        let unknown = crate::config::check_unknown_config_keys(&contents);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                config = %path.display(),
+                count = unknown.len(),
+                keys = %unknown.join(", "),
+                "Unrecognised config key(s)"
+            );
+        }
+
         let Some(agents) = config.agents.as_ref() else {
             return Ok(ReloadReport::default());
         };
