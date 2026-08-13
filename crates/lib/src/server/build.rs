@@ -1259,9 +1259,22 @@ async fn pull_session_tree_from_agent_peers(
     // large the deadline is, and reports "did not answer" for a request it never
     // sent.
     //
-    // Ordering by most-recent successful sync, then by last seen, puts the peer
-    // that is actually serving this agent DB first, so the common case succeeds
-    // on the first attempt and never pays for the dead ones at all.
+    // Ordering by most recent contact puts the peer that is actually serving
+    // this agent DB first, so the common case succeeds on the first attempt and
+    // never pays for the dead ones at all.
+    //
+    // `last_successful_sync` is the key this *should* rank on, and it is the
+    // first key below — but at the eidetica rev we pin, nothing ever writes it.
+    // It is constructed `None`, round-tripped through the peer store, and read
+    // back `None` for every peer, so the sort in practice runs entirely on
+    // `last_seen`. That is a weaker signal — it records registration and status
+    // updates rather than whether the peer has served anything — but it does
+    // separate a live bridge from long-retired identities, which is what this
+    // needs. Keeping the stronger key first means this starts ranking correctly
+    // the moment eidetica populates it, with one caveat worth knowing: a peer
+    // that has genuinely never synced sorts behind every peer that has, so a
+    // brand-new bridge would rank last. That is inert while every value is
+    // `None`, and must be revisited when it stops being.
     let mut ranked: Vec<(Option<String>, String, eidetica::PublicKey)> =
         Vec::with_capacity(peers.len());
     for peer in &peers {
@@ -1283,14 +1296,14 @@ async fn pull_session_tree_from_agent_peers(
         return;
     }
     // ISO-8601 timestamps sort lexicographically, and `None` sorts before
-    // `Some`, so reversing puts "synced most recently" at the front.
+    // `Some`, so reversing puts the most recently contacted peer at the front.
     ranked.sort_by(|a, b| (&b.0, &b.1).cmp(&(&a.0, &a.1)));
 
     info!(
         session_db_id,
         peer_count = ranked.len(),
         peers = ?ranked.iter().map(|(_, _, k)| k.to_string()).collect::<Vec<_>>(),
-        "Pulling exposed session tree; trying peers in order of most recent sync"
+        "Pulling exposed session tree; trying peers in order of most recent contact"
     );
 
     let mut winner = None;
