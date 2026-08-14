@@ -121,6 +121,7 @@ struct TestExt {
     parts: TestParts,
     instantiations: Option<Arc<std::sync::atomic::AtomicUsize>>,
     fail_instantiate: bool,
+    panic_instantiate: bool,
 }
 
 impl TestExt {
@@ -132,6 +133,7 @@ impl TestExt {
             parts: TestParts::default(),
             instantiations: None,
             fail_instantiate: false,
+            panic_instantiate: false,
         }
     }
     /// Bump `counter` on every `instantiate` call, so tests can assert
@@ -145,6 +147,12 @@ impl TestExt {
     /// published never reach the hub's registries.
     fn fails_instantiate(mut self) -> Self {
         self.fail_instantiate = true;
+        self
+    }
+    /// Panic inside `instantiate` (not just an Err return) so the
+    /// `catch_unwind` path in `install_all` is exercised.
+    fn panics_instantiate(mut self) -> Self {
+        self.panic_instantiate = true;
         self
     }
     fn scopes(mut self, scopes: Vec<instance::Scope>) -> Self {
@@ -198,9 +206,13 @@ impl Extension for TestExt {
         let parts = self.parts.clone();
         let instantiations = self.instantiations.clone();
         let fail = self.fail_instantiate;
+        let do_panic = self.panic_instantiate;
         Box::pin(async move {
             if let Some(counter) = instantiations {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if do_panic {
+                panic!("intentional panic for catch_unwind test");
             }
             if fail {
                 return Err(anyhow::anyhow!("simulated instantiation failure"));
@@ -1123,6 +1135,33 @@ async fn install_all_skips_failing_extension_and_installs_the_rest() {
     let ctx = fixture_ctx_with_active(all_active(&["broken"])).await;
     assert!(hub.fire_before_agent_start(&ctx).await.is_empty());
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn install_all_isolates_panicking_instantiation_and_installs_the_rest() {
+    let mut hub = test_hub().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // "boom" panics during instantiate; "after" must still install.
+    let boom = TestExt::new("boom")
+        .command("will-not-register", Arc::new(DummyCmd))
+        .panics_instantiate();
+    hub.install_all(vec![Arc::new(boom), counting_ext("after", calls.clone())])
+        .await
+        .expect("a panicking instantiation must not fail install_all");
+
+    // The panicking extension is registered but contributes nothing
+    // — its drain never ran.
+    assert!(hub.extension_names().contains(&"boom"));
+    assert!(!hub.global_instances.contains_key("boom"));
+    assert!(hub.commands_for("boom").is_empty());
+    assert_eq!(hub.command_owner("will-not-register"), None);
+
+    // The healthy extension installed normally.
+    assert!(hub.global_instances.contains_key("after"));
+    let ctx = fixture_ctx_with_active(all_active(&["after"])).await;
+    let injected = hub.fire_before_agent_start(&ctx).await;
+    assert_eq!(injected.len(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

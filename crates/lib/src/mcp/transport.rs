@@ -172,6 +172,7 @@ impl StdioTransport {
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
