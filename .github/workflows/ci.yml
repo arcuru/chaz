@@ -5,6 +5,10 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # A merge queue runs its checks against a synthetic branch and reports them
+  # under this event. A required check that does not subscribe to it never
+  # reports at all, which stalls the queue rather than failing it.
+  merge_group:
   workflow_dispatch:
 
 permissions:

@@ -8,6 +8,11 @@ on:
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # Required checks must also report on a merge group or the queue stalls. The
+  # gate passes there on its own: a merge group has no head_ref, so the
+  # ^deps/ test in the reusable workflow exits early. The hold gates entry
+  # into the queue, not the queue itself.
+  merge_group:
 
 permissions:
   contents: read
@@ -15,6 +20,6 @@ permissions:
 
 jobs:
   hold:
-    uses: arcuru/actions/.github/workflows/dependency-hold.yml@31c804a9c15602300e5e292e80cac1ad5512a21a # v0.2.0
+    uses: arcuru/actions/.github/workflows/dependency-hold.yml@66448a5bf7ed8885a63470ca9b212a0f2dd83d90 # v0.4.1
     with:
       runs-on: ubicloud-standard-2
