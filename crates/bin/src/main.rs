@@ -119,6 +119,16 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
     }
 }
 
+/// Resolve the configured state directory, expanding a leading `~` when set.
+/// Falls back to the platform XDG state directory when it is absent.
+fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
+    config
+        .state_dir
+        .as_ref()
+        .map(|path| agent::expand_home(std::path::Path::new(path)))
+        .or_else(|| dirs::state_dir().map(|d| d.join("chaz")))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = ChazArgs::parse();
@@ -143,11 +153,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Resolve state directory for persistence
-    let state_dir = config
-        .state_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| dirs::state_dir().map(|d| d.join("chaz")));
+    let state_dir = resolve_state_dir(&config);
     if let Some(dir) = &state_dir {
         std::fs::create_dir_all(dir)?;
     }
@@ -451,7 +457,8 @@ async fn run_usage_subcommand(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_config_path;
+    use super::{resolve_config_path, resolve_state_dir};
+    use chaz_core::config::Config;
     use std::path::PathBuf;
 
     #[test]
@@ -476,5 +483,33 @@ mod tests {
             "unhelpful error: {msg}"
         );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn resolve_state_dir_expands_tilde_and_preserves_other_paths() {
+        let home = dirs::home_dir().expect("home dir in test env");
+        let config = Config {
+            state_dir: Some("~/.local/state/chaz".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&config),
+            Some(home.join(".local/state/chaz"))
+        );
+
+        let config = Config {
+            state_dir: Some("relative/state".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&config),
+            Some(PathBuf::from("relative/state"))
+        );
+
+        let config = Config::default();
+        assert_eq!(
+            resolve_state_dir(&config),
+            dirs::state_dir().map(|dir| dir.join("chaz"))
+        );
     }
 }

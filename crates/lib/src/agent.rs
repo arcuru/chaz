@@ -41,7 +41,7 @@ pub(crate) fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
 
 /// Expand a leading `~` / `~/…` in `path` against the home directory.
 /// Returns `path` unchanged when there is no leading tilde or no home dir.
-fn expand_home(path: &Path) -> PathBuf {
+pub fn expand_home(path: &Path) -> PathBuf {
     let Some(s) = path.to_str() else {
         return path.to_path_buf();
     };
