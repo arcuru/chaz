@@ -938,6 +938,7 @@ mod tests {
             identifier: "@chaz:example".to_string(),
             bridge_db_id: "bafyrbridgedb".to_string(),
             peer_pubkey: None,
+            agent_pubkey: None,
             sync_addresses: Vec::new(),
         };
         let registered =

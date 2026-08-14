@@ -197,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
             identifier: login_id.clone(),
             bridge_db_id: bridge_db_id.clone(),
             peer_pubkey: peer_pubkey.clone(),
+            // Stamped by `establish_login` from the key actually bootstrapped.
+            agent_pubkey: None,
             sync_addresses: sync_addresses.clone(),
         };
         match establish_login(&mut user, &bootstrap, &identity, &ticket, login_ref).await? {

@@ -197,6 +197,20 @@ pub struct LoginRef {
     /// and any writer that does not serve sync — still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_pubkey: Option<String>,
+    /// The key this bridge authenticates to *this agent DB* with — the one it
+    /// bootstrapped and an operator pre-authorized (`--print-pubkey`).
+    ///
+    /// Distinct from [`Self::peer_pubkey`], and the distinction is the whole
+    /// point of the field. A bridge holds two unrelated identities: a device
+    /// key, which names where it is reachable on the transport, and this key,
+    /// which names who it is to the authorization layer. Only the latter is
+    /// written into a session's `home_pubkey` when the bridge attaches an
+    /// agent, so it is the only one a home pubkey can ever be compared
+    /// against. Optional so entries written before this existed still decode —
+    /// they contribute nothing, which costs a missed migration rather than a
+    /// wrong one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pubkey: Option<String>,
     /// Transport addresses this bridge is currently reachable at, as
     /// `(transport, address)` pairs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1596,6 +1610,7 @@ mod tests {
             identifier: identifier.into(),
             bridge_db_id: bridge_db_id.into(),
             peer_pubkey: None,
+            agent_pubkey: None,
             sync_addresses: Vec::new(),
         }
     }
