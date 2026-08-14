@@ -1389,6 +1389,21 @@ impl Server {
 
         info!(session_db_id = %session_db_id, "Server watching session (transport)");
 
+        // Reconcile once, now that the callback is installed. Entries written
+        // while this session was unwatched are already in the database and no
+        // future write is coming to announce them — a daemon restarted with a
+        // message in flight is the ordinary case. Without this the message
+        // waits for unrelated traffic to wake the loop, which from the outside
+        // looks like the agent ignoring it.
+        //
+        // Cheap and idempotent: the loop dedups notifications, and
+        // `process_session` on a session with nothing outstanding is a no-op.
+        // A standalone bridge runs with no processing loop, so the send having
+        // no receiver is expected there rather than a failure.
+        if self.notify_tx.send(session_db_id.clone()).await.is_err() {
+            debug!(session_db_id = %session_db_id, "No processing loop; skipping catch-up");
+        }
+
         Ok(())
     }
 
