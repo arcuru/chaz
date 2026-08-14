@@ -47,6 +47,9 @@ tokio-stream = "0.1"
 tiktoken-rs = "0.11"
 wasmtime = "43"
 blake3 = "1"
+sha2 = "0.10"
+base64 = "0.22"
+unicode-normalization = "0.1"
 futures = "0.3"
 
 # Dev-deps shared.

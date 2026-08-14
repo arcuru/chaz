@@ -72,7 +72,11 @@ There are two paths to give another peer access to an agent or memory bank: a **
 # On Source (peer A): see and approve the request
 /sharing requests
 # Output: Pending bootstrap requests (1):
-#           <id> — agent 'my-agent' requested by ed25519:... as write(10) at <ts>
+#         Each entry opens with the SHA256 fingerprint of the requesting key; everything
+#         under 'claimed' is supplied by the requester.
+#           [1] SHA256:<fingerprint of the requesting key>
+#                wants write(10) on agent 'my-agent'
+#                request <id>, claimed time <ts>
 /sharing approve <id>
 
 # On Receiver: re-run the import — now it succeeds

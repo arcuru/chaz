@@ -1,8 +1,10 @@
+pub mod approval_display;
 pub mod leak_detector;
 pub mod network;
 pub mod sanitizer;
 pub mod secrets;
 
+pub use approval_display::{Quarantined, pubkey_fingerprint, quarantine};
 pub use leak_detector::{LeakDetector, LeakPolicy};
 pub use network::NetworkPolicy;
 pub use sanitizer::Sanitizer;
