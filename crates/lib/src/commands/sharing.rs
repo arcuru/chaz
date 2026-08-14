@@ -349,6 +349,7 @@ mod render_tests {
             identifier: identifier.into(),
             bridge_db_id: bridge_db_id.into(),
             peer_pubkey: None,
+            agent_pubkey: None,
             sync_addresses: Vec::new(),
         }
     }
