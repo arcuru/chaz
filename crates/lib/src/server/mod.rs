@@ -1369,7 +1369,14 @@ impl Server {
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
         session_db
-            .on_write(move |_event, _db| {
+            .on_write(move |event, _db| {
+                // Deliberately not gated on the source. A co-owner pushing
+                // into a shared session arrives as `Remote`, and that has to
+                // wake the agent here exactly as a local commit does — that
+                // is what makes a shared session two-directional. Naming the
+                // source in the log is what separates "a peer's write woke
+                // us" from "our own write did" when reading a trace.
+                debug!(session_db_id = %sid, source = ?event.source(), "Session write; waking the processing loop");
                 let tx = tx.clone();
                 let sid = sid.clone();
                 Box::pin(async move {
@@ -1532,7 +1539,11 @@ impl Server {
             let tx = self.notify_tx.clone();
             let sid = session_db_id.clone();
             session_db
-                .on_write(move |_event, _db| {
+                .on_write(move |event, _db| {
+                    // Source-agnostic for the same reason as `watch_session`:
+                    // a spawned child can be co-owned too, and a peer's write
+                    // into it has to advance the run.
+                    debug!(session_db_id = %sid, source = ?event.source(), "Child session write; waking the processing loop");
                     let tx = tx.clone();
                     let sid = sid.clone();
                     Box::pin(async move {

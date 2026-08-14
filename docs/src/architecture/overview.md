@@ -12,7 +12,7 @@ graph TD
     end
 
     subgraph Server
-        SV[Server<br/>on_local_write callbacks]
+        SV[Server<br/>on_write callbacks]
         SR[SessionRegistry<br/>indices: sessions, matrix_channels, session_names]
     end
 
@@ -33,7 +33,7 @@ graph TD
 
     MG -->|write SessionEntry| EI
     TG -->|write SessionEntry| EI
-    EI -->|on_local_write| SV
+    EI -->|on_write| SV
     SV -->|spawn agent task| RT
     RT <-->|tool calls| TS
     RT <-->|LLM calls| LLM
@@ -57,7 +57,7 @@ graph TD
 Bridges translate between a transport (Matrix, terminal) and the session database. They:
 
 - Write user messages as `SessionEntry` records to the session DB
-- Register `on_local_write` callbacks to detect agent responses
+- Register `on_write` callbacks to detect agent responses
 - Deliver responses to their transport
 
 Bridges are transport-specific but the server is transport-agnostic. Adding a new bridge (Slack, Discord, HTTP API) requires implementing the `Bridge` trait and writing/reading session entries.
@@ -75,7 +75,7 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 The callback-driven server watches session databases and spawns agent tasks:
 
-1. Bridges call `register_session` to set up `on_local_write` callbacks
+1. Bridges call `register_session` to set up `on_write` callbacks
 2. When a callback fires, the processing loop checks the latest entry
 3. If it's a `Message` from a non-agent or a `Directive`, the server spawns an agent task
 4. The agent writes its response to the session DB, triggering bridge callbacks

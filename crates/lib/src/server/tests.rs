@@ -1522,3 +1522,151 @@ async fn deregister_session_releases_runtime_claim() {
         "deregister_session releases the runtime claim so it can be re-claimed"
     );
 }
+
+// ---- Write source: local vs remote -----------------------------------
+//
+// Every `on_write` subscription in chaz is deliberately source-agnostic: a
+// session write wakes the agent whether it was committed here or arrived from
+// a co-owner over sync. These tests pin both halves of that, because nothing
+// else in the suite distinguishes them — a callback registration that quietly
+// stopped seeing remote fires would look identical to a healthy one.
+
+/// Both write sources reach a per-database callback, and `WriteEvent::source`
+/// tells them apart. This is the eidetica contract the whole sharing story
+/// rests on; it is pinned here so a dependency bump that regressed it fails
+/// in chaz rather than silently going one-directional in production.
+#[tokio::test]
+async fn write_events_carry_the_source_that_produced_them() {
+    use crate::test_support::replay_tips_as_remote;
+    use eidetica::instance::WriteSource;
+
+    let (_instance, _server, registry) = server_fixture().await;
+    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+
+    let seen: Arc<std::sync::Mutex<Vec<WriteSource>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    session_db
+        .on_write(move |event, _db| {
+            sink.lock().unwrap().push(event.source());
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap()
+        .detach();
+
+    write_user_message(&session_db, &sid).await;
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[WriteSource::Local],
+        "a locally committed entry fires exactly one Local event"
+    );
+
+    replay_tips_as_remote(registry.instance(), &session_db).await;
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[WriteSource::Local, WriteSource::Remote],
+        "sync-ingested entries fire on the same callback, tagged Remote"
+    );
+}
+
+/// A remote-sourced write on a watched session runs the agent — the host half
+/// of a co-owned session.
+///
+/// The user message is committed *before* `register_session`, so the local
+/// commit fires into a session nobody is watching yet. The only event the
+/// server ever sees is the remote-sourced replay, which makes the agent's
+/// reply attributable to it and nothing else.
+#[tokio::test]
+async fn a_remote_write_wakes_the_agent_on_the_host() {
+    use crate::test_support::{MockBackend, replay_tips_as_remote};
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+
+    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+
+    write_user_message(&session_db, &sid).await;
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("ack from the host");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&session_db, backend, Some("alpha".to_string()), None)
+        .await
+        .unwrap();
+
+    replay_tips_as_remote(registry.instance(), &session_db).await;
+
+    assert!(
+        await_agent_reply(&session_db, &sid, "alpha").await,
+        "a remote-sourced write must drive the agent loop on the host"
+    );
+}
+
+/// The local counterpart, so a regression that gated the wake path on
+/// `WriteSource::Remote` is caught as readily as one that gated it on `Local`.
+#[tokio::test]
+async fn a_local_write_wakes_the_agent() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+
+    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("ack from the host");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&session_db, backend, Some("alpha".to_string()), None)
+        .await
+        .unwrap();
+
+    write_user_message(&session_db, &sid).await;
+
+    assert!(
+        await_agent_reply(&session_db, &sid, "alpha").await,
+        "a locally committed write must drive the agent loop"
+    );
+}
+
+/// Poll the session for a `Message` entry sent by `agent`, up to a few
+/// seconds. The wake path runs on the server's spawned processing loop, so
+/// the reply lands asynchronously with no completion signal to await.
+async fn await_agent_reply(session_db: &eidetica::Database, sid: &str, agent: &str) -> bool {
+    for _ in 0..100 {
+        let session = crate::session::Session::new(
+            crate::types::ConversationId(sid.to_string()),
+            session_db.clone(),
+        )
+        .await;
+        if session
+            .entries()
+            .iter()
+            .any(|e| e.sender == agent && e.entry_type == EntryType::Message)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}

@@ -48,7 +48,7 @@ See [Getting Started](user_guide/getting_started.md) for detailed setup instruct
 graph TD
     U[User] -->|message| G[Bridge<br/>Matrix / TUI]
     G -->|writes SessionEntry| S[(Session DB<br/>eidetica)]
-    S -->|on_local_write| SV[Server]
+    S -->|on_write| SV[Server]
     SV -->|spawns| A[Agent Task]
     A -->|ReAct loop| LLM[LLM Backend<br/>OpenRouter]
     LLM -->|tool calls| T[Tool System]

@@ -318,7 +318,9 @@ This was a real bug fixed in 2026-04 — `/share`/`/agent share`/`/memory share`
 - The source peer's sync server log shows incoming connections from the receiver's address.
 
 **A co-owner's edits to a synced session don't trigger an agent run on the host.**
-Known limitation: chaz only listens to `on_local_write`, but remote-write callbacks were dead code in eidetica until a recent fix. Until that fix is merged and chaz subscribes to `on_remote_write`, remote pushes land in the database silently — they're visible if you re-render the session, but agents won't react to them. Tracked as the "Remote-write callback subscription" item in the followups.
+Sync-ingested entries reach every `on_write` subscriber tagged `WriteSource::Remote`, and chaz gates none of its callbacks on the source — a co-owner's message wakes the host's agent exactly as a local one does. If it doesn't, the write is not reaching the host at all: check the two sync items above, and confirm the host has the session registered (`!chaz attach <name-or-id>` in the target room, or a TUI tab open on it). A session that synced into the peer but was never attached has no callback installed on it.
+
+Note that only `Verified` writes fire callbacks. Entries arrive from sync as `Unverified` and fire on promotion — so if the host holds no key that can validate the co-owner's entries, they land in the database without ever waking anything.
 
 **`/agent import` reports `Bootstrap request <id> pending` instead of importing.**
 Expected when the receiver's pubkey isn't preseeded. The owner needs to run `/sharing requests` to see the queue, then `/sharing approve <id>` to grant the requested permission. After approval, the receiver re-runs `/agent import <ticket>` and the import completes. See "Request flow" above.

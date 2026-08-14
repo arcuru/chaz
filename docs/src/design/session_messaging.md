@@ -79,7 +79,7 @@ sequenceDiagram
     SA->>SV: register_child_session(agent, backend, tools, depth)
     SV-->>SA: (conversation_id, session_db, completion_rx)
     SA->>CS: write Directive entry
-    CS-->>SV: on_local_write callback
+    CS-->>SV: on_write callback
     SV->>CA: spawn agent task
     CA->>CS: write Ack
     CA->>CS: write ToolCall / ToolResult (via event sink)

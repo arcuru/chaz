@@ -44,6 +44,10 @@ uuid.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
+# `testing` exposes `Instance::demote_to_unverified`, which lets a test drive
+# the same ingest-then-verify path sync uses and observe a `WriteSource::Remote`
+# callback without standing up a second peer.
+eidetica = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 wat.workspace = true
 wiremock = "0.6"
