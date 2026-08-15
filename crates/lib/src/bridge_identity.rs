@@ -183,6 +183,52 @@ pub struct BridgeIdentity<'a> {
     pub key_name: &'a str,
 }
 
+/// Reap a superseded bridge peer identity from the sync peer set.
+///
+/// A bridge keeps its key across ordinary restarts, so a login's `peer_pubkey`
+/// changes only when the bridge redeploys and mints a fresh eidetica key — at
+/// which point the old identity is gone forever and any peer entry for it is a
+/// guaranteed connect timeout. That is the one case where explicit
+/// deregistration is correct, and it is *not* a liveness heuristic: a bridge
+/// that is merely offline keeps the same pubkey and is left alone.
+///
+/// Only a `Some → Some` transition where the two pubkeys differ reaps. A
+/// `None → Some` transition is a backfill of a field that did not exist when
+/// the login was first registered, not a retirement, and an unchanged pubkey is
+/// the ordinary-restart path. A stale pointer that does not parse as a pubkey
+/// is a warning, not an abort — a login bootstrap must not die over an
+/// unparseable leftover.
+async fn reap_superseded_peer(sync: &Sync, identifier: &str, old: Option<&str>, new: Option<&str>) {
+    let (Some(old_pubkey_str), Some(new_pubkey_str)) = (old, new) else {
+        return;
+    };
+    if old_pubkey_str == new_pubkey_str {
+        return;
+    }
+    let Ok(old_pubkey) = PublicKey::from_prefixed_string(old_pubkey_str) else {
+        warn!(
+            login = %identifier,
+            old_pubkey = %old_pubkey_str,
+            "Superseded bridge pubkey did not parse; leaving the stale peer in place"
+        );
+        return;
+    };
+    match sync.remove_peer(&old_pubkey).await {
+        Ok(()) => info!(
+            login = %identifier,
+            old_pubkey = %old_pubkey_str,
+            new_pubkey = %new_pubkey_str,
+            "Reaped a superseded bridge peer identity"
+        ),
+        Err(e) => warn!(
+            login = %identifier,
+            old_pubkey = %old_pubkey_str,
+            error = %e,
+            "Could not reap a superseded bridge peer identity"
+        ),
+    }
+}
+
 /// Bring one bridged login online against its owning agent:
 ///
 /// 1. request `Write` on the agent DB the `ticket` points at (via the
@@ -204,6 +250,7 @@ pub struct BridgeIdentity<'a> {
 pub async fn establish_login<B: AccessBootstrap>(
     user: &mut User,
     bootstrap: &B,
+    sync: &Sync,
     identity: &BridgeIdentity<'_>,
     ticket: &DatabaseTicket,
     mut login: LoginRef,
@@ -269,6 +316,20 @@ pub async fn establish_login<B: AccessBootstrap>(
     let database = user.open_database(agent_db_id).await?;
     let agent_db = AgentDb::from_database(database);
     if let Some(existing) = agent_db.find_login(&login.identifier).await? {
+        // A changed peer pubkey is a redeploy with a fresh eidetica key: the
+        // old identity is authoritatively retired (its key is gone forever),
+        // so anything the daemon still dials for it is a guaranteed connect
+        // timeout. Reap it from the sync peer set. An unchanged pubkey — the
+        // ordinary restart, which reuses the persisted key — returns without
+        // touching the peer set, so an offline-but-live bridge is never pruned.
+        reap_superseded_peer(
+            sync,
+            &login.identifier,
+            existing.peer_pubkey.as_deref(),
+            login.peer_pubkey.as_deref(),
+        )
+        .await;
+
         // The pointer already being there is not a reason to leave it alone.
         // It carries where this bridge is reachable, and this process takes a
         // fresh transport address every time it starts — so a pointer written
@@ -312,13 +373,30 @@ mod tests {
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewUser};
 
-    async fn test_user() -> User {
+    /// A fresh in-memory instance plus its admin user. Split out so tests that
+    /// need a [`Sync`] handle can enable sync on the same instance.
+    async fn test_instance() -> (Instance, User) {
         let backend = InMemory::new();
-        let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
-                .await
-                .unwrap();
-        user
+        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            .await
+            .unwrap()
+    }
+
+    async fn test_user() -> User {
+        test_instance().await.1
+    }
+
+    /// A test instance with sync enabled, for tests that exercise the peer set.
+    /// Mirrors the [`Cluster`](eidetica::testing::Cluster) bring-up: the
+    /// in-memory backend supports sync, so `enable_sync` + `sync()` yields a
+    /// live handle with no transport registered.
+    async fn test_user_with_sync() -> (Instance, User, Arc<Sync>) {
+        let (instance, user) = test_instance().await;
+        instance.enable_sync().await.unwrap();
+        let sync = instance
+            .sync()
+            .expect("sync handle present immediately after enable_sync");
+        (instance, user, sync)
     }
 
     /// What a stub bootstrap was asked for, so tests can assert on the
@@ -402,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn establish_login_requests_write_and_carries_the_pointer() {
-        let mut user = test_user().await;
+        let (_instance, mut user, sync) = test_user_with_sync().await;
         let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
         let (agent_db, _) = create_agent_db(
             &mut user,
@@ -423,6 +501,7 @@ mod tests {
         let outcome = establish_login(
             &mut user,
             &bootstrap,
+            &sync,
             &BridgeIdentity {
                 key: &bridge_key,
                 key_name: BRIDGE_KEY_NAME,
@@ -489,7 +568,7 @@ mod tests {
     /// passing it in.
     #[tokio::test]
     async fn establish_login_publishes_the_bootstrapped_key_not_the_caller_s() {
-        let mut user = test_user().await;
+        let (_instance, mut user, sync) = test_user_with_sync().await;
         let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
         // Stands in for the bridge's device key: a real, valid, *other* key.
         let device_key = user.add_private_key(Some("device")).await.unwrap();
@@ -513,6 +592,7 @@ mod tests {
         establish_login(
             &mut user,
             &bootstrap,
+            &sync,
             &BridgeIdentity {
                 key: &bridge_key,
                 key_name: BRIDGE_KEY_NAME,
@@ -622,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn establish_login_pending_does_not_register() {
-        let mut user = test_user().await;
+        let (_instance, mut user, sync) = test_user_with_sync().await;
         let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
         let (agent_db, _) = create_agent_db(
             &mut user,
@@ -639,6 +719,7 @@ mod tests {
         let outcome = establish_login(
             &mut user,
             &PendingBootstrap,
+            &sync,
             &BridgeIdentity {
                 key: &bridge_key,
                 key_name: BRIDGE_KEY_NAME,
@@ -663,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn establish_login_aborts_when_access_denied() {
-        let mut user = test_user().await;
+        let (_instance, mut user, sync) = test_user_with_sync().await;
         let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
         let (agent_db, _) = create_agent_db(
             &mut user,
@@ -680,6 +761,7 @@ mod tests {
         let err = establish_login(
             &mut user,
             &DeniedBootstrap,
+            &sync,
             &BridgeIdentity {
                 key: &bridge_key,
                 key_name: BRIDGE_KEY_NAME,
@@ -698,5 +780,161 @@ mod tests {
         assert!(err.is_err(), "denied access must abort");
         // Nothing was registered.
         assert!(agent_db.list_logins().await.unwrap().is_empty());
+    }
+
+    /// Register `pubkey` in the sync peer set with a tree relationship to
+    /// `tree`, as the daemon records a published bridge identity — so reaping
+    /// (or not reaping) it is observable via [`Sync::get_tree_peers`].
+    async fn register_sync_peer(sync: &Sync, pubkey: &PublicKey, tree: &eidetica::entry::ID) {
+        sync.register_peer(pubkey, Some("bridge")).await.unwrap();
+        sync.add_tree_sync(pubkey, tree).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supersession_reaps_the_retired_peer_and_registers_the_new() {
+        let (_instance, mut user, sync) = test_user_with_sync().await;
+        let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await.unwrap();
+        let (agent_db, _) = create_agent_db(
+            &mut user,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta::default(),
+        )
+        .await
+        .unwrap();
+        let agent_db_id = agent_db.id();
+        let (bridge_db, _) = create_bridge_db(&mut user, "matrix").await.unwrap();
+        let settings_db_id = bridge_db.id();
+
+        let old_pubkey = PublicKey::random();
+        let new_pubkey = PublicKey::random();
+        let old_str = old_pubkey.to_string();
+        let new_str = new_pubkey.to_string();
+
+        // A previous deployment registered this login under the old identity,
+        // and the daemon holds the old peer in the agent DB's sync peer list.
+        agent_db
+            .register_login(LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: Some(old_str.clone()),
+                agent_pubkey: None,
+                sync_addresses: vec![("http".to_string(), "old:1".to_string())],
+            })
+            .await
+            .unwrap();
+        register_sync_peer(&sync, &old_pubkey, &agent_db_id).await;
+
+        let bootstrap = GrantedBootstrap::default();
+        establish_login(
+            &mut user,
+            &bootstrap,
+            &sync,
+            &BridgeIdentity {
+                key: &bridge_key,
+                key_name: BRIDGE_KEY_NAME,
+            },
+            &DatabaseTicket::new(agent_db_id.clone()),
+            LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: settings_db_id.to_string(),
+                peer_pubkey: Some(new_str.clone()),
+                agent_pubkey: None,
+                sync_addresses: vec![("http".to_string(), "new:1".to_string())],
+            },
+        )
+        .await
+        .unwrap();
+
+        // The login pointer now names the new identity.
+        let refreshed = agent_db
+            .find_login("@chaz:example")
+            .await
+            .unwrap()
+            .expect("login must still be registered");
+        assert_eq!(refreshed.peer_pubkey.as_deref(), Some(new_str.as_str()));
+
+        // The retired peer identity is gone from the sync peer set for this DB.
+        let peers = sync.get_tree_peers(&agent_db_id).await.unwrap();
+        assert!(
+            !peers.iter().any(|p| p.public_key() == &old_pubkey),
+            "retired peer identity must be removed from the sync peer set"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_ignores_an_unchanged_pubkey() {
+        let (_instance, _user, sync) = test_user_with_sync().await;
+        let tree = eidetica::entry::ID::parse(
+            "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y",
+        )
+        .unwrap();
+        let key = PublicKey::random();
+        register_sync_peer(&sync, &key, &tree).await;
+
+        // An unchanged pubkey is an ordinary restart, not a retirement.
+        reap_superseded_peer(
+            &sync,
+            "@chaz:example",
+            Some(&key.to_string()),
+            Some(&key.to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            sync.get_tree_peers(&tree).await.unwrap().len(),
+            1,
+            "an unchanged pubkey must leave the peer set alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_ignores_a_none_to_some_backfill() {
+        let (_instance, _user, sync) = test_user_with_sync().await;
+        let tree = eidetica::entry::ID::parse(
+            "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y",
+        )
+        .unwrap();
+        let key = PublicKey::random();
+        register_sync_peer(&sync, &key, &tree).await;
+
+        // None → Some is a backfill of a field that did not exist when the
+        // login was first registered, not a retirement.
+        reap_superseded_peer(&sync, "@chaz:example", None, Some(&key.to_string())).await;
+
+        assert_eq!(
+            sync.get_tree_peers(&tree).await.unwrap().len(),
+            1,
+            "a None → Some backfill must leave the peer set alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_skips_an_unparseable_stale_pubkey() {
+        let (_instance, _user, sync) = test_user_with_sync().await;
+        let tree = eidetica::entry::ID::parse(
+            "bafyr4ihvgcnzzmbaxmzjact36ggoa42z6r5cpe2anlthvl7ajfm2td7e3y",
+        )
+        .unwrap();
+        let key = PublicKey::random();
+        register_sync_peer(&sync, &key, &tree).await;
+
+        // A stale pointer that does not parse must not abort the bootstrap; it
+        // just leaves the peer set alone.
+        reap_superseded_peer(
+            &sync,
+            "@chaz:example",
+            Some("ed25519:!!!invalid!!!"),
+            Some(&key.to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            sync.get_tree_peers(&tree).await.unwrap().len(),
+            1,
+            "an unparseable stale pointer must leave the peer set alone"
+        );
     }
 }
