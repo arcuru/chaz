@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::time::Duration;
 
 use crate::{
     backends::{ChatContext, LLMBackend, MessageRole, ModelInfo},
@@ -33,6 +34,20 @@ use crate::{
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Default API base when the backend config doesn't override it.
 const DEFAULT_API_BASE: &str = "https://api.anthropic.com/v1";
+
+/// How many times to double `max_tokens` when a truncated tool-use is
+/// detected before giving up and surfacing the truncation.
+const MAX_MAX_TOKENS_RAISES: u32 = 3;
+
+/// Ceiling for the `max_tokens` raise on a truncated tool-use. 64k is the
+/// synchronous max-output of the legacy generation (the current generation
+/// allows 128k), so doubling past it is both unnecessary for recovery and
+/// risks a 400 on older models.
+const MAX_OUTPUT_TOKENS_CEILING: u32 = 64 * 1024;
+
+/// `retry-after` values above this are not honored as an absolute floor —
+/// they fall back to exponential backoff. Matches the official SDKs.
+const MAX_RETRY_AFTER_SECS: f64 = 60.0;
 
 /// Handle connections to the native Anthropic Messages API.
 pub struct Anthropic {
@@ -52,10 +67,10 @@ struct MessagesRequest<'a> {
     /// Required by Anthropic — unlike OpenAI, there is no server-side default.
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<Vec<TextBlock>>,
-    messages: Vec<ReqMessage>,
+    system: Option<&'a [TextBlock]>,
+    messages: &'a [ReqMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ReqTool>>,
+    tools: Option<&'a [ReqTool]>,
 }
 
 /// A `system`-field text block (Anthropic's top-level system prompt shape).
@@ -129,7 +144,28 @@ struct MessagesResponse {
     #[serde(default)]
     content: Vec<RespBlock>,
     #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
     usage: Option<AnthUsage>,
+}
+
+impl MessagesResponse {
+    /// Whether the provider truncated this response. Anthropic reports a
+    /// truncated generation as `stop_reason: "max_tokens"` (output budget
+    /// exhausted) or `"model_context_window_exceeded"` (context window full).
+    fn is_truncated(&self) -> bool {
+        matches!(
+            self.stop_reason.as_deref(),
+            Some("max_tokens") | Some("model_context_window_exceeded")
+        )
+    }
+
+    /// Whether any content block is a tool-use request.
+    fn has_tool_use(&self) -> bool {
+        self.content
+            .iter()
+            .any(|b| matches!(b, RespBlock::ToolUse { .. }))
+    }
 }
 
 /// A content block on a response. `Other` catches blocks chaz doesn't consume
@@ -253,94 +289,132 @@ impl Anthropic {
         let (mut system, mut req_messages) = convert_runtime_messages(messages);
         apply_cache_control(&mut system, &mut req_messages, &mut req_tools);
 
-        let request = MessagesRequest {
-            model,
-            max_tokens: self.backend.max_output_tokens(),
-            system,
-            messages: req_messages,
-            tools: if req_tools.is_empty() {
+        let url = format!("{}/messages", self.api_base().trim_end_matches('/'));
+        let mut max_tokens = self.backend.max_output_tokens();
+        let mut raise_attempts: u32 = 0;
+
+        loop {
+            let request = MessagesRequest {
+                model,
+                max_tokens,
+                system: system.as_deref(),
+                messages: &req_messages,
+                tools: if req_tools.is_empty() {
+                    None
+                } else {
+                    Some(&req_tools)
+                },
+            };
+
+            let http_resp = client
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&request)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+
+            let status = http_resp.status();
+            if !status.is_success() {
+                let retry_after = parse_retry_after(http_resp.headers());
+                let body = http_resp.text().await.unwrap_or_default();
+                return Err(LlmError::from_http_status_with_retry_after(
+                    status.as_u16(),
+                    body,
+                    retry_after,
+                ));
+            }
+
+            let response: MessagesResponse =
+                http_resp
+                    .json()
+                    .await
+                    .map_err(|e| LlmError::InvalidRequest {
+                        message: format!("decode messages response: {e}"),
+                    })?;
+
+            // A truncated tool-use is not runnable — its `input` is incomplete
+            // and would otherwise be coerced to `{}`. Re-request with a higher
+            // max_tokens (the documented recovery), then surface truncation if
+            // the raise budget is exhausted.
+            if response.is_truncated() {
+                let can_raise = response.stop_reason.as_deref() == Some("max_tokens")
+                    && response.has_tool_use()
+                    && raise_attempts < MAX_MAX_TOKENS_RAISES;
+                if can_raise {
+                    let raised = max_tokens.saturating_mul(2).min(MAX_OUTPUT_TOKENS_CEILING);
+                    if raised > max_tokens {
+                        raise_attempts += 1;
+                        max_tokens = raised;
+                        tracing::warn!(
+                            model,
+                            max_tokens,
+                            raise_attempts,
+                            "Anthropic response truncated mid-tool-use; retrying with higher max_tokens"
+                        );
+                        continue;
+                    }
+                }
+                return Err(LlmError::TruncatedOutput {
+                    reason: response.stop_reason.unwrap_or_default(),
+                });
+            }
+
+            let MessagesResponse {
+                id,
+                model: response_model,
+                content: blocks,
+                usage,
+                stop_reason: _,
+            } = response;
+
+            let mut text_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            for block in blocks {
+                match block {
+                    RespBlock::Text { text } => text_parts.push(text),
+                    RespBlock::ToolUse { id, name, input } => {
+                        tool_calls.push(ToolCallRequest {
+                            id,
+                            name,
+                            arguments: input.to_string(),
+                        });
+                    }
+                    RespBlock::Other => {}
+                }
+            }
+            let content = if text_parts.is_empty() {
                 None
             } else {
-                Some(req_tools)
-            },
-        };
+                Some(text_parts.join(""))
+            };
 
-        let url = format!("{}/messages", self.api_base().trim_end_matches('/'));
-        let http_resp = client
-            .post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&request)
-            .send()
-            .await
-            .map_err(map_reqwest_err)?;
+            let metadata = build_metadata(id, response_model, usage, model);
 
-        let status = http_resp.status();
-        if !status.is_success() {
-            let body = http_resp.text().await.unwrap_or_default();
-            return Err(LlmError::from_http_status(status.as_u16(), body));
-        }
+            tracing::debug!(
+                "Anthropic response: content={:?} tool_calls={} usage={:?}",
+                content.as_deref().map(|c| &c[..c.len().min(100)]),
+                tool_calls.len(),
+                metadata.as_ref().map(|m| &m.usage),
+            );
 
-        let response: MessagesResponse =
-            http_resp
-                .json()
-                .await
-                .map_err(|e| LlmError::InvalidRequest {
-                    message: format!("decode messages response: {e}"),
-                })?;
-
-        let MessagesResponse {
-            id,
-            model: response_model,
-            content: blocks,
-            usage,
-        } = response;
-
-        let mut text_parts = Vec::new();
-        let mut tool_calls = Vec::new();
-        for block in blocks {
-            match block {
-                RespBlock::Text { text } => text_parts.push(text),
-                RespBlock::ToolUse { id, name, input } => {
-                    tool_calls.push(ToolCallRequest {
-                        id,
-                        name,
-                        arguments: input.to_string(),
-                    });
-                }
-                RespBlock::Other => {}
+            if !tool_calls.is_empty() {
+                // Anthropic thinking blocks aren't requested, so there is nothing
+                // provider-specific to echo back on the follow-up request.
+                return Ok(LLMResponse::ToolCalls {
+                    content,
+                    tool_calls,
+                    provider_extra: Map::new(),
+                    metadata,
+                });
             }
-        }
-        let content = if text_parts.is_empty() {
-            None
-        } else {
-            Some(text_parts.join(""))
-        };
 
-        let metadata = build_metadata(id, response_model, usage, model);
-
-        tracing::debug!(
-            "Anthropic response: content={:?} tool_calls={} usage={:?}",
-            content.as_deref().map(|c| &c[..c.len().min(100)]),
-            tool_calls.len(),
-            metadata.as_ref().map(|m| &m.usage),
-        );
-
-        if !tool_calls.is_empty() {
-            // Anthropic thinking blocks aren't requested, so there is nothing
-            // provider-specific to echo back on the follow-up request.
-            return Ok(LLMResponse::ToolCalls {
-                content,
-                tool_calls,
-                provider_extra: Map::new(),
+            return Ok(LLMResponse::Text {
+                content: content.unwrap_or_default(),
                 metadata,
             });
         }
-
-        Ok(LLMResponse::Text {
-            content: content.unwrap_or_default(),
-            metadata,
-        })
     }
 
     /// Models for this backend with pricing carried from YAML config.
@@ -383,10 +457,12 @@ impl Anthropic {
 
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = parse_retry_after(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::from_http_status(
+            return Err(LlmError::from_http_status_with_retry_after(
                 status.as_u16(),
                 format!("GET {url} returned {status}: {body}"),
+                retry_after,
             ));
         }
 
@@ -496,6 +572,37 @@ fn map_reqwest_err(e: reqwest::Error) -> LlmError {
         LlmError::NetworkError {
             message: e.to_string(),
         }
+    }
+}
+
+/// Parse the `retry-after` response header into a retry floor.
+///
+/// Honors the integer-seconds form and the RFC 7231 HTTP-date form, but only
+/// when `0 < retry_after <= 60` — the official SDKs treat larger values as
+/// "unreasonable" and fall back to exponential backoff, which `backoff_delay`
+/// already provides. Returns `None` when the header is absent, malformed, or
+/// outside that range.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+
+    let secs = if let Ok(n) = raw.parse::<u64>() {
+        n as f64
+    } else if let Ok(when) = chrono::DateTime::parse_from_rfc2822(raw) {
+        when.with_timezone(&chrono::Utc)
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds() as f64
+    } else {
+        return None;
+    };
+
+    if secs > 0.0 && secs <= MAX_RETRY_AFTER_SECS {
+        Some(Duration::from_secs_f64(secs))
+    } else {
+        None
     }
 }
 
@@ -825,5 +932,187 @@ mod tests {
         assert!(matches!(blocks[0], RespBlock::Other));
         assert!(matches!(blocks[1], RespBlock::Text { .. }));
         assert!(matches!(blocks[2], RespBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn messages_response_parses_stop_reason_and_detects_truncation() {
+        let json = serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-5",
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": "partial"}],
+            "usage": {"input_tokens": 10, "output_tokens": 8192}
+        });
+        let resp: MessagesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.stop_reason.as_deref(), Some("max_tokens"));
+        assert!(resp.is_truncated());
+        assert!(!resp.has_tool_use());
+    }
+
+    #[test]
+    fn messages_response_context_window_exceeded_is_truncated() {
+        let json = serde_json::json!({
+            "stop_reason": "model_context_window_exceeded",
+            "content": []
+        });
+        let resp: MessagesResponse = serde_json::from_value(json).unwrap();
+        assert!(resp.is_truncated());
+        assert!(!resp.has_tool_use());
+    }
+
+    #[test]
+    fn messages_response_tool_use_stop_reason_is_not_truncated() {
+        let json = serde_json::json!({
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "t1", "name": "mcp__fs__read", "input": {"path": "x"}}]
+        });
+        let resp: MessagesResponse = serde_json::from_value(json).unwrap();
+        assert!(!resp.is_truncated());
+        assert!(resp.has_tool_use());
+    }
+
+    #[test]
+    fn messages_response_missing_stop_reason_is_not_truncated() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "done"}]
+        });
+        let resp: MessagesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.stop_reason, None);
+        assert!(!resp.is_truncated());
+    }
+
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_retry_after_over_sixty_falls_back_to_exponential() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(45);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            future.to_rfc2822().parse().unwrap(),
+        );
+        let d = parse_retry_after(&headers).expect("http-date retry-after parses");
+        // Allow slack for the parse-to-now comparison.
+        assert!(
+            d >= Duration::from_secs(40) && d <= Duration::from_secs(60),
+            "unexpected delay {d:?}"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_missing_or_malformed_is_none() {
+        assert_eq!(parse_retry_after(&reqwest::header::HeaderMap::new()), None);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    async fn test_secrets() -> SecretStore {
+        let (_instance, mut user) = eidetica::Instance::create_backend(
+            Box::new(eidetica::backend::database::InMemory::new()),
+            eidetica::NewUser::passwordless("t"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut doc = eidetica::crdt::Doc::new();
+        doc.set("name", "test");
+        let db = user.create_database(doc, &key).await.unwrap();
+        SecretStore::new(db).await
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_use_retries_with_higher_max_tokens() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        struct Responder {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Respond for Responder {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Truncated mid-tool-use: the model hit max_tokens.
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "msg-trunc",
+                        "model": "claude-5",
+                        "stop_reason": "max_tokens",
+                        "content": [{"type": "tool_use", "id": "t1", "name": "mcp__fs__read", "input": {}}],
+                        "usage": {"input_tokens": 10, "output_tokens": 8192}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "msg-full",
+                        "model": "claude-5",
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "id": "t1", "name": "mcp__fs__read", "input": {"path": "x"}}],
+                        "usage": {"input_tokens": 10, "output_tokens": 20}
+                    }))
+                }
+            }
+        }
+
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(Responder {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let secrets = test_secrets().await;
+        let mut backend = Backend::new(crate::config::BackendType::Anthropic);
+        backend.api_base = Some(server.uri());
+        backend.api_key = Some("test-key".into());
+        let anthropic = Anthropic::new(&backend, &secrets);
+
+        let result = anthropic
+            .chat_with_tools_impl(
+                &[RuntimeMessage::User("read x".into())],
+                &[ToolDefinition {
+                    name: "mcp__fs__read".into(),
+                    description: "read".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    strict: false,
+                }],
+                "claude-5",
+            )
+            .await
+            .expect("truncation retry resolves to a complete tool-use");
+
+        match result {
+            LLMResponse::ToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].arguments, "{\"path\":\"x\"}");
+            }
+            _ => panic!("expected ToolCalls"),
+        }
+
+        // Two requests: first at the default 8192, second doubled to 16384.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let max_tokens = |req: &wiremock::Request| -> u32 {
+            serde_json::from_slice::<serde_json::Value>(&req.body).unwrap()["max_tokens"]
+                .as_u64()
+                .unwrap() as u32
+        };
+        assert_eq!(max_tokens(&requests[0]), 8192);
+        assert_eq!(max_tokens(&requests[1]), 16384);
     }
 }

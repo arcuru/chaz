@@ -99,6 +99,17 @@ pub enum LlmError {
         message: String,
     },
 
+    /// The provider truncated the output (Anthropic `stop_reason: "max_tokens"`
+    /// or `"model_context_window_exceeded"`). The response is incomplete — a
+    /// truncated tool-use would otherwise be coerced to `{}` arguments. Not
+    /// retried at the runtime layer: the native Anthropic backend already
+    /// re-requested with a higher `max_tokens` before surfacing this.
+    #[error("Output truncated ({reason})")]
+    TruncatedOutput {
+        /// Provider stop reason ("max_tokens" / "model_context_window_exceeded").
+        reason: String,
+    },
+
     /// Client configuration error (missing API key, bad URL). Not retryable.
     #[error("Configuration error: {message}")]
     Configuration {
@@ -172,10 +183,29 @@ impl LlmError {
     }
 
     /// Classify an HTTP status code and message into the appropriate variant.
+    ///
+    /// No `retry-after` header is available (the OpenAI-compatible path goes
+    /// through the SDK, which does not expose response headers). Callers that
+    /// hold the raw response should use [`Self::from_http_status_with_retry_after`].
     pub fn from_http_status(status: u16, message: String) -> Self {
+        Self::from_http_status_with_retry_after(status, message, None)
+    }
+
+    /// Classify an HTTP status code, message, and optional `Retry-After`
+    /// duration into the appropriate variant.
+    ///
+    /// The `retry_after` argument is only meaningful for a 429; on any other
+    /// status it is ignored. It should be pre-capped by the caller (the native
+    /// Anthropic backend honors only `0 < retry-after <= 60`, matching the
+    /// official SDKs) so `backoff_delay` can use it as a floor.
+    pub fn from_http_status_with_retry_after(
+        status: u16,
+        message: String,
+        retry_after: Option<Duration>,
+    ) -> Self {
         match status {
             429 => LlmError::RateLimited {
-                retry_after_duration: None,
+                retry_after_duration: retry_after,
                 message,
             },
             401 | 403 => LlmError::AuthFailed { status, message },
@@ -402,6 +432,60 @@ mod tests {
             message: "bad gateway".into(),
         };
         assert_eq!(err.retry_after(), None);
+    }
+
+    #[test]
+    fn test_from_http_status_with_retry_after_honors_header() {
+        let err = LlmError::from_http_status_with_retry_after(
+            429,
+            "rate limited".into(),
+            Some(Duration::from_secs(30)),
+        );
+        assert!(matches!(
+            err,
+            LlmError::RateLimited {
+                retry_after_duration: Some(d),
+                ..
+            } if d == Duration::from_secs(30)));
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn test_from_http_status_with_retry_after_none() {
+        let err = LlmError::from_http_status_with_retry_after(429, "rate limited".into(), None);
+        assert!(matches!(
+            err,
+            LlmError::RateLimited {
+                retry_after_duration: None,
+                ..
+            }
+        ));
+        assert_eq!(err.retry_after(), None);
+    }
+
+    #[test]
+    fn test_from_http_status_with_retry_after_ignored_for_non_429() {
+        let err = LlmError::from_http_status_with_retry_after(
+            502,
+            "bad gateway".into(),
+            Some(Duration::from_secs(30)),
+        );
+        assert!(matches!(err, LlmError::ServerError { status: 502, .. }));
+        assert_eq!(err.retry_after(), None);
+    }
+
+    #[test]
+    fn test_from_http_status_truncated_output_is_not_retryable() {
+        let err = LlmError::TruncatedOutput {
+            reason: "max_tokens".into(),
+        };
+        assert!(!err.is_retryable());
+        assert!(!err.is_auth_error());
+        assert!(!err.is_client_error());
+        assert_eq!(err.retry_after(), None);
+        assert_eq!(err.status(), None);
+        assert_eq!(err.to_string(), "Output truncated (max_tokens)");
     }
 
     #[test]
