@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::agent::AgentRegistry;
-use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+use crate::agent_db::{AgentDbConfig, AgentMeta, MEMORY_STORE, create_agent_db};
 use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::session::{Session, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
@@ -912,4 +912,91 @@ async fn re_remember_same_key_does_not_leak_old_value() {
         !out.contains("alpha-version"),
         "older value should not leak: {out}"
     );
+}
+
+// ── entry character cap ───────────────────────────────────────────────
+
+#[test]
+fn format_entry_truncates_value_to_cap_with_elision() {
+    let entry = MemoryEntry {
+        key: "cap".into(),
+        value: "x".repeat(500),
+        timestamp: Utc::now(),
+        tags: vec![],
+    };
+    let out = format_entry(&entry, Some(200));
+    assert!(
+        out.contains(&format!("{}…", "x".repeat(200))),
+        "expected 200-char value with elision marker, got: {out}"
+    );
+    assert!(
+        !out.contains(&"x".repeat(201)),
+        "value not truncated: {out}"
+    );
+}
+
+#[test]
+fn format_entry_leaves_short_and_uncapped_values_untouched() {
+    let entry = MemoryEntry {
+        key: "short".into(),
+        value: "brief note".into(),
+        timestamp: Utc::now(),
+        tags: vec!["t".into()],
+    };
+    assert!(format_entry(&entry, Some(200)).contains("brief note"));
+    assert!(format_entry(&entry, None).contains("brief note"));
+}
+
+#[test]
+fn truncation_is_char_boundary_safe() {
+    // Each é is two bytes, so a byte-level slice at 100 chars would
+    // split a character in half. Truncation must keep whole chars.
+    let entry = MemoryEntry {
+        key: "mb".into(),
+        value: "é".repeat(300),
+        timestamp: Utc::now(),
+        tags: vec![],
+    };
+    let out = format_entry(&entry, Some(100));
+    assert!(
+        out.contains(&format!("{}…", "é".repeat(100))),
+        "expected exactly 100 multibyte chars + elision, got: {out}"
+    );
+    assert!(
+        !out.contains(&"é".repeat(101)),
+        "chars split mid-character: {out}"
+    );
+}
+
+#[tokio::test]
+async fn search_memory_honors_entry_char_cap() {
+    let (_instance, registry, index, session) = fixture("alpha").await;
+    let remember = Remember::new(registry.clone(), index.clone(), None);
+    let ctx = make_ctx("alpha", session);
+
+    let long_value = "y".repeat(500);
+    put(&remember, &ctx, "cap", &long_value, &[]).await;
+
+    let entry = index.find_by_name("alpha").expect("agent registered");
+    let agent_db = registry
+        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+        .await
+        .unwrap()
+        .expect("agent db open");
+    let out = search_memory(
+        agent_db.database(),
+        MEMORY_STORE,
+        "cap",
+        &[],
+        5,
+        Some(20),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.contains(&format!("{}…", "y".repeat(20))),
+        "expected 20-char value with elision, got: {out}"
+    );
+    assert!(!out.contains(&"y".repeat(21)), "value not truncated: {out}");
 }

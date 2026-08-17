@@ -138,7 +138,7 @@ async fn do_recall(
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_RECALL_LIMIT)
         .max(1);
-    let result = search_memory(db, store, query, &tags_filter, limit, embedder).await?;
+    let result = search_memory(db, store, query, &tags_filter, limit, None, embedder).await?;
     debug!(agent = %ctx.agent_name, %query, scope = log_scope, "Recalled memory");
     Ok(result)
 }
@@ -548,6 +548,7 @@ pub(crate) async fn search_memory(
     query: &str,
     tags_filter: &[String],
     limit: usize,
+    entry_cap: Option<usize>,
     embedder: Option<&dyn Embedder>,
 ) -> Result<String, String> {
     let hits =
@@ -557,7 +558,7 @@ pub(crate) async fn search_memory(
     }
     Ok(hits
         .iter()
-        .map(|h| format_entry(&h.entry))
+        .map(|h| format_entry(&h.entry, entry_cap))
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -733,23 +734,34 @@ fn entry_has_all_tags(entry: &MemoryEntry, required: &[String]) -> bool {
     })
 }
 
-fn format_entry(m: &MemoryEntry) -> String {
+fn format_entry(m: &MemoryEntry, entry_cap: Option<usize>) -> String {
+    let value = match entry_cap {
+        Some(cap) => truncate_entry_value(&m.value, cap),
+        None => m.value.clone(),
+    };
     if m.tags.is_empty() {
-        format!(
-            "- **{}**: {} ({})",
-            m.key,
-            m.value,
-            m.timestamp.to_rfc3339()
-        )
+        format!("- **{}**: {} ({})", m.key, value, m.timestamp.to_rfc3339())
     } else {
         format!(
             "- **{}**: {} [tags: {}] ({})",
             m.key,
-            m.value,
+            value,
             m.tags.join(", "),
             m.timestamp.to_rfc3339()
         )
     }
+}
+
+/// Truncate a memory value to at most `cap` characters, appending an
+/// elision marker when the value is longer. Operates on whole chars, so
+/// multibyte values are never split mid-character.
+fn truncate_entry_value(value: &str, cap: usize) -> String {
+    if value.chars().count() <= cap {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(cap).collect();
+    out.push('…');
+    out
 }
 
 fn no_results_message(query: &str, tags_filter: &[String]) -> String {
