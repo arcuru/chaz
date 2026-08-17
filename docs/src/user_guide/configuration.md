@@ -259,7 +259,7 @@ The embedder is best-effort:
 - API down on **recall** → query falls back to BM25 only.
 - DB has no rows under the active model's subtree → BM25 only.
 
-Configuring an embedder never makes recall worse than the lexical baseline.
+A missing or failing embedder never makes recall worse than the lexical baseline. A working one is fused with BM25 at equal weight, so the model you pick does affect ranking in both directions — see [Measured recall](memory.md#measured-recall) for the numbers and the harness that produces them.
 
 ## Backends
 
