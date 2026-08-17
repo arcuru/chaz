@@ -23,10 +23,31 @@
 //!   their session structurally through the instance model
 //!   (`ExtensionInstance` endpoints + `ScopeCtx`), not through a cap.
 //! * **Extension-providable** — [`Messenger`], [`MemoryAccess`],
-//!   [`PromptAugmentation`], [`ContextTail`]. An extension publishes an
-//!   impl from the matching [`crate::extension::instance::ExtensionInstance`]
+//!   [`PromptAugmentation`], [`ContextTail`], [`StatusSegment`]. An
+//!   extension publishes an impl from the matching
+//!   [`crate::extension::instance::ExtensionInstance`]
 //!   endpoint; consumers resolve them at turn time through the
 //!   [`crate::extension::instance::CapResolver`].
+//!
+//! # Output families: presentation vs context
+//!
+//! Several extension-providable kinds are *output* capabilities — the
+//! extension emits data the host then routes somewhere. These share one
+//! uniform declaration shape (a pull trait published from an
+//! [`crate::extension::instance::ExtensionInstance`] endpoint, collected
+//! by the host at the turn boundary) but split by *consumption*:
+//!
+//! * **Presentation outputs** — [`StatusSegment`]. Rendered by a frontend
+//!   that may run out-of-process, so they are **materialized to the
+//!   `extension_outputs` session store**
+//!   ([`crate::extension::ExtensionOutput`]) and read back across the
+//!   process boundary.
+//! * **Context / pull outputs** — [`PromptAugmentation`], [`ContextTail`].
+//!   Consumed in-process by the agent loop while assembling a turn, then
+//!   discarded. Transient context, never persisted to a store.
+//!
+//! The daemon owns the choice of which family materializes; the store is
+//! the materialization surface for the presentation subset only.
 //!
 //! [`CapabilityKind::is_host_only`] is the authoritative split, used by
 //! manifest validation to reject host-only kinds in
@@ -350,9 +371,10 @@ pub trait MemoryAccess: Send + Sync {
 ///
 /// Extension-providable — extensions like `skills` publish an impl;
 /// the host calls every provider and concatenates non-empty results
-/// after the agent's core system prompt. The augmentation receives
-/// the agent and the session's recent message text so it can decide
-/// whether to contribute.
+/// after the agent's core system prompt. This is a **context/pull**
+/// output: consumed in-process while assembling the turn, never
+/// materialized to a store. The augmentation receives the agent and the
+/// session's recent message text so it can decide whether to contribute.
 /// The method is async so providers that need database access (e.g.
 /// memory surfacing) can use eidetica without blocking. Extensions
 /// that hold their data purely in memory (skills, rules) return
@@ -372,7 +394,9 @@ pub trait PromptAugmentation: Send + Sync {
 /// Extension-providable — extensions like 'memory' publish an impl;
 /// the host calls every provider and concatenates non-empty results
 /// after the assembled messages. Unlike [`PromptAugmentation`], this
-/// fires at the end of context, not in the system prompt.
+/// fires at the end of context, not in the system prompt. Like it, this
+/// is a **context/pull** output: consumed in-process at turn time, never
+/// materialized to a store.
 pub trait ContextTail: Send + Sync {
     /// Return additional text to append after the conversation messages,
     /// or `None` if this extension has nothing to contribute for this turn.
@@ -392,6 +416,11 @@ pub trait ContextTail: Send + Sync {
 /// payload is plain data, so the same impl serves every gateway without
 /// owning a gateway-specific UI component (that would be pi's tier-2
 /// full-footer override, deliberately skipped here).
+///
+/// This is a **presentation** output: the host materializes each
+/// provider's segments into the `extension_outputs` session store
+/// ([`crate::extension::ExtensionOutput`]) so a frontend — including an
+/// out-of-process one — can render them.
 pub trait StatusSegment: Send + Sync {
     /// Return this extension's current status segments for `agent_name`,
     /// keyed by a short label. An empty map means "nothing to show."
