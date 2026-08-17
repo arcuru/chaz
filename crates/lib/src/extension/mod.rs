@@ -626,6 +626,16 @@ fn log_hook_panic(owner: &'static str, hook: &'static str) {
     );
 }
 
+/// One Global-scope extension whose `instantiate` returned `Err` or
+/// panicked at install time. Mirrors [`crate::mcp::McpRegistryEntry`]'s
+/// `Failed` status for the non-MCP path: queryable after the fact so a
+/// degraded peer can be surfaced without reading logs.
+#[derive(Clone, Debug)]
+pub struct ExtensionInstallFailure {
+    pub name: String,
+    pub error: String,
+}
+
 /// Central registry for hook handlers, extension commands, and the
 /// extensions themselves. Held on `Server` as `Arc<ExtensionHub>`.
 pub struct ExtensionHub {
@@ -662,6 +672,12 @@ pub struct ExtensionHub {
     /// instance's `routine_handler()` endpoint and consulted by
     /// [`Self::dispatch_routine`].
     installed: HashMap<String, handler::InstalledExtension>,
+    /// Global-scope extensions whose `instantiate` returned `Err` or
+    /// panicked at install time, keyed by extension name and holding
+    /// the error message. Populated by `install_all` and queryable via
+    /// [`Self::install_failures`] — the non-MCP mirror of
+    /// `McpRegistry`'s `Failed` entries.
+    install_failures: HashMap<String, String>,
     /// Interned extension-name strings — the per-kind hook vectors
     /// store `owner: &'static str`, so names flowing in as `String`
     /// (from manifests) get leaked once here. Bounded (<< 100 names).
@@ -744,6 +760,7 @@ impl ExtensionHub {
             commands_by_extension: HashMap::new(),
             tools_by_extension: HashMap::new(),
             installed: HashMap::new(),
+            install_failures: HashMap::new(),
             name_intern: HashSet::new(),
             session_registry: None,
             hosted_index: None,
@@ -1105,6 +1122,25 @@ impl ExtensionHub {
         self.extensions.iter().map(|e| e.name()).collect()
     }
 
+    /// Snapshot of every Global-scope extension whose `instantiate`
+    /// failed or panicked during [`Self::install_all`], sorted by name. Empty when
+    /// every Global extension installed cleanly. Queryable after the
+    /// fact so callers (e.g. `/extensions list`) can surface a
+    /// degraded peer without reading logs — the non-MCP mirror of
+    /// [`crate::mcp::McpRegistry::snapshot`]'s `Failed` entries.
+    pub fn install_failures(&self) -> Vec<ExtensionInstallFailure> {
+        let mut out: Vec<_> = self
+            .install_failures
+            .iter()
+            .map(|(name, error)| ExtensionInstallFailure {
+                name: name.clone(),
+                error: error.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     /// Hook kinds an extension actually registered a handler for. Always
     /// a subset of [`Extension::supported_hooks`]. Empty for unknown
     /// extension names.
@@ -1427,13 +1463,14 @@ impl ExtensionHub {
     /// instance and one set of drained hooks.
     ///
     /// Fail-open on instantiation: a Global `instantiate` that returns
-    /// `Err` is logged at warn level and skipped, and `install_all`
-    /// still returns `Ok(())` — one broken extension must not stop the
-    /// rest of the peer from booting. Callers get no programmatic
-    /// signal of a partial failure; the warning log is the surface.
-    /// The extension stays registered and, if it also declares a
-    /// non-Global scope, still instantiates at that scope's lifecycle
-    /// event.
+    /// `Err` or panics is logged at warn level and skipped, and
+    /// `install_all` still returns `Ok(())` — one broken extension must
+    /// not stop the rest of the peer from booting. Either failure is
+    /// also recorded in [`Self::install_failures`] so callers (e.g.
+    /// `/extensions list`) can surface a degraded peer without reading
+    /// logs — the non-MCP mirror of `McpRegistry::insert_failed`. The
+    /// extension stays registered and, if it also declares a non-Global
+    /// scope, still instantiates at that scope's lifecycle event.
     ///
     /// Without `peer_handles` set, the Global instantiation phase is a
     /// no-op (extensions are recorded but their tools/commands/hooks
@@ -1493,6 +1530,7 @@ impl ExtensionHub {
             match result {
                 Ok(Ok(inst)) => {
                     self.drain_global_instance(&name, &inst);
+                    self.install_failures.remove(&name);
                     self.global_instances.insert(name, inst);
                 }
                 Ok(Err(e)) => {
@@ -1501,12 +1539,15 @@ impl ExtensionHub {
                         error = %e,
                         "Global instantiation failed; extension contributes no global tools/commands/hooks"
                     );
+                    self.install_failures.insert(name, e.to_string());
                 }
                 Err(_) => {
                     warn!(
                         extension = %name,
                         "Global instantiation panicked; extension contributes no global tools/commands/hooks"
                     );
+                    self.install_failures
+                        .insert(name, "Global instantiation panicked".to_string());
                 }
             }
         }

@@ -81,8 +81,17 @@ async fn list(ctx: &CommandContext<'_>) -> CommandOutcome {
     let ref_by_name: std::collections::HashMap<&str, &ExtensionRef> =
         refs.iter().map(|r| (r.name(), r)).collect();
 
+    // Global-scope extensions whose `instantiate` failed at install time
+    // are still listed (they stay registered), but flagged so a degraded
+    // peer is visible without reading logs.
+    let failures = hub.install_failures();
+    let failure_by_name: std::collections::HashMap<&str, &str> = failures
+        .iter()
+        .map(|f| (f.name.as_str(), f.error.as_str()))
+        .collect();
+
     let mut lines = vec![format!(
-        "Extensions on this peer (✓ = live for agent '{agent}' this session; ✗ = disabled for this agent):"
+        "Extensions on this peer (✓ = live for agent '{agent}' this session; ✗ = disabled for this agent; ⚠ = global install failed):"
     )];
     for name in &names {
         let session_on = active.contains(*name);
@@ -114,7 +123,23 @@ async fn list(ctx: &CommandContext<'_>) -> CommandOutcome {
         } else {
             ""
         };
-        lines.push(format!("  {marker} {name} [{version}] — {kinds_str}{note}"));
+        let failed = failure_by_name
+            .get(name)
+            .map(|error| {
+                // Collapse any multi-line error into one readable line,
+                // marking the cut so a truncated error is not mistaken
+                // for the whole of it.
+                let collapsed: String = error.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut shown: String = collapsed.chars().take(120).collect();
+                if shown.chars().count() < collapsed.chars().count() {
+                    shown.push('…');
+                }
+                format!("  ⚠ global install failed: {shown}")
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "  {marker} {name} [{version}] — {kinds_str}{note}{failed}"
+        ));
     }
     CommandOutcome::Text(lines.join("\n"))
 }
@@ -325,7 +350,7 @@ mod tests {
     use crate::agent::AgentRegistry;
     use crate::backends::BackendManager;
     use crate::commands::{Command, dispatch};
-    use crate::extension::ExtensionHub;
+    use crate::extension::{Extension, ExtensionHub};
     use crate::extensions::{BuiltinDeps, all_builtins};
     use crate::hosted_index::HostedIndex;
     use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
@@ -353,6 +378,13 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with(Vec::new()).await
+    }
+
+    /// `fixture()` with `extra` extensions appended after the built-ins,
+    /// so tests can register a failing extension and observe the
+    /// `/extensions list` degradation marker.
+    async fn fixture_with(extra: Vec<Arc<dyn Extension>>) -> Fixture {
         let backend = InMemory::new();
         let (instance, user) =
             Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
@@ -424,7 +456,7 @@ mod tests {
         }));
         let secrets = SecretStore::new(chaz_peer).await;
         let backend_mgr = BackendManager::new(&None, secrets.clone());
-        hub.install_all(all_builtins(BuiltinDeps {
+        let mut installed_extensions = all_builtins(BuiltinDeps {
             agent_index: agent_index.clone(),
             memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),
             skill_bank_index: skill_bank_index.clone(),
@@ -434,9 +466,9 @@ mod tests {
             spawn_server_cell: spawn_cell.clone(),
             backend_manager: backend_mgr.clone(),
             security: security.clone(),
-        }))
-        .await
-        .unwrap();
+        });
+        installed_extensions.extend(extra);
+        hub.install_all(installed_extensions).await.unwrap();
         let tool_registry = ToolRegistry::new();
         for (owner, _name, tool) in hub.tools_for_registry() {
             tool_registry.register_arc_owned(tool, Some(owner));
@@ -520,6 +552,30 @@ mod tests {
             .collect()
     }
 
+    /// Extension whose Global `instantiate` always fails, so a test can
+    /// observe the degradation marker `/extensions list` adds.
+    struct FailingExt {
+        name: &'static str,
+    }
+
+    impl Extension for FailingExt {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn supported_hooks(&self) -> &[crate::extension::HookKind] {
+            &[]
+        }
+
+        fn instantiate<'a>(
+            &'a self,
+            _scope_ctx: crate::extension::instance::ScopeCtx<'a>,
+        ) -> crate::extension::instance::InstantiateFuture<'a> {
+            let name = self.name;
+            Box::pin(async move { Err(anyhow::anyhow!("boom from {name}")) })
+        }
+    }
+
     // -------------------------------------------------------------------------
     // listing
     // -------------------------------------------------------------------------
@@ -552,6 +608,33 @@ mod tests {
         assert!(
             !text.lines().skip(1).any(|l| l.starts_with("   ")),
             "every extension should be active on a fresh session, but a row was un-marked:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_flags_an_extension_whose_global_install_failed() {
+        // Register a failing extension alongside the built-ins and assert
+        // `/extensions list` still shows it, but flagged degraded rather
+        // than silently dropped.
+        let f = fixture_with(vec![Arc::new(FailingExt { name: "broken" })]).await;
+        let _ = f.server.active_extensions_for(&f.session_db_id).await;
+
+        let out = dispatch(Command::Extensions(ExtensionsAction::List), &ctx(&f)).await;
+        let text = match out {
+            CommandOutcome::Text(s) => s,
+            _ => panic!("expected CommandOutcome::Text"),
+        };
+        let broken_line = text
+            .lines()
+            .find(|l| l.contains("broken"))
+            .unwrap_or_else(|| panic!("list missing broken extension:\n{text}"));
+        assert!(
+            broken_line.contains("global install failed"),
+            "broken extension should carry the degradation marker: {broken_line}"
+        );
+        assert!(
+            broken_line.contains("boom from broken"),
+            "broken extension should carry its install error: {broken_line}"
         );
     }
 
