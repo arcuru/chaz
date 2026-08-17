@@ -81,6 +81,7 @@ test_support/        #[cfg(test)] harness: MockBackend, MockHost, fresh_session,
 main.rs              CLI args, config, eidetica init, secret store, security context, tool registry, bridge dispatch
 bridge/cli.rs        CliBridge — one-shot `-p` / `--print` prompt runner
 bridge/cmd.rs        CommandBridge — one-shot `cmd` slash-command runner (non-zero exit on error)
+control.rs           Daemon control socket — `chaz cmd` reaches a running peer instead of its state dir
 bridge/tui/          TuiBridge — ratatui-based local interactive surface (default)
 ```
 

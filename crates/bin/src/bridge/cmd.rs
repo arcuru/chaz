@@ -71,63 +71,99 @@ fn render_sessions(list: &[SessionInfo]) -> String {
     out
 }
 
+/// Parse, dispatch, and render one `/command` against an assembled server.
+///
+/// Returns `(ok, output)`: `ok` is false when the command reported an error,
+/// which the caller turns into a non-zero exit status (direct path) or an
+/// `ok: false` response (control socket). Both paths share this so the
+/// output of a command does not depend on how it was delivered.
+pub(crate) async fn run_command(
+    server: &Arc<Server>,
+    config: &Config,
+    secrets: &SecretStore,
+    command: &str,
+    session_name: Option<&str>,
+) -> anyhow::Result<(bool, String)> {
+    // Reject non-commands up front rather than silently treating them as a
+    // prompt — `chaz cmd "hello"` is a mistake, and running it as an LLM
+    // turn would be a surprising and billable way to report that.
+    let cmd = match shared_commands::parse(command) {
+        Parsed::Command(c) => c,
+        Parsed::Usage(hint) => return Ok((false, hint)),
+        Parsed::NotCommand => {
+            return Ok((
+                false,
+                format!(
+                    "not a command: {command:?} — expected a leading '/' (try '/help' in the TUI for the grammar)"
+                ),
+            ));
+        }
+    };
+
+    let (_conv_id, session_db) = super::cli::resolve_cli_session(server, session_name).await?;
+    let session_db_id = session_db.root_id().to_string();
+
+    let backend = BackendManager::new(&config.backends, secrets.clone());
+    let meta = chaz_core::session::read_meta_from_db(&session_db).await;
+    let agent = server
+        .registry()
+        .resolve_agent(&session_db_id, None, server.agent_index())
+        .await;
+
+    let ctx = CommandContext {
+        server,
+        secrets,
+        backend: &backend,
+        session_db_id: &session_db_id,
+        session_db: &session_db,
+        current_agent: &agent.name,
+        session_name: meta.name.as_deref(),
+    };
+
+    Ok(match shared_commands::dispatch(cmd, &ctx).await {
+        CommandOutcome::Text(t) => (true, t),
+        CommandOutcome::Error(e) => (false, e),
+        CommandOutcome::SessionsList(list) => (true, render_sessions(&list)),
+        // Both are control-flow signals for a long-lived frontend. A one-shot
+        // run has nothing to switch to and nothing to quit, so they resolve as
+        // a successful no-op.
+        CommandOutcome::SessionSwitched(s) => (true, s.session_db_id.clone()),
+        CommandOutcome::Quit => (true, String::new()),
+    })
+}
+
 impl Bridge for CommandBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
-        // Reject non-commands up front rather than silently treating them as a
-        // prompt — `chaz cmd "hello"` is a mistake, and running it as an LLM
-        // turn would be a surprising and billable way to report that.
-        let cmd = match shared_commands::parse(&self.command) {
-            Parsed::Command(c) => c,
-            Parsed::Usage(hint) => anyhow::bail!("{hint}"),
-            Parsed::NotCommand => anyhow::bail!(
-                "not a command: {:?} — expected a leading '/' (try '/help' in the TUI for the grammar)",
-                self.command
-            ),
-        };
-
-        let (_conv_id, session_db) =
-            super::cli::resolve_cli_session(&server, self.session_name.as_deref()).await?;
-        let session_db_id = session_db.root_id().to_string();
-
-        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
-        let meta = chaz_core::session::read_meta_from_db(&session_db).await;
-        let agent = server
-            .registry()
-            .resolve_agent(&session_db_id, None, server.agent_index())
-            .await;
-
-        let ctx = CommandContext {
-            server: &server,
-            secrets: &self.secrets,
-            backend: &backend,
-            session_db_id: &session_db_id,
-            session_db: &session_db,
-            current_agent: &agent.name,
-            session_name: meta.name.as_deref(),
-        };
+        let (ok, output) = run_command(
+            &server,
+            &self.config,
+            &self.secrets,
+            &self.command,
+            self.session_name.as_deref(),
+        )
+        .await?;
 
         // Exit status is the only thing a calling script can branch on, so an
-        // `Error` outcome has to leave through `Err` rather than being printed
+        // error outcome has to leave through `Err` rather than being printed
         // as if it were a result.
-        match shared_commands::dispatch(cmd, &ctx).await {
-            CommandOutcome::Text(t) => {
-                println!("{t}");
-                Ok(())
-            }
-            CommandOutcome::Error(e) => anyhow::bail!("{e}"),
-            CommandOutcome::SessionsList(list) => {
-                print!("{}", render_sessions(&list));
-                Ok(())
-            }
-            // Both are control-flow signals for a long-lived frontend. A
-            // one-shot run has nothing to switch to and nothing to quit, so
-            // they resolve as a successful no-op.
-            CommandOutcome::SessionSwitched(s) => {
-                println!("{}", s.session_db_id);
-                Ok(())
-            }
-            CommandOutcome::Quit => Ok(()),
+        if !ok {
+            anyhow::bail!("{output}");
         }
+        print_command_output(&output);
+        Ok(())
+    }
+}
+
+/// Print rendered output the way a pipe wants it: exactly one trailing
+/// newline, and nothing at all for a command whose result is empty.
+pub(crate) fn print_command_output(output: &str) {
+    if output.is_empty() {
+        return;
+    }
+    if output.ends_with('\n') {
+        print!("{output}");
+    } else {
+        println!("{output}");
     }
 }
 
@@ -151,6 +187,16 @@ mod tests {
             llm_call_count: 0,
             loaded: true,
         }
+    }
+
+    #[test]
+    fn a_session_listing_already_ends_in_a_newline() {
+        // `print_command_output` must not add a second one — the two paths
+        // (direct print and control socket) both funnel through it, and a
+        // trailing blank line would show up in one and not the other.
+        let out = render_sessions(&[info(Some("work"), Some("chaz"))]);
+        assert!(out.ends_with('\n'));
+        assert!(!out.ends_with("\n\n"));
     }
 
     #[test]

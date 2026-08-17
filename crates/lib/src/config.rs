@@ -57,6 +57,9 @@ pub struct Config {
     pub embedding: Option<EmbeddingConfig>,
     /// Print-mode configuration (single-shot `-p` / `--print` mode)
     pub cli: Option<CliConfig>,
+    /// Control socket the daemon serves `/command` requests on. Omit for the
+    /// defaults (enabled, at `<state_dir>/control.sock`).
+    pub control: Option<ControlConfig>,
     /// Per-extension agent allowlists for the `AgentStateAdmin` cap.
     /// Each entry maps an extension name (e.g. `"schedule"`) to the
     /// list of agent display names that extension's tools may access.
@@ -214,6 +217,45 @@ pub struct CliConfig {
 
 pub fn default_cli_auto_approved() -> Vec<String> {
     vec!["shell".into(), "write_file".into()]
+}
+
+/// Control socket configuration.
+///
+/// The daemon listens on a unix socket so `chaz cmd` can reach the running
+/// process instead of opening the state directory behind its back. Reaching it
+/// grants the full administrative command surface, so it is restricted to
+/// connections from the daemon's own uid — see
+/// `docs/src/design/control_socket.md`.
+///
+/// ```yaml
+/// control:
+///   enabled: true
+///   path: /run/user/1000/chaz-control.sock
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlConfig {
+    /// Serve the socket. Defaults to true; `false` means the daemon listens
+    /// nowhere and `chaz cmd` always opens the state directory directly.
+    #[serde(default = "default_control_enabled")]
+    pub enabled: bool,
+    /// Override the socket path. Defaults to `<state_dir>/control.sock`.
+    pub path: Option<String>,
+}
+
+/// Hand-written so that `ControlConfig::default()` agrees with an omitted
+/// `control:` block. A derived `Default` would make `enabled` false and turn
+/// "the operator said nothing" into "the operator opted out".
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_control_enabled(),
+            path: None,
+        }
+    }
+}
+
+pub fn default_control_enabled() -> bool {
+    true
 }
 
 /// Configuration for the embedding backend that powers semantic recall.

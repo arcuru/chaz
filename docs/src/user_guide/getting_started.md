@@ -138,9 +138,29 @@ chaz --config config.yaml cmd '/sharing requests'
 ```
 
 The result goes to stdout, and a command that reports an error exits non-zero,
-so scripts can branch on it. Run it with the daemon stopped — it opens the same
-state directory, and two processes on one backend do not observe each other's
-writes.
+so scripts can branch on it.
+
+It reaches a running daemon through that daemon's control socket, so the
+commands worth running while the peer is up — `/sharing requests` on a bridge
+waiting for approval, `/agents` on a daemon that is misbehaving — no longer
+require stopping the process you are trying to inspect. With no daemon running
+it opens the state directory directly instead, which is what makes it usable
+for bring-up against a cold peer.
+
+The socket lives at `<state_dir>/control.sock`, is restricted to the daemon's
+own uid, and carries the peer's whole administrative surface — share tickets,
+bootstrap approvals, agent invitations. Move it or turn it off with:
+
+```yaml
+control:
+  enabled: true # false: no listener, and `chaz cmd` always needs the daemon stopped
+  path: /run/user/1000/chaz-control.sock # default: <state_dir>/control.sock
+```
+
+`chaz cmd --local` skips the socket and reads the state directory even when a
+daemon is running. That shows you what is on disk rather than what the live
+peer holds; the two can disagree. See
+[Daemon Control Socket](../design/control_socket.md) for the design.
 
 ## Single-shot print mode
 

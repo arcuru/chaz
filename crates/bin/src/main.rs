@@ -1,4 +1,5 @@
 mod bridge;
+mod control;
 
 use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
@@ -51,9 +52,12 @@ enum Subcommand {
     /// sequence (`/pubkey`, `/agent invite`, `/agent share`, `/sharing
     /// approve`), which otherwise needs a human at a terminal.
     ///
-    /// Exits non-zero when the command reports an error. Run it with the
-    /// daemon stopped: it opens the same state directory, and two processes
-    /// on one backend do not observe each other's writes.
+    /// Exits non-zero when the command reports an error.
+    ///
+    /// Runs against a live daemon when one is listening on its control socket,
+    /// and otherwise opens the state directory directly — which requires the
+    /// daemon to be stopped, since two processes on one backend do not observe
+    /// each other's writes.
     Cmd(CmdArgs),
 
     /// Run the agent peer with no user interface, until terminated.
@@ -79,6 +83,13 @@ struct CmdArgs {
     /// address anything but a fresh throwaway session.
     #[arg(long, value_name = "NAME")]
     session: Option<String>,
+
+    /// Skip the daemon's control socket and open the state directory
+    /// directly, even when a daemon is running. For inspecting what is on
+    /// disk rather than what the live peer holds — the daemon has writes it
+    /// has not flushed, so the two can disagree.
+    #[arg(long)]
+    local: bool,
 }
 
 #[derive(clap::Args)]
@@ -216,6 +227,29 @@ async fn main() -> anyhow::Result<()> {
         Some(guard)
     };
 
+    // Prefer a running daemon. A command answered over the control socket
+    // never opens the state directory, so it costs no eidetica open, no agent
+    // bootstrap, and no sync — and, more importantly, it sees what the live
+    // peer holds rather than what has reached disk.
+    if let Some(a) = &cmd_args
+        && !a.local
+        && let Some(socket) = control::socket_path(&config, state_dir.as_deref())
+    {
+        let request = control::Request::new(a.command.clone(), a.session.clone());
+        match control::request(&socket, &request).await? {
+            control::Attempt::Answered(response) => {
+                if !response.ok {
+                    anyhow::bail!("{}", response.output);
+                }
+                bridge::cmd::print_command_output(&response.output);
+                return Ok(());
+            }
+            // Nobody home: fall through and open the state directory, which is
+            // safe precisely because no daemon holds it.
+            control::Attempt::NotListening => {}
+        }
+    }
+
     info!(
         config = %config_path.display(),
         print = args.print,
@@ -314,6 +348,54 @@ async fn main() -> anyhow::Result<()> {
         _ => "tui",
     };
     info!(mode, "Starting bridge");
+
+    // Only the daemon serves the control socket. The TUI holds the same
+    // backend and has the same problem, but it also has an operator sitting at
+    // it who can type the command — and serving from both would mean two
+    // processes racing for one path.
+    let _control = if daemon_mode {
+        match control::socket_path(&config, state_dir.as_deref()) {
+            Some(path) => {
+                let listener = control::ControlListener::bind(&path).await?;
+                let control_server = server.clone();
+                let control_config = config.clone();
+                let control_secrets = secret_store.clone();
+                Some(control::serve(listener, move |req: control::Request| {
+                    let server = control_server.clone();
+                    let config = control_config.clone();
+                    let secrets = control_secrets.clone();
+                    async move {
+                        let session = req
+                            .session
+                            .clone()
+                            .unwrap_or_else(|| control::CONTROL_SESSION_NAME.to_string());
+                        match bridge::cmd::run_command(
+                            &server,
+                            &config,
+                            &secrets,
+                            &req.command,
+                            Some(&session),
+                        )
+                        .await
+                        {
+                            Ok((true, output)) => control::Response::ok(output),
+                            Ok((false, output)) => control::Response::error(output),
+                            // A command that failed to even run is still an
+                            // answer the caller has to see; killing the
+                            // connection would read to them as a dead daemon.
+                            Err(e) => control::Response::error(format!("{e:#}")),
+                        }
+                    }
+                }))
+            }
+            None => {
+                info!("Control socket disabled; `chaz cmd` will need this daemon stopped");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let result = if daemon_mode {
         // No bridge: the server is already running sync, schedules, the

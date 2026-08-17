@@ -19,7 +19,7 @@ eidetica = { git = "https://github.com/arcuru/eidetica", rev = "17284e742e9a0ab6
 # Shared third-party deps.
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
