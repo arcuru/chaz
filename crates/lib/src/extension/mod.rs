@@ -136,13 +136,27 @@ pub async fn write_settings(
 /// it with no extra transport.
 pub const EXTENSION_OUTPUTS_STORE: &str = "extension_outputs";
 
-/// One extension's published outputs, materialized into the session DB so
-/// a frontend — the in-process TUI today, an out-of-process bridge later —
-/// can render them. Pure data; no UI component crosses the boundary.
+/// One extension's **presentation** outputs, materialized into the session
+/// DB so a frontend — the in-process TUI today, an out-of-process bridge
+/// later — can render them. Pure data; no UI component crosses the boundary.
 ///
-/// Phase 1 carries only `status` (status-bar segments). Further
-/// presentation kinds (progress, badges) slot in as new
-/// `#[serde(default)]` fields without breaking older readers.
+/// # Presentation vs context outputs
+///
+/// This struct is deliberately the *presentation subset* of everything an
+/// extension can emit: data a frontend renders. Presentation outputs are
+/// **always materialized to the store** because the renderer may live in
+/// another process whose only channel to the daemon is the session DB.
+///
+/// The other extension output family — *context/pull* outputs
+/// ([`caps::PromptAugmentation`], [`caps::ContextTail`]) — is consumed
+/// in-process by the agent loop at turn time and is **never routed through
+/// this struct or persisted to the DB**. It is transient context, not
+/// renderable state. The two families share the uniform capability
+/// declaration convention but diverge here, at the materialization
+/// boundary.
+///
+/// Every field is therefore a presentation kind. Context outputs must
+/// never be added here.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionOutput {
     /// Status-bar segments keyed by a short label; rendered in key order.
