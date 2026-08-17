@@ -1,7 +1,7 @@
 use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
 use crate::grants::Grants;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Resolve an agent's or worker's effective system prompt: read each
 /// `system_prompt_files` entry in order, concatenate their contents, then
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 pub(crate) fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(files.len() + 1);
     for path in files {
-        let resolved = expand_home(path);
+        let resolved = crate::util::expand_home(path);
         match std::fs::read_to_string(&resolved) {
             Ok(content) => {
                 let trimmed = content.trim_end();
@@ -37,23 +37,6 @@ pub(crate) fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
         parts.push(inline.to_string());
     }
     parts.join("\n\n")
-}
-
-/// Expand a leading `~` / `~/…` in `path` against the home directory.
-/// Returns `path` unchanged when there is no leading tilde or no home dir.
-fn expand_home(path: &Path) -> PathBuf {
-    let Some(s) = path.to_str() else {
-        return path.to_path_buf();
-    };
-    if s == "~" {
-        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    path.to_path_buf()
 }
 
 /// Agent definition — first-class entity with persistent identity, sessions,
@@ -530,22 +513,6 @@ mod tests {
         // Missing file is dropped; the rest still assembles.
         let out = resolve_system_prompt("INLINE", &[missing, present]);
         assert_eq!(out, "PRESENT\n\nINLINE");
-    }
-
-    #[test]
-    fn expand_home_rewrites_leading_tilde() {
-        let home = dirs::home_dir().expect("home dir in test env");
-        assert_eq!(
-            expand_home(Path::new("~/brain/x.md")),
-            home.join("brain/x.md")
-        );
-        assert_eq!(expand_home(Path::new("~")), home);
-        // No tilde → untouched; mid-path tilde is not expanded.
-        assert_eq!(
-            expand_home(Path::new("/abs/p.md")),
-            PathBuf::from("/abs/p.md")
-        );
-        assert_eq!(expand_home(Path::new("/a/~/b")), PathBuf::from("/a/~/b"));
     }
 
     fn make_agent(name: &str) -> Agent {
