@@ -377,6 +377,11 @@ pub struct Server {
     /// threading the path through every call site. `None` in `--print` and
     /// tests, where reload is unavailable.
     config_path: std::sync::RwLock<Option<std::path::PathBuf>>,
+    /// Fail-closed ceiling on a pending tool approval, set once at startup
+    /// from `Config.approvals` via [`Server::set_approval_timeout`]. Read by
+    /// the per-session approval proxy each time an exposed session registers,
+    /// so the value doesn't have to thread through the rescan chain.
+    approval_timeout: std::sync::RwLock<std::time::Duration>,
     /// Running `RoutineEngine`, set once at startup via
     /// `set_routine_engine` (skipped under `--print`). Threaded into the
     /// `HookContext` / `ToolContext` built for each session so that
@@ -462,6 +467,9 @@ impl Server {
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
             config_path: std::sync::RwLock::new(None),
+            approval_timeout: std::sync::RwLock::new(
+                crate::bridge::ApprovalsConfig::default().timeout(),
+            ),
             routine_engine: OnceLock::new(),
             mcp_registry,
             // Ready by default: only the deferred fast-start path (build)
@@ -891,6 +899,23 @@ impl Server {
             .resolve_prompt_ref(&cfg.system_prompt, &files, cfg.system_prompt_ref.as_ref())
             .await?;
         Ok(())
+    }
+
+    /// Set how long a tool approval may stay pending before it is denied.
+    /// Applied once at startup from `Config.approvals`.
+    pub fn set_approval_timeout(&self, timeout: std::time::Duration) {
+        *self
+            .approval_timeout
+            .write()
+            .expect("approval_timeout lock poisoned") = timeout;
+    }
+
+    /// The fail-closed ceiling on a pending tool approval.
+    pub fn approval_timeout(&self) -> std::time::Duration {
+        *self
+            .approval_timeout
+            .read()
+            .expect("approval_timeout lock poisoned")
     }
 
     /// Record the on-disk chaz yaml path so `/agent reload` and the TUI `[r]`
@@ -1898,15 +1923,19 @@ impl Server {
 
             {
                 let mut s = session.lock().await;
-                s.add_entry(SessionEntry {
-                    sender: agent_name.clone(),
-                    content: String::new(),
-                    timestamp: Utc::now(),
-                    entry_type: EntryType::Ack,
-                    metadata: None,
-                    routing: None,
-                })
-                .await;
+                if let Err(e) = s
+                    .add_entry(SessionEntry {
+                        sender: agent_name.clone(),
+                        content: String::new(),
+                        timestamp: Utc::now(),
+                        entry_type: EntryType::Ack,
+                        metadata: None,
+                        routing: None,
+                    })
+                    .await
+                {
+                    error!("Failed to write turn ack for {session_db_id}: {e}");
+                }
             }
 
             let request_security = SecurityContext {
@@ -2013,15 +2042,19 @@ impl Server {
                         runtime::RuntimeEvent::ToolCall {
                             name, arguments, ..
                         } => {
-                            s.add_entry(SessionEntry {
-                                sender: event_agent.clone(),
-                                content: format!("{name}({arguments})"),
-                                timestamp: Utc::now(),
-                                entry_type: EntryType::ToolCall,
-                                metadata: None,
-                                routing: None,
-                            })
-                            .await;
+                            if let Err(e) = s
+                                .add_entry(SessionEntry {
+                                    sender: event_agent.clone(),
+                                    content: format!("{name}({arguments})"),
+                                    timestamp: Utc::now(),
+                                    entry_type: EntryType::ToolCall,
+                                    metadata: None,
+                                    routing: None,
+                                })
+                                .await
+                            {
+                                error!("Failed to record tool call: {e}");
+                            }
                         }
                         runtime::RuntimeEvent::ToolResult {
                             name,
@@ -2040,15 +2073,19 @@ impl Server {
                                 };
                                 format!("{name}: {truncated}")
                             };
-                            s.add_entry(SessionEntry {
-                                sender: event_agent.clone(),
-                                content,
-                                timestamp: Utc::now(),
-                                entry_type: EntryType::ToolResult,
-                                metadata: None,
-                                routing: None,
-                            })
-                            .await;
+                            if let Err(e) = s
+                                .add_entry(SessionEntry {
+                                    sender: event_agent.clone(),
+                                    content,
+                                    timestamp: Utc::now(),
+                                    entry_type: EntryType::ToolResult,
+                                    metadata: None,
+                                    routing: None,
+                                })
+                                .await
+                            {
+                                error!("Failed to record tool result: {e}");
+                            }
                         }
                     }
                 }
@@ -2088,27 +2125,35 @@ impl Server {
                     );
                 }
                 Ok(outcome) => {
-                    s.add_entry(SessionEntry {
-                        sender: agent_name,
-                        content: outcome.body,
-                        timestamp: Utc::now(),
-                        entry_type: EntryType::Message,
-                        metadata: outcome.metadata,
-                        routing: None,
-                    })
-                    .await;
+                    if let Err(e) = s
+                        .add_entry(SessionEntry {
+                            sender: agent_name,
+                            content: outcome.body,
+                            timestamp: Utc::now(),
+                            entry_type: EntryType::Message,
+                            metadata: outcome.metadata,
+                            routing: None,
+                        })
+                        .await
+                    {
+                        error!("Failed to write agent reply for {session_db_id}: {e}");
+                    }
                 }
                 Err(err) => {
                     error!("Agent error for {}: {err}", session_db_id);
-                    s.add_entry(SessionEntry {
-                        sender: agent_name,
-                        content: format!("Error: {err}"),
-                        timestamp: Utc::now(),
-                        entry_type: EntryType::Error,
-                        metadata: None,
-                        routing: None,
-                    })
-                    .await;
+                    if let Err(e) = s
+                        .add_entry(SessionEntry {
+                            sender: agent_name,
+                            content: format!("Error: {err}"),
+                            timestamp: Utc::now(),
+                            entry_type: EntryType::Error,
+                            metadata: None,
+                            routing: None,
+                        })
+                        .await
+                    {
+                        error!("Failed to write agent error for {session_db_id}: {e}");
+                    }
                 }
             }
             drop(s);

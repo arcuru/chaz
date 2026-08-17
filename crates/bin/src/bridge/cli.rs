@@ -134,7 +134,7 @@ impl Bridge for CliBridge {
                 metadata: None,
                 routing: None,
             })
-            .await;
+            .await?;
 
         // Wait for an agent reply (Message from a sender in agent_names) or an Error.
         while notify_rx.recv().await.is_some() {

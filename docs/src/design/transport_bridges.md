@@ -238,11 +238,42 @@ Every failure path denies — a bridge-exposed session never auto-_approves_:
   `request_approval` returns `Deny`.
 - **Proxy can't watch the DB**, or the **request write fails** → the pending slot
   is dropped, closing the oneshot → `Deny`.
-- **No decision within 30 minutes** (`APPROVAL_TIMEOUT`) → the slot is dropped →
-  `Deny`. This keeps a down or silent bridge from hanging the ReAct loop forever.
-- **No live bridge at all** → the request entry sits unanswered and times out to
-  `Deny`. Until 4b, exposed sessions denied _silently_; now the denial is visible
-  as an unanswered request entry.
+- **No decision within the request's ceiling** (default 300s) → the daemon
+  resolves the slot as `TimedOut`, which is not an approval. This keeps a down or
+  silent bridge from hanging the ReAct loop forever.
+- **No live bridge at all** → the request entry sits unanswered and times out.
+  Until 4b, exposed sessions denied _silently_; now the outcome is visible as a
+  `TimedOut` decision entry beside its request.
+
+#### One clock, and it is the daemon's
+
+The daemon reads `approvals.timeout`, stamps each request entry with its own
+`timeout_secs`, and on expiry writes the `TimedOut` decision itself. **No bridge
+compares a clock at any point.** It uses the ceiling only to render the window to
+a human ("expires in 5 minutes"), and it learns the outcome the way it learns
+everything else — by reading the session.
+
+This matters because eidetica entries carry no time of their own. Every timestamp
+in a session is one peer's wall clock written into an application payload, so a
+bridge deciding "is this late?" would be comparing the daemon's clock against its
+own, and on a split deployment those drift. A bridge that guessed early would
+silently discard a human's answer.
+
+So a bridge never guesses. It writes the answer it was given, and correctness
+comes from resolution instead:
+
+- Before writing, it checks whether the request already has a decision. If the
+  daemon closed it, the bridge says so in the channel rather than writing.
+- If it loses that race and writes anyway, nothing breaks. `resolved_decisions`
+  treats **`TimedOut` as absorbing**: the daemon writes it only after claiming
+  the pending slot, under the same lock a landing decision takes, so a `TimedOut`
+  entry existing is equivalent to "the runtime was told `TimedOut`". Whatever
+  else is written for that request, in any order, resolution names the outcome
+  the daemon acted on. Among ordinary answers the first one stands, since the
+  daemon took whichever reached it first.
+
+Entry order in the tree is deliberately not the tiebreak — the entry stamped
+earliest is not necessarily the one that arrived first.
 
 So the worst case of any bug or outage is a denied tool, never an unsupervised
 one. `auto_approved_tools` / `tool_policies.*.approval` still govern which tools

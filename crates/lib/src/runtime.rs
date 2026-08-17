@@ -707,6 +707,17 @@ pub async fn execute(
                                         });
                                         continue;
                                     }
+                                    ApprovalDecision::TimedOut => {
+                                        // Tell the model nobody answered rather
+                                        // than that it was refused: the two
+                                        // warrant different next moves.
+                                        messages.push(RuntimeMessage::ToolResult {
+                                            call_id: call.id.clone(),
+                                            content: "Tool execution was not approved in time"
+                                                .to_string(),
+                                        });
+                                        continue;
+                                    }
                                 }
                             }
 

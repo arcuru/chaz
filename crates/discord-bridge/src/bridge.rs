@@ -92,7 +92,11 @@ impl Bridge for DiscordBridge {
             attached: Arc::new(Mutex::new(HashSet::new())),
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             message_counts: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            // No timeout here: the daemon owns the clock and stamps each
+            // request with its own deadline.
+            pending: Arc::new(ApprovalRelay {
+                slots: Mutex::new(HashMap::new()),
+            }),
             bot_id: Arc::new(Mutex::new(None)),
         };
 
@@ -247,7 +251,7 @@ impl Handler {
                 &msg.content,
                 Some(msg.id.get().to_string()),
             ))
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -550,40 +554,99 @@ struct PendingApproval {
     /// channel has had open longest rather than an arbitrary map entry.
     seq: u64,
 }
-type PendingApprovals = Arc<Mutex<HashMap<MessageId, PendingApproval>>>;
+
+/// The posted prompts awaiting an answer.
+struct ApprovalRelay {
+    slots: Mutex<HashMap<MessageId, PendingApproval>>,
+}
+type PendingApprovals = Arc<ApprovalRelay>;
 
 /// Stamps [`PendingApproval::seq`]. Process-wide: prompts from every channel
 /// share one order, and only their relative order matters.
 static NEXT_PROMPT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Render the approval prompt a human reacts to.
+/// Render the approval prompt a human reacts to. The window comes off the
+/// request itself, so the channel is told how long it has without this process
+/// knowing anything about the daemon's configuration.
 fn approval_body(req: &chaz_core::bridge::ApprovalRequestPayload) -> String {
     format!(
         "🔒 **Tool approval required**\n\n\
          **Tool:** `{}`\n\
          **Risk:** {}\n\
-         **Args:** `{}`\n\n\
+         **Args:** `{}`\n\
+         **Expires:** {}\n\n\
          React: ✅ approve · ❌ deny · ⏭️ approve all\n\
          Or reply: `!chaz approve` / `!chaz deny`",
-        req.tool_name, req.risk_level, req.arguments_display
+        req.tool_name,
+        req.risk_level,
+        req.arguments_display,
+        chaz_core::bridge::render_approval_window(req.timeout_secs),
     )
 }
 
 /// Write an `ApprovalDecision` entry resolving `request_id` into the session DB.
 /// The decision syncs to the daemon, whose proxy matches it back and unblocks
 /// the runtime's `request_approval`.
+///
+/// Returns the decision already on record when there is one, in which case
+/// nothing is written: the daemon has closed this request and the answer has
+/// nothing left to resolve. Losing that race is harmless — `resolved_decisions`
+/// resolves to the daemon's outcome whether or not a late answer got written.
 async fn write_approval_decision(
     session_db: &eidetica::Database,
     approver: &str,
     request_id: &str,
     decision: ApprovalDecision,
-) {
+) -> Option<ApprovalDecision> {
     let sid = session_db.root_id().to_string();
     let mut session = Session::new(ConversationId(sid), session_db.clone()).await;
-    session
+    if let Some(already) = chaz_core::bridge::existing_decision(session.entries(), request_id) {
+        info!(%request_id, ?already, "Request already resolved; not writing this answer");
+        return Some(already);
+    }
+    if let Err(e) = session
         .add_entry(chaz_core::bridge::approval_decision_entry(
             approver, request_id, decision,
         ))
+        .await
+    {
+        error!("Failed to write approval decision for {request_id}: {e}");
+    }
+    None
+}
+
+/// What the channel is told when an answer arrives for a request that is
+/// already closed. `None` when the answer simply lost a race with another
+/// human's, which needs no explanation.
+fn already_resolved_notice(already: &ApprovalDecision) -> Option<String> {
+    matches!(already, ApprovalDecision::TimedOut)
+        .then(|| "⌛ That approval had already expired — the tool was not run".to_string())
+}
+
+/// Drop the posted prompt for a request the daemon has given up on, and tell
+/// the channel which tool it was.
+///
+/// The daemon owns the clock and has already written the `TimedOut` decision;
+/// this only renders it, the same way the watcher renders the request itself.
+async fn announce_timeout(
+    pending: &PendingApprovals,
+    http: &Http,
+    channel_id: ChannelId,
+    req: &chaz_core::bridge::ApprovalRequestPayload,
+) {
+    pending
+        .slots
+        .lock()
+        .await
+        .retain(|_, p| p.request_id != req.request_id);
+    let _ = channel_id
+        .say(
+            http,
+            format!(
+                "⌛ Tool approval for `{}` expired with no answer — not approved",
+                req.tool_name
+            ),
+        )
         .await;
 }
 
@@ -591,10 +654,12 @@ async fn write_approval_decision(
 /// `channel_id` (seeding the ✅/❌/⏭️ reactions) and records it in `pending` so
 /// a reaction/command can resolve it.
 ///
-/// Renders only requests with no decision yet and not already posted this
-/// process (`seen`); a failed post is left unseen so the next session write
-/// retries it. Never commits to the session tree (the decision is written later
-/// from the reaction handler), so it is safe inside `on_write`.
+/// Renders only requests with no decision yet, not past their deadline, and not
+/// already posted this process (`seen`); a failed post is left unseen so the
+/// next session write retries it. Also posts a notice for each request the
+/// daemon has timed out. Never commits to the session tree (the decision is
+/// written later from the reaction handler, or by the daemon itself on expiry),
+/// so it is safe inside `on_write`.
 async fn attach_approval_watcher(
     session_db: &eidetica::Database,
     http: Arc<Http>,
@@ -603,16 +668,19 @@ async fn attach_approval_watcher(
 ) -> anyhow::Result<()> {
     let sid = session_db.root_id().to_string();
     let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let announced: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let db = session_db.clone();
     session_db
         .on_write(move |event, _db| {
             // Must not be gated on `Local`: the request this renders is
             // written by the daemon running the agent, which on a split
-            // deployment is a different peer and arrives via sync.
+            // deployment is a different peer and arrives via sync. The same
+            // goes for the timeout decision that closes it.
             tracing::trace!(session = %sid, source = ?event.source(), "Session write; rescanning approval requests");
             let http = http.clone();
             let pending = pending.clone();
             let seen = seen.clone();
+            let announced = announced.clone();
             let sid = sid.clone();
             let db = db.clone();
             Box::pin(async move {
@@ -629,7 +697,7 @@ async fn attach_approval_watcher(
                                     .react(&http, ReactionType::Unicode(e.to_string()))
                                     .await;
                             }
-                            pending.lock().await.insert(
+                            pending.slots.lock().await.insert(
                                 posted.id,
                                 PendingApproval {
                                     session_db: db.clone(),
@@ -644,6 +712,16 @@ async fn attach_approval_watcher(
                             seen.remove(&req.request_id); // retry on next write
                         }
                     }
+                }
+
+                let mut announced = announced.lock().await;
+                for req in chaz_core::bridge::unannounced_timeouts(session.entries(), &announced) {
+                    announced.insert(req.request_id.clone());
+                    info!(
+                        session = %sid, request_id = %req.request_id, tool = %req.tool_name,
+                        "Daemon timed out an approval; telling the channel"
+                    );
+                    announce_timeout(&pending, &http, channel_id, &req).await;
                 }
                 Ok(())
             })
@@ -663,7 +741,7 @@ async fn resolve_pending_approval(
     approve: bool,
 ) {
     let resolved = {
-        let mut p = pending.lock().await;
+        let mut p = pending.slots.lock().await;
         let message_id = chaz_core::bridge::oldest_pending(
             p.iter().map(|(id, pa)| (*id, pa.channel_id, pa.seq)),
             &channel_id,
@@ -679,11 +757,13 @@ async fn resolve_pending_approval(
     } else {
         ApprovalDecision::Deny
     };
-    write_approval_decision(&req.session_db, approver, &req.request_id, decision).await;
-    let label = if approve {
-        "✅ Approved"
-    } else {
-        "❌ Denied"
+    let already =
+        write_approval_decision(&req.session_db, approver, &req.request_id, decision).await;
+    let label = match already.as_ref() {
+        Some(already) => already_resolved_notice(already)
+            .unwrap_or_else(|| "That approval had already been answered".to_string()),
+        None if approve => "✅ Approved".to_string(),
+        None => "❌ Denied".to_string(),
     };
     let _ = channel_id.say(http, label).await;
 }
@@ -695,6 +775,7 @@ async fn handle_approval_reaction(
     pending: &PendingApprovals,
     bot_id: Option<UserId>,
     allowed_users: &HashSet<u64>,
+    http: &Http,
 ) {
     if add.user_id == bot_id {
         return;
@@ -715,7 +796,7 @@ async fn handle_approval_reaction(
         "⏭" | "⏭️" => ApprovalDecision::ApproveAll,
         _ => return,
     };
-    let Some(req) = pending.lock().await.remove(&add.message_id) else {
+    let Some(req) = pending.slots.lock().await.remove(&add.message_id) else {
         return;
     };
     let approver = add
@@ -723,7 +804,11 @@ async fn handle_approval_reaction(
         .map(|u| u.to_string())
         .unwrap_or_else(|| "discord-user".to_string());
     info!(channel = %add.channel_id, request_id = %req.request_id, ?decision, "Approval decision via reaction");
-    write_approval_decision(&req.session_db, &approver, &req.request_id, decision).await;
+    let already =
+        write_approval_decision(&req.session_db, &approver, &req.request_id, decision).await;
+    if let Some(notice) = already.as_ref().and_then(already_resolved_notice) {
+        let _ = add.channel_id.say(http, notice).await;
+    }
 }
 
 /// Discord rejects messages longer than 2000 characters (counted as Unicode
@@ -846,9 +931,9 @@ impl EventHandler for Handler {
     /// ✅/❌/⏭️ on a posted approval prompt is the primary approve path. Look the
     /// reacted-to message up in `pending` and write the decision back into its
     /// session DB.
-    async fn reaction_add(&self, _ctx: Context, add: Reaction) {
+    async fn reaction_add(&self, ctx: Context, add: Reaction) {
         let bot_id = *self.bot_id.lock().await;
-        handle_approval_reaction(add, &self.pending, bot_id, &self.allowed_users).await;
+        handle_approval_reaction(add, &self.pending, bot_id, &self.allowed_users, &ctx.http).await;
     }
 }
 

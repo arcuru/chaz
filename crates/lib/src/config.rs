@@ -31,6 +31,9 @@ pub struct Config {
     pub default_agents: Option<Vec<String>>,
     /// Security settings
     pub security: Option<SecurityConfig>,
+    /// Tool-approval settings. Shared with the bridge binaries, which read the
+    /// same block out of the same file.
+    pub approvals: Option<crate::bridge::ApprovalsConfig>,
     /// Scheduled tasks
     pub schedules: Option<Vec<ScheduleConfig>>,
     /// MCP (Model Context Protocol) subprocess servers
@@ -1505,6 +1508,25 @@ username: "@u:s"
         assert_eq!(login.login_id(), "@u:s");
         let TransportConfig::Matrix(m) = &login.transport;
         assert_eq!(m.homeserver_url, "https://s");
+    }
+
+    #[test]
+    fn approvals_timeout_parses_and_defaults_to_five_minutes() {
+        let cfg: Config = serde_yaml::from_str("approvals:\n  timeout: 5\n").unwrap();
+        assert_eq!(
+            cfg.approvals.as_ref().unwrap().timeout(),
+            std::time::Duration::from_secs(5)
+        );
+
+        // Present but empty, and absent entirely, both mean the default.
+        let bare: Config = serde_yaml::from_str("approvals: {}\n").unwrap();
+        assert_eq!(bare.approvals.unwrap().timeout, 300);
+        let none: Config = serde_yaml::from_str("state_dir: /tmp\n").unwrap();
+        assert!(none.approvals.is_none());
+        assert_eq!(
+            crate::bridge::approval_timeout_or_default(none.approvals.as_ref()),
+            std::time::Duration::from_secs(300)
+        );
     }
 
     #[test]

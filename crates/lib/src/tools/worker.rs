@@ -256,7 +256,8 @@ impl Tool for SpawnWorker {
                     metadata: None,
                     routing: None,
                 })
-                .await;
+                .await
+                .map_err(|e| format!("Failed to write directive for worker '{name}': {e}"))?;
 
             if is_async {
                 return Ok(format!(

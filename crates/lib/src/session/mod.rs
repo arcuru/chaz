@@ -366,23 +366,33 @@ impl Session {
         }
     }
 
-    /// Add an entry to the session with persistence
-    pub async fn add_entry(&mut self, entry: SessionEntry) {
-        match self.database.new_transaction().await {
-            Ok(txn) => match txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
-                Ok(store) => {
-                    if let Err(e) = store.insert(entry.clone()).await {
-                        error!("Failed to persist entry to eidetica: {e}");
-                    } else if let Err(e) = txn.commit().await {
-                        error!("Failed to commit to eidetica: {e}");
-                    }
-                }
-                Err(e) => error!("Failed to open eidetica store: {e}"),
-            },
-            Err(e) => error!("Failed to create eidetica transaction: {e}"),
-        }
+    /// Add an entry to the session, persisting it before it becomes visible
+    /// in memory.
+    ///
+    /// A write failure is returned rather than logged: callers that block on
+    /// an entry landing (tool approvals above all) must learn immediately that
+    /// it never will, and the in-memory history must not claim a row the
+    /// database does not hold.
+    pub async fn add_entry(&mut self, entry: SessionEntry) -> anyhow::Result<()> {
+        let txn = self
+            .database
+            .new_transaction()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to create eidetica transaction: {e}"))?;
+        let store = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to open eidetica store: {e}"))?;
+        store
+            .insert(entry.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to persist entry to eidetica: {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to commit to eidetica: {e}"))?;
 
         self.entries.push(entry);
+        Ok(())
     }
 
     /// Merge backfill history from a bridge (e.g., Matrix room history).
@@ -723,6 +733,102 @@ mod tests {
     use super::test_helpers::*;
     use super::*;
 
+    /// A concurrent write from two peers, resolved by the CRDT — the case the
+    /// approval protocol has to survive.
+    ///
+    /// The daemon expires a request while a bridge is answering it. Neither has
+    /// seen the other's write, so the session forks: two entries off one tip,
+    /// merged when they meet. The tool already did not run — the daemon told the
+    /// runtime `TimedOut` before writing anything — so the merged session has to
+    /// say the same, or the record would claim an approval for a call that never
+    /// happened.
+    ///
+    /// Two transactions opened before either commits reproduce that fork exactly,
+    /// with no sync involved: both branch from the same tip, and reading after
+    /// both commits goes through the same merge a synced split would.
+    #[tokio::test]
+    async fn a_split_between_a_daemon_expiry_and_a_bridge_approval_fails_closed() {
+        use crate::bridge::{ApprovalDecision, approval_decision_entry, resolved_decisions};
+
+        let (_instance, _user, db) = test_session_db().await;
+        let request_id = "req-1";
+
+        // Seed the request first. This is what the real sequence looks like —
+        // the daemon writes the request, both peers see it, and only then can
+        // they diverge answering it. It also gives the `entries` store a shared
+        // history: a store first created independently on two branches has no
+        // common ancestor to merge against.
+        let mut seed = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
+        seed.add_entry(
+            crate::bridge::approval_request_entry(
+                "chaz",
+                &crate::tool::ToolApprovalInfo {
+                    name: "shell".to_string(),
+                    arguments_display: "rm -rf /".to_string(),
+                    risk_level: crate::tool::RiskLevel::High,
+                },
+                std::time::Duration::from_secs(300),
+            )
+            .1,
+        )
+        .await
+        .unwrap();
+
+        // Both peers branch from the same tip: neither transaction can see the
+        // other's write, which is what makes this a fork rather than a sequence.
+        let daemon_txn = db.new_transaction().await.unwrap();
+        let bridge_txn = db.new_transaction().await.unwrap();
+
+        daemon_txn
+            .get_store::<Table<SessionEntry>>("entries")
+            .await
+            .unwrap()
+            .insert(approval_decision_entry(
+                "system",
+                request_id,
+                ApprovalDecision::TimedOut,
+            ))
+            .await
+            .unwrap();
+        bridge_txn
+            .get_store::<Table<SessionEntry>>("entries")
+            .await
+            .unwrap()
+            .insert(approval_decision_entry(
+                "@patrick:example",
+                request_id,
+                ApprovalDecision::Approve,
+            ))
+            .await
+            .unwrap();
+
+        // Bridge commits second, so its approval is the later write. Under a
+        // last-write-wins rule this is exactly the entry that would win.
+        daemon_txn.commit().await.unwrap();
+        bridge_txn.commit().await.unwrap();
+
+        let session = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
+
+        // The merge must not drop either row — `Table::insert` mints a fresh
+        // UUID key per row and `Doc` merges per key, so both survive. If this
+        // ever stops holding, the assertion below could pass vacuously.
+        assert_eq!(
+            session
+                .entries()
+                .iter()
+                .filter(|e| e.entry_type == EntryType::ApprovalDecision)
+                .count(),
+            2,
+            "both sides of the split must survive the merge"
+        );
+
+        assert_eq!(
+            resolved_decisions(session.entries()).get(request_id),
+            Some(&ApprovalDecision::TimedOut),
+            "a split between an expiry and an approval must fail closed"
+        );
+    }
+
     fn entry_at(sender: &str, minutes_ago: i64, routing: Option<EntryRouting>) -> SessionEntry {
         SessionEntry {
             sender: sender.to_string(),
@@ -732,6 +838,38 @@ mod tests {
             metadata: None,
             routing,
         }
+    }
+
+    /// A failed write must be reported, not logged and forgotten: everything
+    /// downstream of an approval request treats "entry landed" as the signal
+    /// that a human can see it.
+    #[tokio::test]
+    async fn add_entry_reports_a_write_that_did_not_land() {
+        let (instance, _user, db) = test_session_db().await;
+        // Same tree, opened without a signing key: reads work, commits don't.
+        let unwritable = Database::open(&instance, db.root_id()).await.unwrap();
+
+        let mut session = Session::new(ConversationId("c1".to_string()), unwritable.clone()).await;
+        let err = session
+            .add_entry(entry_at("user", 0, None))
+            .await
+            .expect_err("commit cannot succeed without a signing key");
+        assert!(err.to_string().contains("eidetica"), "got: {err}");
+
+        // Neither the in-memory history nor the DB may claim the entry.
+        assert!(session.entries().is_empty());
+        let reread = Session::new(ConversationId("c1".to_string()), db.clone()).await;
+        assert!(reread.entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_entry_persists_on_the_happy_path() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut session = Session::new(ConversationId("c1".to_string()), db.clone()).await;
+        session.add_entry(entry_at("user", 0, None)).await.unwrap();
+        assert_eq!(session.entries().len(), 1);
+        let reread = Session::new(ConversationId("c1".to_string()), db).await;
+        assert_eq!(reread.entries().len(), 1);
     }
 
     fn matrix_source(room: &str) -> EntryRouting {

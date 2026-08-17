@@ -351,6 +351,17 @@ participant list. Bring them up to date by re-running `/agent add
 
 Security settings control tool approval, network access, shell sandboxing, secret leak detection, and tool rate limiting. See [Security](security.md) for details.
 
+## Approvals
+
+How long a tool-approval prompt may wait for an answer, in seconds. Defaults to 300 (5 minutes) when the block is absent.
+
+```yaml
+approvals:
+  timeout: 300
+```
+
+The daemon reads this block; bridges do not. Each approval request carries the ceiling with it so a bridge can show you how long the prompt has, but no bridge enforces it — the daemon does. On a split deployment that means only the daemon's config file matters here. See [Security → Tool Approval](security.md#tool-approval).
+
 ## MCP Servers
 
 External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) for details.

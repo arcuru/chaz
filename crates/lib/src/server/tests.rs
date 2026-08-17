@@ -1101,7 +1101,8 @@ async fn write_user_message(session_db: &eidetica::Database, sid: &str) {
             metadata: None,
             routing: None,
         })
-        .await;
+        .await
+        .expect("write user message");
 }
 
 #[tokio::test]

@@ -1480,7 +1480,9 @@ async fn handle_chat_action(
             let session_db_id = tab.session_db_id.clone();
             let mut session =
                 Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
-            session
+            // Only wait on a reply the agent can actually see: an unwritten
+            // message never wakes a turn, so the spinner would never stop.
+            match session
                 .add_entry(SessionEntry {
                     sender: "user".to_string(),
                     content: text,
@@ -1489,8 +1491,11 @@ async fn handle_chat_action(
                     metadata: None,
                     routing: None,
                 })
-                .await;
-            tab.waiting = true;
+                .await
+            {
+                Ok(()) => tab.waiting = true,
+                Err(e) => tracing::error!("Failed to send message: {e}"),
+            }
         }
         ChatAction::OpenSettings(scope) => {
             // From a chat-action context the caller mode is always Chat —
