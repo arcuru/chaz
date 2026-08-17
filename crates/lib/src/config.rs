@@ -73,6 +73,11 @@ pub struct Config {
     /// [`RuntimeMode::Auto`]. A standalone transport bridge effectively runs
     /// as [`RuntimeMode::Never`] (it owns no runtime; the daemon does).
     pub runtime: Option<RuntimeMode>,
+    /// Tool execution host for capability requests. Omit (default) for the
+    /// in-process [`ToolHostConfig::Native`] host; set `bubblewrap` for
+    /// OS-level shell sandboxing via [`ToolHostConfig::Bubblewrap`].
+    #[serde(default)]
+    pub tool_host: Option<ToolHostConfig>,
 }
 
 /// Who claims the right to *run* the agent for a session.
@@ -96,6 +101,26 @@ pub enum RuntimeMode {
     /// Never claim: pure transport. The mode for bridges (Matrix, Discord) —
     /// they expose the session and let the daemon run it.
     Never,
+}
+
+/// Which execution host backs tool capability requests.
+///
+/// The host is the process-wide sandbox tier behind every tool that goes
+/// through `ctx.host()` (shell, file, web). `native` runs capabilities
+/// in-process with grant checks only; `bubblewrap` additionally runs shell
+/// commands in an OS-level sandbox (`bwrap`), degrading to native when
+/// `bwrap` is not installed.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolHostConfig {
+    /// In-process host: grant enforcement only, no OS-level sandbox. The
+    /// default.
+    #[default]
+    Native,
+    /// Bubblewrap host: shell commands run in Linux namespaces (no network,
+    /// read-only system dirs, no `/proc`). Other capabilities fall through
+    /// to native execution.
+    Bubblewrap,
 }
 
 /// One login on some transport, owned by exactly one agent (`login → agent`
@@ -740,6 +765,17 @@ mod tests {
         let cfg: Config = serde_yaml::from_str("").unwrap();
         assert!(cfg.allow_list.is_none());
         assert!(cfg.agents.is_none());
+        assert_eq!(cfg.tool_host, None);
+    }
+
+    #[test]
+    fn parse_tool_host() {
+        let cfg: Config = serde_yaml::from_str("tool_host: bubblewrap\n").unwrap();
+        assert_eq!(cfg.tool_host, Some(ToolHostConfig::Bubblewrap));
+        let cfg: Config = serde_yaml::from_str("tool_host: native\n").unwrap();
+        assert_eq!(cfg.tool_host, Some(ToolHostConfig::Native));
+        // Unknown values are rejected rather than silently defaulting.
+        assert!(serde_yaml::from_str::<Config>("tool_host: sandwich\n").is_err());
     }
 
     #[test]
