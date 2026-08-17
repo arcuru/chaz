@@ -98,7 +98,17 @@ pub fn sort_session_infos(sessions: &mut [SessionInfo]) {
     });
 }
 
-pub(super) async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn new_session(group: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
+    // Resolve the requested group before creating anything — a typo
+    // should report the known groups, not strand an empty session.
+    if let Some(name) = group
+        && ctx.server.agent_group(name).is_none()
+    {
+        return CommandOutcome::Error(format!(
+            "Unknown agent group '{name}'. {}",
+            known_groups_hint(ctx)
+        ));
+    }
     let (conv_id, db) = match ctx.server.registry().create_session(Some("tui")).await {
         Ok(r) => r,
         Err(e) => return CommandOutcome::Error(format!("Failed to create session: {e}")),
@@ -106,7 +116,7 @@ pub(super) async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session_db_id = db.root_id().to_string();
     // Mirror routing reality in `meta.agents` so `/agents` and the
     // per-agent model picker reflect the agent that will actually answer.
-    let _ = ctx.server.auto_attach_default_agent(&session_db_id).await;
+    let _ = ctx.server.auto_attach_agents(&session_db_id, group).await;
     let agent = ctx
         .server
         .registry()
@@ -119,6 +129,42 @@ pub(super) async fn new_session(ctx: &CommandContext<'_>) -> CommandOutcome {
         agent_name: agent.name,
         session_name: None,
     }))
+}
+
+/// One-line tail for "unknown group" errors, naming what *is* configured.
+fn known_groups_hint(ctx: &CommandContext<'_>) -> String {
+    let names = ctx.server.agent_group_names();
+    if names.is_empty() {
+        "No agent groups are configured (set `agent_groups:` in the config).".to_string()
+    } else {
+        format!("Known groups: {}", names.join(", "))
+    }
+}
+
+pub(super) async fn list_agent_groups(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let names = ctx.server.agent_group_names();
+    if names.is_empty() {
+        return CommandOutcome::Text(
+            "No agent groups configured. Add an `agent_groups:` block to the config to \
+             start sessions with a named roster (`/new <group>`)."
+                .to_string(),
+        );
+    }
+    let mut out = String::from("Agent groups (start one with `/new <group>`):\n");
+    for name in names {
+        let members = ctx.server.agent_group(&name).unwrap_or_default();
+        let members = if members.is_empty() {
+            "(empty — attaches no agents)".to_string()
+        } else {
+            members.join(", ")
+        };
+        out.push_str(&format!("  {name}: {members}\n"));
+    }
+    let defaults = ctx.server.default_agents();
+    if !defaults.is_empty() {
+        out.push_str(&format!("  (default): {}\n", defaults.join(", ")));
+    }
+    CommandOutcome::Text(out)
 }
 
 pub(super) async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOutcome {

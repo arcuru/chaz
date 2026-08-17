@@ -78,7 +78,8 @@ pub fn parse(input: &str) -> Parsed {
         "/costs" => return Parsed::Command(Command::ListCosts),
         "/print" => return Parsed::Command(Command::Print),
         "/backends" => return Parsed::Command(Command::ListBackends),
-        "/new" => return Parsed::Command(Command::NewSession),
+        "/new" => return Parsed::Command(Command::NewSession(None)),
+        "/groups" => return Parsed::Command(Command::ListAgentGroups),
         // No-arg `/name` (and `/rename`) clears the alias.
         "/name" | "/rename" => return Parsed::Command(Command::ClearSessionName),
         "/role" => return Parsed::Command(Command::Role(None)),
@@ -367,6 +368,14 @@ pub fn parse(input: &str) -> Parsed {
     }
 
     // --- Session ops with arguments ---
+    if let Some(arg) = text.strip_prefix("/new ") {
+        let group = arg.trim();
+        // Trailing-whitespace-only arg means the no-arg form: create the
+        // session with the peer's `default_agents`.
+        return Parsed::Command(Command::NewSession(
+            (!group.is_empty()).then(|| group.to_string()),
+        ));
+    }
     if let Some(arg) = text.strip_prefix("/join ") {
         let id = arg.trim();
         return if id.is_empty() {
@@ -503,6 +512,23 @@ mod tests {
         assert!(matches!(cmd("/print"), Command::Print));
         assert!(matches!(cmd("/costs"), Command::ListCosts));
         assert!(matches!(cmd("/pubkey"), Command::Pubkey));
+    }
+
+    #[test]
+    fn new_session_with_optional_agent_group() {
+        assert!(matches!(cmd("/new"), Command::NewSession(None)));
+        // Trailing-space-only arg is the no-arg form: peer defaults.
+        assert!(matches!(cmd("/new   "), Command::NewSession(None)));
+        match cmd("/new research") {
+            Command::NewSession(Some(g)) => assert_eq!(g, "research"),
+            other => panic!("expected NewSession(Some), got {other:?}"),
+        }
+        // Surrounding whitespace is trimmed off the group name.
+        match cmd("/new  coding  ") {
+            Command::NewSession(Some(g)) => assert_eq!(g, "coding"),
+            other => panic!("expected NewSession(Some), got {other:?}"),
+        }
+        assert!(matches!(cmd("/groups"), Command::ListAgentGroups));
     }
 
     #[test]

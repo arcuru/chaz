@@ -1004,6 +1004,22 @@ fn render_peer_about(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(none — falls back to first agent)".to_string());
 
+    // Configured `/new <group>` rosters. Read-only here: groups are yaml
+    // only, with no runtime editor and no peer-DB override.
+    let agent_groups = {
+        let mut names: Vec<&str> = config
+            .agent_groups
+            .as_ref()
+            .map(|g| g.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        if names.is_empty() {
+            "(none)".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+
     // Only the in-process bridges count here; Matrix/Discord are external
     // standalone peer binaries (`chaz-matrix`, `chaz-discord`).
     let bridges = "tui, cli";
@@ -1025,6 +1041,7 @@ fn render_peer_about(
         about_kv("  agents", &agent_count_s),
         about_kv("  backends", &backend_s),
         about_kv("  default agents", &default_agents),
+        about_kv("  agent groups", &agent_groups),
     ];
     f.render_widget(Paragraph::new(lines), area);
 }

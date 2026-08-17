@@ -112,6 +112,12 @@ This runs at session-creation time only (TUI `/new`, the picker's "New session" 
 
 Names in `default_agents` that don't have a hosted Agent DB are skipped with a debug log; the rest still attach. Per-agent attach failures are logged but don't unwind the rest. Session creation never fails because of `default_agents`.
 
+### Named agent groups
+
+`agent_groups:` (see [`configuration.md`](configuration.md#agent_groups)) holds named rosters — "the research trio", "the coding pair" — and `/new <group>` creates a session with that roster instead of `default_agents`. Same ordering rule: the first name is the routing host. `/groups` lists them; an unknown name is rejected before the session is created, so a typo leaves nothing behind.
+
+Selection happens at creation time only, exactly like `default_agents`. There is no group membership afterwards — the session's roster is its own from then on, and `/agent add|remove|host` edits it freely.
+
 ### Per-agent model overrides
 
 Each agent on a session can have its own session-scoped model pin, independent of the session-wide `/model` pin. This lets `researcher` stay on Ring-1T while `chaz` runs on Opus inside the same session.

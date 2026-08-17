@@ -347,6 +347,40 @@ sessions created before this field was set keep their current
 participant list. Bring them up to date by re-running `/agent add
 <name>` manually.
 
+### `agent_groups`
+
+Named alternatives to `default_agents`, chosen when a session is
+created: `/new <group>`. Each value is an ordered agent list with the
+same semantics as `default_agents` — names must match entries in
+`agents:`, and the first entry effectively becomes the routing host.
+
+```yaml
+agents:
+  - name: chaz
+  - name: researcher
+  - name: critic
+
+default_agents: [chaz]
+
+agent_groups:
+  research: [researcher, critic]
+  pair: [chaz, critic]
+```
+
+`/new` with no argument uses `default_agents`. `/new research` attaches
+`researcher` then `critic` instead — a group **replaces** the default
+list rather than adding to it. `/groups` lists what is configured, and
+`/new <unknown>` reports the known group names without creating a
+session. A group configured as an empty list (`[]`) creates a session
+with no agents attached; it does not fall back to `default_agents`.
+
+Groups are read from yaml only. Unlike `default_agents` — which the TUI
+edits live under Settings → Peer → Defaults and persists to the peer DB
+— there is no runtime editor for groups, so there is no peer-DB
+override to shadow the yaml. Settings → Peer → About lists the
+configured group names read-only. Editing the yaml and restarting the
+peer is the whole update path.
+
 ## Security
 
 Security settings control tool approval, network access, shell sandboxing, secret leak detection, and tool rate limiting. See [Security](security.md) for details.

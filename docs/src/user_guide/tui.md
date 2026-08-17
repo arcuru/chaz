@@ -61,6 +61,8 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/help`, `/?`     | Open the help overlay (also `F1`)                                      |
 | `/sessions`, `/s` | Open the session picker (also `Ctrl+P`)                                |
 | `/new`            | Create a new session and switch to it                                  |
+| `/new <group>`    | Create a new session with a named agent group attached                 |
+| `/groups`         | List the configured agent groups                                       |
 | `/join <ref>`     | Switch to a session by name or eidetica DB ID                          |
 | `/name <alias>`   | Set a human-friendly alias for the current session (also `/rename`)    |
 | `/name`           | Clear the session alias                                                |
