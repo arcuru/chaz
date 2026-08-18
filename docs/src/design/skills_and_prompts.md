@@ -166,10 +166,16 @@ MCP tool published as `web__fetch`.
 
 Suppression covers every surface the model can reach — the injected catalog,
 `skill_list`, `skill_search`, and `skill_show` — so a name learned outside the
-catalog cannot route around the gate. The `/skills` slash command is a human
-surface and lists everything regardless. A suppressed skill logs at `debug`
-naming the missing tools, which is where to look when a skill unexpectedly
-disappears.
+catalog cannot route around the gate.
+
+A suppressed skill is indistinguishable from an absent one on those surfaces,
+and no slash command lists disk skills (`/skills` manages skill banks). The
+only trace is a `debug` log naming the skill and its missing tools, so run with
+`RUST_LOG=debug` when a skill unexpectedly disappears. Two authoring mistakes
+look exactly like a missing skill: a misspelled tool name, and an MCP tool
+written without its `{server}__` prefix. Tools registered by MCP servers appear
+once their server finishes starting, so a skill requiring one is suppressed on
+turns that run before then.
 
 Only disk-sourced skills carry the field. Agent-owned skills, granted skill
 banks and session-attached banks are always available.
