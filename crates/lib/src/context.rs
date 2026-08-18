@@ -113,6 +113,9 @@ pub struct ContextBuilder<'a> {
     entries: &'a [SessionEntry],
     agent_name: &'a str,
     system_prompt: &'a str,
+    /// Tool definitions for this turn. Also the set that `requires_tools`
+    /// on a skill is matched against, so a builder left without
+    /// [`Self::with_tools`] suppresses every skill that declares one.
     tool_defs: &'a [ToolDefinition],
     config: &'a ContextConfig,
     /// Per-agent override for max context tokens

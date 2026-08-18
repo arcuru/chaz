@@ -154,6 +154,26 @@ Guidelines for working with Nix:
 
 Maximum file size: 64 KiB (IronClaw convention).
 
+##### `requires_tools`
+
+Matched against the tool names presented to the model for the current turn —
+the agent's scoped tool set after the active `ToolProfile` has been applied. A
+tool the profile hides counts as unavailable, because the model cannot call it.
+
+Names must be written exactly as the model sees them. MCP-backed tools are
+namespaced `{server}__{tool}`, so `requires_tools: [fetch]` does not match an
+MCP tool published as `web__fetch`.
+
+Suppression covers every surface the model can reach — the injected catalog,
+`skill_list`, `skill_search`, and `skill_show` — so a name learned outside the
+catalog cannot route around the gate. The `/skills` slash command is a human
+surface and lists everything regardless. A suppressed skill logs at `debug`
+naming the missing tools, which is where to look when a skill unexpectedly
+disappears.
+
+Only disk-sourced skills carry the field. Agent-owned skills, granted skill
+banks and session-attached banks are always available.
+
 #### Discovery paths
 
 Scanned at extension install time, from highest to lowest priority:

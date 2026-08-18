@@ -523,16 +523,62 @@ async fn read_skill_rows(db: &eidetica::Database) -> Vec<crate::agent_db::Skill>
     }
 }
 
+/// The tools the model can actually call this turn — the same list the
+/// runtime hands the LLM, so `requires_tools` is matched against exactly
+/// what the model sees. Names are the presented names: MCP-backed tools
+/// appear as `{server}__{tool}`, and a tool the active `ToolProfile`
+/// hides is absent here because the model cannot call it either.
+fn available_tool_names(ctx: &crate::tool::ToolContext) -> Vec<String> {
+    ctx.tools
+        .definitions(&ctx.profile)
+        .into_iter()
+        .map(|def| def.name)
+        .collect()
+}
+
+/// Required tools absent from `available`. Empty means the skill is usable.
+fn missing_tools(requires_tools: &[String], available: &[String]) -> Vec<String> {
+    requires_tools
+        .iter()
+        .filter(|tool| !available.contains(tool))
+        .cloned()
+        .collect()
+}
+
+/// Whether a skill may appear on a discovery surface, logging the reason
+/// when it may not. A `requires_tools` entry that names no real tool —
+/// a typo, or an MCP tool written without its `{server}__` prefix —
+/// makes the skill vanish, so the suppression has to leave a trace.
+fn skill_is_usable(
+    name: &str,
+    requires_tools: &[String],
+    available: &[String],
+    surface: &str,
+) -> bool {
+    let missing = missing_tools(requires_tools, available);
+    if !missing.is_empty() {
+        tracing::debug!(
+            skill = %name,
+            missing = %missing.join(", "),
+            surface,
+            "Skill suppressed — required tools unavailable to this agent"
+        );
+    }
+    missing.is_empty()
+}
+
 /// Format the catalog as the Markdown block injected into the system
 /// prompt. Discovery-only — names + descriptions, no bodies.
 fn format_catalog(entries: &[CatalogEntry], available_tool_names: &[String]) -> Option<String> {
     let entries: Vec<&CatalogEntry> = entries
         .iter()
         .filter(|entry| {
-            entry
-                .requires_tools
-                .iter()
-                .all(|tool| available_tool_names.contains(tool))
+            skill_is_usable(
+                &entry.name,
+                &entry.requires_tools,
+                available_tool_names,
+                "catalog",
+            )
         })
         .collect();
     if entries.is_empty() {
@@ -634,13 +680,15 @@ impl Tool for SkillListTool {
     fn execute<'a>(
         &'a self,
         _arguments: Value,
-        _ctx: &'a crate::tool::ToolContext,
+        ctx: &'a crate::tool::ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        let available = available_tool_names(ctx);
         let items: Vec<String> = {
             let registry = self.registry.read().unwrap();
             let skills = registry.list();
             skills
                 .iter()
+                .filter(|s| skill_is_usable(&s.name, &s.requires_tools, &available, "skill_list"))
                 .enumerate()
                 .map(|(i, s)| {
                     format!(
@@ -697,14 +745,16 @@ impl Tool for SkillSearchTool {
     fn execute<'a>(
         &'a self,
         arguments: Value,
-        _ctx: &'a crate::tool::ToolContext,
+        ctx: &'a crate::tool::ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         let query = arguments["query"].as_str().unwrap_or("").to_string();
+        let available = available_tool_names(ctx);
         let items: Vec<String> = {
             let registry = self.registry.read().unwrap();
             let results = registry.search(&query);
             results
                 .iter()
+                .filter(|s| skill_is_usable(&s.name, &s.requires_tools, &available, "skill_search"))
                 .enumerate()
                 .map(|(i, s)| format!("{}. **{}** — {}\n", i + 1, s.name, s.description))
                 .collect()
@@ -765,6 +815,7 @@ impl Tool for SkillShowTool {
         let name = arguments["name"].as_str().unwrap_or("").to_string();
         let agent = ctx.agent_name.clone();
         let session = ctx.session.clone();
+        let available = available_tool_names(ctx);
         Box::pin(async move {
             // Session-attached banks aren't held on the tool instance
             // (the tool is registered globally; the per-session
@@ -797,12 +848,24 @@ impl Tool for SkillShowTool {
             )
             .await;
             match entries.iter().find(|e| e.name == name) {
-                Some(entry) => Ok(serde_json::json!({
-                    "text": entry.body,
-                    "name": entry.name,
-                    "description": entry.description,
-                })
-                .to_string()),
+                Some(entry) => {
+                    // Activation honours the same gate as discovery, so a
+                    // name learned elsewhere — conversation history, a
+                    // human running `/skills` — cannot route around it.
+                    let missing = missing_tools(&entry.requires_tools, &available);
+                    if !missing.is_empty() {
+                        return Ok(format!(
+                            "Skill \"{name}\" requires tools this agent does not have: {}.",
+                            missing.join(", ")
+                        ));
+                    }
+                    Ok(serde_json::json!({
+                        "text": entry.body,
+                        "name": entry.name,
+                        "description": entry.description,
+                    })
+                    .to_string())
+                }
                 None => Ok(format!("No skill named \"{name}\" found.")),
             }
         })
@@ -1701,6 +1764,47 @@ mod tests {
         Arc::new(std::sync::RwLock::new(registry_with(skills)))
     }
 
+    fn skill_needing(name: &str, description: &str, requires_tools: &[&str]) -> Skill {
+        Skill {
+            requires_tools: requires_tools.iter().map(|t| (*t).into()).collect(),
+            ..skill(name, description, &[], "body")
+        }
+    }
+
+    /// A no-op tool that exists only to occupy a name in the registry, so
+    /// `requires_tools` has something real to match against.
+    struct StubTool(&'static str);
+
+    impl Tool for StubTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: self.0.into(),
+                description: "stub".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _arguments: Value,
+            _ctx: &'a crate::tool::ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+            Box::pin(async move { Ok(String::new()) })
+        }
+    }
+
+    fn registry_offering(names: &[&'static str]) -> Arc<crate::tool::ToolRegistry> {
+        let registry = crate::tool::ToolRegistry::new();
+        for name in names {
+            registry.register(StubTool(name));
+        }
+        Arc::new(registry)
+    }
+
     #[tokio::test]
     async fn skill_list_descriptor_and_low_risk() {
         let t = SkillListTool {
@@ -1783,6 +1887,88 @@ mod tests {
             .unwrap();
         assert!(out.contains("1. **nix**"));
         assert!(!out.contains("rust"));
+    }
+
+    #[tokio::test]
+    async fn skill_list_hides_skill_whose_required_tool_is_unavailable() {
+        let t = SkillListTool {
+            registry: shared_registry(vec![
+                skill("nix", "Nix tips", &[], "body"),
+                skill_needing("deploy", "Needs shell", &["shell"]),
+            ]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, registry_offering(&[]));
+        let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.contains("**nix**"));
+        assert!(!out.contains("deploy"));
+    }
+
+    #[tokio::test]
+    async fn skill_list_shows_skill_whose_required_tool_is_registered() {
+        let t = SkillListTool {
+            registry: shared_registry(vec![skill_needing("deploy", "Needs shell", &["shell"])]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, registry_offering(&["shell"]));
+        let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.contains("1. **deploy**"));
+    }
+
+    #[tokio::test]
+    async fn skill_search_hides_skill_whose_required_tool_is_unavailable() {
+        let t = SkillSearchTool {
+            registry: shared_registry(vec![
+                skill("deploy-notes", "Deploy notes", &[], "body"),
+                skill_needing("deploy", "Needs shell", &["shell"]),
+            ]),
+        };
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, registry_offering(&[]));
+        let out = t
+            .execute(serde_json::json!({ "query": "deploy" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("**deploy-notes**"));
+        assert!(!out.contains("**deploy**"));
+    }
+
+    async fn skill_show_tool(skills: Vec<Skill>) -> SkillShowTool {
+        let (_i, registry) = fresh_session_registry().await;
+        SkillShowTool {
+            disk: shared_registry(skills),
+            registry,
+            agent_index: crate::hosted_index::HostedIndex::empty("agent"),
+            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_show_refuses_skill_whose_required_tool_is_unavailable() {
+        let t = skill_show_tool(vec![skill_needing("deploy", "Needs shell", &["shell"])]).await;
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, registry_offering(&[]));
+        let out = t
+            .execute(serde_json::json!({ "name": "deploy" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("requires tools this agent does not have"));
+        assert!(out.contains("shell"));
+        assert!(!out.contains("\"text\""));
+    }
+
+    #[tokio::test]
+    async fn skill_show_returns_body_when_required_tool_is_registered() {
+        let t = skill_show_tool(vec![skill_needing("deploy", "Needs shell", &["shell"])]).await;
+        let (_i, session) = fresh_session().await;
+        let ctx = tool_context(session, registry_offering(&["shell"]));
+        let out = t
+            .execute(serde_json::json!({ "name": "deploy" }), &ctx)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON payload");
+        assert_eq!(parsed["name"], "deploy");
+        assert_eq!(parsed["text"], "body");
     }
 
     // ── PromptAugmentation (2) ───────────────────────────────────────
