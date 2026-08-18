@@ -61,7 +61,10 @@ impl Tool for Compact {
             };
 
             let mut session = ctx.session.lock().await;
-            session.add_entry(entry).await;
+            session
+                .add_entry(entry)
+                .await
+                .map_err(|e| format!("Failed to write compaction summary: {e}"))?;
 
             let entry_count = session.entries().len();
             Ok(format!(

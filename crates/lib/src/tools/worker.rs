@@ -32,7 +32,7 @@ impl Tool for SpawnWorker {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "spawn_worker".to_string(),
-            description: "Invoke a Worker template declared under the calling Agent. Workers are configured one-shot LLM calls — no identity, no keys; entries are signed by the parent Agent. The child session DB persists for audit and inspection. Use this for delegated work that doesn't need persistent identity. For delegating to a named peer Agent (Ava, Chaz) with its own keys, use spawn_agent.".to_string(),
+            description: "Invoke a Worker template declared under the calling Agent. Workers are configured one-shot LLM calls — no identity, no keys; entries are signed by the parent Agent. The child session DB persists for audit and inspection. Use this for delegated work that doesn't need persistent identity. For delegating to a named peer Agent (e.g. Chaz) with its own keys, use spawn_agent.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -256,7 +256,8 @@ impl Tool for SpawnWorker {
                     metadata: None,
                     routing: None,
                 })
-                .await;
+                .await
+                .map_err(|e| format!("Failed to write directive for worker '{name}': {e}"))?;
 
             if is_async {
                 return Ok(format!(

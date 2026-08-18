@@ -30,7 +30,7 @@
 - **`default_memory_banks`** — agent config field listing banks to attach at
   agent startup (declarative, not imperative)
 - **`/memory attach` / `/memory detach`** — per-session bank attachment for
-  shared context (e.g. "attach the `ava-facts` bank to this session")
+  shared context (e.g. "attach the `chaz-facts` bank to this session")
 
 **What's deferred (v2):**
 
@@ -97,7 +97,7 @@ The `MemoryPromptAugmentation` provider:
 ## Relevant Memories
 
 - [key]: value (from: self)
-- [key]: value (from: bank:ava-facts)
+- [key]: value (from: bank:chaz-facts)
 ...
 ```
 
@@ -131,10 +131,10 @@ New field on `AgentDbConfig` (and yaml `agents:`):
 
 ```yaml
 agents:
-  - name: ava
-    system_prompt: "You are Ava..."
+  - name: chaz
+    system_prompt: "You are Chaz..."
     default_memory_banks:
-      - ava-facts
+      - chaz-facts
       - chaz-conventions
 ```
 
@@ -220,14 +220,14 @@ pipeline that populates memory automatically from session history.
 ```yaml
 # In config.yaml or agent DB config:
 agents:
-  - name: ava
+  - name: chaz
     system_prompt: "..."
     default_memory_banks:
-      - ava-facts # auto-attached at bootstrap
+      - chaz-facts # auto-attached at bootstrap
       - project-conventions
 # Per-session attachment (via slash commands, not config):
-# /memory attach ava-facts
-# /memory detach ava-facts
+# /memory attach chaz-facts
+# /memory detach chaz-facts
 ```
 
 ### Trust model

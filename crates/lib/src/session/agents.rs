@@ -691,7 +691,7 @@ mod tests {
         let (_instance, registry) = make_registry().await;
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_id = session_db.root_id().to_string();
-        let agent = make_agent_entry(&registry, "ava").await;
+        let agent = make_agent_entry(&registry, "chaz").await;
 
         registry
             .ensure_session_host(&session_id, &agent)
@@ -701,7 +701,7 @@ mod tests {
         let meta = read_meta_from_db(&session_db).await;
         // Attached as a writer and designated host.
         assert_eq!(meta.agents.len(), 1);
-        assert_eq!(meta.agents[0].display_name, "ava");
+        assert_eq!(meta.agents[0].display_name, "chaz");
         assert_eq!(
             meta.host_agent_db_id.as_deref(),
             Some(agent.db_id.to_string().as_str())
@@ -735,7 +735,7 @@ mod tests {
         .unwrap();
 
         // The login owner attaches but must NOT steal the explicit host.
-        let owner = make_agent_entry(&registry, "ava").await;
+        let owner = make_agent_entry(&registry, "chaz").await;
         registry
             .ensure_session_host(&session_id, &owner)
             .await

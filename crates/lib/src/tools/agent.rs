@@ -220,7 +220,8 @@ impl Tool for SpawnAgent {
                     metadata: None,
                     routing: None,
                 })
-                .await;
+                .await
+                .map_err(|e| format!("Failed to write directive for '{agent_display}': {e}"))?;
 
             if is_async {
                 return Ok(format!(

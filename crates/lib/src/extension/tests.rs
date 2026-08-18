@@ -495,7 +495,7 @@ async fn status_outputs_collects_from_global_instance() {
     .unwrap();
 
     let (_inst, db) = make_session_db().await;
-    hub.refresh_status_outputs("ava", &db).await;
+    hub.refresh_status_outputs("chaz", &db).await;
 
     let outputs = read_extension_outputs(&db).await;
     assert_eq!(

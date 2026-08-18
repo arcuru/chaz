@@ -59,8 +59,7 @@ pub fn expand_home(path: &Path) -> PathBuf {
 /// Agent definition — first-class entity with persistent identity, sessions,
 /// schedules, memory, and a set of Worker templates this Agent can invoke.
 ///
-/// See `~/brain/ava/research/chaz-ecosystem/conceptual-model.md` for the
-/// Peer / Agent / Worker / Resource model.
+/// Part of the Peer / Agent / Worker / Resource model.
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,
@@ -708,7 +707,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let agent = Agent::from_db_config("ava", &cfg);
+        let agent = Agent::from_db_config("chaz", &cfg);
         assert_eq!(agent.workers.len(), 2);
 
         let researcher = agent.find_worker("researcher").expect("researcher");

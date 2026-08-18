@@ -1,10 +1,9 @@
 ---
 source: crates/bin/src/bridge/tui/widgets/snapshot_tests.rs
-assertion_line: 150
 expression: s
 ---
- add agent: av▎                         
-  > ava                                 
+ add agent: ch▎                         
+  > chaz                                
                                         
                                         
   ↑↓ select · enter add · esc cancel

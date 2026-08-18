@@ -2,7 +2,7 @@
 //! tabs separated by ` · `. The active tab is highlighted; inactive tabs
 //! are dim.
 //!
-//! Used by the model picker (`scope: Session · ava · chaz`) and the
+//! Used by the model picker (`scope: Session · scout · chaz`) and the
 //! settings pages (`category: Agents · Backends · Defaults · …`).
 
 use ratatui::Frame;

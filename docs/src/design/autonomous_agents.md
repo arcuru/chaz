@@ -67,9 +67,8 @@ All invocation flows through the session-messaging primitive (see
 - Time-window heuristics ("respond if last message > 30s old").
 - Proactive / heartbeat-driven speaking.
 
-These are deferred to later phases — see
-[`multi-agent.md`](../../../../brain/ava/research/chaz-ecosystem/multi-agent.md)
-(Phase 4) for the broader vision. v1 is the minimum that makes the room real.
+These are deferred to later phases. v1 is the minimum that makes the room
+real.
 
 ## Design
 

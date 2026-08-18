@@ -306,8 +306,8 @@ Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in t
 A Worker is a configured one-shot LLM call declared under an Agent's
 `workers:` list. Workers have no identity, no keys, and no persistent
 state of their own — entries written during a Worker invocation are
-signed by the parent Agent's key. Lookup is per-Agent; Ava's
-`researcher` is distinct from Chaz's `researcher`.
+signed by the parent Agent's key. Lookup is per-Agent; Chaz's
+`researcher` is distinct from Scout's `researcher`.
 
 | Field                 | Type                   | Notes                                                                                                                                                                                                                                                                                                        |
 | --------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -328,10 +328,10 @@ resolution chain picks the first authorized agent on the session.
 
 ```yaml
 agents:
-  - name: ava
+  - name: chaz
   - name: researcher
 
-default_agents: [ava, researcher]
+default_agents: [chaz, researcher]
 ```
 
 Each name must match an entry in `agents:`. Names that don't have a
@@ -350,6 +350,17 @@ participant list. Bring them up to date by re-running `/agent add
 ## Security
 
 Security settings control tool approval, network access, shell sandboxing, secret leak detection, and tool rate limiting. See [Security](security.md) for details.
+
+## Approvals
+
+How long a tool-approval prompt may wait for an answer, in seconds. Defaults to 300 (5 minutes) when the block is absent.
+
+```yaml
+approvals:
+  timeout: 300
+```
+
+The daemon reads this block; bridges do not. Each approval request carries the ceiling with it so a bridge can show you how long the prompt has, but no bridge enforces it — the daemon does. On a split deployment that means only the daemon's config file matters here. See [Security → Tool Approval](security.md#tool-approval).
 
 ## MCP Servers
 

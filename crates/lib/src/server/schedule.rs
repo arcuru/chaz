@@ -531,15 +531,19 @@ impl Server {
                     crate::runtime::RuntimeEvent::ToolCall {
                         name, arguments, ..
                     } => {
-                        s.add_entry(SessionEntry {
-                            sender: event_agent.clone(),
-                            content: format!("{name}({arguments})"),
-                            timestamp: Utc::now(),
-                            entry_type: EntryType::ToolCall,
-                            metadata: None,
-                            routing: None,
-                        })
-                        .await;
+                        if let Err(e) = s
+                            .add_entry(SessionEntry {
+                                sender: event_agent.clone(),
+                                content: format!("{name}({arguments})"),
+                                timestamp: Utc::now(),
+                                entry_type: EntryType::ToolCall,
+                                metadata: None,
+                                routing: None,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to record scheduled tool call: {e}");
+                        }
                     }
                     crate::runtime::RuntimeEvent::ToolResult {
                         name,
@@ -558,15 +562,19 @@ impl Server {
                             };
                             format!("{name}: {truncated}")
                         };
-                        s.add_entry(SessionEntry {
-                            sender: event_agent.clone(),
-                            content,
-                            timestamp: Utc::now(),
-                            entry_type: EntryType::ToolResult,
-                            metadata: None,
-                            routing: None,
-                        })
-                        .await;
+                        if let Err(e) = s
+                            .add_entry(SessionEntry {
+                                sender: event_agent.clone(),
+                                content,
+                                timestamp: Utc::now(),
+                                entry_type: EntryType::ToolResult,
+                                metadata: None,
+                                routing: None,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to record scheduled tool result: {e}");
+                        }
                     }
                 }
             }
@@ -603,26 +611,34 @@ impl Server {
                 );
             }
             Ok(outcome) => {
-                s.add_entry(SessionEntry {
-                    sender: agent_name.to_string(),
-                    content: outcome.body.clone(),
-                    timestamp: Utc::now(),
-                    entry_type: EntryType::Message,
-                    metadata: outcome.metadata.clone(),
-                    routing: None,
-                })
-                .await;
+                if let Err(e) = s
+                    .add_entry(SessionEntry {
+                        sender: agent_name.to_string(),
+                        content: outcome.body.clone(),
+                        timestamp: Utc::now(),
+                        entry_type: EntryType::Message,
+                        metadata: outcome.metadata.clone(),
+                        routing: None,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to write scheduled turn result: {e}");
+                }
             }
             Err(err) => {
-                s.add_entry(SessionEntry {
-                    sender: agent_name.to_string(),
-                    content: format!("Error: {err}"),
-                    timestamp: Utc::now(),
-                    entry_type: EntryType::Error,
-                    metadata: None,
-                    routing: None,
-                })
-                .await;
+                if let Err(e) = s
+                    .add_entry(SessionEntry {
+                        sender: agent_name.to_string(),
+                        content: format!("Error: {err}"),
+                        timestamp: Utc::now(),
+                        entry_type: EntryType::Error,
+                        metadata: None,
+                        routing: None,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to write scheduled turn error: {e}");
+                }
             }
         }
 

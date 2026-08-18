@@ -539,6 +539,12 @@ pub async fn build(
     // or the deferred reconcile below) can re-read it.
     server.set_config_path(opts.config_path.clone());
 
+    // Apply the approval ceiling before any exposed session registers, so
+    // every proxy this daemon spawns denies on the same schedule.
+    server.set_approval_timeout(crate::bridge::approval_timeout_or_default(
+        config.approvals.as_ref(),
+    ));
+
     // Apply default_agents list: which agents auto-attach to new
     // sessions. First entry is the routing host. Set before any
     // session-creation path runs.
@@ -1086,6 +1092,7 @@ async fn register_one_exposed_session(
             let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
                 sdb.clone(),
                 entry.display_name.clone(),
+                server.approval_timeout(),
             )
             .await;
             if let Err(e) = server

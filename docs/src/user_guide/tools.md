@@ -170,9 +170,9 @@ Delegates a task to another agent in a child session. The named agent's persiste
 
 ### spawn_worker
 
-Invokes a Worker template declared under the calling Agent. Workers are configured one-shot LLM calls — they have no identity, no keys, and no persistent state of their own; entries written to the child session are signed by the parent Agent's key. Use a Worker for focused, delegated work that doesn't need its own continuity; use `spawn_agent` when you want a named peer Agent (Ava, Chaz) with its own keys and persistent memory.
+Invokes a Worker template declared under the calling Agent. Workers are configured one-shot LLM calls — they have no identity, no keys, and no persistent state of their own; entries written to the child session are signed by the parent Agent's key. Use a Worker for focused, delegated work that doesn't need its own continuity; use `spawn_agent` when you want a named peer Agent (e.g. Chaz) with its own keys and persistent memory.
 
-Worker templates are per-Agent (Ava's `researcher` is distinct from Chaz's `researcher`); resolution is scoped to the calling Agent only.
+Worker templates are per-Agent (Chaz's `researcher` is distinct from Scout's `researcher`); resolution is scoped to the calling Agent only.
 
 ```json
 {
