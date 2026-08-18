@@ -330,6 +330,10 @@ pub struct Session {
     entries: Vec<SessionEntry>,
     /// Store name — "entries" for regular, "entries:{id}" for ephemeral
     store_name: String,
+    /// Set when loading existing history failed, so the session can be told
+    /// apart from a genuinely new one. `None` means the load succeeded (which
+    /// includes a new session with no entries yet).
+    load_error: Option<eidetica::Error>,
 }
 
 const META_STORE: &str = "meta";
@@ -342,28 +346,61 @@ impl Session {
             database,
             entries: Vec::new(),
             store_name: "entries".to_string(),
+            load_error: None,
         };
 
         session.load_from_db().await;
         session
     }
 
-    /// Load entries from eidetica
+    /// Load entries from eidetica.
+    ///
+    /// A load failure is recorded in [`Self::load_error`] rather than left to
+    /// look like an empty session: `get_store` registers a missing `entries`
+    /// store and returns it empty, so a *new* session loads cleanly with zero
+    /// entries, while an *existing* store whose history cannot be merged (two
+    /// independently-rooted stores that share no common ancestor) fails the
+    /// `search` and must be distinguishable.
     async fn load_from_db(&mut self) {
-        let Ok(txn) = self.database.new_transaction().await else {
-            return;
+        let txn = match self.database.new_transaction().await {
+            Ok(txn) => txn,
+            Err(e) => {
+                self.load_error = Some(e);
+                return;
+            }
         };
-        if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
-            match store.search(|_| true).await {
-                Ok(records) => {
-                    let mut entries: Vec<SessionEntry> =
-                        records.into_iter().map(|(_, entry)| entry).collect();
-                    entries.sort_by_key(|e| e.timestamp);
-                    self.entries = entries;
-                }
-                Err(e) => error!("Failed to load session entries from eidetica: {e}"),
+        let store = match txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
+            Ok(store) => store,
+            Err(e) => {
+                self.load_error = Some(e);
+                return;
+            }
+        };
+        match store.search(|_| true).await {
+            Ok(records) => {
+                let mut entries: Vec<SessionEntry> =
+                    records.into_iter().map(|(_, entry)| entry).collect();
+                entries.sort_by_key(|e| e.timestamp);
+                self.entries = entries;
+            }
+            Err(e) => {
+                error!("Failed to load session entries from eidetica: {e}");
+                self.load_error = Some(e);
             }
         }
+    }
+
+    /// The error from the last history load, if one failed.
+    ///
+    /// `None` means the session's history loaded cleanly — including a
+    /// genuinely new session with no entries. `Some` means entries are present
+    /// in the store but could not be read (e.g. two peers created the `entries`
+    /// store independently and the merged history shares no common ancestor),
+    /// and [`Self::entries`] will report zero entries until the store is
+    /// repaired. Callers should treat a session with a load error as unreadable
+    /// rather than as a new, empty conversation.
+    pub fn load_error(&self) -> Option<&eidetica::Error> {
+        self.load_error.as_ref()
     }
 
     /// Add an entry to the session with persistence
@@ -1121,5 +1158,56 @@ mod tests {
         assert_eq!(src.login_id, "@bot:example.com");
         assert_eq!(src.channel, "!room:example.com");
         assert_eq!(src.message_id.as_deref(), Some("$evt"));
+    }
+
+    #[tokio::test]
+    async fn fresh_session_loads_with_no_error() {
+        let (_instance, _user, db) = test_session_db().await;
+        let session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        assert!(session.entries().is_empty());
+        assert!(
+            session.load_error().is_none(),
+            "a new session has no history, so it is not a load failure"
+        );
+    }
+
+    /// Two transactions each first-create the `entries` store off the same
+    /// pre-store base, so the merged history shares no common ancestor.
+    /// Opening a `Session` over that DB must report the load failure instead
+    /// of silently reading as a blank (new) session.
+    #[tokio::test]
+    async fn load_from_db_reports_failure_when_entries_store_cannot_merge() {
+        let (_instance, _user, db) = test_session_db().await;
+
+        // Both transactions snapshot the DB before the `entries` store exists.
+        let tx_a = db.new_transaction().await.unwrap();
+        let tx_b = db.new_transaction().await.unwrap();
+
+        let store_a = tx_a
+            .get_store::<Table<SessionEntry>>("entries")
+            .await
+            .unwrap();
+        store_a.insert(entry_at("ava", 5, None)).await.unwrap();
+        tx_a.commit().await.unwrap();
+
+        let store_b = tx_b
+            .get_store::<Table<SessionEntry>>("entries")
+            .await
+            .unwrap();
+        store_b.insert(entry_at("ava", 4, None)).await.unwrap();
+        tx_b.commit().await.unwrap();
+
+        let session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        assert!(
+            session.entries().is_empty(),
+            "an unmergeable history must not be read as a partial/empty session"
+        );
+        let err = session
+            .load_error()
+            .expect("load must report failure, not a blank session");
+        assert!(
+            err.to_string().contains("No common ancestor"),
+            "unexpected error: {err}"
+        );
     }
 }
