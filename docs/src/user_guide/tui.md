@@ -261,7 +261,7 @@ Pick a model for a specific scope — the whole session, or one agent in this se
 |       resolves to claude-opus-4-7                              |
 |                                                                |
 |   Per-agent overrides                                          |
-|   ava             (uses session pin)                           |
+|   chaz            (uses session pin)                           |
 |   researcher      openai/gpt-5-mini                            |
 |                                                                |
 |   Enter — open picker for selected scope                       |

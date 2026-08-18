@@ -603,13 +603,16 @@ mod tests {
 
     #[test]
     fn owning_agent_writes_go_out_plain() {
-        assert_eq!(render_outbound("ava", "ava", "clear skies"), "clear skies");
+        assert_eq!(
+            render_outbound("chaz", "chaz", "clear skies"),
+            "clear skies"
+        );
     }
 
     #[test]
     fn guest_agent_writes_are_prefixed() {
         assert_eq!(
-            render_outbound("ava", "scout", "logs look clean"),
+            render_outbound("chaz", "scout", "logs look clean"),
             "[scout] logs look clean"
         );
     }
@@ -617,19 +620,19 @@ mod tests {
     #[test]
     fn prefix_is_exact_name_match() {
         // A different-cased or partial name is a distinct agent: still a guest.
-        assert_eq!(render_outbound("ava", "Ava", "hi"), "[Ava] hi");
+        assert_eq!(render_outbound("chaz", "Chaz", "hi"), "[Chaz] hi");
     }
 
     #[test]
     fn reconcile_delivers_only_undelivered_agent_messages() {
         let entries = vec![
             entry("@human:s", "hi", 1, EntryType::Message), // human → already shown
-            entry("ava", "hello", 2, EntryType::Message),   // agent, new → send
-            entry("ava", "ls()", 3, EntryType::ToolCall),   // audit trail → skip
+            entry("chaz", "hello", 2, EntryType::Message),  // agent, new → send
+            entry("chaz", "ls()", 3, EntryType::ToolCall),  // audit trail → skip
             entry("scout", "done", 4, EntryType::Message),  // guest agent, new → send
-            entry("ava", "old", 5, EntryType::Message),     // agent, already delivered → skip
+            entry("chaz", "old", 5, EntryType::Message),    // agent, already delivered → skip
         ];
-        let is_agent = |s: &str| s == "ava" || s == "scout";
+        let is_agent = |s: &str| s == "chaz" || s == "scout";
         let mut delivered = HashSet::new();
         delivered.insert((entries[4].timestamp, "old".to_string()));
 
@@ -642,8 +645,8 @@ mod tests {
 
     #[test]
     fn reconcile_is_idempotent_once_delivered() {
-        let entries = vec![entry("ava", "hello", 2, EntryType::Message)];
-        let is_agent = |s: &str| s == "ava";
+        let entries = vec![entry("chaz", "hello", 2, EntryType::Message)];
+        let is_agent = |s: &str| s == "chaz";
 
         let mut delivered = HashSet::new();
         assert_eq!(
@@ -691,9 +694,9 @@ mod tests {
 
     #[test]
     fn approval_request_and_decision_round_trip() {
-        let (request_id, req) = approval_request_entry("ava", &approval_info("shell"), CEILING);
+        let (request_id, req) = approval_request_entry("chaz", &approval_info("shell"), CEILING);
         assert_eq!(req.entry_type, EntryType::ApprovalRequest);
-        assert_eq!(req.sender, "ava");
+        assert_eq!(req.sender, "chaz");
         let parsed = parse_approval_request(&req).expect("request payload");
         assert_eq!(parsed.request_id, request_id);
         assert_eq!(parsed.tool_name, "shell");
@@ -716,16 +719,16 @@ mod tests {
 
     #[test]
     fn wrong_entry_kind_parses_to_none() {
-        let msg = entry("ava", "hi", 1, EntryType::Message);
+        let msg = entry("chaz", "hi", 1, EntryType::Message);
         assert!(parse_approval_request(&msg).is_none());
         assert!(parse_approval_decision(&msg).is_none());
     }
 
     #[test]
     fn unrendered_skips_decided_and_seen_requests() {
-        let (rid_open, open) = approval_request_entry("ava", &approval_info("a"), CEILING);
-        let (rid_done, done) = approval_request_entry("ava", &approval_info("b"), CEILING);
-        let (rid_seen, seen_req) = approval_request_entry("ava", &approval_info("c"), CEILING);
+        let (rid_open, open) = approval_request_entry("chaz", &approval_info("a"), CEILING);
+        let (rid_done, done) = approval_request_entry("chaz", &approval_info("b"), CEILING);
+        let (rid_seen, seen_req) = approval_request_entry("chaz", &approval_info("c"), CEILING);
         let done_decision = approval_decision_entry("@h:x", &rid_done, ApprovalDecision::Deny);
 
         let entries = vec![open, done, seen_req, done_decision];
@@ -748,7 +751,7 @@ mod tests {
     /// entry is a decision, and decided requests are not rendered.
     #[test]
     fn unrendered_skips_a_request_the_daemon_timed_out() {
-        let (rid, req) = approval_request_entry("ava", &approval_info("shell"), CEILING);
+        let (rid, req) = approval_request_entry("chaz", &approval_info("shell"), CEILING);
         let seen = HashSet::new();
 
         // Still open before the daemon gives up — without this the assertion
@@ -770,9 +773,9 @@ mod tests {
     /// tool. A plain deny is the human's own action and needs no notice.
     #[test]
     fn unannounced_timeouts_surface_only_expiries() {
-        let (rid_out, timed_out) = approval_request_entry("ava", &approval_info("a"), CEILING);
-        let (rid_deny, denied) = approval_request_entry("ava", &approval_info("b"), CEILING);
-        let (_rid_open, open) = approval_request_entry("ava", &approval_info("c"), CEILING);
+        let (rid_out, timed_out) = approval_request_entry("chaz", &approval_info("a"), CEILING);
+        let (rid_deny, denied) = approval_request_entry("chaz", &approval_info("b"), CEILING);
+        let (_rid_open, open) = approval_request_entry("chaz", &approval_info("c"), CEILING);
         let entries = vec![
             timed_out,
             denied,
@@ -814,7 +817,7 @@ mod tests {
     /// arrived later.
     #[test]
     fn a_timeout_absorbs_an_answer_written_alongside_it() {
-        let (rid, req) = approval_request_entry("ava", &approval_info("shell"), CEILING);
+        let (rid, req) = approval_request_entry("chaz", &approval_info("shell"), CEILING);
         let timed_out = approval_decision_entry("system", &rid, ApprovalDecision::TimedOut);
         let approved = approval_decision_entry("@h:x", &rid, ApprovalDecision::Approve);
 
@@ -839,7 +842,7 @@ mod tests {
     /// ignored the rest, so a later entry must not rewrite the outcome.
     #[test]
     fn a_later_answer_does_not_overwrite_the_first() {
-        let (rid, req) = approval_request_entry("ava", &approval_info("shell"), CEILING);
+        let (rid, req) = approval_request_entry("chaz", &approval_info("shell"), CEILING);
         let entries = vec![
             req,
             approval_decision_entry("@first:x", &rid, ApprovalDecision::Deny),
@@ -855,7 +858,7 @@ mod tests {
     /// bridge to go ahead and write its answer.
     #[test]
     fn an_open_request_has_no_existing_decision() {
-        let (rid, req) = approval_request_entry("ava", &approval_info("shell"), CEILING);
+        let (rid, req) = approval_request_entry("chaz", &approval_info("shell"), CEILING);
         assert_eq!(existing_decision(&[req], &rid), None);
     }
 
@@ -917,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_is_not_marked_then_retries() {
-        let entries = [entry("ava", "hello", 2, EntryType::Message)];
+        let entries = [entry("chaz", "hello", 2, EntryType::Message)];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
         let mut delivered = HashSet::new();
 
@@ -925,13 +928,13 @@ mod tests {
         let send = flaky_send(sent.clone(), &["hello"]);
 
         // First pass: the only send fails → nothing delivered, nothing marked.
-        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
         assert_eq!(n, 0);
         assert!(delivered.is_empty(), "a failed send must not be marked");
         assert!(sent.lock().await.is_empty());
 
         // The next write retries the same still-undelivered entry; now it lands.
-        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
         assert_eq!(n, 1);
         assert!(delivered.contains(&(entries[0].timestamp, "hello".to_string())));
         assert_eq!(sent.lock().await.as_slice(), &["hello".to_string()]);
@@ -940,9 +943,9 @@ mod tests {
     #[tokio::test]
     async fn stops_at_first_failure_and_resumes_in_order() {
         let entries = [
-            entry("ava", "a", 1, EntryType::Message),
-            entry("ava", "b", 2, EntryType::Message),
-            entry("ava", "c", 3, EntryType::Message),
+            entry("chaz", "a", 1, EntryType::Message),
+            entry("chaz", "b", 2, EntryType::Message),
+            entry("chaz", "c", 3, EntryType::Message),
         ];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
         let mut delivered = HashSet::new();
@@ -951,7 +954,7 @@ mod tests {
         let send = flaky_send(sent.clone(), &["b"]); // "b" fails its first attempt
 
         // First pass: "a" lands, "b" fails → stop. "c" is never attempted.
-        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
         assert_eq!(n, 1);
         assert_eq!(sent.lock().await.as_slice(), &["a".to_string()]);
         assert!(delivered.contains(&(entries[0].timestamp, "a".to_string())));
@@ -968,7 +971,7 @@ mod tests {
             retry.iter().map(|e| e.content.as_str()).collect::<Vec<_>>(),
             vec!["b", "c"]
         );
-        let n = deliver_in_order(&retry, "ava", &mut delivered, &send).await;
+        let n = deliver_in_order(&retry, "chaz", &mut delivered, &send).await;
         assert_eq!(n, 2);
         assert_eq!(
             sent.lock().await.as_slice(),
@@ -979,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn clean_run_marks_every_entry() {
         let entries = [
-            entry("ava", "one", 1, EntryType::Message),
+            entry("chaz", "one", 1, EntryType::Message),
             entry("scout", "two", 2, EntryType::Message), // guest → prefixed body
         ];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
@@ -988,7 +991,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let send = flaky_send(sent.clone(), &[]); // nothing fails
 
-        let n = deliver_in_order(&pending, "ava", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
         assert_eq!(n, 2);
         // Owning agent plain; guest prefixed (render_outbound contract).
         assert_eq!(

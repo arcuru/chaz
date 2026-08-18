@@ -261,7 +261,7 @@ pub trait ExtensionInstance: Send + Sync + 'static {
     /// the concrete trait object. See [`CapResolver::get`].
     ///
     /// Use this for extension-defined services that don't fit the
-    /// well-known cap set (e.g. an Ava-internal `BrainQuery` cap
+    /// well-known cap set (e.g. a deployment-internal `BrainQuery` cap
     /// shared between brain-indexing and skill extensions).
     fn extension_cap(&self, type_id: std::any::TypeId) -> Option<Arc<dyn Any + Send + Sync>> {
         let _ = type_id;

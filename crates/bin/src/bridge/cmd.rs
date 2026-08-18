@@ -160,10 +160,10 @@ mod tests {
 
     #[test]
     fn sessions_render_one_tab_separated_row_each() {
-        let out = render_sessions(&[info(Some("work"), Some("ava")), info(None, None)]);
+        let out = render_sessions(&[info(Some("work"), Some("chaz")), info(None, None)]);
         let rows: Vec<&str> = out.lines().collect();
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].starts_with("bafyabc\twork\tava\t"));
+        assert!(rows[0].starts_with("bafyabc\twork\tchaz\t"));
         // Absent name and agent have to render as placeholders rather than
         // empty fields, or the columns shift and `cut -f3` reads the wrong one.
         assert!(rows[1].starts_with("bafyabc\t-\tdefault\t"));

@@ -876,7 +876,7 @@ mod tests {
         EntryRouting {
             source: Some(TransportRef {
                 transport: "matrix".to_string(),
-                login_id: "@ava:example.com".to_string(),
+                login_id: "@chaz:example.com".to_string(),
                 channel: room.to_string(),
                 sender: Some("@patrick:example.com".to_string()),
                 sender_display: None,
@@ -894,7 +894,7 @@ mod tests {
                 90,
                 Some(matrix_source("!room:example.com")),
             ),
-            entry_at("ava", 89, None),
+            entry_at("chaz", 89, None),
         ];
 
         let (started_at, source) = session_origin(&entries);
@@ -913,7 +913,7 @@ mod tests {
         // A local entry can precede the first bridge-routed one; the session
         // still started at the local entry.
         let entries = vec![
-            entry_at("ava", 200, None),
+            entry_at("chaz", 200, None),
             entry_at(
                 "@patrick:example.com",
                 100,
@@ -930,7 +930,7 @@ mod tests {
     fn session_origin_yields_nothing_without_evidence() {
         assert_eq!(session_origin(&[]), (None, None));
 
-        let local_only = vec![entry_at("ava", 5, None)];
+        let local_only = vec![entry_at("chaz", 5, None)];
         let (started_at, source) = session_origin(&local_only);
         assert_eq!(started_at, Some(local_only[0].timestamp));
         assert_eq!(source, None, "a purely local session names no transport");
@@ -1052,7 +1052,7 @@ mod tests {
             m.agent_models
                 .insert("researcher".to_string(), "ring-1t".to_string());
             m.agent_models
-                .insert("ava".to_string(), "anthropic/claude-opus-4.7".to_string());
+                .insert("chaz".to_string(), "anthropic/claude-opus-4.7".to_string());
         })
         .await
         .unwrap();
@@ -1071,7 +1071,8 @@ mod tests {
         let (_instance, _user, db) = test_session_db().await;
 
         update_meta_on_db(&db, |m| {
-            m.agent_models.insert("ava".to_string(), "opus".to_string());
+            m.agent_models
+                .insert("chaz".to_string(), "opus".to_string());
         })
         .await
         .unwrap();
@@ -1096,10 +1097,10 @@ mod tests {
             .insert("researcher".to_string(), "ring-1t".to_string());
 
         assert_eq!(meta.resolve_model_for_agent("researcher"), Some("ring-1t"));
-        assert_eq!(meta.resolve_model_for_agent("ava"), Some("session-pin"));
+        assert_eq!(meta.resolve_model_for_agent("chaz"), Some("session-pin"));
 
         meta.model = None;
-        assert_eq!(meta.resolve_model_for_agent("ava"), None);
+        assert_eq!(meta.resolve_model_for_agent("chaz"), None);
         assert_eq!(meta.resolve_model_for_agent("researcher"), Some("ring-1t"));
     }
 

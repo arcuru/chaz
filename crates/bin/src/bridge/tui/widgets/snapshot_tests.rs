@@ -37,7 +37,7 @@ where
 #[test]
 fn scope_strip_three_tabs_middle_selected() {
     let s = snapshot(60, 1, |f, area| {
-        scope_strip(f, area, " scope: ", &["Session", "ava", "chaz"], 1);
+        scope_strip(f, area, " scope: ", &["Session", "scout", "chaz"], 1);
     });
     insta::assert_snapshot!(s);
 }
@@ -111,7 +111,7 @@ fn sidebar_five_items_third_selected_focused() {
 #[test]
 fn inline_edit_prompt_cursor_mid_string() {
     let s = snapshot(40, 1, |f, area| {
-        inline_edit_prompt(f, area, "name", "ava", 2);
+        inline_edit_prompt(f, area, "name", "chaz", 2);
     });
     insta::assert_snapshot!(s);
 }
@@ -133,7 +133,7 @@ fn picker_populated_list_second_selected() {
             "add agent",
             "",
             0,
-            &["chaz", "ava", "researcher"],
+            &["chaz", "scout", "researcher"],
             1,
         );
     });
@@ -151,7 +151,7 @@ fn picker_empty_list_no_matches() {
 #[test]
 fn picker_filter_typed_one_match() {
     let s = snapshot(40, 5, |f, area| {
-        picker(f, area, "add agent", "av", 2, &["ava"], 0);
+        picker(f, area, "add agent", "ch", 2, &["chaz"], 0);
     });
     insta::assert_snapshot!(s);
 }

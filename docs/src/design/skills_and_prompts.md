@@ -107,11 +107,11 @@ Config schema (`agents:` in yaml):
 
 ```yaml
 agents:
-  - name: ava
-    system_prompt: "You are Ava, Patrick's assistant."
+  - name: chaz
+    system_prompt: "You are Chaz."
     system_prompt_files:
       - ~/AGENTS.md
-      - ~/brain/ava/SOUL.md
+      - ~/chaz/persona.md
     # ... model, tools, etc.
 ```
 
@@ -324,19 +324,19 @@ Config migration for operators: replace `persona:` + `role:` in agent configs:
 ```yaml
 # Before
 agents:
-  - name: ava
+  - name: chaz
     persona:
-      files: [~/AGENTS.md, ~/brain/ava/SOUL.md]
-      prompt: "You are Ava."
+      files: [~/AGENTS.md, ~/chaz/persona.md]
+      prompt: "You are Chaz."
     role: assistant
 
 # After
 agents:
-  - name: ava
-    system_prompt: "You are Ava."
+  - name: chaz
+    system_prompt: "You are Chaz."
     system_prompt_files:
       - ~/AGENTS.md
-      - ~/brain/ava/SOUL.md
+      - ~/chaz/persona.md
 ```
 
 The `role:` name had no semantic value (it was just a template key, not

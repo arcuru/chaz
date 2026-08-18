@@ -2,7 +2,7 @@
 
 Chaz Agents have persistent identity as _Living Agents_ — each Agent is its own eidetica database signed by a per-Agent key. Whoever holds the key hosts the Agent. Sessions declare participating Agents by listing their pubkeys in the session's AuthSettings; routing follows key possession.
 
-An **Agent** is a first-class entity (Ava, Chaz). A Worker — declared under an Agent's `workers:` list — is something different: a configured one-shot LLM call with no keys and no persistent identity, invocable from that Agent only via `spawn_worker`. The four-tier conceptual model (Peer / Agent / Worker / Resource) sits behind the names but isn't load-bearing for day-to-day yaml editing.
+An **Agent** is a first-class entity (Chaz, Scout). A Worker — declared under an Agent's `workers:` list — is something different: a configured one-shot LLM call with no keys and no persistent identity, invocable from that Agent only via `spawn_worker`. The four-tier conceptual model (Peer / Agent / Worker / Resource) sits behind the names but isn't load-bearing for day-to-day yaml editing.
 
 YAML `agents:` config is the bootstrap path: at startup, chaz materializes one Agent DB per yaml entry (idempotent), populating its `config` and `meta` stores from the yaml. Worker templates declared under an Agent travel with that Agent's DB as part of its config.
 
@@ -114,7 +114,7 @@ Names in `default_agents` that don't have a hosted Agent DB are skipped with a d
 
 ### Per-agent model overrides
 
-Each agent on a session can have its own session-scoped model pin, independent of the session-wide `/model` pin. This lets `researcher` stay on Ring-1T while `ava` runs on Opus inside the same session.
+Each agent on a session can have its own session-scoped model pin, independent of the session-wide `/model` pin. This lets `researcher` stay on Ring-1T while `chaz` runs on Opus inside the same session.
 
 | Command                | What                                                                           |
 | ---------------------- | ------------------------------------------------------------------------------ |
@@ -526,7 +526,7 @@ Peer-Agent invocation:
 
 ```json
 {
-  "agent": "ava",
+  "agent": "chaz",
   "task": "context-check this rewrite",
   "preset": "deep"
 }

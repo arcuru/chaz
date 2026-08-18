@@ -306,8 +306,8 @@ Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in t
 A Worker is a configured one-shot LLM call declared under an Agent's
 `workers:` list. Workers have no identity, no keys, and no persistent
 state of their own — entries written during a Worker invocation are
-signed by the parent Agent's key. Lookup is per-Agent; Ava's
-`researcher` is distinct from Chaz's `researcher`.
+signed by the parent Agent's key. Lookup is per-Agent; Chaz's
+`researcher` is distinct from Scout's `researcher`.
 
 | Field                 | Type                   | Notes                                                                                                                                                                                                                                                                                                        |
 | --------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -328,10 +328,10 @@ resolution chain picks the first authorized agent on the session.
 
 ```yaml
 agents:
-  - name: ava
+  - name: chaz
   - name: researcher
 
-default_agents: [ava, researcher]
+default_agents: [chaz, researcher]
 ```
 
 Each name must match an entry in `agents:`. Names that don't have a

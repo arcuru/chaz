@@ -129,8 +129,8 @@ Banks must be explicitly attached to participate in auto-recall (even if the age
 
 ```yaml
 agents:
-  - name: ava
-    system_prompt: "You are Ava..."
+  - name: chaz
+    system_prompt: "You are Chaz..."
     default_memory_banks:
       - project-conventions
       - shared-facts

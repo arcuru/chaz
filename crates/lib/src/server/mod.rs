@@ -207,7 +207,7 @@ fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Op
 /// on — `chat_with_tools_for_model` resolves an absent model to the backend
 /// default — so budgeting and the call always agree on which model's window to
 /// charge against. Without it, an agent that pins no model (relying on the
-/// backend default, e.g. a default-routed agent like Ava) budgets against the
+/// backend default, e.g. a default-routed agent like Chaz) budgets against the
 /// static `max_context_tokens` and never triggers the fetch that would learn
 /// its real window, so a 1M-window model silently truncates at the 128k
 /// default.
@@ -1693,7 +1693,7 @@ impl Server {
     /// will call `watch_session` + `claim_runtime(RuntimeMode::Auto)` here so a
     /// session exposed by a dumb bridge gets its runtime owner without a
     /// per-bridge wiring path. Left log-only until the multi-process lease
-    /// lands — see `~/brain/ava/kb/chaz-runtime-ownership.md` (Track A4 / D2).
+    /// lands.
     async fn new_session_watcher(&self) {
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;

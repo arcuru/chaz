@@ -16,7 +16,7 @@
 
 ## Summary
 
-A schedule is an **agent-owned** object: it belongs to an agent (e.g. `ava`),
+A schedule is an **agent-owned** object: it belongs to an agent (e.g. `chaz`),
 not to a session. chaz is the runtime — it hosts one or more agents, and on
 boot it loads each hosted agent and registers that agent's schedules. When a
 schedule fires, chaz loads the owning agent, resolves the schedule's **target**
@@ -114,7 +114,7 @@ sequenceDiagram
     participant AX as Hosted agents
     participant E as RoutineEngine
     participant T as Schedule fires
-    participant AG as Agent (e.g. ava)
+    participant AG as Agent (e.g. chaz)
     participant S as Target session
 
     B->>AX: enumerate hosted agents

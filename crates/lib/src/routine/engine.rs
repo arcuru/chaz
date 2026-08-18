@@ -1198,10 +1198,10 @@ mod tests {
         let peer = user.create_database(s, &key).await.unwrap();
         let (adb, _pk) = create_agent_db(
             &mut user,
-            "ava",
+            "chaz",
             &AgentDbConfig::default(),
             &AgentMeta {
-                display_name: Some("ava".into()),
+                display_name: Some("chaz".into()),
                 ..Default::default()
             },
         )

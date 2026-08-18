@@ -357,14 +357,13 @@ pub enum WebSearchBackendKind {
 
 /// Configuration for an agent.
 ///
-/// An **Agent** is a first-class entity (Ava, Chaz) — it has keys,
+/// An **Agent** is a first-class entity (Chaz, Scout) — it has keys,
 /// persistent identity, sessions, schedules, memory bank attachments,
 /// and a list of Worker templates it can invoke. Workers are configured
 /// one-shot LLM calls; they have no identity of their own and are
 /// declared per-Agent in [`AgentConfig::workers`].
 ///
-/// See `~/brain/ava/research/chaz-ecosystem/conceptual-model.md` for the
-/// four-tier model (Peer / Agent / Worker / Resource).
+/// Part of the four-tier Peer / Agent / Worker / Resource model.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     /// Name of the agent
@@ -380,7 +379,7 @@ pub struct AgentConfig {
     /// List of tool names this agent is allowed to use (None = all tools)
     pub tools: Option<Vec<String>>,
     /// Worker templates this Agent can invoke via `spawn_worker`. Lookup
-    /// is per-Agent — Ava's `researcher` is distinct from Chaz's
+    /// is per-Agent — Chaz's `researcher` is distinct from Scout's
     /// `researcher`. A Worker is a configured one-shot LLM call with no
     /// identity of its own; entries it writes are signed by this Agent's key.
     pub workers: Option<Vec<WorkerConfig>>,
@@ -1214,8 +1213,8 @@ agents:
         // parent Agent's defaults.
         let yaml = r#"
 agents:
-  - name: ava
-    system_prompt: "You are Ava."
+  - name: chaz
+    system_prompt: "You are Chaz."
     model: claude-opus-4-7
     tools: [web_fetch, calculate, spawn_worker]
     workers:
@@ -1226,16 +1225,16 @@ agents:
         system_prompt: "Locate references."
         model: gpt-4
         tools: [web_fetch]
-  - name: chaz
-    system_prompt: "You are Chaz."
+  - name: scout
+    system_prompt: "You are Scout."
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         let agents = cfg.agents.unwrap();
         assert_eq!(agents.len(), 2);
 
-        let ava = &agents[0];
-        assert_eq!(ava.name, "ava");
-        let workers = ava.workers.as_ref().expect("ava has workers");
+        let chaz = &agents[0];
+        assert_eq!(chaz.name, "chaz");
+        let workers = chaz.workers.as_ref().expect("chaz has workers");
         assert_eq!(workers.len(), 2);
 
         let researcher = &workers[0];
@@ -1265,7 +1264,7 @@ agents:
         // `workers` deserializes to None, not Some(vec![]).
         let yaml = r#"
 agents:
-  - name: ava
+  - name: chaz
     system_prompt: "no workers here"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
@@ -1544,7 +1543,7 @@ username: "@u:s"
         let yaml = r#"
 allow_list: "foo"
 agents:
-  - name: ava
+  - name: chaz
     model: gpt-4
 "#;
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();

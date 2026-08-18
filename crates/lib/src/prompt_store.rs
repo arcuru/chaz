@@ -90,7 +90,7 @@ mod tests {
     async fn put_then_read_back_at_snapshot() {
         let (_inst, _user, db) = fresh_db().await;
         let store = PromptStore::new(db);
-        let text = "You are Ava.\n\nVoice: terse.";
+        let text = "You are Chaz.\n\nVoice: terse.";
         let snap = store.put(text).await.unwrap();
         assert_eq!(store.get(&snap).await.as_deref(), Some(text));
     }

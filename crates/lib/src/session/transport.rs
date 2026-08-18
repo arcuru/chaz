@@ -313,8 +313,8 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_binds_exposes_and_resolves() {
         let (_inst, reg) = make_registry().await;
-        let agent = make_agent_entry(&reg, "ava").await;
-        let login = "@ava:example.com";
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@chaz:example.com";
 
         // First call creates the session, binds the channel, attaches the
         // agent as host, and exposes it on the login.

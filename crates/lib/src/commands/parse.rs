@@ -529,17 +529,17 @@ mod tests {
             Command::Model(Some(id)) => assert_eq!(id, "deepseek/deepseek-v4-pro"),
             other => panic!("expected Model(Some), got {other:?}"),
         }
-        match cmd("/model ava gpt-4o") {
+        match cmd("/model chaz gpt-4o") {
             Command::AgentModel { agent, model } => {
-                assert_eq!(agent, "ava");
+                assert_eq!(agent, "chaz");
                 assert_eq!(model.as_deref(), Some("gpt-4o"));
             }
             other => panic!("expected AgentModel, got {other:?}"),
         }
         // `clear` (any case) as the second token wipes the override.
-        match cmd("/model ava CLEAR") {
+        match cmd("/model chaz CLEAR") {
             Command::AgentModel { agent, model } => {
-                assert_eq!(agent, "ava");
+                assert_eq!(agent, "chaz");
                 assert!(model.is_none());
             }
             other => panic!("expected AgentModel clear, got {other:?}"),
@@ -558,13 +558,13 @@ mod tests {
         assert!(matches!(cmd("/agent room"), Command::AgentRoom));
         assert!(matches!(cmd("/agent hosted"), Command::AgentHosted));
         assert!(matches!(cmd("/agent host"), Command::AgentSetHost(None)));
-        match cmd("/agent host ava") {
-            Command::AgentSetHost(Some(r)) => assert_eq!(r, "ava"),
+        match cmd("/agent host chaz") {
+            Command::AgentSetHost(Some(r)) => assert_eq!(r, "chaz"),
             other => panic!("got {other:?}"),
         }
         assert!(matches!(cmd("/agent reload"), Command::AgentReload(None)));
-        match cmd("/agent reload ava") {
-            Command::AgentReload(Some(r)) => assert_eq!(r, "ava"),
+        match cmd("/agent reload chaz") {
+            Command::AgentReload(Some(r)) => assert_eq!(r, "chaz"),
             other => panic!("got {other:?}"),
         }
         assert!(matches!(cmd("/agent burst"), Command::AgentSetBurst(None)));
@@ -599,28 +599,28 @@ mod tests {
 
     #[test]
     fn agent_rehost_flags() {
-        match cmd("/agent rehost --agent ava") {
+        match cmd("/agent rehost --agent chaz") {
             Command::AgentRehost {
                 agent_ref,
                 pubkey,
                 scope,
                 clear,
             } => {
-                assert_eq!(agent_ref, "ava");
+                assert_eq!(agent_ref, "chaz");
                 assert!(pubkey.is_none());
                 assert_eq!(scope, RehostScope::Agent);
                 assert!(!clear);
             }
             other => panic!("got {other:?}"),
         }
-        assert!(usage("/agent rehost --clear ava deadbeef").contains("--clear cannot"));
+        assert!(usage("/agent rehost --clear chaz deadbeef").contains("--clear cannot"));
         assert!(usage("/agent rehost --agent").starts_with("Usage:"));
     }
 
     #[test]
     fn agent_invite_and_import_permission_defaults() {
         // invite defaults to Admin
-        match cmd("/agent invite ava deadbeef") {
+        match cmd("/agent invite chaz deadbeef") {
             Command::AgentInvite { permission, .. } => {
                 assert_eq!(permission, CoOwnerPermission::Admin)
             }
@@ -639,7 +639,7 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
-        assert!(usage("/agent invite ava").contains("pubkey"));
+        assert!(usage("/agent invite chaz").contains("pubkey"));
         assert!(usage("/agent import ticket://x bogus").contains("Unknown permission"));
     }
 

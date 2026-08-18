@@ -118,7 +118,7 @@ pub(super) enum TuiMode {
 
 /// Which DB / domain a Settings page is editing. Two distinct surfaces:
 /// `Peer` edits `chaz_peer` + config-derived globals; `Session` edits the
-/// active tab's `SessionMeta`. See `~/brain/ava/proposals/chaz-settings-pages-plan.md`.
+/// active tab's `SessionMeta`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsScope {
     Peer,

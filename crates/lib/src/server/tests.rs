@@ -32,7 +32,7 @@ async fn budget_model_falls_back_to_backend_default() {
     let (_instance, _server, registry) = server_fixture().await;
     let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
 
-    // Single backend whose first (default) model is flash — the Ava shape.
+    // Single backend whose first (default) model is flash — the Chaz shape.
     let mut b = crate::config::Backend::new(crate::config::BackendType::OpenAICompatible);
     b.name = Some("openrouter".to_string());
     b.models = Some(vec![crate::config::Model {
@@ -236,12 +236,12 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
     let (_instance, server, registry) = server_fixture().await;
 
     // A yaml agent whose entire system prompt comes from a file (no inline
-    // `system_prompt`) — the exact shape of the Ava config.
+    // `system_prompt`) — the exact shape of the Chaz config.
     let dir = tempfile::tempdir().unwrap();
     let prompt_path = dir.path().join("AGENTS.md");
-    std::fs::write(&prompt_path, "You are Ava. Operating manual v1.").unwrap();
+    std::fs::write(&prompt_path, "You are Chaz. Operating manual v1.").unwrap();
     let ac: crate::config::AgentConfig = serde_yaml::from_str(&format!(
-        "name: ava\nsystem_prompt_files: [\"{}\"]\n",
+        "name: chaz\nsystem_prompt_files: [\"{}\"]\n",
         prompt_path.display()
     ))
     .unwrap();
@@ -252,10 +252,10 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
         let mut user = registry.user_for_tests().await;
         create_agent_db(
             &mut user,
-            "ava",
+            "chaz",
             &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
             &AgentMeta {
-                display_name: Some("ava".to_string()),
+                display_name: Some("chaz".to_string()),
                 ..Default::default()
             },
         )
@@ -264,7 +264,7 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
     };
     server.agent_index().register(DbEntry {
         db_id: db.id(),
-        display_name: "ava".to_string(),
+        display_name: "chaz".to_string(),
         pubkey,
     });
 
@@ -276,7 +276,7 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
 
     // Hydration resolves the prompt from the blob (config has no inline text).
     let input = crate::agent::Agent {
-        name: "ava".to_string(),
+        name: "chaz".to_string(),
         system_prompt: String::new(),
         system_prompt_files: vec![],
         default_model: None,
@@ -291,17 +291,20 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
         grants: HashMap::new(),
     };
     let hydrated = server.hydrate_agent_from_db(input.clone()).await;
-    assert_eq!(hydrated.system_prompt, "You are Ava. Operating manual v1.");
+    assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v1.");
 
     // Unchanged yaml + file → gate matches → no-op.
     assert!(!server.reconcile_agent_from_yaml(&ac).await.unwrap());
 
     // Editing the file content makes the resolved prompt change, so
     // reconcile applies again and hydration reflects the new text.
-    std::fs::write(&prompt_path, "You are Ava. Operating manual v2!").unwrap();
+    std::fs::write(&prompt_path, "You are Chaz. Operating manual v2!").unwrap();
     assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
     let hydrated2 = server.hydrate_agent_from_db(input).await;
-    assert_eq!(hydrated2.system_prompt, "You are Ava. Operating manual v2!");
+    assert_eq!(
+        hydrated2.system_prompt,
+        "You are Chaz. Operating manual v2!"
+    );
 }
 
 #[tokio::test]
@@ -312,13 +315,13 @@ async fn reload_config_for_rereads_yaml_from_disk() {
 
     let dir = tempfile::tempdir().unwrap();
     let prompt_path = dir.path().join("AGENTS.md");
-    std::fs::write(&prompt_path, "Ava manual v1.").unwrap();
+    std::fs::write(&prompt_path, "Chaz manual v1.").unwrap();
     let config_path = dir.path().join("config.yaml");
     let write_config = |body: &str| {
         std::fs::write(
                 &config_path,
                 format!(
-                    "homeserver_url: http://localhost\nusername: test\nagents:\n  - name: ava\n    system_prompt_files: [\"{}\"]\n{}",
+                    "homeserver_url: http://localhost\nusername: test\nagents:\n  - name: chaz\n    system_prompt_files: [\"{}\"]\n{}",
                     prompt_path.display(),
                     body
                 ),
@@ -330,7 +333,7 @@ async fn reload_config_for_rereads_yaml_from_disk() {
 
     // Bootstrap the agent DB the way startup would.
     let ac: crate::config::AgentConfig = serde_yaml::from_str(&format!(
-        "name: ava\nsystem_prompt_files: [\"{}\"]\n",
+        "name: chaz\nsystem_prompt_files: [\"{}\"]\n",
         prompt_path.display()
     ))
     .unwrap();
@@ -338,10 +341,10 @@ async fn reload_config_for_rereads_yaml_from_disk() {
         let mut user = registry.user_for_tests().await;
         create_agent_db(
             &mut user,
-            "ava",
+            "chaz",
             &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
             &AgentMeta {
-                display_name: Some("ava".to_string()),
+                display_name: Some("chaz".to_string()),
                 ..Default::default()
             },
         )
@@ -350,26 +353,26 @@ async fn reload_config_for_rereads_yaml_from_disk() {
     };
     server.agent_index().register(DbEntry {
         db_id: db.id(),
-        display_name: "ava".to_string(),
+        display_name: "chaz".to_string(),
         pubkey,
     });
 
     // Scoped reload applies and reports the change.
-    let report = server.reload_config_for(Some("ava")).await.unwrap();
-    assert_eq!(report.changed, vec!["ava".to_string()]);
+    let report = server.reload_config_for(Some("chaz")).await.unwrap();
+    assert_eq!(report.changed, vec!["chaz".to_string()]);
     assert_eq!(report.considered, 1);
 
     // A second reload with the file unchanged is a gated no-op.
-    let report2 = server.reload_config_for(Some("ava")).await.unwrap();
+    let report2 = server.reload_config_for(Some("chaz")).await.unwrap();
     assert!(report2.changed.is_empty());
     assert_eq!(report2.considered, 1);
 
     // Editing the prompt file and reloading reaches hydration.
-    std::fs::write(&prompt_path, "Ava manual v2!").unwrap();
+    std::fs::write(&prompt_path, "Chaz manual v2!").unwrap();
     let report3 = server.reload_config_for(None).await.unwrap();
-    assert_eq!(report3.changed, vec!["ava".to_string()]);
+    assert_eq!(report3.changed, vec!["chaz".to_string()]);
     let input = crate::agent::Agent {
-        name: "ava".to_string(),
+        name: "chaz".to_string(),
         system_prompt: String::new(),
         system_prompt_files: vec![],
         default_model: None,
@@ -384,7 +387,7 @@ async fn reload_config_for_rereads_yaml_from_disk() {
         grants: HashMap::new(),
     };
     let hydrated = server.hydrate_agent_from_db(input).await;
-    assert_eq!(hydrated.system_prompt, "Ava manual v2!");
+    assert_eq!(hydrated.system_prompt, "Chaz manual v2!");
 
     // A name that isn't in the yaml is considered zero times.
     let missing = server.reload_config_for(Some("ghost")).await.unwrap();
