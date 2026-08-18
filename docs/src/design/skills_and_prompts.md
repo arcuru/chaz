@@ -13,7 +13,7 @@
 > - The `skills` extension shipped as `crates/lib/src/extensions/skills.rs` with `Scope::{Global, PerSession}`, the `SkillRegistry`, `PromptAugmentation`, and the `skill_list` / `skill_search` / `skill_show` tools.
 > - `PromptAugmentation` shipped as an extension-providable cap (`crates/lib/src/extension/caps.rs`) and is wired through `ContextBuilder::build`.
 > - **Divergence:** the `SystemPromptSnapshot` entry type / `SystemPromptSnapshotPayload` / observational audit log were **not** built; `PersonaSnapshot` was simply removed from `EntryType`. There is no per-turn snapshot today — every turn assembles fresh and the contributions are not persisted.
-> - **Divergence:** `/agent reload <ref>` was not added; live edits go through `/agent set <ref> system_prompt <value>` / `system_prompt_files`. File-include rehydration happens at agent construction (`AgentRegistry::register`) and on AgentDb config write; there is no on-demand reload command.
+> - **Divergence:** `/agent reload <ref>` shipped as `agent_reload` (re-reads yaml + hash-gated reconcile), not as the narrower file-only re-read described in the original § `/agent reload command` below.
 
 ## Summary
 
@@ -33,8 +33,9 @@
   text is what `system_prompt` holds. No per-session snapshot layer.
 - **`skills` extension** — a built-in extension that scans skill directories at
   install time, holds a `SkillRegistry` in memory, provides `skill_list` /
-  `skill_search` tools, and injects matched skill bodies into the system prompt
-  via a new `PromptAugmentation` capability.
+  `skill_search` / `skill_show` tools, and injects a discovery-only skill
+  catalog into the system prompt via a `PromptAugmentation` capability. Bodies
+  load on demand via `skill_show`.
 - **`PromptAugmentation` cap** — a new extension capability that lets extensions
   append text to the system prompt. The extension hub calls every provider at
   context assembly time. Per-session extension filtering gates participation.
@@ -148,9 +149,11 @@ Guidelines for working with Nix:
 
 - `name` — unique identifier within the skill catalog
 - `description` — one-line summary shown in `skill_list`
-- `triggers` — keyword list for deterministic prefiltering (see below)
-- `requires_tools` — optional; skill is suppressed when required tools aren't available
-- Body — markdown instructions injected into the system prompt
+- `triggers` — search keywords for `skill_search` (see below)
+- `requires_tools` — optional; spec'd as "suppress skill when required tools
+  aren't available" but **not yet wired** at context-assembly time (the field
+  parses from frontmatter but is not checked)
+- Body — markdown instructions returned by `skill_show` on demand
 
 Maximum file size: 64 KiB (IronClaw convention).
 
@@ -197,18 +200,27 @@ Duplicate names: project-local wins (shadowing user-global).
 
 #### Trigger matching (prefiltering)
 
-Deterministic, not LLM-driven. At context assembly time, the extension receives
-the agent's current turn context (the last N user messages, or the session's
-recent entries). For each skill, prefiltering scores trigger matches:
+Skills use progressive disclosure. The skills extension injects a
+discovery-only catalog into the system prompt — names and descriptions,
+no bodies. The LLM calls `skill_show` to load full instructions on demand.
 
-1. Extract all non-common words from recent user messages (stoplist-filtered)
-2. For each skill, count trigger matches against extracted words
-3. Skills with ≥1 match are "active" for this turn
-4. All active skill bodies are concatenated and appended to the system prompt
+1. At context assembly time, `SkillsPromptAugmentation::augment_system_prompt`
+   collects the agent's available skills and passes them to `format_catalog`.
+2. `format_catalog` renders each skill as `name — description` and injects a
+   `## Available skills` block into the system prompt. The block tells the LLM:
+   "To use a skill, call the `skill_show` tool with the skill's `name` to load
+   its full instructions."
+3. No body text is injected. The catalog is discovery-only — the LLM decides
+   which skills to activate.
+4. `skill_show` resolves the named skill against all four sources (disk,
+   agent-owned, granted skill banks, session-attached skill banks) and returns
+   the full body for the current turn.
+5. `triggers` is a search field. `skill_search` matches query terms against
+   name, description, and trigger keywords (case-insensitive substring).
+   Triggers are not an activation gate.
 
-This is cheap (string matching, no LLM call) and predictable (operator knows
-exactly which keywords activate which skill). It deliberately avoids
-embedding-based or LLM-based selection to prevent circular manipulation.
+This is cheap and predictable — the operator knows exactly what appears in
+the catalog, and the LLM controls which bodies it loads.
 
 #### Trust tiers
 
@@ -227,7 +239,7 @@ The effective tool ceiling for a turn is `min(agent's tool set, lowest-trust act
 
 | Tool           | Risk | Description                                                              |
 | -------------- | ---- | ------------------------------------------------------------------------ |
-| `skill_list`   | Low  | List loaded skills with name, description, trigger count, trust tier     |
+| `skill_list`   | Low  | List loaded skills with name, description, and trigger keywords          |
 | `skill_search` | Low  | Full-text search across skill names + descriptions + trigger lists       |
 | `skill_show`   | Low  | Display the full body of a named skill (for the agent to read on-demand) |
 
@@ -282,7 +294,7 @@ The new assembly order in `ContextBuilder::build()`:
 2. Agent.system_prompt_files (already concatenated)  (resolved at construction)
 3. ── blank line ──
 4. hub.augment_system_prompt(agent, entries, meta)   (skills + any other extensions)
-   └── skills extension: active skill bodies, one per matched skill
+   └── skills extension: discovery-only catalog (names + descriptions)
    └── future extensions: memory surfacing, todo reminders, etc.
 5. Optional multi-agent room note                     (existing behavior)
 → RuntimeMessage::System(text)
@@ -319,17 +331,18 @@ drives no behavior.
 
 ### /agent reload command
 
-New shared command replacing `/agent persona bump`:
-
 ```
-/agent reload <ref>
+/agent reload [ref]
 ```
 
-Re-reads `system_prompt_files` from disk, re-hashes, updates the agent's
-in-memory `system_prompt` + persists to `AgentDbConfig`. Writes a
-`SystemPromptSnapshot` with `reason: Reload`. Unlike the old bump, this
-updates the authoritative agent config — there is no snapshot-authoritative
-layer to bypass.
+Re-reads the chaz yaml from disk, then runs `reconcile_agent_from_yaml` for
+each agent (or the named agent) — the same hash-gated reconcile path used at
+startup. When the yaml-derived config differs from what was last applied, the
+agent's DB is rewritten with the refreshed declarative config, including
+re-resolved `system_prompt_files`. A live `/agent set` edit survives when the
+yaml block and prompt files are unchanged.
+
+Errors when no config path is set or the yaml cannot be read or parsed.
 
 ### Migration
 
@@ -373,23 +386,28 @@ agents:
 The `role:` name had no semantic value (it was just a template key, not
 routing-affecting) — it disappears without replacement.
 
-### V2: Eidetica-backed skill libraries
+### Skill banks
 
-Deferred but specced so the extension model accommodates it:
+Skill banks are eidetica databases that hold a collection of skills and can be
+shared between peers (same auth/sync model as memory banks and agent DBs).
+Shipped as a fourth skill source alongside disk, agent-owned, and
+session-attached.
 
-- `SkillLibraryDb` — an eidetica DB kind holding many skills in a Table.
-  `meta.kind = "skill_library"`. Each row is a serialized `SkillManifest` +
-  `prompt_content`.
-- Agent's `skills` config gains `SkillSource::Library { db_id, name }` — a
-  reference to a synced library.
-- `skill_library_<name>` becomes a separate extension (one per library), same
-  pattern as `mcp-<server_name>`. Each library extension provides its own
-  `PromptAugmentation` implementation that queries the library DB.
-- `skill_install` / `skill_remove` tools copy between folders and library DBs.
-- Libraries can be shared/synced via AuthSettings, exactly like memory banks.
+- `SKILL_BANKS_STORE` — key-value store in the agent DB, holding `SkillBankRef`
+  rows (`name`, `db_id`, `pubkey`).
+- `list_skill_banks()` / `attach_skill_bank()` / `detach_skill_bank()` /
+  `find_skill_bank()` on `AgentDb` — CRUD for the agent's attached skill banks.
+- `/skills attach <bank|db_id|ticket>` — attach a skill bank to the agent
+  mid-session. Ticket-based attach goes through the same Iroh ticket exchange as
+  agent invites and memory bank shares.
+- `SkillShowTool` resolves skills against all four sources, including attached
+  banks — a bank's skills appear in the catalog and can be loaded via
+  `skill_show`.
+- `default_skill_banks` on `AgentDbConfig` / `AgentConfig` — skill banks to
+  auto-attach at agent bootstrap.
 
-The v1 folders-only model is a strict subset — adding libraries later adds
-extensions, not new abstractions.
+Skill banks are a first-class source within the skills extension, not a
+separate extension-per-bank.
 
 ## Implementation Touch Points
 
