@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Parsed SKILL.md file.
 #[derive(Debug, Clone)]
@@ -545,10 +545,27 @@ fn missing_tools(requires_tools: &[String], available: &[String]) -> Vec<String>
         .collect()
 }
 
+/// Skill-and-missing-tools pairs already warned about. A suppression that
+/// is a misconfiguration repeats every turn, so the loud line is worth one
+/// per process; the per-turn detail stays at `debug`.
+fn warned_suppressions() -> &'static Mutex<std::collections::HashSet<String>> {
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    WARNED.get_or_init(Mutex::default)
+}
+
+/// True the first time this exact pair is seen, false forever after.
+fn first_suppression(name: &str, missing: &str) -> bool {
+    warned_suppressions()
+        .lock()
+        .expect("skill suppression set poisoned")
+        .insert(format!("{name}\u{1f}{missing}"))
+}
+
 /// Whether a skill may appear on a discovery surface, logging the reason
-/// when it may not. A `requires_tools` entry that names no real tool —
-/// a typo, or an MCP tool written without its `{server}__` prefix —
-/// makes the skill vanish, so the suppression has to leave a trace.
+/// when it may not. A suppressed skill is indistinguishable from an absent
+/// one on every surface the model can see, so it has to leave a trace: the
+/// surface-by-surface detail at `debug`, and one `warn` the first time so
+/// the common causes are visible without raising the log level.
 fn skill_is_usable(
     name: &str,
     requires_tools: &[String],
@@ -556,15 +573,28 @@ fn skill_is_usable(
     surface: &str,
 ) -> bool {
     let missing = missing_tools(requires_tools, available);
-    if !missing.is_empty() {
-        tracing::debug!(
+    if missing.is_empty() {
+        return true;
+    }
+    let missing = missing.join(", ");
+    tracing::debug!(
+        skill = %name,
+        %missing,
+        surface,
+        "Skill suppressed — required tools unavailable to this agent"
+    );
+    if first_suppression(name, &missing) {
+        tracing::warn!(
             skill = %name,
-            missing = %missing.join(", "),
-            surface,
-            "Skill suppressed — required tools unavailable to this agent"
+            %missing,
+            "Skill hidden from this agent — the tools it requires are not in the \
+             agent's tool list. Common causes: a misspelled tool name, an MCP tool \
+             written without its `{{server}}__` prefix, a tool scoped away from this \
+             agent, or an MCP server that has not finished starting. Warned once \
+             per skill; RUST_LOG=debug logs every occurrence."
         );
     }
-    missing.is_empty()
+    false
 }
 
 /// Format the catalog as the Markdown block injected into the system
@@ -1729,6 +1759,17 @@ mod tests {
         .unwrap();
         let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("- **")).collect();
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn first_suppression_is_true_once_per_skill_and_missing_set() {
+        // Keys unique to this test — the warn set is process-global and
+        // other tests share it.
+        assert!(first_suppression("dedup-probe", "shell"));
+        assert!(!first_suppression("dedup-probe", "shell"));
+        // A different missing set is a different problem, so it warns again.
+        assert!(first_suppression("dedup-probe", "shell, file_read"));
+        assert!(!first_suppression("dedup-probe", "shell, file_read"));
     }
 
     #[test]
