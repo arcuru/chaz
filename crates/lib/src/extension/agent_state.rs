@@ -65,8 +65,8 @@ impl ScopedAgentStateAdmin {
     /// collapses the old "two errors for one concept" wart (Gap 3) and
     /// avoids leaking the existence of out-of-scope agents to extension
     /// tools. The operator-facing diagnostic for an empty (deny-all)
-    /// allowlist is emitted once at startup in
-    /// `ExtensionHub::build_agent_state_admin`, not here.
+    /// allowlist is [`deny_all_warning`], logged by the consuming
+    /// extension at its instantiate site — not here.
     fn in_scope(&self, display_name: &str) -> bool {
         match &self.allowed {
             None => true,                            // unrestricted
@@ -80,6 +80,32 @@ impl ScopedAgentStateAdmin {
 /// `/agent` uses for an unresolved ref.
 fn not_found(name: &str) -> String {
     format!("No hosted agent matches '{name}'")
+}
+
+/// The startup diagnostic for an extension whose operator-configured
+/// agent allowlist resolved to deny-all (`Some([])`).
+///
+/// Deny-all is the one allowlist shape that is indistinguishable from a
+/// working configuration at the tool boundary — every lookup fails with
+/// the uniform [`not_found`] error, so nothing downstream surfaces it.
+/// The consuming extension calls this at its instantiate site (once at
+/// startup for a global-scope extension) and logs the returned message
+/// at `WARN`, so the operator finds out at boot instead of from a
+/// confused user staring at "not found" errors.
+///
+/// Returns `None` for every healthy shape — `None` (unrestricted) or a
+/// non-empty list — those are silent.
+pub fn deny_all_warning(extension: &str, allowlist: Option<&[String]>) -> Option<String> {
+    if matches!(allowlist, Some(list) if list.is_empty()) {
+        Some(format!(
+            "extension '{extension}' resolves to a deny-all agent state allowlist — \
+             every agent lookup it attempts fails as not-found. Remove the empty \
+             `agent_state_allowlist.{extension}` list in chaz config to restore \
+             access, or name the agents it should see"
+        ))
+    } else {
+        None
+    }
 }
 
 impl AgentStateAdmin for ScopedAgentStateAdmin {
@@ -256,5 +282,24 @@ mod tests {
         // diagnostic is the startup warn, not this error.
         let err = scope.resolve_agent("alpha").unwrap_err();
         assert_eq!(err, "No hosted agent matches 'alpha'");
+    }
+
+    #[test]
+    fn deny_all_warning_names_extension_and_config_key() {
+        let msg = deny_all_warning("schedule", Some(&[])).unwrap();
+        assert!(msg.contains("'schedule'"), "extension not named: {msg}");
+        assert!(
+            msg.contains("agent_state_allowlist.schedule"),
+            "config key not named: {msg}"
+        );
+    }
+
+    #[test]
+    fn deny_all_warning_silent_for_healthy_shapes() {
+        // Unrestricted — the common case, must stay silent.
+        assert!(deny_all_warning("schedule", None).is_none());
+        // A real (non-empty) list — scoped, not broken.
+        let scoped: Vec<String> = vec!["alpha".into()];
+        assert!(deny_all_warning("schedule", Some(&scoped)).is_none());
     }
 }

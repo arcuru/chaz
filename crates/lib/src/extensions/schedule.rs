@@ -6,7 +6,7 @@
 //! instead of the session `routines` table.
 
 use crate::agent_db::{AgentDb, Schedule, ScheduleTarget};
-use crate::extension::agent_state::ScopedAgentStateAdmin;
+use crate::extension::agent_state::{ScopedAgentStateAdmin, deny_all_warning};
 use crate::extension::caps::AgentStateAdmin;
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
@@ -63,6 +63,14 @@ impl Extension for ScheduleExtension {
         let manifest = self.manifest();
         let peer = scope_ctx.peer();
         let allowlist = peer.agent_state_allowlist.get("schedule").cloned();
+        // A deny-all entry (`schedule: []`) is invisible at the tool
+        // boundary — every lookup fails with the uniform not-found
+        // error. Surface it once here, at the one construction site,
+        // so the operator finds out at boot rather than from a
+        // confused user.
+        if let Some(warning) = deny_all_warning("schedule", allowlist.as_deref()) {
+            tracing::warn!("{warning}");
+        }
         let agent_state: Arc<dyn AgentStateAdmin> = Arc::new(ScopedAgentStateAdmin::new(
             peer.registry.clone(),
             peer.agent_index.clone(),
