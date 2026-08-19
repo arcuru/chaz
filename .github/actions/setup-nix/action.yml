@@ -22,9 +22,13 @@ runs:
           extra-substituters = https://cache.eidetica.dev
           extra-trusted-public-keys = cache.eidetica.dev-1:eND5gRJlbnool3ZLCWT2H8kkygWS8JcsU76HYXbWPBI=
 
+    # `--inputs-from .` resolves `nixpkgs` to this repo's locked nixpkgs input, so
+    # CI runs the same nix-fast-build and nix-eval-jobs as the dev shell. Without
+    # it, `nixpkgs#` comes from the installer's rolling registry and the tooling
+    # changes underneath CI with no commit here.
     - name: Install nix-fast-build
       shell: bash
-      run: nix profile install nixpkgs#nix-fast-build
+      run: nix profile install --inputs-from . nixpkgs#nix-fast-build
 
     - name: Configure cache push
       id: push-setup
