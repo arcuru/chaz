@@ -190,6 +190,52 @@ fn claim_daemon_role(state_dir: Option<&std::path::Path>) -> anyhow::Result<std:
     }
 }
 
+/// Where the advisory claim for a service socket lives: the socket path with
+/// `.lock` appended. Kept beside the socket — not in the state directory — so
+/// every daemon that names the same socket contends on the same file, even
+/// when their state directories differ.
+fn service_socket_lock_path(path: &std::path::Path) -> PathBuf {
+    let mut lock = PathBuf::from(path);
+    lock.as_mut_os_string().push(".lock");
+    lock
+}
+
+/// Take the claim that says "I am the daemon serving this socket path", to be
+/// held for the daemon's whole life.
+///
+/// Keyed to the socket path itself, not the state directory: eidetica's
+/// `ServiceServer` unlinks any socket it finds rather than checking, so two
+/// daemons that name the same `service.path` from different state directories
+/// would otherwise each pass the liveness probe before the other binds and
+/// then silently steal each other's socket. An atomic `flock` on a file
+/// adjacent to the socket makes the acquisition itself the arbitration, with
+/// the kernel dropping the claim when the holder dies.
+///
+/// Returns the open file — dropping it releases the claim, so the caller must
+/// hold it.
+fn claim_service_socket(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = service_socket_lock_path(path);
+    let file = std::fs::File::create(&lock_path).with_context(|| {
+        format!(
+            "could not open the service socket claim at {}",
+            lock_path.display()
+        )
+    })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another daemon already holds the service socket claim at {} — \
+             refusing to start a second opener of {}",
+            lock_path.display(),
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!(
+            "could not take the service socket claim at {}",
+            lock_path.display()
+        ))),
+    }
+}
+
 /// The socket is ready only once it accepts a connection *and* is mode 0600.
 /// `ServiceServer` binds before it chmods, so connect alone would let a
 /// server that fails its chmod pass as ready in the gap before it exits.
@@ -387,17 +433,25 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     //
-    // Both checks happen before the backend is opened, because refusing to
-    // start is the whole point: a daemon that discovered it was second only
+    // All three checks happen before the backend is opened, because refusing
+    // to start is the whole point: a daemon that discovered it was second only
     // after opening the database would already be the second opener.
+    //
+    // The daemon claim covers two chaz daemons on one state directory. The
+    // socket claim covers two daemons on one socket path regardless of state
+    // directory — eidetica's service server unlinks any socket it finds, so
+    // without an atomic claim two daemons naming the same path would each pass
+    // the probe below before the other binds and then steal each other's
+    // socket. The probe covers whatever else is bound at the path that never
+    // took the claim.
     let _daemon_claim = match &service_socket {
         Some(_) => Some(claim_daemon_role(state_dir.as_deref())?),
         None => None,
     };
-    // The claim covers two chaz daemons. The socket probe covers whatever else
-    // might be bound at a configured path — and eidetica's service server
-    // unlinks any socket it finds rather than checking, so without this a
-    // second server would silently steal a live one's.
+    let _socket_claim = match &service_socket {
+        Some(socket) => Some(claim_service_socket(socket)?),
+        None => None,
+    };
     if let Some(socket) = &service_socket
         && service_client::socket_is_live(socket)
     {
@@ -663,8 +717,8 @@ async fn run_usage_subcommand(
 #[cfg(test)]
 mod tests {
     use super::{
-        await_service_readiness, claim_daemon_role, resolve_config_path, resolve_service_socket,
-        resolve_state_dir,
+        await_service_readiness, claim_daemon_role, claim_service_socket, resolve_config_path,
+        resolve_service_socket, resolve_state_dir,
     };
     use chaz_core::config::{Config, ServiceConfig};
     use std::os::unix::fs::PermissionsExt;
@@ -799,6 +853,61 @@ mod tests {
         // daemon start — which is what makes a restart work.
         drop(first);
         claim_daemon_role(Some(tmp.path())).expect("the claim is free once the holder is gone");
+    }
+
+    #[test]
+    fn socket_claim_serializes_two_state_dirs_on_one_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_a = tmp.path().join("state-a");
+        let state_b = tmp.path().join("state-b");
+        std::fs::create_dir_all(&state_a).unwrap();
+        std::fs::create_dir_all(&state_b).unwrap();
+        let socket = tmp.path().join("shared.sock");
+
+        // Different state directories: the state-dir claim is per-directory,
+        // so both daemons hold theirs at once — it cannot be what serializes
+        // access to a socket the two of them name in common.
+        let daemon_a = claim_daemon_role(Some(&state_a)).expect("state A daemon role");
+        let daemon_b = claim_daemon_role(Some(&state_b)).expect("state B daemon role");
+
+        // Race one contender per state directory for the socket claim. Because
+        // the claim is keyed to the socket path, exactly one may hold it.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let tx = tx.clone();
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let _ = tx.send(claim_service_socket(&socket).map_err(|e| e.to_string()));
+            });
+        }
+        drop(tx);
+
+        let mut wins = 0;
+        let mut winner = None;
+        for result in rx {
+            match result {
+                Ok(file) => {
+                    wins += 1;
+                    winner = Some(file);
+                }
+                Err(e) => assert!(
+                    e.contains("refusing to start a second opener"),
+                    "unhelpful contention error: {e}"
+                ),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one daemon may hold the socket claim");
+
+        // The claim is the daemon's lifetime; dropping the winner frees the
+        // socket for the next daemon to start.
+        drop(winner);
+        claim_service_socket(&socket).expect("the socket claim is free once the holder is gone");
+
+        drop(daemon_a);
+        drop(daemon_b);
     }
 
     #[test]
