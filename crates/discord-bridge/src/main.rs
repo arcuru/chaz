@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
             agent_pubkey: None,
             sync_addresses: sync_addresses.clone(),
         };
-        match establish_login(&mut user, &bootstrap, &identity, &ticket, login_ref).await? {
+        match establish_login(&mut user, &bootstrap, &sync, &identity, &ticket, login_ref).await? {
             BootstrapOutcome::Approved => {
                 let creds: DiscordCredentials = bridge_db
                     .read_credentials(&login_id, &unlock)
