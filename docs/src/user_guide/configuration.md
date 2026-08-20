@@ -487,7 +487,9 @@ service:
 
 - The socket defaults to `<state_dir>/eidetica.sock`, beside the database it fronts, rather than eidetica's per-user `$XDG_RUNTIME_DIR/eidetica/service.sock`. One user runs several chaz peers — a daemon and one or more transport bridges — and each owns a separate backend.
 - Serving the socket makes the state directory owner-only (mode `0700`); the socket itself is `0600`. Reaching it is reaching the daemon's own Instance, with everything that implies: sessions, transcripts, credentials, share tickets. Filesystem permissions are the whole authorization boundary.
-- A daemon that finds a **live** socket at that path refuses to start rather than take the backend from the daemon already serving it. A socket file nobody is listening on is a crash leftover and is replaced.
-- The socket is unlinked on clean shutdown (Ctrl-C or SIGTERM).
+- A second daemon on the same state directory refuses to start, before it opens the database. The interlock is a `flock` on `<state_dir>/daemon.lock` held for the daemon's life, so two daemons starting at the same instant cannot both conclude they are first, and a crashed daemon leaves no lock to clean up. A live socket at the configured path is a second, independent refusal — eidetica's service server unlinks whatever socket it finds rather than checking.
+- The socket is unlinked on clean shutdown (Ctrl-C or SIGTERM). A socket file nobody is listening on is a crash leftover and counts as no daemon at all.
+
+Where this is going: a frontend that finds no daemon will start one and connect to it, rather than opening the database itself. Exactly one of N frontends racing on a cold state directory starts a daemon — a `flock` on `<state_dir>/daemon-start.lock` decides which — and the rest wait for its socket. A start that fails, or a daemon that never accepts connections within the readiness bound, is an error to the caller; there is no path back to opening the database directly.
 
 Nothing connects to the socket yet: `chaz cmd`, `chaz --tui`, `chaz --print` and `chaz usage` still open the database directly, so enabling this changes nothing observable today. The transport bridges are unaffected either way — `chaz-matrix` and `chaz-discord` are separate peers with their own state directories and backends, joined by sync rather than by sharing a database.

@@ -1,9 +1,15 @@
 mod bridge;
+// The client half of service mode. The daemon holds the lifetime claim from
+// here; the auto-start machinery is built and tested ahead of the frontends
+// that will consume it, which is why parts of it are not called yet.
+#[allow(dead_code)]
+mod service_client;
 
 use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
 use chaz_core::{agent, config, server, session};
 
+use anyhow::Context;
 use clap::Parser;
 use std::time::Instant;
 use std::{fs::File, io::Read, path::PathBuf};
@@ -153,20 +159,34 @@ fn resolve_service_socket(config: &Config, state_dir: Option<&std::path::Path>) 
     })
 }
 
-/// Is another process already serving on `path`?
+/// Take the claim that says "I am the daemon for this state directory", to be
+/// held for the daemon's whole life.
 ///
-/// A successful connect means a live daemon owns this state directory's
-/// backend. A refused connect means the file is a crash leftover, which the
-/// service server unlinks before it binds.
+/// This is the sole-opener rule's enforcement. It is an atomic `flock` rather
+/// than a look-then-act check, so two daemons starting at the same instant
+/// cannot both conclude they are the first; and the kernel drops it when the
+/// holder dies, so a crashed daemon leaves nothing to clean up.
 ///
-/// This check belongs in eidetica's `ServiceServer`, which today unlinks any
-/// existing socket unconditionally and so would silently steal a live peer's.
-/// Until it moves there, chaz makes it before opening the backend at all —
-/// refusing to start is the whole point, and a daemon that bound second having
-/// already opened the database would be the second opener the socket exists to
-/// prevent.
-fn service_socket_is_live(path: &std::path::Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
+/// Returns the open file — dropping it releases the claim, so the caller must
+/// hold it.
+fn claim_daemon_role(state_dir: Option<&std::path::Path>) -> anyhow::Result<std::fs::File> {
+    let path = state_dir
+        .map(|d| d.join(service_client::DAEMON_LOCK_FILE))
+        .unwrap_or_else(|| PathBuf::from(service_client::DAEMON_LOCK_FILE));
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("could not open the daemon claim at {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another chaz daemon already holds {} — refusing to start a second \
+             opener of the same eidetica backend",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!(
+            "could not take the daemon claim at {}",
+            path.display()
+        ))),
+    }
 }
 
 #[tokio::main]
@@ -293,12 +313,24 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    //
+    // Both checks happen before the backend is opened, because refusing to
+    // start is the whole point: a daemon that discovered it was second only
+    // after opening the database would already be the second opener.
+    let _daemon_claim = match &service_socket {
+        Some(_) => Some(claim_daemon_role(state_dir.as_deref())?),
+        None => None,
+    };
+    // The claim covers two chaz daemons. The socket probe covers whatever else
+    // might be bound at a configured path — and eidetica's service server
+    // unlinks any socket it finds rather than checking, so without this a
+    // second server would silently steal a live one's.
     if let Some(socket) = &service_socket
-        && service_socket_is_live(socket)
+        && service_client::socket_is_live(socket)
     {
         anyhow::bail!(
-            "another chaz daemon is already serving {} — refusing to start a \
-             second opener of the same eidetica backend",
+            "something is already serving {} — refusing to start a second \
+             opener of the same eidetica backend",
             socket.display()
         );
     }
@@ -546,7 +578,7 @@ async fn run_usage_subcommand(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_config_path, resolve_service_socket, resolve_state_dir, service_socket_is_live,
+        claim_daemon_role, resolve_config_path, resolve_service_socket, resolve_state_dir,
     };
     use chaz_core::config::{Config, ServiceConfig};
     use std::path::PathBuf;
@@ -664,22 +696,20 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_socket_file_does_not_read_as_a_live_daemon() {
+    fn a_second_daemon_cannot_take_the_claim() {
         let tmp = tempfile::tempdir().unwrap();
 
-        // Nothing there at all.
-        let missing = tmp.path().join("eidetica.sock");
-        assert!(!service_socket_is_live(&missing));
+        let first = claim_daemon_role(Some(tmp.path())).expect("first daemon takes the claim");
+        let err = claim_daemon_role(Some(tmp.path()))
+            .expect_err("a second daemon must not open the same backend");
+        assert!(
+            format!("{err}").contains("refusing to start a second opener"),
+            "unhelpful error: {err}"
+        );
 
-        // A leftover file where the socket used to be: connect is refused, so
-        // the daemon may start and the service server unlinks it on bind.
-        let stale = tmp.path().join("stale.sock");
-        std::fs::write(&stale, b"").unwrap();
-        assert!(!service_socket_is_live(&stale));
-
-        // A socket someone is actually listening on reads as live.
-        let live = tmp.path().join("live.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
-        assert!(service_socket_is_live(&live));
+        // The claim is the daemon's lifetime, so releasing it lets the next
+        // daemon start — which is what makes a restart work.
+        drop(first);
+        claim_daemon_role(Some(tmp.path())).expect("the claim is free once the holder is gone");
     }
 }
