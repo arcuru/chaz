@@ -64,6 +64,10 @@ enum Subcommand {
     /// systemd, a container, or a test harness, none of which can offer the
     /// TTY the TUI's raw mode requires.
     ///
+    /// With `service.enabled` in config, also serves this peer's eidetica
+    /// Instance on `<state_dir>/eidetica.sock` and refuses to start if another
+    /// daemon is already serving there.
+    ///
     /// Logs to stdout. Stops cleanly on Ctrl-C or SIGTERM.
     Daemon,
 }
@@ -127,6 +131,42 @@ fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
         .as_ref()
         .map(|path| agent::expand_home(std::path::Path::new(path)))
         .or_else(|| dirs::state_dir().map(|d| d.join("chaz")))
+}
+
+/// Where the daemon serves its eidetica Instance, or `None` when the service
+/// socket is switched off.
+///
+/// The default sits beside the database it fronts rather than at eidetica's
+/// per-user default path: one user runs several chaz peers — a daemon and one
+/// or more transport bridges — and each owns a separate backend, so a per-user
+/// singleton socket would front the wrong one.
+fn resolve_service_socket(config: &Config, state_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    let service = config.service.as_ref()?;
+    if !service.enabled {
+        return None;
+    }
+    Some(match &service.path {
+        Some(path) => agent::expand_home(std::path::Path::new(path)),
+        None => state_dir
+            .map(|d| d.join("eidetica.sock"))
+            .unwrap_or_else(|| PathBuf::from("eidetica.sock")),
+    })
+}
+
+/// Is another process already serving on `path`?
+///
+/// A successful connect means a live daemon owns this state directory's
+/// backend. A refused connect means the file is a crash leftover, which the
+/// service server unlinks before it binds.
+///
+/// This check belongs in eidetica's `ServiceServer`, which today unlinks any
+/// existing socket unconditionally and so would silently steal a live peer's.
+/// Until it moves there, chaz makes it before opening the backend at all —
+/// refusing to start is the whole point, and a daemon that bound second having
+/// already opened the database would be the second opener the socket exists to
+/// prevent.
+fn service_socket_is_live(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 #[tokio::main]
@@ -245,6 +285,24 @@ async fn main() -> anyhow::Result<()> {
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
 
+    // The eidetica service socket, when the daemon is asked to serve one.
+    // Only the daemon serves: every other mode is a frontend, and step one of
+    // the migration gives them nothing to connect to yet.
+    let service_socket = if daemon_mode {
+        resolve_service_socket(&config, state_dir.as_deref())
+    } else {
+        None
+    };
+    if let Some(socket) = &service_socket
+        && service_socket_is_live(socket)
+    {
+        anyhow::bail!(
+            "another chaz daemon is already serving {} — refusing to start a \
+             second opener of the same eidetica backend",
+            socket.display()
+        );
+    }
+
     // Initialize eidetica with SQLite backend for persistent storage
     let eidetica_db_path = state_dir
         .as_ref()
@@ -265,6 +323,11 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = t.elapsed().as_millis() as u64,
         "eidetica opened"
     );
+
+    // Clone before `server::build` takes ownership. The service server serves
+    // the very Instance the daemon runs on — that is what makes a connected
+    // client see the daemon's writes instead of racing them.
+    let service_instance = service_socket.as_ref().map(|_| instance.clone());
 
     // In non-interactive --print mode there is no approval UI; pass the
     // configured (or default) CLI auto-approved tools so shell/write_file work
@@ -342,6 +405,18 @@ async fn main() -> anyhow::Result<()> {
     info!(mode, "Starting bridge");
 
     let result = if daemon_mode {
+        // Serve the backend to other local processes, when configured to.
+        let service = match (service_socket, service_instance) {
+            (Some(path), Some(instance)) => {
+                let (stop, stopped) = tokio::sync::watch::channel(());
+                let server = eidetica::service::ServiceServer::new(instance, path.clone());
+                let task = tokio::spawn(async move { server.run(stopped).await });
+                info!(socket = %path.display(), "eidetica service socket serving");
+                Some((stop, task))
+            }
+            _ => None,
+        };
+
         // No bridge: the server is already running sync, schedules, the
         // routine engine, and the agent loop. Hold the process open so that
         // work continues, and let the runtime shut down through the same
@@ -349,6 +424,19 @@ async fn main() -> anyhow::Result<()> {
         info!("chaz daemon ready; waiting for shutdown signal");
         wait_for_shutdown().await;
         info!("Shutdown signal received; stopping");
+
+        // Dropping the sender is the service server's stop signal. Await the
+        // task so the socket file is gone before the process is: a socket
+        // outliving its daemon is the crash leftover a later start has to
+        // reason about.
+        if let Some((stop, task)) = service {
+            drop(stop);
+            match task.await {
+                Ok(Ok(())) => info!("eidetica service socket closed"),
+                Ok(Err(e)) => error!("eidetica service server error: {e}"),
+                Err(e) => error!("eidetica service server task failed: {e}"),
+            }
+        }
         Ok(())
     } else if let Some(a) = cmd_args {
         let bridge = bridge::cmd::CommandBridge::new(config, secret_store, a.command, a.session);
@@ -457,8 +545,10 @@ async fn run_usage_subcommand(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_config_path, resolve_state_dir};
-    use chaz_core::config::Config;
+    use super::{
+        resolve_config_path, resolve_service_socket, resolve_state_dir, service_socket_is_live,
+    };
+    use chaz_core::config::{Config, ServiceConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -511,5 +601,85 @@ mod tests {
             resolve_state_dir(&config),
             dirs::state_dir().map(|dir| dir.join("chaz"))
         );
+    }
+
+    #[test]
+    fn service_socket_is_off_unless_asked_for() {
+        let state = PathBuf::from("/var/lib/chaz");
+
+        // No block at all, and an explicitly disabled block, both mean off —
+        // including one that names a path, which is a path to nowhere until
+        // someone flips `enabled`.
+        assert_eq!(
+            resolve_service_socket(&Config::default(), Some(&state)),
+            None
+        );
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: false,
+                path: Some("/run/chaz.sock".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_service_socket(&config, Some(&state)), None);
+    }
+
+    #[test]
+    fn service_socket_defaults_beside_the_database() {
+        let state = PathBuf::from("/var/lib/chaz");
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: true,
+                path: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_service_socket(&config, Some(&state)),
+            Some(state.join("eidetica.sock"))
+        );
+
+        // No state directory: the socket lands beside the database, which in
+        // that case is the working directory.
+        assert_eq!(
+            resolve_service_socket(&config, None),
+            Some(PathBuf::from("eidetica.sock"))
+        );
+    }
+
+    #[test]
+    fn service_socket_override_expands_tilde() {
+        let home = dirs::home_dir().expect("home dir in test env");
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: true,
+                path: Some("~/run/chaz.sock".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_service_socket(&config, Some(std::path::Path::new("/var/lib/chaz"))),
+            Some(home.join("run/chaz.sock"))
+        );
+    }
+
+    #[test]
+    fn a_dead_socket_file_does_not_read_as_a_live_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Nothing there at all.
+        let missing = tmp.path().join("eidetica.sock");
+        assert!(!service_socket_is_live(&missing));
+
+        // A leftover file where the socket used to be: connect is refused, so
+        // the daemon may start and the service server unlinks it on bind.
+        let stale = tmp.path().join("stale.sock");
+        std::fs::write(&stale, b"").unwrap();
+        assert!(!service_socket_is_live(&stale));
+
+        // A socket someone is actually listening on reads as live.
+        let live = tmp.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(service_socket_is_live(&live));
     }
 }

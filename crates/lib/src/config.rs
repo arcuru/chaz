@@ -67,6 +67,10 @@ pub struct Config {
     pub embedding: Option<EmbeddingConfig>,
     /// Print-mode configuration (single-shot `-p` / `--print` mode)
     pub cli: Option<CliConfig>,
+    /// Eidetica service socket the daemon serves its own backend on, so that
+    /// other local chaz processes can reach it as clients instead of opening
+    /// the same database file. Omit to leave it off.
+    pub service: Option<ServiceConfig>,
     /// Per-extension agent allowlists for the `AgentStateAdmin` cap.
     /// Each entry maps an extension name (e.g. `"schedule"`) to the
     /// list of agent display names that extension's tools may access.
@@ -220,6 +224,39 @@ pub struct CliConfig {
     /// Default: shell, write_file
     #[serde(default = "default_cli_auto_approved")]
     pub auto_approved_tools: Vec<String>,
+}
+
+/// Eidetica service (daemon-mode) configuration.
+///
+/// A chaz peer is one state directory holding one `eidetica.db`, and an
+/// embedded SQLite backend is a single-process store: two processes opening it
+/// do not observe each other's writes and contend for the write lock. Eidetica
+/// answers that with service mode — one process owns the backend and serves it
+/// over a Unix socket, and everything else connects as a client.
+///
+/// With `enabled: true` the daemon additionally serves its Instance on
+/// `<state_dir>/eidetica.sock`. Nothing connects to it yet, so this is
+/// inert until the local frontends are migrated; it is off by default.
+///
+/// The socket is deliberately per-state-directory rather than eidetica's own
+/// per-user default (`$XDG_RUNTIME_DIR/eidetica/service.sock`): one user runs
+/// several chaz peers — a daemon and one or more transport bridges — and each
+/// has its own backend to front.
+///
+/// ```yaml
+/// service:
+///   enabled: true
+///   path: /run/user/1000/chaz-eidetica.sock
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceConfig {
+    /// Serve the socket in daemon mode. Defaults to false, which reproduces
+    /// the embedded-only behaviour exactly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Override the socket path. Defaults to `<state_dir>/eidetica.sock`.
+    /// A leading `~` is expanded.
+    pub path: Option<String>,
 }
 
 pub fn default_cli_auto_approved() -> Vec<String> {
@@ -857,6 +894,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "sync_listen",
         "embedding",
         "cli",
+        "service",
         "agent_state_allowlist",
         "multi_agent",
         "runtime",
@@ -1034,6 +1072,11 @@ fn known_config_keys() -> HashSet<&'static str> {
 
     // ── cli ──
     keys.insert("cli.auto_approved_tools");
+
+    // ── service ──
+    for k in ["service.enabled", "service.path"] {
+        keys.insert(k);
+    }
 
     // ── agent_state_allowlist.<extension_name> ── (dynamic keys)
     keys.insert("agent_state_allowlist.");
@@ -1583,6 +1626,26 @@ context:
             unknown.is_empty(),
             "expected no unknown keys, got: {unknown:?}"
         );
+    }
+
+    #[test]
+    fn service_block_parses_and_defaults_to_off() {
+        let yaml = "service:\n  enabled: true\n  path: /run/user/1000/chaz.sock\n";
+        assert!(
+            check_unknown_config_keys(yaml).is_empty(),
+            "a valid service block must not be reported as unknown"
+        );
+        let config: Config = serde_yaml::from_str(yaml).expect("service block parses");
+        let service = config.service.expect("service block present");
+        assert!(service.enabled);
+        assert_eq!(service.path.as_deref(), Some("/run/user/1000/chaz.sock"));
+
+        // A bare `service:` block opts in to nothing: the socket stays off
+        // unless the operator says otherwise.
+        let bare: Config = serde_yaml::from_str("service: {}\n").expect("bare service parses");
+        let bare = bare.service.expect("service block present");
+        assert!(!bare.enabled);
+        assert!(bare.path.is_none());
     }
 
     #[test]

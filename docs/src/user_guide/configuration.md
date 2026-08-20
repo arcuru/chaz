@@ -151,6 +151,13 @@ web_search:
 # Omit this field to use iroh P2P only (stable peer identity, no address needed).
 # sync_listen: "0.0.0.0:8765"
 
+# Optional: serve this peer's eidetica backend on a unix socket in daemon mode,
+# so other local processes can reach it as clients instead of opening the same
+# database file. Off by default; nothing connects to it yet.
+# service:
+#   enabled: true
+#   path: /run/user/1000/chaz-eidetica.sock   # default <state_dir>/eidetica.sock
+
 # Extension capabilities — operator-level scoping.
 #
 # agent_state_allowlist: per-extension agent allowlists for the
@@ -465,3 +472,22 @@ Chaz persists all data in the state directory:
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
+
+## Eidetica service socket
+
+`eidetica.db` is an embedded SQLite backend, and an embedded backend belongs to one process: two processes that open it do not observe each other's writes and contend for the write lock. That is why `chaz cmd` is documented as needing the daemon stopped.
+
+Eidetica's answer is service mode — one process owns the backend and serves it over a Unix socket, and everything else connects as a client. With `service.enabled`, `chaz daemon` additionally serves its own Instance:
+
+```yaml
+service:
+  enabled: true # default false
+  # path: /run/user/1000/chaz-eidetica.sock   # default <state_dir>/eidetica.sock
+```
+
+- The socket defaults to `<state_dir>/eidetica.sock`, beside the database it fronts, rather than eidetica's per-user `$XDG_RUNTIME_DIR/eidetica/service.sock`. One user runs several chaz peers — a daemon and one or more transport bridges — and each owns a separate backend.
+- Serving the socket makes the state directory owner-only (mode `0700`); the socket itself is `0600`. Reaching it is reaching the daemon's own Instance, with everything that implies: sessions, transcripts, credentials, share tickets. Filesystem permissions are the whole authorization boundary.
+- A daemon that finds a **live** socket at that path refuses to start rather than take the backend from the daemon already serving it. A socket file nobody is listening on is a crash leftover and is replaced.
+- The socket is unlinked on clean shutdown (Ctrl-C or SIGTERM).
+
+Nothing connects to the socket yet: `chaz cmd`, `chaz --tui`, `chaz --print` and `chaz usage` still open the database directly, so enabling this changes nothing observable today. The transport bridges are unaffected either way — `chaz-matrix` and `chaz-discord` are separate peers with their own state directories and backends, joined by sync rather than by sharing a database.
