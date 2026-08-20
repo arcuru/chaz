@@ -74,8 +74,12 @@ pub enum Command {
     // --- Session management ---
     /// Enumerate all known sessions (TUI opens a picker; Matrix renders text).
     ListSessions,
-    /// Create a fresh session and switch to it.
-    NewSession,
+    /// Create a fresh session and switch to it. `Some(group)` names an
+    /// `agent_groups:` entry whose roster auto-attaches instead of
+    /// `default_agents`.
+    NewSession(Option<String>),
+    /// List the named agent groups this peer is configured with.
+    ListAgentGroups,
     /// Resolve identifier (name | DB ID) and switch to it.
     SwitchSession(String),
     /// Show info about the current session.
@@ -372,7 +376,8 @@ pub enum CommandOutcome {
 pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
     match cmd {
         Command::ListSessions => session::list_sessions(ctx).await,
-        Command::NewSession => session::new_session(ctx).await,
+        Command::NewSession(group) => session::new_session(group.as_deref(), ctx).await,
+        Command::ListAgentGroups => session::list_agent_groups(ctx).await,
         Command::SwitchSession(id) => session::switch_session(&id, ctx).await,
         Command::Info => session::info(ctx).await,
         Command::ListCosts => session::list_costs(ctx).await,

@@ -371,6 +371,11 @@ pub struct Server {
     /// (whatever `AgentRegistry::default_agent()` returns). The first
     /// entry effectively becomes the routing host on new sessions.
     default_agents: std::sync::RwLock<Vec<String>>,
+    /// Named alternatives to `default_agents`, selectable at session
+    /// creation (`/new <group>`). Set once at startup from
+    /// `Config.agent_groups`. Each value carries the same ordering
+    /// semantics as `default_agents`.
+    agent_groups: std::sync::RwLock<HashMap<String, Vec<String>>>,
     /// Path to the on-disk chaz yaml, set once at startup via
     /// [`Server::set_config_path`]. Lets `/agent reload` and the TUI `[r]`
     /// action re-read the config and re-run the agent reconcile without
@@ -466,6 +471,7 @@ impl Server {
             notify_tx,
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
+            agent_groups: std::sync::RwLock::new(HashMap::new()),
             config_path: std::sync::RwLock::new(None),
             approval_timeout: std::sync::RwLock::new(
                 crate::bridge::ApprovalsConfig::default().timeout(),
@@ -583,6 +589,39 @@ impl Server {
             .clone()
     }
 
+    /// Set the named agent groups selectable at session creation.
+    /// Applied once at startup from `Config.agent_groups`.
+    pub fn set_agent_groups(&self, groups: HashMap<String, Vec<String>>) {
+        *self
+            .agent_groups
+            .write()
+            .expect("agent_groups lock poisoned") = groups;
+    }
+
+    /// Agent names in `group`, in configured order. `None` when no such
+    /// group is configured — callers report that as a user error rather
+    /// than silently falling back to `default_agents`.
+    pub fn agent_group(&self, group: &str) -> Option<Vec<String>> {
+        self.agent_groups
+            .read()
+            .expect("agent_groups lock poisoned")
+            .get(group)
+            .cloned()
+    }
+
+    /// Configured group names, sorted, for listings and error messages.
+    pub fn agent_group_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .agent_groups
+            .read()
+            .expect("agent_groups lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Register the running `RoutineEngine` so contexts built from this
     /// server can resync the live schedule after a committed routine /
     /// schedule mutation. First call wins (one engine per process);
@@ -658,16 +697,47 @@ impl Server {
     /// yet). Per-agent attach failures are logged but don't unwind the
     /// rest. Returns the list of successfully-attached names in order.
     pub async fn auto_attach_default_agent(&self, session_db_id: &str) -> Vec<String> {
+        self.auto_attach_agents(session_db_id, None).await
+    }
+
+    /// [`Server::auto_attach_default_agent`], with a choice of which name
+    /// list to attach. `Some(group)` takes the names from
+    /// `Config.agent_groups[group]` instead of `default_agents`; `None`
+    /// uses `default_agents`. An unknown group attaches nothing — callers
+    /// validate with [`Server::agent_group`] before creating a session so
+    /// a typo doesn't leave an empty session behind.
+    pub async fn auto_attach_agents(
+        &self,
+        session_db_id: &str,
+        group: Option<&str>,
+    ) -> Vec<String> {
         // Snapshot the configured list; if empty, fall back to a
         // single-default attach so behavior is sane without a
         // `default_agents:` config entry.
-        let configured: Vec<String> = self
-            .default_agents
-            .read()
-            .expect("default_agents lock poisoned")
-            .clone();
+        let configured: Vec<String> = match group {
+            Some(g) => match self.agent_group(g) {
+                Some(names) => names,
+                None => {
+                    tracing::warn!(
+                        group = %g,
+                        session_db_id,
+                        "Unknown agent group — attaching nothing"
+                    );
+                    return Vec::new();
+                }
+            },
+            None => self
+                .default_agents
+                .read()
+                .expect("default_agents lock poisoned")
+                .clone(),
+        };
         let names: Vec<String> = if !configured.is_empty() {
             configured
+        } else if group.is_some() {
+            // An explicitly-selected but empty group means "no agents",
+            // not "fall back to the default".
+            return Vec::new();
         } else if !self.agents.is_empty() {
             vec![self.agents.default_agent().name]
         } else {

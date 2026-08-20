@@ -31,7 +31,8 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
     vec![
         ("# Session", ""),
         ("/sessions", "open session picker"),
-        ("/new", "create a new session"),
+        ("/new", "create a new session [agent group]"),
+        ("/groups", "list configured agent groups"),
         ("/join ", "switch to session by name or DB ID"),
         ("/name ", "set (or clear) a session alias"),
         ("/rename ", "alias for /name"),

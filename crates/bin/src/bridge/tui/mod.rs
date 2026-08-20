@@ -1575,7 +1575,7 @@ async fn handle_chat_action(
             // name but Action::SessionChanged patches it in place from the
             // session DB's on_write fire, so no wholesale invalidation
             // needed there.
-            if matches!(cmd, Command::NewSession) {
+            if matches!(cmd, Command::NewSession(_)) {
                 app.session_list_fresh = false;
             }
             let tab = app.active();
@@ -1692,14 +1692,14 @@ async fn dispatch_picker_selection(
         session_name: session_name.as_deref(),
     };
     let cmd = if selected == "__new__" {
-        Command::NewSession
+        Command::NewSession(None)
     } else {
         Command::SwitchSession(selected)
     };
     // Creating a session from the picker grows the catalog, so the warm
     // cache is now stale — invalidate it (mirrors the `/new` chat path) or
     // the next `/sessions` would show the cached list without this session.
-    let invalidates_cache = matches!(cmd, Command::NewSession);
+    let invalidates_cache = matches!(cmd, Command::NewSession(_));
     let outcome = commands::dispatch(cmd, &ctx).await;
     if invalidates_cache {
         app.session_list_fresh = false;

@@ -1674,3 +1674,100 @@ async fn await_agent_reply(session_db: &eidetica::Database, sid: &str, agent: &s
     }
     false
 }
+
+/// Register a Living Agent DB named `name` so auto-attach can find it.
+async fn register_agent(
+    server: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    name: &str,
+) {
+    let (db, pubkey) = {
+        let mut user = registry.user_for_tests().await;
+        create_agent_db(
+            &mut user,
+            name,
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some(name.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    };
+    server.agent_index().register(DbEntry {
+        db_id: db.id(),
+        display_name: name.to_string(),
+        pubkey,
+    });
+}
+
+#[tokio::test]
+async fn auto_attach_honours_the_selected_agent_group() {
+    let (_instance, server, registry) = server_fixture().await;
+    register_agent(&server, &registry, "alpha").await;
+    register_agent(&server, &registry, "beta").await;
+
+    server.set_default_agents(vec!["alpha".to_string()]);
+    server.set_agent_groups(HashMap::from([
+        (
+            "pair".to_string(),
+            vec!["beta".to_string(), "alpha".to_string()],
+        ),
+        ("solo".to_string(), vec!["beta".to_string()]),
+        ("empty".to_string(), Vec::new()),
+    ]));
+
+    // No group named: the peer default.
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    assert_eq!(
+        server
+            .auto_attach_agents(&db.root_id().to_string(), None)
+            .await,
+        vec!["alpha".to_string()]
+    );
+
+    // A named group replaces the default, and keeps configured order —
+    // the first entry is the routing host.
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    let session_db_id = db.root_id().to_string();
+    assert_eq!(
+        server
+            .auto_attach_agents(&session_db_id, Some("pair"))
+            .await,
+        vec!["beta".to_string(), "alpha".to_string()]
+    );
+    let meta = crate::session::read_meta_from_db(&db).await;
+    let attached: Vec<&str> = meta
+        .agents
+        .iter()
+        .map(|a| a.display_name.as_str())
+        .collect();
+    assert_eq!(attached, vec!["beta", "alpha"]);
+
+    // An explicitly-empty group attaches nothing rather than falling back.
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    assert!(
+        server
+            .auto_attach_agents(&db.root_id().to_string(), Some("empty"))
+            .await
+            .is_empty()
+    );
+
+    // An unknown group attaches nothing — the command layer rejects it
+    // before a session is ever created.
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    assert!(
+        server
+            .auto_attach_agents(&db.root_id().to_string(), Some("nope"))
+            .await
+            .is_empty()
+    );
+
+    assert_eq!(
+        server.agent_group_names(),
+        vec!["empty".to_string(), "pair".to_string(), "solo".to_string()]
+    );
+    assert_eq!(server.agent_group("solo"), Some(vec!["beta".to_string()]));
+    assert!(server.agent_group("nope").is_none());
+}

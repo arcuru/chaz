@@ -29,6 +29,13 @@ pub struct Config {
     /// explicit `host_agent_db_id`, resolution picks the first authorized
     /// agent on the session, which is whichever appears first here.
     pub default_agents: Option<Vec<String>>,
+    /// Named alternatives to `default_agents`, selectable when a session is
+    /// created (`/new <group>`). Each value is an ordered list of agent
+    /// names with the same semantics as `default_agents` — names must
+    /// match an entry in `agents:`, and the first entry effectively
+    /// becomes the routing host. A group named in `/new` replaces
+    /// `default_agents` for that session; it is not merged with it.
+    pub agent_groups: Option<HashMap<String, Vec<String>>>,
     /// Security settings
     pub security: Option<SecurityConfig>,
     /// Tool-approval settings. Shared with the bridge binaries, which read the
@@ -837,6 +844,9 @@ fn known_config_keys() -> HashSet<&'static str> {
         "backends",
         "agents",
         "default_agents",
+        "agent_groups",
+        // Group names are user-chosen, so the subtree under them is dynamic.
+        "agent_groups.",
         "security",
         "schedules",
         "mcp_servers",
@@ -1572,6 +1582,26 @@ context:
         assert!(
             unknown.is_empty(),
             "expected no unknown keys, got: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn agent_groups_and_its_group_names_are_known() {
+        // Group names are chosen by the user, so the registry marks the
+        // subtree dynamic — neither the block nor a name under it is a typo.
+        let yaml = r#"
+agent_groups:
+  research: [researcher, critic]
+  pair: [chaz, critic]
+"#;
+        assert!(
+            check_unknown_config_keys(yaml).is_empty(),
+            "a valid agent_groups block must not be reported as unknown"
+        );
+        // The dynamic subtree must not swallow a misspelling of the block.
+        assert_eq!(
+            check_unknown_config_keys("agent_gruops:\n  research: [a]\n"),
+            vec!["agent_gruops"]
         );
     }
 

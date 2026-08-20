@@ -567,6 +567,42 @@ pub async fn build(
         server.set_default_agents(default_agents);
     }
 
+    // Named agent groups: alternative rosters a session can be created
+    // with (`/new <group>`). yaml-only — there is no runtime editor for
+    // them, so unlike `default_agents` there is no peer-DB override to
+    // consult.
+    if let Some(groups) = config.agent_groups.clone() {
+        let mut names: Vec<&String> = groups.keys().collect();
+        names.sort();
+        info!(
+            groups = ?names,
+            "Applied agent_groups — selectable with /new <group>"
+        );
+        // A member with no `agents:` entry can never resolve to a hosted
+        // Agent DB, so `/new <group>` would report success and hand back a
+        // session with fewer agents than asked for. Auto-attach only
+        // debug-logs the skip, so say it once here where it is actionable.
+        if let Some(agent_configs) = &config.agents {
+            let known: std::collections::HashSet<&str> =
+                agent_configs.iter().map(|a| a.name.as_str()).collect();
+            for group in &names {
+                let unknown: Vec<&str> = groups[*group]
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|m| !known.contains(m))
+                    .collect();
+                if !unknown.is_empty() {
+                    warn!(
+                        group = %group,
+                        members = %unknown.join(", "),
+                        "agent_groups member(s) have no `agents:` entry — they will not attach"
+                    );
+                }
+            }
+        }
+        server.set_agent_groups(groups);
+    }
+
     // Fast-start: the server is now fully constructed and the spawn-tool
     // cell is wired, so the gateway can draw and accept input immediately.
     // The remaining at-startup work — model-window warm, agent reconcile,
