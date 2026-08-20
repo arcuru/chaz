@@ -137,6 +137,12 @@ context:
   max_context_tokens: 128000
   reserved_output_tokens: 4096
 
+# Tool execution host for capability requests. Omit (default) for the native
+# in-process host (grant checks only). Set "bubblewrap" to run shell commands
+# in Linux namespaces — no network, read-only system dirs, no /proc, working
+# dir bind-mounted read-write. Falls back to native when bwrap is not on PATH.
+# tool_host: bubblewrap
+
 # Web search tool (ordered failover chain)
 web_search:
   backends:
