@@ -112,6 +112,29 @@ impl DaemonSpawn for SpawnChazDaemon {
     }
 }
 
+/// Resolve the socket path to the absolute form eidetica's `unix://` URL
+/// parser requires.
+///
+/// The daemon and the client may agree on a *relative* socket path — a bare
+/// `service.path`, or the `eidetica.sock` default when no state directory
+/// resolves — and both bind and probe it against the process working
+/// directory. Eidetica only accepts absolute paths in a `unix://` URL, so the
+/// connection URL must be built from the cwd-resolved form. Everything else —
+/// the stored path, lock paths, liveness probes, stale-socket cleanup — keeps
+/// working with the path as given.
+fn resolve_socket_url_path(socket: &Path) -> Result<PathBuf> {
+    if socket.is_absolute() {
+        return Ok(socket.to_path_buf());
+    }
+    let cwd = std::env::current_dir().with_context(|| {
+        format!(
+            "could not resolve the relative service socket {} against the working directory",
+            socket.display()
+        )
+    })?;
+    Ok(cwd.join(socket))
+}
+
 /// Finds the daemon serving a state directory, starting one if there is none.
 pub struct AutoStart<S> {
     /// Where the daemon serves its eidetica Instance.
@@ -204,7 +227,8 @@ impl<S: DaemonSpawn> AutoStart<S> {
     /// Connect to the daemon serving this peer, starting one if there is none.
     pub async fn connect(&self) -> Result<eidetica::Instance> {
         self.ensure_serving().await?;
-        eidetica::Instance::connect(format!("unix://{}", self.socket.display()))
+        let url_path = resolve_socket_url_path(&self.socket)?;
+        eidetica::Instance::connect(format!("unix://{}", url_path.display()))
             .await
             .with_context(|| format!("could not connect to {}", self.socket.display()))
     }
@@ -491,5 +515,133 @@ mod tests {
             .await
             .expect("a later caller retries the same path");
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_absolute_socket_stays_as_is_for_the_connection_url() {
+        let socket = Path::new("/run/chaz/eidetica.sock");
+        assert_eq!(
+            resolve_socket_url_path(socket).expect("an absolute path resolves as-is"),
+            PathBuf::from("/run/chaz/eidetica.sock")
+        );
+    }
+
+    #[test]
+    fn a_relative_socket_resolves_against_the_working_directory_for_the_url() {
+        // No cwd mutation needed: the resolver's output for a relative path is
+        // by construction the current directory joined with it, and the
+        // process cwd is stable while this test runs.
+        let socket = Path::new("eidetica.sock");
+        let expected = std::env::current_dir()
+            .expect("the test harness has a working directory")
+            .join("eidetica.sock");
+        assert_eq!(
+            resolve_socket_url_path(socket).expect("a relative path resolves against the cwd"),
+            expected
+        );
+    }
+
+    /// Serializes process-wide working-directory changes. `cargo test` runs
+    /// tests on their own threads but inside one process, and the working
+    /// directory is process-global — so the test that moves it must be the
+    /// only one in flight while it does.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the process working directory at `dir`, restoring the original
+    /// on drop. Not `Send` — deliberately — so it must stay on one thread; a
+    /// `current_thread` `#[tokio::test]` provides that.
+    struct CwdGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let _lock = CWD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous =
+                std::env::current_dir().expect("the test harness must have a working directory");
+            std::env::set_current_dir(dir).expect("a temporary directory must be usable as cwd");
+            Self { _lock, previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_reaches_a_relative_service_socket_without_spawning() {
+        // The failure this guards: a relative `state_dir` or `service.path`
+        // yields a relative socket path (`state/eidetica.sock` below), and
+        // eidetica's `unix://` parser rejects relative paths. The server
+        // binds exactly that relative path in the temporary cwd, so a client
+        // whose URL builder did not absolutise it would fail to connect.
+        //
+        // The path is parented rather than a bare filename because the pinned
+        // ServiceServer chmods the socket's parent — a bare name's empty
+        // parent fails server-side, before any client is involved.
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::enter(dir.path());
+
+        let socket = PathBuf::from("state/eidetica.sock");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // A real daemon, not a fake: the point is the wire protocol end to
+        // end, which a stand-in listener would not exercise.
+        let (instance, _) = eidetica::Instance::create_backend(
+            Box::new(eidetica::backend::database::InMemory::new()),
+            eidetica::NewUser::passwordless("chaz"),
+        )
+        .await
+        .unwrap();
+        let (stop, stopped) = tokio::sync::watch::channel(());
+        let server = eidetica::service::ServiceServer::new(instance, socket.clone());
+        let task = tokio::spawn(async move { server.run(stopped).await });
+
+        // The server binds asynchronously, so wait for the socket before
+        // probing it as a client. A client that probed first would see no
+        // daemon and spawn its own — which is exactly what the real bug made
+        // happen for a server it should have found.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket_is_live(&socket) {
+            assert!(
+                Instant::now() < deadline,
+                "the service server did not bind in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // A live socket must get zero starts from the client.
+        let daemon = FakeDaemon::new(&socket);
+        let starts = daemon.starts();
+
+        let auto = fast(socket.clone(), &state_dir, daemon);
+        let client = auto
+            .connect()
+            .await
+            .expect("a relative service socket connects after cwd resolution");
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "a live daemon must not be spawned"
+        );
+
+        // The connection is real, not just a parsed URL: the bootstrap admin
+        // answers an RPC over the wire.
+        let user = client
+            .login_user("chaz", None)
+            .await
+            .expect("the bootstrap admin answers over the wire");
+        assert_eq!(user.username(), "chaz");
+
+        drop(stop);
+        task.await
+            .expect("service server task panicked")
+            .expect("clean shutdown");
     }
 }
