@@ -11,6 +11,7 @@ use chaz_core::{agent, config, server, session};
 
 use anyhow::Context;
 use clap::Parser;
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 use std::{fs::File, io::Read, path::PathBuf};
 use tracing::{error, info, warn};
@@ -189,76 +190,75 @@ fn claim_daemon_role(state_dir: Option<&std::path::Path>) -> anyhow::Result<std:
     }
 }
 
-/// Wait until the spawned eidetica service server is actually accepting
-/// connections on `path`, or fail the daemon's startup.
+/// The socket is ready only once it accepts a connection *and* is mode 0600.
+/// `ServiceServer` binds before it chmods, so connect alone would let a
+/// server that fails its chmod pass as ready in the gap before it exits.
+fn socket_is_ready(path: &std::path::Path) -> bool {
+    let mode_0600 = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777 == 0o600)
+        .unwrap_or(false);
+    mode_0600 && service_client::socket_is_live(path)
+}
+
+/// Fail startup unless the spawned service server actually comes up on `path`.
 ///
-/// Fail-closed: the daemon must not log that its socket is serving — or
-/// enter `wait_for_shutdown` — while nothing is listening on it. The server
-/// task races the readiness probe, and whichever resolves first decides:
-///
-/// - the task ends first: it never came up (a bind error, a panic, an early
-///   exit), so its error is propagated as a startup error;
-/// - the probe succeeds first: the socket accepts connections, and the task
-///   — with its shutdown sender — is returned for the clean-shutdown path;
-/// - the bound expires first: the server is stopped and awaited so its
-///   socket file is cleaned up, then the timeout is propagated.
-///
-/// The sender is passed by value and returned on success so it is the *only*
-/// sender while this function runs: dropping it on the timeout path is what
-/// tells the server to stop, and handing it back is what lets the caller
-/// stop the server on shutdown.
+/// The server task races a bounded readiness probe under `tokio::select!`,
+/// biased so a finished task wins a tie — a server that just died must never
+/// be reported ready. On timeout the only stop sender is dropped (the server's
+/// shutdown signal) and the task awaited so its socket file is gone before
+/// startup fails. On success the sender and still-running task are returned
+/// for the existing shutdown path.
 async fn await_service_readiness(
     path: &std::path::Path,
     task: tokio::task::JoinHandle<eidetica::Result<()>>,
     stop: tokio::sync::watch::Sender<()>,
     timeout: Duration,
-    poll: Duration,
 ) -> anyhow::Result<(
     tokio::sync::watch::Sender<()>,
     tokio::task::JoinHandle<eidetica::Result<()>>,
 )> {
-    let deadline = Instant::now() + timeout;
-    let mut task = Some(task);
-    loop {
-        // The server task ended before accepting a connection. However it
-        // ended, the socket never served, so startup fails with its error.
-        if let Some(t) = &task
-            && t.is_finished()
-        {
-            let t = task.take().expect("task is present");
-            match t.await {
-                Ok(Ok(())) => anyhow::bail!(
-                    "eidetica service server exited before accepting a connection on {}",
-                    path.display()
-                ),
-                Ok(Err(e)) => anyhow::bail!(
-                    "eidetica service server failed to start on {}: {e}",
-                    path.display()
-                ),
-                Err(e) => anyhow::bail!(
-                    "eidetica service server task failed before accepting a connection on {}: {e}",
-                    path.display()
-                ),
+    let ready = async {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if socket_is_ready(path) {
+                return Ok(());
             }
-        }
-        if service_client::socket_is_live(path) {
-            return Ok((stop, task.take().expect("task is present")));
-        }
-        if Instant::now() >= deadline {
-            // Gave up: stop the server — dropping the last sender is its
-            // shutdown signal — and await the task so its socket file is
-            // gone before startup fails.
-            drop(stop);
-            if let Some(t) = task.take() {
-                let _ = t.await;
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out after {timeout:?} waiting for the eidetica service socket at {} \
+                     to accept connections with mode 0600",
+                    path.display()
+                );
             }
-            anyhow::bail!(
-                "timed out after {timeout:?} waiting for the eidetica service socket at {} to \
-                 accept connections — the service server never came up",
+            tokio::time::sleep(service_client::DEFAULT_POLL_INTERVAL).await;
+        }
+    };
+
+    let mut task = task;
+    tokio::select! {
+        biased;
+        result = &mut task => match result {
+            Ok(Ok(())) => anyhow::bail!(
+                "eidetica service server exited before serving {}",
                 path.display()
-            );
-        }
-        tokio::time::sleep(poll).await;
+            ),
+            Ok(Err(e)) => anyhow::bail!(
+                "eidetica service server failed to start on {}: {e}",
+                path.display()
+            ),
+            Err(e) => anyhow::bail!(
+                "eidetica service server task failed before serving {}: {e}",
+                path.display()
+            ),
+        },
+        result = ready => match result {
+            Ok(()) => Ok((stop, task)),
+            Err(e) => {
+                drop(stop);
+                let _ = task.await;
+                Err(e)
+            }
+        },
     }
 }
 
@@ -526,7 +526,6 @@ async fn main() -> anyhow::Result<()> {
                     task,
                     stop,
                     service_client::DEFAULT_READINESS_TIMEOUT,
-                    service_client::DEFAULT_POLL_INTERVAL,
                 )
                 .await?;
                 info!(socket = %path.display(), "eidetica service socket serving");
@@ -802,24 +801,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbindable_service_socket_fails_startup_instead_of_advertising_ready() {
+    async fn unbindable_socket_fails_startup_with_the_bind_error() {
         let dir = tempfile::tempdir().unwrap();
-        // A Unix socket path past the platform's sun_path limit (108 bytes
-        // on Linux) can never bind — deterministically, and with a fresh
-        // tempdir nothing else can make the bind fail. This is the
-        // regression: the daemon used to log "serving" and enter the
-        // shutdown wait while the socket was never actually live.
+        // Past the platform's sun_path limit (108 bytes): bind always fails.
         let too_long = dir
             .path()
             .join(format!("eidetica-{}.sock", "x".repeat(120)));
-        assert!(
-            too_long.as_os_str().len() > 108,
-            "test path must exceed the Unix socket path limit"
-        );
+        assert!(too_long.as_os_str().len() > 108);
 
-        // A real instance and a real server, so the failing bind is the
-        // real one rather than a mocked task.
-        let (instance, _admin) = eidetica::Instance::create_backend(
+        let (instance, _) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
             eidetica::NewUser::passwordless("chaz"),
         )
@@ -831,45 +821,30 @@ mod tests {
 
         let timeout = Duration::from_secs(10);
         let started = Instant::now();
-        let err = match await_service_readiness(
-            &too_long,
-            task,
-            stop,
-            timeout,
-            Duration::from_millis(10),
-        )
-        .await
-        {
-            Ok(_) => panic!("an unbindable socket must fail startup, not advertise ready"),
-            Err(e) => e,
-        };
-
+        let err = await_service_readiness(&too_long, task, stop, timeout)
+            .await
+            .expect_err("an unbindable socket must fail startup");
         assert!(
             started.elapsed() < timeout,
-            "startup must fail promptly rather than wait out the readiness bound: {:?}",
-            started.elapsed()
+            "must fail promptly, not wait out the readiness bound"
         );
         let msg = format!("{err}");
         assert!(
-            msg.contains("failed to start"),
-            "the bind failure must be the surfaced error: {msg}"
-        );
-        assert!(
-            !msg.contains("timed out"),
-            "the bind error must surface, not the readiness timeout: {msg}"
+            msg.contains("failed to start") && !msg.contains("timed out"),
+            "the bind error must surface, not a timeout: {msg}"
         );
         assert!(
             !too_long.exists(),
-            "a failed start must not leave a socket file behind"
+            "a failed start must not leave a socket file"
         );
     }
 
     #[tokio::test]
-    async fn ready_service_socket_keeps_task_and_sender_for_clean_shutdown() {
+    async fn ready_socket_returns_task_and_sender_for_clean_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("eidetica.sock");
 
-        let (instance, _admin) = eidetica::Instance::create_backend(
+        let (instance, _) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
             eidetica::NewUser::passwordless("chaz"),
         )
@@ -879,28 +854,20 @@ mod tests {
         let server = eidetica::service::ServiceServer::new(instance, socket.clone());
         let task = tokio::spawn(async move { server.run(stopped).await });
 
-        // Readiness succeeds: the socket accepts connections, and the task
-        // and its shutdown sender come back for the clean-shutdown path.
-        let (stop, task) = await_service_readiness(
-            &socket,
-            task,
-            stop,
-            Duration::from_secs(5),
-            Duration::from_millis(10),
-        )
-        .await
-        .expect("a bindable socket must come up");
-        assert!(super::service_client::socket_is_live(&socket));
+        let (stop, task) = await_service_readiness(&socket, task, stop, Duration::from_secs(5))
+            .await
+            .expect("a bindable socket must come up");
+        assert!(
+            super::socket_is_ready(&socket),
+            "socket must be live and 0600"
+        );
 
-        // The returned sender still stops the server, and the returned task
-        // completes and removes the socket file — exactly the shutdown
-        // sequence the daemon's shutdown path runs.
+        // The returned sender stops the server, whose task then removes the
+        // socket file — the daemon's shutdown sequence.
         drop(stop);
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => panic!("service server error on shutdown: {e}"),
-            Err(e) => panic!("service server task failed on shutdown: {e}"),
-        }
+        task.await
+            .expect("service server task panicked")
+            .expect("clean shutdown");
         assert!(!socket.exists(), "shutdown must remove the socket file");
     }
 }
