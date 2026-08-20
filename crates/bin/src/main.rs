@@ -211,10 +211,35 @@ fn service_socket_lock_path(path: &std::path::Path) -> PathBuf {
 /// adjacent to the socket makes the acquisition itself the arbitration, with
 /// the kernel dropping the claim when the holder dies.
 ///
+/// The claim lives beside the socket, so taking it must establish the
+/// socket's parent the same way eidetica's `ServiceServer` does — create it
+/// and pin it to owner-only 0700 — or a valid custom `service.path` inside a
+/// not-yet-existing dedicated directory would fail here, on the lock file,
+/// before the server ever gets to create the parent. A bare relative path
+/// with no parent (bound in the working directory) has nothing to create.
+///
 /// Returns the open file — dropping it releases the claim, so the caller must
 /// hold it.
 fn claim_service_socket(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let lock_path = service_socket_lock_path(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not create the parent directory {} of the service socket at {}",
+                parent.display(),
+                path.display()
+            )
+        })?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "could not restrict the parent directory {} of the service socket at {} to owner-only access",
+                    parent.display(),
+                    path.display()
+                )
+            },
+        )?;
+    }
     let file = std::fs::File::create(&lock_path).with_context(|| {
         format!(
             "could not open the service socket claim at {}",
@@ -908,6 +933,41 @@ mod tests {
 
         drop(daemon_a);
         drop(daemon_b);
+    }
+
+    #[test]
+    fn taking_the_claim_creates_an_absent_nested_parent_at_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A valid custom service.path inside a not-yet-existing dedicated
+        // directory: eidetica's ServiceServer creates the parent itself, so
+        // the claim must do the same before dropping the lock file there —
+        // otherwise startup would fail here before the server ever runs.
+        let socket = tmp.path().join("deep").join("nested").join("eidetica.sock");
+        let parent = socket.parent().unwrap();
+        assert!(!parent.exists(), "precondition: the parent is absent");
+
+        let claim =
+            claim_service_socket(&socket).expect("taking the claim creates the socket parent");
+        assert!(parent.is_dir(), "the claim must create the socket parent");
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the parent must be owner-only, as eidetica's ServiceServer pins it"
+        );
+        assert!(
+            super::service_socket_lock_path(&socket).exists(),
+            "the claim file must sit beside the socket"
+        );
+
+        // The parent creation must not disturb the socket-keyed flock: a
+        // second claim on the same socket still contends.
+        let err = claim_service_socket(&socket)
+            .expect_err("the first claim is still held while the parent exists");
+        assert!(
+            format!("{err}").contains("refusing to start a second opener"),
+            "unhelpful contention error: {err}"
+        );
+        drop(claim);
     }
 
     #[test]
