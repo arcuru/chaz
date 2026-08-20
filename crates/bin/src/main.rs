@@ -667,6 +667,7 @@ mod tests {
         resolve_state_dir,
     };
     use chaz_core::config::{Config, ServiceConfig};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -798,6 +799,27 @@ mod tests {
         // daemon start — which is what makes a restart work.
         drop(first);
         claim_daemon_role(Some(tmp.path())).expect("the claim is free once the holder is gone");
+    }
+
+    #[test]
+    fn socket_is_ready_requires_0600_even_while_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("eidetica.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        // A server that bound but has not chmodded yet: live, but the mode
+        // half of readiness is missing, so it must not count as ready.
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !super::socket_is_ready(&socket),
+            "a live socket with mode 0755 must not be ready"
+        );
+
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            super::socket_is_ready(&socket),
+            "a live socket with mode 0600 must be ready"
+        );
     }
 
     #[tokio::test]

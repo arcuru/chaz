@@ -156,7 +156,9 @@ web_search:
 # database file. Off by default; nothing connects to it yet.
 # service:
 #   enabled: true
-#   path: /run/user/1000/chaz-eidetica.sock   # default <state_dir>/eidetica.sock
+#   path: /run/user/1000/chaz/eidetica.sock   # default <state_dir>/eidetica.sock
+#   # service.path must sit inside a directory dedicated to this chaz peer:
+#   # eidetica chmods the socket's parent directory to 0700 on startup.
 
 # Extension capabilities — operator-level scoping.
 #
@@ -482,11 +484,12 @@ Eidetica's answer is service mode — one process owns the backend and serves it
 ```yaml
 service:
   enabled: true # default false
-  # path: /run/user/1000/chaz-eidetica.sock   # default <state_dir>/eidetica.sock
+  # path: /run/user/1000/chaz/eidetica.sock   # default <state_dir>/eidetica.sock
 ```
 
 - The socket defaults to `<state_dir>/eidetica.sock`, beside the database it fronts, rather than eidetica's per-user `$XDG_RUNTIME_DIR/eidetica/service.sock`. One user runs several chaz peers — a daemon and one or more transport bridges — and each owns a separate backend.
-- Serving the socket makes the state directory owner-only (mode `0700`); the socket itself is `0600`. Reaching it is reaching the daemon's own Instance, with everything that implies: sessions, transcripts, credentials, share tickets. Filesystem permissions are the whole authorization boundary.
+- Serving the socket makes its parent directory owner-only (mode `0700`); the socket itself is `0600`. Reaching it is reaching the daemon's own Instance, with everything that implies: sessions, transcripts, credentials, share tickets. Filesystem permissions are the whole authorization boundary.
+- A custom `service.path` must point inside a directory dedicated to this chaz peer: eidetica creates the socket's parent directory and chmods it to `0700` on startup, so a path directly under a shared directory such as `/tmp` would make that directory owner-only for every process on the machine. The default `<state_dir>` is already such a per-peer directory.
 - A second daemon on the same state directory refuses to start, before it opens the database. The interlock is a `flock` on `<state_dir>/daemon.lock` held for the daemon's life, so two daemons starting at the same instant cannot both conclude they are first, and a crashed daemon leaves no lock to clean up. A live socket at the configured path is a second, independent refusal — eidetica's service server unlinks whatever socket it finds rather than checking.
 - The socket is unlinked on clean shutdown (Ctrl-C or SIGTERM). A socket file nobody is listening on is a crash leftover and counts as no daemon at all.
 
