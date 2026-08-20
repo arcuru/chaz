@@ -302,6 +302,42 @@ The `<provider>/<model>` naming means **multiple models coexist on the same DB**
 
 When both rankers produce hits, results are fused with **RRF** (`k=60`, [Cormack et al. 2009](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)): each entry's combined score is `1/(60 + rank_BM25) + 1/(60 + rank_cosine)`, summed over whichever lists it appears in. Entries in only one ranker still surface; entries in both are boosted. The top `limit` are returned.
 
+### Measured recall
+
+Ranking quality is measured, not assumed. `dev/memory-corpus/build_corpus.py` turns the docs you are reading into a 200-entry corpus (`crates/lib/src/tools/testdata/memory_corpus.json`) with two query sets, and `crates/lib/src/tools/memory_corpus_tests.rs` runs `recall` over it:
+
+- **Title queries** (200) — each entry's own section heading. Known-item retrieval where the query shares the document's vocabulary. BM25's best case.
+- **Paraphrase queries** (28) — hand-written questions that deliberately avoid the document's wording ("stop the model reaching machines on my home LAN" → the network-grants entry). BM25's worst case.
+
+Recall@k with `embeddinggemma:300m` served over an OpenAI-compatible endpoint, 768-dimension vectors, no prompt prefixes on either the stored text or the query:
+
+| Query set  |   k | BM25 only | Hybrid    |
+| ---------- | --: | --------- | --------- |
+| title      |   1 | 0.695     | **0.755** |
+| title      |   3 | 0.890     | **0.900** |
+| title      |   5 | 0.935     | **0.940** |
+| title      |  10 | **0.980** | 0.975     |
+| paraphrase |   1 | 0.214     | **0.286** |
+| paraphrase |   3 | 0.250     | **0.357** |
+| paraphrase |   5 | 0.321     | **0.429** |
+| paraphrase |  10 | 0.321     | **0.536** |
+
+Four things to take from it:
+
+- **The semantic leg earns its keep on paraphrases, which is the case that matters.** Auto-recall builds its query from the last few conversation messages, so it is a paraphrase query almost by construction — a user does not repeat a memory's wording back at it. At `k=10` semantic ranking nearly doubles paraphrase recall.
+- **BM25 alone plateaus.** Paraphrase recall is 0.321 at both `k=5` and `k=10`: an entry sharing no token with the query is dropped from the BM25 list entirely, so widening the result set cannot reach it. Only the semantic leg keeps climbing with depth.
+- **Fusion is unweighted, so a weak embedding model costs recall.** RRF gives both legs the same say. On the lexical best case at `k=10`, hybrid is fractionally _behind_ BM25 — the semantic ranker displaces a correct lexical hit. With a genuinely poor model the loss is larger; the corpus suite pins that behaviour with a deliberately near-noise embedder and sees title recall@5 fall from 0.935 to 0.850. Measure a candidate model before adopting it.
+- **A model's own conventions are not applied.** Some embedding models expect the text to be wrapped in task-specific prefixes and score worse without them. Chaz embeds `key + " " + value` and the raw query, verbatim, on both sides — consistently, so nothing is mismatched, but a model with strong prefix conventions will not be at its best.
+
+Reproduce the table with the ignored harness (it needs a reachable endpoint and makes ~430 embedding calls):
+
+```bash
+CHAZ_EMBED_API_BASE=http://127.0.0.1:8091/v1 \
+CHAZ_EMBED_MODEL=embeddinggemma:300m \
+CHAZ_EMBED_PROVIDER=llama-swap \
+cargo test -p chaz-core --all-features --lib live_hybrid_vs_bm25 -- --ignored --nocapture
+```
+
 ### Where settings live
 
 The embedding system spans three storage layers, and it's worth knowing which is which because they have very different lifecycle and sync behavior.
@@ -334,7 +370,7 @@ The hybrid path degrades gracefully — none of these scenarios error out:
 | Empty `query` string                                         | Recency sort over the surviving entries.                  |
 | Query matches no BM25 token AND no semantic match            | Returns "No memories found …"                             |
 
-The guarantee: configuring an embedder never makes recall worse, and a flaky embedding service never costs you a memory write.
+The guarantee is about availability, not ranking: an embedder that is missing, unconfigured or broken falls back to the lexical baseline, and a flaky embedding service never costs you a memory write. A _working_ embedder is a second opinion with an equal vote — a poor model can rank a correct lexical hit out of the top `k`. See [Measured recall](#measured-recall).
 
 ## What Doesn't Exist (Any More)
 

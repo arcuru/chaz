@@ -896,3 +896,7 @@ fn doc_text(entry: &MemoryEntry) -> String {
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "memory_corpus_tests.rs"]
+mod corpus_tests;

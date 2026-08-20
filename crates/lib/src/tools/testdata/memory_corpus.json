@@ -1,0 +1,1320 @@
+{
+  "source": "docs/src/**/*.md, one entry per level-2/3 heading",
+  "generator": "dev/memory-corpus/build_corpus.py",
+  "entries": [
+    {
+      "key": "architecture/extensions.md#1-drain-path-global-only",
+      "value": "installall (mod.rs) validates every manifest, pushes the extensions onto the hub, then for each Global extension builds its instance and calls drainglobalinstance. The drain pumps the instance's endpoints into the hub's legacy registries: - tools() \u2192 the owner-attributed tool map (and from there into the runtime ToolRegistry, built in main.rs from hub.toolsforregistry()). - commands() \u2192 the hub command map (first-write-wins; built-in reserved names win over extension registra",
+      "tags": ["architecture", "extensions"],
+      "title_query": "1. Drain path (Global only)"
+    },
+    {
+      "key": "architecture/extensions.md#2-live-instance-path-per-turn",
+      "value": "System-prompt and context-tail augmentation consult live instances directly each turn. augmentsystemprompt and contexttails (mod.rs) call contextinstances(agentname, sessiondb), which returns the deduped union of per-session \u222a per-agent instances (session wins on name collision; Global is intentionally excluded \u2014 those endpoints need session/agent context Global instances don't carry), then asks each for promptaugmentation / contexttail. Per-session active-set filtering appli",
+      "tags": ["architecture", "extensions"],
+      "title_query": "2. Live-instance path (per-turn)"
+    },
+    {
+      "key": "architecture/extensions.md#extensioninstance-endpoints",
+      "value": "What an instance exposes back to the host (instance.rs). All default to empty / None: - Tools \u2014 tools() -> Vec<Arc<dyn Tool>> - Commands \u2014 commands() -> Vec<(String, Arc<dyn ExtensionCommand>)> - Per-turn context \u2014 promptaugmentation(), contexttail() - Extension-to-extension caps \u2014 memoryaccess(), messenger(), and the TypeId-keyed escape hatch extensioncap(typeid) - Hook handlers \u2014 beforeagentstarthook(), toolcallhook(), toolresulthook(), agentendhook(), sessionstarthook(), s",
+      "tags": ["architecture", "extensions"],
+      "title_query": "ExtensionInstance endpoints"
+    },
+    {
+      "key": "architecture/extensions.md#hook-kinds",
+      "value": "Every registration is tagged with a HookKind, and every extension declares in supportedhooks() which kinds it intends to use: Declaration drives security (only declared kinds run; for sandboxed extensions this becomes the manifest the host inspects before loading), efficiency (the hub skips extensions that don't handle a kind), and inspection (/extensions list).",
+      "tags": ["architecture", "extensions"],
+      "title_query": "Hook kinds"
+    },
+    {
+      "key": "architecture/extensions.md#lazy-population",
+      "value": "Global instances are built eagerly at the tail of installall. PerSession and PerAgent instances are built lazily the first time a turn touches them: - ensuresessioninstances(sessiondb) \u2014 instantiates every PerSession extension for a session, keyed by session DB root ID. - ensureagentinstances(agentname, agentdb) \u2014 the mirror for PerAgent, keyed by agent DB root ID (so two sessions driven by the same agent share one instance). Per-agent resolution at turn time goes through ens",
+      "tags": ["architecture", "extensions"],
+      "title_query": "Lazy population"
+    },
+    {
+      "key": "architecture/extensions.md#scopes-lifecycle",
+      "value": "Scope (instance.rs) has three values, each with its own lifecycle and its own instance map on the hub: An extension that contributes at multiple scopes returns each scope in the slice (e.g. memory and skills are Global, PerSession \u2014 Global tools/commands plus a per-session context tail). The host calls instantiate once per scope; the ScopeCtx variant matches the scope being built: PeerHandles is the peer-level bag every instance closes over at construction: the SessionRegistr",
+      "tags": ["architecture", "extensions"],
+      "title_query": "Scopes & lifecycle"
+    },
+    {
+      "key": "architecture/extensions.md#two-level-model",
+      "value": "Every extension is two traits, both in crates/lib/src/extension/: - Extension (mod.rs) \u2014 the static declaration. It knows its name(), manifest(), supportedhooks(), the scopes() it lives at, and how to instantiate(ScopeCtx) -> ExtensionInstance. It holds no per-turn state. - ExtensionInstance (instance.rs) \u2014 the runtime view, one per live scope. It publishes everything it contributes through typed endpoints, each defaulting to empty; an instance overrides only what it actually",
+      "tags": ["architecture", "extensions"],
+      "title_query": "Two-level model"
+    },
+    {
+      "key": "architecture/overview.md#bridges",
+      "value": "Bridges translate between a transport (Matrix, terminal) and the session database. They: - Write user messages as SessionEntry records to the session DB - Register onlocalwrite callbacks to detect agent responses - Deliver responses to their transport Bridges are transport-specific but the server is transport-agnostic. Adding a new bridge (Slack, Discord, HTTP API) requires implementing the Bridge trait and writing/reading session entries. Design stance \u2014 a bridge is a transp",
+      "tags": ["architecture", "overview"],
+      "title_query": "Bridges"
+    },
+    {
+      "key": "architecture/overview.md#runtime",
+      "value": "The ReAct loop (runtime::execute) drives agent reasoning: 1. Build context from session history 2. Call LLM with tool definitions 3. If the LLM returns tool calls: check approval, execute with timeout, scan for leaks, feed results back 4. If the LLM returns text: return as the agent's response 5. After max iterations: force a summary The runtime emits RuntimeEvents (ToolCall, ToolResult) via an optional event sink for audit trail logging. Source: crates/lib/src/runtime.rs",
+      "tags": ["architecture", "overview"],
+      "title_query": "Runtime"
+    },
+    {
+      "key": "architecture/overview.md#server",
+      "value": "The callback-driven server watches session databases and spawns agent tasks: 1. Bridges call registersession to set up onlocalwrite callbacks 2. When a callback fires, the processing loop checks the latest entry 3. If it's a Message from a non-agent or a Directive, the server spawns an agent task 4. The agent writes its response to the session DB, triggering bridge callbacks Per-session serialization ensures only one agent task runs per session at a time, preventing duplicate",
+      "tags": ["architecture", "overview"],
+      "title_query": "Server"
+    },
+    {
+      "key": "architecture/overview.md#session-model",
+      "value": "Each conversation is an eidetica Database containing a Table<SessionEntry> (history) and a DocStore called meta (session config: name, agent, model, role, backend). Sessions are identified globally by their DB root ID. The SessionRegistry holds index stores only: sessions, matrixchannels (Matrix roomid \u2192 sessiondbid, fan-out supported), and sessionnames. See Session Model(sessions.md) for details.",
+      "tags": ["architecture", "overview"],
+      "title_query": "Session Model"
+    },
+    {
+      "key": "architecture/overview.md#system-diagram",
+      "value": "Three peer-local layers, none synced: user.databases() (eidetica's catalog of every DB this peer holds keys for) is the source of truth for \"which DBs do we host\"; HostedIndex is an in-memory cache derived from it at startup; chazgroup holds session/channel/name indices; chazpeer holds credentials and cron/schedule state. Sync-ful state lives in per-session, per-agent, and per-bank DBs.",
+      "tags": ["architecture", "overview"],
+      "title_query": "System Diagram"
+    },
+    {
+      "key": "architecture/overview.md#tool-system",
+      "value": "Tools implement the Tool trait (descriptor + execute). ToolPolicy controls risk level, approval requirements, and timeouts. ScopedTools provides per-agent tool visibility with transitive narrowing. Tools access system resources through the ToolHost trait \u2014 a sandboxed capability boundary. The default NativeToolHost executes capabilities in-process with grant enforcement; future WASM and bubblewrap hosts provide VM-level and OS-level sandboxing without changing any tool code. ",
+      "tags": ["architecture", "overview"],
+      "title_query": "Tool System"
+    },
+    {
+      "key": "architecture/react.md#concurrency",
+      "value": "The server uses a global Semaphore(10) to cap concurrent LLM calls across all sessions. Agent tasks acquire a permit before calling the runtime.",
+      "tags": ["architecture", "react"],
+      "title_query": "Concurrency"
+    },
+    {
+      "key": "architecture/react.md#context-assembly",
+      "value": "The ContextBuilder assembles session entries into RuntimeMessage vectors within a token budget. The runtime receives these pre-built messages: AssistantToolCalls and ToolResult messages are maintained in the runtime's local message vector (not written to the session during the loop -- the event sink handles that separately).",
+      "tags": ["architecture", "react"],
+      "title_query": "Context Assembly"
+    },
+    {
+      "key": "architecture/react.md#event-sink",
+      "value": "The runtime accepts an optional RuntimeEventSink (an mpsc::Sender<RuntimeEvent>). When provided, it emits events during the loop: - RuntimeEvent::ToolCall -- before executing a tool - RuntimeEvent::ToolResult -- after a tool returns The server consumes these events and writes ToolCall and ToolResult entries to the session DB for audit trail and TUI display.",
+      "tags": ["architecture", "react"],
+      "title_query": "Event Sink"
+    },
+    {
+      "key": "architecture/react.md#fallback-behavior",
+      "value": "- If the backend doesn't support tool calling, the runtime falls back to a single-shot LLM call. - If the first tool-aware call fails after retries, it retries once without tools (covers models/providers that advertise tools but reject the schema). - A LoopDetector fingerprints each tool-call set (name + canonical args); when the same fingerprint repeats LOOPDETECTIONTHRESHOLD times the runtime pushes a \"you're stuck in a loop\" User message and breaks out. - If MAXTOOLITERATI",
+      "tags": ["architecture", "react"],
+      "title_query": "Fallback Behavior"
+    },
+    {
+      "key": "architecture/react.md#security-gates",
+      "value": "Each tool call passes through multiple checks. Most are unconditional; the extension hooks fire only when an extension is registered for that hook kind and is active on the session. 1. Rate limiting: If the tool's resolved policy carries a ratelimit, a sliding-window counter checks the call frequency. Excess calls are rejected before execution. 2. Approval gate: Checks the tool's ApprovalRequirement against the SecurityContext. If approval is needed, sends an ApprovalExchange",
+      "tags": ["architecture", "react"],
+      "title_query": "Security Gates"
+    },
+    {
+      "key": "architecture/sessions.md#assistant-responsemetadata",
+      "value": "Every assistant Message entry carries an optional ResponseMetadata: the model name, an optional provider and response ID, a TokenUsage (prompt/completion/cached/cachecreation/reasoning tokens plus an optional costusd), and any extra wire-format fields the backend retained. This is populated from the LLMResponse returned by the configured LLMBackend at the moment the assistant turn is committed to the session DB \u2014 there is no separate billing log. crates/lib/src/session/usage.",
+      "tags": ["architecture", "sessions"],
+      "title_query": "Assistant `ResponseMetadata`"
+    },
+    {
+      "key": "architecture/sessions.md#compaction",
+      "value": "The compact tool and /compact TUI command write a Summary entry to the session. The ContextBuilder treats the most recent Summary as the conversation start boundary, effectively replacing older messages with the summary.",
+      "tags": ["architecture", "sessions"],
+      "title_query": "Compaction"
+    },
+    {
+      "key": "architecture/sessions.md#context-building",
+      "value": "ContextBuilder (in context.rs) assembles the LLM context within a token budget: 1. Account for system prompt and tool definition tokens first 2. Find the most recent Summary entry (context boundary \u2014 older entries excluded) 3. Filter for Message, Directive, and Summary entries 4. Fill from newest messages backward until the token budget is exhausted 5. Map senders to roles: current agent name = assistant, everything else = user Token estimation uses tiktoken (cl100kbase BPE t",
+      "tags": ["architecture", "sessions"],
+      "title_query": "Context Building"
+    },
+    {
+      "key": "architecture/sessions.md#matrix-channels",
+      "value": "A Matrix channel is an explicit (roomid \u2192 sessiondbid) attachment. A room's first message auto-creates a session and a channel. !chaz attach <session> rebinds a room to a different session; !chaz detach removes the binding; !chaz channels lists rooms attached to the current session. At Matrix bridge startup, every persisted channel for a joined room receives both server-processing and response-delivery callbacks \u2014 this is how scheduled-session responses reach Matrix even when",
+      "tags": ["architecture", "sessions"],
+      "title_query": "Matrix channels"
+    },
+    {
+      "key": "architecture/sessions.md#named-sessions",
+      "value": "Sessions can be given human-friendly names via setsessionname() (TUI: /name <alias>). Names are persisted in the registry's sessionnames index and mirrored into the session's meta doc. resolvesession() tries name \u2192 DB ID, so names work everywhere a session identifier is accepted (/join, schedules, etc.).",
+      "tags": ["architecture", "sessions"],
+      "title_query": "Named Sessions"
+    },
+    {
+      "key": "architecture/sessions.md#session-registry",
+      "value": "A session is identified solely by the root ID of its own eidetica Database. The SessionRegistry holds three index stores inside the peer-local chazgroup DB \u2014 nothing load-bearing about a session lives here: - sessions: every known sessiondbid \u2192 origin tag (for debugging/listing) - matrixchannels: Matrix roomid \u2192 sessiondbid (fan-out supported \u2014 one session may receive responses on many rooms) - sessionnames: human-friendly name \u2192 sessiondbid The canonical per-session configur",
+      "tags": ["architecture", "sessions"],
+      "title_query": "Session Registry"
+    },
+    {
+      "key": "architecture/sessions.md#what-enters-the-llm-context",
+      "value": "Only Message, Directive, and Summary entries enter the conversation portion of the LLM context. The context builder maps senders to roles: entries from the current agent become assistant messages, all others become user messages. The system prompt is assembled fresh every turn from the agent's systemprompt + systempromptfiles (resolved at agent construction) plus PromptAugmentation contributions from the extension hub (skills, memory recall, \u2026) and the optional multi-agent ro",
+      "tags": ["architecture", "sessions"],
+      "title_query": "What Enters the LLM Context"
+    },
+    {
+      "key": "architecture/tools.md#adding-a-new-tool",
+      "value": "Tools are published by extensions(extensions.md). The Tool impl is the tool's behavior; the extension is what wires it into the runtime registry. 1. Create crates/lib/src/tools/mytool.rs implementing Tool. 2. Add mod mytool; + pub use to crates/lib/src/tools/mod.rs. 3. Have an extension's ExtensionInstance::tools() return your Tool. Either add it to an existing built-in (e.g. extensions/core.rs for general tools) or create a new extension in crates/lib/src/extensions/myext.rs",
+      "tags": ["architecture", "tools"],
+      "title_query": "Adding a New Tool"
+    },
+    {
+      "key": "architecture/tools.md#scopedtools-and-narrowing",
+      "value": "ScopedTools provides a filtered view of the tool registry: When agent A spawns agent B, B's tools are computed as the intersection of A's current scope and B's allowedtools. This is transitive -- tools can only decrease down the spawn tree. Allowlist entries support glob patterns: \"filesystem.\" matches all tools with that namespace prefix (requires a dot after the prefix). This is useful for MCP tool namespaces. Glob patterns work across all ScopedTools operations: definition",
+      "tags": ["architecture", "tools"],
+      "title_query": "ScopedTools and Narrowing"
+    },
+    {
+      "key": "architecture/tools.md#tool-policy",
+      "value": "Each tool has a policy controlling its risk level, approval requirements, and execution timeout: Tools provide a defaultpolicy(). Config-level overrides in security.toolpolicies take precedence. The ToolPolicyRegistry resolves the effective policy per tool.",
+      "tags": ["architecture", "tools"],
+      "title_query": "Tool Policy"
+    },
+    {
+      "key": "architecture/tools.md#tool-trait",
+      "value": "Every tool implements the Tool trait: ToolDescriptor provides the tool's name, description, and a JSON Schema for its parameters. The LLM sees these as function definitions.",
+      "tags": ["architecture", "tools"],
+      "title_query": "Tool Trait"
+    },
+    {
+      "key": "architecture/tools.md#toolcontext",
+      "value": "The ToolContext is passed to every tool execution: Before each tool call the runtime calls ctx.resolvecallgrants(&policy.grants, toolname), which attenuates the tool's policy grant through the session ceiling, the agent-wide cap, and the per-tool override (most-restrictive-wins; see Grants::attenuate(https://github.com/arcuru/chaz/blob/main/crates/lib/src/grants.rs)), and stores the result in grants. Tools use ctx.host() for system access (shell, file, network) and ctx.grants",
+      "tags": ["architecture", "tools"],
+      "title_query": "ToolContext"
+    },
+    {
+      "key": "architecture/tools.md#toolerror",
+      "value": "Tool execution failures are classified by a typed ToolError enum so the runtime can make retry/re-prompt decisions: From<String> and From<&str> are implemented so tools that produce untyped errors (e.g. via ? on helpers returning Result<, String>) auto-convert to Execution. ToolError::isretryable() returns true for Timeout and Network; the runtime retries Network errors once with a 500ms backoff (Timeout is deliberately NOT retried because the partial work may have succeeded)",
+      "tags": ["architecture", "tools"],
+      "title_query": "ToolError"
+    },
+    {
+      "key": "architecture/tools.md#toolhost",
+      "value": "The ToolHost trait is the sandboxed capability boundary between tools and the operating system. Tools request capabilities (shell commands, file I/O, HTTP requests) through the host rather than calling OS APIs directly: The host enforces grants at the capability boundary \u2014 the tool says what it wants to do, the host decides whether to allow it and how to execute it. Two ToolHost implementations live in-tree: Tools (shell, web, file) call ctx.host().request() against the trait",
+      "tags": ["architecture", "tools"],
+      "title_query": "ToolHost"
+    },
+    {
+      "key": "design/agent_schedules.md#chaz-as-runtime",
+      "value": "The engine's discovery inverts: it enumerates hosted agents and reads their schedule registries, rather than scanning session DBs for routine rows. The existing \"does this peer host the target agent?\" check (heartbeat.rs:169, today only multi-peer dedup) becomes the dispatch gate \u2014 the ownership boundary falls out naturally.",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "chaz as runtime"
+    },
+    {
+      "key": "design/agent_schedules.md#execution-path-decided-standalone-never-touches-the-target-s-runtime",
+      "value": "A fired schedule's turn runs through a standalone execution path, not the interactive processsession \u2192 SessionRuntime \u2192 spawnagenttask machinery. This is a hard requirement: a Pinned target may be a live session a user is actively conversing in, and the schedule turn must not mutate or hijack that session's SessionRuntime (its agentoverride, backend, completion channel, watcher wiring). Reusing registerchildsession (which pins the agent by overwriting SessionRuntime.agentover",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "Execution path (decided: standalone; never touches the target's runtime)"
+    },
+    {
+      "key": "design/agent_schedules.md#intrinsic-routing-private-wake-prompt",
+      "value": "Because the schedule belongs to the agent, the fire path invokes that agent directly and never consults resolveagentforentry. The wake-prompt is invocation-scoped context for that turn \u2014 not a broadcast Directive entry. The agent's resulting tool calls and any Message are written to the target session as normal entries (audit + visibility land where they belong); the prompt itself is not a shared entry.",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "Intrinsic routing & private wake-prompt"
+    },
+    {
+      "key": "design/agent_schedules.md#lifecycle-bounds-gap-4",
+      "value": "A Cron schedule is infinite by default; OneShot retires itself. Two optional bounds make finite recurring work expressible without a third trigger type: - expiresat \u2014 an absolute instant after which the schedule stops. Robust across restarts for free (absolute time). - maxfires \u2014 retire after N fires. Needs a persisted counter, so firecount lives in the agent DB (authoritative), not just the engine's in-memory routine. Enforcement is at the fire path (Server::fireagentschedul",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "Lifecycle bounds (Gap 4)"
+    },
+    {
+      "key": "design/agent_schedules.md#model",
+      "value": "A Schedule is owned by an agent and stored in that agent's Living-Agent DB (the same signed eidetica DB that already holds the agent's config/meta/history). Schedules therefore sync and travel with the agent across peers, exactly like its config. - Pinned \u2014 \"resume this session at 9pm and check in.\" The agent's home/default session is not a separate concept \u2014 it is just a Pinned schedule whose sessiondbid is that session. - Fresh \u2014 \"every 9pm, go do X\" \u2014 an autonomous recurri",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "Model"
+    },
+    {
+      "key": "design/agent_schedules.md#problem",
+      "value": "Today scheduled wakes are session-owned: Routine rows live in each session DB's routines table; HeartbeatPayload merely names a target agent; RoutineEngine discovers work by scanning sessions; the HeartbeatRoutineHandler writes a Directive entry that processsession then routes through resolveagentforentry (override \u2192 @mention \u2192 host \u2192 first-authorized \u2192 default). Consequences: - In a multi-agent session a wake \"for @beta\" can be answered by whoever the generic resolver picks ",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "Problem"
+    },
+    {
+      "key": "design/agent_schedules.md#summary",
+      "value": "A schedule is an agent-owned object: it belongs to an agent (e.g. ava), not to a session. chaz is the runtime \u2014 it hosts one or more agents, and on boot it loads each hosted agent and registers that agent's schedules. When a schedule fires, chaz loads the owning agent, resolves the schedule's target (an existing pinned session, or a fresh session created per fire), builds context as that agent, feeds the wake-prompt as private invocation input, and runs the agent's loop. The ",
+      "tags": ["design", "agent_schedules"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/agent_state_admin.md#capability-kind",
+      "value": "Add a new host-only variant to CapabilityKind: ishostonly() returns true for this variant (same as SessionRead/SessionWrite).",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Capability Kind"
+    },
+    {
+      "key": "design/agent_state_admin.md#capability-request",
+      "value": "The agents field is not set by the extension's manifest author \u2014 it's set by the operator in toolpolicy and injected into the caps bundle by the hub during resolution. The manifest only declares the kind; the operator configures the scope.",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Capability Request"
+    },
+    {
+      "key": "design/agent_state_admin.md#problem",
+      "value": "Heartbeat tools (scheduleadd, schedulemodify, scheduleremove, schedulelist, scheduleonce) read and write agent-owned schedules in the target agent's eidetica DB. Today they receive an Arc<dyn AgentDbAccess> handle at construction time \u2014 an untyped, unscoped, undeclared capability: 1. Not in the cap system. CapabilityKind has no variant for \"access agent state.\" The trait exists in tools/schedule.rs, invisible to manifests, extensions, or the hub. 2. No attenuation. The handle",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Problem"
+    },
+    {
+      "key": "design/agent_state_admin.md#scoped-wrapper",
+      "value": "The hub's factory builds a scoped implementation from the raw infrastructure handles:",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Scoped Wrapper"
+    },
+    {
+      "key": "design/agent_state_admin.md#security-posture",
+      "value": "> This capability system is a guardrail, not a sandbox. It is designed to stop a poorly behaving agent or tool from doing accidental damage \u2014 deleting the wrong schedule, scheduling noise into another agent's DB, writing to a path outside ~/code/. It is not designed to contain an LLM or tool that is explicitly, adversarially trying to escape. If we can achieve the latter, that's great, but it is not the requirement driving this design. The distinction matters: The ceiling (ex",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Security posture"
+    },
+    {
+      "key": "design/agent_state_admin.md#tool-changes",
+      "value": "Heartbeat tools drop HostedIndex and Arc<dyn AgentDbAccess>, receive Arc<dyn AgentStateAdmin> from the caps bundle instead: resolvetargetagent changes from: to: The openagentdb helper uses cap.openagentdb(&entry).await instead of access.openagentdb(&entry).await.",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Tool Changes"
+    },
+    {
+      "key": "design/agent_state_admin.md#trait",
+      "value": "Note: resolveagent replaces the HostedIndex::findbyname calls the tools currently make. The match-by-ID path (eidetica::entry::ID::parse) is absorbed into the trait impl \u2014 the tool doesn't need to know whether the user passed a name or a DB id; the cap resolves both against the scoped set.",
+      "tags": ["design", "agent_state_admin"],
+      "title_query": "Trait"
+    },
+    {
+      "key": "design/autonomous_agents.md#change-1-relax-the-loop-guard-mention-gated",
+      "value": "processsession's shouldprocess gains a branch for agent-authored Message entries: Excluding displayname == sender stops an agent waking itself with a self-mention. Requiring the mention target to be attached (authorized on the session) means a stray @someone in prose can't wake anything.",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "Change 1 \u2014 relax the loop guard (mention-gated)"
+    },
+    {
+      "key": "design/autonomous_agents.md#change-2-resolution-for-the-agent-agent-case",
+      "value": "Reuse resolveagentforentry, which is already mention-aware, with one added constraint: when the triggering entry's sender is an agent, the resolved agent must be a mentioned, attached agent other than the sender. The human-message path keeps its full precedence chain (mention \u2192 host \u2192 first authorized \u2192 \u2026) untouched.",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "Change 2 \u2014 resolution for the agent\u2192agent case"
+    },
+    {
+      "key": "design/autonomous_agents.md#current-behavior",
+      "value": "All invocation flows through the session-messaging primitive (see Session Messaging(./sessionmessaging.md)). The relevant constraints: - Loop guard (server.rs, processsession): Any Message authored by a known agent \u2014 including the agent's own reply and any other agent's \u2014 is ignored. This is the hard wall preventing agent\u2194agent loops, and it is exactly what blocks the chat-room model. - Single speaker: resolveagentforentry (session/agents.rs) returns one agent by precedence: ",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "Current Behavior"
+    },
+    {
+      "key": "design/autonomous_agents.md#goals",
+      "value": "1. An agent's Message may wake another attached agent when, and only when, it @mentions that agent by display name. 2. The decision is pure heuristic \u2014 no classifier, no extra tokens. 3. Agent\u2192agent recursion is bounded and cannot run away on cost. 4. The human\u2192agent path has zero behavior change (no regression).",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "Goals"
+    },
+    {
+      "key": "design/autonomous_agents.md#non-goals-v1",
+      "value": "- Ambient participation (every agent free-evaluating every message). - Any LLM-based \"is this for me?\" gate. - Parallel speakers / concurrent agent turns in one session. - Time-window heuristics (\"respond if last message > 30s old\"). - Proactive / heartbeat-driven speaking. These are deferred to later phases \u2014 see multi-agent.md(../../../../brain/ava/research/chaz-ecosystem/multi-agent.md) (Phase 4) for the broader vision. v1 is the minimum that makes the room real.",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "Non-Goals (v1)"
+    },
+    {
+      "key": "design/autonomous_agents.md#summary",
+      "value": "Today a session is a 1:1 router: a human message wakes exactly one agent, which replies, and processing stops. This design turns a session into a chat room: multiple agents are members, and an agent's message can wake another agent. v1 keeps this deliberately small and safe \u2014 an agent only wakes another agent when it explicitly @mentions an attached agent, and the decision to respond uses no extra LLM call. Runaway loops are bounded by a per-burst turn budget derived from the",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/autonomous_agents.md#the-seam-stays-where-it-is",
+      "value": "No fan-out evaluator is needed. The existing notify \u2192 processsession loop already re-fires whenever a new entry is written. When an agent writes its reply Message, that write re-triggers processsession on the latest entry. So the only changes are to (a) what processsession decides to act on and (b) which agent it resolves \u2014 recursion falls out of the existing callback chain, naturally serialized by the per-session lock.",
+      "tags": ["design", "autonomous_agents"],
+      "title_query": "The seam stays where it is"
+    },
+    {
+      "key": "design/autonomous_memory.md#config-default-memory-banks",
+      "value": "New field on AgentDbConfig (and yaml agents:): At agent DB bootstrap / reload: 1. For each bank name in defaultmemorybanks: 2. Find the bank DB via HostedIndex (or findmemorybank) 3. If the agent doesn't already have a MemoryBankRef to it: - Grant Write auth on the bank DB to the agent's pubkey - Write a MemoryBankRef { dbid, name, permission: Write } into the agent's memorybanks store 4. Same pattern as memorygrant in crates/lib/src/commands/memory.rs This is idempotent \u2014 re",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "Config: default_memory_banks"
+    },
+    {
+      "key": "design/autonomous_memory.md#memory-attach-and-memory-detach",
+      "value": "Session-scoped commands for shared context: Adds the bank to the current session's active bank set (stored in session.extensionsettings\"memory\".attachedbanks). The bank must already be granted to the agent running this session. Removes the bank from the session's active set. Does not revoke the grant \u2014 the bank remains accessible via remember bank=<name> and future sessions. Session-scoped attachment is lighter weight than the global defaultmemorybanks \u2014 it's for temporary co",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "/memory attach and /memory detach"
+    },
+    {
+      "key": "design/autonomous_memory.md#memoryaccess-cap-impl",
+      "value": "The extension publishes CapProvider::MemoryAccess(Arc<MemoryAccessImpl>). The impl delegates to the existing searchmemory and writememoryentry functions in crates/lib/src/tools/memory.rs \u2014 no duplication. MemoryScope::Agent \u2192 agent's own AgentDb::memory. MemoryScope::Bank { name } \u2192 resolve bank name via HostedIndex, search MemoryBankDb::memory. This makes memory consumable by other extensions (e.g. a future todo extension that stores checklist state in a shared bank without ",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "MemoryAccess cap impl"
+    },
+    {
+      "key": "design/autonomous_memory.md#problem",
+      "value": "Today the memory extension provides manual tools (remember/recall) but does nothing autonomous. An agent must explicitly remember facts and explicitly recall them. There's no: 1. Autonomous surfacing \u2014 relevant memories don't appear in the system prompt unless the agent calls recall. The agent's own stored knowledge sits unused. 2. Cross-agent shared context \u2014 memory banks exist (/memory grant works) but there's no config-driven attachment. Banks are manually attached per ses",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "Problem"
+    },
+    {
+      "key": "design/autonomous_memory.md#promptaugmentation-memory-surfacing",
+      "value": "The MemoryPromptAugmentation provider: 1. Receives agentname and recentmessagetext (the last ~5 user/assistant messages as text) 2. Extract meaningful query terms from those messages (stoplist-filtered, same tokenizer as recall) 3. Search the agent's own memory store (always active) 4. Search each attached bank (from memorybanks store) 5. Combine results with RRF (k=60), take top 5 6. Format as a compact block:",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "PromptAugmentation: memory surfacing"
+    },
+    {
+      "key": "design/autonomous_memory.md#summary",
+      "value": "What exists: - crates/lib/src/extensions/memory.rs \u2014 registers remember, recall, listmemorybanks tools - crates/lib/src/agentdb.rs \u2014 per-agent memory store (Table<MemoryEntry>) - crates/lib/src/memorybankdb.rs \u2014 standalone shared memory bank DBs - crates/lib/src/commands/memory.rs \u2014 /memory new|list|delete|grant|revoke|share|import - crates/lib/src/extension/caps.rs \u2014 MemoryAccess trait (defined, no impl), PromptAugmentation trait - BM25 + cosine hybrid search in crates/lib/s",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/autonomous_memory.md#what-we-do-not-do-v2-territory",
+      "value": "OMP's memory pipeline has three phases we're explicitly deferring: 1. Per-session extraction \u2014 reading past session transcripts with an LLM to extract durable knowledge (technical decisions, resolved failures, recurring workflows). This is expensive (one LLM call per past session) and needs a job queue. 2. Cross-session consolidation \u2014 merging per-session extractions into a curated MEMORY.md document and generated skill playbooks. This is the \"what did we learn across all ses",
+      "tags": ["design", "autonomous_memory"],
+      "title_query": "What we do NOT do (v2 territory)"
+    },
+    {
+      "key": "design/capability_tiers.md#model-four-tiers-composed-by-attenuation",
+      "value": "Effective authority for any single capability request is the intersection of four scopes: Each inner tier can only subtract. Resolution lives in ToolContext::resolvecallgrants, called once per tool invocation.",
+      "tags": ["design", "capability_tiers"],
+      "title_query": "Model: four tiers, composed by attenuation"
+    },
+    {
+      "key": "design/capability_tiers.md#policy-layer-vs-enforcement-point",
+      "value": "All four tiers resolve to one effective Grants, but where each becomes real differs: - Agent capabilities, per-tool override, tool policy are pure policy resolution \u2014 they intersect into the effective Grants the host receives and checks in-process. - Session ceiling is the tier that ultimately wants a stronger enforcement point. \"No network this session\" is a network namespace with no interface; \"confined to /work\" is a mount whose only bind is the working dir. A grant string",
+      "tags": ["design", "capability_tiers"],
+      "title_query": "Policy layer vs. enforcement point"
+    },
+    {
+      "key": "design/capability_tiers.md#problem",
+      "value": "Capability grants were a flat, per-tool map (HashMap<String, Grants> keyed by tool name) composed by mergeover, which did per-kind replacement. Two flaws followed: 1. No chokepoint. Authority was sliced per-tool, but resources are shared across tools \u2014 the filesystem is reachable through both shell and writefile; the network through both webfetch and shell (curl). \"This agent has no network\" or \"this session is confined to /work\" was inexpressible as a single setting; you had",
+      "tags": ["design", "capability_tiers"],
+      "title_query": "Problem"
+    },
+    {
+      "key": "design/capability_tiers.md#status",
+      "value": "- Done: the attenuate operator; the four-tier resolution; agent-wide capabilities; session capabilities on SessionMeta; FsGrant enforcement in execfileread/execfilewrite (advisory \u2014 lexical path-prefix bound, symlinks not followed). - Deferred (per-session enforced host): today ToolContext.host is effectively a global NativeToolHost that checks grants in-process. The remaining work is to construct the host per session from the resolved ceiling \u2014 first as the grant holder, the",
+      "tags": ["design", "capability_tiers"],
+      "title_query": "Status"
+    },
+    {
+      "key": "design/capability_tiers.md#the-attenuate-operator",
+      "value": "Grants::attenuate(self, narrower) is monotonic (most-restrictive-wins), replacing mergeover. Per capability kind: - Allowlists (shell.allow, network.endpoints, fs.allowread/write) \u2192 intersection. Each is an Allowlist<T> with an explicit permissive state: Permissive (the omitted/default) is the top, so Permissive \u2229 X = X, while Only(list) intersects normally \u2014 and an empty Only() is deny-all that intersects to deny-all. This three-state encoding (vs. a bare Vec where empty mea",
+      "tags": ["design", "capability_tiers"],
+      "title_query": "The `attenuate` operator"
+    },
+    {
+      "key": "design/model_info_store.md#how-the-runtime-uses-it",
+      "value": "- At startup, Server::warmmodelwindows reads contextwindows() into the default backend's overlay (BackendManager::setmodelwindows). The overlay lives behind a shared Arc, so it also reaches every per-session worker backend cloned from the default. - BackendManager::contextwindow resolves in two tiers: a YAML-declared contextwindow: (explicit operator intent \u2014 wins), then the overlay (the zero-config path). None only when neither knows the model, in which case the budget falls",
+      "tags": ["design", "model_info_store"],
+      "title_query": "How the runtime uses it"
+    },
+    {
+      "key": "design/model_info_store.md#how-the-store-gets-populated",
+      "value": "A model lands in the store via two triggers (both, by design): 1. On switch \u2014 when you pick a model in the TUI picker, dispatchmodelselection hands the merged ModelInfo to Server::cachemodelinfo, which slots its window into the live overlay and puts it into the store. 2. On first runtime use \u2014 when the runtime is about to budget a turn for a model whose window it doesn't yet know, spawnmodelwindowfetch (via Server::ensuremodelwindowcached) fetches that model's info from the l",
+      "tags": ["design", "model_info_store"],
+      "title_query": "How the store gets populated"
+    },
+    {
+      "key": "design/model_info_store.md#modelinfo-serialization",
+      "value": "ModelInfo (crates/lib/src/backends.rs) is the single shape used end-to-end \u2014 runtime display type, picker row, and the persisted value here. Every field except id pairs #serde(default) (older/sparser entries load cleanly) with skipserializingif (absent values aren't written at all), so a stored entry carries only the fields a model actually has. With the in-use set already tiny, this keeps each persisted map about as small as it can be.",
+      "tags": ["design", "model_info_store"],
+      "title_query": "`ModelInfo` serialization"
+    },
+    {
+      "key": "design/model_info_store.md#summary",
+      "value": "There are two different needs around model metadata, and they are served differently on purpose: 1. Browsing (the TUI picker) wants the whole provider catalog \u2014 hundreds of models with pricing and modality badges \u2014 but only transiently, while the picker is open. This is pulled live from the backend's /models endpoint and cached in memory for the session (App::sessioncatalog). It is never written to disk. 2. Budgeting (the runtime) wants the context window for the handful of m",
+      "tags": ["design", "model_info_store"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/model_info_store.md#the-ctx-n-gauge",
+      "value": "The status bar shows context occupancy as ctx N%. Two subtleties make it honest: - Numerator is a point-in-time high-water mark, not a running sum. It uses ResponseMetadata.contexttokens \u2014 the input token count of the turn's final LLM call \u2014 set by MetadataAccumulator (it overwrites this per call while it sums usage.prompttokens across ReAct iterations). Dividing the summed prompttokens would overshoot the window badly on multi-tool-call turns; contexttokens is how full the w",
+      "tags": ["design", "model_info_store"],
+      "title_query": "The `ctx N%` gauge"
+    },
+    {
+      "key": "design/model_info_store.md#the-in-memory-picker-catalog",
+      "value": "The browse catalog (App::sessioncatalog) is pulled live on first open and reused for the rest of the session (instant reopen, no re-fetch). The picker's refresh binding clears it to force a re-pull. It is gone on restart, where the next open re-fetches. Nothing about browsing touches the store \u2014 only selecting or using a model does. The tradeoff is deliberate: we give up an instant/offline picker across restarts (one /models HTTP call on first open per session) in exchange fo",
+      "tags": ["design", "model_info_store"],
+      "title_query": "The in-memory picker catalog"
+    },
+    {
+      "key": "design/model_info_store.md#what-s-persisted-and-where",
+      "value": "- DB: chazpeer (per-machine; not the synced chazgroup). - Store: one DocStore named modelinfo. - Key: a single fixed key, inuse. - Value: a JSON BTreeMap<modelid, ModelInfo> \u2014 the set of models in use. BTreeMap so the serialization is order-stable, which makes the no-write-on-unchanged check below exact. ModelInfoStore (crates/lib/src/modelinfostore.rs) exposes: - all() -> BTreeMap<id, ModelInfo> \u2014 read the whole in-use set. - contextwindows() -> {id -> window} \u2014 the windows ",
+      "tags": ["design", "model_info_store"],
+      "title_query": "What's persisted, and where"
+    },
+    {
+      "key": "design/session_messaging.md#design-goals",
+      "value": "1. Single invocation path: All agent execution goes through Server::processsession 2. Rich entry types: Sessions record not just chat messages but also directives, tool calls, and acknowledgments 3. Observable: The full ReAct loop is visible in the session database for debugging and audit 4. Extensible: New invocation sources (scheduler, inter-agent messages) use the same mechanism",
+      "tags": ["design", "session_messaging"],
+      "title_query": "Design Goals"
+    },
+    {
+      "key": "design/session_messaging.md#entry-types",
+      "value": "Directive entries are included in the LLM context as user role messages. This is because they are instructions to the agent, functionally equivalent to a user message.",
+      "tags": ["design", "session_messaging"],
+      "title_query": "Entry Types"
+    },
+    {
+      "key": "design/session_messaging.md#oncelock-for-circular-dependency",
+      "value": "SpawnAgent is registered in the ToolRegistry before Server exists (the server needs the registry). The circular dependency is resolved with Arc<OnceLock<Arc<Server>>>: 1. Create the OnceLock and pass it to SpawnAgent 2. Register SpawnAgent in the ToolRegistry 3. Create Server with the ToolRegistry 4. Set the OnceLock with the Server",
+      "tags": ["design", "session_messaging"],
+      "title_query": "OnceLock for Circular Dependency"
+    },
+    {
+      "key": "design/session_messaging.md#problem",
+      "value": "Originally, spawnagent called runtime::execute directly, bypassing the server's callback infrastructure. This created two separate invocation paths with different behavior: bridge messages went through the server, but spawned child invocations did not. This made it impossible to unify features like audit trails, session sharing, and scheduled runs.",
+      "tags": ["design", "session_messaging"],
+      "title_query": "Problem"
+    },
+    {
+      "key": "design/session_messaging.md#server-processing-logic",
+      "value": "The server's processsession decides whether to act on an entry: This prevents the server from re-triggering on its own agent responses while allowing it to process directives from any source.",
+      "tags": ["design", "session_messaging"],
+      "title_query": "Server Processing Logic"
+    },
+    {
+      "key": "design/session_messaging.md#spawncontext",
+      "value": "Spawn-specific metadata is bundled in SpawnContext: - calldepth \u2014 current nesting level (incremented per spawn) - maxcalldepth \u2014 from agent definition - parenttools \u2014 the parent's ScopedTools for transitive narrowing - completiontx \u2014 signals the parent when the child finishes",
+      "tags": ["design", "session_messaging"],
+      "title_query": "SpawnContext"
+    },
+    {
+      "key": "design/session_messaging.md#summary",
+      "value": "All agent invocation in chaz goes through a single mechanism: write an entry to a session database, and the server's callback-driven processing handles execution. Users, agents, schedulers, and system processes all invoke agents the same way.",
+      "tags": ["design", "session_messaging"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/skills_and_prompts.md#agent-fields",
+      "value": "The Agent struct and AgentDbConfig lose persona, defaultrole/role, and gain: Agent::build() or Agent::fromdbconfig() resolves files \u2192 reads \u2192 BLAKE3 hashes them \u2192 concatenates into systemprompt. The runtime Agent carries the resolved text; disk edits don't silently take effect \u2014 the operator must run /agent reload (or restart chaz). Config schema (agents: in yaml):",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "Agent fields"
+    },
+    {
+      "key": "design/skills_and_prompts.md#context-assembly-flow",
+      "value": "The new assembly order in ContextBuilder::build(): The assembled system prompt is recorded as a SystemPromptSnapshot entry in the session for audit purposes, but ContextBuilder does NOT look up past snapshots \u2014 it always assembles fresh.",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "Context assembly flow"
+    },
+    {
+      "key": "design/skills_and_prompts.md#problem",
+      "value": "Today chaz has three tangled layers for what should be one thing: 1. RoleDetails (role.rs) \u2014 named static prompt templates. Deprecated but still wired: Agent carries defaultrole, AgentDbConfig carries role, Agent::fromconfig() calls migrateroletopersona(), ContextBuilder falls back to legacy role prompt when no snapshot exists. This is dead code walking on a one-release grace period. 2. Persona (persona.rs) \u2014 per-agent file includes + inline prompt. Resolved to text + file ha",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "Problem"
+    },
+    {
+      "key": "design/skills_and_prompts.md#promptaugmentation-capability",
+      "value": "A new extension capability that lets extensions inject text into the system prompt before each LLM call. The Capability enum gains PromptAugmentation(Arc<dyn PromptAugmentation>). ExtensionCaps has promptaugmentation: Vec<Arc<dyn PromptAugmentation>>. The hub collects all providers, calls each, concatenates non-empty results.",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "PromptAugmentation capability"
+    },
+    {
+      "key": "design/skills_and_prompts.md#skills-extension",
+      "value": "A single built-in extension \u2014 skills in crates/lib/src/extensions/skills.rs \u2014 that manages the skill catalog and hooks into context assembly. #### Skill format SKILL.md convention: YAML frontmatter + Markdown body. - name \u2014 unique identifier within the skill catalog - description \u2014 one-line summary shown in skilllist - triggers \u2014 keyword list for deterministic prefiltering (see below) - requirestools \u2014 optional; skill is suppressed when required tools aren't available - Body ",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "Skills extension"
+    },
+    {
+      "key": "design/skills_and_prompts.md#summary",
+      "value": "What dies: - crates/lib/src/role.rs \u2014 removed. The one-release migration window closes. - crates/lib/src/persona.rs \u2014 removed. Persona, ResolvedPersona, PersonaSnapshot, PersonaSnapshotPayload, SnapshotReason all gone. - migrateroletopersona() \u2014 removed. - All defaultrole / role: fields on Agent, AgentDbConfig, AgentConfig. What replaces them: - Agent fields \u2014 systemprompt: String, systempromptfiles: Vec<PathBuf>. These live in AgentDbConfig and the runtime Agent struct. File",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/skills_and_prompts.md#systempromptsnapshot-audit-only",
+      "value": "This replaces the current PersonaSnapshotPayload. The reason field is retained for audit filtering (\"show me all bumps since last week\") but drives no behavior.",
+      "tags": ["design", "skills_and_prompts"],
+      "title_query": "SystemPromptSnapshot (audit-only)"
+    },
+    {
+      "key": "design/transport_bridges.md#inbound-message-session-entry",
+      "value": "The bridge's inbound code (handlemessage / the Matrix message handler) does no more than resolve-or-create the session, ensure the reconciler/approval watchers are installed, and append the Message entry. It then stops. It does not build context, call an LLM, or write a reply.",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "Inbound: message \u2192 session entry"
+    },
+    {
+      "key": "design/transport_bridges.md#outbound-reconcile-replies-onto-the-transport",
+      "value": "Delivery is the transport-generic reconciler attachreconciler (chazcore::bridge), installed once per session. On every session write it re-derives the set of agent Message entries the transport hasn't shown yet (undeliveredagentmessages) and sends them in order, marking each delivered only after the transport send succeeds. A failed send stops the pass and leaves the tail for the next write \u2014 at-least-once, never silently dropped. The only transport-specific part is the send ",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "Outbound: reconcile replies onto the transport"
+    },
+    {
+      "key": "design/transport_bridges.md#summary",
+      "value": "A transport bridge (chaz-matrix, chaz-discord) is dumb: it is a pure I/O translator between one transport account and a set of session databases. It never runs an agent. Its entire job is three verbs: 1. proxy inbound \u2014 turn a received message into a Message entry in the right session DB; 2. deliver outbound \u2014 reconcile new agent Message entries back onto the transport; 3. relay approvals \u2014 render a tool-approval prompt the daemon raised, and write the human's decision back. ",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "Summary"
+    },
+    {
+      "key": "design/transport_bridges.md#the-agent-db-the-session-registry",
+      "value": "Each agent DB carries a synced session registry (SESSIONSSTORE, a Table<SessionRef>). A SessionRef records a session's id plus exposedon: Vec<String> \u2014 the set of bridge labels (each a loginid) that expose it: This is the rendezvous. A bridge, on binding a channel to a session, calls exposesessionon(sessionid, loginid) to add its label; that write syncs to the daemon, which is watching the registry. The daemon never has to be told about a session out of band \u2014 it discovers ex",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "The agent DB \u2014 the session registry"
+    },
+    {
+      "key": "design/transport_bridges.md#the-daemon-registry-watch",
+      "value": "The daemon closes the loop in watchagentsessionregistries (server/build.rs), run once at deferred startup: 1. Install an onwrite callback on every hosted agent DB. eidetica's onwrite fires for local and remote (synced) writes, so a bridge's exposesessionon write \u2014 which arrives via sync \u2014 triggers it. 2. Every callback fire (debounced) calls registerexposedsessions, which for each agent walks listsessionrefs(), skips any ref that is not exposedon anything or is already being ",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "The daemon registry-watch"
+    },
+    {
+      "key": "design/transport_bridges.md#the-session-db-the-conversation-and-the-channel",
+      "value": "Each conversation is one session DB. Beyond its entry log it holds the transport bindings: which (transport, loginid, channel) tuples this session is reachable on, in a per-session transportbindings DocStore (session::transport). Putting the binding in the session DB (rather than a central peer-local index) means it syncs with the session \u2014 a bridge and the daemon agree on where a session is reachable without a side channel. The session DB is also the only channel between a b",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "The session DB \u2014 the conversation _and_ the channel"
+    },
+    {
+      "key": "design/transport_bridges.md#why-dumb",
+      "value": "The earlier split made each bridge its own peer (see Transport Bridges \u2192 Why bridges are separate peers(../userguide/bridges.md#why-bridges-are-separate-peers)) but the bridge still called Server::new with the agent-running loop enabled \u2014 so a bridge answered its own messages. That defeated the point: two peers could both run the same agent against the same session and fork it. The fix is a hard rule: exactly one peer runs the agent for a given session. The daemon is that pee",
+      "tags": ["design", "transport_bridges"],
+      "title_query": "Why dumb"
+    },
+    {
+      "key": "index.md#how-it-works",
+      "value": "Bridges (Matrix, TUI) write messages to per-session eidetica databases. The server watches for new entries via callbacks and spawns agent tasks. Agents run a ReAct loop against an OpenAI-compatible LLM backend, executing tools and writing results back to the session. Bridges detect responses via their own callbacks and deliver them to the user.",
+      "tags": ["index"],
+      "title_query": "How It Works"
+    },
+    {
+      "key": "index.md#key-features",
+      "value": "- ReAct tool-calling loop with built-in tools (shell, file I/O, web fetch, search, calculate, time, memory, spawn, compact, schedule, describe) plus external MCP tools. - Living Agents \u2014 per-agent eidetica DBs with system prompt, memory banks, schedules, presets, and co-ownership across peers. - Multi-agent orchestration with depth limiting, transitive tool narrowing, and a per-room burst budget to backstop runaways. - Persistent, syncable sessions backed by eidetica(https://",
+      "tags": ["index"],
+      "title_query": "Key Features"
+    },
+    {
+      "key": "index.md#links",
+      "value": "- GitHub Repository(https://github.com/arcuru/chaz) - Matrix Room: #chaz:jackson.dev(https://matrix.to/#/#chaz:jackson.dev) - Blog Post: Chaz: An LLM <-> Matrix Chatbot(https://jackson.dev/post/chaz/)",
+      "tags": ["index"],
+      "title_query": "Links"
+    },
+    {
+      "key": "index.md#project-status",
+      "value": "Chaz is under active development. The core architecture (sessions, ReAct loop, tools, agents, sync) is functional. See the architecture overview(architecture/overview.md) for the current state.",
+      "tags": ["index"],
+      "title_query": "Project Status"
+    },
+    {
+      "key": "index.md#quick-start",
+      "value": "Transport bridges are separate binaries running as their own peers \u2014 start chaz-matrix alongside the daemon rather than expecting the agent process to spawn it. --config is optional: when omitted, chaz falls back to $XDGCONFIGHOME/chaz/config.yaml (typically ~/.config/chaz/config.yaml). Drop the file there and you can just run chaz. See Getting Started(userguide/gettingstarted.md) for detailed setup instructions.",
+      "tags": ["index"],
+      "title_query": "Quick Start"
+    },
+    {
+      "key": "user_guide/agents.md#agent-db-schema",
+      "value": "Each Agent DB contains the following well-known stores: The peer maintains two in-memory indices (hostedindex::HostedIndex) \u2014 one for Living Agents and one for standalone Memory Bank DBs \u2014 built once at startup by walking eidetica's user.databases() and reading each DB's meta.kind marker (agent / bank / session, written at creation time). Both indices map dbid \u2194 displayname \u2194 pubkey. They exist because eidetica has no inverse \"list DBs this key can access\" query, and routing ",
+      "tags": ["user_guide", "agents"],
+      "title_query": "Agent DB schema"
+    },
+    {
+      "key": "user_guide/agents.md#auto-attach-on-new-sessions",
+      "value": "Freshly-created sessions auto-attach a configured roster so /agents and the model picker reflect routing reality on the very first message. The list is Config.defaultagents (see configuration.md(configuration.md#defaultagents)) \u2014 typically the same agent(s) you message most often. Without that config, just the first agent in agents: is attached. This runs at session-creation time only (TUI /new, the picker's \"New session\" row, CLI --session, TUI startup default). It does not ",
+      "tags": ["user_guide", "agents"],
+      "title_query": "Auto-attach on new sessions"
+    },
+    {
+      "key": "user_guide/agents.md#defining-agents-bootstrap-via-yaml",
+      "value": "At startup, each yaml entry becomes an Agent DB named agent:<displayname> on first boot only. On subsequent boots, existing DBs are reused without overwriting their config \u2014 yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with /agent set <ref> <field> <value>, which takes effect on the next message (no restart needed) via runtime hydration from the DB. Because the DB \u2014 not the yaml \u2014 is authorit",
+      "tags": ["user_guide", "agents"],
+      "title_query": "Defining Agents (bootstrap via YAML)"
+    },
+    {
+      "key": "user_guide/agents.md#editing-the-system-prompt",
+      "value": "The skills extension can additionally append text to the system prompt at context-assembly time via the PromptAugmentation capability \u2014 see the design note in design/skillsandprompts.md(../design/skillsandprompts.md). A dedicated user-guide page for Skills is not written yet.",
+      "tags": ["user_guide", "agents"],
+      "title_query": "Editing the system prompt"
+    },
+    {
+      "key": "user_guide/agents.md#legacy-roles-deprecated",
+      "value": "Older configs used a top-level roles: block and an agent.role: reference. The /role slash command and role: config field have been removed from the live edit path; /role now prints a deprecation message pointing to /agent set <name> systemprompt <text>. Move any remaining role: text into the owning agent's systemprompt: field.",
+      "tags": ["user_guide", "agents"],
+      "title_query": "Legacy `roles:` (deprecated)"
+    },
+    {
+      "key": "user_guide/agents.md#session-participation",
+      "value": "A session's authoritative participant list is its eidetica AuthSettings. Adding an agent to a session grants its pubkey Permission::Write on the session DB; revoking removes it. The SessionMeta.agents: Vec<AgentRef> field is a readable cache that stays in sync.",
+      "tags": ["user_guide", "agents"],
+      "title_query": "Session participation"
+    },
+    {
+      "key": "user_guide/agents.md#system-prompts",
+      "value": "An agent's system prompt is built from two AgentDbConfig fields, both optional: The resolved prompt is stored off the agent's primary DB in a content-addressed blob store (a DocStore on chazpeer), and AgentDbConfig.systempromptref holds an eidetica Snapshot pointing at it. Hydration reads the prompt by that ref (memoized \u2014 the snapshot is an immutable content address) rather than re-reading the files each turn, so the append-only config never accumulates tens of KB of prompt ",
+      "tags": ["user_guide", "agents"],
+      "title_query": "System Prompts"
+    },
+    {
+      "key": "user_guide/bridges.md#approving-tools-from-a-room",
+      "value": "When an agent wants to run a tool that requires approval (see Security \u2192 Tool Approval(security.md#tool-approval)), the daemon posts a prompt into the room/channel the turn came from: React \u2705 / \u274c / \u23ed on the prompt (Discord seeds the reactions for you; on Matrix add them yourself), or reply !chaz approve / !chaz deny to resolve the oldest pending prompt in that room. The decision travels back to the daemon over the synced session DB and the turn continues. This is fail-closed:",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "Approving tools from a room"
+    },
+    {
+      "key": "user_guide/bridges.md#how-credentials-are-stored",
+      "value": "The bridge's settings database is an eidetica PasswordStore<DocStore> \u2014 encrypted at rest and on the wire. Only ciphertext ever syncs; the unlockpassword lives in the bridge's environment and never enters any synced database. A wrong password makes the store refuse to open (reads error rather than leaking plaintext), and losing it makes the stored credentials unrecoverable \u2014 re-seed from config. The daemon never holds the unlock password and never reads this database; it only",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "How credentials are stored"
+    },
+    {
+      "key": "user_guide/bridges.md#running-as-a-service",
+      "value": "Bridges are long-lived and operator-supervised \u2014 run them under systemd (or your supervisor of choice), not from the daemon. A minimal unit: Prefer systemd credentials / an EnvironmentFile over inline Environment= for the secrets. A bridge restart is cheap and idempotent: it re-seeds its credential store and re-bootstraps access (a no-op once approved).",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "Running as a service"
+    },
+    {
+      "key": "user_guide/bridges.md#setup",
+      "value": "A bridge needs Write access to each agent DB it serves, and the daemon must approve that access once. It uses that access sparingly: its login pointer still travels as metadata on the access request and is registered by the daemon at approval, so you see the claim in /sharing requests before granting it. The write authority is for session exposure \u2014 every new channel adds an entry to the agent DB's session registry, and that happens per channel, long after the one-time login ",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "Setup"
+    },
+    {
+      "key": "user_guide/bridges.md#the-bridge-config-file",
+      "value": "A bridge reads its own YAML file \u2014 chaz-matrix defaults to $XDGCONFIGHOME/chaz/matrix-bridge.yaml, chaz-discord to discord-bridge.yaml \u2014 or pass --config <path>. The same file carries two kinds of keys, parsed independently: - chaz runtime keys the bridge's embedded server needs: backends:, agents: (just the identities the bridge serves), security:, optionally synclisten: and statedir:. These are the ordinary config(configuration.md) keys. - bridge-only keys: unlockpassword:,",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "The bridge config file"
+    },
+    {
+      "key": "user_guide/bridges.md#troubleshooting",
+      "value": "The bridge logs \"Access pending owner approval\" and exits / skips a login. Expected on first run before approval. Run /sharing requests then /sharing approve <id> on the daemon, then restart the bridge. See Setup step 5. To avoid the round-trip entirely, preseed with /agent invite. \"no Matrix/Discord logins are ready.\" Every configured login is still pending approval (or none are configured). Approve them on the daemon and restart. The bridge can't reach the daemon. Bootstrap",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "Troubleshooting"
+    },
+    {
+      "key": "user_guide/bridges.md#why-bridges-are-separate-peers",
+      "value": "Earlier versions ran the Matrix bridge inside the chaz process and read its credentials (homeserverurl, username, password) from the central config. That coupling is gone. Now: - A login belongs to exactly one agent. A bridge's job is to route one transport account's traffic to one owning agent's sessions. - Credentials never sit in the daemon's config or database. Each bridge owns an encrypted settings database (a PasswordStore) holding its own homeserver/token/allow-list, u",
+      "tags": ["user_guide", "bridges"],
+      "title_query": "Why bridges are separate peers"
+    },
+    {
+      "key": "user_guide/configuration.md#backends",
+      "value": "Each backend requires a name, type, apibase, and optionally apikey and models. The apikey field supports environment variable references: \"${VARNAME}\" or \"$VARNAME\". Keys are resolved at startup and stored in eidetica's SecretStore. They are never included in LLM context. When multiple backends are defined, model names are prefixed with the backend name (e.g., openrouter:anthropic/claude-sonnet-4). With a single backend, no prefix is needed.",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "Backends"
+    },
+    {
+      "key": "user_guide/configuration.md#embeddings",
+      "value": "The embedding: block configures semantic recall for the memory tools(memory.md). Omit it to keep recall lexical-only (BM25); add it to enable hybrid lexical + semantic ranking via Reciprocal Rank Fusion. See Searching memory(memory.md#searching-memory) for ranking details.",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "Embeddings"
+    },
+    {
+      "key": "user_guide/configuration.md#failure-handling",
+      "value": "The embedder is best-effort: - API down on write \u2192 memory is still stored, the vector is skipped, a warn is logged. - API down on recall \u2192 query falls back to BM25 only. - DB has no rows under the active model's subtree \u2192 BM25 only. Configuring an embedder never makes recall worse than the lexical baseline.",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "Failure handling"
+    },
+    {
+      "key": "user_guide/configuration.md#resilience",
+      "value": "All LLM HTTP requests are wrapped in a configurable timeout and retried on transient failures: Retries use exponential backoff (1s, 2s, 4s, \u2026 capped at 30s). Rate-limit responses (HTTP 429) with a Retry-After header are honored as the minimum delay. Non-retryable errors (401, 403, 400) fail immediately.",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "Resilience"
+    },
+    {
+      "key": "user_guide/configuration.md#searxng",
+      "value": "searxng entries take a url: instead of an apikey:. The URL is the instance root \u2014 /search?q=<query>&format=json is appended. Self-hosting is ~5 minutes with the official docker-compose stack at https://docs.searxng.org/admin/installation-docker.html and doesn't require opening any ports externally. Public instances at https://searx.space work but come and go, and many rate-limit aggressively or disable the JSON output format. If you see searxng returned HTTP 403 / HTTP 429 in",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "SearxNG"
+    },
+    {
+      "key": "user_guide/configuration.md#switching-models",
+      "value": "Each model writes to its own subtree (embeddings:<provider>/<model>); subtrees coexist on the same DB and sync together. Switching models leaves the old subtree dormant \u2014 entries written under the old model stop contributing to recall until they're reindexed (planned: /memory reindex). Until then, recall against the new model uses semantic only on the entries written since the switch, plus BM25 on everything.",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "Switching models"
+    },
+    {
+      "key": "user_guide/configuration.md#web-search",
+      "value": "The websearch tool is always registered. Backends are an ordered preference list: the tool tries each entry in turn and falls through on any error, returning the first success. Empty results are a legitimate answer and do not trigger failover. Omit the websearch: section entirely to use DuckDuckGo alone (keyless).",
+      "tags": ["user_guide", "configuration"],
+      "title_query": "Web search"
+    },
+    {
+      "key": "user_guide/discord.md#commands",
+      "value": "Commands are sent as Discord messages prefixed with !chaz, routed through the same transport-neutral dispatch the TUI and Matrix bridge use. !chaz help lists the surface; the common commands match the Matrix command tables(matrix.md#commands) (session ops, !chaz agent \u2026, !chaz sharing \u2026, !chaz model, etc.). Channel-rebinding verbs don't apply on Discord.",
+      "tags": ["user_guide", "discord"],
+      "title_query": "Commands"
+    },
+    {
+      "key": "user_guide/discord.md#discord-portal-setup",
+      "value": "1. Create an application and a bot at the Discord Developer Portal(https://discord.com/developers/applications), and copy the bot token. 2. Under Bot \u2192 Privileged Gateway Intents, enable Message Content Intent \u2014 the bridge requests it, and without it message bodies arrive empty. 3. Invite the bot to your server with the Send Messages, Read Message History, and Add Reactions permissions (reactions drive the approve/deny flow).",
+      "tags": ["user_guide", "discord"],
+      "title_query": "Discord portal setup"
+    },
+    {
+      "key": "user_guide/discord.md#limitations",
+      "value": "- Text only. Like the Matrix bridge, the Discord bridge ingests only text; attachments and embeds are not seen by the model. - One channel \u2194 one session, fixed. There is no in-Discord rebind command.",
+      "tags": ["user_guide", "discord"],
+      "title_query": "Limitations"
+    },
+    {
+      "key": "user_guide/discord.md#message-handling",
+      "value": "- DMs: the bot responds to every message from an allowed user. - Server channels: the bot responds to messages prefixed with !chaz or that mention the bot. Each Discord channel is bound to its own session, fixed per channel (unlike Matrix, you don't rebind a channel to a different session from within Discord). The first message in a channel auto-creates the session.",
+      "tags": ["user_guide", "discord"],
+      "title_query": "Message Handling"
+    },
+    {
+      "key": "user_guide/discord.md#see-also",
+      "value": "- Transport Bridges(bridges.md) \u2014 architecture, config layout, approval flow - Matrix Bot(matrix.md) \u2014 the full command reference (shared with Discord) - Sharing & Sync(sessionsharing.md) \u2014 tickets and the /sharing queue",
+      "tags": ["user_guide", "discord"],
+      "title_query": "See also"
+    },
+    {
+      "key": "user_guide/discord.md#setup",
+      "value": "1. Share the owning agent from the daemon and copy the ticket: 2. Write the bridge config (default $XDGCONFIGHOME/chaz/discord-bridge.yaml, or pass --config): bottoken accepts a ${ENV} reference or literal; when omitted it falls back to the DISCORDTOKEN environment variable, so the secret can stay out of the file. allowedusers is an optional allow-list of Discord user ids \u2014 empty means everyone (the bot always ignores other bots and its own messages). 3. Run the bridge (with ",
+      "tags": ["user_guide", "discord"],
+      "title_query": "Setup"
+    },
+    {
+      "key": "user_guide/discord.md#tool-approval",
+      "value": "Approval requests are posted as messages in the channel. Respond either via reactions (\u2705 approve \u00b7 \u274c deny \u00b7 \u23ed approve all) or by replying !chaz approve / !chaz deny. To skip approval for specific low-risk tools, add them to security.autoapprovedtools.",
+      "tags": ["user_guide", "discord"],
+      "title_query": "Tool Approval"
+    },
+    {
+      "key": "user_guide/extensions.md#adding-an-extension",
+      "value": "Activates memory on the current session. Takes effect on the next agent turn: - The extension's tools become visible to the LLM (added to the tool list it sees in its next response). - The extension's toolcall / toolresult / beforeagentstart hooks start firing. - The extension's slash commands start dispatching (e.g. /schedule begins to work). Re-running /extensions add on an already-active extension is a no-op and reports back that it's already active.",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Adding an extension"
+    },
+    {
+      "key": "user_guide/extensions.md#built-in-extension-catalog",
+      "value": "These ship in the chaz binary today. The \"Provides\" column lists the hook kinds(../architecture/extensions.md#hook-kinds) the extension declares \u2014 Tool and Command are the surfaces a user notices; the others are runtime hooks that fire around each agent turn. Disabling an extension hides its tools from the LLM, stops its hooks from firing, and disarms its slash commands. The core and system extensions are practical floors \u2014 chaz still runs without them, but agents lose shell,",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Built-in extension catalog"
+    },
+    {
+      "key": "user_guide/extensions.md#changing-settings",
+      "value": "Merges key = value into the named extension's per-session settings. <value> is JSON-parsed first, so: - /extensions set schedule maxretries 3 stores the number 3 - /extensions set schedule enabled true stores the boolean true - /extensions set schedule label \"morning sweep\" stores a string - /extensions set schedule tags '\"urgent\",\"ops\"' stores an array - /extensions set schedule label foo \u2014 foo doesn't parse as JSON, so it's stored as the string \"foo\" Each call replaces the ",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Changing settings"
+    },
+    {
+      "key": "user_guide/extensions.md#inspecting-settings",
+      "value": "Prints the per-session settings JSON for the named extension. With no overrides written, this returns {} \u2014 extensions fall back to their own defaultsettings(../architecture/extensions.md#per-session-settings) when a key is missing.",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Inspecting settings"
+    },
+    {
+      "key": "user_guide/extensions.md#listing-extensions",
+      "value": "Both forms show every extension registered on this peer, marked for the agent responding in this session: The version in brackets is the chaz binary version that registered the extension. The trailing list is the hook kinds it declared \u2014 handy for seeing at a glance which extensions provide tools, which provide commands, and which only hook into the agent lifecycle. The marker reflects the effective state for the responding agent: - \u2713 \u2014 active for this agent on this session. ",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Listing extensions"
+    },
+    {
+      "key": "user_guide/extensions.md#per-agent-scope",
+      "value": "add and remove take an optional trailing scope token \u2014 session (the default) or agent: - session (default) \u2014 edits the session's extensions log. Affects every agent responding in the session. - agent \u2014 edits the responding agent's Living Agent DB. The agent can only narrow the session set: remove \u2026 agent records an opt-out for that one agent, and add \u2026 agent clears a prior opt-out. It cannot turn an extension on that the session has turned off \u2014 the session set is the upper b",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Per-agent scope"
+    },
+    {
+      "key": "user_guide/extensions.md#removing-an-extension",
+      "value": "Deactivates memory on the current session. Takes effect on the next agent turn \u2014 the next LLM call won't see remember / recall / listmemorybanks in its tool list, hooks stop firing, and any of the extension's slash commands return a clear error pointing back to /extensions add. Removal persists across restarts. Each add/remove appends an event to the session's eidetica extensions log; the session-start reconciler folds the log to determine the current set rather than defaulti",
+      "tags": ["user_guide", "extensions"],
+      "title_query": "Removing an extension"
+    },
+    {
+      "key": "user_guide/getting_started.md#from-source",
+      "value": "Chaz is rustls-based and only needs a Rust toolchain plus pkg-config at build time (no system OpenSSL or SQLite). The Nix dev shell provides everything. The trailing .# on nix develop is required \u2014 without it Nix picks up eidetica's flake from the workspace.",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "From Source"
+    },
+    {
+      "key": "user_guide/getting_started.md#prerequisites",
+      "value": "- An OpenAI-compatible LLM API key (e.g., OpenRouter(https://openrouter.ai/)) - For Matrix mode: a Matrix account for the bot - Rust toolchain or Nix (for building from source)",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "Prerequisites"
+    },
+    {
+      "key": "user_guide/getting_started.md#running-as-a-daemon",
+      "value": "The TUI needs a terminal \u2014 it puts one into raw mode and takes over the alternate screen. To run the same peer without one, use the daemon subcommand: This runs sync, schedules, the routine engine, and the agent loop with no user interface, logging to stdout for systemd, a container, or a supervisor to collect. It stops cleanly on Ctrl-C or SIGTERM. This is also the process transport bridges sync against.",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "Running as a daemon"
+    },
+    {
+      "key": "user_guide/getting_started.md#running-one-command",
+      "value": "Any /command the TUI accepts can be run non-interactively: The result goes to stdout, and a command that reports an error exits non-zero, so scripts can branch on it. Run it with the daemon stopped \u2014 it opens the same state directory, and two processes on one backend do not observe each other's writes.",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "Running one command"
+    },
+    {
+      "key": "user_guide/getting_started.md#running-the-matrix-bot",
+      "value": "The Matrix bridge is its own binary and its own peer \u2014 chaz-matrix, started separately from the agent process rather than spawned inside it: The bridge holds the Matrix login, and reaches the agent's database through an access ticket. It runs no agents and calls no LLM itself: inbound messages are written into session databases, and the daemon's replies sync back out to the room. The bot logs in to Matrix, accepts room invites from allowed users, and responds to messages. In ",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "Running the Matrix Bot"
+    },
+    {
+      "key": "user_guide/getting_started.md#running-the-tui",
+      "value": "The TUI is the default \u2014 just run chaz with no other mode flag: You'll see a terminal interface with an input bar at the bottom and a status bar showing the current session and agent. Type a message and press Enter to chat. You can also pass an initial prompt as a positional argument; it pre-fills the input box so you can review and send it: Type /help to see available commands.",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "Running the TUI"
+    },
+    {
+      "key": "user_guide/getting_started.md#single-shot-print-mode",
+      "value": "For scripted use or scheduling, run a single prompt and exit with -p / --print: There is no interactive approval \u2014 tools requiring approval are auto-denied unless they're in the print-mode auto-approved list (default: shell, writefile; override with the cli: config block). Pass --session NAME to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (chaz-cli.log); only the agent's reply g",
+      "tags": ["user_guide", "getting_started"],
+      "title_query": "Single-shot print mode"
+    },
+    {
+      "key": "user_guide/logging.md#debug",
+      "value": "Verbose output useful for development and troubleshooting: - LLM request/response details (model, message count, finish reason) - Individual tool results with content preview - Model resolution (requested vs resolved, backend selected) - File read operations with byte counts - Memory store/recall operations - HTTP response status and body size - Shell command exit codes - MCP JSON-RPC message traffic",
+      "tags": ["user_guide", "logging"],
+      "title_query": "debug"
+    },
+    {
+      "key": "user_guide/logging.md#error",
+      "value": "Errors indicate failures needing attention: - Matrix login or sync failures - Session database errors (load, persist, commit) - Agent execution failures - Bridge crashes",
+      "tags": ["user_guide", "logging"],
+      "title_query": "error"
+    },
+    {
+      "key": "user_guide/logging.md#info-default",
+      "value": "At the default level you'll see: - Startup: config loaded, agent count, tool registry ready, bridge mode, eidetica sync address - Sessions: new session creation, backfill, bridge callback registration - Agent lifecycle: ReAct loop completion, max iterations reached, tool-aware fallback - Tool execution: shell commands run, files written, web fetches initiated - Security: approval decisions (approve/deny/approve-all), MCP server restarts - Scheduling: schedule fires, manual tr",
+      "tags": ["user_guide", "logging"],
+      "title_query": "info (default)"
+    },
+    {
+      "key": "user_guide/logging.md#redirecting-to-a-file",
+      "value": "For daemon (logs default to stdout), redirect to capture them: TUI, -p / --print, and cmd modes already log to a daily-rotated file in statedir (see above) \u2014 no redirect needed. To follow live, tail that file in another terminal.",
+      "tags": ["user_guide", "logging"],
+      "title_query": "Redirecting to a File"
+    },
+    {
+      "key": "user_guide/logging.md#warn",
+      "value": "Warnings indicate degraded or blocked operations: - Secret leaks: detected patterns and action taken (redact or block) - Network policy: SSRF blocks (private IPs, internal hostnames), endpoint denials - Shell policy: commands denied by allowlist/denylist - Tool issues: execution errors, timeouts, unknown tools, rate limiting - Injection: prompt injection patterns detected in tool output - Approval: channel failures (auto-deny)",
+      "tags": ["user_guide", "logging"],
+      "title_query": "warn"
+    },
+    {
+      "key": "user_guide/logging.md#where-logs-go",
+      "value": "The sink depends on the bridge mode, because the TUI and print modes need to keep stdout clean for their own output: Every mode that reserves stdout for its own output \u2014 the TUI's screen, a -p reply, a cmd result \u2014 logs to the rotated file instead. daemon reserves nothing, so it logs to stdout. Transport bridges are separate processes and log on their own stderr. statedir comes from statedir: in the config or the platform XDG state dir (typically ~/.local/state/chaz). The sta",
+      "tags": ["user_guide", "logging"],
+      "title_query": "Where Logs Go"
+    },
+    {
+      "key": "user_guide/matrix.md#commands",
+      "value": "Commands are sent as Matrix messages. Session ops go through the same transport-neutral dispatch as the TUI \u2014 both bridges stay in sync. Most TUI slash commands have a !chaz equivalent; the table below covers the common surface. Extension-registered commands (e.g. !chaz schedule, !chaz memory) are auto-registered for whichever extensions are installed \u2014 see the relevant page for syntax.",
+      "tags": ["user_guide", "matrix"],
+      "title_query": "Commands"
+    },
+    {
+      "key": "user_guide/matrix.md#living-agents",
+      "value": "!chaz agent <sub> ... \u2014 add, remove, host, list, room, hosted, new, delete, share, unshare, import, set, invite, revoke-peer, rehost, home-status. Mirrors /agent ... in the TUI; see Agents(agents.md). !chaz agents lists the agents attached to this session. !chaz pubkey prints this peer's default pubkey (for !chaz agent invite from another peer).",
+      "tags": ["user_guide", "matrix"],
+      "title_query": "Living Agents"
+    },
+    {
+      "key": "user_guide/matrix.md#message-handling",
+      "value": "- DMs: The bot responds to every message - Group rooms: The bot responds to messages prefixed with !chaz or that mention the bot To send a message with room context: To send without the !chaz prefix in a DM, just type normally.",
+      "tags": ["user_guide", "matrix"],
+      "title_query": "Message Handling"
+    },
+    {
+      "key": "user_guide/matrix.md#scripted-bring-up",
+      "value": "The approval round-trip in step 5 exists because the bridge's key is unknown until it first asks. Ask it directly instead, and the whole sequence runs unattended \u2014 useful for provisioning and required for automated tests. Run these with both processes stopped: each opens a state directory, and two processes on one backend do not observe each other's writes. Put that ticket in the bridge config, then start the daemon and the bridge. The bridge logs Access was pre-authorized an",
+      "tags": ["user_guide", "matrix"],
+      "title_query": "Scripted bring-up"
+    },
+    {
+      "key": "user_guide/matrix.md#setup",
+      "value": "1. Create a Matrix account for the bot on any homeserver. 2. Share the owning agent from the daemon and copy the ticket: 3. Write the bridge config (default $XDGCONFIGHOME/chaz/matrix-bridge.yaml, or pass --config). Each logins: entry pairs a Matrix account with its owning agent and the ticket from step 2: homeserverurl, username, and password are the bot's login; password (and unlockpassword) accept ${ENV} references so no secret has to live in the file. allowlist / roomsize",
+      "tags": ["user_guide", "matrix"],
+      "title_query": "Setup"
+    },
+    {
+      "key": "user_guide/matrix.md#sharing-queue",
+      "value": "!chaz sharing status | requests | approve <id> | reject <id> \u2014 inspect shared DBs and manage bootstrap requests across agent/bank/session DBs.",
+      "tags": ["user_guide", "matrix"],
+      "title_query": "Sharing queue"
+    },
+    {
+      "key": "user_guide/mcp.md#configuration",
+      "value": "Add MCP servers in the mcpservers section of your config. Stdio and HTTP servers can coexist:",
+      "tags": ["user_guide", "mcp"],
+      "title_query": "Configuration"
+    },
+    {
+      "key": "user_guide/mcp.md#fields",
+      "value": "Set exactly one of command (stdio) or url (HTTP) per server. You can also drop one MCP server config per file into mcpserverdir (see Configuration(configuration.md)); those entries are merged with the inline list at startup.",
+      "tags": ["user_guide", "mcp"],
+      "title_query": "Fields"
+    },
+    {
+      "key": "user_guide/mcp.md#prompts-as-tool-results",
+      "value": "getprompt returns the rendered template as a tool result (each message tagged role body). It does NOT replace the agent's system prompt \u2014 the model decides what to do with the content. Use this for parameterized prompt libraries the server exposes (summarize, explain-code, etc.).",
+      "tags": ["user_guide", "mcp"],
+      "title_query": "Prompts as tool results"
+    },
+    {
+      "key": "user_guide/mcp.md#resource-contents",
+      "value": "readresource concatenates every text content block the server returns. Binary blobs are summarized inline as binary <mime>: ~N bytes rather than dumped \u2014 chaz never spills decoded binary into the model's context. The same 100 KB truncation that bounds tool output bounds resource reads.",
+      "tags": ["user_guide", "mcp"],
+      "title_query": "Resource contents"
+    },
+    {
+      "key": "user_guide/mcp.md#resources-and-prompts",
+      "value": "The MCP spec defines three primitives a server can expose: Tools, Resources, and Prompts. Chaz consumes all three. Whichever primitives a server advertises in its initialize response light up the corresponding wrapper tools: The model uses these like any other tool: listresources returns URIs + metadata, readresource fetches one by URI. For prompts, listprompts shows declared argument shapes (required args marked with ) and getprompt renders the template into a single assista",
+      "tags": ["user_guide", "mcp"],
+      "title_query": "Resources and Prompts"
+    },
+    {
+      "key": "user_guide/mcp.md#tool-discovery-and-namespacing",
+      "value": "At startup, chaz: 1. Spawns each MCP server subprocess 2. Performs the MCP initialize handshake \u2014 records which primitives (tools, resources, prompts) the server advertises 3. Calls tools/list to discover available tools (only when the server claims the tools capability) 4. Registers each tool as servernametoolname (e.g., filesystemreadfile) 5. Adds capability wrapper tools for any other primitives the server claimed (see Resources and Prompts(#resources-and-prompts)) Failed ",
+      "tags": ["user_guide", "mcp"],
+      "title_query": "Tool Discovery and Namespacing"
+    },
+    {
+      "key": "user_guide/memory.md#list-memory-banks",
+      "value": "Lists every bank the agent can see, with the permission level. Always includes self. Designed to be called on-demand when the agent needs to discover what's available \u2014 same pattern as describetool.",
+      "tags": ["user_guide", "memory"],
+      "title_query": "`list_memory_banks`"
+    },
+    {
+      "key": "user_guide/memory.md#recall",
+      "value": "Searches the agent's own memory. Add \"bank\": \"<name>\" to search a bank. All three extra fields are optional: - tags: string \u2014 AND-filter; only entries carrying every listed tag are considered. - limit: integer \u2014 cap on returned entries (default 10). - query: \"\" \u2014 empty string returns by recency (handy with a tags filter). See Searching memory(#searching-memory) below for how ranking works.",
+      "tags": ["user_guide", "memory"],
+      "title_query": "`recall`"
+    },
+    {
+      "key": "user_guide/memory.md#remember",
+      "value": "Writes to the agent's own memory. Optional tags: string attach free-form labels for later filtering. Add \"bank\": \"<name>\" to write to a shared bank where the agent has Write. If an embedding backend(configuration.md#embeddings) is configured, every write also embeds key + \" \" + value and stores the vector in the same DB under embeddings:<provider>/<model> \u2014 joined to the memory row by the row ID. This happens in one transaction. If the embedding API fails, the memory is still",
+      "tags": ["user_guide", "memory"],
+      "title_query": "`remember`"
+    },
+    {
+      "key": "user_guide/memory.md#the-tools",
+      "value": "Agents interact with memory through three tools. All three need to be in allowedtools.",
+      "tags": ["user_guide", "memory"],
+      "title_query": "The Tools"
+    },
+    {
+      "key": "user_guide/memory.md#the-two-kinds",
+      "value": "\"Another agent's DB\" works here because every Agent DB is a memory bank \u2014 it has the same memory Table. Granting agent B Read on agent A's DB means B can recall from A's notes.",
+      "tags": ["user_guide", "memory"],
+      "title_query": "The Two Kinds"
+    },
+    {
+      "key": "user_guide/memory.md#why-it-looks-this-way",
+      "value": "Earlier iterations had a MemoryGrant capability flag and a globalmemory store in the peer-local group DB. All of that was removed. The current model is authorisation by key possession: an agent can read or write a bank iff eidetica's AuthSettings on that bank's DB says so. There is no app-level permission flag to forget to check \u2014 opening the DB with the wrong key just fails. Two consequences worth noticing: - Self memory is not grant-gated. If remember/recall is in the agent",
+      "tags": ["user_guide", "memory"],
+      "title_query": "Why It Looks This Way"
+    },
+    {
+      "key": "user_guide/security.md#capability-grants",
+      "value": "Tools access system resources through the ToolHost trait \u2014 a sandboxed capability boundary. Grants configure what each tool is allowed to do; the host enforces those grants at execution time. The default NativeToolHost enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.",
+      "tags": ["user_guide", "security"],
+      "title_query": "Capability Grants"
+    },
+    {
+      "key": "user_guide/security.md#capability-tiers-and-attenuation",
+      "value": "The same grant shape (shell / network / fs) is set at four tiers. They are intersected at every tool call, and each inner tier can only subtract authority \u2014 never widen it (\"most-restrictive-wins\"): The key property: the session ceiling and agent capabilities are chokepoints. The filesystem is reachable through both shell and writefile; the network through both webfetch and shell (curl). Setting allowprivate: false on a single tool doesn't stop another tool reaching the resou",
+      "tags": ["user_guide", "security"],
+      "title_query": "Capability tiers and attenuation"
+    },
+    {
+      "key": "user_guide/security.md#network-grants",
+      "value": "The webfetch tool's HTTP requests are filtered by endpoint patterns: Private IP addresses (RFC 1918, loopback, link-local) are always blocked unless allowprivate: true. Wildcard hosts (\".example.com\") are supported. > Deprecated: security.allowedendpoints is a legacy field. It still works but is converted to a network grant at startup with a deprecation warning. Use toolpolicies.webfetch.grants.network.endpoints for new configs.",
+      "tags": ["user_guide", "security"],
+      "title_query": "Network grants"
+    },
+    {
+      "key": "user_guide/security.md#shell-grants",
+      "value": "The shell tool's commands are filtered by allow/deny lists in its grant: If allow is non-empty, only commands starting with an allowed prefix are permitted. The deny list blocks commands regardless of the allowlist. > Deprecated: security.shellallowlist and security.shelldenylist are legacy fields. They still work but are converted to shell grants at startup with a deprecation warning. Use toolpolicies.shell.grants.shell for new configs.",
+      "tags": ["user_guide", "security"],
+      "title_query": "Shell grants"
+    },
+    {
+      "key": "user_guide/security.md#the-layered-model",
+      "value": "Five separately-configurable layers sit between an LLM tool call and any real-world effect. They're enforced in this order; an earlier layer can short-circuit the rest: The layers in plain words: Two more orthogonal layers wrap everything: - Secret store keeps API keys out of LLM context entirely \u2014 they're resolved at the HTTP client boundary, never quoted to the model. - Agent-level controls (allowedtools, per-Agent workers: list, depth caps) shrink which layers even get a c",
+      "tags": ["user_guide", "security"],
+      "title_query": "The Layered Model"
+    },
+    {
+      "key": "user_guide/security.md#tool-approval",
+      "value": "Each tool has a default approval requirement that can be overridden in config: Approval levels: - Never -- runs without asking - UnlessAutoApproved -- runs if in autoapprovedtools, asks otherwise - Always -- always asks the user How you're asked depends on the surface: - TUI \u2014 an inline y/n/a prompt. - Matrix / Discord \u2014 the daemon posts a \ud83d\udd12 approval prompt into the room/channel; react \u2705 approve \u00b7 \u274c deny \u00b7 \u23ed approve-all, or reply !chaz approve / !chaz deny. The decision rides",
+      "tags": ["user_guide", "security"],
+      "title_query": "Tool Approval"
+    },
+    {
+      "key": "user_guide/session_sharing.md#how-it-works",
+      "value": "Each chaz instance starts an HTTP sync server automatically at startup. The server address is logged: Shared databases are advertised via database tickets -- URLs that encode the database ID and the source peer's network address. Eidetica handles the sync protocol, entry replication, conflict resolution, and (for sessions) bidirectional propagation. A /share command flips eidetica's per-DB syncenabled flag for the current peer so it actually serves the DB to ticket holders, t",
+      "tags": ["user_guide", "session_sharing"],
+      "title_query": "How It Works"
+    },
+    {
+      "key": "user_guide/session_sharing.md#memory-banks-and-sessions",
+      "value": "Memory banks use the same /memory share + /memory import perm shape. Sessions use /share + /sync <ticket> \u2014 sessions don't have a permission flag because session sharing today implies write access. The /sharing command surface is unified across kinds. Bare /sharing (or /sharing status) lists every database this peer is currently sharing, grouped by kind with DB root IDs. /sharing requests, /sharing approve <id>, /sharing reject <id> operate on the single eidetica request queu",
+      "tags": ["user_guide", "session_sharing"],
+      "title_query": "Memory banks and sessions"
+    },
+    {
+      "key": "user_guide/session_sharing.md#preseed-flow-still-supported",
+      "value": "If the source peer authorizes the receiver's pubkey ahead of time via /agent invite, the receiver's /agent import succeeds immediately \u2014 eidetica's handler returns the existing-key fast path without queueing a request. This is the right shape when the two peers can communicate out-of-band before the import (e.g. you control both, or you've exchanged pubkeys via Matrix). When they can't, use the request flow.",
+      "tags": ["user_guide", "session_sharing"],
+      "title_query": "Preseed flow (still supported)"
+    },
+    {
+      "key": "user_guide/session_sharing.md#request-flow-default",
+      "value": "The trailing admin|write|read token on /agent import (and /memory import) controls the permission the requester asks for. Default: write. read works for spectators; admin for co-owners.",
+      "tags": ["user_guide", "session_sharing"],
+      "title_query": "Request flow (default)"
+    },
+    {
+      "key": "user_guide/session_sharing.md#sharing-a-session",
+      "value": "On the instance that has the session: Output: Paste the ticket on the receiving instance: After syncing, the session appears in the session list. Use /sessions to find and open it.",
+      "tags": ["user_guide", "session_sharing"],
+      "title_query": "Sharing a Session"
+    },
+    {
+      "key": "user_guide/session_sharing.md#sharing-an-agent-or-memory-bank",
+      "value": "There are two paths to give another peer access to an agent or memory bank: a request flow (the receiver asks; the owner approves) and a preseed flow (the owner authorizes the receiver's pubkey out-of-band first). The request flow is the new default \u2014 fewer steps and read-only sharing works.",
+      "tags": ["user_guide", "session_sharing"],
+      "title_query": "Sharing an Agent or Memory Bank"
+    },
+    {
+      "key": "user_guide/skills.md#available-skills",
+      "value": "Each line is name \u2014 description. To use a skill, call the skillshow tool with the skill's name to load its full instructions. - nix \u2014 Nix and NixOS package management, configuration, and troubleshooting - postgres-debug \u2014 Common postgres failure modes and triage steps - release-checklist \u2014 Steps for cutting a chaz release",
+      "tags": ["user_guide", "skills"],
+      "title_query": "Available skills"
+    },
+    {
+      "key": "user_guide/skills.md#the-four-sources",
+      "value": "Skills are composed at turn time from four sources, in priority order. The first definition of a name wins; later sources don't override earlier ones. Disk paths are scanned at extension install time (process startup). DB-backed sources are read at every turn \u2014 write a new skill to a granted bank from another peer, sync settles, the next turn sees it.",
+      "tags": ["user_guide", "skills"],
+      "title_query": "The Four Sources"
+    },
+    {
+      "key": "user_guide/skills.md#the-skill-md-format",
+      "value": "Disk skills are Markdown files with YAML frontmatter. One skill per file. Max size 64 KiB. Required frontmatter: The Markdown body after the closing --- is the full instruction text loaded by skillshow. Skills in DB-backed sources (AgentDb.skills, skill banks) carry the same name / description / body plus a timestamp and free-form tags. There's no markdown-frontmatter parsing step for those \u2014 they're written directly into the eidetica table.",
+      "tags": ["user_guide", "skills"],
+      "title_query": "The SKILL.md format"
+    },
+    {
+      "key": "user_guide/skills.md#the-skills-commands",
+      "value": "Every transport uses the same surface. TUI: /skills <sub>. Matrix: !chaz skills <sub>. /skills manages skill banks \u2014 the eidetica-backed source kind (#4 and #5 in the four-sources table). Disk skills (#1, #2) are filesystem-only; no command authors them. Agent-private skills (#3) are written directly to the agent DB in v1 (no slash surface yet). Permission tokens for grant: read lets the agent see and load the bank's skills; write additionally lets it add or edit them (writes",
+      "tags": ["user_guide", "skills"],
+      "title_query": "The `/skills` commands"
+    },
+    {
+      "key": "user_guide/skills.md#tools",
+      "value": "These are registered with the runtime so the LLM can invoke them like any other tool. All three are low-risk (read-only catalog access). skilllist and skillsearch currently only see disk skills; skillshow walks all four sources in the priority order above. (This asymmetry is a known v1 limitation \u2014 bodies are reachable from anywhere; the listing tools haven't been unified yet.)",
+      "tags": ["user_guide", "skills"],
+      "title_query": "Tools"
+    },
+    {
+      "key": "user_guide/skills.md#what-the-llm-sees",
+      "value": "Every turn, the per-session PromptAugmentation from the skills extension appends a block like this to the system prompt:",
+      "tags": ["user_guide", "skills"],
+      "title_query": "What the LLM sees"
+    },
+    {
+      "key": "user_guide/tools.md#approval-requirements",
+      "value": "- Never -- tool runs without asking the user - UnlessAutoApproved -- runs automatically if listed in security.autoapprovedtools, otherwise asks - Always -- always asks the user before running In the TUI, approval is an inline prompt (y/n/a). In Matrix, approval is not yet implemented -- unapproved tools time out.",
+      "tags": ["user_guide", "tools"],
+      "title_query": "Approval Requirements"
+    },
+    {
+      "key": "user_guide/tools.md#built-in-tools",
+      "value": "Every built-in is owned by an extension(extensions.md); disabling an extension hides its tools from the LLM. The owning extension is shown so you can find a tool's lifecycle (and disable it per-session/per-agent) at a glance. That's 23 tools across 7 extensions today. External tools from MCP servers(mcp.md) plug in under the same policy layer and show up here too, namespaced as <server><tool> (matches the Anthropic Agent SDK / Claude Code mcpservertool convention so OpenAI-co",
+      "tags": ["user_guide", "tools"],
+      "title_query": "Built-in Tools"
+    },
+    {
+      "key": "user_guide/tools.md#edit-file",
+      "value": "Replace exact text in a file. The tool validates that each oldtext appears exactly once before writing, which makes diff-style edits safe. Use the edits array to apply several replacements atomically (all or nothing).",
+      "tags": ["user_guide", "tools"],
+      "title_query": "edit_file"
+    },
+    {
+      "key": "user_guide/tools.md#read-file-write-file",
+      "value": "Read or write files on the host filesystem. Both go through the host's FileRead / FileWrite capabilities and honour the FsGrant(#capability-boundary) allowread / allowwrite allowlists (advisory path-prefix confinement; symlinks not followed).",
+      "tags": ["user_guide", "tools"],
+      "title_query": "read_file / write_file"
+    },
+    {
+      "key": "user_guide/tools.md#risk-levels",
+      "value": "- Low -- safe operations with no side effects - Medium -- operations that modify state or access the network - High -- operations that execute arbitrary code",
+      "tags": ["user_guide", "tools"],
+      "title_query": "Risk Levels"
+    },
+    {
+      "key": "user_guide/tools.md#web-fetch",
+      "value": "Performs HTTP requests. Subject to network policy (endpoint allowlisting, SSRF protection).",
+      "tags": ["user_guide", "tools"],
+      "title_query": "web_fetch"
+    },
+    {
+      "key": "user_guide/tui.md#commands",
+      "value": "The TUI catalogs every built-in slash command in its inline completion popup \u2014 type / to open it, Tab / arrow keys to navigate, Enter to insert. F1 or /help shows the same catalog as a scrollable overlay. The list below is the same one rendered there, grouped the same way.",
+      "tags": ["user_guide", "tui"],
+      "title_query": "Commands"
+    },
+    {
+      "key": "user_guide/tui.md#extensions",
+      "value": "See Extensions(extensions.md). Extensions can also register their own slash commands; they appear in the completion popup once installed.",
+      "tags": ["user_guide", "tui"],
+      "title_query": "Extensions"
+    },
+    {
+      "key": "user_guide/tui.md#interface-layout",
+      "value": "The TUI has four main pieces: 1. Tab bar \u2014 one tab per open session. Click to switch, x to close, or use Ctrl+PageUp/Ctrl+PageDown. Closing the last tab is refused (the TUI always shows at least one session). 2. Messages area \u2014 conversation history with all entry types 3. Status bar \u2014 session name, then the agent and model. A single-agent session shows agent: <name> | model: <model>; a multi-agent session lists the whole roster with the host marked and each agent's model (age",
+      "tags": ["user_guide", "tui"],
+      "title_query": "Interface Layout"
+    },
+    {
+      "key": "user_guide/tui.md#key-bindings",
+      "value": "Approval prompts hijack the keyboard while open: y approve, n deny, a approve all remaining tool calls for this turn.",
+      "tags": ["user_guide", "tui"],
+      "title_query": "Key Bindings"
+    },
+    {
+      "key": "user_guide/tui.md#llm-config",
+      "value": "Model resolution order for any given turn (highest priority first): 1. Per-agent session override \u2014 SessionMeta.agentmodelsagentname 2. Session-wide pin \u2014 SessionMeta.model 3. The agent's defaultmodel from its DB config (seeded from YAML agents.model) 4. The backend's default model /model (no args) names which source wins for the current agent, so the display always matches what the next message will actually run.",
+      "tags": ["user_guide", "tui"],
+      "title_query": "LLM config"
+    },
+    {
+      "key": "user_guide/tui.md#tui-utilities",
+      "value": "Unknown /<name> commands route to extension dispatch \u2014 see the error you get back for the closest match.",
+      "tags": ["user_guide", "tui"],
+      "title_query": "TUI utilities"
+    },
+    {
+      "key": "user_guide/usage.md#chaz-usage-cli",
+      "value": "For headless or scripted rollups \u2014 say, in a cron job, dashboard, or one-off audit \u2014 run the subcommand mode. It opens the eidetica store, computes the same rollup, prints it, and exits without starting any bridge.",
+      "tags": ["user_guide", "usage"],
+      "title_query": "`chaz usage` (CLI)"
+    },
+    {
+      "key": "user_guide/usage.md#costs-tui",
+      "value": "From inside the TUI, type: This walks the user-central session catalog, folds every assistant message's metadata into per-session, per-model, and total counts, and renders a plain-text rollup: - Total: calls, prompt + completion tokens (with cached tokens annotated), and total cost when at least one entry reported one. - By model: per-model call counts and cost, sorted by cost descending. - Top sessions: up to ten sessions with the most cost / activity, with gateway tag, call",
+      "tags": ["user_guide", "usage"],
+      "title_query": "`/costs` (TUI)"
+    },
+    {
+      "key": "user_guide/usage.md#examples",
+      "value": "The JSON output preserves the per-session and per-model breakdowns, the applied filter, and a costreported flag that lets downstream consumers distinguish \"we know the cost was zero\" from \"the backend never reported one.\"",
+      "tags": ["user_guide", "usage"],
+      "title_query": "Examples"
+    },
+    {
+      "key": "user_guide/usage.md#how-it-s-captured",
+      "value": "Each call to a configured LLMBackend returns a TokenUsage alongside the model response: - prompttokens, completiontokens, totaltokens - cachedtokens, cachecreationtokens, reasoningtokens (optional, when the provider reports them) - costusd (optional) For OpenAI-compatible backends, chaz sends usage: { include: true } on the request. When chatting through OpenRouter that surfaces costusd directly \u2014 no extra reconciliation pass is needed. Providers that don't return a cost stil",
+      "tags": ["user_guide", "usage"],
+      "title_query": "How It's Captured"
+    },
+    {
+      "key": "user_guide/usage.md#see-also",
+      "value": "- Session Model(../architecture/sessions.md) \u2014 where ResponseMetadata is persisted and how entries flow through a session. - TUI Mode(tui.md) \u2014 full TUI command reference. - Logging(logging.md) \u2014 for tracing-based observability of the underlying LLM calls.",
+      "tags": ["user_guide", "usage"],
+      "title_query": "See Also"
+    },
+    {
+      "key": "user_guide/usage.md#what-doesn-t-roll-up",
+      "value": "- Non-message entries \u2014 ToolCall, ToolResult, Ack, and Error entries have no ResponseMetadata (no LLM call happened for them). - Sessions chaz can't open \u2014 corrupted or otherwise unreadable session DBs are logged via warn! and skipped. - Costs that the provider didn't report \u2014 token counts still aggregate, but the cost column stays at \"no data\" rather than silently summing to zero.",
+      "tags": ["user_guide", "usage"],
+      "title_query": "What Doesn't Roll Up"
+    }
+  ],
+  "paraphrase_queries": [
+    {
+      "query": "make searching my notes understand meaning rather than exact words",
+      "gold": "user_guide/configuration.md#embeddings"
+    },
+    {
+      "query": "what happens when the vector service is unreachable",
+      "gold": "user_guide/configuration.md#failure-handling"
+    },
+    {
+      "query": "I changed which vectoriser I use, do my older notes still come back",
+      "gold": "user_guide/configuration.md#switching-models"
+    },
+    {
+      "query": "can one assistant read another one's notes",
+      "gold": "user_guide/memory.md#the-two-kinds"
+    },
+    {
+      "query": "restrict which commands the model is allowed to run",
+      "gold": "user_guide/security.md#shell-grants"
+    },
+    {
+      "query": "stop the model reaching machines on my home LAN",
+      "gold": "user_guide/security.md#network-grants"
+    },
+    {
+      "query": "change a snippet of text inside an existing document",
+      "gold": "user_guide/tools.md#edit-file"
+    },
+    {
+      "query": "which keys do I press when it asks permission",
+      "gold": "user_guide/tui.md#key-bindings"
+    },
+    {
+      "query": "keep a permanent record of what the background process printed",
+      "gold": "user_guide/logging.md#redirecting-to-a-file"
+    },
+    {
+      "query": "ask one question from a shell script and get the answer on stdout",
+      "gold": "user_guide/getting_started.md#single-shot-print-mode"
+    },
+    {
+      "query": "why do the external server's functions have a prefix in their names",
+      "gold": "user_guide/mcp.md#tool-discovery-and-namespacing"
+    },
+    {
+      "query": "does the bot reply to every private message on discord",
+      "gold": "user_guide/discord.md#message-handling"
+    },
+    {
+      "query": "where does the connector keep its password safely",
+      "gold": "user_guide/bridges.md#how-credentials-are-stored"
+    },
+    {
+      "query": "it says it is waiting for the owner to allow it",
+      "gold": "user_guide/bridges.md#troubleshooting"
+    },
+    {
+      "query": "let another machine join an existing conversation",
+      "gold": "user_guide/session_sharing.md#sharing-a-session"
+    },
+    {
+      "query": "what does the file that defines an ability look like",
+      "gold": "user_guide/skills.md#the-skill-md-format"
+    },
+    {
+      "query": "where does the persona text that shapes replies come from",
+      "gold": "user_guide/agents.md#system-prompts"
+    },
+    {
+      "query": "where do the token counts come from",
+      "gold": "user_guide/usage.md#how-it-s-captured"
+    },
+    {
+      "query": "combining two permission sets always keeps the stricter one",
+      "gold": "design/capability_tiers.md#the-attenuate-operator"
+    },
+    {
+      "query": "what is a conversation actually stored as",
+      "gold": "architecture/overview.md#session-model"
+    },
+    {
+      "query": "one assistant should only wake another when it names it",
+      "gold": "design/autonomous_agents.md#goals"
+    },
+    {
+      "query": "recurring wake-ups belong to the assistant, not to the chat",
+      "gold": "design/agent_schedules.md#model"
+    },
+    {
+      "query": "keep the connector a thin translator with no smarts in it",
+      "gold": "design/transport_bridges.md#why-dumb"
+    },
+    {
+      "query": "the percentage showing how full the window is",
+      "gold": "design/model_info_store.md#the-ctx-n-gauge"
+    },
+    {
+      "query": "turn a feature on for every conversation instead of just this one",
+      "gold": "user_guide/extensions.md#per-agent-scope"
+    },
+    {
+      "query": "how dangerous each operation is rated",
+      "gold": "user_guide/tools.md#risk-levels"
+    },
+    {
+      "query": "automate the setup so nobody has to click approve",
+      "gold": "user_guide/matrix.md#scripted-bring-up"
+    },
+    {
+      "query": "how long does each plugin instance live",
+      "gold": "architecture/extensions.md#scopes-lifecycle"
+    }
+  ]
+}
