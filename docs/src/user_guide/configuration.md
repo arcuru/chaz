@@ -236,7 +236,8 @@ context:
 
 # Directories the bubblewrap host may mount read-write as a shell working
 # directory. Requested working dirs must canonicalize inside one of these
-# roots; omit for none (commands run against the ephemeral /tmp).
+# roots; omit for none (commands run against the ephemeral /tmp). A root
+# that canonicalizes to / is refused at startup.
 # tool_host_writable_roots:
 #   - /srv/work
 

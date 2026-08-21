@@ -110,7 +110,8 @@ pub struct Config {
     /// working directory. Paths are canonicalized (symlinks and `..`
     /// resolved) and must land inside one of these roots; anything else is
     /// refused. Omit or leave empty and no host path is ever writable —
-    /// shell commands run against the ephemeral `/tmp`.
+    /// shell commands run against the ephemeral `/tmp`. A root that
+    /// canonicalizes to the filesystem root `/` is refused at construction.
     #[serde(default)]
     pub tool_host_writable_roots: Vec<PathBuf>,
 }

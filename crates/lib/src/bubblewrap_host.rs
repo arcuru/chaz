@@ -28,9 +28,13 @@
 //! - A writable working directory **only** when the requested directory
 //!   canonicalizes inside one of the configured writable roots
 //!   (`tool_host_writable_roots`). Symlinks and `..` are resolved before
-//!   the check, so they cannot smuggle a path outside a root. With no
-//!   roots configured, commands run against the ephemeral `/tmp` and no
-//!   host path is mounted read-write.
+//!   the check, so they cannot smuggle a path outside a root. A root that
+//!   canonicalizes to `/` is refused at construction — a writable root of
+//!   `/` would mount the entire host filesystem read-write. The writable
+//!   working-dir bind is applied *before* the read-only system binds, so
+//!   the read-only mounts always win even if a working dir overlaps an
+//!   ancestor of one of them. With no roots configured, commands run
+//!   against the ephemeral `/tmp` and no host path is mounted read-write.
 //!
 //! File read/write and HTTP capabilities fall through to the native
 //! host's grant-checked execution — bubblewrap provides the most value
@@ -97,27 +101,36 @@ impl BubblewrapToolHost {
     /// against the ephemeral `/tmp`.
     pub fn new() -> Self {
         Self::with_roots(Vec::new())
+            .expect("no writable roots configured, so construction cannot fail")
     }
 
     /// Create a host whose shell commands may be given a working dir
     /// under one of `roots` (canonicalized here). Each root must exist;
     /// missing roots are dropped with a warning rather than silently
-    /// widening later.
-    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
-        let writable_roots = roots
-            .into_iter()
-            .filter_map(|r| match r.canonicalize() {
-                Ok(c) if c.is_dir() => Some(c),
+    /// widening later. A root that canonicalizes to the filesystem root
+    /// `/` is refused with an error — it would mount the entire host
+    /// filesystem read-write, nullifying the sandbox.
+    pub fn with_roots(roots: Vec<PathBuf>) -> Result<Self, String> {
+        let mut writable_roots = Vec::new();
+        for r in roots {
+            match r.canonicalize() {
+                Ok(c) if c == Path::new("/") => {
+                    return Err(format!(
+                        "tool_host_writable_roots entry {:?} canonicalizes to the filesystem root `/` — \
+                         a writable root of `/` would mount the entire host filesystem read-write \
+                         inside the sandbox; configure narrower roots",
+                        r.display()
+                    ));
+                }
+                Ok(c) if c.is_dir() => writable_roots.push(c),
                 Ok(_) => {
                     warn!(root = %r.display(), "tool_host_writable_roots entry is not a directory — ignored");
-                    None
                 }
                 Err(e) => {
                     warn!(root = %r.display(), error = %e, "tool_host_writable_roots entry does not exist — ignored");
-                    None
                 }
-            })
-            .collect();
+            }
+        }
 
         let available = probe_bwrap();
 
@@ -129,11 +142,11 @@ impl BubblewrapToolHost {
             );
         }
 
-        Self {
+        Ok(Self {
             bwrap_path: "bwrap".to_string(),
             available,
             writable_roots,
-        }
+        })
     }
 
     /// Whether a working bwrap was found at construction time.
@@ -230,6 +243,15 @@ fn build_bwrap_command(
         "/dev",
     ]);
 
+    // The writable working-dir bind is emitted *before* the read-only
+    // system binds: bwrap applies mounts in argv order, and a writable
+    // bind mounted after a read-only one would shadow it — a working dir
+    // that is an ancestor of a system dir would turn that system dir
+    // writable. Mounted first, the read-only binds land on top and win.
+    if let Some(dir) = working_dir {
+        cmd.arg("--bind").arg(dir).arg(dir);
+    }
+
     for sys_dir in RO_BINDS {
         if Path::new(sys_dir).exists() {
             cmd.arg("--ro-bind").arg(sys_dir).arg(sys_dir);
@@ -241,7 +263,6 @@ fn build_bwrap_command(
     // absence is stronger confinement anyway — no host process list and
     // no `/proc/<pid>/root` escape hatch.
     if let Some(dir) = working_dir {
-        cmd.arg("--bind").arg(dir).arg(dir);
         cmd.arg("--chdir").arg(dir);
     } else {
         cmd.arg("--chdir").arg("/tmp");
@@ -429,6 +450,62 @@ mod tests {
     }
 
     #[test]
+    fn test_root_writable_root_is_rejected() {
+        // A configured writable root that canonicalizes to `/` would mount
+        // the entire host filesystem read-write — refuse it at construction,
+        // whatever spelling the operator used.
+        for root in ["/", "/./", "/tmp/.."] {
+            let err = BubblewrapToolHost::with_roots(vec![PathBuf::from(root)])
+                .err()
+                .expect("writable root canonicalizing to / must be rejected");
+            assert!(
+                err.contains("filesystem root"),
+                "{root}: expected root-refusal error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_writable_bind_precedes_readonly_system_binds() {
+        // bwrap applies mounts in argv order, so a writable working-dir
+        // bind mounted after a read-only system bind would shadow it — a
+        // working dir that is an ancestor of a system dir would turn that
+        // system dir writable. The writable bind must therefore come first.
+        let workdir = std::env::temp_dir();
+        let host = host_with_root(workdir.to_str().unwrap());
+        let cmd = host
+            .build_shell_command("id", Some(workdir.to_str().unwrap()))
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        let workdir_str = workdir.to_str().unwrap();
+        let writable_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == workdir_str && w[2] == workdir_str)
+            .expect("writable working-dir bind must be present");
+
+        let ro_idxs: Vec<usize> = args
+            .windows(3)
+            .enumerate()
+            .filter(|(_, w)| w[0] == "--ro-bind")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !ro_idxs.is_empty(),
+            "read-only system binds must be present: {args:?}"
+        );
+        for ro in ro_idxs {
+            assert!(
+                writable_idx < ro,
+                "writable bind at {writable_idx} must precede read-only bind at {ro}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_working_dir_dotdot_escape_is_rejected() {
         // A root of /tmp plus a ".." walk must not widen past the root:
         // canonicalization happens before the containment check.
@@ -481,6 +558,17 @@ impl BubblewrapToolHost {
         Self {
             bwrap_path: path.to_string(),
             available: true,
+            writable_roots: Vec::new(),
+        }
+    }
+
+    /// Create a host with explicit availability (for testing host
+    /// *selection* in other modules without probing the real system).
+    #[cfg(test)]
+    pub(crate) fn test_host(available: bool) -> Self {
+        Self {
+            bwrap_path: "/usr/bin/bwrap".to_string(),
+            available,
             writable_roots: Vec::new(),
         }
     }
@@ -628,7 +716,8 @@ mod integration {
         require_bwrap();
         let dir = std::env::temp_dir().join(format!("chaz-bwrap-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let host = BubblewrapToolHost::with_roots(vec![std::env::temp_dir()]);
+        let host = BubblewrapToolHost::with_roots(vec![std::env::temp_dir()])
+            .expect("the temp dir is a valid writable root");
         let result = host
             .request(
                 &Capability::Shell {

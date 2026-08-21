@@ -254,7 +254,7 @@ tool_host_writable_roots:
   - /tmp/agent-scratch
 ```
 
-A requested working directory must canonicalize (symlinks and `..` resolved) to a directory inside one of these roots; anything else — including `/`, `/home`, or a symlink pointing outside — is refused before `bwrap` runs.
+A requested working directory must canonicalize (symlinks and `..` resolved) to a directory inside one of these roots; anything else — including `/`, `/home`, or a symlink pointing outside — is refused before `bwrap` runs. A root that canonicalizes to `/` is itself refused at startup: it would mount the entire host filesystem read-write, so chaz refuses to start rather than run with the sandbox nullified. The read-only system binds above are applied after the writable working-dir bind, so they always win even if a working directory overlaps an ancestor of one of them.
 
 ### Fail-closed selection
 
