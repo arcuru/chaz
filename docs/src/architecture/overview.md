@@ -201,7 +201,7 @@ crates/lib/src/
   runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning, loop detector
   context.rs           ContextBuilder — token-budgeted context assembly (tiktoken), room note + augmentation
   tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError, RateLimiter
-  tool_host.rs         ToolHost trait — sandboxed capability boundary (Native, future WASM/bwrap)
+  tool_host.rs         ToolHost trait — sandboxed capability boundary (Native, bwrap; future WASM)
   bubblewrap_host.rs   ToolHost impl wrapping commands in `bwrap` (OS-level sandbox)
   wasm_host.rs         ToolHost impl for WASM-sandboxed extensions
   grants.rs            Typed capability grants (shell/network/fs)

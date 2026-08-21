@@ -1,6 +1,7 @@
 use crate::tool::PresentationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// Configuration for the chaz bot
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -105,6 +106,13 @@ pub struct Config {
     /// OS-level shell sandboxing via [`ToolHostConfig::Bubblewrap`].
     #[serde(default)]
     pub tool_host: Option<ToolHostConfig>,
+    /// Directories the bubblewrap host may mount read-write as a shell
+    /// working directory. Paths are canonicalized (symlinks and `..`
+    /// resolved) and must land inside one of these roots; anything else is
+    /// refused. Omit or leave empty and no host path is ever writable —
+    /// shell commands run against the ephemeral `/tmp`.
+    #[serde(default)]
+    pub tool_host_writable_roots: Vec<PathBuf>,
 }
 
 /// The process's authority to run agent and routine work.
@@ -243,8 +251,9 @@ pub enum RuntimeMode {
 /// The host is the process-wide sandbox tier behind every tool that goes
 /// through `ctx.host()` (shell, file, web). `native` runs capabilities
 /// in-process with grant checks only; `bubblewrap` additionally runs shell
-/// commands in an OS-level sandbox (`bwrap`), degrading to native when
-/// `bwrap` is not installed.
+/// commands in an OS-level sandbox (`bwrap`) and refuses to start if a
+/// working sandbox cannot be created; `bubblewrap-unsafe-fallback` makes
+/// the degradation to native execution explicit instead of fatal.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolHostConfig {
@@ -253,9 +262,14 @@ pub enum ToolHostConfig {
     #[default]
     Native,
     /// Bubblewrap host: shell commands run in Linux namespaces (no network,
-    /// read-only system dirs, no `/proc`). Other capabilities fall through
-    /// to native execution.
+    /// private PID namespace, cleared environment, read-only system dirs
+    /// and `/nix/store`). Startup fails if `bwrap` cannot create a sandbox.
     Bubblewrap,
+    /// Explicitly allow the bubblewrap host to degrade to native execution
+    /// when no working `bwrap` sandbox is available. The unsafe choice is
+    /// opt-in; plain `bubblewrap` fails closed.
+    #[serde(rename = "bubblewrap-unsafe-fallback")]
+    BubblewrapUnsafeFallback,
 }
 
 /// One login on some transport, owned by exactly one agent (`login → agent`
@@ -1416,8 +1430,26 @@ mod tests {
         assert_eq!(cfg.tool_host, Some(ToolHostConfig::Bubblewrap));
         let cfg: Config = serde_yaml::from_str("tool_host: native\n").unwrap();
         assert_eq!(cfg.tool_host, Some(ToolHostConfig::Native));
+        // The unsafe fallback is a separate, explicit selection.
+        let cfg: Config = serde_yaml::from_str("tool_host: bubblewrap-unsafe-fallback\n").unwrap();
+        assert_eq!(
+            cfg.tool_host,
+            Some(ToolHostConfig::BubblewrapUnsafeFallback)
+        );
         // Unknown values are rejected rather than silently defaulting.
         assert!(serde_yaml::from_str::<Config>("tool_host: sandwich\n").is_err());
+    }
+
+    #[test]
+    fn parse_tool_host_writable_roots() {
+        let cfg: Config = serde_yaml::from_str(
+            "tool_host_writable_roots:\n  - /srv/work\n  - /tmp/agent-scratch\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tool_host_writable_roots.len(), 2);
+        // Omitted → empty → no writable working dirs at all.
+        let cfg: Config = serde_yaml::from_str::<Config>("runtime: auto\n").unwrap();
+        assert!(cfg.tool_host_writable_roots.is_empty());
     }
 
     #[test]

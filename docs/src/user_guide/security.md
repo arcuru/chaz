@@ -228,7 +228,43 @@ The session ceiling lives on the session itself (`SessionMeta.capabilities`) rat
 >     endpoints: [] # deny-all egress
 > ```
 >
-> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — the `BubblewrapToolHost` (`tool_host: bubblewrap`) provides that for `shell` commands, which run with `--unshare-net`. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
+> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that a shell command _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary — the `BubblewrapToolHost` (`tool_host: bubblewrap`) runs every shell command with `--unshare-net`, so there is no interface beyond loopback inside the namespace. File and HTTP capabilities still run in-process under their grants, so pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) to cover those paths too.
+
+## The bubblewrap tool host
+
+Setting `tool_host: bubblewrap` routes shell commands through
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`), which gives each command its own Linux namespaces using unprivileged user namespaces — no root, no setuid. Inside the sandbox a shell command gets:
+
+- **No network** (`--unshare-net`) — loopback only, no external interfaces.
+- **A private PID namespace** (`--unshare-pid`) — host PIDs are unaddressable, so a same-UID host process cannot be signalled or inspected.
+- **No `/proc`** — mounting a procfs for the new PID namespace is refused by some hardened kernels, and its absence is stronger confinement anyway: no host process list, no `/proc/<pid>/root`.
+- **An empty environment** (`--clearenv`) restored with fixed `PATH`, `HOME=/tmp`, and `LANG` — provider API keys and other host secrets never reach a shell command.
+- **Read-only system directories**: `/usr`, `/bin`, `/lib`, `/lib64`, `/nix/store`, and `/run/current-system`. Only `/nix/store` is bound — not all of `/nix` — because a read-only mount still allows connecting to the Nix daemon's Unix socket under `/nix/var/nix`.
+- **Ephemeral `/tmp`** (tmpfs) and a minimal `/dev`.
+
+File read/write and HTTP capabilities are not namespaced; they run on the native host's grant-checked path exactly as before.
+
+### Writable working directories
+
+By default **nothing on the host is writable from inside the sandbox** — commands run against the ephemeral `/tmp`. To let a command work in a real directory, list approved roots:
+
+```yaml
+tool_host_writable_roots:
+  - /srv/work
+  - /tmp/agent-scratch
+```
+
+A requested working directory must canonicalize (symlinks and `..` resolved) to a directory inside one of these roots; anything else — including `/`, `/home`, or a symlink pointing outside — is refused before `bwrap` runs.
+
+### Fail-closed selection
+
+Selecting `bubblewrap` requires a working sandbox: at startup chaz probes `bwrap` by actually creating a namespace, and if that fails the server refuses to start rather than silently running unsandboxed. If you genuinely want to degrade to native execution when `bwrap` is unavailable, say so explicitly:
+
+```yaml
+tool_host: bubblewrap-unsafe-fallback
+```
+
+That logs a prominent warning and runs shell commands natively (grant checks only). The unsafe fallback is always opt-in; plain `bubblewrap` fails closed.
 
 ## Leak Detection
 

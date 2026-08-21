@@ -10,90 +10,151 @@
 //! Shell commands run in a fresh namespace with:
 //! - No network access (`--unshare-net`)
 //! - No IPC access (`--unshare-ipc`)
-//! - Read-only system directories (`/usr`, `/bin`, `/lib`, `/lib64`, `/nix`)
-//! - Ephemeral `/tmp` (tmpfs)
-//! - The working directory (when supplied) bind-mounted read-write; every
-//!   other path is simply absent from the mount namespace
-//! - No `/proc` — the host's PID namespace and `/proc/<pid>/root` escape
-//!   hatch are not exposed
+//! - A private PID namespace (`--unshare-pid`): host PIDs are not
+//!   addressable from inside, so host processes cannot be signalled
+//! - An empty environment (`--clearenv`) restored with only fixed
+//!   `PATH`, `HOME`, and `LANG` values — provider keys and other host
+//!   secrets never reach a shell command
+//! - Read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/nix/store`, and
+//!   `/run/current-system`. `/nix/store` rather than all of `/nix`, so
+//!   the Nix daemon socket under `/nix/var/nix` is not exposed
+//!   (read-only mounts still permit Unix-socket connects)
+//! - Ephemeral `/tmp` (tmpfs) and a minimal `/dev`
+//! - No `/proc`: mounting a procfs for the new PID namespace is refused
+//!   with `EPERM` on some hardened kernels, and its absence is strictly
+//!   stronger confinement — the host process list and the
+//!   `/proc/<pid>/root` escape hatch are simply not reachable
 //! - Killed when the parent exits (`--die-with-parent`)
+//! - A writable working directory **only** when the requested directory
+//!   canonicalizes inside one of the configured writable roots
+//!   (`tool_host_writable_roots`). Symlinks and `..` are resolved before
+//!   the check, so they cannot smuggle a path outside a root. With no
+//!   roots configured, commands run against the ephemeral `/tmp` and no
+//!   host path is mounted read-write.
 //!
-//! File read/write and HTTP capabilities fall through to native
-//! execution — bubblewrap provides the most value for shell commands,
-//! which are the highest-risk tool in chaz.
+//! File read/write and HTTP capabilities fall through to the native
+//! host's grant-checked execution — bubblewrap provides the most value
+//! for shell commands, which are the highest-risk tool in chaz.
 //!
-//! # Graceful degradation
+//! # Fail-closed selection
 //!
-//! If `bwrap` is not installed, the host falls back to native
-//! execution for all capabilities. A warning is logged at startup.
+//! Selecting `tool_host: bubblewrap` requires a working `bwrap`: the
+//! probe at startup actually creates a sandbox, and if that fails the
+//! server refuses to start rather than silently running unsandboxed.
+//! Degrading to native execution is a separate, explicit choice
+//! (`tool_host: bubblewrap-unsafe-fallback`).
 
 use crate::grants::Grants;
 use crate::tool::ToolError;
 use crate::tool_host::{Capability, CapabilityResult, NativeToolHost, ToolHost};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tracing::warn;
+
+/// Fixed environment restored inside the sandbox after `--clearenv`.
+const SANDBOX_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
+const SANDBOX_HOME: &str = "/tmp";
+const SANDBOX_LANG: &str = "C.UTF-8";
+
+/// Read-only system directories bound into every sandbox (when present).
+const RO_BINDS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    // The store only — all of /nix would expose the daemon socket under
+    // /nix/var/nix/daemon-socket, and a read-only mount still allows
+    // connecting to a Unix socket.
+    "/nix/store",
+    "/run/current-system",
+];
 
 /// OS-level sandboxing host using bubblewrap (`bwrap`).
 ///
 /// Creates a new Linux namespace per shell command execution,
 /// restricting filesystem access, network, and process visibility.
-/// Non-shell capabilities pass through to native execution.
+/// Non-shell capabilities are denied.
 ///
-/// Selectable via `tool_host: bubblewrap` in config; the default is
-/// [`NativeToolHost`]. When `bwrap` is absent from `PATH` the host
-/// degrades to native execution for every capability.
+/// Selected via `tool_host: bubblewrap` in config. Construction probes
+/// for a *working* `bwrap`; if the probe fails the host reports itself
+/// unavailable and shell requests error out — the server decides at
+/// startup whether that is fatal (`bubblewrap`) or an explicit,
+/// acknowledged degradation (`bubblewrap-unsafe-fallback`).
 pub struct BubblewrapToolHost {
     /// Path to the `bwrap` binary.
     bwrap_path: String,
-    /// Whether a working `bwrap` binary was found at construction time.
+    /// Whether a working `bwrap` was found at construction time.
     available: bool,
+    /// Canonical directories a working dir may live in. Empty means no
+    /// host path is ever mounted read-write.
+    writable_roots: Vec<PathBuf>,
 }
 
 impl BubblewrapToolHost {
-    /// Create a new bubblewrap host.
-    ///
-    /// Probes for `bwrap` on the system. If not found, the host
-    /// degrades to native execution with a warning.
+    /// Create a host with no writable roots: shell commands always run
+    /// against the ephemeral `/tmp`.
     pub fn new() -> Self {
-        let available = std::process::Command::new("bwrap")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        Self::with_roots(Vec::new())
+    }
+
+    /// Create a host whose shell commands may be given a working dir
+    /// under one of `roots` (canonicalized here). Each root must exist;
+    /// missing roots are dropped with a warning rather than silently
+    /// widening later.
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        let writable_roots = roots
+            .into_iter()
+            .filter_map(|r| match r.canonicalize() {
+                Ok(c) if c.is_dir() => Some(c),
+                Ok(_) => {
+                    warn!(root = %r.display(), "tool_host_writable_roots entry is not a directory — ignored");
+                    None
+                }
+                Err(e) => {
+                    warn!(root = %r.display(), error = %e, "tool_host_writable_roots entry does not exist — ignored");
+                    None
+                }
+            })
+            .collect();
+
+        let available = probe_bwrap();
 
         if available {
-            tracing::info!("BubblewrapToolHost: bwrap found, shell sandboxing active");
+            tracing::info!("BubblewrapToolHost: bwrap sandbox probe succeeded");
         } else {
             warn!(
-                "BubblewrapToolHost: bwrap not found — falling back to native execution for all capabilities. Install bubblewrap for OS-level shell sandboxing."
+                "BubblewrapToolHost: bwrap could not create a sandbox — the host will deny shell execution. Install bubblewrap and ensure unprivileged user namespaces work, or select tool_host: bubblewrap-unsafe-fallback to acknowledge native fallback."
             );
         }
 
         Self {
             bwrap_path: "bwrap".to_string(),
             available,
+            writable_roots,
         }
     }
 
-    /// Create a host with a specific bwrap binary path (for testing).
-    #[cfg(test)]
-    fn with_path(path: &str) -> Self {
-        Self {
-            bwrap_path: path.to_string(),
-            available: true,
-        }
+    /// Whether a working bwrap was found at construction time.
+    pub fn is_available(&self) -> bool {
+        self.available
     }
 
     /// Build the bwrap command for shell execution. Visible for testing.
+    ///
+    /// Fails when `working_dir` cannot be confined: it must canonicalize
+    /// (symlinks and `..` resolved) to a directory inside one of the
+    /// configured writable roots.
     pub fn build_shell_command(
         &self,
         command: &str,
         working_dir: Option<&str>,
-    ) -> tokio::process::Command {
-        build_bwrap_command(&self.bwrap_path, command, working_dir)
+    ) -> Result<std::process::Command, String> {
+        let resolved = match working_dir {
+            Some(dir) => Some(resolve_working_dir(dir, &self.writable_roots)?),
+            None => None,
+        };
+        build_bwrap_command(&self.bwrap_path, command, resolved.as_deref())
     }
 }
 
@@ -103,38 +164,84 @@ impl Default for BubblewrapToolHost {
     }
 }
 
+/// Probe that `bwrap` can actually create a sandbox here — not merely
+/// that the binary exists. Runs the real profile with a trivial command.
+fn probe_bwrap() -> bool {
+    let Ok(mut cmd) = build_bwrap_command("bwrap", "true", None) else {
+        return false;
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Resolve a model-supplied working dir to a confineable path.
+///
+/// `canonicalize` resolves symlinks and `..` components, so a symlink
+/// planted under an allowed root or a `..` walk cannot land outside it:
+/// the check runs on the final target, not the requested spelling.
+fn resolve_working_dir(dir: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let canonical = Path::new(dir)
+        .canonicalize()
+        .map_err(|e| format!("working dir {dir:?} is not accessible: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("working dir {dir:?} is not a directory"));
+    }
+    if roots.iter().any(|r| canonical.starts_with(r)) {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "working dir {dir:?} resolves outside every configured writable root — refusing to bind it read-write"
+        ))
+    }
+}
+
 /// Build a `bwrap` command with the sandbox profile applied.
 fn build_bwrap_command(
     bwrap_path: &str,
     command: &str,
-    working_dir: Option<&str>,
-) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(bwrap_path);
+    working_dir: Option<&Path>,
+) -> Result<std::process::Command, String> {
+    let mut cmd = std::process::Command::new(bwrap_path);
 
-    cmd.arg("--unshare-net")
-        .arg("--unshare-ipc")
-        .arg("--unshare-uts")
-        .arg("--die-with-parent")
-        .arg("--new-session")
-        .arg("--tmpfs")
-        .arg("/tmp");
+    cmd.args([
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        // Private PID namespace: host PIDs become unaddressable, so a
+        // same-UID host process cannot be signalled from inside.
+        "--unshare-pid",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        SANDBOX_PATH,
+        "--setenv",
+        "HOME",
+        SANDBOX_HOME,
+        "--setenv",
+        "LANG",
+        SANDBOX_LANG,
+        "--tmpfs",
+        "/tmp",
+        "--dev",
+        "/dev",
+    ]);
 
-    for sys_dir in &["/usr", "/bin", "/lib", "/lib64", "/nix"] {
-        if std::path::Path::new(sys_dir).exists() {
+    for sys_dir in RO_BINDS {
+        if Path::new(sys_dir).exists() {
             cmd.arg("--ro-bind").arg(sys_dir).arg(sys_dir);
         }
     }
 
-    // `/proc` is deliberately *not* mounted: without `--unshare-pid` a fresh
-    // procfs still shows the host's PID namespace, leaking the host process
-    // list and re-exposing the host root through `/proc/<pid>/root`.
-    cmd.arg("--dev").arg("/dev");
-
+    // `/proc` is deliberately *not* mounted: mounting a procfs for the
+    // fresh PID namespace is refused with EPERM on some kernels, and its
+    // absence is stronger confinement anyway — no host process list and
+    // no `/proc/<pid>/root` escape hatch.
     if let Some(dir) = working_dir {
-        if std::path::Path::new(dir).is_dir() {
-            cmd.arg("--bind").arg(dir).arg(dir);
-            cmd.arg("--chdir").arg(dir);
-        }
+        cmd.arg("--bind").arg(dir).arg(dir);
+        cmd.arg("--chdir").arg(dir);
     } else {
         cmd.arg("--chdir").arg("/tmp");
     }
@@ -143,7 +250,7 @@ fn build_bwrap_command(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    cmd
+    Ok(cmd)
 }
 
 impl ToolHost for BubblewrapToolHost {
@@ -157,10 +264,9 @@ impl ToolHost for BubblewrapToolHost {
                 Capability::Shell {
                     command,
                     working_dir,
-                } if self.available => {
-                    exec_shell_bwrap(command, working_dir.as_deref(), grants).await
-                }
-                // Shell when bwrap unavailable, plus all other capabilities
+                } => exec_shell_bwrap(self, command, working_dir.as_deref(), grants).await,
+                // File and HTTP capabilities run on the native host's
+                // grant-checked paths; the namespace adds nothing for them.
                 _ => NativeToolHost.request(capability, grants).await,
             }
         })
@@ -170,7 +276,7 @@ impl ToolHost for BubblewrapToolHost {
         if self.available {
             "bwrap"
         } else {
-            "bwrap(degraded→native)"
+            "bwrap(unavailable)"
         }
     }
 }
@@ -178,17 +284,26 @@ impl ToolHost for BubblewrapToolHost {
 /// Execute a shell command inside a bubblewrap namespace.
 /// Grant enforcement is performed first via the shared `check_shell_command`.
 async fn exec_shell_bwrap(
+    host: &BubblewrapToolHost,
     command: &str,
     working_dir: Option<&str>,
     grants: &Grants,
 ) -> Result<CapabilityResult, ToolError> {
+    if !host.available {
+        return Err(ToolError::Execution(
+            "shell execution denied: tool_host is bubblewrap but no working bwrap sandbox \
+             is available on this system"
+                .to_string(),
+        ));
+    }
+
     // Grant check — shared with native host
     crate::tool_host::check_shell_command(command, grants.shell.as_ref()).map_err(|msg| {
         warn!(command = %command, "Bwrap shell command denied: {msg}");
         ToolError::Execution(msg)
     })?;
 
-    let mut cmd = build_bwrap_command("bwrap", command, working_dir);
+    let mut cmd = tokio::process::Command::from(build_shell_cmd(host, command, working_dir)?);
 
     let output = cmd
         .output()
@@ -202,22 +317,52 @@ async fn exec_shell_bwrap(
     }))
 }
 
+/// Validate the working dir and build the command, mapping confinement
+/// failures onto [`ToolError`].
+fn build_shell_cmd(
+    host: &BubblewrapToolHost,
+    command: &str,
+    working_dir: Option<&str>,
+) -> Result<std::process::Command, ToolError> {
+    host.build_shell_command(command, working_dir)
+        .map_err(|msg| {
+            warn!(command = %command, "Bwrap working dir rejected: {msg}");
+            ToolError::Execution(msg)
+        })
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn host_with_root(root: &str) -> BubblewrapToolHost {
+        BubblewrapToolHost {
+            bwrap_path: "/usr/bin/bwrap".to_string(),
+            available: true,
+            writable_roots: vec![PathBuf::from(root)],
+        }
+    }
+
     #[test]
     fn test_bwrap_command_structure() {
         let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
-        let cmd = host.build_shell_command("echo hello", None);
+        let cmd = host.build_shell_command("echo hello", None).unwrap();
 
         let debug = format!("{cmd:?}");
         assert!(debug.contains("bwrap"), "Should use bwrap: {debug}");
         assert!(
             debug.contains("--unshare-net"),
             "Should unshare network: {debug}"
+        );
+        assert!(
+            debug.contains("--unshare-pid"),
+            "Should unshare PIDs: {debug}"
+        );
+        assert!(
+            debug.contains("--clearenv"),
+            "Should clear the environment: {debug}"
         );
         assert!(
             debug.contains("--die-with-parent"),
@@ -232,53 +377,93 @@ mod tests {
     }
 
     #[test]
-    fn test_bwrap_command_includes_working_dir() {
+    fn test_environment_is_minimal_and_fixed() {
         let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
-        // Use /tmp which exists on all systems
-        let cmd = host.build_shell_command("ls", Some("/tmp"));
+        let cmd = host.build_shell_command("env", None).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("--clearenv"), "{debug}");
+        assert!(debug.contains("\"PATH\""), "{debug}");
+        assert!(debug.contains(SANDBOX_PATH), "{debug}");
+        assert!(debug.contains("\"HOME\""), "{debug}");
+        assert!(debug.contains("\"LANG\""), "{debug}");
+        // No way for caller-supplied env to leak: the builder never reads
+        // the parent environment at all.
+    }
 
+    #[test]
+    fn test_nix_store_bound_not_all_of_nix() {
+        let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
+        let cmd = host.build_shell_command("id", None).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("/nix/store"), "{debug}");
+        assert!(
+            !debug.contains("\"/nix\""),
+            "all of /nix must not be bound (daemon socket exposure): {debug}"
+        );
+    }
+
+    #[test]
+    fn test_bwrap_command_includes_confined_working_dir() {
+        let dir = std::env::temp_dir();
+        let host = host_with_root(dir.to_str().unwrap());
+        let cmd = host
+            .build_shell_command("ls", Some(dir.to_str().unwrap()))
+            .unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("--chdir"), "Should have chdir: {debug}");
+        assert!(debug.contains("--bind"), "Should bind the workdir: {debug}");
     }
 
     #[test]
-    fn test_bwrap_sandboxes_network_commands() {
-        let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
-        let cmd = host.build_shell_command("curl http://evil.com", None);
-
-        let debug = format!("{cmd:?}");
-        // The command is present but --unshare-net will prevent it at runtime
-        assert!(debug.contains("curl"), "Should contain curl: {debug}");
-        assert!(
-            debug.contains("--unshare-net"),
-            "Should unshare network: {debug}"
-        );
+    fn test_working_dir_outside_roots_is_rejected() {
+        let host = host_with_root("/nonexistent-root-for-tests");
+        // Paths that exist on every Linux host (the Nix build sandbox has
+        // no /home) but outside the configured root.
+        for dir in ["/", "/etc"] {
+            let err = host
+                .build_shell_command("ls", Some(dir))
+                .expect_err("must reject dir outside roots");
+            assert!(err.contains("writable root"), "{dir}: {err}");
+        }
     }
 
     #[test]
-    fn test_bwrap_command_readonly_system_dirs() {
-        let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
-        let cmd = host.build_shell_command("id", None);
-
-        let debug = format!("{cmd:?}");
-        // Should have --ro-bind for system directories that exist
-        assert!(debug.contains("--ro-bind"), "Should have ro-bind: {debug}");
+    fn test_working_dir_dotdot_escape_is_rejected() {
+        // A root of /tmp plus a ".." walk must not widen past the root:
+        // canonicalization happens before the containment check.
+        let host = host_with_root("/tmp");
+        let err = host
+            .build_shell_command("ls", Some("/tmp/../etc"))
+            .expect_err(".. escape must be rejected");
+        assert!(err.contains("writable root"), "{err}");
     }
 
     #[test]
-    fn test_degraded_name() {
-        let mut host = BubblewrapToolHost::new();
+    fn test_working_dir_symlink_escape_is_rejected() {
+        let base = std::env::temp_dir().join(format!("chaz-bwrap-sym-{}", std::process::id()));
+        let inside = base.join("inside");
+        let outside = std::env::temp_dir().join("chaz-bwrap-sym-outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = inside.join("escape");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let host = host_with_root(base.to_str().unwrap());
+        let err = host
+            .build_shell_command("ls", Some(link.to_str().unwrap()))
+            .expect_err("symlink escape must be rejected");
+        assert!(err.contains("writable root"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn test_unavailable_host_denies_shell() {
+        let mut host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
         host.available = false;
-        assert!(
-            host.name().contains("degraded"),
-            "Should indicate degradation"
-        );
-    }
-
-    #[test]
-    fn test_available_name() {
-        let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
-        assert_eq!(host.name(), "bwrap");
+        assert_eq!(host.name(), "bwrap(unavailable)");
     }
 
     #[test]
@@ -287,25 +472,40 @@ mod tests {
     }
 }
 
+// Keep the test-only constructor next to its users.
+impl BubblewrapToolHost {
+    /// Create a host with a specific bwrap binary path (for testing).
+    #[cfg(test)]
+    fn with_path(path: &str) -> Self {
+        Self {
+            bwrap_path: path.to_string(),
+            available: true,
+            writable_roots: Vec::new(),
+        }
+    }
+}
+
 // ── Integration tests (real bwrap execution) ───────────────────
 //
 // These run a *real* `bwrap` sandbox and assert on the denials — the whole
-// point of the host. They skip (rather than fail) when bwrap is absent from
-// PATH or the kernel refuses unprivileged user namespaces, so they stay green
-// on systems without bubblewrap while still exercising the boundary where it
-// is available.
-#[cfg(test)]
+// point of the host. They compile and hard-fail on Linux: CI builds there
+// with bwrap on PATH, so a silent skip would be a hole in the gate. On
+// non-Linux targets the module is not compiled at all.
+#[cfg(all(test, target_os = "linux"))]
 mod integration {
     use super::*;
     use crate::tool_host::ShellOutput;
 
     /// Run `command` through a freshly-built bwrap host and return the shell
-    /// output. Panics if the host is degraded or returns a non-shell result —
-    /// a degraded host silently falls through to native execution, which would
-    /// make every "denied" assertion below a false pass.
+    /// output. Panics unless the host probed healthy — an unavailable host
+    /// denies everything, which would make every "denied" assertion below a
+    /// false pass.
     async fn run(command: &str, working_dir: Option<&str>) -> ShellOutput {
         let host = BubblewrapToolHost::new();
-        assert!(host.available, "bwrap must be usable for this test");
+        assert!(
+            host.is_available(),
+            "bwrap must be usable for these tests: install bubblewrap / enable unprivileged user namespaces"
+        );
         let result = host
             .request(
                 &Capability::Shell {
@@ -345,40 +545,43 @@ mod integration {
             .unwrap_or(false)
     }
 
+    fn require_bwrap() {
+        assert!(
+            bwrap_usable(),
+            "these tests require a working bwrap sandbox on Linux"
+        );
+    }
+
     #[tokio::test]
-    async fn network_access_is_denied_with_a_useful_error() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap sandbox unavailable");
-            return;
-        }
-        // `/dev/tcp` is a bash builtin: a successful connect would print
-        // CONNECTED. `--unshare-net` must make the connect fail instead, and
-        // the failure should carry a diagnostic on stderr.
+    async fn network_access_is_denied() {
+        require_bwrap();
+        // Portable across shells (no bashisms): with --unshare-net the
+        // namespace has no interfaces beyond loopback, so anything listed
+        // under /sys/class/net beyond `lo` means the sandbox leaked the
+        // host network namespace.
         let out = run(
-            "cat < /dev/tcp/1.1.1.1/80 2>/dev/null && echo CONNECTED || echo BLOCKED",
+            "for i in /sys/class/net/* /sys/class/net/.[!.]*; do \
+                 [ -e \"$i\" ] && echo \"${i##*/}\"; \
+             done",
             None,
         )
         .await;
+        let interfaces: Vec<&str> = out.stdout.split_whitespace().collect();
         assert!(
-            !out.stdout.contains("CONNECTED"),
-            "a sandboxed shell reached the network: {}",
-            out.stdout
-        );
-        assert!(out.stdout.contains("BLOCKED"), "got: {}", out.stdout);
-        assert!(
-            !out.stderr.is_empty(),
-            "a denied connection should surface a diagnostic on stderr"
+            interfaces.iter().all(|i| *i == "lo"),
+            "a sandboxed shell saw non-loopback interfaces: {:?}",
+            interfaces
         );
     }
 
     #[tokio::test]
     async fn write_to_readonly_system_dir_is_denied() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap sandbox unavailable");
-            return;
-        }
-        let out = run("echo PWNED > /nix/bwrap-escape-test", None).await;
-        assert_ne!(out.exit_code, 0, "write to /nix must fail, got {out:?}");
+        require_bwrap();
+        let out = run("echo PWNED > /nix/store/bwrap-escape-test", None).await;
+        assert_ne!(
+            out.exit_code, 0,
+            "write to /nix/store must fail, got {out:?}"
+        );
         assert!(
             !out.stderr.is_empty(),
             "a denied write should surface a useful error on stderr"
@@ -387,10 +590,7 @@ mod integration {
 
     #[tokio::test]
     async fn write_outside_working_dir_is_denied() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap sandbox unavailable");
-            return;
-        }
+        require_bwrap();
         // `/etc` is not mounted into the namespace at all, so the path is
         // absent and the write fails without touching the host.
         let out = run("echo PWNED > /etc/bwrap-escape-test", None).await;
@@ -402,14 +602,46 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn working_dir_outside_configured_roots_is_denied_at_runtime() {
+        require_bwrap();
+        // No writable roots configured → "/" must be refused outright
+        // rather than bound read-write.
+        let host = BubblewrapToolHost::new();
+        let result = host
+            .request(
+                &Capability::Shell {
+                    command: "echo PWNED > /PWNED".to_string(),
+                    working_dir: Some("/".to_string()),
+                },
+                &Grants::default(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "working_dir=/ must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn write_to_working_dir_is_allowed() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap sandbox unavailable");
-            return;
-        }
+        require_bwrap();
         let dir = std::env::temp_dir().join(format!("chaz-bwrap-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let out = run("echo hello > out.txt", Some(dir.to_str().unwrap())).await;
+        let host = BubblewrapToolHost::with_roots(vec![std::env::temp_dir()]);
+        let result = host
+            .request(
+                &Capability::Shell {
+                    command: "echo hello > out.txt".to_string(),
+                    working_dir: Some(dir.to_str().unwrap().to_string()),
+                },
+                &Grants::default(),
+            )
+            .await
+            .expect("confined working dir must be accepted");
+        let out = match result {
+            CapabilityResult::Shell(o) => o,
+            other => panic!("expected shell output, got {other:?}"),
+        };
         assert_eq!(
             out.exit_code, 0,
             "write inside workdir must succeed: {out:?}"
@@ -422,13 +654,31 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn host_pid_namespace_is_not_exposed() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap sandbox unavailable");
-            return;
-        }
-        // `/proc` is deliberately not mounted; `test -d /proc` must report it
-        // absent rather than listing the host's processes.
+    async fn host_pids_cannot_be_signalled_from_inside() {
+        require_bwrap();
+        // The test process's own PID is a live host PID. Inside the private
+        // PID namespace that number addresses nothing, so kill must fail —
+        // this is exactly the same-UID kill escape the namespace closes.
+        let host_pid = std::process::id();
+        let out = run(
+            &format!("kill -0 {host_pid} 2>/dev/null && echo SIGNAL_OK || echo SIGNAL_FAIL"),
+            None,
+        )
+        .await;
+        assert_eq!(out.exit_code, 0, "probe itself must run cleanly: {out:?}");
+        assert!(
+            out.stdout.contains("SIGNAL_FAIL"),
+            "a host PID was signalled from inside the sandbox: {}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn proc_is_not_mounted() {
+        require_bwrap();
+        // Mounting a pid-namespaced procfs is EPERM on some kernels; its
+        // absence is deliberate. `test -d /proc` must report it absent
+        // rather than exposing the host's process tree.
         let out = run(
             "test -d /proc && echo PROC_EXISTS || echo PROC_ABSENT",
             None,
@@ -439,5 +689,21 @@ mod integration {
             "/proc must not be mounted, got: {}",
             out.stdout
         );
+    }
+
+    #[tokio::test]
+    async fn environment_does_not_leak_provider_keys() {
+        require_bwrap();
+        // Any variable exported into the test process (CI secrets, API keys)
+        // must not be visible inside the sandbox: only the fixed PATH, HOME
+        // and LANG come back after --clearenv.
+        let out = run("env | cut -d= -f1 | sort | tr '\\n' ' '", None).await;
+        let names: Vec<&str> = out.stdout.split_whitespace().collect();
+        for name in names {
+            assert!(
+                matches!(name, "PATH" | "HOME" | "LANG" | "PWD" | "_" | "SHLVL"),
+                "unexpected variable leaked into the sandbox: {name}"
+            );
+        }
     }
 }

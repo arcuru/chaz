@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::bail;
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
@@ -860,8 +861,35 @@ pub async fn build(
                 std::sync::Arc::new(tool_host::NativeToolHost::new())
             }
             config::ToolHostConfig::Bubblewrap => {
+                let host = bubblewrap_host::BubblewrapToolHost::with_roots(
+                    config.tool_host_writable_roots.clone(),
+                );
+                if !host.is_available() {
+                    bail!(
+                        "tool_host: bubblewrap requires a working bwrap sandbox, but the probe \
+                         failed (bwrap missing or unprivileged user namespaces unavailable). \
+                         Install bubblewrap, or set tool_host: bubblewrap-unsafe-fallback to \
+                         explicitly accept native execution without OS-level sandboxing."
+                    );
+                }
                 info!("Tool host: bubblewrap (OS-level shell sandboxing)");
-                std::sync::Arc::new(bubblewrap_host::BubblewrapToolHost::new())
+                std::sync::Arc::new(host)
+            }
+            config::ToolHostConfig::BubblewrapUnsafeFallback => {
+                let host = bubblewrap_host::BubblewrapToolHost::with_roots(
+                    config.tool_host_writable_roots.clone(),
+                );
+                if host.is_available() {
+                    info!("Tool host: bubblewrap (OS-level shell sandboxing)");
+                    std::sync::Arc::new(host)
+                } else {
+                    warn!(
+                        "Tool host: bubblewrap-unsafe-fallback selected and no working bwrap \
+                         sandbox is available — running shell commands natively WITHOUT \
+                         OS-level sandboxing (explicitly acknowledged in config)."
+                    );
+                    std::sync::Arc::new(tool_host::NativeToolHost::new())
+                }
             }
         };
 

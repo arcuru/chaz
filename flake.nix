@@ -93,8 +93,8 @@
 
         # Test-only extras: subprocess tests spawn python3, tests that touch
         # $HOME need it to point at a writable path inside the sandbox, and the
-        # bubblewrap host's integration tests need bwrap on PATH (they skip
-        # gracefully where unprivileged user namespaces are unavailable).
+        # bubblewrap host's integration tests need bwrap on PATH (they
+        # hard-fail without a working sandbox on Linux).
         testArgs =
           buildArgs
           // {
