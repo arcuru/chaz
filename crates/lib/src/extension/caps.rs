@@ -180,9 +180,13 @@ pub enum CapabilityRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
-    /// Access hosted agent DBs for state operations. The `agents`
-    /// field is set by the operator (not the extension) — it carries
-    /// the per-extension agent allowlist from `tool_policy`.
+    /// Access hosted agent DBs for state operations. `agents`, when
+    /// declared in a manifest, self-narrows the extension to that set
+    /// (`None` = no self-narrowing, `Some(empty)` = deny-all). No
+    /// extension declares this request today — the live scoping input
+    /// is the operator's `agent_state_allowlist` config map, applied
+    /// by each extension when it builds its
+    /// [`crate::extension::agent_state::ScopedAgentStateAdmin`].
     AgentStateAdmin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agents: Option<Vec<String>>,

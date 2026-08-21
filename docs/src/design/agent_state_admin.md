@@ -1,9 +1,11 @@
 # Agent State Admin Capability
 
-**Status:** Implemented (2026-05-18). Error/UX reconciliation 2026-05-19 (Gap 3): uniform not-found error + startup deny-all `WARN`.
+**Status:** Implemented (2026-05-18). Error/UX reconciliation 2026-05-19 (Gap 3): uniform not-found error. Startup deny-all `WARN`: shipped 2026-08-18 (see the second status update below).
 **Depends on:** cap traits landed (`crates/lib/src/extension/caps.rs`), hub wiring (Steps 2–5 of cap refactor), `AgentDbAccess` trait (landed in `crates/lib/src/tools/schedule.rs`).
 
 > **Status update (2026-05-27):** the `ExtensionCaps` bundle layer described below was deleted by `refactor(extension): delete inert ExtensionCaps bundle layer` (commit `03ba480`). The cap itself still exists and is still operator-scoped via `agent_state_allowlist`, but it is now reached through `PeerHandles.agent_state_allowlist` plus `ScopedAgentStateAdmin` built inside an `ExtensionInstance` (see [Extension Framework](../architecture/extensions.md)). The "Extension Caps Slot" / `CapProvider::AgentStateAdmin` sections below describe an intermediate shape that no longer exists in code; the security posture and operator-config layer (`agent_state_allowlist`, intersection table, startup deny-all `WARN`) are unchanged.
+
+> **Status update (2026-08-18):** the manifest∩operator intersection model never shipped and is retracted as a future refinement. `resolve_agent_allowlist()` and the hub-side factory (`build_agent_state_admin`) do not exist, and no extension declares `AgentStateAdmin` in its manifest — `requested_capabilities` is declaration vocabulary with no live declarers. The operator's `agent_state_allowlist` map is the **only** scoping input: each consuming extension reads its own entry from `PeerHandles.agent_state_allowlist` at instantiate time and builds its `ScopedAgentStateAdmin` itself. What this pass added is the startup deny-all `WARN` (`deny_all_warning` in `agent_state.rs`, logged at the consuming extension's construction site). The Capability-Request `agents` injection, the intersection table, and the hub-factory passages below describe that future refinement, not shipped behavior.
 
 ## Security posture
 
@@ -42,7 +44,7 @@ pub enum CapabilityKind {
     /// Read/write agent-owned state (schedules, memory, configuration).
     /// Host-only — only chaz core may provide the impl. The hub
     /// scopes each impl to the set of agents declared in the
-    /// operator's tool_policy before handing it to the extension.
+    /// operator's `agent_state_allowlist` map before handing it to the extension.
     AgentStateAdmin,
 }
 ```
@@ -65,7 +67,7 @@ pub enum CapabilityRequest {
 }
 ```
 
-The `agents` field is not set by the extension's manifest author — it's set by the operator in `tool_policy` and injected into the caps bundle by the hub during resolution. The manifest only declares the _kind_; the operator configures the _scope_.
+The `agents` field is not set by the extension's manifest author — it's set by the operator (in the top-level `agent_state_allowlist` map, not `tool_policy`) and injected during resolution, per the intersection table below. The manifest only declares the _kind_; the operator configures the _scope_. _(Future refinement — see the 2026-08-18 status update; today nothing injects this field.)_
 
 ### Trait
 
@@ -99,83 +101,52 @@ Note: `resolve_agent` replaces the `HostedIndex::find_by_name` calls the tools c
 The hub's factory builds a scoped implementation from the raw infrastructure handles:
 
 ```rust
-// crates/lib/src/extension/agent_state.rs (new)
+// crates/lib/src/extension/agent_state.rs
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use crate::agent_db::AgentDb;
-use crate::extension::caps::{AgentStateAdmin, CapFuture};
-use crate::hosted_index::{DbEntry, HostedIndex};
-use crate::session::SessionRegistry;
-
-/// `AgentStateAdmin` impl scoped to a specific set of agent names.
+/// An `AgentStateAdmin` whose `resolve_agent` and `open_agent_db`
+/// reject agents outside an operator-configured allowlist.
 pub struct ScopedAgentStateAdmin {
     registry: Arc<SessionRegistry>,
     index: HostedIndex,
-    /// Display names the cap holder is allowed to access.
-    /// Empty = deny-all (cap was not granted at all).
-    /// The caller resolves names through this set only.
-    allowed: HashSet<String>,
+    /// `Some(set)` — only agents in `set` are accessible, and an
+    /// empty set means deny-all. `None` — unrestricted; all hosted
+    /// agents are visible.
+    allowed: Option<HashSet<String>>,
 }
 
 impl ScopedAgentStateAdmin {
+    /// Build a scoped handle. `None` = unrestricted (the operator
+    /// hasn't narrowed this extension); `Some(list)` = only the named
+    /// agents; `Some(empty)` = deny-all (surfaced once at startup —
+    /// see `deny_all_warning`).
     pub fn new(
         registry: Arc<SessionRegistry>,
         index: HostedIndex,
-        allowed: HashSet<String>,
-    ) -> Self {
-        Self { registry, index, allowed }
-    }
+        allowlist: Option<Vec<String>>,
+    ) -> Self { /* … */ }
+
+    /// `true` when `display_name` is within this handle's scope.
+    fn in_scope(&self, display_name: &str) -> bool { /* … */ }
 }
 
 impl AgentStateAdmin for ScopedAgentStateAdmin {
     fn resolve_agent(&self, name: &str) -> Result<DbEntry, String> {
         // Resolve via HostedIndex (name or DB id), then check scope.
-        let entry = if let Some(e) = self.index.find_by_name(name) {
-            e
-        } else if let Ok(id) = eidetica::entry::ID::parse(name)
-            && let Some(e) = self.index.find_by_id(&id)
-        {
-            e
-        } else {
-            return Err(format!("No hosted agent matches '{name}'"));
-        };
-        // Scope check: the agent's display name must be in the
-        // operator-configured allowlist.
-        if !self.allowed.is_empty() && !self.allowed.contains(&entry.display_name) {
-            return Err(format!(
-                "Agent '{}' is outside the allowed set for this capability",
-                entry.display_name
-            ));
-        }
-        Ok(entry)
+        // A scoped-out agent is reported as not-found, identical to a
+        // genuinely missing one (see Error semantics below).
+        /* … */
     }
 
-    fn open_agent_db<'a>(
-        &'a self,
-        entry: &'a DbEntry,
-    ) -> CapFuture<'a, Result<AgentDb, String>> {
-        Box::pin(async move {
-            // Duplicate the scope check (defense in depth — the entry
-            // should have come from resolve_agent, but verify anyway).
-            if !self.allowed.is_empty() && !self.allowed.contains(&entry.display_name) {
-                return Err(format!(
-                    "Agent '{}' is outside the allowed set for this capability",
-                    entry.display_name
-                ));
-            }
-            let agent_db = self
-                .registry
-                .open_agent_db(&entry.db_id, Some(&entry.pubkey))
-                .await
-                .map_err(|e| format!("Failed to open agent DB: {e}"))?
-                .ok_or_else(|| format!("No key for agent '{}' DB", entry.display_name))?;
-            Ok(agent_db)
-        })
+    fn open_agent_db<'a>(&'a self, entry: &'a DbEntry) -> CapFuture<'a, AgentDb> {
+        // Defense in depth — the entry should have come through
+        // `resolve_agent`, but verify the scope anyway. Same
+        // not-found masking as the resolve path.
+        /* … */
     }
 }
 ```
+
+The encoding that shipped is `Option<HashSet<String>>`, not a bare `HashSet`: `None` (absent operator entry) means unrestricted, while `Some(empty)` means deny-all. An earlier draft of this section used `HashSet<String>` with "empty = deny-all", which left no way to express "no narrowing applied" — the two meanings are distinct and the `Option` keeps them apart.
 
 ### Extension Caps Slot
 
@@ -264,11 +235,20 @@ This map is, by design, the **operator mutation surface** — it is
 peer-local operator policy, applied once at startup. There is no runtime
 command to mutate it (a runtime override would need a persistence/sync
 model — peer-local vs. synced, who may change it — that is an open
-decision, deliberately deferred rather than guessed). The effective scope
-_is_ observable at runtime: it is logged at startup (see below), and an
-empty/deny-all resolution is logged at `WARN`.
+decision, deliberately deferred rather than guessed). A deny-all entry
+is surfaced at boot via `WARN` (see Error semantics below) because at
+the tool boundary it is indistinguishable from a working configuration.
 
-The hub resolves these at install time via `resolve_agent_allowlist()`:
+In the shape that shipped, this map is the **only** scoping input: the
+consuming extension reads its own entry
+(`peer.agent_state_allowlist.get(<extension name>)`) and passes it to
+`ScopedAgentStateAdmin::new` as the `Option<Vec<String>>` allowlist —
+`None` when the entry is absent, the list otherwise. There is no
+manifest side to intersect with (see the 2026-08-18 status update).
+
+**Future refinement — manifest∩operator intersection.** If extensions
+ever declare `AgentStateAdmin { agents }` in their manifests, resolution
+would intersect the two sides:
 
 | Manifest    | Operator    | Result                         |
 | ----------- | ----------- | ------------------------------ |
@@ -280,7 +260,7 @@ The hub resolves these at install time via `resolve_agent_allowlist()`:
 | Some([])    | \*          | Some([]) (manifest deny-all)   |
 | \*          | Some([])    | Some([]) (operator deny-all)   |
 
-If the intersection is empty, the effective allowlist is `Some([])` — the `ScopedAgentStateAdmin` rejects all agents. The cap slot is still `Some` (not `None`) because the extension can still function — it just gets `Err` on every operation.
+If the intersection is empty, the effective allowlist is `Some([])` — the `ScopedAgentStateAdmin` rejects every agent with the uniform not-found error. The extension still loads and runs; it just gets `Err` on every operation.
 
 Per-tool scoping (in `tool_policy`) is a future refinement.
 
@@ -294,20 +274,22 @@ one concept" wart (a denied lookup used to say "outside the allowed set"
 while a missing one said "not found") and avoids leaking the existence
 of out-of-scope agents to extension tools.
 
-Because the deny-all (`Some([])`) state is now invisible at the tool
-boundary, it would otherwise be a silent footgun. So the hub emits a
-one-time **`WARN` at startup** when an extension's effective allowlist
-resolves to empty, naming the extension and the config key to fix; the
-non-empty / unrestricted cases log at `DEBUG`. The operator finds out at
-boot, not from a confused user staring at a "not found" error.
+Because the deny-all (`Some([])`) state is invisible at the tool
+boundary, it would otherwise be a silent footgun. So the consuming
+extension emits a one-time **`WARN`** at its construction site when its
+allowlist resolves to an empty list, naming the extension and the
+config key to fix (`deny_all_warning` in `agent_state.rs`); healthy
+shapes — unrestricted or a non-empty list — stay silent. The operator
+finds out at boot, not from a confused user staring at a "not found"
+error.
 
 ### Migration from AgentDbAccess
 
 1. Add `AgentStateAdmin` trait, `CapabilityKind` variant, and `CapabilityRequest` variant to `caps.rs` (pure addition).
 2. Add `ScopedAgentStateAdmin` as a new module `crates/lib/src/extension/agent_state.rs`.
-3. Wire the hub to build `ScopedAgentStateAdmin` from operator config + `HostedIndex` + `SessionRegistry` during `install_all`.
-4. Migrate heartbeat tools: drop `HostedIndex` and `Arc<dyn AgentDbAccess>`, take `Arc<dyn AgentStateAdmin>` from caps.
-5. Migrate heartbeat extension: declare the cap in its manifest; tools receive the cap from the bundle.
+3. Hub exposes the operator map — `set_hosted_index` + `set_agent_state_allowlist` on `ExtensionHub`, wired from `Config` at server build. Extensions build their own `ScopedAgentStateAdmin` from the map at instantiate; there is no hub-side factory.
+4. Migrate heartbeat tools: drop `HostedIndex` and `Arc<dyn AgentDbAccess>`, take `Arc<dyn AgentStateAdmin>`.
+5. Migrate heartbeat extension: build the scoped handle from the operator map in `instantiate`. The manifest declares nothing — host-only cap requests are declaration vocabulary with no live declarers (see the 2026-08-18 status update).
 6. Remove the `AgentDbAccess` trait from `tools/schedule.rs` (no consumers remain).
 
 ## Relationships to Other Caps
@@ -321,35 +303,33 @@ boot, not from a confused user staring at a "not found" error.
 
 ## Implementation Log
 
-| Step                                                                                 | Status                          |
-| ------------------------------------------------------------------------------------ | ------------------------------- |
-| `CapabilityKind::AgentStateAdmin` + trait + request + provider + caps slot           | ✅ `caps.rs`                    |
-| `ScopedAgentStateAdmin` wrapper                                                      | ✅ `agent_state.rs` (8 tests)   |
-| Hub wiring — `set_hosted_index`, `build_agent_state_admin`                           | ✅ `extension/mod.rs`           |
-| Operator config — `agent_state_allowlist` in `Config` + `set_agent_state_allowlist`  | ✅ `config.rs`, `main.rs`       |
-| Allowlist intersection — `resolve_agent_allowlist`                                   | ✅ `extension/mod.rs` (8 tests) |
-| Tool migration — `Arc<dyn AgentStateAdmin>` replaces `HostedIndex` + `AgentDbAccess` | ✅ `tools/schedule.rs`          |
-| Extension migration — declares `AgentStateAdmin` in manifest                         | ✅ `extensions/schedule.rs`     |
-| Remove old `AgentDbAccess`/`RegistryAgentDbAccess` traits                            | ✅                              |
-| Clean up unused `_registry` parameter                                                | ✅                              |
+| Step                                                                                 | Status                                                              |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `CapabilityKind::AgentStateAdmin` + trait + request variant                          | ✅ `caps.rs` (declaration vocabulary — no manifest declares it yet) |
+| `ScopedAgentStateAdmin` wrapper                                                      | ✅ `agent_state.rs` (10 tests)                                      |
+| Hub wiring — `set_hosted_index` + `set_agent_state_allowlist`, wired at server build | ✅ `extension/mod.rs`, `server/build.rs`                            |
+| Operator config — `agent_state_allowlist` in `Config`                                | ✅ `config.rs`                                                      |
+| Startup deny-all `WARN` — `deny_all_warning` + call site in schedule `instantiate`   | ✅ `agent_state.rs`, `extensions/schedule.rs` (2026-08-18)          |
+| Tool migration — `Arc<dyn AgentStateAdmin>` replaces `HostedIndex` + `AgentDbAccess` | ✅ `tools/schedule.rs`                                              |
+| Extension wiring — schedule builds its own scoped handle from the operator map       | ✅ `extensions/schedule.rs`                                         |
+| Remove old `AgentDbAccess`/`RegistryAgentDbAccess` traits                            | ✅                                                                  |
+| Manifest declaration + `resolve_agent_allowlist()` intersection                      | ⛔ not shipped — retracted as future refinement (2026-08-18)        |
 
 ## Tests
 
-| Location           | Test                                             | What it verifies                                          |
-| ------------------ | ------------------------------------------------ | --------------------------------------------------------- |
-| `agent_state.rs`   | `scoped_resolve_allows_known_agent`              | Agent in allowed set resolves correctly                   |
-| `agent_state.rs`   | `scoped_resolve_rejects_unknown_agent`           | Agent outside allowed set returns `Err`                   |
-| `agent_state.rs`   | `scoped_resolve_resolves_by_id_and_checks_scope` | DB id lookup also enforces allowlist                      |
-| `agent_state.rs`   | `scoped_resolve_by_id_rejects_scoped_out_agent`  | ID lookup of denied agent fails                           |
-| `agent_state.rs`   | `scoped_open_db_rejects_scoped_out_entry`        | `open_agent_db` checks scope even without `resolve_agent` |
-| `agent_state.rs`   | `scoped_open_db_succeeds_for_allowed_agent`      | Happy path — opens DB for allowed agent                   |
-| `agent_state.rs`   | `none_allowlist_is_unrestricted`                 | `None` → all agents visible                               |
-| `agent_state.rs`   | `empty_allowlist_denies_all`                     | `Some([])` → deny-all                                     |
-| `extension/mod.rs` | `both_none_is_unrestricted`                      | No manifest or operator allowlist                         |
-| `extension/mod.rs` | `operator_narrows_unrestricted_manifest`         | Operator restricts manifest                               |
-| `extension/mod.rs` | `manifest_only_when_operator_absent`             | Manifest stands alone                                     |
-| `extension/mod.rs` | `intersection_when_both_set`                     | Intersect of manifest + operator                          |
-| `extension/mod.rs` | `no_overlap_returns_empty_deny_all`              | Non-overlapping = deny-all                                |
-| `extension/mod.rs` | `manifest_empty_is_deny_all`                     | Manifest empty overrides operator                         |
-| `extension/mod.rs` | `operator_empty_is_deny_all`                     | Operator empty overrides manifest                         |
-| `extension/mod.rs` | `operator_matches_manifest_exactly`              | Exact match preserved                                     |
+| Location         | Test                                              | What it verifies                                          |
+| ---------------- | ------------------------------------------------- | --------------------------------------------------------- |
+| `agent_state.rs` | `scoped_resolve_allows_known_agent`               | Agent in allowed set resolves correctly                   |
+| `agent_state.rs` | `scoped_resolve_rejects_unknown_agent`            | Agent outside allowed set returns the uniform not-found   |
+| `agent_state.rs` | `scoped_resolve_resolves_by_id_and_checks_scope`  | DB id lookup also enforces allowlist                      |
+| `agent_state.rs` | `scoped_resolve_by_id_rejects_scoped_out_agent`   | ID lookup of denied agent fails                           |
+| `agent_state.rs` | `scoped_open_db_rejects_scoped_out_entry`         | `open_agent_db` checks scope even without `resolve_agent` |
+| `agent_state.rs` | `scoped_open_db_succeeds_for_allowed_agent`       | Happy path — opens DB for allowed agent                   |
+| `agent_state.rs` | `none_allowlist_is_unrestricted`                  | `None` → all agents visible                               |
+| `agent_state.rs` | `empty_allowlist_denies_all`                      | `Some([])` → deny-all, surfaces as not-found              |
+| `agent_state.rs` | `deny_all_warning_names_extension_and_config_key` | Startup WARN names the extension and the config key       |
+| `agent_state.rs` | `deny_all_warning_silent_for_healthy_shapes`      | Unrestricted / non-empty lists produce no warning         |
+
+The `extension/mod.rs` intersection tests listed in earlier drafts of this
+document were never written — they belong to the manifest∩operator model
+retracted in the 2026-08-18 status update.
