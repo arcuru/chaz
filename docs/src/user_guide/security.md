@@ -237,7 +237,7 @@ Setting `tool_host: bubblewrap` routes shell commands through
 
 - **No network** (`--unshare-net`) — loopback only, no external interfaces.
 - **A private PID namespace** (`--unshare-pid`) — host PIDs are unaddressable, so a same-UID host process cannot be signalled or inspected.
-- **No `/proc`** — mounting a procfs for the new PID namespace is refused by some hardened kernels, and its absence is stronger confinement anyway: no host process list, no `/proc/<pid>/root`.
+- **No `/proc`** — mounting a procfs for the new PID namespace is refused by some hardened kernels, and its absence is stronger confinement anyway: no host process list, no `/proc/<pid>/root`. This has a practical cost: with no procfs, `/dev/fd` is a dangling symlink, so shell constructs that depend on it fail — bash process substitution, for example, errors with `cat: /dev/fd/63: No such file or directory`. Tools that read `/proc` directly will not work either.
 - **An empty environment** (`--clearenv`) restored with fixed `PATH`, `HOME=/tmp`, and `LANG` — provider API keys and other host secrets never reach a shell command.
 - **Read-only system directories**: `/usr`, `/bin`, `/lib`, `/lib64`, `/nix/store`, and `/run/current-system`. Only `/nix/store` is bound — not all of `/nix` — because a read-only mount still allows connecting to the Nix daemon's Unix socket under `/nix/var/nix`.
 - **Ephemeral `/tmp`** (tmpfs) and a minimal `/dev`.

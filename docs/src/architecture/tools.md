@@ -109,10 +109,10 @@ The host enforces grants at the capability boundary — the tool says what it wa
 
 | Host                 | Tier       | Isolation                                                                | Status                                                                                                                                                                               |
 | -------------------- | ---------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | The only host wired in today — used for every built-in tool.                                                                                                                         |
+| `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | The default host — used for every built-in tool unless `tool_host` selects another.                                                                                                  |
 | `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | `crates/lib/src/bubblewrap_host.rs`, config-selectable via `tool_host: bubblewrap` (fails closed when no working sandbox; `bubblewrap-unsafe-fallback` opts into native degradation) |
 
-Tools (shell, web, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
+Tools (shell, web, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; which host is used is chosen by the `tool_host` config key.
 
 A separate WASM-tools path (`crates/lib/src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
 

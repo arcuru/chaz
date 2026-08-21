@@ -74,7 +74,8 @@ const RO_BINDS: &[&str] = &[
 ///
 /// Creates a new Linux namespace per shell command execution,
 /// restricting filesystem access, network, and process visibility.
-/// Non-shell capabilities are denied.
+/// Non-shell capabilities (file read/write, HTTP) are not namespaced —
+/// they pass through to the native host's grant-checked execution.
 ///
 /// Selected via `tool_host: bubblewrap` in config. Construction probes
 /// for a *working* `bwrap`; if the probe fails the host reports itself

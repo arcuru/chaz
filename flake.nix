@@ -59,7 +59,8 @@
 
         # bubblewrap is the optional runtime sandbox for the shell tool. It is
         # Linux-only; on Darwin the list is empty and chaz simply never finds
-        # `bwrap` on PATH (the host degrades to native execution).
+        # `bwrap` on PATH (`tool_host: bubblewrap` then fails closed; only
+        # `bubblewrap-unsafe-fallback` degrades to native execution).
         bwrapInputs = lib.optionals pkgs.stdenv.isLinux [pkgs.bubblewrap];
 
         # Use the toolchain with the crane helper functions
