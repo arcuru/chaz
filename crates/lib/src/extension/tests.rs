@@ -1136,6 +1136,39 @@ async fn install_all_skips_failing_extension_and_installs_the_rest() {
     let ctx = fixture_ctx_with_active(all_active(&["broken"])).await;
     assert!(hub.fire_before_agent_start(&ctx).await.is_empty());
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // The failure is recorded so callers can surface a degraded peer
+    // without reading logs (mirrors McpRegistry::insert_failed).
+    let failures = hub.install_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].name, "broken");
+    assert!(
+        failures[0]
+            .error
+            .contains("simulated instantiation failure")
+    );
+}
+
+#[tokio::test]
+async fn install_all_records_no_failures_when_every_global_extension_installs() {
+    let mut hub = test_hub().await;
+    hub.install_all(vec![cmd_ext("alpha", "one"), cmd_ext("beta", "two")])
+        .await
+        .unwrap();
+    assert!(hub.install_failures().is_empty());
+}
+
+#[tokio::test]
+async fn install_all_clears_a_failure_when_a_later_install_succeeds() {
+    let mut hub = test_hub().await;
+    let broken = Arc::new(TestExt::new("flaky").fails_instantiate()) as Arc<dyn Extension>;
+    hub.install_all(vec![broken]).await.unwrap();
+    assert_eq!(hub.install_failures().len(), 1);
+
+    let fixed = Arc::new(TestExt::new("flaky")) as Arc<dyn Extension>;
+    hub.install_all(vec![fixed]).await.unwrap();
+    assert!(hub.install_failures().is_empty());
+    assert!(hub.global_instances.contains_key("flaky"));
 }
 
 #[tokio::test]
@@ -1163,6 +1196,13 @@ async fn install_all_isolates_panicking_instantiation_and_installs_the_rest() {
     let injected = hub.fire_before_agent_start(&ctx).await;
     assert_eq!(injected.len(), 1);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A panic is an install failure too, and is recorded alongside the
+    // `Err` case so `/extensions list` flags it.
+    let failures = hub.install_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].name, "boom");
+    assert!(failures[0].error.contains("panicked"));
 }
 
 #[tokio::test]
