@@ -19,6 +19,7 @@ jobs:
     name: Push to cache
     environment: publish
     runs-on: ubicloud-standard-8
+    timeout-minutes: 60
     if: |
       github.repository_owner == 'arcuru' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')

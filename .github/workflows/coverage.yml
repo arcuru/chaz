@@ -12,6 +12,7 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubicloud-standard-8
+    timeout-minutes: 30
     # Scheduled workflow that reads CODECOV_TOKEN: forks don't run it.
     if: github.repository_owner == 'arcuru'
     steps:
