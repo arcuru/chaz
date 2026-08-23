@@ -1,7 +1,7 @@
-//! Scoped `AgentStateAdmin` implementation — the hub's factory for
-//! building per-extension agent-state handles from the raw infra handles
-//! (`HostedIndex` + `SessionRegistry`) narrowed to the operator's
-//! configured agent allowlist.
+//! Scoped `AgentStateAdmin` wrapper built directly by consuming
+//! extensions from their entry in the operator's `agent_state_allowlist`
+//! map, using the raw infrastructure handles (`HostedIndex` +
+//! `SessionRegistry`).
 //!
 //! This is a **guardrail, not a sandbox** — the scope check is a
 //! defensive check against poorly behaved tools, not a security boundary
@@ -16,11 +16,12 @@ use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::session::SessionRegistry;
 
 /// An `AgentStateAdmin` whose `resolve_agent` and `open_agent_db` reject
-/// agents outside an operator-configured allowlist.
+/// agents outside the allowlist from the consuming extension's
+/// operator-configured map entry.
 ///
-/// The hub constructs one per extension that declares `AgentStateAdmin`
-/// in its manifest, scoped to the set of agent names the operator allows
-/// for that extension in `tool_policy`.
+/// Each consuming extension constructs this wrapper directly during
+/// instantiation from `PeerHandles.agent_state_allowlist`; no manifest
+/// declaration or hub factory participates in scoping.
 pub struct ScopedAgentStateAdmin {
     registry: Arc<SessionRegistry>,
     index: HostedIndex,
