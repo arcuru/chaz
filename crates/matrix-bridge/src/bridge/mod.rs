@@ -120,7 +120,11 @@ async fn attach_response_callback(
     chaz_core::bridge::attach_reconciler(session_db, agents, owning_agent, move |body| {
         let room = room.clone();
         async move {
-            info!("→ Matrix({}): {}", room.room_id(), body.replace('\n', " "));
+            info!(
+                room_id = %room.room_id(),
+                body_bytes = body.len(),
+                "Delivering Matrix response"
+            );
             let content = RoomMessageEventContent::text_markdown(&body);
             room.send(content).await?;
             Ok(())

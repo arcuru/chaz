@@ -440,7 +440,7 @@ wait_for "daemon" 90 grep -q "daemon ready" "$WORKSPACE/daemon.log"
 # ignored asserts on the line the bridge writes when it drops one, which is the
 # only direct evidence that the drop happened — and the rest of the tree at
 # debug would bury it under matrix-sdk's sync traffic.
-BRIDGE_RUST_LOG="info,chaz_matrix_bridge=debug"
+BRIDGE_RUST_LOG="info,chaz_matrix_bridge=debug,chaz_core::session::transport=debug"
 
 # Which log file the live bridge is writing to. The restart case respawns it
 # under a second name, and the group-room cases run after that.
@@ -454,6 +454,21 @@ wait_for "bridge matrix login" 120 grep -q "The client is ready" "$WORKSPACE/bri
 if grep -qi "pending owner approval" "$WORKSPACE/bridge.log"; then
 	fail "bridge is waiting on manual approval — pre-authorization did not take (see $WORKSPACE/bridge.log)"
 fi
+
+# Preserve the daemon's pre-conversation state. Restoring it below models the
+# observed failure: the daemon's copied state knows the agent and bridge but
+# predates the room session, while the bridge retains that existing session.
+# The next Matrix event must make the bridge re-publish the session or the
+# restored daemon can never discover and pull its tree.
+DAEMON_PRE_SESSION_STATE="$WORKSPACE/state-daemon-pre-session"
+log "snapshotting daemon state before the first channel session"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon to exit for state snapshot" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+cp -a "$WORKSPACE/state-daemon" "$DAEMON_PRE_SESSION_STATE"
+spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon after state snapshot" 120 grep -q "daemon ready" "$WORKSPACE/daemon.log"
 
 # --------------------------------------------------------------- puppet ------
 mx() {
@@ -516,15 +531,41 @@ wait_for "the agent's reply in the room" "$REPLY_TIMEOUT" reply_arrived
 
 printf '\033[1;32mPASS\033[0m — cold boot: the reply crossed Matrix, sync, the agent, and came back\n' >&2
 
+# Restore the pre-session daemon state while keeping the bridge alive. The
+# next message resolves the existing channel session on the bridge, rather
+# than creating a new one. It must refresh session sync and exposure so the
+# recovered daemon observes and pulls it.
+log "restoring daemon pre-session state"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon to exit before restoring state" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+rm -rf "$WORKSPACE/state-daemon"
+cp -a "$DAEMON_PRE_SESSION_STATE" "$WORKSPACE/state-daemon"
+spawn daemon-recovered "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon after state recovery" 120 grep -q "daemon ready" "$WORKSPACE/daemon-recovered.log"
+
+log "sending a turn to the existing channel session after state recovery"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc --arg b "existing session after copied state" '{msgtype:"m.text",body:$b}')" >/dev/null
+wait_for "recovered daemon to reply through the existing session" "$REPLY_TIMEOUT" replies_at_least 2
+grep -q "Daemon registered bridge-exposed session" "$WORKSPACE/daemon-recovered.log" ||
+	fail "recovered daemon did not register the re-published existing session"
+grep -q "Resolved existing transport channel session" "$BRIDGE_LOG" ||
+	fail "bridge did not resolve the pre-existing channel session during recovery"
+
+printf '\033[1;32mPASS\033[0m — copied-state recovery: existing session was re-published, pulled, and answered\n' >&2
+
 # --------------------------------------------------------- restart cases ---
 # Case A — restart the bridge mid-conversation
-log "Case A: sending second message"
+log "Case A: sending third message"
 TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc --arg b "second turn" '{msgtype:"m.text",body:$b}')" >/dev/null
 
-log "waiting for the second reply"
-wait_for "second reply" "$REPLY_TIMEOUT" replies_at_least 2
+log "waiting for the third reply"
+wait_for "third reply" "$REPLY_TIMEOUT" replies_at_least 3
 
 log "restarting the bridge"
 kill -TERM "$BRIDGE_PID"
@@ -540,12 +581,12 @@ if grep -qi "pending owner approval" "$WORKSPACE/bridge-restarted.log"; then
 	fail "bridge asked for re-approval after restart — key persistence regression"
 fi
 
-log "Case A: sending third message after bridge restart"
+log "Case A: sending fourth message after bridge restart"
 TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc --arg b "third turn after bridge restart" '{msgtype:"m.text",body:$b}')" >/dev/null
 
-wait_for "third reply" "$REPLY_TIMEOUT" replies_at_least 3
+wait_for "fourth reply" "$REPLY_TIMEOUT" replies_at_least 4
 
 # Case B — restart the daemon mid-conversation
 log "Case B: restarting the daemon"
@@ -557,12 +598,12 @@ spawn daemon-restarted "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
 DAEMON_PID="$SPAWNED_PID"
 wait_for "daemon to come back online" 120 grep -q "daemon ready" "$WORKSPACE/daemon-restarted.log"
 
-log "Case B: sending fourth message after daemon restart"
+log "Case B: sending fifth message after daemon restart"
 TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc --arg b "fourth turn after daemon restart" '{msgtype:"m.text",body:$b}')" >/dev/null
 
-wait_for "fourth reply" "$REPLY_TIMEOUT" replies_at_least 4
+wait_for "fifth reply" "$REPLY_TIMEOUT" replies_at_least 5
 
 printf '\033[1;32mPASS\033[0m — all restart cases passed (bridge + daemon)\n' >&2
 
@@ -750,7 +791,7 @@ TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"react test"}')" >/dev/null
 
-wait_for "fifth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 5
+wait_for "sixth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 6
 
 if ! grep -q "detected tool result" "$WORKSPACE/stub-llm.log"; then
 	fail "ReAct loop did not complete: stub never received a tool result in a follow-up request"

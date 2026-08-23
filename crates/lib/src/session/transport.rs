@@ -223,6 +223,15 @@ impl SessionRegistry {
             .find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
             .await?
         {
+            self.publish_channel_session(&agent_db, found.1.root_id(), bridge_label)
+                .await?;
+            tracing::debug!(
+                session_db_id = %found.1.root_id(),
+                transport,
+                login_id,
+                channel,
+                "Resolved existing transport channel session"
+            );
             return Ok(found);
         }
 
@@ -230,27 +239,51 @@ impl SessionRegistry {
         let (conv, db) = self.create_session(Some(&source)).await?;
         let session_db_id = db.root_id().to_string();
 
+        tracing::debug!(
+            session_db_id,
+            transport,
+            login_id,
+            channel,
+            "Created transport channel session"
+        );
+
         bind_transport(&db, transport, login_id, channel).await?;
         // Attach the owning agent as host: grants its pubkey Write, delegates
         // session auth to the agent DB, and lists the session in the agent
         // registry (exposed_on empty until the expose below).
         self.ensure_session_host(&session_db_id, agent).await?;
-        agent_db
-            .expose_session_on(&session_db_id, bridge_label)
+        self.publish_channel_session(&agent_db, db.root_id(), bridge_label)
             .await?;
-        // Enable sync for the freshly created session DB. New DBs default to
-        // `sync_enabled = false`; without this the bridge won't serve the daemon's
-        // sync requests for this session, so the inbound message never reaches the
+        Ok((conv, db))
+    }
+
+    /// Make a channel session available to the daemon before notifying it
+    /// through the agent DB registry. This also refreshes an existing
+    /// session's exposure after bridge restart or state recovery: the registry
+    /// write wakes the daemon's watch, while on-commit sync makes the session
+    /// tree serveable when it tries to pull it.
+    async fn publish_channel_session(
+        &self,
+        agent_db: &crate::agent_db::AgentDb,
+        session_db_id: &eidetica::entry::ID,
+        bridge_label: &str,
+    ) -> anyhow::Result<()> {
+        // Enable sync for the channel session DB. New DBs default to
+        // `sync_enabled = false`; recovered sessions can have the same stale
+        // setting. Without this the bridge won't serve the daemon's sync
+        // requests for the session, so the inbound message never reaches the
         // agent and no reply comes back. Best-effort — a sync-serve failure
         // shouldn't sink the inbound message path.
-        if let Err(e) = self.enable_sync_for(db.root_id()).await {
+        if let Err(e) = self.enable_sync_for(session_db_id).await {
             tracing::warn!(
-                session_db_id,
+                session_db_id = %session_db_id,
                 error = %e,
                 "failed to enable sync for channel session DB; daemon may not see inbound"
             );
         }
-        Ok((conv, db))
+        agent_db
+            .expose_session_on(&session_db_id.to_string(), bridge_label)
+            .await
     }
 }
 
@@ -354,5 +387,48 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn existing_channel_session_refreshes_exposure_and_sync() {
+        let (_inst, reg) = make_registry_with_sync().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@chaz:example.com";
+
+        let (_cv, db) = reg
+            .get_or_create_channel_session(&agent, login, "matrix", login, "!room:s")
+            .await
+            .unwrap();
+        let sid = db.root_id().clone();
+        reg.disable_sync_for(&sid).await.unwrap();
+
+        let agent_db = reg
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_for_callback = writes.clone();
+        let subscription = agent_db
+            .database()
+            .on_write(move |_, _| {
+                let writes = writes_for_callback.clone();
+                Box::pin(async move {
+                    writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        subscription.detach();
+
+        let (_cv, resolved) = reg
+            .get_or_create_channel_session(&agent, login, "matrix", login, "!room:s")
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.root_id(), &sid);
+        assert!(reg.is_sync_enabled_for(&sid).await.unwrap());
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
