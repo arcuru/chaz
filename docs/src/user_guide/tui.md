@@ -127,11 +127,14 @@ See [Memory](memory.md).
 
 See [Agents — Schedules](agents.md#schedules).
 
-| Command                                       | Description                                               |
-| --------------------------------------------- | --------------------------------------------------------- |
-| `/schedule list`                              | List an agent's schedules                                 |
-| `/schedule add <id> <cron> <agent> <task...>` | Add a schedule (6-field cron: `sec min hour dom mon dow`) |
-| `/schedule remove <id>`                       | Remove a schedule by id                                   |
+| Command                                                   | Description                                               |
+| --------------------------------------------------------- | --------------------------------------------------------- |
+| `/schedule list`                                          | List an agent's schedules                                 |
+| `/schedule add <id> <cron> <agent> <task...>`             | Add a schedule (6-field cron: `sec min hour dom mon dow`) |
+| `/schedule add interval <id> <seconds> <agent> <task...>` | Add a fixed-delay interval schedule                       |
+| `/schedule modify <id> cron <6 fields> [agent]`           | Replace a schedule trigger with cron                      |
+| `/schedule modify <id> interval <seconds> [agent]`        | Replace a schedule trigger with an interval               |
+| `/schedule remove <id>`                                   | Remove a schedule by id                                   |
 
 ### Extensions
 

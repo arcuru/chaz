@@ -106,7 +106,14 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/memory unshare ", "stop sharing a memory bank"),
         ("# Schedule", ""),
         ("/schedule list", "list an agent's schedules"),
-        ("/schedule add ", "<id> <cron 6 fields> <agent> <task...>"),
+        (
+            "/schedule add ",
+            "<id> <cron 6 fields> <agent> <task...> | interval <id> <seconds> <agent> <task...>",
+        ),
+        (
+            "/schedule modify ",
+            "<id> cron <6 fields> [agent] | interval <seconds> [agent]",
+        ),
         ("/schedule remove ", "remove a schedule by id"),
         ("# LLM config", ""),
         ("/models", "open the Models settings page"),

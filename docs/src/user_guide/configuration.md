@@ -124,7 +124,9 @@ mcp_servers:
 
 # Scheduled tasks — imported at startup as agent-owned schedules in the
 # owning agent's DB (Pinned to the resolved session), fired by the same
-# RoutineEngine as the /schedule command. Cron is 6 fields:
+# RoutineEngine as the /schedule command. Bootstrap YAML schedules are
+# cron-only; runtime /schedule commands and schedule tools also support
+# fixed-delay intervals. Cron is 6 fields:
 # sec min hour day-of-month month day-of-week. Idempotent by `name`
 # within the owning agent.
 schedules:

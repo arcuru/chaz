@@ -210,7 +210,7 @@ authoritative):
 
 ## Routine handlers
 
-Cron and one-shot work fires through the routine engine (`crates/lib/src/routine/`),
+Cron, fixed-delay interval, and one-shot work fires through the routine engine (`crates/lib/src/routine/`),
 not as a hook. A Global instance returns a `routine_handler()`; the
 engine dispatches via `ExtensionHub::dispatch_routine(name, &scope,
 payload)`.
@@ -231,7 +231,7 @@ scopes exist on the engine side (`RoutineScope::Global` from
 `Agent(id)` from an agent DB) — they control where the routine is stored
 and rescheduled, not what the handler receives.
 
-The engine owns cron rescheduling, one-shot row deletion, and
+The engine owns recurring rescheduling, one-shot row deletion, and
 auto-disable after `max_failures` consecutive errors; the handler just
 does the per-fire work. Routine fires are **not** gated by the
 per-session active set.

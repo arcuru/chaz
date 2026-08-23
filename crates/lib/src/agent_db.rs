@@ -21,6 +21,8 @@
 
 use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
 use crate::grants::Grants;
+use crate::routine::Trigger;
+use crate::routine::types::next_interval_fire;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
@@ -757,6 +759,7 @@ impl AgentDb {
     /// Dedup-by-id keeps edits and failure-state updates idempotent
     /// (same pattern as `attach_memory_bank`'s dedup-by-name).
     pub async fn upsert_schedule(&self, schedule: Schedule) -> anyhow::Result<()> {
+        validate_schedule_trigger(&schedule.trigger)?;
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
         let existing = store.search(|t: &Schedule| t.id == schedule.id).await?;
@@ -1096,6 +1099,22 @@ pub async fn bootstrap_from_config(
     }
 
     Ok(out)
+}
+
+fn validate_schedule_trigger(trigger: &Trigger) -> anyhow::Result<()> {
+    let Trigger::Interval { period } = trigger else {
+        return Ok(());
+    };
+    if period.is_zero() {
+        anyhow::bail!("interval period must be greater than zero");
+    }
+    if chrono::Duration::from_std(*period).is_err() {
+        anyhow::bail!("interval period cannot be represented by chrono");
+    }
+    if next_interval_fire(*period, Utc::now()).is_none() {
+        anyhow::bail!("interval period cannot produce a future fire safely");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1484,6 +1503,34 @@ mod tests {
         assert!(db.list_schedules().await.unwrap().is_empty());
         assert!(db.find_schedule("nope").await.unwrap().is_none());
         assert!(!db.remove_schedule("nope").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn invalid_interval_schedule_does_not_persist() {
+        use crate::routine::Trigger;
+        let (_user, db) = peer_with_agent_db().await;
+        for (id, period) in [
+            ("zero", std::time::Duration::ZERO),
+            (
+                "overflow",
+                (DateTime::<Utc>::MAX_UTC.signed_duration_since(Utc::now())
+                    + chrono::Duration::seconds(1))
+                .to_std()
+                .unwrap(),
+            ),
+        ] {
+            let schedule = Schedule::new(
+                id,
+                Trigger::Interval { period },
+                "never run",
+                ScheduleTarget::Fresh,
+            );
+            assert!(
+                db.upsert_schedule(schedule).await.is_err(),
+                "{id} must reject"
+            );
+            assert!(db.find_schedule(id).await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]
