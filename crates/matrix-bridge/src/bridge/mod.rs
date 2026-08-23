@@ -2,7 +2,9 @@ mod client;
 mod commands;
 mod history;
 
-use chaz_core::bridge::{ApprovalDecision, Bridge};
+use chaz_core::bridge::{
+    ApprovalDecision, Bridge, is_transient_outbound_status, retry_outbound_chunk,
+};
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
@@ -117,20 +119,67 @@ async fn attach_response_callback(
     // Same session DB, two watchers: deliver agent replies, and surface tool
     // approval prompts the daemon proxied here.
     attach_approval_watcher(session_db, room.clone(), pending).await?;
-    chaz_core::bridge::attach_reconciler(session_db, agents, owning_agent, move |body| {
-        let room = room.clone();
-        async move {
-            info!(
-                room_id = %room.room_id(),
-                body_bytes = body.len(),
-                "Delivering Matrix response"
-            );
-            let content = RoomMessageEventContent::text_markdown(&body);
-            room.send(content).await?;
-            Ok(())
-        }
-    })
+    chaz_core::bridge::attach_reconciler(
+        session_db,
+        agents,
+        owning_agent,
+        |body| chunk_message(body, MATRIX_MESSAGE_LIMIT),
+        move |body| {
+            let room = room.clone();
+            async move {
+                info!(
+                    room_id = %room.room_id(),
+                    body_bytes = body.len(),
+                    "Delivering Matrix response"
+                );
+                let content = RoomMessageEventContent::text_markdown(&body);
+                retry_outbound_chunk(
+                    || {
+                        let room = room.clone();
+                        let content = content.clone();
+                        async move { room.send(content).await.map(|_| ()) }
+                    },
+                    is_transient_matrix_send_error,
+                )
+                .await?;
+                Ok(())
+            }
+        },
+    )
     .await
+}
+
+fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
+    match error {
+        matrix_sdk::Error::Http(http) => match http.as_ref() {
+            matrix_sdk::HttpError::Reqwest(error) => error.is_connect(),
+            matrix_sdk::HttpError::Api(_) => http
+                .as_client_api_error()
+                .is_some_and(|error| is_transient_outbound_status(error.status_code.as_u16())),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Matrix homeservers limit event content, so outbound reply bodies must be
+/// delivered as separate events. Markdown carries both plain and formatted
+/// bodies; this byte ceiling leaves room for both fields and the event envelope.
+const MATRIX_MESSAGE_LIMIT: usize = 8_000;
+
+fn chunk_message(body: &str, limit: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    for ch in body.chars() {
+        if chunk.len() + ch.len_utf8() > limit && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(ch);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 /// Dispatch a shared command in the context of a Matrix room.
@@ -1177,4 +1226,22 @@ async fn resolve_pending_approval(
     let _ = room
         .send(RoomMessageEventContent::notice_plain(label))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MATRIX_MESSAGE_LIMIT, chunk_message};
+
+    #[test]
+    fn matrix_chunks_are_transport_sized_and_lossless() {
+        let body = "🦀".repeat(MATRIX_MESSAGE_LIMIT / 4 + 1);
+        let chunks = chunk_message(&body, MATRIX_MESSAGE_LIMIT);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= MATRIX_MESSAGE_LIMIT)
+        );
+        assert_eq!(chunks.concat(), body);
+    }
 }
