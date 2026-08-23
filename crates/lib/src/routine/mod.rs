@@ -52,6 +52,7 @@ pub async fn upsert_session_routine(
     session_db: &Database,
     routine: &Routine,
 ) -> anyhow::Result<()> {
+    engine::validate_trigger(&routine.trigger)?;
     let txn = session_db.new_transaction().await?;
     let store = txn
         .get_store::<Table<Routine>>(SESSION_ROUTINES_STORE)
@@ -85,4 +86,49 @@ pub async fn remove_session_routine(session_db: &Database, id: &RoutineId) -> an
         txn.commit().await?;
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routine::{RoutineId, RoutineTarget, Trigger};
+    use eidetica::backend::database::InMemory;
+    use eidetica::crdt::Doc;
+    use eidetica::{Instance, NewUser};
+    use std::time::Duration;
+
+    async fn fixture_db() -> (Instance, Database) {
+        let (instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+                .await
+                .unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut metadata = Doc::new();
+        metadata.set("name", "session");
+        let database = user.create_database(metadata, &key).await.unwrap();
+        (instance, database)
+    }
+
+    #[tokio::test]
+    async fn upsert_session_routine_rejects_zero_duration_interval_without_persisting() {
+        let (_instance, session_db) = fixture_db().await;
+        let routine = Routine::interval(
+            RoutineId::new("zero-interval"),
+            "zero interval",
+            Duration::ZERO,
+            RoutineTarget {
+                extension: "heartbeat".into(),
+                payload: serde_json::json!({}),
+            },
+        );
+
+        let error = upsert_session_routine(&session_db, &routine)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "interval period must be greater than zero"
+        );
+        assert!(list_session_routines(&session_db).await.unwrap().is_empty());
+    }
 }

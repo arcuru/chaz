@@ -93,7 +93,7 @@ Each Agent DB contains the following well-known stores:
 | `meta`           | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar, agent-level `home_pubkey`             |
 | `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                        |
 | `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)         |
-| `schedules`      | `Table<Schedule>`            | Agent-owned cron/one-shot wakes — see [Schedules](#schedules) below                                 |
+| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below                  |
 | `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution    |
 | `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                   |
 | `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                    |
@@ -317,12 +317,13 @@ pointer that silently re-routes turns.
 
 A schedule is a time-driven, **agent-owned** wake. It lives in the owning agent's DB `schedules` store (so it syncs and travels with the agent, exactly like its config), not in any session. The chaz `RoutineEngine` (one per peer) sleeps until the next due fire across every hosted agent's schedules, then runs the **standalone fire path**: it loads the owning agent, resolves the schedule's target, and runs that agent's turn directly. The schedule's `prompt` is invocation-scoped input for that turn — it is **not** written as a broadcast `Directive` entry, and there is no "resolve who responds" step (the schedule names its owner). A peer that doesn't host the owning agent silently skips, so multi-peer setups don't double-fire.
 
-Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Two trigger shapes:
+Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Three trigger shapes:
 
-- **Cron triggers** fire on a recurring schedule (`cron: "0 */5 * * * *"`). Each peer hosting the owning agent fires independently.
+- **Cron triggers** fire on a calendar schedule (`cron: "0 */5 * * * *"`). Each peer hosting the owning agent fires independently.
+- **Interval triggers** fire first after their period, then after the same fixed delay from each successful dispatch (`interval_seconds: 300`). The agent turn continues asynchronously, so overlapping turns remain possible. Zero and durations chrono cannot represent are rejected.
 - **One-shot triggers** fire once at an absolute `fire_at`, then the engine drops the schedule. These back the `schedule_once` tool described in [Tools](./tools.md).
 
-**Lifecycle bounds.** A cron schedule is infinite by default. Two optional bounds make finite recurring work expressible without inventing a new trigger type:
+**Lifecycle bounds.** Cron and interval schedules are infinite by default. Two optional bounds make finite recurring work expressible without inventing a new trigger type:
 
 - `max_fires` — retire after N fires. `cron` hourly + `max_fires: 8` = "wake hourly for 8 hours".
 - `expires_at` — an RFC 3339 instant after which it stops.
@@ -344,20 +345,23 @@ Routines are created two ways, both compiling to the same `Routine` rows fired b
 
 Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
 
-- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
+- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes one period after its last successful dispatch, rather than from restart time. A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
 - **The target agent must be hosted on this peer** — otherwise the handler silently skips (the multi-peer dedupe above).
 - **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.
 
 ### `/schedule` commands
 
-Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+Cron uses 6 fields: `sec min hour day_of_month month day_of_week`. Intervals use whole seconds and are fixed-delay from successful dispatch; they do not wait for the asynchronous agent turn to finish.
 
-| Command                                                                       | What                                                                                                                        |
-| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. One-shot rules are rendered with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of the cron. |
-| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                           |
-| `/schedule remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                     |
+| Command                                                                       | What                                                                                                                               |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. Interval rules render as `every 300s`; one-shots render with an `@YYYY-MM-DD HH:MM:SSZ` marker. |
+| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                                  |
+| `/schedule add interval <id> <seconds> <agent_ref> <task…>`                   | Upsert a fixed-delay interval rule keyed by `<id>`.                                                                                |
+| `/schedule modify <id> cron <6 fields> [agent_ref]`                           | Replace a rule's trigger with a cron expression.                                                                                   |
+| `/schedule modify <id> interval <seconds> [agent_ref]`                        | Replace a rule's trigger with a fixed-delay interval.                                                                              |
+| `/schedule remove <id>`                                                       | Remove a rule by id.                                                                                                               |
 
 To create a one-shot rule from the TUI, agents call the `schedule_once` tool. There's no slash-command form yet.
 
@@ -365,6 +369,12 @@ Example — make `researcher` post a morning briefing to the current session wee
 
 ```text
 /schedule add brief 0 0 9 * * Mon-Fri researcher Summarize overnight activity and surface anything urgent.
+```
+
+Example — make `researcher` check the current session five minutes after each completed check:
+
+```text
+/schedule add interval check-in 300 researcher Check for updates and report only actionable changes.
 ```
 
 ## Tool Narrowing

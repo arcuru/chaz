@@ -141,7 +141,7 @@ crates/lib/src/
   openai.rs            OpenAI-compatible backend (async-openai byot)
   embedding.rs         Embedder trait + OpenAiEmbedder (for memory/skill semantic search)
   defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
-  routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines
+   routine/             RoutineEngine — sleep-until-next driver for cron, interval + one-shot Routines
     mod.rs             Module root + re-exports
     engine.rs          Engine — register/reload/deregister, fire_due, dispatch through ExtensionHub
     types.rs           Routine, RoutineId, RoutineScope (Global/Session/Agent), AgentSchedulePayload

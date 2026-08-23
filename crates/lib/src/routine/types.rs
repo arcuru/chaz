@@ -3,13 +3,14 @@
 //! Routine types — the engine-agnostic data model.
 //!
 //! A [`Routine`] is a unit of work the [`crate::routine::RoutineEngine`]
-//! fires on some trigger. Triggers come in two flavors today
-//! ([`Trigger`]): recurring `Cron` and single-shot `OneShot`. Both
+//! fires on some trigger. Triggers come in three flavors today
+//! ([`Trigger`]): recurring `Cron` and `Interval`, and single-shot `OneShot`. All
 //! route through the same [`RoutineTarget`] (an extension name plus
 //! an opaque JSON payload) so the engine never inspects the work.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Opaque routine identifier. Caller-provided; the engine treats it
 /// as a string token. [`generate_id`] is the convenience for tools
@@ -46,19 +47,30 @@ pub fn generate_id(prefix: &str) -> RoutineId {
 ///
 /// `Cron` re-parses on load — `expr` is stored verbatim and a fresh
 /// [`cron::Schedule`] is built each time the engine needs the next
-/// fire time.
+/// fire time. `Interval` waits `period` after each fire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
     Cron { expr: String },
+    Interval { period: Duration },
     OneShot { fire_at: DateTime<Utc> },
 }
 
 impl Trigger {
     /// `true` for recurring triggers; `false` for one-shots.
     pub fn is_recurring(&self) -> bool {
-        matches!(self, Self::Cron { .. })
+        matches!(self, Self::Cron { .. } | Self::Interval { .. })
     }
+}
+
+/// Return the next fixed-delay fire after `anchor`, if the period and
+/// resulting timestamp are representable.
+pub(crate) fn next_interval_fire(period: Duration, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if period.is_zero() {
+        return None;
+    }
+    let period = chrono::Duration::from_std(period).ok()?;
+    anchor.checked_add_signed(period)
 }
 
 /// Which extension handles this routine, plus the opaque payload the
@@ -112,6 +124,25 @@ impl Routine {
             id,
             name: name.into(),
             trigger: Trigger::Cron { expr: expr.into() },
+            target,
+            enabled: true,
+            max_failures: 3,
+            consecutive_failures: 0,
+            last_error: None,
+        }
+    }
+
+    /// Construct a recurring interval routine with default failure handling.
+    pub fn interval(
+        id: RoutineId,
+        name: impl Into<String>,
+        period: Duration,
+        target: RoutineTarget,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            trigger: Trigger::Interval { period },
             target,
             enabled: true,
             max_failures: 3,
@@ -215,6 +246,20 @@ mod tests {
     }
 
     #[test]
+    fn interval_constructor_marks_recurring() {
+        let r = Routine::interval(
+            RoutineId::new("heartbeat"),
+            "heartbeat",
+            Duration::from_secs(60),
+            RoutineTarget {
+                extension: "heartbeat".into(),
+                payload: serde_json::Value::Null,
+            },
+        );
+        assert!(r.trigger.is_recurring());
+    }
+
+    #[test]
     fn trigger_serde_tags_kind_snake_case() {
         let cron = Trigger::Cron {
             expr: "0 * * * * *".into(),
@@ -222,6 +267,13 @@ mod tests {
         let s = serde_json::to_string(&cron).unwrap();
         assert!(s.contains("\"kind\":\"cron\""), "got: {s}");
         assert_eq!(serde_json::from_str::<Trigger>(&s).unwrap(), cron);
+
+        let interval = Trigger::Interval {
+            period: Duration::from_secs(60),
+        };
+        let s = serde_json::to_string(&interval).unwrap();
+        assert_eq!(s, r#"{"kind":"interval","period":{"secs":60,"nanos":0}}"#);
+        assert_eq!(serde_json::from_str::<Trigger>(&s).unwrap(), interval);
 
         let ts = Utc::now();
         let one = Trigger::OneShot { fire_at: ts };

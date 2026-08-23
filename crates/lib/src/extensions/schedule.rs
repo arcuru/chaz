@@ -117,7 +117,7 @@ struct ScheduleCommand {
 
 impl ExtensionCommand for ScheduleCommand {
     fn description(&self) -> &'static str {
-        "Manage schedules on agents — add | remove | list"
+        "Manage schedules on agents — add | modify | remove | list"
     }
 
     fn invoke<'a>(
@@ -143,8 +143,9 @@ impl ExtensionCommand for ScheduleCommand {
                     }
                 }
                 "add" => add_cmd(rest, &*self.agent_state, ctx).await,
+                "modify" => modify_cmd(rest, &*self.agent_state, ctx).await,
                 other => ExtensionCommandOutcome::Error(format!(
-                    "Unknown subcommand '/schedule {other}'. Use: add | remove | list"
+                    "Unknown subcommand '/schedule {other}'. Use: add | modify | remove | list"
                 )),
             }
         })
@@ -175,6 +176,7 @@ fn fmt_schedule_line(t: &Schedule) -> String {
     let state = if t.enabled { "" } else { " (disabled)" };
     let when = match &t.trigger {
         Trigger::Cron { expr } => expr.clone(),
+        Trigger::Interval { period } => format!("every {period:?}"),
         Trigger::OneShot { fire_at } => format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ")),
     };
     let target_label = match &t.target {
@@ -286,13 +288,161 @@ async fn remove_cmd(
     }
 }
 
-/// Parse and execute `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task...>`.
+/// Parse and execute `/schedule modify <id> cron <6 fields> [agent]` or
+/// `/schedule modify <id> interval <seconds> [agent]`.
+async fn modify_cmd(
+    rest: &str,
+    cap: &dyn AgentStateAdmin,
+    ctx: &HookContext,
+) -> ExtensionCommandOutcome {
+    let mut tokens = rest.split_whitespace();
+    let (id, kind) = match (tokens.next(), tokens.next()) {
+        (Some(id), Some(kind)) => (id, kind),
+        _ => {
+            return ExtensionCommandOutcome::Error(
+                "Usage: /schedule modify <id> cron <sec> <min> <hour> <dom> <mon> <dow> [agent] | interval <seconds> [agent]".into(),
+            );
+        }
+    };
+    let (trigger, agent_ref, description) = match kind {
+        "interval" => {
+            let seconds = match tokens.next().and_then(|value| value.parse::<u64>().ok()) {
+                Some(seconds) if seconds > 0 => seconds,
+                _ => {
+                    return ExtensionCommandOutcome::Error(
+                        "Interval seconds must be greater than zero".into(),
+                    );
+                }
+            };
+            let period = std::time::Duration::from_secs(seconds);
+            if chrono::Duration::from_std(period).is_err() {
+                return ExtensionCommandOutcome::Error(
+                    "Interval seconds cannot be represented by chrono".into(),
+                );
+            }
+            (
+                Trigger::Interval { period },
+                tokens.next(),
+                format!("every {seconds}s"),
+            )
+        }
+        "cron" => {
+            let fields: Vec<_> = (&mut tokens).take(6).collect();
+            if fields.len() != 6 {
+                return ExtensionCommandOutcome::Error(
+                    "Usage: /schedule modify <id> cron <sec> <min> <hour> <dom> <mon> <dow> [agent]".into(),
+                );
+            }
+            let expr = fields.join(" ");
+            if let Err(e) = CronSchedule::from_str(&expr) {
+                return ExtensionCommandOutcome::Error(format!("Invalid cron '{expr}': {e}"));
+            }
+            (
+                Trigger::Cron { expr: expr.clone() },
+                tokens.next(),
+                format!("cron='{expr}'"),
+            )
+        }
+        _ => return ExtensionCommandOutcome::Error("Trigger must be cron or interval".into()),
+    };
+    if tokens.next().is_some() {
+        return ExtensionCommandOutcome::Error("Too many arguments to /schedule modify".into());
+    }
+    let (_, adb) = match open_agent_db_for_cmd(cap, ctx, agent_ref).await {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let Some(mut schedule) = (match adb.find_schedule(id).await {
+        Ok(schedule) => schedule,
+        Err(e) => return ExtensionCommandOutcome::Error(format!("Failed to read schedule: {e}")),
+    }) else {
+        return ExtensionCommandOutcome::Error(format!("No schedule with id '{id}'"));
+    };
+    schedule.trigger = trigger;
+    match adb.upsert_schedule(schedule).await {
+        Ok(()) => {
+            if let Some(engine) = ctx.routine_engine.as_ref()
+                && let Err(e) = engine.reload_agent(&adb.id().to_string(), &adb).await
+            {
+                tracing::warn!(agent = %adb.id(), "engine.reload_agent after modify failed: {e}");
+            }
+            ExtensionCommandOutcome::Text(format!("Modified schedule '{id}': {description}"))
+        }
+        Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save schedule: {e}")),
+    }
+}
+
+/// Parse and execute `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task...>`
+/// or `/schedule add interval <id> <seconds> <agent_ref> <task...>`.
 /// Writes an agent-owned Schedule with target = Pinned(current session).
 async fn add_cmd(
     rest: &str,
     cap: &dyn AgentStateAdmin,
     ctx: &HookContext,
 ) -> ExtensionCommandOutcome {
+    let mut tokens = rest.split_whitespace();
+    if tokens.next() == Some("interval") {
+        let (id, seconds, agent_ref) = match (tokens.next(), tokens.next(), tokens.next()) {
+            (Some(id), Some(seconds), Some(agent_ref)) => (id, seconds, agent_ref),
+            _ => {
+                return ExtensionCommandOutcome::Error(
+                    "Usage: /schedule add interval <id> <seconds> <agent> <task...>".into(),
+                );
+            }
+        };
+        let task = tokens.collect::<Vec<_>>().join(" ");
+        if task.is_empty() {
+            return ExtensionCommandOutcome::Error(
+                "Usage: /schedule add interval <id> <seconds> <agent> <task...>".into(),
+            );
+        }
+        let seconds = match seconds.parse::<u64>() {
+            Ok(seconds) if seconds > 0 => seconds,
+            _ => {
+                return ExtensionCommandOutcome::Error(
+                    "Interval seconds must be greater than zero".into(),
+                );
+            }
+        };
+        let period = std::time::Duration::from_secs(seconds);
+        if chrono::Duration::from_std(period).is_err() {
+            return ExtensionCommandOutcome::Error(
+                "Interval seconds cannot be represented by chrono".into(),
+            );
+        }
+        let entry = match cap.resolve_agent(agent_ref) {
+            Ok(entry) => entry,
+            Err(e) => return ExtensionCommandOutcome::Error(e),
+        };
+        let adb = match cap.open_agent_db(&entry).await {
+            Ok(adb) => adb,
+            Err(e) => return ExtensionCommandOutcome::Error(format!("{e:#}")),
+        };
+        let session_db_id = {
+            let s = ctx.session.lock().await;
+            s.database().root_id().to_string()
+        };
+        let schedule = Schedule::new(
+            id.to_string(),
+            Trigger::Interval { period },
+            task.clone(),
+            ScheduleTarget::Pinned { session_db_id },
+        );
+        return match adb.upsert_schedule(schedule).await {
+            Ok(()) => {
+                if let Some(engine) = ctx.routine_engine.as_ref()
+                    && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
+                {
+                    tracing::warn!(agent = %entry.db_id, "engine.reload_agent after add failed: {e}");
+                }
+                ExtensionCommandOutcome::Text(format!(
+                    "Schedule '{id}' on agent '{}': every {seconds}s → this session — {task}",
+                    entry.display_name
+                ))
+            }
+            Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save schedule: {e}")),
+        };
+    }
     let mut tokens = rest.split_whitespace();
     let id = tokens.next();
     let c1 = tokens.next();
@@ -446,6 +596,41 @@ mod tests {
         };
         assert!(out.contains("five-min"), "list missing id: {out}");
         assert!(out.contains("0 */5 * * * *"), "list missing cron: {out}");
+    }
+
+    #[tokio::test]
+    async fn interval_add_then_list_round_trips() {
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
+        let added = c
+            .invoke("add interval five-min 300 alpha do a thing", &ctx)
+            .await;
+        match added {
+            ExtensionCommandOutcome::Text(s) => assert!(s.contains("every 300s"), "got: {s}"),
+            ExtensionCommandOutcome::Error(e) => panic!("add failed: {e}"),
+        }
+        let listed = c.invoke("list", &ctx).await;
+        let out = match listed {
+            ExtensionCommandOutcome::Text(s) => s,
+            ExtensionCommandOutcome::Error(e) => panic!("list failed: {e}"),
+        };
+        assert!(out.contains("five-min"), "list missing id: {out}");
+        assert!(out.contains("every 300s"), "list missing interval: {out}");
+    }
+
+    #[tokio::test]
+    async fn modify_switches_a_schedule_to_interval() {
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
+        let _ = c.invoke("add tick 0 * * * * * alpha check", &ctx).await;
+        match c.invoke("modify tick interval 300 alpha", &ctx).await {
+            ExtensionCommandOutcome::Text(s) => assert!(s.contains("every 300s"), "got: {s}"),
+            ExtensionCommandOutcome::Error(e) => panic!("modify failed: {e}"),
+        }
+        match c.invoke("list", &ctx).await {
+            ExtensionCommandOutcome::Text(s) => assert!(s.contains("every 300s"), "got: {s}"),
+            ExtensionCommandOutcome::Error(e) => panic!("list failed: {e}"),
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Resolve an agent reference to a `DbEntry` via the scoped cap.
 /// `None` = the running agent.
@@ -120,6 +121,22 @@ fn validate_cron(expr: &str) -> Result<(), String> {
         .map_err(|e| format!("Invalid cron '{expr}': {e}"))
 }
 
+fn interval_trigger(arguments: &Value) -> Result<Option<Trigger>, String> {
+    let Some(seconds) = arguments.get("interval_seconds") else {
+        return Ok(None);
+    };
+    let seconds = seconds
+        .as_u64()
+        .ok_or_else(|| "interval_seconds must be a positive integer".to_string())?;
+    let period = Duration::from_secs(seconds);
+    if period.is_zero() {
+        return Err("interval_seconds must be greater than zero".into());
+    }
+    chrono::Duration::from_std(period)
+        .map_err(|_| "interval_seconds cannot be represented by chrono".to_string())?;
+    Ok(Some(Trigger::Interval { period }))
+}
+
 /// Parse the optional `target` argument: `"pinned"` (default) or
 /// `"fresh"`. Returns the [`ScheduleTarget`] variant.
 fn parse_target(target_str: Option<&str>, session_db_id: &str) -> ScheduleTarget {
@@ -157,14 +174,19 @@ impl Tool for ScheduleAdd {
                 "type": "object",
                 "properties": {
                     "id":     { "type": "string", "description": "Unique id for this schedule (e.g. 'hourly-check', 'daily-backup'). Referenced by schedule_modify and schedule_remove." },
-                    "cron":   { "type": "string", "description": "6-field cron expression: sec min hour day-of-month month day-of-week. Examples: '0 */5 * * * *' = every 5 minutes; '0 0 9 * * *' = 9am daily." },
+                    "cron":   { "type": "string", "description": "6-field cron expression: sec min hour day-of-month month day-of-week. Mutually exclusive with interval_seconds." },
+                    "interval_seconds": { "type": "integer", "minimum": 1, "description": "Fixed delay after each completed fire, in seconds. Mutually exclusive with cron." },
                     "task":   { "type": "string", "description": "Free-form instruction the agent receives when the schedule fires." },
                     "agent":  { "type": "string", "description": "Optional: agent that owns the schedule, by display name or DB id. Omit to target yourself." },
                     "target": { "type": "string", "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." },
                     "max_fires":  { "type": "integer", "description": "Optional: retire the schedule after this many fires. E.g. cron hourly + max_fires 8 = 'wake hourly for 8 hours'." },
                     "expires_at": { "type": "string", "description": "Optional: RFC 3339 timestamp after which the schedule stops firing (e.g. '2026-06-01T09:00:00Z'). Whichever of max_fires/expires_at is hit first retires it." }
                 },
-                "required": ["id", "cron", "task"]
+                "required": ["id", "task"],
+                "oneOf": [
+                    { "required": ["cron"], "not": { "required": ["interval_seconds"] } },
+                    { "required": ["interval_seconds"], "not": { "required": ["cron"] } }
+                ]
             }),
         }
     }
@@ -180,9 +202,22 @@ impl Tool for ScheduleAdd {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let user_id = str_arg(&arguments, "id")?;
-            let cron = str_arg(&arguments, "cron")?;
             let task = str_arg(&arguments, "task")?;
-            validate_cron(cron)?;
+            let cron = opt_str(&arguments, "cron");
+            let interval = interval_trigger(&arguments)?;
+            let trigger = match (cron, interval) {
+                (Some(_), Some(_)) => {
+                    return Err("Pass exactly one of cron or interval_seconds".into());
+                }
+                (Some(cron), None) => {
+                    validate_cron(cron)?;
+                    Trigger::Cron {
+                        expr: cron.to_string(),
+                    }
+                }
+                (None, Some(interval)) => interval,
+                (None, None) => return Err("Pass exactly one of cron or interval_seconds".into()),
+            };
             let expires_at = opt_expires_at(&arguments)?;
             let max_fires = opt_max_fires(&arguments)?;
 
@@ -212,9 +247,7 @@ impl Tool for ScheduleAdd {
 
             let mut schedule = Schedule::new(
                 user_id.to_string(),
-                Trigger::Cron {
-                    expr: cron.to_string(),
-                },
+                trigger,
                 task.to_string(),
                 schedule_target,
             );
@@ -234,8 +267,12 @@ impl Tool for ScheduleAdd {
                 _ => "this session".to_string(),
             };
             let bounds = fmt_bounds(&expires_at, &max_fires);
+            let trigger = match cron {
+                Some(cron) => format!("cron='{cron}'"),
+                None => format!("every {}s", arguments["interval_seconds"]),
+            };
             Ok(format!(
-                "Added schedule '{user_id}' on agent '{}': cron='{cron}' → {target_label}{bounds} — {task}",
+                "Added schedule '{user_id}' on agent '{}': {trigger} → {target_label}{bounds} — {task}",
                 entry.display_name
             ))
         })
@@ -269,7 +306,8 @@ impl Tool for ScheduleModify {
                 "properties": {
                     "id":      { "type": "string", "description": "Id of the schedule to edit (as returned by schedule_list)." },
                     "agent":   { "type": "string", "description": "Optional: agent that owns the schedule (defaults to yourself). Required if the schedule is owned by a different agent." },
-                    "cron":    { "type": "string", "description": "Optional: new 6-field cron expression." },
+                    "cron":    { "type": "string", "description": "Optional: new 6-field cron expression. Mutually exclusive with interval_seconds." },
+                    "interval_seconds": { "type": "integer", "minimum": 1, "description": "Optional: new fixed delay after each completed fire. Mutually exclusive with cron." },
                     "task":    { "type": "string", "description": "Optional: new task text." },
                     "target":  { "type": "string", "description": "Optional: 'pinned' or 'fresh'." },
                     "enabled": { "type": "boolean", "description": "Optional: toggle the schedule on/off without deleting it. Re-enabling a schedule that already hit its max_fires/expires_at bound will retire again on the next fire." },
@@ -293,6 +331,7 @@ impl Tool for ScheduleModify {
         Box::pin(async move {
             let id = str_arg(&arguments, "id")?;
             let new_cron = opt_str(&arguments, "cron");
+            let new_interval = interval_trigger(&arguments)?;
             let new_task = opt_str(&arguments, "task");
             let new_target = opt_str(&arguments, "target");
             let new_enabled = opt_bool(&arguments, "enabled");
@@ -300,6 +339,7 @@ impl Tool for ScheduleModify {
             let new_max_fires = opt_max_fires(&arguments)?;
 
             if new_cron.is_none()
+                && new_interval.is_none()
                 && new_task.is_none()
                 && new_target.is_none()
                 && new_enabled.is_none()
@@ -307,9 +347,12 @@ impl Tool for ScheduleModify {
                 && new_max_fires.is_none()
             {
                 return Err(
-                    "No fields to modify — pass at least one of: cron, task, target, enabled, max_fires, expires_at"
+                    "No fields to modify — pass at least one of: cron, interval_seconds, task, target, enabled, max_fires, expires_at"
                         .into(),
                 );
+            }
+            if new_cron.is_some() && new_interval.is_some() {
+                return Err("Pass at most one of cron or interval_seconds".into());
             }
             if let Some(c) = new_cron {
                 validate_cron(c)?;
@@ -334,6 +377,9 @@ impl Tool for ScheduleModify {
                 schedule.trigger = Trigger::Cron {
                     expr: c.to_string(),
                 };
+            }
+            if let Some(interval) = new_interval.as_ref() {
+                schedule.trigger = interval.clone();
             }
             if let Some(t) = new_task {
                 schedule.prompt = t.to_string();
@@ -370,6 +416,12 @@ impl Tool for ScheduleModify {
             )];
             if let Some(c) = new_cron {
                 parts.push(format!("cron='{c}'"));
+            }
+            if let Some(interval) = new_interval {
+                let Trigger::Interval { period } = interval else {
+                    unreachable!()
+                };
+                parts.push(format!("every {}s", period.as_secs()));
             }
             if let Some(t) = new_task {
                 parts.push(format!("task='{t}'"));
@@ -520,6 +572,7 @@ impl Tool for ScheduleList {
                 let state = if t.enabled { "" } else { " (disabled)" };
                 let schedule = match &t.trigger {
                     Trigger::Cron { expr } => expr.clone(),
+                    Trigger::Interval { period } => format!("every {period:?}"),
                     Trigger::OneShot { fire_at } => {
                         format!("@{}", fire_at.format("%Y-%m-%d %H:%M:%SZ"))
                     }
@@ -1050,5 +1103,61 @@ mod tests {
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(out.contains("fresh-one"), "id missing: {out}");
         assert!(out.contains("fresh"), "target label missing: {out}");
+    }
+
+    #[tokio::test]
+    async fn add_and_modify_interval_schedule() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = ScheduleAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = ScheduleModify::new(scoped(registry.clone(), index.clone()));
+        let list = ScheduleList::new(scoped(registry, index));
+        let ctx = make_ctx("alpha", session);
+        add.execute(
+            serde_json::json!({ "id": "poll", "interval_seconds": 60, "task": "check" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        modify
+            .execute(
+                serde_json::json!({ "id": "poll", "interval_seconds": 120 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.contains("every 120s"), "interval missing: {out}");
+    }
+
+    #[tokio::test]
+    async fn add_rejects_cron_and_interval_together() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = ScheduleAdd::new(scoped(registry, index));
+        let ctx = make_ctx("alpha", session);
+        let err = add
+            .execute(
+                serde_json::json!({
+                    "id": "bad", "cron": "0 * * * * *", "interval_seconds": 60, "task": "t"
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("mixed triggers should fail");
+        assert!(format!("{err:?}").contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn add_schema_makes_cron_and_interval_mutually_exclusive() {
+        let (_instance, registry, index, _session) = fixture("alpha").await;
+        let schema = ScheduleAdd::new(scoped(registry, index))
+            .descriptor()
+            .parameters;
+        assert_eq!(
+            schema["oneOf"],
+            serde_json::json!([
+                { "required": ["cron"], "not": { "required": ["interval_seconds"] } },
+                { "required": ["interval_seconds"], "not": { "required": ["cron"] } }
+            ])
+        );
     }
 }

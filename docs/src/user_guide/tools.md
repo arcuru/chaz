@@ -26,7 +26,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `skill_list`        | `skills`   | Low    | Never              | List the skills available to this agent (progressive disclosure)       |
 | `skill_search`      | `skills`   | Low    | Never              | Search the skill catalog by keyword                                    |
 | `skill_show`        | `skills`   | Low    | Never              | Fetch a skill's body — the "activation" half of progressive disclosure |
-| `schedule_add`      | `schedule` | Low    | Never              | Add a recurring agent-owned schedule (cron)                            |
+| `schedule_add`      | `schedule` | Low    | Never              | Add a recurring agent-owned cron or interval schedule                  |
 | `schedule_modify`   | `schedule` | Low    | Never              | Partial update of an existing schedule                                 |
 | `schedule_remove`   | `schedule` | Low    | Never              | Delete a schedule by id                                                |
 | `schedule_list`     | `schedule` | Low    | Never              | List an agent's schedules                                              |
@@ -198,7 +198,7 @@ Skills come from three sources merged at session start: disk skills shipped on t
 
 ### schedule_add / schedule_modify / schedule_remove / schedule_list
 
-Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash commands described in [Agents — Schedules](agents.md#schedules). Schedules live in the owning agent's DB (not the session) and are fired by chaz's `RoutineEngine`, which sleeps until the next due fire instead of polling. `schedule_add` targets the current session (Pinned) by default, or a fresh session per fire. Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash commands described in [Agents — Schedules](agents.md#schedules). Schedules live in the owning agent's DB (not the session) and are fired by chaz's `RoutineEngine`, which sleeps until the next due fire instead of polling. `schedule_add` targets the current session (Pinned) by default, or a fresh session per fire. Pass exactly one trigger: `cron` uses 6 fields (`sec min hour day_of_month month day_of_week`), while `interval_seconds` is a fixed delay after each successful dispatch. The agent turn runs asynchronously, so an interval does not prevent overlapping turns.
 
 ```json
 {
@@ -207,6 +207,18 @@ Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash co
   "task": "Summarize overnight activity"
 }
 ```
+
+For a five-minute fixed-delay check instead:
+
+```json
+{
+  "id": "check-in",
+  "interval_seconds": 300,
+  "task": "Check for actionable updates"
+}
+```
+
+`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields. Intervals first fire after one period; after a restart, the next fire remains one period after the saved dispatch. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
 
 The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
 

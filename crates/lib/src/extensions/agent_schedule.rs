@@ -9,8 +9,10 @@
 //! [`crate::runtime::execute`], write results, and attribute cost to
 //! the agent's `schedule_fires` store.
 //!
-//! The handler spawns a `tokio` task for the actual agent turn so the
-//! engine's fire loop isn't blocked on LLM latency.
+//! The handler acknowledges dispatch after spawning a `tokio` task, so the
+//! engine's fire loop isn't blocked on LLM latency. Recurrence is therefore
+//! anchored after successful handler completion (dispatch), not agent-turn
+//! completion.
 
 use crate::extension::handler::{HandlerFuture, RoutineHandler};
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};

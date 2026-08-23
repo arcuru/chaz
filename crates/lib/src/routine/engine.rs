@@ -5,7 +5,7 @@
 //!
 //! Replaced the poll-based `HeartbeatRunner` (per-30s tick) and the
 //! separate `Scheduler` cron driver with one engine handling both
-//! recurring cron rules and one-shot schedules, scoped globally
+//! recurring cron and interval rules and one-shot schedules, scoped globally
 //! (`chaz_peer.routines`) or per-session (`session_db.rules`). Fires
 //! dispatch through [`ExtensionHub::dispatch_routine`] from
 //! [`Engine::fire_due`].
@@ -19,7 +19,7 @@
 
 use super::types::{
     AGENT_SCHEDULE_EXTENSION, AgentSchedulePayload, Routine, RoutineId, RoutineScope,
-    RoutineTarget, Trigger,
+    RoutineTarget, Trigger, next_interval_fire,
 };
 use crate::agent_db::AgentDb;
 use crate::extension::ExtensionHub;
@@ -136,7 +136,11 @@ impl RoutineEngine {
 
     async fn load_globals(self: &Arc<Self>) -> anyhow::Result<()> {
         let routines = load_routines_table(&self.chaz_peer, GLOBAL_ROUTINES_STORE).await?;
-        let last_fired = load_last_fired(&self.chaz_peer).await;
+        let last_fired = load_last_fired(
+            &self.chaz_peer,
+            routines.iter().map(|routine| routine.id.clone()).collect(),
+        )
+        .await;
         let mut state = self.state.lock().await;
         for r in routines {
             if !r.enabled {
@@ -192,7 +196,11 @@ impl RoutineEngine {
         session_db: &Database,
     ) -> anyhow::Result<()> {
         let routines = load_routines_table(session_db, SESSION_ROUTINES_STORE).await?;
-        let last_fired = load_last_fired(&self.chaz_peer).await;
+        let last_fired = load_last_fired(
+            &self.chaz_peer,
+            routines.iter().map(|routine| routine.id.clone()).collect(),
+        )
+        .await;
         let mut state = self.state.lock().await;
         for r in routines {
             if !r.enabled {
@@ -262,32 +270,40 @@ impl RoutineEngine {
         agent_db: &AgentDb,
     ) -> anyhow::Result<()> {
         let schedules = agent_db.list_schedules().await?;
-        let last_fired = load_last_fired(&self.chaz_peer).await;
+        let routines: Vec<_> = schedules
+            .into_iter()
+            .filter(|schedule| schedule.enabled)
+            .filter_map(|schedule| match schedule_to_routine(agent_db_id, &schedule) {
+                Ok(routine) => Some((schedule, routine)),
+                Err(e) => {
+                    warn!(agent = agent_db_id, schedule = %schedule.id, "skipping unconvertible schedule: {e}");
+                    None
+                }
+            })
+            .collect();
+        let last_fired = load_last_fired(
+            &self.chaz_peer,
+            routines
+                .iter()
+                .map(|(_, routine)| routine.id.clone())
+                .collect(),
+        )
+        .await;
         let mut state = self.state.lock().await;
         let now = Utc::now();
-        for t in schedules {
-            if !t.enabled {
-                continue;
-            }
+        for (schedule, routine) in routines {
             // A schedule past its expiry / fire-count bound is never
             // seeded — a restart must not resurrect a retired schedule.
             // The authoritative enable=false write happens in the fire
             // path; this is the load-time guard.
-            if let Some(reason) = t.retirement_reason(now) {
+            if let Some(reason) = schedule.retirement_reason(now) {
                 tracing::debug!(
                     agent = agent_db_id,
-                    schedule = %t.id,
+                    schedule = %schedule.id,
                     "skipping retired schedule at load: {reason}"
                 );
                 continue;
             }
-            let routine = match schedule_to_routine(agent_db_id, &t) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(agent = agent_db_id, schedule = %t.id, "skipping unconvertible schedule: {e}");
-                    continue;
-                }
-            };
             let last = last_fired.get(routine.id.as_str()).copied();
             if let Some(when) = next_fire_time(&routine.trigger, last) {
                 state.push(RoutineEntry {
@@ -353,6 +369,7 @@ impl RoutineEngine {
                  not engine.add_routine"
             );
         }
+        validate_trigger(&routine.trigger)?;
         let id = routine.id.clone();
         let trigger = routine.trigger.clone();
         let target_db = match &scope {
@@ -482,7 +499,7 @@ impl RoutineEngine {
 
     /// Fire every routine whose `next_fire` is `<= now`. Records the
     /// fire, dispatches through `ExtensionHub::dispatch_routine`, and
-    /// either reschedules (Cron) or removes (OneShot).
+    /// either reschedules recurring triggers or removes one-shots.
     async fn fire_due(self: &Arc<Self>) {
         let now = Utc::now();
         let mut to_fire: Vec<RoutineId> = Vec::new();
@@ -540,7 +557,7 @@ impl RoutineEngine {
 
     async fn on_fire_success(self: &Arc<Self>, id: &RoutineId, entry: &RoutineEntry) {
         let now = Utc::now();
-        // Persist last_fired for cron recurrence so a restart picks up
+        // Persist last_fired for recurrence so a restart picks up
         // from "after the last fire" rather than re-firing immediately.
         if entry.routine.trigger.is_recurring()
             && let Err(e) = save_last_fired(&self.chaz_peer, id, now).await
@@ -550,7 +567,7 @@ impl RoutineEngine {
 
         let mut state = self.state.lock().await;
         match entry.routine.trigger {
-            Trigger::Cron { .. } => {
+            Trigger::Cron { .. } | Trigger::Interval { .. } => {
                 if let Some(when) = next_fire_time(&entry.routine.trigger, Some(now)) {
                     if let Some(e) = state.routines.get_mut(id) {
                         e.routine.consecutive_failures = 0;
@@ -559,7 +576,7 @@ impl RoutineEngine {
                     }
                     state.heap.push(Reverse((when, id.clone())));
                 } else {
-                    // Cron stopped producing future fires — disable
+                    // The trigger stopped producing future fires — disable
                     // and surface for admin inspection.
                     if let Some(e) = state.routines.get_mut(id) {
                         e.routine.enabled = false;
@@ -605,13 +622,13 @@ impl RoutineEngine {
             e.routine.max_failures > 0 && e.routine.consecutive_failures >= e.routine.max_failures;
 
         match entry.routine.trigger {
-            Trigger::Cron { .. } if !auto_disable => {
+            Trigger::Cron { .. } | Trigger::Interval { .. } if !auto_disable => {
                 if let Some(when) = next_fire_time(&entry.routine.trigger, Some(now)) {
                     e.next_fire = when;
                     state.heap.push(Reverse((when, id.clone())));
                 }
             }
-            Trigger::Cron { .. } => {
+            Trigger::Cron { .. } | Trigger::Interval { .. } => {
                 e.routine.enabled = false;
                 warn!(
                     routine = %id,
@@ -676,6 +693,8 @@ fn schedule_to_routine(
 /// * `OneShot` — the `fire_at` is returned directly, even if it's in
 ///   the past; the engine handles already-due routines on the next
 ///   tick.
+/// * `Interval` — first fire is one period from now; later fires are
+///   one period after the last fire.
 fn next_fire_time(trigger: &Trigger, last: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     match trigger {
         Trigger::Cron { expr } => {
@@ -685,8 +704,23 @@ fn next_fire_time(trigger: &Trigger, last: Option<DateTime<Utc>>) -> Option<Date
                 None => schedule.upcoming(Utc).next(),
             }
         }
+        Trigger::Interval { period } => next_interval_fire(*period, last.unwrap_or_else(Utc::now)),
         Trigger::OneShot { fire_at } => Some(*fire_at),
     }
+}
+
+pub(crate) fn validate_trigger(trigger: &Trigger) -> anyhow::Result<()> {
+    if let Trigger::Interval { period } = trigger {
+        if period.is_zero() {
+            anyhow::bail!("interval period must be greater than zero");
+        }
+        let period = chrono::Duration::from_std(*period)
+            .map_err(|_| anyhow::anyhow!("interval period cannot be represented by chrono"))?;
+        if Utc::now().checked_add_signed(period).is_none() {
+            anyhow::bail!("interval period cannot produce a future fire safely");
+        }
+    }
+    Ok(())
 }
 
 fn truncate_error(mut s: String) -> String {
@@ -746,7 +780,7 @@ async fn delete_routine_row(db: &Database, store: &str, id: &RoutineId) -> anyho
     Ok(())
 }
 
-async fn load_last_fired(db: &Database) -> HashMap<String, DateTime<Utc>> {
+async fn load_last_fired(db: &Database, ids: Vec<RoutineId>) -> HashMap<String, DateTime<Utc>> {
     let out = HashMap::new();
     let Ok(txn) = db.new_transaction().await else {
         return out;
@@ -754,13 +788,15 @@ async fn load_last_fired(db: &Database) -> HashMap<String, DateTime<Utc>> {
     let Ok(store) = txn.get_store::<DocStore>(LAST_FIRED_STORE).await else {
         return out;
     };
-    // DocStore doesn't expose a list/iter today; per-id last_fired
-    // lookup happens through callers that hold the id. Returning an
-    // empty map seeds the engine on startup with "no prior fires"
-    // semantics, which matches today's `heartbeat.rs:248` bootstrap
-    // (set last_fired = now on first sight). When DocStore gains an
-    // iter, expand this to populate the map up front.
-    let _ = store;
+    let mut out = out;
+    for id in ids {
+        let Ok(value) = store.get_string(id.as_str()).await else {
+            continue;
+        };
+        if let Ok(when) = DateTime::parse_from_rfc3339(&value) {
+            out.insert(id.as_str().to_string(), when.with_timezone(&Utc));
+        }
+    }
     out
 }
 
@@ -888,6 +924,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interval_reschedules_after_fire() {
+        let (_inst, peer) = fixture_db().await;
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        let id = RoutineId::new("interval");
+        engine
+            .add_routine(
+                Routine::interval(
+                    id.clone(),
+                    "every minute",
+                    std::time::Duration::from_secs(60),
+                    target("heartbeat"),
+                ),
+                RoutineScope::Global,
+                None,
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut state = engine.state.lock().await;
+            let due = Utc::now() - chrono::Duration::seconds(1);
+            let entry = state.routines.get_mut(&id).unwrap();
+            entry.next_fire = due;
+            state.heap.push(Reverse((due, id.clone())));
+        }
+
+        let completed_after = Utc::now();
+        engine.fire_due().await;
+        let state = engine.state.lock().await;
+        let entry = state.routines.get(&id).unwrap();
+        assert!(entry.next_fire >= completed_after + chrono::Duration::seconds(60));
+        assert!(entry.next_fire <= Utc::now() + chrono::Duration::seconds(60));
+    }
+
+    #[tokio::test]
+    async fn rejected_intervals_do_not_persist_or_enter_engine_state() {
+        let (_inst, peer) = fixture_db().await;
+        let engine = RoutineEngine::new(peer.clone(), None).await.unwrap();
+        for (id, period) in [
+            ("zero", std::time::Duration::ZERO),
+            ("overflow", std::time::Duration::MAX),
+        ] {
+            let result = engine
+                .add_routine(
+                    Routine::interval(RoutineId::new(id), id, period, target("heartbeat")),
+                    RoutineScope::Global,
+                    None,
+                )
+                .await;
+            assert!(result.is_err(), "{id} interval should be rejected");
+            assert!(engine.get(&RoutineId::new(id)).await.is_none());
+        }
+        assert!(
+            load_routines_table(&peer, GLOBAL_ROUTINES_STORE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn interval_restart_anchors_after_persisted_completion() {
+        let (_inst, peer) = fixture_db().await;
+        let id = RoutineId::new("interval");
+        let completion = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        upsert_routine(
+            &peer,
+            GLOBAL_ROUTINES_STORE,
+            &Routine::interval(
+                id.clone(),
+                "interval",
+                std::time::Duration::from_secs(60),
+                target("heartbeat"),
+            ),
+        )
+        .await
+        .unwrap();
+        save_last_fired(&peer, &id, completion).await.unwrap();
+
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.routines[&id].next_fire,
+            completion + chrono::Duration::seconds(60)
+        );
+    }
+
+    #[tokio::test]
     async fn remove_routine_drops_it_from_state() {
         let (_inst, peer) = fixture_db().await;
         let engine = RoutineEngine::new(peer, None).await.unwrap();
@@ -993,10 +1117,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_session_removes_interval_routine() {
+        let (_inst_peer, peer) = fixture_db().await;
+        let (_inst_sess, sess) = fixture_db().await;
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        let id = RoutineId::new("interval");
+        crate::routine::upsert_session_routine(
+            &sess,
+            &Routine::interval(
+                id.clone(),
+                "interval",
+                std::time::Duration::from_secs(60),
+                target("heartbeat"),
+            ),
+        )
+        .await
+        .unwrap();
+        engine.register_session("s1", &sess).await.unwrap();
+        assert!(engine.get(&id).await.is_some());
+        crate::routine::remove_session_routine(&sess, &id)
+            .await
+            .unwrap();
+        engine.reload_session("s1", &sess).await.unwrap();
+        assert!(engine.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
     async fn next_fire_time_for_one_shot_returns_the_target_time() {
         let when = Utc::now() + chrono::Duration::seconds(60);
         let next = next_fire_time(&Trigger::OneShot { fire_at: when }, None).unwrap();
         assert_eq!(next, when);
+    }
+
+    #[test]
+    fn next_fire_time_for_interval_advances_from_the_last_fire() {
+        let period = std::time::Duration::from_secs(60);
+        let last = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let next = next_fire_time(&Trigger::Interval { period }, Some(last)).unwrap();
+        assert_eq!(next, last + chrono::Duration::seconds(60));
+    }
+
+    #[test]
+    fn next_fire_time_rejects_zero_interval() {
+        assert!(
+            next_fire_time(
+                &Trigger::Interval {
+                    period: std::time::Duration::ZERO,
+                },
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn next_fire_time_returns_none_when_interval_overflows_datetime() {
+        assert!(
+            next_fire_time(
+                &Trigger::Interval {
+                    period: std::time::Duration::from_secs(1),
+                },
+                Some(DateTime::<Utc>::MAX_UTC),
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
