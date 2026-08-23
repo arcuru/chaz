@@ -26,6 +26,72 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tracing::error;
 
+/// Maximum attempts for one outbound transport chunk, including the first.
+pub const OUTBOUND_CHUNK_MAX_ATTEMPTS: u32 = 3;
+const OUTBOUND_CHUNK_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+const OUTBOUND_CHUNK_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// HTTP statuses for which an outbound transport chunk may be retried.
+pub fn is_transient_outbound_status(status: u16) -> bool {
+    matches!(status, 429 | 503 | 504)
+}
+
+/// Retry a single outbound transport chunk under the shared bridge policy.
+///
+/// The caller supplies transport-specific transient-error classification; the
+/// bound, exponential backoff, and jitter stay identical across transports.
+/// A successful chunk is never sent again while a later chunk is retried.
+pub async fn retry_outbound_chunk<F, Fut, E, Classify>(
+    send: F,
+    is_transient: Classify,
+) -> Result<(), E>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    Classify: Fn(&E) -> bool,
+{
+    retry_outbound_chunk_with_backoff(send, is_transient, |delay| async move {
+        tokio::time::sleep(delay).await;
+    })
+    .await
+}
+
+async fn retry_outbound_chunk_with_backoff<F, Fut, E, Classify, Wait, WaitFut>(
+    send: F,
+    is_transient: Classify,
+    wait: Wait,
+) -> Result<(), E>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    Classify: Fn(&E) -> bool,
+    Wait: Fn(std::time::Duration) -> WaitFut,
+    WaitFut: std::future::Future<Output = ()>,
+{
+    for attempt in 1..=OUTBOUND_CHUNK_MAX_ATTEMPTS {
+        match send().await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient(&error) && attempt < OUTBOUND_CHUNK_MAX_ATTEMPTS => {
+                wait(outbound_chunk_backoff(attempt)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
+fn outbound_chunk_backoff(retry_number: u32) -> std::time::Duration {
+    let multiplier = 1u128 << retry_number.saturating_sub(1);
+    let base_ms = OUTBOUND_CHUNK_BACKOFF_BASE.as_millis();
+    let capped_ms = base_ms
+        .saturating_mul(multiplier)
+        .min(OUTBOUND_CHUNK_BACKOFF_CAP.as_millis());
+    // getrandom failure must not turn a transient delivery problem into a
+    // permanent one; an unjittered bounded delay is the safe fallback.
+    let jitter_percent = getrandom::u32().map(|n| n % 21).unwrap_or(10);
+    std::time::Duration::from_millis((capped_ms * (90 + u128::from(jitter_percent)) / 100) as u64)
+}
+
 /// Trait for transport bridges (Matrix, TUI, etc.)
 ///
 /// A bridge owns a transport connection and translates platform events
@@ -434,8 +500,12 @@ pub fn render_outbound(owning_agent: &str, sender: &str, content: &str) -> Strin
 /// Identity of a delivered entry: `(timestamp, content)` — the same key the
 /// session backfill dedupes on.
 type DeliveredKey = (DateTime<Utc>, String);
-/// Per-channel set of agent messages already sent to the transport.
-type DeliveredSet = Arc<Mutex<HashSet<DeliveredKey>>>;
+/// Per-channel count of chunks successfully sent for each agent message.
+///
+/// `usize::MAX` marks an entry whose final chunk was delivered. Keeping the
+/// prefix count while an entry is in flight lets a later reconciliation resume
+/// at the failed chunk rather than repeat the prefix.
+type DeliveredSet = Arc<Mutex<HashMap<DeliveredKey, usize>>>;
 
 /// The agent `Message` entries in `entries` not yet in `delivered`.
 ///
@@ -470,7 +540,8 @@ pub fn undelivered_agent_messages<'a>(
 async fn deliver_in_order<S, Fut>(
     pending: &[&SessionEntry],
     owning_agent: &str,
-    delivered: &mut HashSet<DeliveredKey>,
+    delivered: &mut HashMap<DeliveredKey, usize>,
+    chunk: &impl Fn(&str) -> Vec<String>,
     send: &S,
 ) -> usize
 where
@@ -480,14 +551,20 @@ where
     let mut delivered_now = 0;
     for entry in pending {
         let body = render_outbound(owning_agent, &entry.sender, &entry.content);
-        if let Err(e) = send(body).await {
-            error!(
-                "Failed to deliver to transport: {e}; \
-                 leaving it for retry on the next write"
-            );
-            break;
+        let key = (entry.timestamp, entry.content.clone());
+        let chunks = chunk(&body);
+        let start = delivered.get(&key).copied().unwrap_or(0);
+        for (index, body) in chunks.into_iter().enumerate().skip(start) {
+            if let Err(e) = send(body).await {
+                error!(
+                    "Failed to deliver to transport: {e}; \
+                     leaving it for retry on the next write"
+                );
+                return delivered_now;
+            }
+            delivered.insert(key.clone(), index + 1);
         }
-        delivered.insert((entry.timestamp, entry.content.clone()));
+        delivered.insert(key, usize::MAX);
         delivered_now += 1;
     }
     delivered_now
@@ -505,26 +582,28 @@ where
 /// fires.
 ///
 /// Delivery is at-least-once: an entry is added to the delivered-set only
-/// after `send` reports success, and a failing send stops the pass so the
-/// undelivered tail is retried — in order — on the next write. A transport
-/// that delivers a multi-part body non-atomically (e.g. chunked to fit a
-/// length cap) may therefore re-emit the already-sent prefix on retry; that
-/// is the cost of never silently dropping a message.
+/// after its final chunk reports success, and a failing send stops the pass so
+/// the undelivered tail is retried — in order — on the next write. The
+/// delivered-set retains each entry's successful chunk prefix, so a
+/// non-atomic transport resumes at the failed chunk without re-emitting that
+/// prefix.
 ///
 /// `send` is the transport's delivery closure — it receives each rendered
 /// body and is responsible for delivering it (and any transport-specific
 /// logging). Matrix passes `room.send`; Discord passes `ChannelId::say`. It
 /// is held across the delivered-set lock so concurrent writes can't
 /// interleave or double-emit.
-pub async fn attach_reconciler<S, Fut>(
+pub async fn attach_reconciler<S, Fut, C>(
     session_db: &eidetica::Database,
     agents: Arc<AgentRegistry>,
     owning_agent: String,
+    chunk: C,
     send: S,
 ) -> anyhow::Result<()>
 where
     S: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+    C: Fn(&str) -> Vec<String> + Send + Sync + 'static,
 {
     let sid = session_db.root_id().to_string();
     // Seed with everything already committed — the transport shows it already.
@@ -533,11 +612,12 @@ where
         let seed = session
             .entries()
             .iter()
-            .map(|e| (e.timestamp, e.content.clone()))
+            .map(|e| ((e.timestamp, e.content.clone()), usize::MAX))
             .collect();
         Arc::new(Mutex::new(seed))
     };
     let send = Arc::new(send);
+    let chunk = Arc::new(chunk);
     session_db
         .on_write(move |event, db| {
             // Fires for local commits and for sync ingest alike: a co-owner's
@@ -551,17 +631,22 @@ where
             let sid = sid.clone();
             let delivered = delivered.clone();
             let send = send.clone();
+            let chunk = chunk.clone();
             Box::pin(async move {
                 let session = Session::new(ConversationId(sid), db).await;
                 // Hold the lock across the sends so concurrent writes can't
                 // interleave or double-emit; delivery is serialized.
                 let mut delivered = delivered.lock().await;
+                let completed = delivered
+                    .iter()
+                    .filter_map(|(key, sent)| (*sent == usize::MAX).then_some(key.clone()))
+                    .collect();
                 let pending = undelivered_agent_messages(
                     session.entries(),
                     |s| agents.get(s).is_some(),
-                    &delivered,
+                    &completed,
                 );
-                deliver_in_order(&pending, &owning_agent, &mut delivered, send.as_ref()).await;
+                deliver_in_order(&pending, &owning_agent, &mut delivered, chunk.as_ref(), send.as_ref()).await;
                 Ok(())
             })
         })
@@ -573,6 +658,140 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test]
+    async fn outbound_chunk_retries_transient_failures_independently() {
+        let attempts = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
+        let waits = Arc::new(Mutex::new(Vec::new()));
+
+        for chunk in ["first", "second"] {
+            let attempts = attempts.clone();
+            let waits = waits.clone();
+            retry_outbound_chunk_with_backoff(
+                || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let mut attempts = attempts.lock().await;
+                        let count = attempts.entry(chunk.to_string()).or_default();
+                        *count += 1;
+                        if *count == 1 {
+                            Err("transient")
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                |error| *error == "transient",
+                |delay| {
+                    let waits = waits.clone();
+                    async move { waits.lock().await.push(delay) }
+                },
+            )
+            .await
+            .expect("each chunk retries its own first failure");
+        }
+
+        assert_eq!(
+            *attempts.lock().await,
+            HashMap::from([("first".into(), 2), ("second".into(), 2)])
+        );
+        let waits = waits.lock().await;
+        assert_eq!(waits.len(), 2);
+        assert!(
+            waits
+                .iter()
+                .all(|delay| (450..=550).contains(&delay.as_millis()))
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_chunk_stops_after_three_transient_attempts_and_never_retries_permanent() {
+        let transient_attempts = Arc::new(AtomicU64::new(0));
+        let result = retry_outbound_chunk_with_backoff(
+            || {
+                let attempts = transient_attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>("transient")
+                }
+            },
+            |error| *error == "transient",
+            |_| async {},
+        )
+        .await;
+        assert_eq!(result, Err("transient"));
+        assert_eq!(
+            transient_attempts.load(Ordering::SeqCst),
+            u64::from(OUTBOUND_CHUNK_MAX_ATTEMPTS)
+        );
+
+        let permanent_attempts = Arc::new(AtomicU64::new(0));
+        let result = retry_outbound_chunk_with_backoff(
+            || {
+                let attempts = permanent_attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>("permanent")
+                }
+            },
+            |error| *error == "transient",
+            |_| async {},
+        )
+        .await;
+        assert_eq!(result, Err("permanent"));
+        assert_eq!(permanent_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_explicit_outbound_statuses_are_transient() {
+        for status in [429, 503, 504] {
+            assert!(is_transient_outbound_status(status));
+        }
+        for status in [400, 401, 403, 404, 500, 502] {
+            assert!(!is_transient_outbound_status(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn later_chunk_recovers_without_resending_delivered_prefix() {
+        let entries = [entry("chaz", "first|second|third", 1, EntryType::Message)];
+        let pending: Vec<&SessionEntry> = entries.iter().collect();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send = flaky_send(sent.clone(), &["second"]);
+        let mut delivered = HashMap::new();
+        let chunk = |body: &str| body.split('|').map(str::to_string).collect();
+
+        // The second transport chunk exhausts this reconciliation pass after
+        // the first landed. Its prefix is recorded independently of the entry.
+        assert_eq!(
+            deliver_in_order(&pending, "chaz", &mut delivered, &chunk, &send).await,
+            0
+        );
+        assert_eq!(sent.lock().await.as_slice(), &["first".to_string()]);
+        assert_eq!(
+            delivered.get(&(entries[0].timestamp, entries[0].content.clone())),
+            Some(&1)
+        );
+
+        // A later callback resumes at chunk 1, not at the entry's beginning.
+        assert_eq!(
+            deliver_in_order(&pending, "chaz", &mut delivered, &chunk, &send).await,
+            1
+        );
+        assert_eq!(
+            sent.lock().await.as_slice(),
+            &[
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
+        );
+        assert_eq!(
+            delivered.get(&(entries[0].timestamp, entries[0].content.clone())),
+            Some(&usize::MAX)
+        );
+    }
 
     fn entry(sender: &str, content: &str, ts: i64, entry_type: EntryType) -> SessionEntry {
         SessionEntry {
@@ -583,6 +802,10 @@ mod tests {
             metadata: None,
             routing: None,
         }
+    }
+
+    fn one_chunk(body: &str) -> Vec<String> {
+        vec![body.to_string()]
     }
 
     #[test]
@@ -922,21 +1145,24 @@ mod tests {
     async fn failed_send_is_not_marked_then_retries() {
         let entries = [entry("chaz", "hello", 2, EntryType::Message)];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
-        let mut delivered = HashSet::new();
+        let mut delivered = HashMap::new();
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let send = flaky_send(sent.clone(), &["hello"]);
 
         // First pass: the only send fails → nothing delivered, nothing marked.
-        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &one_chunk, &send).await;
         assert_eq!(n, 0);
         assert!(delivered.is_empty(), "a failed send must not be marked");
         assert!(sent.lock().await.is_empty());
 
         // The next write retries the same still-undelivered entry; now it lands.
-        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &one_chunk, &send).await;
         assert_eq!(n, 1);
-        assert!(delivered.contains(&(entries[0].timestamp, "hello".to_string())));
+        assert_eq!(
+            delivered.get(&(entries[0].timestamp, "hello".to_string())),
+            Some(&usize::MAX)
+        );
         assert_eq!(sent.lock().await.as_slice(), &["hello".to_string()]);
     }
 
@@ -948,30 +1174,33 @@ mod tests {
             entry("chaz", "c", 3, EntryType::Message),
         ];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
-        let mut delivered = HashSet::new();
+        let mut delivered = HashMap::new();
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let send = flaky_send(sent.clone(), &["b"]); // "b" fails its first attempt
 
         // First pass: "a" lands, "b" fails → stop. "c" is never attempted.
-        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &one_chunk, &send).await;
         assert_eq!(n, 1);
         assert_eq!(sent.lock().await.as_slice(), &["a".to_string()]);
-        assert!(delivered.contains(&(entries[0].timestamp, "a".to_string())));
-        assert!(!delivered.contains(&(entries[1].timestamp, "b".to_string())));
+        assert_eq!(
+            delivered.get(&(entries[0].timestamp, "a".to_string())),
+            Some(&usize::MAX)
+        );
+        assert!(!delivered.contains_key(&(entries[1].timestamp, "b".to_string())));
 
         // The reconciler recomputes pending from the delivered-set: "a" drops
         // out, leaving ["b", "c"]. The retry delivers both, in order.
         let retry: Vec<&SessionEntry> = pending
             .iter()
             .copied()
-            .filter(|e| !delivered.contains(&(e.timestamp, e.content.clone())))
+            .filter(|e| delivered.get(&(e.timestamp, e.content.clone())) != Some(&usize::MAX))
             .collect();
         assert_eq!(
             retry.iter().map(|e| e.content.as_str()).collect::<Vec<_>>(),
             vec!["b", "c"]
         );
-        let n = deliver_in_order(&retry, "chaz", &mut delivered, &send).await;
+        let n = deliver_in_order(&retry, "chaz", &mut delivered, &one_chunk, &send).await;
         assert_eq!(n, 2);
         assert_eq!(
             sent.lock().await.as_slice(),
@@ -986,12 +1215,12 @@ mod tests {
             entry("scout", "two", 2, EntryType::Message), // guest → prefixed body
         ];
         let pending: Vec<&SessionEntry> = entries.iter().collect();
-        let mut delivered = HashSet::new();
+        let mut delivered = HashMap::new();
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let send = flaky_send(sent.clone(), &[]); // nothing fails
 
-        let n = deliver_in_order(&pending, "chaz", &mut delivered, &send).await;
+        let n = deliver_in_order(&pending, "chaz", &mut delivered, &one_chunk, &send).await;
         assert_eq!(n, 2);
         // Owning agent plain; guest prefixed (render_outbound contract).
         assert_eq!(

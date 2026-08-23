@@ -20,7 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chaz_core::backends::BackendManager;
-use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
+use chaz_core::bridge::{
+    ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry, is_transient_outbound_status,
+    retry_outbound_chunk,
+};
 use chaz_core::commands::{self, CommandContext, CommandOutcome, Parsed};
 use chaz_core::config::Config;
 use chaz_core::hosted_index::DbEntry;
@@ -277,17 +280,16 @@ impl Handler {
             session_db,
             self.server.agents_arc(),
             self.owning_agent.clone(),
+            |body| chunk_message(body, DISCORD_MESSAGE_LIMIT),
             move |body| {
                 let http = http.clone();
                 async move {
                     info!("→ Discord({channel_id}): {}", body.replace('\n', " "));
-                    // Discord rejects any message over DISCORD_MESSAGE_LIMIT
-                    // characters, so a long agent reply goes out as several
-                    // messages split on natural boundaries. A body that already
-                    // fits produces a single chunk (and an empty body, none).
-                    for piece in chunk_message(&body, DISCORD_MESSAGE_LIMIT) {
-                        channel_id.say(&http, piece).await?;
-                    }
+                    retry_outbound_chunk(
+                        || async { channel_id.say(&http, body.clone()).await.map(|_| ()) },
+                        is_transient_discord_send_error,
+                    )
+                    .await?;
                     Ok(())
                 }
             },
@@ -476,6 +478,18 @@ impl Handler {
         if let Err(e) = msg_say(ctx, channel_id, text).await {
             error!("Failed to send command response: {e}");
         }
+    }
+}
+
+fn is_transient_discord_send_error(error: &serenity::Error) -> bool {
+    match error {
+        serenity::Error::Http(http) => match http {
+            serenity::http::HttpError::Request(error) => error.is_connect(),
+            _ => http
+                .status_code()
+                .is_some_and(|status| is_transient_outbound_status(status.as_u16())),
+        },
+        _ => false,
     }
 }
 
@@ -939,7 +953,10 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{charge_message_quota, chunk_message, first_delivery, hard_split};
+    use super::{
+        charge_message_quota, chunk_message, first_delivery, hard_split,
+        is_transient_discord_send_error,
+    };
     use serenity::model::id::MessageId;
     use std::collections::{HashMap, HashSet};
     use tokio::sync::Mutex;
@@ -977,6 +994,15 @@ mod tests {
         // A different message is unaffected.
         assert!(first_delivery(&seen, MessageId::new(43)).await);
         assert!(!first_delivery(&seen, MessageId::new(43)).await);
+    }
+
+    #[test]
+    fn a_generic_io_error_is_permanent() {
+        // A local I/O failure (disk, pipe, …) says nothing about the Discord
+        // transport: retrying it would burn attempts on a problem retries
+        // cannot fix, so it must surface as permanent.
+        let error = serenity::Error::Io(std::io::Error::other("local I/O hiccup"));
+        assert!(!is_transient_discord_send_error(&error));
     }
 
     /// Every chunk must respect the char ceiling — the whole point of the split.
