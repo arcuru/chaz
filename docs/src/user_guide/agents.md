@@ -345,7 +345,7 @@ Routines are created two ways, both compiling to the same `Routine` rows fired b
 
 Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
 
-- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes one period after its last successful dispatch, rather than from restart time. A one-shot whose `fire_at` passed while down fires once on the next start.
+- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes from its last successful-dispatch anchor, so if its period elapsed during downtime it fires immediately on restart. A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
 - **The target agent must be hosted on this peer** — otherwise the handler silently skips (the multi-peer dedupe above).
 - **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.

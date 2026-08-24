@@ -87,9 +87,14 @@ impl EngineState {
     }
 
     fn remove(&mut self, id: &RoutineId) -> Option<RoutineEntry> {
-        // Heap removal is implicit — `fire_due` skips stale entries
-        // by checking against `routines`.
-        self.routines.remove(id)
+        let entry = self.routines.remove(id);
+        if entry.is_some() {
+            // A reload may reinsert the same id at exactly the same time.
+            // Value-based stale detection cannot distinguish those entries,
+            // so remove the old heap slot eagerly.
+            self.heap.retain(|Reverse((_, queued_id))| queued_id != id);
+        }
+        entry
     }
 
     fn peek_next_fire(&self) -> Option<DateTime<Utc>> {
@@ -233,7 +238,7 @@ impl RoutineEngine {
             .map(|(id, _)| id.clone())
             .collect();
         for id in to_remove {
-            state.routines.remove(&id);
+            state.remove(&id);
         }
         drop(state);
         self.notify.notify_one();
@@ -332,7 +337,7 @@ impl RoutineEngine {
             .map(|(id, _)| id.clone())
             .collect();
         for id in to_remove {
-            state.routines.remove(&id);
+            state.remove(&id);
         }
         drop(state);
         self.notify.notify_one();
@@ -347,8 +352,41 @@ impl RoutineEngine {
         agent_db_id: &str,
         agent_db: &AgentDb,
     ) -> anyhow::Result<()> {
+        let scope = RoutineScope::Agent(agent_db_id.to_string());
+        let prior_intervals: HashMap<_, _> = {
+            let state = self.state.lock().await;
+            state
+                .routines
+                .iter()
+                .filter(|(_, entry)| entry.scope == scope)
+                .filter_map(|(id, entry)| match entry.routine.trigger {
+                    Trigger::Interval { .. } => Some((id.clone(), entry.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
         self.deregister_agent(agent_db_id).await;
-        self.register_agent(agent_db_id, agent_db).await
+        self.register_agent(agent_db_id, agent_db).await?;
+
+        // A metadata-only interval edit must not move an already scheduled
+        // first fire.  Keep the existing slot only when the trigger is
+        // unchanged; creation, enablement, and trigger changes have no prior
+        // live interval and therefore seed from now instead.
+        let mut state = self.state.lock().await;
+        for (id, prior) in prior_intervals {
+            if let Some(entry) = state.routines.get_mut(&id)
+                && entry.routine.trigger == prior.routine.trigger
+            {
+                entry.next_fire = prior.next_fire;
+                state
+                    .heap
+                    .retain(|Reverse((_, queued_id))| queued_id != &id);
+                state.heap.push(Reverse((prior.next_fire, id)));
+            }
+        }
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
     }
 
     /// Forget the successful-dispatch anchor for an agent schedule. Call this
@@ -572,7 +610,7 @@ impl RoutineEngine {
         let now = Utc::now();
         // Persist last_fired for recurrence so a restart picks up
         // from "after the last fire" rather than re-firing immediately.
-        if entry.routine.trigger.is_recurring()
+        if matches!(entry.routine.trigger, Trigger::Interval { .. })
             && let Err(e) = save_last_fired(&self.chaz_peer, id, now).await
         {
             error!(routine = %id, "failed to persist last_fired: {e}");
@@ -700,9 +738,8 @@ fn schedule_to_routine(
 
 /// Compute when a routine should next fire.
 ///
-/// * `Cron` — `last` is "the time the routine last fired" (or `None`
-///   for never). Returns the next cron time strictly after that
-///   anchor, or `None` if the expression is invalid.
+/// * `Cron` — returns the next cron time after the current time. Persisted
+///   interval anchors must not turn a restart into cron catch-up.
 /// * `OneShot` — the `fire_at` is returned directly, even if it's in
 ///   the past; the engine handles already-due routines on the next
 ///   tick.
@@ -712,10 +749,8 @@ fn next_fire_time(trigger: &Trigger, last: Option<DateTime<Utc>>) -> Option<Date
     match trigger {
         Trigger::Cron { expr } => {
             let schedule = CronSchedule::from_str(expr).ok()?;
-            match last {
-                Some(anchor) => schedule.after(&anchor).next(),
-                None => schedule.upcoming(Utc).next(),
-            }
+            let _ = last;
+            schedule.upcoming(Utc).next()
         }
         Trigger::Interval { period } => next_interval_fire(*period, last.unwrap_or_else(Utc::now)),
         Trigger::OneShot { fire_at } => Some(*fire_at),
@@ -824,7 +859,7 @@ async fn save_last_fired(db: &Database, id: &RoutineId, when: DateTime<Utc>) -> 
 async fn delete_last_fired(db: &Database, id: &RoutineId) -> anyhow::Result<()> {
     let txn = db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await?;
-    let _ = store.delete(id.as_str()).await;
+    store.delete(id.as_str()).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1029,6 +1064,34 @@ mod tests {
         assert_eq!(
             state.routines[&id].next_fire,
             completion + chrono::Duration::seconds(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_restart_skips_missed_ticks_despite_old_anchor() {
+        let (_inst, peer) = fixture_db().await;
+        let id = RoutineId::new("cron");
+        upsert_routine(
+            &peer,
+            GLOBAL_ROUTINES_STORE,
+            &Routine::cron(id.clone(), "cron", "* * * * * *", target("heartbeat")),
+        )
+        .await
+        .unwrap();
+        save_last_fired(
+            &peer,
+            &id,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let before = Utc::now();
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        let next = engine.state.lock().await.routines[&id].next_fire;
+        assert!(
+            next > before,
+            "cron restart must schedule a future tick: {next}"
         );
     }
 
@@ -1579,6 +1642,97 @@ mod tests {
         assert_eq!(
             agent_interval_next_fire(&engine, &owner, "poll").await,
             anchor + chrono::Duration::seconds(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_reload_keeps_one_interval_heap_entry_and_first_fire() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        let anchor = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        save_last_fired(&peer, &id, anchor).await.unwrap();
+        let mut schedule = Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        );
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        let first_fire = agent_interval_next_fire(&engine, &owner, "poll").await;
+
+        schedule.prompt = "updated metadata".into();
+        adb.upsert_schedule(schedule).await.unwrap();
+        engine.reload_agent(&owner, &adb).await.unwrap();
+
+        let state = engine.state.lock().await;
+        assert_eq!(state.routines[&id].next_fire, first_fire);
+        assert_eq!(
+            state
+                .heap
+                .iter()
+                .filter(|Reverse((_, queued_id))| queued_id == &id)
+                .count(),
+            1,
+            "metadata reload must leave one live heap entry"
+        );
+        drop(state);
+
+        engine.fire_due().await;
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state
+                .heap
+                .iter()
+                .filter(|Reverse((_, queued_id))| queued_id == &id)
+                .count(),
+            1,
+            "the due interval must dispatch and reschedule exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_interval_starts_a_full_period_later() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        save_last_fired(
+            &peer,
+            &id,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut schedule = Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        );
+        schedule.enabled = false;
+        adb.upsert_schedule(schedule).await.unwrap();
+
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        let before = Utc::now();
+        engine
+            .clear_agent_schedule_anchor(&owner, "poll")
+            .await
+            .unwrap();
+        let mut enabled = adb.find_schedule("poll").await.unwrap().unwrap();
+        enabled.enabled = true;
+        adb.upsert_schedule(enabled).await.unwrap();
+        engine.reload_agent(&owner, &adb).await.unwrap();
+        assert!(
+            agent_interval_next_fire(&engine, &owner, "poll").await
+                >= before + chrono::Duration::seconds(59)
         );
     }
 

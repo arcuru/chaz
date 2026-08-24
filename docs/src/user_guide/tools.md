@@ -218,7 +218,7 @@ For a five-minute fixed-delay check instead:
 }
 ```
 
-`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields. Intervals first fire after one period; after a restart, the next fire remains one period after the saved dispatch. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
+`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields. Intervals first fire after one period; after a restart they resume from the saved dispatch anchor and fire immediately if the period elapsed while chaz was down. Missed cron ticks are skipped. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
 
 The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
 

@@ -434,6 +434,18 @@ async fn add_cmd(
             Ok(adb) => adb,
             Err(e) => return ExtensionCommandOutcome::Error(format!("{e:#}")),
         };
+        match adb.find_schedule(id).await {
+            Ok(Some(_)) => {
+                return ExtensionCommandOutcome::Error(format!(
+                    "Schedule '{id}' already exists on agent '{}'; use /schedule modify or remove first",
+                    entry.display_name
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return ExtensionCommandOutcome::Error(format!("Failed to read schedule: {e}"));
+            }
+        }
         let session_db_id = {
             let s = ctx.session.lock().await;
             s.database().root_id().to_string()
@@ -504,6 +516,16 @@ async fn add_cmd(
         Ok(adb) => adb,
         Err(e) => return ExtensionCommandOutcome::Error(format!("{e:#}")),
     };
+    match adb.find_schedule(id).await {
+        Ok(Some(_)) => {
+            return ExtensionCommandOutcome::Error(format!(
+                "Schedule '{id}' already exists on agent '{}'; use /schedule modify or remove first",
+                entry.display_name
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => return ExtensionCommandOutcome::Error(format!("Failed to read schedule: {e}")),
+    }
 
     // Get current session's DB id for Pinned target.
     let session_db_id = {
@@ -669,6 +691,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_rejects_an_existing_id() {
+        let (_i, index, registry, ctx) = fixture().await;
+        let c = cmd(registry, index);
+        assert!(matches!(
+            c.invoke("add interval poll 60 alpha check", &ctx).await,
+            ExtensionCommandOutcome::Text(_)
+        ));
+        match c.invoke("add interval poll 120 alpha replace", &ctx).await {
+            ExtensionCommandOutcome::Error(e) => assert!(e.contains("already exists"), "got: {e}"),
+            ExtensionCommandOutcome::Text(s) => panic!("expected duplicate error, got: {s}"),
+        }
+    }
+
+    #[tokio::test]
     async fn modify_switches_a_schedule_to_interval() {
         let (_i, index, registry, ctx) = fixture().await;
         let c = cmd(registry, index);
@@ -765,21 +801,30 @@ mod tests {
         let anchor_id = format!("agent:{}:poll", entry.db_id);
 
         save_anchor(&peer, &anchor_id).await;
-        let _ = c.invoke("add interval poll 60 alpha check", &ctx).await;
+        match c.invoke("add interval poll 60 alpha check", &ctx).await {
+            ExtensionCommandOutcome::Text(_) => {}
+            ExtensionCommandOutcome::Error(e) => panic!("add failed: {e}"),
+        }
         assert!(
             !has_anchor(&peer, &anchor_id).await,
             "add must clear the anchor"
         );
 
         save_anchor(&peer, &anchor_id).await;
-        let _ = c.invoke("modify poll interval 120 alpha", &ctx).await;
+        match c.invoke("modify poll interval 120 alpha", &ctx).await {
+            ExtensionCommandOutcome::Text(_) => {}
+            ExtensionCommandOutcome::Error(e) => panic!("modify failed: {e}"),
+        }
         assert!(
             !has_anchor(&peer, &anchor_id).await,
             "trigger changes must clear the anchor"
         );
 
         save_anchor(&peer, &anchor_id).await;
-        let _ = c.invoke("remove poll", &ctx).await;
+        match c.invoke("remove poll", &ctx).await {
+            ExtensionCommandOutcome::Text(_) => {}
+            ExtensionCommandOutcome::Error(e) => panic!("remove failed: {e}"),
+        }
         assert!(
             !has_anchor(&peer, &anchor_id).await,
             "remove must clear the anchor"

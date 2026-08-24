@@ -319,6 +319,9 @@ impl Tool for ScheduleModify {
                     "expires_at": { "type": "string", "description": "Optional: set/replace the RFC 3339 expiry timestamp." }
                 },
                 "required": ["id"]
+                ,"allOf": [
+                    { "not": { "required": ["cron", "interval_seconds"] } }
+                ]
             }),
         }
     }
@@ -378,6 +381,7 @@ impl Tool for ScheduleModify {
                 })?;
 
             let trigger_changed = new_cron.is_some() || new_interval.is_some();
+            let enabling = new_enabled == Some(true) && !schedule.enabled;
 
             if let Some(c) = new_cron {
                 schedule.trigger = Trigger::Cron {
@@ -411,7 +415,7 @@ impl Tool for ScheduleModify {
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
             if let Some(engine) = ctx.routine_engine.as_ref() {
-                if trigger_changed {
+                if trigger_changed || enabling {
                     engine
                         .clear_agent_schedule_anchor(&entry.db_id.to_string(), id)
                         .await
@@ -1239,6 +1243,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabling_interval_clears_an_old_anchor() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let peer = registry.chaz_peer().clone();
+        let engine = crate::routine::RoutineEngine::new(peer.clone(), None)
+            .await
+            .unwrap();
+        let add = ScheduleAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = ScheduleModify::new(scoped(registry, index.clone()));
+        let mut ctx = make_ctx("alpha", session);
+        ctx.routine_engine = Some(engine);
+        let entry = index.find_by_name("alpha").unwrap();
+        let anchor_id = format!("agent:{}:poll", entry.db_id);
+
+        add.execute(
+            serde_json::json!({ "id": "poll", "interval_seconds": 60, "task": "check" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        modify
+            .execute(serde_json::json!({ "id": "poll", "enabled": false }), &ctx)
+            .await
+            .unwrap();
+        save_anchor(&peer, &anchor_id).await;
+        modify
+            .execute(serde_json::json!({ "id": "poll", "enabled": true }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "enabling must discard an old interval anchor"
+        );
+    }
+
+    #[tokio::test]
     async fn add_rejects_cron_and_interval_together() {
         let (_i, registry, index, session) = fixture("alpha").await;
         let add = ScheduleAdd::new(scoped(registry, index));
@@ -1253,6 +1292,42 @@ mod tests {
             .await
             .expect_err("mixed triggers should fail");
         assert!(format!("{err:?}").contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn modify_rejects_cron_and_interval_together() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = ScheduleAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = ScheduleModify::new(scoped(registry, index));
+        let ctx = make_ctx("alpha", session);
+        add.execute(
+            serde_json::json!({ "id": "poll", "interval_seconds": 60, "task": "check" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let err = modify
+            .execute(
+                serde_json::json!({ "id": "poll", "cron": "0 * * * * *", "interval_seconds": 60 }),
+                &ctx,
+            )
+            .await
+            .expect_err("mixed triggers should fail");
+        assert!(format!("{err:?}").contains("at most one"));
+    }
+
+    #[tokio::test]
+    async fn modify_schema_makes_cron_and_interval_mutually_exclusive() {
+        let (_instance, registry, index, _session) = fixture("alpha").await;
+        let schema = ScheduleModify::new(scoped(registry, index))
+            .descriptor()
+            .parameters;
+        assert_eq!(
+            schema["allOf"],
+            serde_json::json!([
+                { "not": { "required": ["cron", "interval_seconds"] } }
+            ])
+        );
     }
 
     #[tokio::test]
