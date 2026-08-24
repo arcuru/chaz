@@ -256,10 +256,14 @@ impl Tool for ScheduleAdd {
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
-            if let Some(engine) = ctx.routine_engine.as_ref()
-                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
-            {
-                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+            if let Some(engine) = ctx.routine_engine.as_ref() {
+                engine
+                    .clear_agent_schedule_anchor(&entry.db_id.to_string(), user_id)
+                    .await
+                    .map_err(|e| format!("Failed to clear schedule anchor: {e}"))?;
+                if let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await {
+                    tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+                }
             }
 
             let target_label = match opt_str(&arguments, "target") {
@@ -373,6 +377,8 @@ impl Tool for ScheduleModify {
                     )
                 })?;
 
+            let trigger_changed = new_cron.is_some() || new_interval.is_some();
+
             if let Some(c) = new_cron {
                 schedule.trigger = Trigger::Cron {
                     expr: c.to_string(),
@@ -404,10 +410,16 @@ impl Tool for ScheduleModify {
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
-            if let Some(engine) = ctx.routine_engine.as_ref()
-                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
-            {
-                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+            if let Some(engine) = ctx.routine_engine.as_ref() {
+                if trigger_changed {
+                    engine
+                        .clear_agent_schedule_anchor(&entry.db_id.to_string(), id)
+                        .await
+                        .map_err(|e| format!("Failed to clear schedule anchor: {e}"))?;
+                }
+                if let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await {
+                    tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+                }
             }
 
             let mut parts = vec![format!(
@@ -493,10 +505,14 @@ impl Tool for ScheduleRemove {
 
             match adb.remove_schedule(id).await {
                 Ok(true) => {
-                    if let Some(engine) = ctx.routine_engine.as_ref()
-                        && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
-                    {
-                        tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+                    if let Some(engine) = ctx.routine_engine.as_ref() {
+                        engine
+                            .clear_agent_schedule_anchor(&entry.db_id.to_string(), id)
+                            .await
+                            .map_err(|e| format!("Failed to clear schedule anchor: {e}"))?;
+                        if let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await {
+                            tracing::warn!(agent = %entry.db_id, "engine.reload_agent after schedule change failed: {e}");
+                        }
                     }
                     Ok(format!(
                         "Removed schedule '{id}' from agent '{}'",
@@ -720,10 +736,12 @@ mod tests {
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::{DbEntry, HostedIndex};
+    use crate::routine::LAST_FIRED_STORE;
     use crate::session::{Session, SessionRegistry};
     use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
     use crate::types::ConversationId;
     use eidetica::backend::database::InMemory;
+    use eidetica::store::DocStore;
     use eidetica::{Instance, NewUser};
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
@@ -801,6 +819,22 @@ mod tests {
             iteration_budget: None,
             routine_engine: None,
         }
+    }
+
+    async fn save_anchor(peer: &eidetica::Database, id: &str) {
+        let txn = peer.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await.unwrap();
+        store
+            .set_string(id, "2023-11-14T22:13:20+00:00")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    async fn has_anchor(peer: &eidetica::Database, id: &str) -> bool {
+        let txn = peer.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await.unwrap();
+        store.get_string(id).await.is_ok()
     }
 
     #[tokio::test]
@@ -1127,6 +1161,81 @@ mod tests {
             .unwrap();
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(out.contains("every 120s"), "interval missing: {out}");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_changes_clear_interval_anchor_but_metadata_does_not() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let peer = registry.chaz_peer().clone();
+        let engine = crate::routine::RoutineEngine::new(peer.clone(), None)
+            .await
+            .unwrap();
+        let add = ScheduleAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = ScheduleModify::new(scoped(registry.clone(), index.clone()));
+        let remove = ScheduleRemove::new(scoped(registry.clone(), index.clone()));
+        let mut ctx = make_ctx("alpha", session);
+        ctx.routine_engine = Some(engine);
+        let entry = index.find_by_name("alpha").unwrap();
+        let anchor_id = format!("agent:{}:poll", entry.db_id);
+
+        save_anchor(&peer, &anchor_id).await;
+        add.execute(
+            serde_json::json!({ "id": "poll", "interval_seconds": 60, "task": "check" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "add must clear an old incarnation anchor"
+        );
+
+        save_anchor(&peer, &anchor_id).await;
+        modify
+            .execute(
+                serde_json::json!({ "id": "poll", "task": "check again" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            has_anchor(&peer, &anchor_id).await,
+            "metadata-only edits keep the anchor"
+        );
+
+        modify
+            .execute(
+                serde_json::json!({ "id": "poll", "interval_seconds": 120 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "trigger changes must clear the anchor"
+        );
+
+        save_anchor(&peer, &anchor_id).await;
+        remove
+            .execute(serde_json::json!({ "id": "poll" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "remove must clear the anchor"
+        );
+
+        save_anchor(&peer, &anchor_id).await;
+        add.execute(
+            serde_json::json!({ "id": "poll", "interval_seconds": 60, "task": "check" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "recreate must clear the old anchor"
+        );
     }
 
     #[tokio::test]

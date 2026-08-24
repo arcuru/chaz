@@ -351,6 +351,19 @@ impl RoutineEngine {
         self.register_agent(agent_db_id, agent_db).await
     }
 
+    /// Forget the successful-dispatch anchor for an agent schedule. Call this
+    /// after creating or removing a schedule, and after changing its trigger:
+    /// schedule ids are user-chosen and can otherwise identify a prior
+    /// incarnation in the peer-local anchor store.
+    pub async fn clear_agent_schedule_anchor(
+        &self,
+        agent_db_id: &str,
+        schedule_id: &str,
+    ) -> anyhow::Result<()> {
+        let id = RoutineId::new(format!("agent:{agent_db_id}:{schedule_id}"));
+        delete_last_fired(&self.chaz_peer, &id).await
+    }
+
     /// Insert a new routine. Persists to the appropriate DB then
     /// updates in-memory state and wakes the run loop.
     pub async fn add_routine(
@@ -804,6 +817,14 @@ async fn save_last_fired(db: &Database, id: &RoutineId, when: DateTime<Utc>) -> 
     let txn = db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await?;
     store.set_string(id.as_str(), when.to_rfc3339()).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+async fn delete_last_fired(db: &Database, id: &RoutineId) -> anyhow::Result<()> {
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await?;
+    let _ = store.delete(id.as_str()).await;
     txn.commit().await?;
     Ok(())
 }
@@ -1452,6 +1473,113 @@ mod tests {
         // deregister clears in-memory state.
         engine.deregister_agent(&owner).await;
         assert!(engine.list_routines().await.is_empty());
+    }
+
+    async fn agent_interval_next_fire(
+        engine: &RoutineEngine,
+        owner: &str,
+        schedule_id: &str,
+    ) -> DateTime<Utc> {
+        let id = RoutineId::new(format!("agent:{owner}:{schedule_id}"));
+        engine.state.lock().await.routines[&id].next_fire
+    }
+
+    #[tokio::test]
+    async fn new_or_recreated_agent_interval_discards_old_anchor() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        save_last_fired(
+            &peer,
+            &id,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        adb.upsert_schedule(Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        ))
+        .await
+        .unwrap();
+
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine
+            .clear_agent_schedule_anchor(&owner, "poll")
+            .await
+            .unwrap();
+        let before = Utc::now();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        let next = agent_interval_next_fire(&engine, &owner, "poll").await;
+        assert!(next >= before + chrono::Duration::seconds(59));
+    }
+
+    #[tokio::test]
+    async fn changing_agent_interval_trigger_discards_old_anchor() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        save_last_fired(
+            &peer,
+            &id,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        adb.upsert_schedule(Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(120),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        ))
+        .await
+        .unwrap();
+
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine
+            .clear_agent_schedule_anchor(&owner, "poll")
+            .await
+            .unwrap();
+        let before = Utc::now();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        let next = agent_interval_next_fire(&engine, &owner, "poll").await;
+        assert!(next >= before + chrono::Duration::seconds(119));
+    }
+
+    #[tokio::test]
+    async fn metadata_only_agent_schedule_update_keeps_interval_anchor() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        let anchor = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        save_last_fired(&peer, &id, anchor).await.unwrap();
+        let mut schedule = Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        );
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        schedule.prompt = "check again".into();
+        adb.upsert_schedule(schedule).await.unwrap();
+
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        assert_eq!(
+            agent_interval_next_fire(&engine, &owner, "poll").await,
+            anchor + chrono::Duration::seconds(60)
+        );
     }
 
     #[tokio::test]
