@@ -416,7 +416,6 @@ impl RoutineEngine {
         // A lifecycle change is followed by reload_agent. Remove the old
         // incarnation while clearing its anchor so an in-flight completion
         // cannot recreate that anchor between these two operations.
-        #[allow(clippy::await_holding_lock)]
         let mut state = self.state.lock().await;
         state.remove(&id);
         delete_last_fired(&self.chaz_peer, &id).await?;
@@ -635,7 +634,6 @@ impl RoutineEngine {
         // The lock also covers the anchor write: reloads clear an interval's
         // old anchor before replacing its entry, so letting either operation
         // interleave would let an old completion recreate that anchor.
-        #[allow(clippy::await_holding_lock)]
         let mut state = self.state.lock().await;
         if state.routines.get(id).map(|current| current.incarnation) != Some(entry.incarnation) {
             return;
@@ -766,6 +764,10 @@ fn schedule_to_routine(
 
 /// Compute when a routine should next fire.
 ///
+/// `interval_anchor` is the persisted last-fire time for `Interval`
+/// triggers — `Cron` deliberately ignores it so a restart cannot become
+/// cron catch-up.
+///
 /// * `Cron` — returns the next cron time after the current time. Persisted
 ///   interval anchors must not turn a restart into cron catch-up.
 /// * `OneShot` — the `fire_at` is returned directly, even if it's in
@@ -773,14 +775,19 @@ fn schedule_to_routine(
 ///   tick.
 /// * `Interval` — first fire is one period from now; later fires are
 ///   one period after the last fire.
-fn next_fire_time(trigger: &Trigger, last: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+fn next_fire_time(
+    trigger: &Trigger,
+    interval_anchor: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
     match trigger {
         Trigger::Cron { expr } => {
             let schedule = CronSchedule::from_str(expr).ok()?;
-            let _ = last;
+            let _ = interval_anchor;
             schedule.upcoming(Utc).next()
         }
-        Trigger::Interval { period } => next_interval_fire(*period, last.unwrap_or_else(Utc::now)),
+        Trigger::Interval { period } => {
+            next_interval_fire(*period, interval_anchor.unwrap_or_else(Utc::now))
+        }
         Trigger::OneShot { fire_at } => Some(*fire_at),
     }
 }
