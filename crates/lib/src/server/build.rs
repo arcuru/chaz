@@ -931,7 +931,7 @@ async fn watch_agent_session_registries(
     registry: Arc<session::SessionRegistry>,
     default_backend: backends::BackendManager,
 ) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
 
     // Install a write-watch on every hosted agent DB → ping the rescan channel.
     let mut watched_agents = 0usize;
@@ -983,14 +983,35 @@ async fn watch_agent_session_registries(
         "Watching agent session registries for bridge-exposed sessions"
     );
 
-    // Initial pass: register sessions already exposed before startup.
-    register_exposed_sessions(&server, &registry, &default_backend).await;
+    // A rescan may need to bootstrap several old session trees. Do not await
+    // it here: doing so leaves this receiver unable to observe a newly
+    // exposed session until every stale peer dial finishes. A bridge event is
+    // the latency-sensitive path, so each debounced signal starts its own
+    // bounded rescan while older recovery work continues in the background.
+    let rescan = || {
+        let server = server.clone();
+        let registry = registry.clone();
+        let default_backend = default_backend.clone();
+        async move {
+            register_exposed_sessions(&server, &registry, &default_backend).await;
+        }
+    };
+    run_exposed_session_rescans(rx, rescan).await;
+}
 
-    // React to every agent-DB write (a bridge's SessionRef sync lands here),
-    // debouncing a burst into one rescan.
+/// Start the initial registry recovery and every subsequent debounced rescan
+/// without making the event receiver wait for a slow session-tree bootstrap.
+pub(crate) async fn run_exposed_session_rescans<F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<()>,
+    rescan: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(rescan());
     while rx.recv().await.is_some() {
         while rx.try_recv().is_ok() {}
-        register_exposed_sessions(&server, &registry, &default_backend).await;
+        tokio::spawn(rescan());
     }
 }
 
