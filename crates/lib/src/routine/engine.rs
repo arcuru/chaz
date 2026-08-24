@@ -63,6 +63,10 @@ struct RoutineEntry {
     scope: RoutineScope,
     /// Computed next-fire time. Refreshed after every fire.
     next_fire: DateTime<Utc>,
+    /// Changes whenever a definition is replaced. A dispatched snapshot may
+    /// complete only against the same incarnation, never a later routine
+    /// which reused its id.
+    incarnation: u64,
 }
 
 /// Mutable engine state guarded by a single mutex. Heap and routine
@@ -70,6 +74,7 @@ struct RoutineEntry {
 struct EngineState {
     heap: BinaryHeap<Reverse<(DateTime<Utc>, RoutineId)>>,
     routines: HashMap<RoutineId, RoutineEntry>,
+    next_incarnation: u64,
 }
 
 impl EngineState {
@@ -77,12 +82,21 @@ impl EngineState {
         Self {
             heap: BinaryHeap::new(),
             routines: HashMap::new(),
+            next_incarnation: 0,
         }
     }
 
-    fn push(&mut self, entry: RoutineEntry) {
+    fn push(&mut self, mut entry: RoutineEntry) {
+        self.next_incarnation = self.next_incarnation.wrapping_add(1);
+        entry.incarnation = self.next_incarnation;
         self.heap
             .push(Reverse((entry.next_fire, entry.routine.id.clone())));
+        self.routines.insert(entry.routine.id.clone(), entry);
+    }
+
+    fn insert(&mut self, mut entry: RoutineEntry) {
+        self.next_incarnation = self.next_incarnation.wrapping_add(1);
+        entry.incarnation = self.next_incarnation;
         self.routines.insert(entry.routine.id.clone(), entry);
     }
 
@@ -149,14 +163,12 @@ impl RoutineEngine {
         let mut state = self.state.lock().await;
         for r in routines {
             if !r.enabled {
-                state.routines.insert(
-                    r.id.clone(),
-                    RoutineEntry {
-                        routine: r,
-                        scope: RoutineScope::Global,
-                        next_fire: DateTime::<Utc>::MAX_UTC,
-                    },
-                );
+                state.insert(RoutineEntry {
+                    routine: r,
+                    scope: RoutineScope::Global,
+                    next_fire: DateTime::<Utc>::MAX_UTC,
+                    incarnation: 0,
+                });
                 continue;
             }
             let last = last_fired.get(r.id.as_str()).copied();
@@ -166,6 +178,7 @@ impl RoutineEngine {
                         routine: r,
                         scope: RoutineScope::Global,
                         next_fire: when,
+                        incarnation: 0,
                     };
                     state.push(entry);
                 }
@@ -178,14 +191,12 @@ impl RoutineEngine {
                     r.last_error = Some(truncate_error(
                         "next_fire_time returned None at startup".into(),
                     ));
-                    state.routines.insert(
-                        r.id.clone(),
-                        RoutineEntry {
-                            routine: r,
-                            scope: RoutineScope::Global,
-                            next_fire: DateTime::<Utc>::MAX_UTC,
-                        },
-                    );
+                    state.insert(RoutineEntry {
+                        routine: r,
+                        scope: RoutineScope::Global,
+                        next_fire: DateTime::<Utc>::MAX_UTC,
+                        incarnation: 0,
+                    });
                 }
             }
         }
@@ -217,6 +228,7 @@ impl RoutineEngine {
                     routine: r,
                     scope: RoutineScope::Session(session_db_id.to_string()),
                     next_fire: when,
+                    incarnation: 0,
                 });
             }
         }
@@ -315,6 +327,7 @@ impl RoutineEngine {
                     routine,
                     scope: RoutineScope::Agent(agent_db_id.to_string()),
                     next_fire: when,
+                    incarnation: 0,
                 });
             }
         }
@@ -378,6 +391,7 @@ impl RoutineEngine {
                 && entry.routine.trigger == prior.routine.trigger
             {
                 entry.next_fire = prior.next_fire;
+                entry.incarnation = prior.incarnation;
                 state
                     .heap
                     .retain(|Reverse((_, queued_id))| queued_id != &id);
@@ -399,7 +413,16 @@ impl RoutineEngine {
         schedule_id: &str,
     ) -> anyhow::Result<()> {
         let id = RoutineId::new(format!("agent:{agent_db_id}:{schedule_id}"));
-        delete_last_fired(&self.chaz_peer, &id).await
+        // A lifecycle change is followed by reload_agent. Remove the old
+        // incarnation while clearing its anchor so an in-flight completion
+        // cannot recreate that anchor between these two operations.
+        #[allow(clippy::await_holding_lock)]
+        let mut state = self.state.lock().await;
+        state.remove(&id);
+        delete_last_fired(&self.chaz_peer, &id).await?;
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
     }
 
     /// Insert a new routine. Persists to the appropriate DB then
@@ -448,6 +471,7 @@ impl RoutineEngine {
             routine,
             scope,
             next_fire: when,
+            incarnation: 0,
         });
         drop(state);
         self.notify.notify_one();
@@ -608,6 +632,14 @@ impl RoutineEngine {
 
     async fn on_fire_success(self: &Arc<Self>, id: &RoutineId, entry: &RoutineEntry) {
         let now = Utc::now();
+        // The lock also covers the anchor write: reloads clear an interval's
+        // old anchor before replacing its entry, so letting either operation
+        // interleave would let an old completion recreate that anchor.
+        #[allow(clippy::await_holding_lock)]
+        let mut state = self.state.lock().await;
+        if state.routines.get(id).map(|current| current.incarnation) != Some(entry.incarnation) {
+            return;
+        }
         // Persist last_fired for recurrence so a restart picks up
         // from "after the last fire" rather than re-firing immediately.
         if matches!(entry.routine.trigger, Trigger::Interval { .. })
@@ -616,7 +648,6 @@ impl RoutineEngine {
             error!(routine = %id, "failed to persist last_fired: {e}");
         }
 
-        let mut state = self.state.lock().await;
         match entry.routine.trigger {
             Trigger::Cron { .. } | Trigger::Interval { .. } => {
                 if let Some(when) = next_fire_time(&entry.routine.trigger, Some(now)) {
@@ -636,7 +667,6 @@ impl RoutineEngine {
             }
             Trigger::OneShot { .. } => {
                 // Drop the routine row + in-memory state.
-                drop(state);
                 let scope = entry.scope.clone();
                 if let RoutineScope::Global = scope
                     && let Err(e) =
@@ -648,7 +678,6 @@ impl RoutineEngine {
                 // session DB handle — engine doesn't hold one here.
                 // Cleanup is driven by the hub's session registry on
                 // its own deregister path.
-                let mut state = self.state.lock().await;
                 state.routines.remove(id);
             }
         }
@@ -663,9 +692,10 @@ impl RoutineEngine {
         let err_string = truncate_error(err.to_string());
         let now = Utc::now();
         let mut state = self.state.lock().await;
-        let Some(e) = state.routines.get_mut(id) else {
+        if state.routines.get(id).map(|current| current.incarnation) != Some(entry.incarnation) {
             return;
-        };
+        }
+        let e = state.routines.get_mut(id).expect("checked above");
         e.routine.consecutive_failures = e.routine.consecutive_failures.saturating_add(1);
         e.routine.last_error = Some(err_string);
 
@@ -689,14 +719,12 @@ impl RoutineEngine {
             }
             Trigger::OneShot { .. } => {
                 // D21: one-shot failure drops the routine; no retry.
-                drop(state);
                 if let RoutineScope::Global = entry.scope
                     && let Err(e) =
                         delete_routine_row(&self.chaz_peer, GLOBAL_ROUTINES_STORE, id).await
                 {
                     error!(routine = %id, "failed to delete failed one-shot row: {e}");
                 }
-                let mut state = self.state.lock().await;
                 state.routines.remove(id);
             }
         }
@@ -1012,6 +1040,92 @@ mod tests {
         let entry = state.routines.get(&id).unwrap();
         assert!(entry.next_fire >= completed_after + chrono::Duration::seconds(60));
         assert!(entry.next_fire <= Utc::now() + chrono::Duration::seconds(60));
+    }
+
+    #[tokio::test]
+    async fn stale_interval_success_cannot_anchor_or_reschedule_replacement() {
+        let (_inst, peer) = fixture_db().await;
+        let engine = RoutineEngine::new(peer.clone(), None).await.unwrap();
+        let id = RoutineId::new("interval");
+        engine
+            .add_routine(
+                Routine::interval(
+                    id.clone(),
+                    "old",
+                    std::time::Duration::from_secs(60),
+                    target("heartbeat"),
+                ),
+                RoutineScope::Global,
+                None,
+            )
+            .await
+            .unwrap();
+        let fired = engine.state.lock().await.routines[&id].clone();
+
+        engine
+            .add_routine(
+                Routine::interval(
+                    id.clone(),
+                    "replacement",
+                    std::time::Duration::from_secs(120),
+                    target("heartbeat"),
+                ),
+                RoutineScope::Global,
+                None,
+            )
+            .await
+            .unwrap();
+        let replacement_next_fire = engine.state.lock().await.routines[&id].next_fire;
+
+        engine.on_fire_success(&id, &fired).await;
+
+        assert_eq!(
+            engine.state.lock().await.routines[&id].next_fire,
+            replacement_next_fire
+        );
+        assert!(load_last_fired(&peer, vec![id]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_failure_cannot_update_replacement() {
+        let (_inst, peer) = fixture_db().await;
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        let id = RoutineId::new("interval");
+        engine
+            .add_routine(
+                Routine::interval(
+                    id.clone(),
+                    "old",
+                    std::time::Duration::from_secs(60),
+                    target("heartbeat"),
+                ),
+                RoutineScope::Global,
+                None,
+            )
+            .await
+            .unwrap();
+        let fired = engine.state.lock().await.routines[&id].clone();
+        engine
+            .add_routine(
+                Routine::interval(
+                    id.clone(),
+                    "replacement",
+                    std::time::Duration::from_secs(120),
+                    target("heartbeat"),
+                ),
+                RoutineScope::Global,
+                None,
+            )
+            .await
+            .unwrap();
+
+        engine
+            .on_fire_failure(&id, &fired, anyhow::anyhow!("old fire failed"))
+            .await;
+
+        let replacement = engine.state.lock().await.routines[&id].routine.clone();
+        assert_eq!(replacement.consecutive_failures, 0);
+        assert!(replacement.last_error.is_none());
     }
 
     #[tokio::test]
