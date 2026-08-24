@@ -514,6 +514,8 @@ impl RoutineEngine {
             }
         };
         delete_routine_row(target_db, store_name, id).await?;
+        // Avoid inheriting the removed incarnation's interval anchor on restart.
+        delete_last_fired(&self.chaz_peer, id).await?;
         self.notify.notify_one();
         Ok(())
     }
@@ -1259,6 +1261,38 @@ mod tests {
             .unwrap();
         engine.remove_routine(&id, None).await.unwrap();
         assert!(engine.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn readded_global_interval_does_not_inherit_removed_anchor_on_restart() {
+        let (_inst, peer) = fixture_db().await;
+        let engine = RoutineEngine::new(peer.clone(), None).await.unwrap();
+        let id = RoutineId::new("interval");
+        let routine = Routine::interval(
+            id.clone(),
+            "every minute",
+            std::time::Duration::from_secs(60),
+            target("heartbeat"),
+        );
+        let stale_anchor = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+
+        engine
+            .add_routine(routine.clone(), RoutineScope::Global, None)
+            .await
+            .unwrap();
+        save_last_fired(&peer, &id, stale_anchor).await.unwrap();
+        engine.remove_routine(&id, None).await.unwrap();
+
+        let before = Utc::now();
+        engine
+            .add_routine(routine, RoutineScope::Global, None)
+            .await
+            .unwrap();
+
+        let restarted = RoutineEngine::new(peer, None).await.unwrap();
+        let next = restarted.state.lock().await.routines[&id].next_fire;
+        assert!(next >= before + chrono::Duration::seconds(59));
+        assert_ne!(next, stale_anchor + chrono::Duration::seconds(60));
     }
 
     #[tokio::test]
