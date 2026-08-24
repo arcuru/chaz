@@ -1008,10 +1008,35 @@ pub(crate) async fn run_exposed_session_rescans<F, Fut>(
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(rescan());
-    while rx.recv().await.is_some() {
-        while rx.try_recv().is_ok() {}
-        tokio::spawn(rescan());
+    const MAX_IN_FLIGHT: usize = 2;
+
+    let mut scans = tokio::task::JoinSet::new();
+    scans.spawn(rescan());
+    let mut pending = false;
+
+    loop {
+        tokio::select! {
+            signal = rx.recv() => match signal {
+                Some(()) => {
+                    while rx.try_recv().is_ok() {}
+                    if scans.len() < MAX_IN_FLIGHT {
+                        scans.spawn(rescan());
+                    } else {
+                        pending = true;
+                    }
+                }
+                None => break,
+            },
+            completed = scans.join_next(), if !scans.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "Exposed-session rescan task failed");
+                }
+                if pending {
+                    pending = false;
+                    scans.spawn(rescan());
+                }
+            }
+        }
     }
 }
 
