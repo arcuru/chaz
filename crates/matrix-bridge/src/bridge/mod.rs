@@ -3,7 +3,8 @@ mod commands;
 mod history;
 
 use chaz_core::bridge::{
-    ApprovalDecision, Bridge, is_transient_outbound_status, retry_outbound_chunk,
+    ApprovalDecision, Bridge, chunk_message_bytes, is_transient_outbound_status,
+    retry_outbound_chunk,
 };
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
@@ -123,7 +124,7 @@ async fn attach_response_callback(
         session_db,
         agents,
         owning_agent,
-        |body| chunk_message(body, MATRIX_MESSAGE_LIMIT),
+        |body| chunk_message_bytes(body, MATRIX_MESSAGE_LIMIT),
         move |body| {
             let room = room.clone();
             async move {
@@ -166,21 +167,6 @@ fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
 /// delivered as separate events. Markdown carries both plain and formatted
 /// bodies; this byte ceiling leaves room for both fields and the event envelope.
 const MATRIX_MESSAGE_LIMIT: usize = 8_000;
-
-fn chunk_message(body: &str, limit: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut chunk = String::new();
-    for ch in body.chars() {
-        if chunk.len() + ch.len_utf8() > limit && !chunk.is_empty() {
-            chunks.push(std::mem::take(&mut chunk));
-        }
-        chunk.push(ch);
-    }
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-    chunks
-}
 
 /// Dispatch a shared command in the context of a Matrix room.
 async fn dispatch_in_room(
@@ -1230,7 +1216,8 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
-    use super::{MATRIX_MESSAGE_LIMIT, chunk_message};
+    use super::MATRIX_MESSAGE_LIMIT;
+    use chaz_core::bridge::chunk_message_bytes as chunk_message;
 
     #[test]
     fn matrix_chunks_are_transport_sized_and_lossless() {
