@@ -371,7 +371,7 @@ Example — make `researcher` post a morning briefing to the current session wee
 /schedule add brief 0 0 9 * * Mon-Fri researcher Summarize overnight activity and surface anything urgent.
 ```
 
-Example — make `researcher` check the current session five minutes after each completed check:
+Example — make `researcher` check the current session five minutes after each successful handler dispatch:
 
 ```text
 /schedule add interval check-in 300 researcher Check for updates and report only actionable changes.
