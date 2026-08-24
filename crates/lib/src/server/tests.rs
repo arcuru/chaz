@@ -1363,6 +1363,123 @@ async fn watcher_registers_exposed_sessions_only() {
     );
 }
 
+#[tokio::test]
+async fn registry_watcher_rescans_while_initial_recovery_is_blocked() {
+    // A restored daemon can have many old exposed sessions. Their bootstrap
+    // must not prevent the watcher from reacting to a new bridge exposure.
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let task = tokio::spawn({
+        let started = started.clone();
+        let release = release.clone();
+        let runs = runs.clone();
+        async move {
+            super::build::run_exposed_session_rescans(rx, move || {
+                let started = started.clone();
+                let release = release.clone();
+                let runs = runs.clone();
+                async move {
+                    let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if run == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("initial recovery should start");
+    tx.send(()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while runs.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new exposure should rescan before initial recovery completes");
+
+    release.notify_one();
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn registry_watcher_bounds_and_coalesces_rescans() {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let task = tokio::spawn({
+        let release = release.clone();
+        let started = started.clone();
+        let active = active.clone();
+        let peak = peak.clone();
+        async move {
+            super::build::run_exposed_session_rescans(rx, move || {
+                let release = release.clone();
+                let started = started.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    let permit = release.acquire().await.unwrap();
+                    permit.forget();
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while started.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tx.send(()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..8 {
+        tx.send(()).await.unwrap();
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while started.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a signal coalesced while both scans ran should start one follow-up");
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    release.add_permits(2);
+    drop(tx);
+    task.await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Track A: transport/runtime split (`watch_session` + `claim_runtime`).
 // ---------------------------------------------------------------------------

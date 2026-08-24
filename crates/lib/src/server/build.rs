@@ -931,7 +931,7 @@ async fn watch_agent_session_registries(
     registry: Arc<session::SessionRegistry>,
     default_backend: backends::BackendManager,
 ) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
 
     // Install a write-watch on every hosted agent DB → ping the rescan channel.
     let mut watched_agents = 0usize;
@@ -983,14 +983,60 @@ async fn watch_agent_session_registries(
         "Watching agent session registries for bridge-exposed sessions"
     );
 
-    // Initial pass: register sessions already exposed before startup.
-    register_exposed_sessions(&server, &registry, &default_backend).await;
+    // A rescan may need to bootstrap several old session trees. Do not await
+    // it here: doing so leaves this receiver unable to observe a newly
+    // exposed session until every stale peer dial finishes. A bridge event is
+    // the latency-sensitive path, so each debounced signal starts its own
+    // bounded rescan while older recovery work continues in the background.
+    let rescan = || {
+        let server = server.clone();
+        let registry = registry.clone();
+        let default_backend = default_backend.clone();
+        async move {
+            register_exposed_sessions(&server, &registry, &default_backend).await;
+        }
+    };
+    run_exposed_session_rescans(rx, rescan).await;
+}
 
-    // React to every agent-DB write (a bridge's SessionRef sync lands here),
-    // debouncing a burst into one rescan.
-    while rx.recv().await.is_some() {
-        while rx.try_recv().is_ok() {}
-        register_exposed_sessions(&server, &registry, &default_backend).await;
+/// Start the initial registry recovery and every subsequent debounced rescan
+/// without making the event receiver wait for a slow session-tree bootstrap.
+pub(crate) async fn run_exposed_session_rescans<F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<()>,
+    rescan: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    const MAX_IN_FLIGHT: usize = 2;
+
+    let mut scans = tokio::task::JoinSet::new();
+    scans.spawn(rescan());
+    let mut pending = false;
+
+    loop {
+        tokio::select! {
+            signal = rx.recv() => match signal {
+                Some(()) => {
+                    while rx.try_recv().is_ok() {}
+                    if scans.len() < MAX_IN_FLIGHT {
+                        scans.spawn(rescan());
+                    } else {
+                        pending = true;
+                    }
+                }
+                None => break,
+            },
+            completed = scans.join_next(), if !scans.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "Exposed-session rescan task failed");
+                }
+                if pending {
+                    pending = false;
+                    scans.spawn(rescan());
+                }
+            }
+        }
     }
 }
 
@@ -1269,14 +1315,6 @@ async fn migrate_bridge_home_to_this_peer(
 /// How many exposed sessions are registered at once during a rescan.
 const MAX_CONCURRENT_SESSION_REGISTRATIONS: usize = 8;
 
-/// Deadline for one peer's attempt at serving a session tree.
-///
-/// WORKAROUND (eidetica): `sync_tree_with_peer_*` exposes no deadline of its
-/// own. Its transports do bound a single attempt internally, but a caller
-/// cannot observe that bound, so we keep one here. Remove once the sync API
-/// takes a deadline the way ticket bootstrap already does.
-const PULL_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Pull a bridge-exposed session's own tree onto this daemon.
 ///
 /// The agent-DB registry only carries a *pointer* (the session root id); the
@@ -1341,40 +1379,24 @@ async fn pull_session_tree_from_agent_peers(
     }
     // Ask the peer most likely to answer first, and ask one at a time.
     //
-    // Asking them concurrently does not overlap the work. Eidetica awaits each
-    // `SendRequest` inline in its background sync engine's single command loop,
-    // so requests issued together still execute strictly one after another. A
-    // concurrent race therefore buys nothing and costs the diagnosis: every
-    // peer's deadline runs against the moment the batch was issued, not the
-    // moment its own request reached the wire, so peers queued behind a
-    // dead one time out having never been asked at all.
-    //
-    // That is fatal here rather than merely slow. Retired bridge identities are
-    // never pruned from the agent DB's peer set, and a dead address costs its
-    // full transport timeout while the engine is blocked on it. With several
-    // dead peers ahead of the live one, the live peer's request is still sitting
-    // in the queue when its deadline expires — so the pull fails no matter how
-    // large the deadline is, and reports "did not answer" for a request it never
-    // sent.
+    // Eidetica races each peer's addresses concurrently and runs the transfer
+    // once on the selected route, but these peer attempts remain sequential so
+    // a successful peer ends the search without starting redundant transfers.
     //
     // Ordering by most recent contact puts the peer that is actually serving
     // this agent DB first, so the common case succeeds on the first attempt and
     // never pays for the dead ones at all.
     //
-    // `last_successful_sync` is the key this *should* rank on, and it is the
-    // first key below — but at the eidetica rev we pin, nothing ever writes it.
-    // It is constructed `None`, round-tripped through the peer store, and read
-    // back `None` for every peer, so the sort in practice runs entirely on
-    // `last_seen`. That is a weaker signal — it records registration and status
-    // updates rather than whether the peer has served anything — but it does
-    // separate a live bridge from long-retired identities, which is what this
-    // needs. Keeping the stronger key first means this starts ranking correctly
-    // the moment eidetica populates it, with one caveat worth knowing: a peer
-    // that has genuinely never synced sorts behind every peer that has, so a
-    // brand-new bridge would rank last. That is inert while every value is
-    // `None`, and must be revisited when it stops being.
-    let mut ranked: Vec<(Option<String>, String, eidetica::PublicKey)> =
-        Vec::with_capacity(peers.len());
+    // Ranking runs on `last_seen`: the stronger "last successful sync" signal
+    // eidetica once carried on `PeerInfo` (`last_successful_sync`) is gone —
+    // nothing ever wrote it, so it was permanently `None` anyway. Eidetica now
+    // exposes a real per-tree/peer `SyncStatus::last_sync`, but it is in-memory
+    // only (gone after a restart) and lives on the tree handle rather than on
+    // `PeerInfo`, so it is not available at this ranking site. `last_seen` is a
+    // weaker signal — it records registration and status updates rather than
+    // whether the peer has served anything — but it does separate a live bridge
+    // from long-retired identities, which is what this needs.
+    let mut ranked: Vec<(String, eidetica::PublicKey)> = Vec::with_capacity(peers.len());
     for peer in &peers {
         let peer_key = peer.public_key().clone();
         match sync.get_peer_info(&peer_key).await {
@@ -1383,65 +1405,53 @@ async fn pull_session_tree_from_agent_peers(
                 if matches!(info.status, eidetica::sync::PeerStatus::Blocked) {
                     continue;
                 }
-                ranked.push((info.last_successful_sync, info.last_seen, peer_key));
+                ranked.push((info.last_seen, peer_key));
             }
             // No stored info is not a reason to skip it — it just sorts last.
-            _ => ranked.push((None, String::new(), peer_key)),
+            _ => ranked.push((String::new(), peer_key)),
         }
     }
     if ranked.is_empty() {
         tracing::debug!(session_db_id, "no eligible peers to pull from");
         return;
     }
-    // ISO-8601 timestamps sort lexicographically, and `None` sorts before
-    // `Some`, so reversing puts the most recently contacted peer at the front.
-    ranked.sort_by(|a, b| (&b.0, &b.1).cmp(&(&a.0, &a.1)));
+    // ISO-8601 timestamps sort lexicographically, so reversing puts the most
+    // recently contacted peer at the front.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
 
     info!(
         session_db_id,
         peer_count = ranked.len(),
-        peers = ?ranked.iter().map(|(_, _, k)| k.to_string()).collect::<Vec<_>>(),
+        peers = ?ranked.iter().map(|(_, k)| k.to_string()).collect::<Vec<_>>(),
         "Pulling exposed session tree; trying peers in order of most recent contact"
     );
 
     let mut winner = None;
     let mut tried = Vec::with_capacity(ranked.len());
-    for (_, _, peer_key) in &ranked {
+    for (_, peer_key) in &ranked {
         tried.push(peer_key.to_string());
-        // WORKAROUND (eidetica): `sync_tree_with_peer_auth` carries no deadline
-        // of its own. The transports below it do bound a single attempt, but a
-        // caller cannot see that bound, so keep a deadline here. Note it cannot
-        // cancel the queued command — the background engine runs it to
-        // completion regardless — it only stops us waiting on it.
-        let outcome = tokio::time::timeout(
-            PULL_ATTEMPT_TIMEOUT,
-            sync.sync_tree_with_peer_auth(
+        match sync
+            .sync_tree_with_peer_auth(
                 peer_key,
                 &session_id,
                 Some(&signing_key),
                 Some(&key_name),
                 Some(permission),
                 None,
-            ),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(())) => {
+            )
+            .await
+        {
+            Ok(()) => {
                 winner = Some(peer_key.clone());
                 break;
             }
             // "Refused", "not found", and "never answered" are different
             // diagnoses and only one of them is an authorization problem, so
             // each peer's own outcome is worth a line of its own.
-            Ok(Err(e)) => info!(
+            Err(e) => info!(
                 peer = %peer_key,
                 session_db_id,
                 "Pull attempt refused by peer: {e}"
-            ),
-            Err(_) => info!(
-                peer = %peer_key,
-                session_db_id,
-                "Pull attempt timed out after {PULL_ATTEMPT_TIMEOUT:?}"
             ),
         }
     }
