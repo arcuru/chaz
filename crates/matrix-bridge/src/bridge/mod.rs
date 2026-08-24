@@ -1225,7 +1225,7 @@ mod tests {
             Error as RumaApiError, ErrorBody, ErrorKind, FromHttpResponseError, StandardErrorBody,
         },
     };
-    use ruma::events::room::message::{MessageType, RoomMessageEventContent};
+    use ruma::events::room::message::{MessageFormat, MessageType, RoomMessageEventContent};
 
     /// Build a `matrix_sdk::Error` shaped exactly as the SDK surfaces a
     /// homeserver error response: `Http(Api(Server(MatrixError)))` carrying the
@@ -1275,11 +1275,39 @@ mod tests {
             .map(RoomMessageEventContent::text_markdown)
             .collect();
         match &rendered[0].msgtype {
-            MessageType::Text(text) => assert!(text.formatted.is_some()),
+            MessageType::Text(text) => {
+                assert_eq!(text.body, chunks[0]);
+                let formatted = text
+                    .formatted
+                    .as_ref()
+                    .expect("unclosed fence opener renders as HTML");
+                assert_eq!(formatted.format, MessageFormat::Html);
+                assert_eq!(
+                    formatted.body,
+                    "<pre><code class=\"language-rust\"></code></pre>\n"
+                );
+            }
             _ => panic!("text_markdown must produce a text event"),
         }
         match &rendered[1].msgtype {
-            MessageType::Text(text) => assert_eq!(text.body, chunks[1]),
+            MessageType::Text(text) => {
+                assert_eq!(text.body, chunks[1]);
+                // The stray closing fence does not extend chunk 1's code
+                // block; the x's render as a paragraph and the fence as an
+                // empty code block. Pinned to current ruma output.
+                let formatted = text
+                    .formatted
+                    .as_ref()
+                    .expect("stray closing fence renders as HTML");
+                assert_eq!(formatted.format, MessageFormat::Html);
+                assert_eq!(
+                    formatted.body,
+                    format!(
+                        "<p>{}</p>\n<pre><code></code></pre>\n",
+                        "x".repeat(MATRIX_MESSAGE_LIMIT - "```rust\n".len())
+                    )
+                );
+            }
             _ => panic!("text_markdown must produce a text event"),
         }
     }
