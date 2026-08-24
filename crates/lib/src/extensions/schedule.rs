@@ -276,10 +276,18 @@ async fn remove_cmd(
     };
     match adb.remove_schedule(schedule_id).await {
         Ok(true) => {
-            if let Some(engine) = ctx.routine_engine.as_ref()
-                && let Err(e) = engine.reload_agent(&adb.id().to_string(), &adb).await
-            {
-                tracing::warn!(agent = %adb.id(), "engine.reload_agent after remove failed: {e}");
+            if let Some(engine) = ctx.routine_engine.as_ref() {
+                if let Err(e) = engine
+                    .clear_agent_schedule_anchor(&adb.id().to_string(), schedule_id)
+                    .await
+                {
+                    return ExtensionCommandOutcome::Error(format!(
+                        "Failed to clear schedule anchor: {e}"
+                    ));
+                }
+                if let Err(e) = engine.reload_agent(&adb.id().to_string(), &adb).await {
+                    tracing::warn!(agent = %adb.id(), "engine.reload_agent after remove failed: {e}");
+                }
             }
             ExtensionCommandOutcome::Text(format!("Removed schedule '{schedule_id}'"))
         }
@@ -361,10 +369,18 @@ async fn modify_cmd(
     schedule.trigger = trigger;
     match adb.upsert_schedule(schedule).await {
         Ok(()) => {
-            if let Some(engine) = ctx.routine_engine.as_ref()
-                && let Err(e) = engine.reload_agent(&adb.id().to_string(), &adb).await
-            {
-                tracing::warn!(agent = %adb.id(), "engine.reload_agent after modify failed: {e}");
+            if let Some(engine) = ctx.routine_engine.as_ref() {
+                if let Err(e) = engine
+                    .clear_agent_schedule_anchor(&adb.id().to_string(), id)
+                    .await
+                {
+                    return ExtensionCommandOutcome::Error(format!(
+                        "Failed to clear schedule anchor: {e}"
+                    ));
+                }
+                if let Err(e) = engine.reload_agent(&adb.id().to_string(), &adb).await {
+                    tracing::warn!(agent = %adb.id(), "engine.reload_agent after modify failed: {e}");
+                }
             }
             ExtensionCommandOutcome::Text(format!("Modified schedule '{id}': {description}"))
         }
@@ -430,10 +446,18 @@ async fn add_cmd(
         );
         return match adb.upsert_schedule(schedule).await {
             Ok(()) => {
-                if let Some(engine) = ctx.routine_engine.as_ref()
-                    && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
-                {
-                    tracing::warn!(agent = %entry.db_id, "engine.reload_agent after add failed: {e}");
+                if let Some(engine) = ctx.routine_engine.as_ref() {
+                    if let Err(e) = engine
+                        .clear_agent_schedule_anchor(&entry.db_id.to_string(), id)
+                        .await
+                    {
+                        return ExtensionCommandOutcome::Error(format!(
+                            "Failed to clear schedule anchor: {e}"
+                        ));
+                    }
+                    if let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await {
+                        tracing::warn!(agent = %entry.db_id, "engine.reload_agent after add failed: {e}");
+                    }
                 }
                 ExtensionCommandOutcome::Text(format!(
                     "Schedule '{id}' on agent '{}': every {seconds}s → this session — {task}",
@@ -495,10 +519,18 @@ async fn add_cmd(
     );
     match adb.upsert_schedule(schedule).await {
         Ok(()) => {
-            if let Some(engine) = ctx.routine_engine.as_ref()
-                && let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await
-            {
-                tracing::warn!(agent = %entry.db_id, "engine.reload_agent after add failed: {e}");
+            if let Some(engine) = ctx.routine_engine.as_ref() {
+                if let Err(e) = engine
+                    .clear_agent_schedule_anchor(&entry.db_id.to_string(), id)
+                    .await
+                {
+                    return ExtensionCommandOutcome::Error(format!(
+                        "Failed to clear schedule anchor: {e}"
+                    ));
+                }
+                if let Err(e) = engine.reload_agent(&entry.db_id.to_string(), &adb).await {
+                    tracing::warn!(agent = %entry.db_id, "engine.reload_agent after add failed: {e}");
+                }
             }
             ExtensionCommandOutcome::Text(format!(
                 "Schedule '{id}' on agent '{}': cron='{cron}' → this session — {task}",
@@ -515,9 +547,11 @@ mod tests {
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::hosted_index::{DbEntry, HostedIndex};
+    use crate::routine::LAST_FIRED_STORE;
     use crate::session::{Session, SessionRegistry};
     use crate::types::ConversationId;
     use eidetica::backend::database::InMemory;
+    use eidetica::store::DocStore;
     use eidetica::{Instance, NewUser};
     use tokio::sync::Mutex;
 
@@ -576,6 +610,22 @@ mod tests {
         ScheduleCommand {
             agent_state: Arc::new(scoped),
         }
+    }
+
+    async fn save_anchor(peer: &eidetica::Database, id: &str) {
+        let txn = peer.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await.unwrap();
+        store
+            .set_string(id, "2023-11-14T22:13:20+00:00")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    async fn has_anchor(peer: &eidetica::Database, id: &str) -> bool {
+        let txn = peer.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(LAST_FIRED_STORE).await.unwrap();
+        store.get_string(id).await.is_ok()
     }
 
     #[tokio::test]
@@ -700,6 +750,40 @@ mod tests {
             }
             ExtensionCommandOutcome::Error(e) => panic!("list errored: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn command_lifecycle_changes_clear_interval_anchor() {
+        let (_i, index, registry, mut ctx) = fixture().await;
+        let peer = registry.chaz_peer().clone();
+        let engine = crate::routine::RoutineEngine::new(peer.clone(), None)
+            .await
+            .unwrap();
+        ctx.routine_engine = Some(engine);
+        let c = cmd(registry, index.clone());
+        let entry = index.find_by_name("alpha").unwrap();
+        let anchor_id = format!("agent:{}:poll", entry.db_id);
+
+        save_anchor(&peer, &anchor_id).await;
+        let _ = c.invoke("add interval poll 60 alpha check", &ctx).await;
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "add must clear the anchor"
+        );
+
+        save_anchor(&peer, &anchor_id).await;
+        let _ = c.invoke("modify poll interval 120 alpha", &ctx).await;
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "trigger changes must clear the anchor"
+        );
+
+        save_anchor(&peer, &anchor_id).await;
+        let _ = c.invoke("remove poll", &ctx).await;
+        assert!(
+            !has_anchor(&peer, &anchor_id).await,
+            "remove must clear the anchor"
+        );
     }
 
     #[tokio::test]
