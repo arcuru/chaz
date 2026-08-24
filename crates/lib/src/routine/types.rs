@@ -199,6 +199,11 @@ pub const AGENT_SCHEDULE_EXTENSION: &str = "agent_schedule";
 pub struct AgentSchedulePayload {
     pub owner_agent_db_id: String,
     pub schedule_id: String,
+    /// Identity of the in-memory routine entry that dispatched this turn.
+    /// Omitted by older persisted payloads; the engine supplies it at
+    /// dispatch time so a detached turn can verify the entry is still live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     pub prompt: String,
     /// `crate::agent_db::ScheduleTarget`, carried as JSON so this type
     /// doesn't depend on the agent_db module.
@@ -243,6 +248,19 @@ mod tests {
             },
         );
         assert!(!r.trigger.is_recurring());
+    }
+
+    #[test]
+    fn agent_schedule_payload_accepts_pre_generation_rows() {
+        let payload: AgentSchedulePayload = serde_json::from_value(serde_json::json!({
+            "owner_agent_db_id": "owner",
+            "schedule_id": "wake",
+            "prompt": "wake",
+            "target": {"kind": "fresh"},
+            "one_shot": true
+        }))
+        .unwrap();
+        assert_eq!(payload.generation, None);
     }
 
     #[test]

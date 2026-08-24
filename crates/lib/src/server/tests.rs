@@ -458,6 +458,7 @@ fn fresh_schedule_payload(
     AgentSchedulePayload {
         owner_agent_db_id: owner_agent_db_id.to_string(),
         schedule_id: schedule_id.to_string(),
+        generation: None,
         prompt: prompt.to_string(),
         target: serde_json::to_value(crate::agent_db::ScheduleTarget::Fresh).unwrap(),
         one_shot: true,
@@ -474,6 +475,7 @@ fn pinned_schedule_payload(
     AgentSchedulePayload {
         owner_agent_db_id: owner_agent_db_id.to_string(),
         schedule_id: schedule_id.to_string(),
+        generation: None,
         prompt: prompt.to_string(),
         target: serde_json::to_value(crate::agent_db::ScheduleTarget::Pinned {
             session_db_id: session_db_id.to_string(),
@@ -1285,6 +1287,123 @@ async fn fire_fresh_runs_when_agent_home_is_unset_legacy() {
     // recorded — which only happens when we get past the gate.
     let fires = adb.list_schedule_fires().await.unwrap();
     assert_eq!(fires.len(), 1, "legacy None must let the fire through");
+}
+
+async fn schedule_engine_for(
+    server: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    owner_id: &str,
+    adb: &crate::agent_db::AgentDb,
+) -> Arc<crate::routine::RoutineEngine> {
+    let engine = crate::routine::RoutineEngine::new(registry.chaz_peer().clone(), None)
+        .await
+        .unwrap();
+    engine.register_agent(owner_id, adb).await.unwrap();
+    server.set_routine_engine(engine.clone());
+    engine
+}
+
+#[tokio::test]
+async fn fire_schedule_skips_dispatched_payload_after_removal() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+    let owner_id = entry.db_id.to_string();
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 9 * * *".into(),
+        },
+        "old prompt",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    let engine = schedule_engine_for(&server, &registry, &owner_id, &adb).await;
+    let routine_id = crate::routine::RoutineId::new(format!("agent:{owner_id}:wake"));
+    let mut payload = fresh_schedule_payload(&owner_id, "wake", "old prompt");
+    payload.generation = engine.current_generation(&routine_id).await;
+
+    adb.remove_schedule("wake").await.unwrap();
+    engine.deregister_agent(&owner_id).await;
+
+    server.fire_agent_schedule(payload).await.unwrap();
+    assert!(adb.list_schedule_fires().await.unwrap().is_empty());
+    assert!(
+        registry
+            .list_sessions()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn fire_schedule_skips_dispatched_payload_after_same_id_replacement() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+    let owner_id = entry.db_id.to_string();
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 9 * * *".into(),
+        },
+        "old prompt",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    let engine = schedule_engine_for(&server, &registry, &owner_id, &adb).await;
+    let routine_id = crate::routine::RoutineId::new(format!("agent:{owner_id}:wake"));
+    let mut payload = fresh_schedule_payload(&owner_id, "wake", "old prompt");
+    payload.generation = engine.current_generation(&routine_id).await;
+
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 10 * * *".into(),
+        },
+        "replacement prompt",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    engine.reload_agent(&owner_id, &adb).await.unwrap();
+
+    server.fire_agent_schedule(payload).await.unwrap();
+    assert!(adb.list_schedule_fires().await.unwrap().is_empty());
+    assert!(
+        registry
+            .list_sessions()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn fire_schedule_runs_dispatched_payload_for_live_entry() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+    let owner_id = entry.db_id.to_string();
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 9 * * *".into(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    let engine = schedule_engine_for(&server, &registry, &owner_id, &adb).await;
+    let routine_id = crate::routine::RoutineId::new(format!("agent:{owner_id}:wake"));
+    let mut payload = fresh_schedule_payload(&owner_id, "wake", "wake");
+    payload.generation = engine.current_generation(&routine_id).await;
+
+    let result = server.fire_agent_schedule(payload).await;
+    assert!(result.is_err(), "empty test backend fails after the gate");
+    assert_eq!(adb.list_schedule_fires().await.unwrap().len(), 1);
+    assert_eq!(registry.list_sessions().await.unwrap_or_default().len(), 1);
 }
 
 #[tokio::test]
