@@ -507,22 +507,23 @@ type DeliveredKey = (DateTime<Utc>, String);
 /// at the failed chunk rather than repeat the prefix.
 type DeliveredSet = Arc<Mutex<HashMap<DeliveredKey, usize>>>;
 
-/// The agent `Message` entries in `entries` not yet in `delivered`.
+/// The agent `Message` entries in `entries` not yet delivered to the
+/// transport, per the `is_delivered` membership predicate.
 ///
 /// Pure, so the reconcile rule is unit-testable without a live DB or
 /// transport. `is_agent` selects agent senders; human participants' messages
 /// are already on the transport, so they are never echoed back.
-pub fn undelivered_agent_messages<'a>(
-    entries: &'a [SessionEntry],
+pub fn undelivered_agent_messages(
+    entries: &[SessionEntry],
     is_agent: impl Fn(&str) -> bool,
-    delivered: &HashSet<DeliveredKey>,
-) -> Vec<&'a SessionEntry> {
+    is_delivered: impl Fn(&DateTime<Utc>, &str) -> bool,
+) -> Vec<&SessionEntry> {
     entries
         .iter()
         .filter(|e| {
             e.entry_type == EntryType::Message
                 && is_agent(&e.sender)
-                && !delivered.contains(&(e.timestamp, e.content.clone()))
+                && !is_delivered(&e.timestamp, &e.content)
         })
         .collect()
 }
@@ -637,14 +638,10 @@ where
                 // Hold the lock across the sends so concurrent writes can't
                 // interleave or double-emit; delivery is serialized.
                 let mut delivered = delivered.lock().await;
-                let completed = delivered
-                    .iter()
-                    .filter_map(|(key, sent)| (*sent == usize::MAX).then_some(key.clone()))
-                    .collect();
                 let pending = undelivered_agent_messages(
                     session.entries(),
                     |s| agents.get(s).is_some(),
-                    &completed,
+                    |ts, content| delivered.get(&(*ts, content.to_string())) == Some(&usize::MAX),
                 );
                 deliver_in_order(&pending, &owning_agent, &mut delivered, chunk.as_ref(), send.as_ref()).await;
                 Ok(())
@@ -859,10 +856,12 @@ mod tests {
         let mut delivered = HashSet::new();
         delivered.insert((entries[4].timestamp, "old".to_string()));
 
-        let got: Vec<&str> = undelivered_agent_messages(&entries, is_agent, &delivered)
-            .iter()
-            .map(|e| e.content.as_str())
-            .collect();
+        let got: Vec<&str> = undelivered_agent_messages(&entries, is_agent, |ts, content| {
+            delivered.contains(&(*ts, content.to_string()))
+        })
+        .iter()
+        .map(|e| e.content.as_str())
+        .collect();
         assert_eq!(got, vec!["hello", "done"]);
     }
 
@@ -873,12 +872,20 @@ mod tests {
 
         let mut delivered = HashSet::new();
         assert_eq!(
-            undelivered_agent_messages(&entries, is_agent, &delivered).len(),
+            undelivered_agent_messages(&entries, is_agent, |ts, content| {
+                delivered.contains(&(*ts, content.to_string()))
+            })
+            .len(),
             1
         );
         // Mark it delivered (what the callback does) → a second pass is a no-op.
         delivered.insert((entries[0].timestamp, "hello".to_string()));
-        assert!(undelivered_agent_messages(&entries, is_agent, &delivered).is_empty());
+        assert!(
+            undelivered_agent_messages(&entries, is_agent, |ts, content| {
+                delivered.contains(&(*ts, content.to_string()))
+            })
+            .is_empty()
+        );
     }
 
     #[test]
