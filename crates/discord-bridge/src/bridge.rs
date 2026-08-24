@@ -860,9 +860,27 @@ impl EventHandler for Handler {
 mod tests {
     use super::{charge_message_quota, first_delivery, is_transient_discord_send_error};
 
+    use reqwest::{Method, StatusCode};
+    use serenity::http::{ErrorResponse, HttpError as SerenityHttpError};
     use serenity::model::id::MessageId;
     use std::collections::{HashMap, HashSet};
     use tokio::sync::Mutex;
+
+    /// Build a `serenity::Error` shaped as the SDK surfaces a failed send:
+    /// `Http(UnsuccessfulRequest(ErrorResponse))` carrying the given status.
+    /// `ErrorResponse` is `#[non_exhaustive]` with an async-only constructor, so
+    /// this goes through `from_response` on a synthesized `reqwest::Response`
+    /// (converted from an `http::Response`; reqwest supplies a placeholder URL).
+    async fn discord_http_error(status: StatusCode) -> serenity::Error {
+        let body = r#"{"code": 0, "message": "synthesized", "errors": []}"#;
+        let http_response = http::Response::builder()
+            .status(status)
+            .body(body.to_owned())
+            .expect("static response parts");
+        let response: reqwest::Response = http_response.into();
+        let error_response = ErrorResponse::from_response(response, Method::POST).await;
+        serenity::Error::Http(SerenityHttpError::UnsuccessfulRequest(error_response))
+    }
 
     #[tokio::test]
     async fn a_user_spends_their_message_quota_and_is_then_refused() {
@@ -906,5 +924,39 @@ mod tests {
         // cannot fix, so it must surface as permanent.
         let error = serenity::Error::Io(std::io::Error::other("local I/O hiccup"));
         assert!(!is_transient_discord_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_and_server_overload_statuses_are_transient() {
+        for status in [429, 503, 504] {
+            let error =
+                discord_http_error(StatusCode::from_u16(status).expect("valid status")).await;
+            assert!(
+                is_transient_discord_send_error(&error),
+                "status {status} should be transient"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_http_statuses_are_not_transient() {
+        for status in [400, 401, 403, 404, 500, 502] {
+            let error =
+                discord_http_error(StatusCode::from_u16(status).expect("valid status")).await;
+            assert!(
+                !is_transient_discord_send_error(&error),
+                "status {status} should be permanent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reqwest_connect_error_is_transient() {
+        // `reqwest::Error` has no public constructor, so the connect arm can
+        // only be pinned with a real failed request; nothing listens on port 1
+        // and the refusal is immediate even inside the Nix sandbox.
+        let error = reqwest::get("http://127.0.0.1:1/").await.unwrap_err();
+        let error = serenity::Error::Http(SerenityHttpError::Request(error));
+        assert!(is_transient_discord_send_error(&error));
     }
 }

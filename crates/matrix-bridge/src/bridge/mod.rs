@@ -1216,8 +1216,33 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
-    use super::MATRIX_MESSAGE_LIMIT;
+    use super::{MATRIX_MESSAGE_LIMIT, is_transient_matrix_send_error};
     use chaz_core::bridge::chunk_message_bytes as chunk_message;
+    use matrix_sdk::{Error as MatrixSdkError, HttpError};
+    use ruma::api::{
+        client::uiaa::UiaaResponse,
+        error::{
+            Error as RumaApiError, ErrorBody, ErrorKind, FromHttpResponseError, StandardErrorBody,
+        },
+    };
+
+    /// Build a `matrix_sdk::Error` shaped exactly as the SDK surfaces a
+    /// homeserver error response: `Http(Api(Server(MatrixError)))` carrying the
+    /// given status. Built from real ruma types so an SDK upgrade that reshapes
+    /// these enums breaks this suite instead of silently un-pinning the retry
+    /// classification.
+    fn matrix_api_error(status: reqwest::StatusCode) -> MatrixSdkError {
+        let ruma_error = RumaApiError::new(
+            status,
+            ErrorBody::Standard(StandardErrorBody::new(
+                ErrorKind::Unknown,
+                "synthesized homeserver error".to_owned(),
+            )),
+        );
+        MatrixSdkError::Http(Box::new(HttpError::Api(Box::new(
+            FromHttpResponseError::Server(UiaaResponse::MatrixError(ruma_error)),
+        ))))
+    }
 
     #[test]
     fn matrix_chunks_are_transport_sized_and_lossless() {
@@ -1230,5 +1255,50 @@ mod tests {
                 .all(|chunk| chunk.len() <= MATRIX_MESSAGE_LIMIT)
         );
         assert_eq!(chunks.concat(), body);
+    }
+
+    #[test]
+    fn homeserver_overload_statuses_are_transient() {
+        for status in [429, 503, 504] {
+            assert!(
+                is_transient_matrix_send_error(&matrix_api_error(
+                    reqwest::StatusCode::from_u16(status).expect("valid status"),
+                )),
+                "status {status} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_http_statuses_are_not_transient() {
+        for status in [400, 401, 403, 404, 500, 502] {
+            assert!(
+                !is_transient_matrix_send_error(&matrix_api_error(
+                    reqwest::StatusCode::from_u16(status).expect("valid status"),
+                )),
+                "status {status} should be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_outside_the_http_layer_is_permanent() {
+        assert!(!is_transient_matrix_send_error(
+            &MatrixSdkError::AuthenticationRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reqwest_connect_error_is_transient() {
+        // `reqwest::Error` has no public constructor, so the connect arm can
+        // only be pinned with a real failed request; nothing listens on port 1
+        // and the refusal is immediate even inside the Nix sandbox.
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("test client");
+        let error = client.get("http://127.0.0.1:1/").send().await.unwrap_err();
+        let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
+        assert!(is_transient_matrix_send_error(&error));
     }
 }
