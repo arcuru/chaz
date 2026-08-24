@@ -56,6 +56,29 @@ impl Server {
             return Ok(());
         };
 
+        // A routine handler detaches agent turns from the engine's fire loop.
+        // Require a generation-bearing payload to still name the live entry
+        // before it can create a session or begin any turn work. Legacy
+        // persisted payloads omit this field and retain the prior behavior.
+        if let Some(generation) = &payload.generation {
+            let routine_id = crate::routine::RoutineId::new(format!(
+                "agent:{}:{}",
+                payload.owner_agent_db_id, payload.schedule_id
+            ));
+            let current = match self.routine_engine() {
+                Some(engine) => engine.current_generation(&routine_id).await,
+                None => None,
+            };
+            if current.as_deref() != Some(generation) {
+                tracing::debug!(
+                    agent = %agent_entry.display_name,
+                    schedule = %payload.schedule_id,
+                    "Stale agent schedule fire; skipping"
+                );
+                return Ok(());
+            }
+        }
+
         // 1b. Lifecycle bound check (Gap 4). The agent DB is the
         //     authoritative store; the engine's in-memory routine is
         //     rebuilt from it. If the schedule has hit its expiry or

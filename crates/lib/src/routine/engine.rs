@@ -121,6 +121,9 @@ impl EngineState {
 /// routines flow in via [`Self::register_session`] as sessions open.
 pub struct RoutineEngine {
     state: Mutex<EngineState>,
+    /// Unique per engine construction so a detached fire from a prior
+    /// process cannot match a freshly-created entry with the same incarnation.
+    generation_seed: String,
     notify: Arc<Notify>,
     chaz_peer: Database,
     /// Hub the engine dispatches routine fires through. Optional so
@@ -145,6 +148,7 @@ impl RoutineEngine {
     ) -> anyhow::Result<Arc<Self>> {
         let engine = Arc::new(Self {
             state: Mutex::new(EngineState::new()),
+            generation_seed: uuid::Uuid::new_v4().to_string(),
             notify: Arc::new(Notify::new()),
             chaz_peer,
             hub,
@@ -533,6 +537,17 @@ impl RoutineEngine {
         state.routines.get(id).map(|e| e.routine.clone())
     }
 
+    /// Generation of the current routine entry, if it is still live.
+    /// A generation is scoped to this engine construction as well as the
+    /// entry incarnation, so it cannot collide after an engine restart.
+    pub async fn current_generation(&self, id: &RoutineId) -> Option<String> {
+        let state = self.state.lock().await;
+        state
+            .routines
+            .get(id)
+            .map(|entry| format!("{}:{}", self.generation_seed, entry.incarnation))
+    }
+
     /// Single iteration of the run loop. Public for tests; the
     /// `run` task drives this in an infinite loop.
     pub async fn tick(self: &Arc<Self>) {
@@ -613,12 +628,24 @@ impl RoutineEngine {
 
         let dispatch_result: anyhow::Result<()> = match &self.hub {
             Some(hub) => {
-                hub.dispatch_routine(
-                    &entry.routine.target.extension,
-                    &entry.scope,
-                    entry.routine.target.payload.clone(),
-                )
-                .await
+                let payload = if entry.routine.target.extension == AGENT_SCHEDULE_EXTENSION {
+                    (|| -> anyhow::Result<_> {
+                        let mut payload: AgentSchedulePayload =
+                            serde_json::from_value(entry.routine.target.payload.clone())?;
+                        payload.generation =
+                            Some(format!("{}:{}", self.generation_seed, entry.incarnation));
+                        serde_json::to_value(payload).map_err(Into::into)
+                    })()
+                } else {
+                    Ok(entry.routine.target.payload.clone())
+                };
+                match payload {
+                    Ok(payload) => {
+                        hub.dispatch_routine(&entry.routine.target.extension, &entry.scope, payload)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             None => Ok(()),
         };
@@ -743,6 +770,7 @@ fn schedule_to_routine(
     let payload = AgentSchedulePayload {
         owner_agent_db_id: owner_agent_db_id.to_string(),
         schedule_id: t.id.clone(),
+        generation: None,
         prompt: t.prompt.clone(),
         target: serde_json::to_value(&t.target)?,
         one_shot: !t.trigger.is_recurring(),
@@ -1815,6 +1843,32 @@ mod tests {
             1,
             "the due interval must dispatch and reschedule exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_reload_keeps_agent_schedule_generation() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        let mut schedule = Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        );
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        let before = engine.current_generation(&id).await;
+
+        schedule.prompt = "updated metadata".into();
+        adb.upsert_schedule(schedule).await.unwrap();
+        engine.reload_agent(&owner, &adb).await.unwrap();
+
+        assert_eq!(engine.current_generation(&id).await, before);
     }
 
     #[tokio::test]
