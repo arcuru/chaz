@@ -1225,6 +1225,7 @@ mod tests {
             Error as RumaApiError, ErrorBody, ErrorKind, FromHttpResponseError, StandardErrorBody,
         },
     };
+    use ruma::events::room::message::{MessageType, RoomMessageEventContent};
 
     /// Build a `matrix_sdk::Error` shaped exactly as the SDK surfaces a
     /// homeserver error response: `Http(Api(Server(MatrixError)))` carrying the
@@ -1255,6 +1256,32 @@ mod tests {
                 .all(|chunk| chunk.len() <= MATRIX_MESSAGE_LIMIT)
         );
         assert_eq!(chunks.concat(), body);
+    }
+
+    #[test]
+    fn markdown_spans_crossing_chunks_render_independently() {
+        let body = format!(
+            "```rust\n{}\n```",
+            "x".repeat(MATRIX_MESSAGE_LIMIT - "```rust\n".len())
+        );
+        let chunks = chunk_message(&body, MATRIX_MESSAGE_LIMIT);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), body);
+
+        // Matrix receives separate events, so its Markdown parser sees an
+        // unclosed fence in the first event and its close in the second.
+        let rendered: Vec<_> = chunks
+            .iter()
+            .map(RoomMessageEventContent::text_markdown)
+            .collect();
+        match &rendered[0].msgtype {
+            MessageType::Text(text) => assert!(text.formatted.is_some()),
+            _ => panic!("text_markdown must produce a text event"),
+        }
+        match &rendered[1].msgtype {
+            MessageType::Text(text) => assert_eq!(text.body, chunks[1]),
+            _ => panic!("text_markdown must produce a text event"),
+        }
     }
 
     #[test]

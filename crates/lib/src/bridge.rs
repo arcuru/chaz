@@ -38,84 +38,56 @@ pub fn is_transient_outbound_status(status: u16) -> bool {
 
 /// Split a body into chunks at most `limit` Unicode scalar values long.
 ///
+/// Concatenating the chunks reproduces `body` exactly, byte for byte.
 /// Splitting prefers newlines, then spaces, and hard-splits an oversized
 /// token only when no boundary fits. Empty bodies yield no chunks.
+/// Whitespace-only chunks occur only when the remaining input is all whitespace.
 pub fn chunk_message_chars(body: &str, limit: usize) -> Vec<String> {
-    chunk_message(body, limit, |part| part.chars().count(), |_| 1)
+    chunk_message(body, limit, |_| 1)
 }
 
 /// Split a body into chunks at most `limit` UTF-8 bytes long.
 ///
+/// Concatenating the chunks reproduces `body` exactly, byte for byte.
 /// Splitting prefers newlines, then spaces, and hard-splits an oversized
-/// token only when no boundary fits. Empty bodies yield no chunks.
+/// token only when no boundary fits. Empty bodies yield no chunks. A limit
+/// smaller than a scalar's UTF-8 encoding cannot produce a valid chunk.
+/// Whitespace-only chunks occur only when the remaining input is all whitespace.
 pub fn chunk_message_bytes(body: &str, limit: usize) -> Vec<String> {
-    chunk_message(body, limit, str::len, char::len_utf8)
+    chunk_message(body, limit, char::len_utf8)
 }
 
-fn chunk_message(
-    body: &str,
-    limit: usize,
-    measure: fn(&str) -> usize,
-    measure_char: fn(char) -> usize,
-) -> Vec<String> {
-    pack_parts(body.split('\n'), "\n", limit, measure, |line, lim| {
-        pack_parts(line.split(' '), " ", lim, measure, |token, token_limit| {
-            hard_split(token, token_limit, measure_char)
-        })
-    })
-}
-
-fn pack_parts<'a, I, B>(
-    parts: I,
-    sep: &str,
-    limit: usize,
-    measure: fn(&str) -> usize,
-    break_part: B,
-) -> Vec<String>
-where
-    I: Iterator<Item = &'a str>,
-    B: Fn(&str, usize) -> Vec<String>,
-{
-    let sep_len = measure(sep);
+fn chunk_message(body: &str, limit: usize, measure_char: fn(char) -> usize) -> Vec<String> {
+    assert!(limit > 0, "chunk limit must be positive");
     let mut chunks = Vec::new();
-    let mut cur = String::new();
-    let mut cur_len = 0;
+    let mut rest = body;
 
-    for part in parts {
-        let part_len = measure(part);
-        let needed = if cur.is_empty() {
-            part_len
-        } else {
-            cur_len + sep_len + part_len
-        };
-        if needed <= limit {
-            if !cur.is_empty() {
-                cur.push_str(sep);
-                cur_len += sep_len;
+    while !rest.is_empty() {
+        let mut used = 0;
+        let mut prefix_end = 0;
+        for (index, ch) in rest.char_indices() {
+            let width = measure_char(ch);
+            if used + width > limit {
+                break;
             }
-            cur.push_str(part);
-            cur_len += part_len;
-            continue;
+            used += width;
+            prefix_end = index + ch.len_utf8();
         }
 
-        if !cur.is_empty() {
-            chunks.push(std::mem::take(&mut cur));
-            cur_len = 0;
-        }
-        if part_len <= limit {
-            cur.push_str(part);
-            cur_len = part_len;
-        } else {
-            let mut pieces = break_part(part, limit);
-            if let Some(last) = pieces.pop() {
-                chunks.extend(pieces);
-                cur_len = measure(&last);
-                cur = last;
-            }
-        }
-    }
-    if !cur.is_empty() {
-        chunks.push(cur);
+        assert!(prefix_end > 0, "chunk limit cannot fit a Unicode scalar");
+        let prefix = &rest[..prefix_end];
+        let boundary = (prefix_end < rest.len())
+            .then(|| {
+                prefix
+                    .rfind('\n')
+                    .or_else(|| prefix.rfind(' '))
+                    .map(|index| index + 1)
+                    .filter(|&end| !prefix[..end].trim().is_empty())
+            })
+            .flatten();
+        let end = boundary.unwrap_or(prefix_end);
+        chunks.push(rest[..end].to_owned());
+        rest = &rest[end..];
     }
     chunks
 }
@@ -764,7 +736,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::{chunk_message_chars as chunk_message, hard_split_chars as hard_split};
+    use super::{
+        chunk_message_bytes, chunk_message_chars as chunk_message, hard_split_chars as hard_split,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
@@ -888,6 +862,33 @@ mod tests {
         assert!(chunk_message("", 2000).is_empty());
     }
 
+    fn assert_lossless_chunks(body: &str, limit: usize) {
+        let char_chunks = chunk_message(body, limit);
+        assert_within_limit(&char_chunks, limit);
+        assert_eq!(char_chunks.concat(), body);
+
+        if body.chars().all(|ch| ch.len_utf8() <= limit) {
+            let byte_chunks = chunk_message_bytes(body, limit);
+            assert!(byte_chunks.iter().all(|chunk| chunk.len() <= limit));
+            assert_eq!(byte_chunks.concat(), body);
+        }
+    }
+
+    #[test]
+    fn chunks_preserve_every_byte_across_boundaries() {
+        for limit in 1..=12 {
+            for body in [
+                "aaaaa bbbbb",
+                "aaaaa\nbbbbb",
+                "a  b",
+                "short supercalifragilisticexpialidocious",
+                "🦀 a\n🦀🦀 b",
+            ] {
+                assert_lossless_chunks(body, limit);
+            }
+        }
+    }
+
     #[test]
     fn splits_on_newline_boundaries() {
         // Three 40-char lines, limit 100: two lines pack, the third spills over.
@@ -896,7 +897,8 @@ mod tests {
         let chunks = chunk_message(&body, 100);
         assert_within_limit(&chunks, 100);
         // First chunk packs two lines joined by the newline; never a torn line.
-        assert_eq!(chunks, vec![format!("{line}\n{line}"), line]);
+        assert_eq!(chunks, vec![format!("{line}\n{line}\n"), line]);
+        assert_eq!(chunks.concat(), body);
     }
 
     #[test]
@@ -909,16 +911,11 @@ mod tests {
         // No word is ever split: every whitespace-delimited token in every chunk
         // is one of the originals.
         for chunk in &chunks {
-            for tok in chunk.split(' ') {
+            for tok in chunk.split(' ').filter(|tok| !tok.is_empty()) {
                 assert!(words.contains(&tok.to_string()), "torn word: {tok:?}");
             }
         }
-        // And nothing is lost: flatten the chunks back to the original words.
-        let recovered: Vec<String> = chunks
-            .iter()
-            .flat_map(|c| c.split(' ').map(str::to_string))
-            .collect();
-        assert_eq!(recovered, words);
+        assert_eq!(chunks.concat(), body);
     }
 
     #[test]
@@ -940,6 +937,7 @@ mod tests {
         let chunks = chunk_message(&body, 10);
         assert_within_limit(&chunks, 10);
         assert_eq!(chunks, vec!["zzzzzzzzzz", "zzzzzzzzzz", "zzzzz hi"]);
+        assert_eq!(chunks.concat(), body);
     }
 
     #[test]
@@ -980,9 +978,9 @@ mod tests {
     fn byte_chunks_prefer_boundaries_and_hard_split_on_char_boundaries() {
         let body = "alpha\nbravo\ncharlie";
         let chunks = chunk_message_bytes(body, 11);
-        assert_eq!(chunks, vec!["alpha\nbravo", "charlie"]);
+        assert_eq!(chunks, vec!["alpha\n", "bravo\n", "charlie"]);
         assert!(chunks.iter().all(|chunk| chunk.len() <= 11));
-        assert_eq!(chunks.join("\n"), body);
+        assert_eq!(chunks.concat(), body);
 
         let crabs = "🦀".repeat(3);
         let chunks = chunk_message_bytes(&crabs, 8);
