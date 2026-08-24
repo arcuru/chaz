@@ -347,6 +347,9 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
+    /// their lifecycle read-modify-write operations must not lose increments.
+    schedule_accounting: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Home-peer gate skip counter keyed by `(session_db_id, agent_name)`.
     /// In-memory, peer-local. Incremented on every wake that the gate
     /// suppresses; cleared when a turn actually runs (home == self) or on
@@ -466,6 +469,7 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,

@@ -87,19 +87,10 @@ impl Server {
         //     in-memory routine keeps ticking until the next
         //     reload/restart, but every tick now early-returns here).
         if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-            && let Ok(Some(mut schedule)) = adb.find_schedule(&payload.schedule_id).await
-            && let Some(reason) = schedule.retirement_reason(Utc::now())
+            && let Ok(Some(reason)) = self
+                .retire_schedule_if_due(&adb, &payload.schedule_id, Utc::now())
+                .await
         {
-            if schedule.enabled {
-                schedule.enabled = false;
-                if let Err(e) = adb.upsert_schedule(schedule).await {
-                    tracing::error!(
-                        agent = %agent_entry.display_name,
-                        schedule = %payload.schedule_id,
-                        "Failed to persist schedule retirement: {e}"
-                    );
-                }
-            }
             tracing::info!(
                 agent = %agent_entry.display_name,
                 schedule = %payload.schedule_id,
@@ -175,18 +166,13 @@ impl Server {
                 // agent reload, but every tick now early-returns here.
                 if !self.is_session_open(session_db_id).await {
                     if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-                        && let Ok(Some(mut schedule)) =
-                            adb.find_schedule(&payload.schedule_id).await
-                        && schedule.enabled
+                        && let Err(e) = self.disable_schedule(&adb, &payload.schedule_id).await
                     {
-                        schedule.enabled = false;
-                        if let Err(e) = adb.upsert_schedule(schedule).await {
-                            tracing::error!(
-                                agent = %agent_name,
-                                schedule = %payload.schedule_id,
-                                "Failed to persist Pinned-target retirement: {e}"
-                            );
-                        }
+                        tracing::error!(
+                            agent = %agent_name,
+                            schedule = %payload.schedule_id,
+                            "Failed to persist Pinned-target retirement: {e}"
+                        );
                     }
                     tracing::info!(
                         session = %session_db_id,
@@ -306,26 +292,23 @@ impl Server {
             // `max_fires`, retire it now (persist enabled=false) so the
             // next tick's pre-check — and any reload — drops it. One-shot
             // schedules are deleted below, so they don't count.
-            if !payload.one_shot
-                && outcome.is_ok()
-                && let Ok(Some(mut schedule)) = adb.find_schedule(&payload.schedule_id).await
-            {
-                schedule.fire_count = schedule.fire_count.saturating_add(1);
-                if let Some(reason) = schedule.retirement_reason(fired_at) {
-                    schedule.enabled = false;
-                    tracing::info!(
+            if !payload.one_shot && outcome.is_ok() {
+                match self
+                    .account_successful_schedule_fire(&adb, &payload.schedule_id, fired_at)
+                    .await
+                {
+                    Ok(Some((fire_count, reason))) => tracing::info!(
                         agent = %agent_name,
                         schedule = %payload.schedule_id,
-                        fire_count = schedule.fire_count,
+                        fire_count,
                         "Schedule retired after fire ({reason})"
-                    );
-                }
-                if let Err(e) = adb.upsert_schedule(schedule).await {
-                    tracing::error!(
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::error!(
                         agent = %agent_name,
                         schedule = %payload.schedule_id,
                         "Failed to persist schedule fire_count: {e}"
-                    );
+                    ),
                 }
             }
         }
@@ -402,6 +385,89 @@ impl Server {
                 None
             }
         }
+    }
+
+    /// Return the in-process mutex for an agent-owned schedule. The key uses
+    /// the agent DB id as well as the schedule id, which is the schedule's
+    /// durable ownership boundary.
+    async fn schedule_accounting_lock(
+        &self,
+        adb: &crate::agent_db::AgentDb,
+        schedule_id: &str,
+    ) -> Arc<Mutex<()>> {
+        let key = format!("{}:{schedule_id}", adb.id());
+        let mut locks = self.schedule_accounting.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Persist a pre-fire lifecycle retirement while sharing the same lock as
+    /// completion accounting. Returns the retirement reason when a bound was
+    /// reached, whether or not the row was already disabled.
+    async fn retire_schedule_if_due(
+        &self,
+        adb: &crate::agent_db::AgentDb,
+        schedule_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Option<String>> {
+        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
+        let _guard = lock.lock().await;
+        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
+            return Ok(None);
+        };
+        let Some(reason) = schedule.retirement_reason(now) else {
+            return Ok(None);
+        };
+        if schedule.enabled {
+            schedule.enabled = false;
+            adb.upsert_schedule(schedule).await?;
+        }
+        Ok(Some(reason))
+    }
+
+    /// Disable a schedule for a terminal non-turn condition while sharing the
+    /// completion-accounting lock. Missing or already-disabled rows are no-ops.
+    async fn disable_schedule(
+        &self,
+        adb: &crate::agent_db::AgentDb,
+        schedule_id: &str,
+    ) -> anyhow::Result<()> {
+        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
+        let _guard = lock.lock().await;
+        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
+            return Ok(());
+        };
+        if schedule.enabled {
+            schedule.enabled = false;
+            adb.upsert_schedule(schedule).await?;
+        }
+        Ok(())
+    }
+
+    /// Atomically (within this daemon) account for one successful recurring
+    /// schedule turn. The mutex is intentionally acquired only after the turn:
+    /// schedule turns remain asynchronous and may overlap.
+    pub(super) async fn account_successful_schedule_fire(
+        &self,
+        adb: &crate::agent_db::AgentDb,
+        schedule_id: &str,
+        fired_at: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Option<(u32, String)>> {
+        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
+        let _guard = lock.lock().await;
+        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
+            return Ok(None);
+        };
+        schedule.fire_count = schedule.fire_count.saturating_add(1);
+        let retirement = schedule.retirement_reason(fired_at);
+        if retirement.is_some() {
+            schedule.enabled = false;
+        }
+        let fire_count = schedule.fire_count;
+        adb.upsert_schedule(schedule).await?;
+        Ok(retirement.map(|reason| (fire_count, reason)))
     }
 
     /// Load the agent, hydrate from DB, build context with the wake-prompt

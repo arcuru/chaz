@@ -794,6 +794,68 @@ async fn agent_schedule_records_fire_even_on_llm_failure() {
     assert!(fires[0].usage.is_none());
 }
 
+#[tokio::test]
+async fn schedule_accounting_serially_counts_and_retires_at_max_fires() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (_entry, adb) = seed_agent(&server, &registry, "accounting-serial").await;
+    let mut schedule = Schedule::new(
+        "recurring",
+        Trigger::Cron {
+            expr: "0 0 * * * *".into(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    );
+    schedule.max_fires = Some(3);
+    adb.upsert_schedule(schedule).await.unwrap();
+
+    for _ in 0..3 {
+        server
+            .account_successful_schedule_fire(&adb, "recurring", Utc::now())
+            .await
+            .unwrap();
+    }
+
+    let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
+    assert_eq!(schedule.fire_count, 3);
+    assert!(!schedule.enabled);
+}
+
+#[tokio::test]
+async fn schedule_accounting_keeps_every_overlapping_completion() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (_entry, adb) = seed_agent(&server, &registry, "accounting-concurrent").await;
+    let mut schedule = Schedule::new(
+        "recurring",
+        Trigger::Cron {
+            expr: "0 0 * * * *".into(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    );
+    schedule.max_fires = Some(3);
+    adb.upsert_schedule(schedule).await.unwrap();
+
+    const COMPLETIONS: u32 = 12;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..COMPLETIONS {
+        let server = server.clone();
+        let adb = adb.clone();
+        tasks.spawn(async move {
+            server
+                .account_successful_schedule_fire(&adb, "recurring", Utc::now())
+                .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap().unwrap();
+    }
+
+    let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
+    assert_eq!(schedule.fire_count, COMPLETIONS);
+    assert!(!schedule.enabled);
+}
+
 // ---- Home-peer gate ---------------------------------------------------
 
 fn make_agent_ref(db_id: &str, home: Option<&str>) -> crate::session::AgentRef {
