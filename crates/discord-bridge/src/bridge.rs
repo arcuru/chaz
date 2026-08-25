@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chaz_core::backends::BackendManager;
-use chaz_core::bridge::{
-    ApprovalDecision, Bridge, attach_reconciler, chunk_message_chars, inbound_user_entry,
-    is_transient_outbound_status, retry_outbound_chunk,
+use chaz_core::bridge::outbound::{
+    chunk_message_chars, is_transient_outbound_status, retry_outbound_chunk,
 };
+use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
 use chaz_core::commands::{self, CommandContext, CommandOutcome, Parsed};
 use chaz_core::config::Config;
 use chaz_core::hosted_index::DbEntry;
