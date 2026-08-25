@@ -63,27 +63,51 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// List, and optionally leave, every joined Matrix room for a bridge login.
-    Rooms {
-        /// Operate on this login (MXID) when the bridge config has several.
-        #[arg(long)]
-        login: Option<String>,
-
-        /// Actually leave the rooms (the default is a dry-run listing only).
-        #[arg(long)]
-        execute: bool,
-
-        /// Leave attempts per room before giving up.
-        #[arg(long, default_value_t = 3, value_parser = parse_retries)]
-        retries: u32,
-
-        /// Delay between rooms, in milliseconds.
-        #[arg(long, default_value_t = 250, value_parser = parse_delay_ms)]
-        delay_ms: u64,
-    },
+    /// Inspect or leave rooms for a bridge login.
+    Rooms(RoomsArgs),
 }
 
-/// Clap value parser for `rooms --retries`: leave attempts per room, bounded to
+#[derive(clap::Args)]
+struct RoomsArgs {
+    #[command(subcommand)]
+    command: RoomsCommand,
+}
+
+#[derive(clap::Subcommand)]
+enum RoomsCommand {
+    /// List every joined Matrix room without changing membership.
+    List(RoomSelection),
+
+    /// Preview leaving every joined room, or perform it with --execute.
+    LeaveAll(LeaveAllArgs),
+}
+
+#[derive(clap::Args)]
+struct RoomSelection {
+    /// Operate on this login (MXID) when the bridge config has several.
+    #[arg(long)]
+    login: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct LeaveAllArgs {
+    #[command(flatten)]
+    selection: RoomSelection,
+
+    /// Actually leave the rooms (the default is a dry-run preview).
+    #[arg(long)]
+    execute: bool,
+
+    /// Leave attempts per room before giving up.
+    #[arg(long, default_value_t = 3, value_parser = parse_retries)]
+    retries: u32,
+
+    /// Delay between rooms, in milliseconds.
+    #[arg(long, default_value_t = 250, value_parser = parse_delay_ms)]
+    delay_ms: u64,
+}
+
+/// Clap value parser for `rooms leave-all --retries`: leave attempts per room, bounded to
 /// 1..=10. Zero would be a no-op loop, and anything above the cap would stall a
 /// reset indefinitely.
 fn parse_retries(s: &str) -> Result<u32, String> {
@@ -96,7 +120,7 @@ fn parse_retries(s: &str) -> Result<u32, String> {
     Ok(retries)
 }
 
-/// Clap value parser for `rooms --delay-ms`: delay between rooms, bounded to
+/// Clap value parser for `rooms leave-all --delay-ms`: delay between rooms, bounded to
 /// 100..=60000 — a 100ms floor against hammering the homeserver, and a 60s
 /// ceiling so a reset over many rooms cannot drag.
 fn parse_delay_ms(s: &str) -> Result<u64, String> {
@@ -135,12 +159,16 @@ async fn main() -> anyhow::Result<()> {
     // The `rooms` maintenance subcommand runs once and exits; it never starts
     // the bridge or opens the bridge's own backend.
     if let Some(command) = &args.command {
-        let Command::Rooms {
-            login,
-            execute,
-            retries,
-            delay_ms,
-        } = command;
+        let Command::Rooms(rooms) = command;
+        let (login, execute, retries, delay_ms) = match &rooms.command {
+            RoomsCommand::List(selection) => (selection.login.as_deref(), false, 3, 250),
+            RoomsCommand::LeaveAll(args) => (
+                args.selection.login.as_deref(),
+                args.execute,
+                args.retries,
+                args.delay_ms,
+            ),
+        };
         let contents = std::fs::read_to_string(&config_path)?;
         let bridge_cfg: MatrixBridgeConfig = match serde_yaml::from_str(&contents) {
             Ok(cfg) => cfg,
@@ -152,10 +180,10 @@ async fn main() -> anyhow::Result<()> {
         let code = chaz_matrix_bridge::rooms::run_rooms(
             &config_path,
             &bridge_cfg,
-            login.as_deref(),
-            *execute,
-            *retries,
-            *delay_ms,
+            login,
+            execute,
+            retries,
+            delay_ms,
         )
         .await;
         std::process::exit(i32::from(code));
@@ -412,49 +440,62 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
 mod tests {
     use super::*;
 
-    /// Parse a `rooms` invocation through the real clap wiring, returning the
-    /// resulting `(retries, delay_ms)` pair — or `None` when clap rejects it.
-    /// Asserts dry-run stays the default on every accepted parse.
-    fn parse_rooms(args: &[&str]) -> Option<(u32, u64)> {
-        let argv = std::iter::once("chaz-matrix")
-            .chain(std::iter::once("rooms"))
+    /// Parse a `rooms leave-all` invocation through the real clap wiring,
+    /// returning `(execute, retries, delay_ms)` or `None` when clap rejects it.
+    fn parse_leave_all(args: &[&str]) -> Option<(bool, u32, u64)> {
+        let argv = ["chaz-matrix", "rooms", "leave-all"]
+            .into_iter()
             .chain(args.iter().copied())
             .collect::<Vec<_>>();
         let parsed = Args::try_parse_from(argv).ok()?;
-        match parsed.command? {
-            Command::Rooms {
-                execute,
-                retries,
-                delay_ms,
-                ..
-            } => {
-                assert!(!execute, "dry-run must remain the default");
-                Some((retries, delay_ms))
-            }
+        let Command::Rooms(rooms) = parsed.command?;
+        match rooms.command {
+            RoomsCommand::LeaveAll(args) => Some((args.execute, args.retries, args.delay_ms)),
+            RoomsCommand::List(_) => None,
         }
     }
 
     #[test]
-    fn room_args_reject_zero_and_over_max() {
-        // Zero retries is a no-op loop; zero delay discards the guard entirely.
-        assert!(parse_rooms(&["--retries", "0"]).is_none());
-        assert!(parse_rooms(&["--delay-ms", "0"]).is_none());
-        // Over-max values would stall or hammer a reset.
-        assert!(parse_rooms(&["--retries", "11"]).is_none());
-        assert!(parse_rooms(&["--delay-ms", "60001"]).is_none());
-        // Non-numeric input is rejected by the same parsers.
-        assert!(parse_rooms(&["--retries", "many"]).is_none());
-        assert!(parse_rooms(&["--delay-ms", "soon"]).is_none());
+    fn room_commands_have_the_requested_shape() {
+        let parsed = Args::try_parse_from(["chaz-matrix", "rooms", "list"]).unwrap();
+        let Some(Command::Rooms(RoomsArgs {
+            command: RoomsCommand::List(_),
+        })) = parsed.command
+        else {
+            panic!("rooms list parsed as the wrong command");
+        };
+
+        assert_eq!(parse_leave_all(&[]), Some((false, 3, 250)));
+        assert_eq!(parse_leave_all(&["--execute"]), Some((true, 3, 250)));
+        assert!(Args::try_parse_from(["chaz-matrix", "rooms"]).is_err());
+        assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--execute"]).is_err());
+        assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--retries", "3"]).is_err());
     }
 
     #[test]
-    fn room_args_accept_boundaries_and_defaults() {
-        // Inclusive boundaries, each independent of the other's default.
-        assert_eq!(parse_rooms(&["--retries", "1"]), Some((1, 250)));
-        assert_eq!(parse_rooms(&["--retries", "10"]), Some((10, 250)));
-        assert_eq!(parse_rooms(&["--delay-ms", "100"]), Some((3, 100)));
-        assert_eq!(parse_rooms(&["--delay-ms", "60000"]), Some((3, 60000)));
-        // Defaults unchanged: 3 retries, 250ms delay, dry-run.
-        assert_eq!(parse_rooms(&[]), Some((3, 250)));
+    fn leave_all_args_reject_zero_and_over_max() {
+        assert!(parse_leave_all(&["--retries", "0"]).is_none());
+        assert!(parse_leave_all(&["--delay-ms", "0"]).is_none());
+        assert!(parse_leave_all(&["--retries", "11"]).is_none());
+        assert!(parse_leave_all(&["--delay-ms", "60001"]).is_none());
+        assert!(parse_leave_all(&["--retries", "many"]).is_none());
+        assert!(parse_leave_all(&["--delay-ms", "soon"]).is_none());
+    }
+
+    #[test]
+    fn leave_all_args_accept_boundaries_and_defaults() {
+        assert_eq!(parse_leave_all(&["--retries", "1"]), Some((false, 1, 250)));
+        assert_eq!(
+            parse_leave_all(&["--retries", "10"]),
+            Some((false, 10, 250))
+        );
+        assert_eq!(
+            parse_leave_all(&["--delay-ms", "100"]),
+            Some((false, 3, 100))
+        );
+        assert_eq!(
+            parse_leave_all(&["--delay-ms", "60000"]),
+            Some((false, 3, 60000))
+        );
     }
 }
