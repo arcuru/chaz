@@ -54,6 +54,33 @@ struct Args {
     /// with the bridge stopped; it opens the bridge's own backend.
     #[arg(long)]
     print_pubkey: bool,
+
+    /// Maintenance subcommands that run once and exit instead of starting the
+    /// bridge.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// List, and optionally leave, every joined Matrix room for a bridge login.
+    Rooms {
+        /// Operate on this login (MXID) when the bridge config has several.
+        #[arg(long)]
+        login: Option<String>,
+
+        /// Actually leave the rooms (the default is a dry-run listing only).
+        #[arg(long)]
+        execute: bool,
+
+        /// Leave attempts per room before giving up.
+        #[arg(long, default_value_t = 3)]
+        retries: u32,
+
+        /// Delay between rooms, in milliseconds.
+        #[arg(long, default_value_t = 250)]
+        delay_ms: u64,
+    },
 }
 
 /// A login that bootstrapped access and has its credentials in hand, ready to
@@ -76,6 +103,36 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config_path = resolve_config_path(args.config.as_deref())?;
+
+    // The `rooms` maintenance subcommand runs once and exits; it never starts
+    // the bridge or opens the bridge's own backend.
+    if let Some(command) = &args.command {
+        let Command::Rooms {
+            login,
+            execute,
+            retries,
+            delay_ms,
+        } = command;
+        let contents = std::fs::read_to_string(&config_path)?;
+        let bridge_cfg: MatrixBridgeConfig = match serde_yaml::from_str(&contents) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                println!("cannot parse bridge config {}: {e}", config_path.display());
+                std::process::exit(2);
+            }
+        };
+        let code = chaz_matrix_bridge::rooms::run_rooms(
+            &config_path,
+            &bridge_cfg,
+            login.as_deref(),
+            *execute,
+            *retries,
+            *delay_ms,
+        )
+        .await;
+        std::process::exit(i32::from(code));
+    }
+
     let contents = std::fs::read_to_string(&config_path)?;
 
     // Parse the same bytes twice: once as the full chaz config (backends,

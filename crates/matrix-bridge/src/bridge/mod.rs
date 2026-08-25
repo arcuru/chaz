@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
-use client::{Login, MatrixClient, is_allowed};
+use client::is_allowed;
+pub(crate) use client::{Login, MatrixClient};
 use commands::{get_backend, rate_limit};
 use history::read_room_history;
 

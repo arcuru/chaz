@@ -798,3 +798,52 @@ if ! grep -q "detected tool result" "$WORKSPACE/stub-llm.log"; then
 fi
 
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
+
+# ----------------------------------------------------------- room reset ---
+# The `chaz-matrix rooms` maintenance subcommand, run against the same throwaway
+# homeserver and bridge config. It signs in with a fresh throwaway device —
+# never the bridge's own session — so leaving rooms here is harmless to the
+# still-running bridge, whose sync merely observes the membership changes. This
+# phase runs last: every message case above is already done, and the bridge's
+# auto-join only fires on a new invite, so nothing re-joins behind it.
+
+log "room reset: dry-run"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms >"$WORKSPACE/rooms-dryrun.log" 2>&1 ||
+	fail "rooms dry-run failed (see $WORKSPACE/rooms-dryrun.log)"
+grep -q "dry-run" "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run did not report dry-run mode (see $WORKSPACE/rooms-dryrun.log)"
+grep -qF "$ROOM_ID" "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run did not list the DM room (see $WORKSPACE/rooms-dryrun.log)"
+grep -qF "$GROUP_ROOM_ID" "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run did not list the group room (see $WORKSPACE/rooms-dryrun.log)"
+! grep -qE "^left " "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run left a room (see $WORKSPACE/rooms-dryrun.log)"
+
+log "room reset: execute"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms --execute >"$WORKSPACE/rooms-execute.log" 2>&1 ||
+	fail "rooms --execute failed (see $WORKSPACE/rooms-execute.log)"
+grep -qF "left $ROOM_ID" "$WORKSPACE/rooms-execute.log" ||
+	fail "rooms --execute did not leave the DM room (see $WORKSPACE/rooms-execute.log)"
+grep -qF "left $GROUP_ROOM_ID" "$WORKSPACE/rooms-execute.log" ||
+	fail "rooms --execute did not leave the group room (see $WORKSPACE/rooms-execute.log)"
+grep -q "failed 0" "$WORKSPACE/rooms-execute.log" ||
+	fail "rooms --execute summary did not report 0 failed (see $WORKSPACE/rooms-execute.log)"
+
+log "room reset: dry-run after execute (idempotence)"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms >"$WORKSPACE/rooms-dryrun2.log" 2>&1 ||
+	fail "rooms dry-run (after execute) failed (see $WORKSPACE/rooms-dryrun2.log)"
+grep -q "nothing to do" "$WORKSPACE/rooms-dryrun2.log" ||
+	fail "rooms dry-run after execute did not report nothing to do (see $WORKSPACE/rooms-dryrun2.log)"
+! grep -qF "$ROOM_ID" "$WORKSPACE/rooms-dryrun2.log" ||
+	fail "rooms dry-run after execute still listed the DM room (see $WORKSPACE/rooms-dryrun2.log)"
+! grep -qF "$GROUP_ROOM_ID" "$WORKSPACE/rooms-dryrun2.log" ||
+	fail "rooms dry-run after execute still listed the group room (see $WORKSPACE/rooms-dryrun2.log)"
+
+# The agent's password must never appear in any of the three outputs, even
+# though the bridge config that resolves it carries the literal value.
+for out in rooms-dryrun rooms-execute rooms-dryrun2; do
+	grep -qF "$AGENT_PASSWORD" "$WORKSPACE/$out.log" &&
+		fail "agent password leaked into rooms output ($WORKSPACE/$out.log)"
+done
+
+printf '\033[1;32mPASS\033[0m — room reset passed (dry-run lists, --execute leaves, re-run idempotent, no secret leaked)\n' >&2
