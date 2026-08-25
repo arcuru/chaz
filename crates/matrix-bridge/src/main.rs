@@ -74,13 +74,41 @@ enum Command {
         execute: bool,
 
         /// Leave attempts per room before giving up.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 3, value_parser = parse_retries)]
         retries: u32,
 
         /// Delay between rooms, in milliseconds.
-        #[arg(long, default_value_t = 250)]
+        #[arg(long, default_value_t = 250, value_parser = parse_delay_ms)]
         delay_ms: u64,
     },
+}
+
+/// Clap value parser for `rooms --retries`: leave attempts per room, bounded to
+/// 1..=10. Zero would be a no-op loop, and anything above the cap would stall a
+/// reset indefinitely.
+fn parse_retries(s: &str) -> Result<u32, String> {
+    let retries: u32 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid retry count"))?;
+    if !(1..=10).contains(&retries) {
+        return Err(format!("retries must be between 1 and 10, got {retries}"));
+    }
+    Ok(retries)
+}
+
+/// Clap value parser for `rooms --delay-ms`: delay between rooms, bounded to
+/// 100..=60000 — a 100ms floor against hammering the homeserver, and a 60s
+/// ceiling so a reset over many rooms cannot drag.
+fn parse_delay_ms(s: &str) -> Result<u64, String> {
+    let delay_ms: u64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid delay in milliseconds"))?;
+    if !(100..=60_000).contains(&delay_ms) {
+        return Err(format!(
+            "delay_ms must be between 100 and 60000, got {delay_ms}"
+        ));
+    }
+    Ok(delay_ms)
 }
 
 /// A login that bootstrapped access and has its credentials in hand, ready to
@@ -378,4 +406,55 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
     let dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
     Ok(dir.join("chaz").join("matrix-bridge.yaml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a `rooms` invocation through the real clap wiring, returning the
+    /// resulting `(retries, delay_ms)` pair — or `None` when clap rejects it.
+    /// Asserts dry-run stays the default on every accepted parse.
+    fn parse_rooms(args: &[&str]) -> Option<(u32, u64)> {
+        let argv = std::iter::once("chaz-matrix")
+            .chain(std::iter::once("rooms"))
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>();
+        let parsed = Args::try_parse_from(argv).ok()?;
+        match parsed.command? {
+            Command::Rooms {
+                execute,
+                retries,
+                delay_ms,
+                ..
+            } => {
+                assert!(!execute, "dry-run must remain the default");
+                Some((retries, delay_ms))
+            }
+        }
+    }
+
+    #[test]
+    fn room_args_reject_zero_and_over_max() {
+        // Zero retries is a no-op loop; zero delay discards the guard entirely.
+        assert!(parse_rooms(&["--retries", "0"]).is_none());
+        assert!(parse_rooms(&["--delay-ms", "0"]).is_none());
+        // Over-max values would stall or hammer a reset.
+        assert!(parse_rooms(&["--retries", "11"]).is_none());
+        assert!(parse_rooms(&["--delay-ms", "60001"]).is_none());
+        // Non-numeric input is rejected by the same parsers.
+        assert!(parse_rooms(&["--retries", "many"]).is_none());
+        assert!(parse_rooms(&["--delay-ms", "soon"]).is_none());
+    }
+
+    #[test]
+    fn room_args_accept_boundaries_and_defaults() {
+        // Inclusive boundaries, each independent of the other's default.
+        assert_eq!(parse_rooms(&["--retries", "1"]), Some((1, 250)));
+        assert_eq!(parse_rooms(&["--retries", "10"]), Some((10, 250)));
+        assert_eq!(parse_rooms(&["--delay-ms", "100"]), Some((3, 100)));
+        assert_eq!(parse_rooms(&["--delay-ms", "60000"]), Some((3, 60000)));
+        // Defaults unchanged: 3 retries, 250ms delay, dry-run.
+        assert_eq!(parse_rooms(&[]), Some((3, 250)));
+    }
 }
