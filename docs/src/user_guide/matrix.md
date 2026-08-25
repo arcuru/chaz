@@ -97,22 +97,26 @@ Two things worth knowing:
 
 ## Maintenance: listing and leaving rooms
 
-`chaz-matrix rooms` enumerates every room a login is joined to and, with
-`--execute`, leaves them — a reset path for retiring a bridge account or
-clearing it for a fresh test. The default is a dry-run that lists rooms and
-leaves nothing:
+`chaz-matrix rooms` provides separate list and reset commands. `rooms list`
+enumerates every room a login is joined to. `rooms leave-all` previews the same
+set without changing membership; add `--execute` to leave every listed room:
 
 ```bash
-chaz-matrix --config matrix-bridge.yaml rooms            # dry-run: list only
-chaz-matrix --config matrix-bridge.yaml rooms --execute  # leave every joined room
+chaz-matrix --config matrix-bridge.yaml rooms list
+chaz-matrix --config matrix-bridge.yaml rooms leave-all            # preview
+chaz-matrix --config matrix-bridge.yaml rooms leave-all --execute  # leave all
 ```
 
 With a single `logins:` entry the login is implicit; with several, name one by
-MXID with `--login`:
+MXID with `--login` on either command:
 
 ```bash
-chaz-matrix --config matrix-bridge.yaml rooms --login @chaz:example --execute
+chaz-matrix --config matrix-bridge.yaml rooms leave-all \
+  --login @chaz:example --execute
 ```
+
+`--retries` and `--delay-ms` tune only `leave-all`; listing has no leave policy
+to tune.
 
 Exit codes: `0` for a successful run, an empty room list, or a dry-run; `1`
 when one or more rooms failed to leave; `2` for a setup failure — no or

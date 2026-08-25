@@ -104,11 +104,11 @@ stranger, and the agent all joined:
 
 ### Room reset
 
-The `chaz-matrix rooms` maintenance subcommand runs last, against the same
-throwaway homeserver: a dry-run lists every room the agent is joined to and
-leaves nothing, `--execute` leaves them all, and a second dry-run reports
-nothing to do — the reset is idempotent, and the agent's password never appears
-in the command's output.
+The `chaz-matrix rooms` maintenance command runs last, against the same
+throwaway homeserver: `rooms list` lists every room the agent is joined to,
+`rooms leave-all` previews the reset, `rooms leave-all --execute` leaves them
+all, and a final list reports nothing to do — the reset is idempotent, and the
+agent's password never appears in the command's output.
 
 ## Transport
 

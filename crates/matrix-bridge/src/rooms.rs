@@ -1,5 +1,5 @@
-//! `chaz-matrix rooms` — enumerate, and optionally leave, every joined Matrix
-//! room for a bridge login.
+//! `chaz-matrix rooms` — list or leave every joined Matrix room for a bridge
+//! login.
 //!
 //! A maintenance path, not part of the bridge's steady-state runtime. It signs
 //! in with a fresh throwaway device — never the bridge's own persisted session
@@ -293,7 +293,7 @@ async fn run_reset<E: RoomEndpoint>(
                 "{} joined room(s); nothing was left (dry-run)",
                 rooms.len()
             );
-            let _ = writeln!(out, "re-run with --execute to leave them");
+            let _ = writeln!(out, "re-run `rooms leave-all --execute` to leave them");
             0
         }
         Mode::Execute => {
