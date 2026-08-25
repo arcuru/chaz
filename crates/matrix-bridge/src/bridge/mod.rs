@@ -2,10 +2,10 @@ mod client;
 mod commands;
 mod history;
 
-use chaz_core::bridge::{
-    ApprovalDecision, Bridge, chunk_message_bytes, is_transient_outbound_status,
-    retry_outbound_chunk,
+use chaz_core::bridge::outbound::{
+    chunk_message_bytes, is_transient_outbound_status, retry_outbound_chunk,
 };
+use chaz_core::bridge::{ApprovalDecision, Bridge};
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
 };
@@ -1217,7 +1217,7 @@ async fn resolve_pending_approval(
 #[cfg(test)]
 mod tests {
     use super::{MATRIX_MESSAGE_LIMIT, is_transient_matrix_send_error};
-    use chaz_core::bridge::chunk_message_bytes as chunk_message;
+    use chaz_core::bridge::outbound::chunk_message_bytes as chunk_message;
     use matrix_sdk::{Error as MatrixSdkError, HttpError};
     use ruma::api::{
         client::uiaa::UiaaResponse,
