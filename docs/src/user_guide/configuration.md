@@ -496,3 +496,27 @@ service:
 Where this is going: a frontend that finds no daemon will start one and connect to it, rather than opening the database itself. Exactly one of N frontends racing on a cold state directory starts a daemon — a `flock` on `<state_dir>/daemon-start.lock` decides which — and the rest wait for its socket. A start that fails, or a daemon that never accepts connections within the readiness bound, is an error to the caller; there is no path back to opening the database directly.
 
 Nothing connects to the socket yet: `chaz cmd`, `chaz --tui`, `chaz --print` and `chaz usage` still open the database directly, so enabling this changes nothing observable today. The transport bridges are unaffected either way — `chaz-matrix` and `chaz-discord` are separate peers with their own state directories and backends, joined by sync rather than by sharing a database.
+
+### Walkthrough: serve and recover the peer socket
+
+1. Enable the default per-peer socket and start the daemon:
+
+   ```yaml
+   service:
+     enabled: true
+   ```
+
+   ```console
+   $ chaz daemon
+   ... eidetica service socket serving socket=/home/alice/.local/state/chaz/eidetica.sock
+   ... chaz daemon ready; waiting for shutdown signal
+   ```
+
+2. Try to start another daemon against the same config. It refuses before opening the backend:
+
+   ```console
+   $ chaz daemon
+   Error: another chaz daemon already holds /home/alice/.local/state/chaz/daemon.lock — refusing to start a second opener of the same eidetica backend
+   ```
+
+3. Stop the first daemon with Ctrl-C. A clean shutdown removes the socket and releases both advisory locks, so the same command starts normally again. After a crash, the kernel still releases the locks; the next start replaces the stale socket file.
