@@ -17,11 +17,11 @@ use chaz_core::session::{Session, bind_transport, transport_bindings, unbind_tra
 
 use crate::credentials::MatrixCredentials;
 
-use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
+use matrix_sdk::ruma::{OwnedEventId, TransactionId};
 use matrix_sdk::{Room, RoomState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -134,11 +134,19 @@ async fn attach_response_callback(
                     "Delivering Matrix response"
                 );
                 let content = RoomMessageEventContent::text_markdown(&body);
+                // Reuse this ID across retries so the homeserver can deduplicate them.
+                let txn_id = TransactionId::new();
                 retry_outbound_chunk(
                     || {
                         let room = room.clone();
                         let content = content.clone();
-                        async move { room.send(content).await.map(|_| ()) }
+                        let txn_id = txn_id.clone();
+                        async move {
+                            room.send(content)
+                                .with_transaction_id(txn_id)
+                                .await
+                                .map(|_| ())
+                        }
                     },
                     is_transient_matrix_send_error,
                 )
