@@ -25,6 +25,9 @@ backends:
     api_base: https://openrouter.ai/api/v1
     models:
       - name: anthropic/claude-sonnet-4
+        # Pin this model's OpenAI-compatible reasoning mode. Omit to use the
+        # backend or provider default.
+        # reasoning: { enabled: false }
       - name: google/gemini-2.5-pro
   - name: local
     type: openaicompatible
@@ -279,6 +282,22 @@ All LLM HTTP requests are wrapped in a configurable timeout and retried on trans
 | `max_retries`     | `3`     | Retry attempts for transient errors (429, 5xx, timeouts, network) |
 
 Retries use exponential backoff (1s, 2s, 4s, … capped at 30s). Rate-limit responses (HTTP 429) with a `Retry-After` header are honored as the minimum delay. Non-retryable errors (401, 403, 400) fail immediately.
+
+### Per-model reasoning
+
+OpenAI-compatible backends can set a reasoning mode per configured model:
+
+```yaml
+backends:
+  - name: proxy
+    type: openaicompatible
+    api_base: http://127.0.0.1:18081/v1
+    models:
+      - name: example/model
+        reasoning: { enabled: false }
+```
+
+When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit caller choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different modes.
 
 ## Agents
 

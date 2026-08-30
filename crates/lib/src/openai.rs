@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::{
     backends::{ChatContext, LLMBackend},
     cache::{CacheControl, CacheRegion},
-    config::Backend,
+    config::{Backend, ReasoningConfig},
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
     security::SecretStore,
@@ -44,6 +44,10 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ChatTool>>,
+    /// Model-configured default. This must be omitted rather than serialized
+    /// as null when the provider should retain its own reasoning behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
     /// Opt into OpenRouter's extended usage accounting (`cost`, cache details,
     /// reasoning tokens). Unknown to vanilla OpenAI/DeepSeek but ignored
     /// silently per the spec, so we always set it.
@@ -342,6 +346,34 @@ impl OpenAI {
         Ok(Client::with_config(config))
     }
 
+    /// Return the configured reasoning default for `model`, matching either
+    /// its raw id or its `backend:model` form. A caller-provided request field
+    /// remains authoritative because it is not overwritten here.
+    fn reasoning_for_model(&self, model: &str) -> Option<ReasoningConfig> {
+        let model = model.trim_start_matches(&format!("{}:", self.backend.get_name()));
+        self.backend
+            .models
+            .as_ref()?
+            .iter()
+            .find(|configured| configured.name == model)
+            .and_then(|configured| configured.reasoning.clone())
+    }
+
+    fn chat_request<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ChatTool>>,
+    ) -> ChatRequest<'a> {
+        ChatRequest {
+            model,
+            messages,
+            tools,
+            reasoning: self.reasoning_for_model(model),
+            usage: UsageOpts { include: true },
+        }
+    }
+
     /// Execute a single LLM call with tool definitions, returning a structured response.
     ///
     /// This is called by the runtime's ReAct loop. It converts RuntimeMessages
@@ -363,16 +395,15 @@ impl OpenAI {
             &self.backend,
         );
 
-        let request = ChatRequest {
+        let request = self.chat_request(
             model,
-            messages: openai_messages,
-            tools: if openai_tools.is_empty() {
+            openai_messages,
+            if openai_tools.is_empty() {
                 None
             } else {
                 Some(openai_tools)
             },
-            usage: UsageOpts { include: true },
-        };
+        );
 
         let timeout = self.backend.request_timeout();
         let response: ChatResponse = tokio::time::timeout(
@@ -666,12 +697,7 @@ impl LLMBackend for OpenAI {
             "LLM request"
         );
 
-        let request = ChatRequest {
-            model: &model,
-            messages,
-            tools: None,
-            usage: UsageOpts { include: true },
-        };
+        let request = self.chat_request(&model, messages, None);
 
         let timeout = self.backend.request_timeout();
         let response: ChatResponse = tokio::time::timeout(
@@ -1019,6 +1045,73 @@ mod tests {
             },
             cache_control: None,
         }
+    }
+
+    async fn openai_for(reasoning: Option<bool>) -> OpenAI {
+        let (_instance, mut user) = eidetica::Instance::create_backend(
+            Box::new(eidetica::backend::database::InMemory::new()),
+            eidetica::NewUser::passwordless("t"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let mut doc = eidetica::crdt::Doc::new();
+        doc.set("name", "test");
+        let secrets = SecretStore::new(user.create_database(doc, &key).await.unwrap()).await;
+        let mut backend = Backend::new(crate::config::BackendType::OpenAICompatible);
+        backend.name = Some("proxy".to_string());
+        backend.api_base = Some("http://localhost:18081/v1".into());
+        backend.api_key = Some("test-key".into());
+        backend.models = Some(vec![crate::config::Model {
+            name: "test-model".into(),
+            reasoning: reasoning.map(|enabled| ReasoningConfig { enabled }),
+            price_input: None,
+            price_output: None,
+            price_cache_read: None,
+            context_window: None,
+        }]);
+        OpenAI::new(&backend, &secrets)
+    }
+
+    #[tokio::test]
+    async fn configured_reasoning_is_serialized_in_outbound_request() {
+        let backend = openai_for(Some(false)).await;
+        let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_reasoning_is_omitted_from_outbound_request() {
+        // Absent config must omit the field rather than null it, so the
+        // provider default applies.
+        let backend = openai_for(None).await;
+        let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
+        let body = serde_json::to_value(request).unwrap();
+        assert!(
+            body.get("reasoning").is_none(),
+            "expected no `reasoning` field, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_reasoning_matches_backend_prefixed_model_id() {
+        // Callers may pass `backend:model`; the configured default still applies.
+        let backend = openai_for(Some(false)).await;
+        let request = backend.chat_request("proxy:test-model", vec![msg("user", "hi")], None);
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+    }
+
+    #[tokio::test]
+    async fn unknown_model_omits_reasoning_field() {
+        let backend = openai_for(Some(false)).await;
+        let request = backend.chat_request("other-model", vec![msg("user", "hi")], None);
+        let body = serde_json::to_value(request).unwrap();
+        assert!(
+            body.get("reasoning").is_none(),
+            "expected no `reasoning` field, got: {body}"
+        );
     }
 
     #[test]
