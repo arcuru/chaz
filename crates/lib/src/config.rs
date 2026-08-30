@@ -580,6 +580,9 @@ impl Backend {
 pub struct Model {
     /// The name of the model
     pub name: String,
+    /// OpenAI-compatible reasoning mode for requests to this model. Omit to
+    /// leave the provider's default unchanged.
+    pub reasoning: Option<ReasoningConfig>,
     /// Input token price in USD per million tokens, if known. Surfaced in
     /// the TUI model picker; optional because backends typically don't
     /// publish pricing in a standard machine-readable form. Populate
@@ -601,6 +604,17 @@ pub struct Model {
     /// of the global `max_context_tokens` default.
     #[serde(default)]
     pub context_window: Option<u32>,
+}
+
+/// OpenAI-compatible reasoning settings for one configured model.
+///
+/// This is deliberately model-scoped: one backend commonly serves models
+/// with different reasoning defaults. An explicit request setting takes
+/// precedence over this configured default.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ReasoningConfig {
+    /// Enable or disable provider reasoning for this request.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -888,6 +902,8 @@ fn known_config_keys() -> HashSet<&'static str> {
     // ── backends[].models[] ──
     for k in [
         "backends[].models[].name",
+        "backends[].models[].reasoning",
+        "backends[].models[].reasoning.enabled",
         "backends[].models[].price_input",
         "backends[].models[].price_output",
         "backends[].models[].price_cache_read",
@@ -1292,6 +1308,8 @@ backends:
     api_key: "${OPENROUTER_KEY}"
     models:
       - name: "gpt-4"
+        reasoning:
+          enabled: false
       - name: "claude-3"
     request_timeout: 60
     max_retries: 5
@@ -1306,6 +1324,10 @@ backends:
         assert_eq!(b.request_timeout().as_secs(), 60);
         assert_eq!(b.max_retries(), 5);
         assert_eq!(b.models.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            b.models.as_ref().unwrap()[0].reasoning,
+            Some(ReasoningConfig { enabled: false })
+        );
         // secret_key scopes to backend name
         assert_eq!(b.secret_key(), "backend:openrouter");
     }

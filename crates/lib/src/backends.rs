@@ -570,6 +570,7 @@ mod tests {
                 .iter()
                 .map(|m| Model {
                     name: m.to_string(),
+                    reasoning: None,
                     price_input: None,
                     price_output: None,
                     price_cache_read: None,
