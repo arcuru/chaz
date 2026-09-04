@@ -1225,7 +1225,10 @@ async fn config_show_cmd(
          ───────────────────────\n\
          /memory config set <key> <value>  to change\n\
          /memory config reset              to revert to defaults",
-        config.auto_recall_enabled, config.auto_recall_max_entries, config.auto_recall_max_chars, banks_str,
+        config.auto_recall_enabled,
+        config.auto_recall_max_entries,
+        config.auto_recall_max_chars,
+        banks_str,
     ))
 }
 
@@ -1866,6 +1869,56 @@ mod tests {
     }
 
     // ── /memory config: auto_recall_max_chars ────────────────────────────────
+
+    // ── /memory config set: unknown-key warning ────────────────────────────
+
+    async fn config_set_via_cmd(cmd: &MemoryCommand, rest: &str) -> ExtensionCommandOutcome {
+        // config_set_cmd needs a session-bound HookContext for the
+        // agent-DB lookup, like attach_via_dispatcher above.
+        use crate::session::Session;
+        use crate::types::ConversationId;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+        let (_conv, session_db) = cmd.registry.create_session(Some("test")).await.unwrap();
+        let session = Arc::new(TokioMutex::new(
+            Session::new(ConversationId(session_db.root_id().to_string()), session_db).await,
+        ));
+        let ctx = HookContext {
+            agent_name: "alpha".to_string(),
+            model: None,
+            call_depth: 0,
+            session,
+            active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
+        };
+        config_set_cmd(rest, &ctx, &cmd.registry, &cmd.agent_index).await
+    }
+
+    #[tokio::test]
+    async fn config_set_unknown_key_lists_valid_keys() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        // Pre-rename keys are no longer recognized and must hit the
+        // unknown-key warning, which lists the new key names.
+        for old in ["max_entries 5", "max_entry_chars 200", "bogus 1"] {
+            match config_set_via_cmd(&cmd, old).await {
+                ExtensionCommandOutcome::Error(msg) => {
+                    assert!(msg.contains("Unknown key"), "missing warning: {msg}");
+                    assert!(
+                        msg.contains("auto_recall_max_entries")
+                            && msg.contains("auto_recall_max_chars"),
+                        "warning must list new key names: {msg}"
+                    );
+                }
+                ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
+            }
+        }
+        // The renamed keys are still accepted.
+        assert_text(
+            config_set_via_cmd(&cmd, "auto_recall_max_entries 5").await,
+            "Set auto_recall_max_entries = 5",
+        );
+    }
 
     #[test]
     fn auto_recall_config_defaults_to_200_char_cap() {
