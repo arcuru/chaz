@@ -905,6 +905,77 @@ async fn peer_is_home_for_returns_false_when_home_is_another_peer() {
     assert!(!server.peer_is_home_for(&sid, "alpha").await);
 }
 
+// ---- Deferred home-pubkey warnings ----------------------------------
+// `warn_unset_home_pubkey_on_coowned` runs deferred off the critical path
+// (build.rs step 2c). These tests pin its lazy contract: solo agents never
+// trigger a session-index fetch, co-owned agents do, and a precomputed list
+// is reused instead of re-queried.
+
+#[tokio::test]
+async fn home_pubkey_warn_skips_session_fetch_for_solo_agents() {
+    let (_instance, server, registry) = server_fixture().await;
+    seed_agent(&server, &registry, "alpha").await;
+    // A live session exists, so a fetch would return Some — None proves the
+    // solo-agent fast path never touched the session index.
+    registry.create_session(Some("t")).await.unwrap();
+    let fetched =
+        build::warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), None).await;
+    assert!(
+        fetched.is_none(),
+        "solo agents must not trigger a session fetch"
+    );
+}
+
+#[tokio::test]
+async fn home_pubkey_warn_fetches_sessions_for_coowned_agents() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    let other = registry.new_ephemeral_key("other-peer").await.unwrap();
+    registry
+        .grant_on_agent_db(
+            &entry.db_id,
+            &other,
+            "co-owner:test",
+            eidetica::auth::types::Permission::Admin(1),
+        )
+        .await
+        .unwrap();
+    registry.create_session(Some("t")).await.unwrap();
+    let fetched =
+        build::warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), None).await;
+    assert_eq!(
+        fetched.map(|s| s.len()),
+        Some(1),
+        "co-owned agents must trigger a session fetch"
+    );
+}
+
+#[tokio::test]
+async fn home_pubkey_warn_reuses_precomputed_sessions() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    let other = registry.new_ephemeral_key("other-peer").await.unwrap();
+    registry
+        .grant_on_agent_db(
+            &entry.db_id,
+            &other,
+            "co-owner:test",
+            eidetica::auth::types::Permission::Admin(1),
+        )
+        .await
+        .unwrap();
+    // One real session exists, but the caller passes an empty precomputed
+    // list — an empty result proves the cached list was reused, not re-queried.
+    registry.create_session(Some("t")).await.unwrap();
+    let fetched =
+        build::warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), Some(&[])).await;
+    assert_eq!(
+        fetched.map(|s| s.len()),
+        Some(0),
+        "precomputed list must be reused, not re-queried"
+    );
+}
+
 // ---- Bridge-home migration ------------------------------------------
 
 fn bridge_set(keys: &[&eidetica::auth::crypto::PublicKey]) -> std::collections::HashSet<String> {

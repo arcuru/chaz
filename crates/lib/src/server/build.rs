@@ -216,13 +216,9 @@ pub async fn build(
         hosted_index::build_from_user(&user).await?
     };
 
-    // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
-    // still unset (legacy default). These keep working as before — any
-    // keyholder may run — but on co-owned agents that's the multi-peer
-    // race the home-peer system exists to fix. WARN with the recovery
-    // command so operators see actionable migration guidance instead of
-    // silent forks.
-    warn_unset_home_pubkey_on_coowned(&registry, &agent_index_store).await;
+    // NOTE: the co-owned home_pubkey migration warnings used to run here.
+    // They moved to `run_deferred_startup` (step 2c) — the session-index
+    // scan is the slowest query in startup and the warnings are advisory.
 
     // Attach default memory banks declared in agent configs. Idempotent —
     // already-attached banks are skipped (grant_on_memory_bank is idempotent,
@@ -664,7 +660,10 @@ pub async fn build(
 ///    the blob store and refreshes declarative agent fields. This is the
 ///    data-correctness gate: `mark_startup_ready` runs immediately after
 ///    so held turns release the moment agent config is consistent, before
-///    the (slower) schedule + routine work below.
+///    the (slower) schedule + routine work below. The home-pubkey
+///    migration warnings also run here (lazy: no session scan for all-solo
+///    setups; the fetched list feeds 3b so the session index is walked at
+///    most once).
 /// 3. Schedule materialization + routine engine — long-lived background
 ///    services; nothing user-facing waits on them.
 ///
@@ -722,6 +721,22 @@ async fn run_deferred_startup(
     info!(
         ready_after_ms = deferred_start.elapsed().as_millis() as u64,
         "Startup gate released — message processing enabled"
+    );
+
+    // 2c. Home-pubkey migration warnings for pre-existing co-owned
+    //     agents/sessions whose `home_pubkey` is still unset (legacy
+    //     default). Deferred off the critical path: the session-index scan
+    //     is the slowest query in startup and these warnings are advisory.
+    //     Lazy: all-solo setups fetch nothing (returns `None`); otherwise
+    //     the fetched list is handed to 3b below so the routine engine
+    //     doesn't re-query it.
+    let t = Instant::now();
+    let deferred_sessions =
+        warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), None).await;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        sessions = deferred_sessions.as_ref().map(|s| s.len()),
+        "Deferred: checked home_pubkey on co-owned agents"
     );
 
     // 3a. Translate YAML `schedules:` into agent-owned Schedules. Each
@@ -844,8 +859,12 @@ async fn run_deferred_startup(
         server.set_routine_engine(engine.clone());
         // Pick up every session's routines + ensure the server is
         // watching those sessions so directive writes from fires drive
-        // an agent turn.
-        let sessions = registry.list_sessions().await.unwrap_or_default();
+        // an agent turn. Reuses the 2c home_pubkey scan's list when it
+        // fetched one so the index isn't walked twice per boot.
+        let sessions = match deferred_sessions {
+            Some(s) => s,
+            None => registry.list_sessions().await.unwrap_or_default(),
+        };
         for s in sessions {
             let Ok((_conv, sdb)) = registry.open_session(&s.session_db_id).await else {
                 continue;
@@ -1511,15 +1530,25 @@ async fn pull_session_tree_from_agent_peers(
 ///
 /// Solo agents (single AuthKey) are skipped: there's only one peer that
 /// can run them anyway, so the lack of `home_pubkey` causes no fork.
-async fn warn_unset_home_pubkey_on_coowned(
+///
+/// Runs deferred off the critical path (step 2c of `run_deferred_startup`).
+/// Lazy: the session-index scan only happens when at least one hosted agent
+/// is actually co-owned — all-solo setups return `None` without touching the
+/// session index. Pass an already-computed session list (e.g. from an earlier
+/// startup step) to skip the fetch; the list that was scanned (fetched or
+/// reused) is returned so a later step can reuse it in turn. A fetch failure
+/// warns nothing and returns `None`, same as before.
+pub(crate) async fn warn_unset_home_pubkey_on_coowned(
     registry: &session::SessionRegistry,
     agent_index: &hosted_index::HostedIndex,
-) {
+    precomputed_sessions: Option<&[session::SessionIndex]>,
+) -> Option<Vec<session::SessionIndex>> {
     let agents = agent_index.list();
-    let Ok(sessions) = registry.list_sessions().await else {
-        return;
-    };
 
+    // Count active AuthKeys per agent first. Solo agents can never fork, so
+    // when every hosted agent is solo there is nothing to warn about and the
+    // expensive session-index scan below is skipped entirely.
+    let mut coowned: Vec<(&hosted_index::DbEntry, usize)> = Vec::new();
     for entry in &agents {
         // Count active AuthKeys on the agent DB.
         let active_count = match registry
@@ -1543,10 +1572,27 @@ async fn warn_unset_home_pubkey_on_coowned(
             _ => continue,
         };
 
-        if active_count <= 1 {
-            continue; // Solo agent, no race possible.
+        if active_count > 1 {
+            coowned.push((entry, active_count));
         }
+    }
+    if coowned.is_empty() {
+        return None;
+    }
 
+    // Only co-owned agents can fork, so only now touch the session index —
+    // reusing the caller's list when one was already computed at startup.
+    let sessions: Vec<session::SessionIndex> = match precomputed_sessions {
+        Some(cached) => cached.to_vec(),
+        None => {
+            let Ok(fetched) = registry.list_sessions().await else {
+                return None;
+            };
+            fetched
+        }
+    };
+
+    for (entry, active_count) in &coowned {
         // Agent-level home_pubkey check.
         let agent_level_home = match registry
             .open_agent_db(&entry.db_id, Some(&entry.pubkey))
@@ -1589,6 +1635,8 @@ async fn warn_unset_home_pubkey_on_coowned(
             }
         }
     }
+
+    Some(sessions)
 }
 
 /// Resolve the configured web-search backends: extract each API key (if any)
