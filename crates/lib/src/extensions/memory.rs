@@ -13,8 +13,8 @@
 //! ```text
 //! /memory config show
 //! /memory config set auto_recall_enabled false
-//! /memory config set max_entries 5
-//! /memory config set max_entry_chars 200
+//! /memory config set auto_recall_max_entries 5
+//! /memory config set auto_recall_max_chars 200
 //! /memory config reset
 //! ```
 
@@ -49,12 +49,12 @@ struct AutoRecallConfig {
     #[serde(default = "default_true")]
     auto_recall_enabled: bool,
     /// Max entries to surface from own memory + each bank.
-    #[serde(default = "default_max_entries")]
-    max_entries: usize,
+    #[serde(default = "default_auto_recall_max_entries")]
+    auto_recall_max_entries: usize,
     /// Max characters per entry surfaced in the context tail; longer
     /// values are truncated with an elision marker.
-    #[serde(default = "default_max_entry_chars")]
-    max_entry_chars: usize,
+    #[serde(default = "default_auto_recall_max_chars")]
+    auto_recall_max_chars: usize,
     /// Which banks participate in auto-recall. `None` = all attached banks.
     #[serde(default)]
     auto_recall_banks: Option<Vec<String>>,
@@ -63,18 +63,18 @@ struct AutoRecallConfig {
 fn default_true() -> bool {
     true
 }
-fn default_max_entries() -> usize {
+fn default_auto_recall_max_entries() -> usize {
     3
 }
-fn default_max_entry_chars() -> usize {
+fn default_auto_recall_max_chars() -> usize {
     200
 }
 impl Default for AutoRecallConfig {
     fn default() -> Self {
         Self {
             auto_recall_enabled: true,
-            max_entries: 3,
-            max_entry_chars: 200,
+            auto_recall_max_entries: 3,
+            auto_recall_max_chars: 200,
             auto_recall_banks: None,
         }
     }
@@ -353,8 +353,8 @@ impl ContextTail for MemoryContextTail {
                 return Ok(None);
             }
 
-            let max_entries = config.max_entries;
-            let entry_cap = Some(config.max_entry_chars);
+            let max_entries = config.auto_recall_max_entries;
+            let entry_cap = Some(config.auto_recall_max_chars);
 
             // Search own memory
             let own_results = search_memory(
@@ -1218,14 +1218,14 @@ async fn config_show_cmd(
     ExtensionCommandOutcome::Text(format!(
         "Auto-recall config:\n\
          ───────────────────────\n\
-         auto_recall_enabled = {}\n\
-         max_entries         = {}\n\
-         max_entry_chars     = {}\n\
-         auto_recall_banks   = {}\n\
+         auto_recall_enabled     = {}\n\
+         auto_recall_max_entries = {}\n\
+         auto_recall_max_chars   = {}\n\
+         auto_recall_banks       = {}\n\
          ───────────────────────\n\
          /memory config set <key> <value>  to change\n\
          /memory config reset              to revert to defaults",
-        config.auto_recall_enabled, config.max_entries, config.max_entry_chars, banks_str,
+        config.auto_recall_enabled, config.auto_recall_max_entries, config.auto_recall_max_chars, banks_str,
     ))
 }
 
@@ -1240,8 +1240,8 @@ async fn config_set_cmd(
         None => {
             return ExtensionCommandOutcome::Error(
                 "Usage: /memory config set <key> <value>\n\
-                 Keys: auto_recall_enabled (true|false), max_entries (1-20), \
-                 max_entry_chars (1-2000), auto_recall_banks (comma-separated names)"
+                 Keys: auto_recall_enabled (true|false), auto_recall_max_entries (1-20), \
+                 auto_recall_max_chars (1-2000), auto_recall_banks (comma-separated names)"
                     .into(),
             );
         }
@@ -1263,16 +1263,16 @@ async fn config_set_cmd(
                 ));
             }
         },
-        "max_entries" => match value.parse::<usize>() {
-            Ok(n) if (1..=20).contains(&n) => config.max_entries = n,
+        "auto_recall_max_entries" => match value.parse::<usize>() {
+            Ok(n) if (1..=20).contains(&n) => config.auto_recall_max_entries = n,
             _ => {
                 return ExtensionCommandOutcome::Error(format!(
                     "Invalid value '{value}'. Must be 1–20."
                 ));
             }
         },
-        "max_entry_chars" => match value.parse::<usize>() {
-            Ok(n) if (1..=2000).contains(&n) => config.max_entry_chars = n,
+        "auto_recall_max_chars" => match value.parse::<usize>() {
+            Ok(n) if (1..=2000).contains(&n) => config.auto_recall_max_chars = n,
             _ => {
                 return ExtensionCommandOutcome::Error(format!(
                     "Invalid value '{value}'. Must be 1–2000."
@@ -1289,7 +1289,7 @@ async fn config_set_cmd(
         }
         _ => {
             return ExtensionCommandOutcome::Error(format!(
-                "Unknown key '{key}'. Valid keys: auto_recall_enabled, max_entries, max_entry_chars, auto_recall_banks"
+                "Unknown key '{key}'. Valid keys: auto_recall_enabled, auto_recall_max_entries, auto_recall_max_chars, auto_recall_banks"
             ));
         }
     }
@@ -1865,18 +1865,18 @@ mod tests {
         }
     }
 
-    // ── /memory config: max_entry_chars ────────────────────────────────
+    // ── /memory config: auto_recall_max_chars ────────────────────────────────
 
     #[test]
     fn auto_recall_config_defaults_to_200_char_cap() {
         let cfg = AutoRecallConfig::default();
-        assert_eq!(cfg.max_entry_chars, 200);
+        assert_eq!(cfg.auto_recall_max_chars, 200);
         // Configs stored before the cap existed deserialize with the
         // default rather than zero.
         let parsed: AutoRecallConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.max_entry_chars, 200);
+        assert_eq!(parsed.auto_recall_max_chars, 200);
         let roundtrip: AutoRecallConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(roundtrip.max_entry_chars, 200);
+        assert_eq!(roundtrip.auto_recall_max_chars, 200);
     }
 }
