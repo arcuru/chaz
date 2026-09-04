@@ -386,16 +386,23 @@ impl RoutineEngine {
         self.register_agent(agent_db_id, agent_db).await?;
 
         // A metadata-only interval edit must not move an already scheduled
-        // first fire.  Keep the existing slot only when the trigger is
-        // unchanged; creation, enablement, and trigger changes have no prior
-        // live interval and therefore seed from now instead.
+        // first fire, but it must invalidate already-detached payloads: the
+        // generation names the executable content (trigger + prompt/target),
+        // not just the slot. Keep the existing slot when the trigger is
+        // unchanged; preserve the incarnation only when the dispatch payload
+        // is also identical (a true no-op reload). A prompt/target edit keeps
+        // its slot yet bumps the generation, so a detached old payload no
+        // longer validates. Creation, enablement, and trigger changes have no
+        // prior live interval and seed from now with a fresh incarnation.
         let mut state = self.state.lock().await;
         for (id, prior) in prior_intervals {
             if let Some(entry) = state.routines.get_mut(&id)
                 && entry.routine.trigger == prior.routine.trigger
             {
                 entry.next_fire = prior.next_fire;
-                entry.incarnation = prior.incarnation;
+                if entry.routine.target.payload == prior.routine.target.payload {
+                    entry.incarnation = prior.incarnation;
+                }
                 state
                     .heap
                     .retain(|Reverse((_, queued_id))| queued_id != &id);
@@ -1880,7 +1887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_reload_keeps_agent_schedule_generation() {
+    async fn metadata_reload_bumps_agent_schedule_generation() {
         use crate::agent_db::{Schedule, ScheduleTarget};
         let (_inst, _user, peer, adb) = agent_fixture().await;
         let owner = adb.id().to_string();
@@ -1900,6 +1907,36 @@ mod tests {
 
         schedule.prompt = "updated metadata".into();
         adb.upsert_schedule(schedule).await.unwrap();
+        engine.reload_agent(&owner, &adb).await.unwrap();
+
+        let after = engine.current_generation(&id).await;
+        assert_ne!(
+            after, before,
+            "a prompt edit must invalidate detached payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_reload_preserves_agent_schedule_generation() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:poll"));
+        adb.upsert_schedule(Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        ))
+        .await
+        .unwrap();
+        let engine = RoutineEngine::new(peer, None).await.unwrap();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        let before = engine.current_generation(&id).await;
+
+        // No-op reload (nothing changed) must not invalidate live payloads.
         engine.reload_agent(&owner, &adb).await.unwrap();
 
         assert_eq!(engine.current_generation(&id).await, before);

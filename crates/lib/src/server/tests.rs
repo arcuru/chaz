@@ -1443,6 +1443,53 @@ async fn fire_schedule_skips_dispatched_payload_after_same_id_replacement() {
 }
 
 #[tokio::test]
+async fn fire_schedule_skips_dispatched_payload_after_metadata_edit() {
+    // Gap (a): a prompt-only edit keeps the same trigger/slot, so the
+    // detached old payload must no longer validate — the generation now
+    // names the executable content, not just the slot.
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+    let owner_id = entry.db_id.to_string();
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 9 * * *".into(),
+        },
+        "old prompt",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    let engine = schedule_engine_for(&server, &registry, &owner_id, &adb).await;
+    let routine_id = crate::routine::RoutineId::new(format!("agent:{owner_id}:wake"));
+    let mut payload = fresh_schedule_payload(&owner_id, "wake", "old prompt");
+    payload.generation = engine.current_generation(&routine_id).await;
+
+    // Metadata-only edit: same trigger, new prompt.
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 9 * * *".into(),
+        },
+        "replacement prompt",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    engine.reload_agent(&owner_id, &adb).await.unwrap();
+
+    server.fire_agent_schedule(payload).await.unwrap();
+    assert!(adb.list_schedule_fires().await.unwrap().is_empty());
+    assert!(
+        registry
+            .list_sessions()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn fire_schedule_runs_dispatched_payload_for_live_entry() {
     let (_instance, server, registry) = server_fixture().await;
     let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
