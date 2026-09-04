@@ -60,23 +60,13 @@ impl Server {
         // Require a generation-bearing payload to still name the live entry
         // before it can create a session or begin any turn work. Legacy
         // persisted payloads omit this field and retain the prior behavior.
-        if let Some(generation) = &payload.generation {
-            let routine_id = crate::routine::RoutineId::new(format!(
-                "agent:{}:{}",
-                payload.owner_agent_db_id, payload.schedule_id
-            ));
-            let current = match self.routine_engine() {
-                Some(engine) => engine.current_generation(&routine_id).await,
-                None => None,
-            };
-            if current.as_deref() != Some(generation) {
-                tracing::debug!(
-                    agent = %agent_entry.display_name,
-                    schedule = %payload.schedule_id,
-                    "Stale agent schedule fire; skipping"
-                );
-                return Ok(());
-            }
+        if !self.schedule_generation_is_live(&payload).await {
+            tracing::debug!(
+                agent = %agent_entry.display_name,
+                schedule = %payload.schedule_id,
+                "Stale agent schedule fire; skipping"
+            );
+            return Ok(());
         }
 
         // 1b. Lifecycle bound check (Gap 4). The agent DB is the
@@ -100,7 +90,7 @@ impl Server {
         }
 
         // 2. Resolve target
-        let target: ScheduleTarget = serde_json::from_value(payload.target)
+        let target: ScheduleTarget = serde_json::from_value(payload.target.clone())
             .map_err(|e| anyhow::anyhow!("invalid schedule target in payload: {e}"))?;
 
         let agent_name = agent_entry.display_name.clone();
@@ -252,6 +242,22 @@ impl Server {
             }
         }
 
+        // Re-validate after target resolution + lock acquisition: a remove
+        // or same-ID replacement (including a metadata-only prompt/target
+        // edit, which now bumps the generation) may have landed between the
+        // pre-check above and turn start. Fail closed — release the lock
+        // and skip before any LLM work or cost attribution.
+        if !self.schedule_generation_is_live(&payload).await {
+            tracing::debug!(
+                agent = %agent_name,
+                schedule = %payload.schedule_id,
+                "Stale agent schedule fire at turn start; skipping"
+            );
+            let mut processing = self.processing.lock().await;
+            processing.remove(&session_db_id);
+            return Ok(());
+        }
+
         // 4. Load the agent + build context + run the turn.
         let outcome = self
             .run_schedule_turn(
@@ -363,6 +369,29 @@ impl Server {
         crate::extension::read_disabled(adb.database())
             .await
             .unwrap_or_default()
+    }
+
+    /// True when a generation-bearing payload still names the live engine
+    /// entry. Legacy payloads without a generation always pass. Called both
+    /// before session creation and again after target resolution + lock
+    /// acquisition so a remove/replace landing in between can't slip a
+    /// detached turn through.
+    async fn schedule_generation_is_live(
+        &self,
+        payload: &crate::routine::AgentSchedulePayload,
+    ) -> bool {
+        let Some(generation) = &payload.generation else {
+            return true;
+        };
+        let routine_id = crate::routine::RoutineId::new(format!(
+            "agent:{}:{}",
+            payload.owner_agent_db_id, payload.schedule_id
+        ));
+        let current = match self.routine_engine() {
+            Some(engine) => engine.current_generation(&routine_id).await,
+            None => None,
+        };
+        current.as_deref() == Some(generation)
     }
 
     /// Open the agent's Living Agent DB if this peer hosts the agent.
