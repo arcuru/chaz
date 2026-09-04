@@ -148,21 +148,24 @@ Per-agent settings stored in the agent DB. View and change with `/memory config`
 /memory config show
 # Auto-recall config:
 # ──────────────────────
-# auto_recall_enabled = true
-# max_entries         = 3
-# auto_recall_banks   = (all attached)
+# auto_recall_enabled     = true
+# auto_recall_max_entries = 3
+# auto_recall_max_chars   = 200
+# auto_recall_banks       = (all attached)
 
-/memory config set max_entries 5
+/memory config set auto_recall_max_entries 5
+/memory config set auto_recall_max_chars 200
 /memory config set auto_recall_banks project-notes,shared-facts
 /memory config set auto_recall_enabled false       # disable auto-recall
 /memory config reset                             # revert to defaults
 ```
 
-| Setting               | Default | Range      | What                                                   |
-| --------------------- | ------- | ---------- | ------------------------------------------------------ |
-| `auto_recall_enabled` | `true`  | true/false | Turn autonomous auto-recall on/off                     |
-| `max_entries`         | `3`     | 1–20       | Max results auto-recalled from own memory + per bank   |
-| `auto_recall_banks`   | _(all)_ | names      | Which banks participate; comma-separated, empty = none |
+| Setting                   | Default | Range      | What                                                   |
+| ------------------------- | ------- | ---------- | ------------------------------------------------------ |
+| `auto_recall_enabled`     | `true`  | true/false | Turn autonomous auto-recall on/off                     |
+| `auto_recall_max_entries` | `3`     | 1–20       | Max results auto-recalled from own memory + per bank   |
+| `auto_recall_max_chars`   | `200`   | 1–2000     | Max characters per auto-recalled entry (truncated)     |
+| `auto_recall_banks`       | _(all)_ | names      | Which banks participate; comma-separated, empty = none |
 
 Disabling auto-recall stops the `## Relevant Memories` block but leaves the `remember`/`recall` tools fully functional. Auto-recall only searches banks listed in `auto_recall_banks` (or all attached banks when unset).
 
