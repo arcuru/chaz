@@ -328,7 +328,7 @@ Each schedule has a **target**: `Pinned` (fire into a specific existing session)
 - `max_fires` — retire after N fires. `cron` hourly + `max_fires: 8` = "wake hourly for 8 hours".
 - `expires_at` — an RFC 3339 instant after which it stops.
 
-Whichever is hit first retires the schedule: the fire path (the authoritative chokepoint, which holds the agent DB) persists `enabled = false` and the per-fire `fire_count`, so `max_fires` survives restarts and a retired schedule is **not** re-seeded on reload. A retired schedule is kept (disabled) rather than deleted so its history stays auditable — `schedule_list` shows the bounds and a `[fired N×]` counter. (Implementation note: the in-memory routine keeps its cron slot until the next reload/restart, but every post-bound tick early-returns at the fire path without running the agent — correctness is at the chokepoint, not the heap.)
+Whichever is hit first retires the schedule: the fire path (the authoritative chokepoint, which holds the agent DB) persists `enabled = false` and the per-fire `fire_count`, so `max_fires` survives restarts and a retired schedule is **not** re-seeded on reload. Admission reserves the slot before the turn runs, so overlapping turns can't overshoot `max_fires`; a failed turn refunds its slot, keeping the bound a count of successful fires rather than attempts. A retired schedule is kept (disabled) rather than deleted so its history stays auditable — `schedule_list` shows the bounds and a `[fired N×]` counter. (Implementation note: the in-memory routine keeps its cron slot until the next reload/restart, but every post-bound tick early-returns at the fire path without running the agent — correctness is at the chokepoint, not the heap.)
 
 A schedule whose `Pinned` session is gone, or whose owning agent is no longer a member, self-skips at fire time (logged, not errored) — there is no detach/delete sweep.
 
@@ -376,6 +376,88 @@ Example — make `researcher` check the current session five minutes after each 
 ```text
 /schedule add interval check-in 300 researcher Check for updates and report only actionable changes.
 ```
+
+### Walkthrough: interval wake, failure, and recovery
+
+A full life-cycle run-through with the `watcher` agent: a 60-second Fresh
+interval capped at 3 fires, created from the agent side with the
+`schedule_add` tool. Every transcript below is the real surface — tool
+results and `schedule_list` rows, quoted exactly as chaz renders them.
+
+1. **Happy path — create and first fire.** The agent calls `schedule_add`:
+
+   ```json
+   {
+     "id": "watcher",
+     "interval_seconds": 60,
+     "target": "fresh",
+     "max_fires": 3,
+     "task": "Check the deploy queue and report only actionable changes"
+   }
+   ```
+
+   Tool result:
+
+   ```text
+   Added schedule 'watcher' on agent 'watcher': every 60s → fresh session (max 3 fires) — Check the deploy queue and report only actionable changes
+   ```
+
+   Sixty seconds later the engine fires: a Fresh session is created, the
+   owner's turn runs with the prompt as invocation-scoped input, and the
+   listing advances:
+
+   ```text
+   Schedules on 'watcher':
+   - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
+   ```
+
+2. **Failure — the backend is down.** The next fire's turn fails (LLM
+   unreachable). The fire is still recorded for audit, but with no usage
+   metadata — and its `max_fires` slot is refunded, so the listing is
+   unchanged and the schedule keeps trying instead of burning budget on
+   attempts:
+
+   ```text
+   Schedules on 'watcher':
+   - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
+   ```
+
+   Same `[fired 1×]` — the failed turn consumed nothing. A torn-down
+   variant of the same story: a prompt edit landing between dispatch and
+   turn start makes the detached turn fail its generation re-check
+   (`Stale agent schedule fire at turn start; skipping`), and the
+   just-created Fresh session is deregistered and marked closed rather
+   than left behind as a user-visible empty session.
+
+3. **Retirement and recovery — the cap is reached.** Fires 2 and 3
+   succeed. The third admission spends the last slot, so the row retires
+   on the spot (`Schedule retired after fire (reached max_fires (3))` in
+   the server log):
+
+   ```text
+   Schedules on 'watcher':
+   - **watcher** [every 60s] (disabled) (max 3 fires) [fired 3×] → fresh — Check the deploy queue and report only actionable changes
+   ```
+
+   The retired row is kept for audit, not deleted. To put the watcher
+   back on duty with a fresh budget, raise the bound and re-enable it —
+   changes take effect on the running engine immediately:
+
+   ```json
+   { "id": "watcher", "max_fires": 6, "enabled": true }
+   ```
+
+   ```text
+   Modified schedule 'watcher' on 'watcher': enabled=true max_fires=6
+   ```
+
+4. **Overlap — why the cap holds.** Interval turns run asynchronously and
+   may overlap: admission reserves the `max_fires` slot _before_ the turn
+   starts, under one in-process lock per schedule. Twelve turns piling
+   onto `max_fires: 3` run exactly three — the rest skip at admission and
+   record nothing. The lock is process-local (two chaz processes hosting
+   the same agent are out of scope); in practice the home-peer gate means
+   a single peer admits a schedule's fires.
 
 ## Tool Narrowing
 
