@@ -347,8 +347,7 @@ impl OpenAI {
     }
 
     /// Return the configured reasoning default for `model`, matching either
-    /// its raw id or its `backend:model` form. A caller-provided request field
-    /// remains authoritative because it is not overwritten here.
+    /// its raw id or its `backend:model` form.
     fn reasoning_for_model(&self, model: &str) -> Option<ReasoningConfig> {
         let model = model.trim_start_matches(&format!("{}:", self.backend.get_name()));
         self.backend
@@ -921,6 +920,7 @@ fn convert_chat_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReasoningEffort;
 
     #[test]
     fn usage_normalizes_openai_style_cached_tokens() {
@@ -1047,7 +1047,7 @@ mod tests {
         }
     }
 
-    async fn openai_for(reasoning: Option<bool>) -> OpenAI {
+    async fn openai_for(reasoning: Option<ReasoningEffort>) -> OpenAI {
         let (_instance, mut user) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
             eidetica::NewUser::passwordless("t"),
@@ -1064,7 +1064,7 @@ mod tests {
         backend.api_key = Some("test-key".into());
         backend.models = Some(vec![crate::config::Model {
             name: "test-model".into(),
-            reasoning: reasoning.map(|enabled| ReasoningConfig { enabled }),
+            reasoning: reasoning.map(|effort| ReasoningConfig { effort }),
             price_input: None,
             price_output: None,
             price_cache_read: None,
@@ -1075,10 +1075,37 @@ mod tests {
 
     #[tokio::test]
     async fn configured_reasoning_is_serialized_in_outbound_request() {
-        let backend = openai_for(Some(false)).await;
+        let backend = openai_for(Some(ReasoningEffort::None)).await;
         let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
         let body = serde_json::to_value(request).unwrap();
-        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "none"}));
+    }
+
+    #[tokio::test]
+    async fn nonzero_reasoning_effort_is_serialized_verbatim() {
+        let backend = openai_for(Some(ReasoningEffort::High)).await;
+        let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn every_reasoning_effort_matches_openrouter_wire_string() {
+        // The gateway only accepts these exact strings; `xhigh` in
+        // particular must not become `x_high` under a rename rule change.
+        let cases = [
+            (ReasoningEffort::None, "none"),
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ];
+        for (effort, wire) in cases {
+            let v = serde_json::to_value(ReasoningConfig { effort }).unwrap();
+            assert_eq!(v, serde_json::json!({"effort": wire}));
+        }
     }
 
     #[tokio::test]
@@ -1097,15 +1124,15 @@ mod tests {
     #[tokio::test]
     async fn configured_reasoning_matches_backend_prefixed_model_id() {
         // Callers may pass `backend:model`; the configured default still applies.
-        let backend = openai_for(Some(false)).await;
+        let backend = openai_for(Some(ReasoningEffort::None)).await;
         let request = backend.chat_request("proxy:test-model", vec![msg("user", "hi")], None);
         let body = serde_json::to_value(request).unwrap();
-        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "none"}));
     }
 
     #[tokio::test]
     async fn unknown_model_omits_reasoning_field() {
-        let backend = openai_for(Some(false)).await;
+        let backend = openai_for(Some(ReasoningEffort::None)).await;
         let request = backend.chat_request("other-model", vec![msg("user", "hi")], None);
         let body = serde_json::to_value(request).unwrap();
         assert!(

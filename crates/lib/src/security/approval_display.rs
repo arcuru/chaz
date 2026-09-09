@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn over_length_values_are_capped_and_marked() {
-        let raw = "@".to_string() + &"a".repeat(200);
+        let raw = "@".to_string() + "a".repeat(200).as_str();
         let q = quarantine(&raw);
         assert_eq!(q.text.chars().count(), DISPLAY_CAP);
         assert!(q.text.ends_with('…'));
