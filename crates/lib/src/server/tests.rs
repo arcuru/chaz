@@ -779,6 +779,17 @@ async fn agent_schedule_records_fire_even_on_llm_failure() {
 
     let (entry, adb) = seed_agent(&server, &registry, "delta").await;
 
+    adb.upsert_schedule(Schedule::new(
+        "f1",
+        Trigger::Interval {
+            period: std::time::Duration::from_secs(60),
+        },
+        "do thing",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+
     let payload = fresh_schedule_payload(&entry.db_id.to_string(), "f1", "do thing");
     let _ = server.fire_agent_schedule(payload).await;
 
@@ -842,6 +853,40 @@ async fn schedule_admission_serially_reserves_and_retires_at_max_fires() {
         ),
         "admission past max_fires must retire-skip"
     );
+}
+
+#[tokio::test]
+async fn schedule_admission_rejects_missing_and_disabled_rows() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (_entry, adb) = seed_agent(&server, &registry, "alpha").await;
+
+    assert!(matches!(
+        server
+            .try_admit_schedule_fire(&adb, "missing", Utc::now(), true)
+            .await
+            .unwrap(),
+        crate::server::schedule::ScheduleAdmission::Retired(reason)
+            if reason == "schedule was removed"
+    ));
+
+    let mut schedule = Schedule::new(
+        "disabled",
+        Trigger::Interval {
+            period: std::time::Duration::from_secs(60),
+        },
+        "check",
+        crate::agent_db::ScheduleTarget::Fresh,
+    );
+    schedule.enabled = false;
+    adb.upsert_schedule(schedule).await.unwrap();
+    assert!(matches!(
+        server
+            .try_admit_schedule_fire(&adb, "disabled", Utc::now(), true)
+            .await
+            .unwrap(),
+        crate::server::schedule::ScheduleAdmission::Retired(reason)
+            if reason == "schedule is disabled"
+    ));
 }
 
 #[tokio::test]
@@ -986,7 +1031,10 @@ async fn schedule_admission_refund_frees_slot_after_failed_turn() {
     );
     let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
     assert_eq!(schedule.fire_count, 1);
-    assert!(!schedule.enabled, "admission spending the last slot retires");
+    assert!(
+        !schedule.enabled,
+        "admission spending the last slot retires"
+    );
 
     server
         .refund_schedule_fire_admission(&adb, "recurring", Utc::now())
@@ -1495,6 +1543,17 @@ async fn fire_fresh_runs_when_agent_home_is_unset_legacy() {
         .await
         .unwrap();
 
+    adb.upsert_schedule(Schedule::new(
+        "f1",
+        Trigger::OneShot {
+            fire_at: Utc::now(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+
     let payload = fresh_schedule_payload(&entry.db_id.to_string(), "f1", "wake");
     let _ = server.fire_agent_schedule(payload).await;
     // Even with the LLM call failing (no backends), a ScheduleFire is
@@ -1720,7 +1779,10 @@ async fn fire_schedule_stale_at_turn_start_tears_down_fresh_session() {
     drop(guard);
 
     let result = fire.await.expect("fire task join");
-    assert!(result.is_ok(), "stale turn-start skip returns Ok: {result:?}");
+    assert!(
+        result.is_ok(),
+        "stale turn-start skip returns Ok: {result:?}"
+    );
 
     // No orphaned session: the row survives (append-only history) but is
     // Closed, the server holds no runtime claim, and nothing was recorded.

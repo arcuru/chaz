@@ -138,13 +138,16 @@ fn interval_trigger(arguments: &Value) -> Result<Option<Trigger>, String> {
 }
 
 /// Parse the optional `target` argument: `"pinned"` (default) or
-/// `"fresh"`. Returns the [`ScheduleTarget`] variant.
-fn parse_target(target_str: Option<&str>, session_db_id: &str) -> ScheduleTarget {
+/// `"fresh"`.
+fn parse_target(target_str: Option<&str>, session_db_id: &str) -> Result<ScheduleTarget, String> {
     match target_str {
-        Some("fresh") => ScheduleTarget::Fresh,
-        _ => ScheduleTarget::Pinned {
+        None | Some("pinned") => Ok(ScheduleTarget::Pinned {
             session_db_id: session_db_id.to_string(),
-        },
+        }),
+        Some("fresh") => Ok(ScheduleTarget::Fresh),
+        Some(value) => Err(format!(
+            "Invalid target '{value}'; expected 'pinned' or 'fresh'"
+        )),
     }
 }
 
@@ -175,10 +178,10 @@ impl Tool for ScheduleAdd {
                 "properties": {
                     "id":     { "type": "string", "description": "Unique id for this schedule (e.g. 'hourly-check', 'daily-backup'). Referenced by schedule_modify and schedule_remove." },
                     "cron":   { "type": "string", "description": "6-field cron expression: sec min hour day-of-month month day-of-week. Mutually exclusive with interval_seconds." },
-                    "interval_seconds": { "type": "integer", "minimum": 1, "description": "Fixed delay after each completed fire, in seconds. Mutually exclusive with cron." },
+                    "interval_seconds": { "type": "integer", "minimum": 1, "description": "Fixed delay after each successful dispatch, in seconds. Mutually exclusive with cron." },
                     "task":   { "type": "string", "description": "Free-form instruction the agent receives when the schedule fires." },
                     "agent":  { "type": "string", "description": "Optional: agent that owns the schedule, by display name or DB id. Omit to target yourself." },
-                    "target": { "type": "string", "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." },
+                    "target": { "type": "string", "enum": ["pinned", "fresh"], "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." },
                     "max_fires":  { "type": "integer", "description": "Optional: retire the schedule after this many fires. E.g. cron hourly + max_fires 8 = 'wake hourly for 8 hours'." },
                     "expires_at": { "type": "string", "description": "Optional: RFC 3339 timestamp after which the schedule stops firing (e.g. '2026-06-01T09:00:00Z'). Whichever of max_fires/expires_at is hit first retires it." }
                 },
@@ -243,7 +246,7 @@ impl Tool for ScheduleAdd {
                 let s = ctx.session.lock().await;
                 s.database().root_id().to_string()
             };
-            let schedule_target = parse_target(opt_str(&arguments, "target"), &session_db_id);
+            let schedule_target = parse_target(opt_str(&arguments, "target"), &session_db_id)?;
 
             let mut schedule = Schedule::new(
                 user_id.to_string(),
@@ -311,9 +314,9 @@ impl Tool for ScheduleModify {
                     "id":      { "type": "string", "description": "Id of the schedule to edit (as returned by schedule_list)." },
                     "agent":   { "type": "string", "description": "Optional: agent that owns the schedule (defaults to yourself). Required if the schedule is owned by a different agent." },
                     "cron":    { "type": "string", "description": "Optional: new 6-field cron expression. Mutually exclusive with interval_seconds." },
-                    "interval_seconds": { "type": "integer", "minimum": 1, "description": "Optional: new fixed delay after each completed fire. Mutually exclusive with cron." },
+                    "interval_seconds": { "type": "integer", "minimum": 1, "description": "Optional: new fixed delay after each successful dispatch. Mutually exclusive with cron." },
                     "task":    { "type": "string", "description": "Optional: new task text." },
-                    "target":  { "type": "string", "description": "Optional: 'pinned' or 'fresh'." },
+                    "target":  { "type": "string", "enum": ["pinned", "fresh"], "description": "Optional: 'pinned' or 'fresh'." },
                     "enabled": { "type": "boolean", "description": "Optional: toggle the schedule on/off without deleting it. Re-enabling a schedule that already hit its max_fires/expires_at bound will retire again on the next fire." },
                     "max_fires":  { "type": "integer", "description": "Optional: set/replace the max-fires bound (counts existing fires)." },
                     "expires_at": { "type": "string", "description": "Optional: set/replace the RFC 3339 expiry timestamp." }
@@ -399,7 +402,7 @@ impl Tool for ScheduleModify {
                     let s = ctx.session.lock().await;
                     s.database().root_id().to_string()
                 };
-                schedule.target = parse_target(Some(t), &session_db_id);
+                schedule.target = parse_target(Some(t), &session_db_id)?;
             }
             if let Some(e) = new_enabled {
                 schedule.enabled = e;
@@ -1117,6 +1120,79 @@ mod tests {
             .await
             .expect_err("empty task should fail");
         assert!(format!("{err:?}").contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn add_rejects_invalid_target() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = ScheduleAdd::new(scoped(registry.clone(), index.clone()));
+        let list = ScheduleList::new(scoped(registry, index));
+        let ctx = make_ctx("alpha", session);
+
+        let err = add
+            .execute(
+                serde_json::json!({
+                    "id": "bad-target",
+                    "cron": "0 0 * * * *",
+                    "task": "daily report",
+                    "target": "elsewhere"
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("invalid target should fail");
+        assert!(format!("{err:?}").contains("expected 'pinned' or 'fresh'"));
+        assert!(
+            list.execute(serde_json::json!({}), &ctx)
+                .await
+                .unwrap()
+                .contains("No schedules"),
+            "a rejected add must not persist a schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_rejects_invalid_target_without_changing_schedule() {
+        let (_i, registry, index, session) = fixture("alpha").await;
+        let add = ScheduleAdd::new(scoped(registry.clone(), index.clone()));
+        let modify = ScheduleModify::new(scoped(registry.clone(), index.clone()));
+        let list = ScheduleList::new(scoped(registry, index));
+        let ctx = make_ctx("alpha", session);
+
+        add.execute(
+            serde_json::json!({ "id": "r1", "cron": "0 * * * * *", "task": "t" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let err = modify
+            .execute(
+                serde_json::json!({ "id": "r1", "target": "elsewhere" }),
+                &ctx,
+            )
+            .await
+            .expect_err("invalid target should fail");
+        assert!(format!("{err:?}").contains("expected 'pinned' or 'fresh'"));
+        let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(
+            out.contains("→ pinned"),
+            "target changed after rejection: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_schemas_constrain_target_values() {
+        let (_instance, registry, index, _session) = fixture("alpha").await;
+        let scoped = scoped(registry, index);
+        for schema in [
+            ScheduleAdd::new(scoped.clone()).descriptor().parameters,
+            ScheduleModify::new(scoped).descriptor().parameters,
+        ] {
+            assert_eq!(
+                schema["properties"]["target"]["enum"],
+                serde_json::json!(["pinned", "fresh"])
+            );
+        }
     }
 
     #[tokio::test]
