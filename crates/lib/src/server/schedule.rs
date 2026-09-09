@@ -81,58 +81,22 @@ impl Server {
             return Ok(());
         }
 
-        // 1b. Lifecycle admission (Gap 4). The agent DB is the
-        //     authoritative store; the engine's in-memory routine is
-        //     rebuilt from it. Admission reserves a `max_fires` slot up
-        //     front under the per-schedule accounting lock, so N
-        //     concurrent overlapping turns cannot all pass at
-        //     `fire_count` 0 — this is the hard-cap enforcement point.
-        //     If the schedule has hit its expiry or max_fires bound,
-        //     persist `enabled = false` and skip (the in-memory routine
-        //     keeps ticking until the next reload/restart, but every
-        //     post-bound tick early-returns here). One-shots check the
-        //     bounds but reserve nothing (their row is deleted below).
-        let mut admission_note: Option<String> = None;
-        if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await {
-            match self
-                .try_admit_schedule_fire(&adb, &payload.schedule_id, Utc::now(), !payload.one_shot)
-                .await
-            {
-                Ok(ScheduleAdmission::Retired(reason)) => {
-                    tracing::info!(
-                        agent = %agent_entry.display_name,
-                        schedule = %payload.schedule_id,
-                        "Schedule retired ({reason}); skipping fire"
-                    );
-                    return Ok(());
-                }
-                Ok(ScheduleAdmission::Admitted { retired_now, .. }) => {
-                    admission_note = retired_now;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        agent = %agent_entry.display_name,
-                        schedule = %payload.schedule_id,
-                        "Failed to check schedule lifecycle bounds, firing anyway: {e}"
-                    );
-                }
-            }
-        }
+        let adb = self
+            .open_agent_db_for_schedule(&agent_entry)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("cannot open owning agent DB for schedule fire"))?;
 
-        // 2. Resolve target
+        // 2. Resolve and check the target before lifecycle admission. A
+        // non-home daemon must not consume a max_fires slot for work it will
+        // never run.
         let target: ScheduleTarget = serde_json::from_value(payload.target.clone())
             .map_err(|e| anyhow::anyhow!("invalid schedule target in payload: {e}"))?;
 
         let agent_name = agent_entry.display_name.clone();
 
-        let (session_db, is_fresh, session_db_id) = match &target {
+        match &target {
             ScheduleTarget::Fresh => {
-                // Home-peer gate (agent-level). Fresh schedules have no
-                // session yet to carry `AgentRef.home_pubkey`, so the gate
-                // falls back to the agent DB's `meta.home_pubkey`. Legacy
-                // `None` lets every keyholder run (pre-feature default).
-                if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-                    && let Some(home) = crate::db_kind::read_agent_home_pubkey(adb.database()).await
+                if let Some(home) = crate::db_kind::read_agent_home_pubkey(adb.database()).await
                     && home != agent_entry.pubkey
                 {
                     tracing::debug!(
@@ -142,52 +106,10 @@ impl Server {
                     );
                     return Ok(());
                 }
-
-                let source = format!(
-                    "schedule:{}:{}",
-                    payload.owner_agent_db_id, payload.schedule_id
-                );
-                let (_conv, db) = self.registry.create_session(Some(&source)).await?;
-                let sid = db.root_id().to_string();
-
-                // Attach the owner agent to the session so it has Write
-                // permission and the session meta records membership.
-                self.registry
-                    .attach_agent_to_session(&sid, &agent_entry)
-                    .await?;
-
-                // Register with the server so the session has a
-                // SessionRuntime (backend + on_write callback) for any
-                // tools that need it (spawn_agent writes to the on_write
-                // path). The agent_override is set to the schedule owner so
-                // future interactive writes route to this agent.
-                self.register_session(
-                    &db,
-                    self.default_backend.clone(),
-                    Some(agent_name.clone()),
-                    None,
-                )
-                .await?;
-
-                tracing::info!(
-                    session = %sid,
-                    agent = %agent_name,
-                    schedule = %payload.schedule_id,
-                    "Created Fresh session for agent schedule fire"
-                );
-
-                (db, true, sid)
             }
             ScheduleTarget::Pinned { session_db_id } => {
-                // Closed-session retirement. If the pinned session has been
-                // deregistered, soft-disable the schedule rather than reopen
-                // a dead DB. Mirrors the lifecycle-bound retirement pattern
-                // above: the in-memory routine keeps ticking until the next
-                // agent reload, but every tick now early-returns here.
                 if !self.is_session_open(session_db_id).await {
-                    if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-                        && let Err(e) = self.disable_schedule(&adb, &payload.schedule_id).await
-                    {
+                    if let Err(e) = self.disable_schedule(&adb, &payload.schedule_id).await {
                         tracing::error!(
                             agent = %agent_name,
                             schedule = %payload.schedule_id,
@@ -202,25 +124,122 @@ impl Server {
                     );
                     return Ok(());
                 }
-
-                let (_conv, db) = self.registry.open_session(session_db_id).await?;
-                let sid = session_db_id.clone();
-
-                // Home-peer gate (per-session). Pinned schedules fire into
-                // an existing session, so the gate uses that session's
-                // `AgentRef.home_pubkey` — same source as `process_session`.
-                // If the session was rehosted to another peer, this fire
-                // belongs to them.
-                if !self.peer_is_home_for(&sid, &agent_name).await {
+                if !self.peer_is_home_for(session_db_id, &agent_name).await {
                     tracing::debug!(
-                        session = %sid,
+                        session = %session_db_id,
                         agent = %agent_name,
                         schedule = %payload.schedule_id,
                         "Not home peer for pinned schedule's session; skipping"
                     );
-                    self.record_home_skip(&sid, &agent_name).await;
+                    self.record_home_skip(session_db_id, &agent_name).await;
                     return Ok(());
                 }
+            }
+        }
+
+        // Reserve the max_fires slot before creating a Fresh session. The
+        // home checks above ensure a non-home daemon cannot consume it.
+        let admission_note = match self
+            .try_admit_schedule_fire(&adb, &payload.schedule_id, Utc::now(), !payload.one_shot)
+            .await?
+        {
+            ScheduleAdmission::Admitted { retired_now } => retired_now,
+            ScheduleAdmission::Retired(reason) => {
+                tracing::info!(
+                    agent = %agent_name,
+                    schedule = %payload.schedule_id,
+                    "Schedule retired ({reason}); skipping fire"
+                );
+                return Ok(());
+            }
+        };
+
+        let (session_db, is_fresh, session_db_id) = match &target {
+            ScheduleTarget::Fresh => {
+                let source = format!(
+                    "schedule:{}:{}",
+                    payload.owner_agent_db_id, payload.schedule_id
+                );
+                let (_conv, db) = match self.registry.create_session(Some(&source)).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        if !payload.one_shot {
+                            self.refund_schedule_fire_admission(
+                                &adb,
+                                &payload.schedule_id,
+                                Utc::now(),
+                            )
+                            .await?;
+                        }
+                        return Err(error);
+                    }
+                };
+                let sid = db.root_id().to_string();
+
+                // Attach the owner agent to the session so it has Write
+                // permission and the session meta records membership.
+                if let Err(error) = self
+                    .registry
+                    .attach_agent_to_session(&sid, &agent_entry)
+                    .await
+                {
+                    self.deregister_session(&sid).await;
+                    let _ = self.registry.mark_session_closed(&sid).await;
+                    if !payload.one_shot {
+                        self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
+                            .await?;
+                    }
+                    return Err(error);
+                }
+
+                // Register with the server so the session has a
+                // SessionRuntime (backend + on_write callback) for any
+                // tools that need it (spawn_agent writes to the on_write
+                // path). The agent_override is set to the schedule owner so
+                // future interactive writes route to this agent.
+                if let Err(error) = self
+                    .register_session(
+                        &db,
+                        self.default_backend.clone(),
+                        Some(agent_name.clone()),
+                        None,
+                    )
+                    .await
+                {
+                    self.deregister_session(&sid).await;
+                    let _ = self.registry.mark_session_closed(&sid).await;
+                    if !payload.one_shot {
+                        self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
+                            .await?;
+                    }
+                    return Err(error);
+                }
+
+                tracing::info!(
+                    session = %sid,
+                    agent = %agent_name,
+                    schedule = %payload.schedule_id,
+                    "Created Fresh session for agent schedule fire"
+                );
+
+                (db, true, sid)
+            }
+            ScheduleTarget::Pinned { session_db_id } => {
+                let (_conv, db) = match self.registry.open_session(session_db_id).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        if !payload.one_shot {
+                            self.refund_schedule_fire_admission(
+                                &adb,
+                                &payload.schedule_id,
+                                Utc::now(),
+                            )
+                            .await?;
+                        }
+                        return Err(error);
+                    }
+                };
+                let sid = session_db_id.clone();
 
                 // Idempotent attach: if the agent was detached after the
                 // schedule was created, the fire-time membership check
@@ -244,6 +263,14 @@ impl Server {
                             schedule = %payload.schedule_id,
                             "Pinned schedule: failed to re-attach agent to session: {e}"
                         );
+                        if !payload.one_shot {
+                            self.refund_schedule_fire_admission(
+                                &adb,
+                                &payload.schedule_id,
+                                Utc::now(),
+                            )
+                            .await?;
+                        }
                         return Ok(()); // self-skip
                     }
                     tracing::info!(
@@ -268,6 +295,10 @@ impl Server {
                     schedule = %payload.schedule_id,
                     "Session busy; skipping schedule fire"
                 );
+                if !payload.one_shot {
+                    self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
+                        .await?;
+                }
                 return Ok(());
             }
         }
@@ -302,6 +333,10 @@ impl Server {
                     );
                 }
             }
+            if !payload.one_shot {
+                self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
+                    .await?;
+            }
             return Ok(());
         }
 
@@ -324,54 +359,46 @@ impl Server {
 
         // 5. Record ScheduleFire on the agent's DB (best-effort audit).
         let fired_at = Utc::now();
-        if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await {
-            let fire = ScheduleFire {
-                schedule_id: payload.schedule_id.clone(),
-                fired_at,
-                session_db_id: session_db_id.clone(),
-                fresh: is_fresh,
-                usage: outcome.as_ref().ok().and_then(|o| o.metadata.clone()),
-            };
-            if let Err(e) = adb.record_schedule_fire(fire).await {
+        let fire = ScheduleFire {
+            schedule_id: payload.schedule_id.clone(),
+            fired_at,
+            session_db_id: session_db_id.clone(),
+            fresh: is_fresh,
+            usage: outcome.as_ref().ok().and_then(|o| o.metadata.clone()),
+        };
+        if let Err(e) = adb.record_schedule_fire(fire).await {
+            tracing::error!(
+                agent = %agent_name,
+                schedule = %payload.schedule_id,
+                "Failed to record ScheduleFire: {e}"
+            );
+        }
+
+        // A failed turn refunds its reservation, so max_fires counts
+        // successful fires rather than attempts. One-shots reserve nothing.
+        if !payload.one_shot {
+            if outcome.is_ok() {
+                if let Some(reason) = admission_note {
+                    tracing::info!(
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        "Schedule retired after fire ({reason})"
+                    );
+                }
+            } else if let Err(e) = self
+                .refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
+                .await
+            {
                 tracing::error!(
                     agent = %agent_name,
                     schedule = %payload.schedule_id,
-                    "Failed to record ScheduleFire: {e}"
+                    "Failed to refund schedule fire_count: {e}"
                 );
-            }
-
-            // Lifecycle accounting (Gap 4): the `max_fires` slot was
-            // already reserved at admission, so a successful turn counts
-            // nothing further. A failed turn refunds its reservation so
-            // `max_fires` keeps counting successful fires, not attempts.
-            // One-shot schedules reserved nothing and refund nothing
-            // (their row is deleted below).
-            if !payload.one_shot {
-                if outcome.is_ok() {
-                    if let Some(reason) = admission_note {
-                        tracing::info!(
-                            agent = %agent_name,
-                            schedule = %payload.schedule_id,
-                            "Schedule retired after fire ({reason})"
-                        );
-                    }
-                } else if let Err(e) = self
-                    .refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
-                    .await
-                {
-                    tracing::error!(
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Failed to refund schedule fire_count: {e}"
-                    );
-                }
             }
         }
 
         // 6. One-shot cleanup: delete the Schedule row after a successful fire.
-        if payload.one_shot
-            && let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-        {
+        if payload.one_shot {
             if let Err(e) = adb.remove_schedule(&payload.schedule_id).await {
                 tracing::error!(
                     agent = %agent_name,
@@ -490,9 +517,8 @@ impl Server {
     /// tick's admission — and any engine reload — drops it.
     ///
     /// `reserve = false` (one-shots) still enforces the bounds but counts
-    /// nothing. A missing row stays lenient (admit, count nothing): the
-    /// generation check normally precedes this, so a missing row with a
-    /// live generation should not wedge firing.
+    /// nothing. Missing or disabled rows are not executable, even for legacy
+    /// generation-free payloads.
     ///
     /// The lock is process-local: two chaz processes hosting the same
     /// agent could still double-admit against the shared agent DB.
@@ -508,7 +534,10 @@ impl Server {
         let lock = self.schedule_accounting_lock(adb, schedule_id).await;
         let _guard = lock.lock().await;
         let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
-            return Ok(ScheduleAdmission::Admitted { retired_now: None });
+            return Ok(ScheduleAdmission::Retired("schedule was removed".into()));
+        };
+        if !schedule.enabled {
+            return Ok(ScheduleAdmission::Retired("schedule is disabled".into()));
         };
         if let Some(reason) = schedule.retirement_reason(now) {
             if schedule.enabled {
@@ -573,8 +602,6 @@ impl Server {
         }
         Ok(())
     }
-
-
 
     /// Load the agent, hydrate from DB, build context with the wake-prompt
     /// as a private System message, run the ReAct loop, and write entries.

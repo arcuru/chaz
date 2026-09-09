@@ -3,7 +3,7 @@
 //!
 //! The routine engine fires agent-owned schedules and dispatches them to
 //! this extension's routine handler. Unlike the legacy session-routine path, which
-//! write a Directive entry and let `process_session` handle the turn,
+//! writes a Directive entry and lets `process_session` handle the turn,
 //! agent schedules use a **standalone execution path**: load the agent,
 //! build context, run the ReAct loop directly via
 //! [`crate::runtime::execute`], write results, and attribute cost to
