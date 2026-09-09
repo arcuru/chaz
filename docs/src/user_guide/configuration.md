@@ -25,9 +25,9 @@ backends:
     api_base: https://openrouter.ai/api/v1
     models:
       - name: anthropic/claude-sonnet-4
-        # Pin this model's OpenAI-compatible reasoning mode. Omit to use the
+        # How hard this model should think. Omit to use the
         # backend or provider default.
-        # reasoning: { enabled: false }
+        # reasoning: { effort: none }
       - name: google/gemini-2.5-pro
   - name: local
     type: openaicompatible
@@ -285,7 +285,7 @@ Retries use exponential backoff (1s, 2s, 4s, … capped at 30s). Rate-limit resp
 
 ### Per-model reasoning
 
-OpenAI-compatible backends can set a reasoning mode per configured model:
+Some models think before they answer, spending extra tokens working through the question. That helps on hard problems but slows down simple ones. You can set how much effort each model puts in:
 
 ```yaml
 backends:
@@ -294,10 +294,12 @@ backends:
     api_base: http://127.0.0.1:18081/v1
     models:
       - name: example/model
-        reasoning: { enabled: false }
+        reasoning: { effort: none }
 ```
 
-When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit caller choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different modes.
+Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Anything else is passed straight through to the provider, so only use levels your provider supports.
+
+When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
 
 ## Agents
 

@@ -609,12 +609,28 @@ pub struct Model {
 /// OpenAI-compatible reasoning settings for one configured model.
 ///
 /// This is deliberately model-scoped: one backend commonly serves models
-/// with different reasoning defaults. An explicit request setting takes
-/// precedence over this configured default.
+/// with different reasoning defaults. The configured value applies to every
+/// request for the named model; there is no per-request override.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct ReasoningConfig {
-    /// Enable or disable provider reasoning for this request.
-    pub enabled: bool,
+    /// How hard the provider should think for this model. `none` pins
+    /// reasoning off.
+    pub effort: ReasoningEffort,
+}
+
+/// Reasoning effort levels accepted by OpenRouter and OpenAI-compatible
+/// APIs. `none` turns reasoning off; anything else selects how much the
+/// model thinks before answering. Unknown strings fail config parsing.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -903,7 +919,7 @@ fn known_config_keys() -> HashSet<&'static str> {
     for k in [
         "backends[].models[].name",
         "backends[].models[].reasoning",
-        "backends[].models[].reasoning.enabled",
+        "backends[].models[].reasoning.effort",
         "backends[].models[].price_input",
         "backends[].models[].price_output",
         "backends[].models[].price_cache_read",
@@ -1309,7 +1325,7 @@ backends:
     models:
       - name: "gpt-4"
         reasoning:
-          enabled: false
+          effort: none
       - name: "claude-3"
     request_timeout: 60
     max_retries: 5
@@ -1326,10 +1342,27 @@ backends:
         assert_eq!(b.models.as_ref().unwrap().len(), 2);
         assert_eq!(
             b.models.as_ref().unwrap()[0].reasoning,
-            Some(ReasoningConfig { enabled: false })
+            Some(ReasoningConfig {
+                effort: ReasoningEffort::None
+            })
         );
         // secret_key scopes to backend name
         assert_eq!(b.secret_key(), "backend:openrouter");
+    }
+
+    #[test]
+    fn invalid_reasoning_effort_is_rejected() {
+        let yaml = r#"
+backends:
+  - type: openaicompatible
+    name: openrouter
+    api_base: "https://openrouter.ai/api/v1"
+    models:
+      - name: "gpt-4"
+        reasoning:
+          effort: turbo
+"#;
+        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
     }
 
     #[test]
