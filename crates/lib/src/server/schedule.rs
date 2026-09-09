@@ -253,8 +253,25 @@ impl Server {
                 schedule = %payload.schedule_id,
                 "Stale agent schedule fire at turn start; skipping"
             );
-            let mut processing = self.processing.lock().await;
-            processing.remove(&session_db_id);
+            {
+                let mut processing = self.processing.lock().await;
+                processing.remove(&session_db_id);
+            }
+            if is_fresh {
+                // The session above was created for a turn that will never
+                // run. Tear it down (runtime state + catalog status) so no
+                // permanent user-visible empty session remains. Pinned
+                // targets reuse a pre-existing session and are left alone.
+                self.deregister_session(&session_db_id).await;
+                if let Err(e) = self.registry.mark_session_closed(&session_db_id).await {
+                    tracing::warn!(
+                        session = %session_db_id,
+                        agent = %agent_name,
+                        schedule = %payload.schedule_id,
+                        "Failed to mark stale Fresh session closed: {e}"
+                    );
+                }
+            }
             return Ok(());
         }
 
