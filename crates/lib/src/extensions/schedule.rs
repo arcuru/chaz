@@ -63,11 +63,7 @@ impl Extension for ScheduleExtension {
         let manifest = self.manifest();
         let peer = scope_ctx.peer();
         let allowlist = peer.agent_state_allowlist.get("schedule").cloned();
-        // A deny-all entry (`schedule: []`) is invisible at the tool
-        // boundary — every lookup fails with the uniform not-found
-        // error. Surface it once here, at the one construction site,
-        // so the operator finds out at boot rather than from a
-        // confused user.
+        // An empty list otherwise makes every requested agent look missing.
         if let Some(warning) = deny_all_warning("schedule", allowlist.as_deref()) {
             tracing::warn!("{warning}");
         }

@@ -106,9 +106,8 @@ pub enum CapabilityKind {
     Messenger,
     /// Search / write memory in a named scope.
     Memory,
-    /// Read/write agent-owned state (schedules, memory, configuration).
-    /// Host-only — the hub scopes each impl to the operator-configured
-    /// set of agents before the extension sees it.
+    /// Read/write agent-owned state such as schedules, memory, and
+    /// configuration. Host-only.
     AgentStateAdmin,
     /// Append text to the agent's system prompt at context assembly time.
     /// Extension-providable — extensions like `skills` publish impls;
@@ -201,13 +200,9 @@ pub enum CapabilityRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
-    /// Access hosted agent DBs for state operations. `agents`, when
-    /// declared in a manifest, self-narrows the extension to that set
-    /// (`None` = no self-narrowing, `Some(empty)` = deny-all). No
-    /// extension declares this request today — the live scoping input
-    /// is the operator's `agent_state_allowlist` config map, applied
-    /// by each extension when it builds its
-    /// [`crate::extension::agent_state::ScopedAgentStateAdmin`].
+    /// Reserved manifest vocabulary for agent-state access. Chaz does
+    /// not currently read this request when it builds an extension's
+    /// handle; `agent_state_allowlist` is the live source of scope.
     AgentStateAdmin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agents: Option<Vec<String>>,
