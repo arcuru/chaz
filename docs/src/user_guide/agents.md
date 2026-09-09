@@ -315,11 +315,13 @@ pointer that silently re-routes turns.
 
 ## Schedules
 
-A schedule is a time-driven, **agent-owned** wake. It lives in the owning agent's DB `schedules` store (so it syncs and travels with the agent, exactly like its config), not in any session. The chaz `RoutineEngine` (one per peer) sleeps until the next due fire across every hosted agent's schedules, then runs the **standalone fire path**: it loads the owning agent, resolves the schedule's target, and runs that agent's turn directly. The schedule's `prompt` is invocation-scoped input for that turn — it is **not** written as a broadcast `Directive` entry, and there is no "resolve who responds" step (the schedule names its owner). A peer that doesn't host the owning agent silently skips, so multi-peer setups don't double-fire.
+A schedule belongs to an Agent and lives in that Agent's DB, not in a session. It syncs with the Agent's other state. Only the Agent's home daemon executes it: Fresh schedules use the Agent-level home, while Pinned schedules use that Agent's home for the target session. Other daemons may load the same synced row, but the home-peer check makes them skip it. There is no distributed lock or automatic failover; use `/agent rehost --agent` for Fresh schedules or `/agent rehost` in the pinned session when the home daemon changes.
+
+The home daemon's `RoutineEngine` sleeps until a schedule is due, then runs the owning Agent directly. The schedule prompt is private input for that turn. It is not written as a broadcast `Directive`, and the normal "which Agent responds?" routing step does not run because the schedule already names its owner.
 
 Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Three trigger shapes:
 
-- **Cron triggers** fire on a calendar schedule (`cron: "0 */5 * * * *"`). Each peer hosting the owning agent fires independently.
+- **Cron triggers** fire on a calendar schedule (`cron: "0 */5 * * * *"`).
 - **Interval triggers** fire first after their period, then after the same fixed delay from each successful dispatch (`interval_seconds: 300`). The agent turn continues asynchronously, so overlapping turns remain possible. Zero and durations chrono cannot represent are rejected.
 - **One-shot triggers** fire once at an absolute `fire_at`, then the engine drops the schedule. These back the `schedule_once` tool described in [Tools](./tools.md).
 
@@ -328,7 +330,7 @@ Each schedule has a **target**: `Pinned` (fire into a specific existing session)
 - `max_fires` — retire after N fires. `cron` hourly + `max_fires: 8` = "wake hourly for 8 hours".
 - `expires_at` — an RFC 3339 instant after which it stops.
 
-Whichever is hit first retires the schedule: the fire path (the authoritative chokepoint, which holds the agent DB) persists `enabled = false` and the per-fire `fire_count`, so `max_fires` survives restarts and a retired schedule is **not** re-seeded on reload. Admission reserves the slot before the turn runs, so overlapping turns can't overshoot `max_fires`; a failed turn refunds its slot, keeping the bound a count of successful fires rather than attempts. A retired schedule is kept (disabled) rather than deleted so its history stays auditable — `schedule_list` shows the bounds and a `[fired N×]` counter. (Implementation note: the in-memory routine keeps its cron slot until the next reload/restart, but every post-bound tick early-returns at the fire path without running the agent — correctness is at the chokepoint, not the heap.)
+Whichever is hit first retires the schedule. The fire path writes `enabled = false` and `fire_count` to the Agent DB, so the count survives restarts and reloads do not revive a retired row. It reserves a `max_fires` slot before the turn starts; overlapping turns therefore cannot exceed the cap. A failed turn refunds its slot, so the count records successful fires rather than attempts. Retired schedules stay in the DB as disabled rows, and `schedule_list` shows their bounds and `[fired N×]` count.
 
 A schedule whose `Pinned` session is gone, or whose owning agent is no longer a member, self-skips at fire time (logged, not errored) — there is no detach/delete sweep.
 
@@ -338,7 +340,7 @@ Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock 
 
 Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
 
-- **Interactive** — the `/schedule add|remove|list` command and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)). This is the only interactive surface; there is no separate `/schedule` command.
+- **Interactive** — `/schedule add|modify|remove|list` and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)).
 - **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), translated into session-scoped routines at startup.
 
 ### When rules fire
@@ -347,7 +349,7 @@ Firing is **server-side and independent of any UI**. A rule fires whenever chaz 
 
 - **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes from its last successful-dispatch anchor, so if its period elapsed during downtime it fires immediately on restart. A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
-- **The target agent must be hosted on this peer** — otherwise the handler silently skips (the multi-peer dedupe above).
+- **The home daemon must be running and host the Agent.** A non-home daemon skips the fire. Rehost the Agent or pinned session explicitly if ownership moves.
 - **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.
 
 ### `/schedule` commands
@@ -357,8 +359,8 @@ Cron uses 6 fields: `sec min hour day_of_month month day_of_week`. Intervals use
 | Command                                                                       | What                                                                                                                               |
 | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. Interval rules render as `every 300s`; one-shots render with an `@YYYY-MM-DD HH:MM:SSZ` marker. |
-| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                                  |
-| `/schedule add interval <id> <seconds> <agent_ref> <task…>`                   | Upsert a fixed-delay interval rule keyed by `<id>`.                                                                                |
+| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Add a cron rule. Duplicate IDs are rejected; use `modify` or remove the old rule first. Task may contain `@mentions`.              |
+| `/schedule add interval <id> <seconds> <agent_ref> <task…>`                   | Add a fixed-delay interval rule. Duplicate IDs are rejected.                                                                       |
 | `/schedule modify <id> cron <6 fields> [agent_ref]`                           | Replace a rule's trigger with a cron expression.                                                                                   |
 | `/schedule modify <id> interval <seconds> [agent_ref]`                        | Replace a rule's trigger with a fixed-delay interval.                                                                              |
 | `/schedule remove <id>`                                                       | Remove a rule by id.                                                                                                               |
@@ -379,10 +381,8 @@ Example — make `researcher` check the current session five minutes after each 
 
 ### Walkthrough: interval wake, failure, and recovery
 
-A full life-cycle run-through with the `watcher` agent: a 60-second Fresh
-interval capped at 3 fires, created from the agent side with the
-`schedule_add` tool. Every transcript below is the real surface — tool
-results and `schedule_list` rows, quoted exactly as chaz renders them.
+This example uses a 60-second Fresh interval owned by `watcher`, capped at
+three successful fires. It starts with the `schedule_add` tool.
 
 1. **Happy path — create and first fire.** The agent calls `schedule_add`:
 
@@ -411,23 +411,18 @@ results and `schedule_list` rows, quoted exactly as chaz renders them.
    - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
    ```
 
-2. **Failure — the backend is down.** The next fire's turn fails (LLM
-   unreachable). The fire is still recorded for audit, but with no usage
-   metadata — and its `max_fires` slot is refunded, so the listing is
-   unchanged and the schedule keeps trying instead of burning budget on
-   attempts:
+2. **Failure and retry.** If the backend is unavailable, the failed turn is
+   recorded without usage metadata. Its `max_fires` slot is refunded, so the
+   count stays at one and the interval tries again after the next period:
 
    ```text
    Schedules on 'watcher':
    - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
    ```
 
-   Same `[fired 1×]` — the failed turn consumed nothing. A torn-down
-   variant of the same story: a prompt edit landing between dispatch and
-   turn start makes the detached turn fail its generation re-check
-   (`Stale agent schedule fire at turn start; skipping`), and the
-   just-created Fresh session is deregistered and marked closed rather
-   than left behind as a user-visible empty session.
+   A prompt or target edit can also invalidate a detached fire before its
+   turn starts. In that case chaz closes the newly created Fresh session and
+   runs the edited schedule on its next due fire.
 
 3. **Retirement and recovery — the cap is reached.** Fires 2 and 3
    succeed. The third admission spends the last slot, so the row retires
@@ -451,13 +446,41 @@ results and `schedule_list` rows, quoted exactly as chaz renders them.
    Modified schedule 'watcher' on 'watcher': enabled=true max_fires=6
    ```
 
-4. **Overlap — why the cap holds.** Interval turns run asynchronously and
-   may overlap: admission reserves the `max_fires` slot _before_ the turn
-   starts, under one in-process lock per schedule. Twelve turns piling
-   onto `max_fires: 3` run exactly three — the rest skip at admission and
-   record nothing. The lock is process-local (two chaz processes hosting
-   the same agent are out of scope); in practice the home-peer gate means
-   a single peer admits a schedule's fires.
+4. **Disable or remove it.** Disable a schedule without deleting its row,
+   or remove it completely:
+
+   ```json
+   { "id": "watcher", "enabled": false }
+   ```
+
+   ```text
+   Modified schedule 'watcher' on 'watcher': enabled=false
+   ```
+
+   ```json
+   { "id": "watcher" }
+   ```
+
+   The second call uses `schedule_remove` and returns:
+
+   ```text
+   Removed schedule 'watcher' from agent 'watcher'
+   ```
+
+To retire at a time instead of a count, pass an RFC 3339 timestamp such as
+`"expires_at": "2026-06-01T09:00:00Z"`. You may set both bounds; the first
+one reached wins. `schedule_list` is the show surface: there is no separate
+`schedule_show` tool or `/schedule show` command.
+
+The slash command can replace a trigger without changing the prompt or target:
+
+```text
+/schedule modify check-in interval 600 researcher
+```
+
+It cannot edit bounds, targets, prompts, or enabled state. Use
+`schedule_modify` for those fields. Slash-command schedules are always Pinned;
+use the tool when you need a Fresh target.
 
 ## Tool Narrowing
 
