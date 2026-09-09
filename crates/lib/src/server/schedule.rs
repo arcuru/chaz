@@ -7,6 +7,18 @@
 
 use super::*;
 
+/// Outcome of [`Server::try_admit_schedule_fire`].
+pub(super) enum ScheduleAdmission {
+    /// The schedule may fire. `retired_now` carries the bound message
+    /// when this admission spent the last `max_fires` slot (the row is
+    /// already persisted disabled). Admissions that reserve nothing
+    /// (one-shots, missing rows) carry `None` and refund nothing.
+    Admitted { retired_now: Option<String> },
+    /// The schedule already hit a lifecycle bound; the row is persisted
+    /// disabled (no-op if it already was). The caller skips the fire.
+    Retired(String),
+}
+
 impl Server {
     /// Standalone execution path for agent-owned schedule fires.
     ///
@@ -69,24 +81,42 @@ impl Server {
             return Ok(());
         }
 
-        // 1b. Lifecycle bound check (Gap 4). The agent DB is the
+        // 1b. Lifecycle admission (Gap 4). The agent DB is the
         //     authoritative store; the engine's in-memory routine is
-        //     rebuilt from it. If the schedule has hit its expiry or
-        //     max_fires bound, persist `enabled = false` and skip —
-        //     this is what actually retires a recurring schedule (the
-        //     in-memory routine keeps ticking until the next
-        //     reload/restart, but every tick now early-returns here).
-        if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await
-            && let Ok(Some(reason)) = self
-                .retire_schedule_if_due(&adb, &payload.schedule_id, Utc::now())
+        //     rebuilt from it. Admission reserves a `max_fires` slot up
+        //     front under the per-schedule accounting lock, so N
+        //     concurrent overlapping turns cannot all pass at
+        //     `fire_count` 0 — this is the hard-cap enforcement point.
+        //     If the schedule has hit its expiry or max_fires bound,
+        //     persist `enabled = false` and skip (the in-memory routine
+        //     keeps ticking until the next reload/restart, but every
+        //     post-bound tick early-returns here). One-shots check the
+        //     bounds but reserve nothing (their row is deleted below).
+        let mut admission_note: Option<String> = None;
+        if let Some(adb) = self.open_agent_db_for_schedule(&agent_entry).await {
+            match self
+                .try_admit_schedule_fire(&adb, &payload.schedule_id, Utc::now(), !payload.one_shot)
                 .await
-        {
-            tracing::info!(
-                agent = %agent_entry.display_name,
-                schedule = %payload.schedule_id,
-                "Schedule retired ({reason}); skipping fire"
-            );
-            return Ok(());
+            {
+                Ok(ScheduleAdmission::Retired(reason)) => {
+                    tracing::info!(
+                        agent = %agent_entry.display_name,
+                        schedule = %payload.schedule_id,
+                        "Schedule retired ({reason}); skipping fire"
+                    );
+                    return Ok(());
+                }
+                Ok(ScheduleAdmission::Admitted { retired_now, .. }) => {
+                    admission_note = retired_now;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        agent = %agent_entry.display_name,
+                        schedule = %payload.schedule_id,
+                        "Failed to check schedule lifecycle bounds, firing anyway: {e}"
+                    );
+                }
+            }
         }
 
         // 2. Resolve target
@@ -310,28 +340,30 @@ impl Server {
                 );
             }
 
-            // Lifecycle accounting (Gap 4): a recurring schedule that
-            // ran its turn increments `fire_count`. When that reaches
-            // `max_fires`, retire it now (persist enabled=false) so the
-            // next tick's pre-check — and any reload — drops it. One-shot
-            // schedules are deleted below, so they don't count.
-            if !payload.one_shot && outcome.is_ok() {
-                match self
-                    .account_successful_schedule_fire(&adb, &payload.schedule_id, fired_at)
+            // Lifecycle accounting (Gap 4): the `max_fires` slot was
+            // already reserved at admission, so a successful turn counts
+            // nothing further. A failed turn refunds its reservation so
+            // `max_fires` keeps counting successful fires, not attempts.
+            // One-shot schedules reserved nothing and refund nothing
+            // (their row is deleted below).
+            if !payload.one_shot {
+                if outcome.is_ok() {
+                    if let Some(reason) = admission_note {
+                        tracing::info!(
+                            agent = %agent_name,
+                            schedule = %payload.schedule_id,
+                            "Schedule retired after fire ({reason})"
+                        );
+                    }
+                } else if let Err(e) = self
+                    .refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
                     .await
                 {
-                    Ok(Some((fire_count, reason))) => tracing::info!(
+                    tracing::error!(
                         agent = %agent_name,
                         schedule = %payload.schedule_id,
-                        fire_count,
-                        "Schedule retired after fire ({reason})"
-                    ),
-                    Ok(None) => {}
-                    Err(e) => tracing::error!(
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Failed to persist schedule fire_count: {e}"
-                    ),
+                        "Failed to refund schedule fire_count: {e}"
+                    );
                 }
             }
         }
@@ -449,28 +481,78 @@ impl Server {
             .clone()
     }
 
-    /// Persist a pre-fire lifecycle retirement while sharing the same lock as
-    /// completion accounting. Returns the retirement reason when a bound was
-    /// reached, whether or not the row was already disabled.
-    async fn retire_schedule_if_due(
+    /// Pre-fire admission check that reserves a `max_fires` slot up front
+    /// under the per-schedule accounting lock. This is the hard-cap
+    /// enforcement point: the bound check and the `fire_count` increment
+    /// happen atomically, so N concurrent overlapping turns cannot all
+    /// pass admission at count 0. A turn that hits `max_fires` with its
+    /// reservation persists `enabled = false` immediately, so the next
+    /// tick's admission — and any engine reload — drops it.
+    ///
+    /// `reserve = false` (one-shots) still enforces the bounds but counts
+    /// nothing. A missing row stays lenient (admit, count nothing): the
+    /// generation check normally precedes this, so a missing row with a
+    /// live generation should not wedge firing.
+    ///
+    /// The lock is process-local: two chaz processes hosting the same
+    /// agent could still double-admit against the shared agent DB.
+    /// Cross-process overlap is out of scope — in practice the home-peer
+    /// gate means a single peer admits a schedule's fires.
+    pub(super) async fn try_admit_schedule_fire(
         &self,
         adb: &crate::agent_db::AgentDb,
         schedule_id: &str,
         now: chrono::DateTime<Utc>,
-    ) -> anyhow::Result<Option<String>> {
+        reserve: bool,
+    ) -> anyhow::Result<ScheduleAdmission> {
         let lock = self.schedule_accounting_lock(adb, schedule_id).await;
         let _guard = lock.lock().await;
         let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
-            return Ok(None);
+            return Ok(ScheduleAdmission::Admitted { retired_now: None });
         };
-        let Some(reason) = schedule.retirement_reason(now) else {
-            return Ok(None);
-        };
-        if schedule.enabled {
-            schedule.enabled = false;
-            adb.upsert_schedule(schedule).await?;
+        if let Some(reason) = schedule.retirement_reason(now) {
+            if schedule.enabled {
+                schedule.enabled = false;
+                adb.upsert_schedule(schedule).await?;
+            }
+            return Ok(ScheduleAdmission::Retired(reason));
         }
-        Ok(Some(reason))
+        if !reserve {
+            return Ok(ScheduleAdmission::Admitted { retired_now: None });
+        }
+        schedule.fire_count = schedule.fire_count.saturating_add(1);
+        let retired_now = schedule.retirement_reason(now);
+        if retired_now.is_some() {
+            schedule.enabled = false;
+        }
+        adb.upsert_schedule(schedule).await?;
+        Ok(ScheduleAdmission::Admitted { retired_now })
+    }
+
+    /// Refund one reserved admission after a failed turn, under the same
+    /// lock. Keeps `max_fires` counting successful fires rather than
+    /// attempts: without this, N failed turns would burn the budget and
+    /// retire a schedule that never ran once. If the refund drops the row
+    /// back under its bound it is re-enabled (an expiry still retires, so
+    /// only a bound-free row flips back); the engine picks the revived
+    /// row up on its next reload.
+    pub(super) async fn refund_schedule_fire_admission(
+        &self,
+        adb: &crate::agent_db::AgentDb,
+        schedule_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
+        let _guard = lock.lock().await;
+        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
+            return Ok(());
+        };
+        schedule.fire_count = schedule.fire_count.saturating_sub(1);
+        if !schedule.enabled && schedule.retirement_reason(now).is_none() {
+            schedule.enabled = true;
+        }
+        adb.upsert_schedule(schedule).await?;
+        Ok(())
     }
 
     /// Disable a schedule for a terminal non-turn condition while sharing the
@@ -492,29 +574,7 @@ impl Server {
         Ok(())
     }
 
-    /// Atomically (within this daemon) account for one successful recurring
-    /// schedule turn. The mutex is intentionally acquired only after the turn:
-    /// schedule turns remain asynchronous and may overlap.
-    pub(super) async fn account_successful_schedule_fire(
-        &self,
-        adb: &crate::agent_db::AgentDb,
-        schedule_id: &str,
-        fired_at: chrono::DateTime<Utc>,
-    ) -> anyhow::Result<Option<(u32, String)>> {
-        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
-        let _guard = lock.lock().await;
-        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
-            return Ok(None);
-        };
-        schedule.fire_count = schedule.fire_count.saturating_add(1);
-        let retirement = schedule.retirement_reason(fired_at);
-        if retirement.is_some() {
-            schedule.enabled = false;
-        }
-        let fire_count = schedule.fire_count;
-        adb.upsert_schedule(schedule).await?;
-        Ok(retirement.map(|reason| (fire_count, reason)))
-    }
+
 
     /// Load the agent, hydrate from DB, build context with the wake-prompt
     /// as a private System message, run the ReAct loop, and write entries.

@@ -795,7 +795,7 @@ async fn agent_schedule_records_fire_even_on_llm_failure() {
 }
 
 #[tokio::test]
-async fn schedule_accounting_serially_counts_and_retires_at_max_fires() {
+async fn schedule_admission_serially_reserves_and_retires_at_max_fires() {
     let (_instance, server, registry) = server_fixture().await;
     let (_entry, adb) = seed_agent(&server, &registry, "accounting-serial").await;
     let mut schedule = Schedule::new(
@@ -809,20 +809,47 @@ async fn schedule_accounting_serially_counts_and_retires_at_max_fires() {
     schedule.max_fires = Some(3);
     adb.upsert_schedule(schedule).await.unwrap();
 
-    for _ in 0..3 {
-        server
-            .account_successful_schedule_fire(&adb, "recurring", Utc::now())
+    // Three admissions spend the budget; the third retires the row.
+    for expected_count in 1..=3u32 {
+        match server
+            .try_admit_schedule_fire(&adb, "recurring", Utc::now(), true)
             .await
-            .unwrap();
+            .unwrap()
+        {
+            crate::server::schedule::ScheduleAdmission::Admitted { retired_now } => {
+                assert_eq!(retired_now.is_some(), expected_count == 3);
+            }
+            crate::server::schedule::ScheduleAdmission::Retired(_) => {
+                panic!("admission {expected_count} of 3 must succeed")
+            }
+        }
+        let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
+        assert_eq!(schedule.fire_count, expected_count);
     }
 
     let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
     assert_eq!(schedule.fire_count, 3);
     assert!(!schedule.enabled);
+
+    // A fourth admission is denied — the cap holds serially too.
+    assert!(
+        matches!(
+            server
+                .try_admit_schedule_fire(&adb, "recurring", Utc::now(), true)
+                .await
+                .unwrap(),
+            crate::server::schedule::ScheduleAdmission::Retired(_)
+        ),
+        "admission past max_fires must retire-skip"
+    );
 }
 
 #[tokio::test]
-async fn schedule_accounting_keeps_every_overlapping_completion() {
+async fn schedule_admission_caps_overlapping_turns_at_max_fires() {
+    // Hard-cap regression test: 12 concurrent overlapping admissions
+    // against max_fires=3 must admit exactly 3 — the reservation happens
+    // under the per-schedule lock, so no two turns can both pass at
+    // count 0.
     let (_instance, server, registry) = server_fixture().await;
     let (_entry, adb) = seed_agent(&server, &registry, "accounting-concurrent").await;
     let mut schedule = Schedule::new(
@@ -836,24 +863,149 @@ async fn schedule_accounting_keeps_every_overlapping_completion() {
     schedule.max_fires = Some(3);
     adb.upsert_schedule(schedule).await.unwrap();
 
-    const COMPLETIONS: u32 = 12;
+    const ATTEMPTS: u32 = 12;
     let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..COMPLETIONS {
+    for _ in 0..ATTEMPTS {
         let server = server.clone();
         let adb = adb.clone();
         tasks.spawn(async move {
             server
-                .account_successful_schedule_fire(&adb, "recurring", Utc::now())
+                .try_admit_schedule_fire(&adb, "recurring", Utc::now(), true)
                 .await
         });
     }
+    let mut admitted = 0u32;
+    let mut retired = 0u32;
     while let Some(result) = tasks.join_next().await {
-        result.unwrap().unwrap();
+        match result.unwrap().unwrap() {
+            crate::server::schedule::ScheduleAdmission::Admitted { .. } => admitted += 1,
+            crate::server::schedule::ScheduleAdmission::Retired(_) => retired += 1,
+        }
     }
+    assert_eq!(admitted, 3, "exactly max_fires admissions may succeed");
+    assert_eq!(retired, ATTEMPTS - 3);
 
     let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
-    assert_eq!(schedule.fire_count, COMPLETIONS);
+    assert_eq!(schedule.fire_count, 3);
     assert!(!schedule.enabled);
+}
+
+#[tokio::test]
+async fn schedule_overlapping_fires_respect_max_fires_end_to_end() {
+    // Full-path hard-cap proof: 12 concurrent overlapping
+    // `fire_agent_schedule` turns against max_fires=3 must run exactly
+    // 3 turns. The pre-fire admission (not post-hoc counting) is the
+    // enforcement point, so this holds no matter how the turns
+    // interleave. (The test backend fails every turn, so the 3 admitted
+    // turns refund their slots afterwards — the audit row count is the
+    // stable witness: denied fires record nothing.)
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "accounting-e2e").await;
+    let owner_id = entry.db_id.to_string();
+    let mut schedule = Schedule::new(
+        "recurring",
+        Trigger::Cron {
+            expr: "0 0 * * * *".into(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    );
+    schedule.max_fires = Some(3);
+    adb.upsert_schedule(schedule).await.unwrap();
+    let engine = schedule_engine_for(&server, &registry, &owner_id, &adb).await;
+    let routine_id = crate::routine::RoutineId::new(format!("agent:{owner_id}:recurring"));
+    let generation = engine.current_generation(&routine_id).await;
+    assert!(
+        generation.is_some(),
+        "engine must seed a generation for the schedule"
+    );
+
+    const ATTEMPTS: usize = 12;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..ATTEMPTS {
+        let server = server.clone();
+        let mut payload = fresh_schedule_payload(&owner_id, "recurring", "wake");
+        payload.generation = generation.clone();
+        // Recurring fire: one-shot payloads check the bounds but reserve
+        // no slot (their row is deleted after the turn).
+        payload.one_shot = false;
+        tasks.spawn(async move { server.fire_agent_schedule(payload).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        // Admitted turns err (empty test backend); denied ones return Ok.
+        let _ = result.unwrap();
+    }
+
+    // Exactly max_fires turns ran: one audit row + one Fresh session each.
+    // (Post-hoc counting would have run all 12.)
+    let fires = adb.list_schedule_fires().await.unwrap();
+    assert_eq!(
+        fires.len(),
+        3,
+        "only max_fires overlapping turns may run, got {}",
+        fires.len()
+    );
+    assert_eq!(
+        registry.list_sessions().await.unwrap_or_default().len(),
+        3,
+        "each admitted Fresh turn creates exactly one session"
+    );
+    // All three turns failed, so all three slots refunded.
+    let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
+    assert_eq!(schedule.fire_count, 0);
+    assert!(schedule.enabled);
+}
+
+#[tokio::test]
+async fn schedule_admission_refund_frees_slot_after_failed_turn() {
+    // Failed turns must not burn the "successful fires" budget: a refund
+    // drops the count and re-enables a max-retired row, so the next fire
+    // can spend the slot.
+    let (_instance, server, registry) = server_fixture().await;
+    let (_entry, adb) = seed_agent(&server, &registry, "accounting-refund").await;
+    let mut schedule = Schedule::new(
+        "recurring",
+        Trigger::Cron {
+            expr: "0 0 * * * *".into(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    );
+    schedule.max_fires = Some(1);
+    adb.upsert_schedule(schedule).await.unwrap();
+
+    assert!(
+        matches!(
+            server
+                .try_admit_schedule_fire(&adb, "recurring", Utc::now(), true)
+                .await
+                .unwrap(),
+            crate::server::schedule::ScheduleAdmission::Admitted { .. }
+        ),
+        "first admission must succeed"
+    );
+    let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
+    assert_eq!(schedule.fire_count, 1);
+    assert!(!schedule.enabled, "admission spending the last slot retires");
+
+    server
+        .refund_schedule_fire_admission(&adb, "recurring", Utc::now())
+        .await
+        .unwrap();
+    let schedule = adb.find_schedule("recurring").await.unwrap().unwrap();
+    assert_eq!(schedule.fire_count, 0);
+    assert!(schedule.enabled, "refund must revive a max-retired row");
+
+    assert!(
+        matches!(
+            server
+                .try_admit_schedule_fire(&adb, "recurring", Utc::now(), true)
+                .await
+                .unwrap(),
+            crate::server::schedule::ScheduleAdmission::Admitted { .. }
+        ),
+        "refunded slot must be re-admissible"
+    );
 }
 
 // ---- Home-peer gate ---------------------------------------------------
