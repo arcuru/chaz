@@ -200,6 +200,8 @@ Skills come from three sources merged at session start: disk skills shipped on t
 
 Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash commands described in [Agents — Schedules](agents.md#schedules). Schedules live in the owning agent's DB (not the session) and are fired by chaz's `RoutineEngine`, which sleeps until the next due fire instead of polling. `schedule_add` targets the current session (Pinned) by default, or a fresh session per fire. Pass exactly one trigger: `cron` uses 6 fields (`sec min hour day_of_month month day_of_week`), while `interval_seconds` is a fixed delay after each successful dispatch. The agent turn runs asynchronously, so an interval does not prevent overlapping turns.
 
+`target` accepts only `"pinned"` or `"fresh"`. Pinned reuses the current session; Fresh creates a session for each fire. `schedule_add` rejects an existing ID. Use `schedule_modify` to change that row, or `schedule_remove` before adding a replacement.
+
 ```json
 {
   "id": "morning-brief",
@@ -218,7 +220,17 @@ For a five-minute fixed-delay check instead:
 }
 ```
 
-`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields. Intervals first fire after one period; after a restart they resume from the saved dispatch anchor and fire immediately if the period elapsed while chaz was down. Missed cron ticks are skipped. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
+`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields, plus `task`, `target`, `enabled`, `max_fires`, and `expires_at`. For example, this changes the period and pauses the schedule:
+
+```json
+{
+  "id": "check-in",
+  "interval_seconds": 600,
+  "enabled": false
+}
+```
+
+Intervals first fire after one period. A task-only or target-only edit keeps the current due time; changing the trigger or re-enabling the schedule starts a full new period. The dispatch anchor is saved across reloads and restarts. If chaz was down longer than the period, the interval fires as soon as it starts again. Missed cron ticks are skipped. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
 
 The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
 
@@ -228,6 +240,18 @@ The `agent` field is optional — omit it to target yourself, or pass a display 
 - `expires_at` — RFC 3339 timestamp after which it stops firing.
 
 Whichever bound is hit first wins; both are optional (omit = unbounded). `fire_count` is tracked authoritatively in the agent DB so `max_fires` survives restarts. When a bound is reached the schedule is persisted as disabled (it shows in `schedule_list` as `(disabled)` with its `[fired N×]` count rather than being deleted, so the history stays auditable). `schedule_modify` can set/replace `max_fires`/`expires_at`; re-enabling a schedule that already passed a bound will simply retire again on its next fire.
+
+```json
+{
+  "id": "check-in",
+  "max_fires": 8,
+  "expires_at": "2026-06-01T09:00:00Z"
+}
+```
+
+Use `schedule_list` to inspect a schedule. There is no separate show tool. A failed turn does not consume a `max_fires` slot; chaz refunds the reservation and tries the interval again after its next period. To recover a schedule that reached a bound, raise or replace the bound and set `enabled` to `true` in the same `schedule_modify` call.
+
+Schedules belong to one Agent. Only that Agent's home daemon executes them: Fresh schedules use the Agent-level home, and Pinned schedules use the Agent's home for that session. Other daemons skip the fire. Ownership changes are explicit through `/agent rehost`; this is not a distributed-locking or automatic-failover scheme.
 
 ### schedule_once
 
