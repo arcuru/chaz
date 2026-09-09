@@ -1516,6 +1516,86 @@ async fn fire_schedule_runs_dispatched_payload_for_live_entry() {
 }
 
 #[tokio::test]
+async fn fire_schedule_stale_at_turn_start_tears_down_fresh_session() {
+    // A remove/replace landing between the pre-check and turn start must
+    // not orphan the just-created Fresh session. Hold the processing lock
+    // so the fire parks after target resolution (session created), retire
+    // the engine entry mid-flight, then release: the late re-check fails
+    // and the Fresh session must be torn down, not left Active.
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+    let owner_id = entry.db_id.to_string();
+    adb.upsert_schedule(Schedule::new(
+        "wake",
+        Trigger::Cron {
+            expr: "0 0 9 * * *".into(),
+        },
+        "wake",
+        crate::agent_db::ScheduleTarget::Fresh,
+    ))
+    .await
+    .unwrap();
+    let engine = schedule_engine_for(&server, &registry, &owner_id, &adb).await;
+    let routine_id = crate::routine::RoutineId::new(format!("agent:{owner_id}:wake"));
+    let mut payload = fresh_schedule_payload(&owner_id, "wake", "wake");
+    payload.generation = engine.current_generation(&routine_id).await;
+    assert!(
+        payload.generation.is_some(),
+        "engine must seed a generation for the schedule"
+    );
+
+    // Park the fire after target resolution (Fresh session already
+    // created) by holding the processing mutex it must acquire next.
+    let guard = server.processing.lock().await;
+    let server_clone = server.clone();
+    let fire = tokio::spawn(async move { server_clone.fire_agent_schedule(payload).await });
+
+    // Wait for the Fresh session to appear, then pull the engine entry
+    // out from under the parked fire (simulates a remove/replace landing
+    // mid-flight).
+    let sid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let sessions = registry.list_sessions().await.unwrap_or_default();
+            if let Some(s) = sessions.first() {
+                return s.session_db_id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fresh session should appear while the fire is parked");
+    engine.deregister_agent(&owner_id).await;
+    drop(guard);
+
+    let result = fire.await.expect("fire task join");
+    assert!(result.is_ok(), "stale turn-start skip returns Ok: {result:?}");
+
+    // No orphaned session: the row survives (append-only history) but is
+    // Closed, the server holds no runtime claim, and nothing was recorded.
+    let sessions = registry.list_sessions().await.unwrap_or_default();
+    assert_eq!(sessions.len(), 1, "exactly the torn-down session");
+    assert!(
+        sessions
+            .iter()
+            .all(|s| s.status == crate::session::SessionStatus::Closed),
+        "stale Fresh session must be Closed, not Active"
+    );
+    assert_eq!(sessions[0].session_db_id, sid);
+    assert!(
+        !server.is_session_open(&sid).await,
+        "server runtime claim must be released"
+    );
+    assert!(
+        !server.processing.lock().await.contains(&sid),
+        "processing lock must be released"
+    );
+    assert!(
+        adb.list_schedule_fires().await.unwrap().is_empty(),
+        "stale fire must not record a ScheduleFire"
+    );
+}
+
+#[tokio::test]
 async fn fire_pinned_skips_when_session_home_is_another_peer() {
     let (_instance, server, registry) = server_fixture().await;
     let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
