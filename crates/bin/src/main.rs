@@ -1,11 +1,18 @@
 mod bridge;
+// The client half of service mode. The daemon holds the lifetime claim from
+// here; the auto-start machinery is built and tested ahead of the frontends
+// that will consume it, which is why parts of it are not called yet.
+#[allow(dead_code)]
+mod service_client;
 
 use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
 use chaz_core::{agent, config, server, session};
 
+use anyhow::Context;
 use clap::Parser;
-use std::time::Instant;
+use std::os::unix::fs::PermissionsExt;
+use std::time::{Duration, Instant};
 use std::{fs::File, io::Read, path::PathBuf};
 use tracing::{error, info, warn};
 
@@ -63,6 +70,10 @@ enum Subcommand {
     /// (`chaz-matrix`, `chaz-discord`) sync against, and the form to run under
     /// systemd, a container, or a test harness, none of which can offer the
     /// TTY the TUI's raw mode requires.
+    ///
+    /// With `service.enabled` in config, also serves this peer's eidetica
+    /// Instance on `<state_dir>/eidetica.sock` and refuses to start if another
+    /// daemon is already serving there.
     ///
     /// Logs to stdout. Stops cleanly on Ctrl-C or SIGTERM.
     Daemon,
@@ -127,6 +138,199 @@ fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
         .as_ref()
         .map(|path| agent::expand_home(std::path::Path::new(path)))
         .or_else(|| dirs::state_dir().map(|d| d.join("chaz")))
+}
+
+/// Where the daemon serves its eidetica Instance, or `None` when the service
+/// socket is switched off.
+///
+/// The default sits beside the database it fronts rather than at eidetica's
+/// per-user default path: one user runs several chaz peers — a daemon and one
+/// or more transport bridges — and each owns a separate backend, so a per-user
+/// singleton socket would front the wrong one.
+fn resolve_service_socket(config: &Config, state_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    let service = config.service.as_ref()?;
+    if !service.enabled {
+        return None;
+    }
+    Some(match &service.path {
+        Some(path) => agent::expand_home(std::path::Path::new(path)),
+        None => state_dir
+            .map(|d| d.join("eidetica.sock"))
+            .unwrap_or_else(|| PathBuf::from("eidetica.sock")),
+    })
+}
+
+/// Take the claim that says "I am the daemon for this state directory", to be
+/// held for the daemon's whole life.
+///
+/// This is the sole-opener rule's enforcement. It is an atomic `flock` rather
+/// than a look-then-act check, so two daemons starting at the same instant
+/// cannot both conclude they are the first; and the kernel drops it when the
+/// holder dies, so a crashed daemon leaves nothing to clean up.
+///
+/// Returns the open file — dropping it releases the claim, so the caller must
+/// hold it.
+fn claim_daemon_role(state_dir: Option<&std::path::Path>) -> anyhow::Result<std::fs::File> {
+    let path = state_dir
+        .map(|d| d.join(service_client::DAEMON_LOCK_FILE))
+        .unwrap_or_else(|| PathBuf::from(service_client::DAEMON_LOCK_FILE));
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("could not open the daemon claim at {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another chaz daemon already holds {} — refusing to start a second \
+             opener of the same eidetica backend",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!(
+            "could not take the daemon claim at {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Where the advisory claim for a service socket lives: the socket path with
+/// `.lock` appended. Kept beside the socket — not in the state directory — so
+/// every daemon that names the same socket contends on the same file, even
+/// when their state directories differ.
+fn service_socket_lock_path(path: &std::path::Path) -> PathBuf {
+    let mut lock = PathBuf::from(path);
+    lock.as_mut_os_string().push(".lock");
+    lock
+}
+
+/// Take the claim that says "I am the daemon serving this socket path", to be
+/// held for the daemon's whole life.
+///
+/// Keyed to the socket path itself, not the state directory: eidetica's
+/// `ServiceServer` unlinks any socket it finds rather than checking, so two
+/// daemons that name the same `service.path` from different state directories
+/// would otherwise each pass the liveness probe before the other binds and
+/// then silently steal each other's socket. An atomic `flock` on a file
+/// adjacent to the socket makes the acquisition itself the arbitration, with
+/// the kernel dropping the claim when the holder dies.
+///
+/// The claim lives beside the socket, so taking it must establish the
+/// socket's parent the same way eidetica's `ServiceServer` does — create it
+/// and pin it to owner-only 0700 — or a valid custom `service.path` inside a
+/// not-yet-existing dedicated directory would fail here, on the lock file,
+/// before the server ever gets to create the parent. A bare relative path
+/// with no parent (bound in the working directory) has nothing to create.
+///
+/// Returns the open file — dropping it releases the claim, so the caller must
+/// hold it.
+fn claim_service_socket(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = service_socket_lock_path(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not create the parent directory {} of the service socket at {}",
+                parent.display(),
+                path.display()
+            )
+        })?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "could not restrict the parent directory {} of the service socket at {} to owner-only access",
+                    parent.display(),
+                    path.display()
+                )
+            },
+        )?;
+    }
+    let file = std::fs::File::create(&lock_path).with_context(|| {
+        format!(
+            "could not open the service socket claim at {}",
+            lock_path.display()
+        )
+    })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another daemon already holds the service socket claim at {} — \
+             refusing to start a second opener of {}",
+            lock_path.display(),
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!(
+            "could not take the service socket claim at {}",
+            lock_path.display()
+        ))),
+    }
+}
+
+/// The socket is ready only once it accepts a connection *and* is mode 0600.
+/// `ServiceServer` binds before it chmods, so connect alone would let a
+/// server that fails its chmod pass as ready in the gap before it exits.
+fn socket_is_ready(path: &std::path::Path) -> bool {
+    let mode_0600 = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777 == 0o600)
+        .unwrap_or(false);
+    mode_0600 && service_client::socket_is_live(path)
+}
+
+/// Fail startup unless the spawned service server actually comes up on `path`.
+///
+/// The server task races a bounded readiness probe under `tokio::select!`,
+/// biased so a finished task wins a tie — a server that just died must never
+/// be reported ready. On timeout the only stop sender is dropped (the server's
+/// shutdown signal) and the task awaited so its socket file is gone before
+/// startup fails. On success the sender and still-running task are returned
+/// for the existing shutdown path.
+async fn await_service_readiness(
+    path: &std::path::Path,
+    task: tokio::task::JoinHandle<eidetica::Result<()>>,
+    stop: tokio::sync::watch::Sender<()>,
+    timeout: Duration,
+) -> anyhow::Result<(
+    tokio::sync::watch::Sender<()>,
+    tokio::task::JoinHandle<eidetica::Result<()>>,
+)> {
+    let ready = async {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if socket_is_ready(path) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out after {timeout:?} waiting for the eidetica service socket at {} \
+                     to accept connections with mode 0600",
+                    path.display()
+                );
+            }
+            tokio::time::sleep(service_client::DEFAULT_POLL_INTERVAL).await;
+        }
+    };
+
+    let mut task = task;
+    tokio::select! {
+        biased;
+        result = &mut task => match result {
+            Ok(Ok(())) => anyhow::bail!(
+                "eidetica service server exited before serving {}",
+                path.display()
+            ),
+            Ok(Err(e)) => anyhow::bail!(
+                "eidetica service server failed to start on {}: {e}",
+                path.display()
+            ),
+            Err(e) => anyhow::bail!(
+                "eidetica service server task failed before serving {}: {e}",
+                path.display()
+            ),
+        },
+        result = ready => match result {
+            Ok(()) => Ok((stop, task)),
+            Err(e) => {
+                drop(stop);
+                let _ = task.await;
+                Err(e)
+            }
+        },
+    }
 }
 
 #[tokio::main]
@@ -245,6 +449,44 @@ async fn main() -> anyhow::Result<()> {
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
 
+    // The eidetica service socket, when the daemon is asked to serve one.
+    // Only the daemon serves: every other mode is a frontend, and step one of
+    // the migration gives them nothing to connect to yet.
+    let service_socket = if daemon_mode {
+        resolve_service_socket(&config, state_dir.as_deref())
+    } else {
+        None
+    };
+    //
+    // All three checks happen before the backend is opened, because refusing
+    // to start is the whole point: a daemon that discovered it was second only
+    // after opening the database would already be the second opener.
+    //
+    // The daemon claim covers two chaz daemons on one state directory. The
+    // socket claim covers two daemons on one socket path regardless of state
+    // directory — eidetica's service server unlinks any socket it finds, so
+    // without an atomic claim two daemons naming the same path would each pass
+    // the probe below before the other binds and then steal each other's
+    // socket. The probe covers whatever else is bound at the path that never
+    // took the claim.
+    let _daemon_claim = match &service_socket {
+        Some(_) => Some(claim_daemon_role(state_dir.as_deref())?),
+        None => None,
+    };
+    let _socket_claim = match &service_socket {
+        Some(socket) => Some(claim_service_socket(socket)?),
+        None => None,
+    };
+    if let Some(socket) = &service_socket
+        && service_client::socket_is_live(socket)
+    {
+        anyhow::bail!(
+            "something is already serving {} — refusing to start a second \
+             opener of the same eidetica backend",
+            socket.display()
+        );
+    }
+
     // Initialize eidetica with SQLite backend for persistent storage
     let eidetica_db_path = state_dir
         .as_ref()
@@ -265,6 +507,11 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = t.elapsed().as_millis() as u64,
         "eidetica opened"
     );
+
+    // Clone before `server::build` takes ownership. The service server serves
+    // the very Instance the daemon runs on — that is what makes a connected
+    // client see the daemon's writes instead of racing them.
+    let service_instance = service_socket.as_ref().map(|_| instance.clone());
 
     // In non-interactive --print mode there is no approval UI; pass the
     // configured (or default) CLI auto-approved tools so shell/write_file work
@@ -342,6 +589,30 @@ async fn main() -> anyhow::Result<()> {
     info!(mode, "Starting bridge");
 
     let result = if daemon_mode {
+        // Serve the backend to other local processes, when configured to.
+        let service = match (service_socket, service_instance) {
+            (Some(path), Some(instance)) => {
+                let (stop, stopped) = tokio::sync::watch::channel(());
+                let server = eidetica::service::ServiceServer::new(instance, path.clone());
+                let task = tokio::spawn(async move { server.run(stopped).await });
+                // Fail closed: do not log "serving" — and do not enter the
+                // shutdown wait below — until the socket has actually
+                // accepted a connection. A server that failed to bind must
+                // fail the daemon's startup, not leave it idling with a
+                // socket nobody can reach.
+                let (stop, task) = await_service_readiness(
+                    &path,
+                    task,
+                    stop,
+                    service_client::DEFAULT_READINESS_TIMEOUT,
+                )
+                .await?;
+                info!(socket = %path.display(), "eidetica service socket serving");
+                Some((stop, task))
+            }
+            _ => None,
+        };
+
         // No bridge: the server is already running sync, schedules, the
         // routine engine, and the agent loop. Hold the process open so that
         // work continues, and let the runtime shut down through the same
@@ -349,6 +620,19 @@ async fn main() -> anyhow::Result<()> {
         info!("chaz daemon ready; waiting for shutdown signal");
         wait_for_shutdown().await;
         info!("Shutdown signal received; stopping");
+
+        // Dropping the sender is the service server's stop signal. Await the
+        // task so the socket file is gone before the process is: a socket
+        // outliving its daemon is the crash leftover a later start has to
+        // reason about.
+        if let Some((stop, task)) = service {
+            drop(stop);
+            match task.await {
+                Ok(Ok(())) => info!("eidetica service socket closed"),
+                Ok(Err(e)) => error!("eidetica service server error: {e}"),
+                Err(e) => error!("eidetica service server task failed: {e}"),
+            }
+        }
         Ok(())
     } else if let Some(a) = cmd_args {
         let bridge = bridge::cmd::CommandBridge::new(config, secret_store, a.command, a.session);
@@ -457,9 +741,14 @@ async fn run_usage_subcommand(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_config_path, resolve_state_dir};
-    use chaz_core::config::Config;
+    use super::{
+        await_service_readiness, claim_daemon_role, claim_service_socket, resolve_config_path,
+        resolve_service_socket, resolve_state_dir,
+    };
+    use chaz_core::config::{Config, ServiceConfig};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn explicit_config_arg_wins() {
@@ -511,5 +800,265 @@ mod tests {
             resolve_state_dir(&config),
             dirs::state_dir().map(|dir| dir.join("chaz"))
         );
+    }
+
+    #[test]
+    fn service_socket_is_off_unless_asked_for() {
+        let state = PathBuf::from("/var/lib/chaz");
+
+        // No block at all, and an explicitly disabled block, both mean off —
+        // including one that names a path, which is a path to nowhere until
+        // someone flips `enabled`.
+        assert_eq!(
+            resolve_service_socket(&Config::default(), Some(&state)),
+            None
+        );
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: false,
+                path: Some("/run/chaz.sock".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_service_socket(&config, Some(&state)), None);
+    }
+
+    #[test]
+    fn service_socket_defaults_beside_the_database() {
+        let state = PathBuf::from("/var/lib/chaz");
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: true,
+                path: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_service_socket(&config, Some(&state)),
+            Some(state.join("eidetica.sock"))
+        );
+
+        // No state directory: the socket lands beside the database, which in
+        // that case is the working directory.
+        assert_eq!(
+            resolve_service_socket(&config, None),
+            Some(PathBuf::from("eidetica.sock"))
+        );
+    }
+
+    #[test]
+    fn service_socket_override_expands_tilde() {
+        let home = dirs::home_dir().expect("home dir in test env");
+        let config = Config {
+            service: Some(ServiceConfig {
+                enabled: true,
+                path: Some("~/run/chaz.sock".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_service_socket(&config, Some(std::path::Path::new("/var/lib/chaz"))),
+            Some(home.join("run/chaz.sock"))
+        );
+    }
+
+    #[test]
+    fn a_second_daemon_cannot_take_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let first = claim_daemon_role(Some(tmp.path())).expect("first daemon takes the claim");
+        let err = claim_daemon_role(Some(tmp.path()))
+            .expect_err("a second daemon must not open the same backend");
+        assert!(
+            format!("{err}").contains("refusing to start a second opener"),
+            "unhelpful error: {err}"
+        );
+
+        // The claim is the daemon's lifetime, so releasing it lets the next
+        // daemon start — which is what makes a restart work.
+        drop(first);
+        claim_daemon_role(Some(tmp.path())).expect("the claim is free once the holder is gone");
+    }
+
+    #[test]
+    fn socket_claim_serializes_two_state_dirs_on_one_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_a = tmp.path().join("state-a");
+        let state_b = tmp.path().join("state-b");
+        std::fs::create_dir_all(&state_a).unwrap();
+        std::fs::create_dir_all(&state_b).unwrap();
+        let socket = tmp.path().join("shared.sock");
+
+        // Different state directories: the state-dir claim is per-directory,
+        // so both daemons hold theirs at once — it cannot be what serializes
+        // access to a socket the two of them name in common.
+        let daemon_a = claim_daemon_role(Some(&state_a)).expect("state A daemon role");
+        let daemon_b = claim_daemon_role(Some(&state_b)).expect("state B daemon role");
+
+        // Race one contender per state directory for the socket claim. Because
+        // the claim is keyed to the socket path, exactly one may hold it.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let tx = tx.clone();
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let _ = tx.send(claim_service_socket(&socket).map_err(|e| e.to_string()));
+            });
+        }
+        drop(tx);
+
+        let mut wins = 0;
+        let mut winner = None;
+        for result in rx {
+            match result {
+                Ok(file) => {
+                    wins += 1;
+                    winner = Some(file);
+                }
+                Err(e) => assert!(
+                    e.contains("refusing to start a second opener"),
+                    "unhelpful contention error: {e}"
+                ),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one daemon may hold the socket claim");
+
+        // The claim is the daemon's lifetime; dropping the winner frees the
+        // socket for the next daemon to start.
+        drop(winner);
+        claim_service_socket(&socket).expect("the socket claim is free once the holder is gone");
+
+        drop(daemon_a);
+        drop(daemon_b);
+    }
+
+    #[test]
+    fn taking_the_claim_creates_an_absent_nested_parent_at_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A valid custom service.path inside a not-yet-existing dedicated
+        // directory: eidetica's ServiceServer creates the parent itself, so
+        // the claim must do the same before dropping the lock file there —
+        // otherwise startup would fail here before the server ever runs.
+        let socket = tmp.path().join("deep").join("nested").join("eidetica.sock");
+        let parent = socket.parent().unwrap();
+        assert!(!parent.exists(), "precondition: the parent is absent");
+
+        let claim =
+            claim_service_socket(&socket).expect("taking the claim creates the socket parent");
+        assert!(parent.is_dir(), "the claim must create the socket parent");
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the parent must be owner-only, as eidetica's ServiceServer pins it"
+        );
+        assert!(
+            super::service_socket_lock_path(&socket).exists(),
+            "the claim file must sit beside the socket"
+        );
+
+        // The parent creation must not disturb the socket-keyed flock: a
+        // second claim on the same socket still contends.
+        let err = claim_service_socket(&socket)
+            .expect_err("the first claim is still held while the parent exists");
+        assert!(
+            format!("{err}").contains("refusing to start a second opener"),
+            "unhelpful contention error: {err}"
+        );
+        drop(claim);
+    }
+
+    #[test]
+    fn socket_is_ready_requires_0600_even_while_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("eidetica.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        // A server that bound but has not chmodded yet: live, but the mode
+        // half of readiness is missing, so it must not count as ready.
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !super::socket_is_ready(&socket),
+            "a live socket with mode 0755 must not be ready"
+        );
+
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            super::socket_is_ready(&socket),
+            "a live socket with mode 0600 must be ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbindable_socket_fails_startup_with_the_bind_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Past the platform's sun_path limit (108 bytes): bind always fails.
+        let too_long = dir
+            .path()
+            .join(format!("eidetica-{}.sock", "x".repeat(120)));
+        assert!(too_long.as_os_str().len() > 108);
+
+        let (instance, _) = eidetica::Instance::create_backend(
+            Box::new(eidetica::backend::database::InMemory::new()),
+            eidetica::NewUser::passwordless("chaz"),
+        )
+        .await
+        .unwrap();
+        let (stop, stopped) = tokio::sync::watch::channel(());
+        let server = eidetica::service::ServiceServer::new(instance, too_long.clone());
+        let task = tokio::spawn(async move { server.run(stopped).await });
+
+        let timeout = Duration::from_secs(10);
+        let started = Instant::now();
+        let err = await_service_readiness(&too_long, task, stop, timeout)
+            .await
+            .expect_err("an unbindable socket must fail startup");
+        assert!(
+            started.elapsed() < timeout,
+            "must fail promptly, not wait out the readiness bound"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to start") && !msg.contains("timed out"),
+            "the bind error must surface, not a timeout: {msg}"
+        );
+        assert!(
+            !too_long.exists(),
+            "a failed start must not leave a socket file"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_socket_returns_task_and_sender_for_clean_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("eidetica.sock");
+
+        let (instance, _) = eidetica::Instance::create_backend(
+            Box::new(eidetica::backend::database::InMemory::new()),
+            eidetica::NewUser::passwordless("chaz"),
+        )
+        .await
+        .unwrap();
+        let (stop, stopped) = tokio::sync::watch::channel(());
+        let server = eidetica::service::ServiceServer::new(instance, socket.clone());
+        let task = tokio::spawn(async move { server.run(stopped).await });
+
+        let (stop, task) = await_service_readiness(&socket, task, stop, Duration::from_secs(5))
+            .await
+            .expect("a bindable socket must come up");
+        assert!(
+            super::socket_is_ready(&socket),
+            "socket must be live and 0600"
+        );
+
+        // The returned sender stops the server, whose task then removes the
+        // socket file — the daemon's shutdown sequence.
+        drop(stop);
+        task.await
+            .expect("service server task panicked")
+            .expect("clean shutdown");
+        assert!(!socket.exists(), "shutdown must remove the socket file");
     }
 }

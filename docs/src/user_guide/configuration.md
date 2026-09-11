@@ -156,6 +156,15 @@ web_search:
 # Omit this field to use iroh P2P only (stable peer identity, no address needed).
 # sync_listen: "0.0.0.0:8765"
 
+# Optional: serve this peer's eidetica backend on a unix socket in daemon mode,
+# so other local processes can reach it as clients instead of opening the same
+# database file. Off by default; nothing connects to it yet.
+# service:
+#   enabled: true
+#   path: /run/user/1000/chaz/eidetica.sock   # default <state_dir>/eidetica.sock
+#   # service.path must sit inside a directory dedicated to this chaz peer:
+#   # eidetica chmods the socket's parent directory to 0700 on startup.
+
 # Extension capabilities — operator-level scoping.
 #
 # agent_state_allowlist: per-extension agent allowlists for the
@@ -488,3 +497,49 @@ Chaz persists all data in the state directory:
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
+
+## Eidetica service socket
+
+`eidetica.db` is an embedded SQLite backend, and an embedded backend belongs to one process: two processes that open it do not observe each other's writes and contend for the write lock. That is why `chaz cmd` is documented as needing the daemon stopped.
+
+Eidetica's answer is service mode — one process owns the backend and serves it over a Unix socket, and everything else connects as a client. With `service.enabled`, `chaz daemon` additionally serves its own Instance:
+
+```yaml
+service:
+  enabled: true # default false
+  # path: /run/user/1000/chaz/eidetica.sock   # default <state_dir>/eidetica.sock
+```
+
+- The socket defaults to `<state_dir>/eidetica.sock`, beside the database it fronts, rather than eidetica's per-user `$XDG_RUNTIME_DIR/eidetica/service.sock`. One user runs several chaz peers — a daemon and one or more transport bridges — and each owns a separate backend.
+- Serving the socket makes its parent directory owner-only (mode `0700`); the socket itself is `0600`. Reaching it is reaching the daemon's own Instance, with everything that implies: sessions, transcripts, credentials, share tickets. Filesystem permissions are the whole authorization boundary.
+- A custom `service.path` must point inside a directory dedicated to this chaz peer: eidetica creates the socket's parent directory and chmods it to `0700` on startup, so a path directly under a shared directory such as `/tmp` would make that directory owner-only for every process on the machine. The default `<state_dir>` is already such a per-peer directory.
+- A second daemon on the same state directory refuses to start, before it opens the database. The interlock is a `flock` on `<state_dir>/daemon.lock` held for the daemon's life, so two daemons starting at the same instant cannot both conclude they are first, and a crashed daemon leaves no lock to clean up. A live socket at the configured path is a second, independent refusal — eidetica's service server unlinks whatever socket it finds rather than checking.
+- The socket is unlinked on clean shutdown (Ctrl-C or SIGTERM). A socket file nobody is listening on is a crash leftover and counts as no daemon at all.
+
+Where this is going: a frontend that finds no daemon will start one and connect to it, rather than opening the database itself. Exactly one of N frontends racing on a cold state directory starts a daemon — a `flock` on `<state_dir>/daemon-start.lock` decides which — and the rest wait for its socket. A start that fails, or a daemon that never accepts connections within the readiness bound, is an error to the caller; there is no path back to opening the database directly.
+
+Nothing connects to the socket yet: `chaz cmd`, `chaz --tui`, `chaz --print` and `chaz usage` still open the database directly, so enabling this changes nothing observable today. The transport bridges are unaffected either way — `chaz-matrix` and `chaz-discord` are separate peers with their own state directories and backends, joined by sync rather than by sharing a database.
+
+### Walkthrough: serve and recover the peer socket
+
+1. Enable the default per-peer socket and start the daemon:
+
+   ```yaml
+   service:
+     enabled: true
+   ```
+
+   ```console
+   $ chaz daemon
+   ... eidetica service socket serving socket=/home/alice/.local/state/chaz/eidetica.sock
+   ... chaz daemon ready; waiting for shutdown signal
+   ```
+
+2. Try to start another daemon against the same config. It refuses before opening the backend:
+
+   ```console
+   $ chaz daemon
+   Error: another chaz daemon already holds /home/alice/.local/state/chaz/daemon.lock — refusing to start a second opener of the same eidetica backend
+   ```
+
+3. Stop the first daemon with Ctrl-C. A clean shutdown removes the socket and releases both advisory locks, so the same command starts normally again. After a crash, the kernel still releases the locks; the next start replaces the stale socket file.
