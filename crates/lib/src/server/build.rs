@@ -27,9 +27,9 @@ use tracing::{error, info, warn};
 use crate::config::{self, Config};
 use crate::server::Server;
 use crate::{
-    agent, agent_db, backends, commands, db_kind, embedding, extension, extensions, grants,
-    hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session, tool, tool_host,
-    tools,
+    agent, agent_db, backends, bubblewrap_host, commands, db_kind, embedding, extension,
+    extensions, grants, hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session,
+    tool, tool_host, tools,
 };
 
 /// Knobs [`build`] can't infer from [`Config`] — behavior a one-shot CLI run and
@@ -502,8 +502,17 @@ pub async fn build(
 
     // Create the callback-driven server
     let context_config = config.context.clone().unwrap_or_default();
-    let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
-        as std::sync::Arc<dyn tool_host::ToolHost>;
+    let tool_host: std::sync::Arc<dyn tool_host::ToolHost> =
+        match config.tool_host.unwrap_or_default() {
+            config::ToolHostConfig::Native => {
+                info!("Tool host: native (in-process, grant checks only)");
+                std::sync::Arc::new(tool_host::NativeToolHost::new())
+            }
+            config::ToolHostConfig::Bubblewrap => {
+                info!("Tool host: bubblewrap (OS-level shell sandboxing)");
+                std::sync::Arc::new(bubblewrap_host::BubblewrapToolHost::new())
+            }
+        };
 
     let server = Server::new(
         registry.clone(),
