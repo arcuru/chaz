@@ -1909,7 +1909,7 @@ dependencies = [
 [[package]]
 name = "eidetica"
 version = "0.2.0"
-source = "git+https://github.com/arcuru/eidetica?rev=5d9a657c1df341ecb6ab291dbf8527488356ac52#5d9a657c1df341ecb6ab291dbf8527488356ac52"
+source = "git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04#40b4a1e568bdba7438cb7af1c1eee74e2c38cf04"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1925,7 +1925,7 @@ dependencies = [
  "instability",
  "iroh",
  "iroh-tickets",
- "lru 0.16.3",
+ "libc",
  "multihash-codetable",
  "postcard",
  "postcard-derive",
@@ -2516,8 +2516,6 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
  "serde",
  "serde_core",
@@ -3603,15 +3601,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "lru"
-version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
-dependencies = [
- "hashbrown 0.16.1",
 ]
 
 [[package]]
