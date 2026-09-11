@@ -1,0 +1,114 @@
+[
+  {
+    "query": "make searching my notes understand meaning rather than exact words",
+    "gold": "user_guide/configuration.md#embeddings"
+  },
+  {
+    "query": "what happens when the vector service is unreachable",
+    "gold": "user_guide/configuration.md#failure-handling"
+  },
+  {
+    "query": "I changed which vectoriser I use, do my older notes still come back",
+    "gold": "user_guide/configuration.md#switching-models"
+  },
+  {
+    "query": "can one assistant read another one's notes",
+    "gold": "user_guide/memory.md#the-two-kinds"
+  },
+  {
+    "query": "restrict which commands the model is allowed to run",
+    "gold": "user_guide/security.md#shell-grants"
+  },
+  {
+    "query": "stop the model reaching machines on my home LAN",
+    "gold": "user_guide/security.md#network-grants"
+  },
+  {
+    "query": "change a snippet of text inside an existing document",
+    "gold": "user_guide/tools.md#edit-file"
+  },
+  {
+    "query": "which keys do I press when it asks permission",
+    "gold": "user_guide/tui.md#key-bindings"
+  },
+  {
+    "query": "keep a permanent record of what the background process printed",
+    "gold": "user_guide/logging.md#redirecting-to-a-file"
+  },
+  {
+    "query": "ask one question from a shell script and get the answer on stdout",
+    "gold": "user_guide/getting_started.md#single-shot-print-mode"
+  },
+  {
+    "query": "why do the external server's functions have a prefix in their names",
+    "gold": "user_guide/mcp.md#tool-discovery-and-namespacing"
+  },
+  {
+    "query": "does the bot reply to every private message on discord",
+    "gold": "user_guide/discord.md#message-handling"
+  },
+  {
+    "query": "where does the connector keep its password safely",
+    "gold": "user_guide/bridges.md#how-credentials-are-stored"
+  },
+  {
+    "query": "it says it is waiting for the owner to allow it",
+    "gold": "user_guide/bridges.md#troubleshooting"
+  },
+  {
+    "query": "let another machine join an existing conversation",
+    "gold": "user_guide/session_sharing.md#sharing-a-session"
+  },
+  {
+    "query": "what does the file that defines an ability look like",
+    "gold": "user_guide/skills.md#the-skill-md-format"
+  },
+  {
+    "query": "where does the persona text that shapes replies come from",
+    "gold": "user_guide/agents.md#system-prompts"
+  },
+  {
+    "query": "where do the token counts come from",
+    "gold": "user_guide/usage.md#how-it-s-captured"
+  },
+  {
+    "query": "combining two permission sets always keeps the stricter one",
+    "gold": "design/capability_tiers.md#the-attenuate-operator"
+  },
+  {
+    "query": "what is a conversation actually stored as",
+    "gold": "architecture/overview.md#session-model"
+  },
+  {
+    "query": "one assistant should only wake another when it names it",
+    "gold": "design/autonomous_agents.md#goals"
+  },
+  {
+    "query": "recurring wake-ups belong to the assistant, not to the chat",
+    "gold": "design/agent_schedules.md#model"
+  },
+  {
+    "query": "keep the connector a thin translator with no smarts in it",
+    "gold": "design/transport_bridges.md#why-dumb"
+  },
+  {
+    "query": "the percentage showing how full the window is",
+    "gold": "design/model_info_store.md#the-ctx-n-gauge"
+  },
+  {
+    "query": "turn a feature on for every conversation instead of just this one",
+    "gold": "user_guide/extensions.md#per-agent-scope"
+  },
+  {
+    "query": "how dangerous each operation is rated",
+    "gold": "user_guide/tools.md#risk-levels"
+  },
+  {
+    "query": "automate the setup so nobody has to click approve",
+    "gold": "user_guide/matrix.md#scripted-bring-up"
+  },
+  {
+    "query": "how long does each plugin instance live",
+    "gold": "architecture/extensions.md#scopes-lifecycle"
+  }
+]
