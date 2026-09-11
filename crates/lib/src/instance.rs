@@ -189,6 +189,7 @@ fn validate(config: &EideticaConfig) -> Result<(), ConnectError> {
 
 fn is_service_connection(connection: &str) -> bool {
     connection
+        .trim()
         .split_once("://")
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("unix"))
 }
@@ -393,6 +394,14 @@ eidetica:
             let config: Config = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(required_settings(&config).unwrap().0.connection, connection);
         }
+    }
+
+    #[test]
+    fn service_detection_ignores_surrounding_whitespace_and_case() {
+        assert!(is_service_connection("unix:///run/eidetica.sock"));
+        assert!(is_service_connection("UNIX:///run/eidetica.sock"));
+        assert!(is_service_connection("  unix:///run/eidetica.sock  "));
+        assert!(!is_service_connection("sqlite://./chaz.db"));
     }
 
     #[tokio::test]
