@@ -15,6 +15,12 @@ pub struct Config {
     pub room_size_limit: Option<usize>,
     /// Set the state directory for chaz
     pub state_dir: Option<String>,
+    /// Connection and login settings for this process's Eidetica instance.
+    /// Startup callers opt into the shared connector explicitly; legacy
+    /// callers continue to use `state_dir` until their migration slice.
+    pub eidetica: Option<EideticaConfig>,
+    /// Whether this process may execute agents or acts only as a client.
+    pub execution: Option<ExecutionRole>,
     /// Model to use for summarizing chats
     pub chat_summary_model: Option<String>,
     /// Backend configuration
@@ -83,6 +89,64 @@ pub struct Config {
     /// [`RuntimeMode::Auto`]. A standalone transport bridge effectively runs
     /// as [`RuntimeMode::Never`] (it owns no runtime; the daemon does).
     pub runtime: Option<RuntimeMode>,
+}
+
+/// The process's authority to run agent and routine work.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionRole {
+    /// Install and run agent execution and autonomous routines.
+    Executor,
+    /// Observe and mutate application state without executing agents.
+    Client,
+}
+
+/// Eidetica connection settings shared by every Chaz executable.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EideticaConfig {
+    /// Native Eidetica connection URL (`sqlite:`, `postgres:`, `memory:`, or
+    /// `unix:`). Eidetica validates the scheme and compiled feature support.
+    pub connection: String,
+    /// Existing Eidetica user to log in as. Connecting never provisions it.
+    pub login: EideticaLoginConfig,
+    /// Direct-owner sync setup. Service clients must omit this block because
+    /// the daemon owns transports, peers, and bootstrap.
+    pub sync: Option<EideticaSyncConfig>,
+}
+
+/// Login credentials for an existing Eidetica user.
+#[derive(Deserialize, Clone)]
+pub struct EideticaLoginConfig {
+    pub username: String,
+    /// Plain native password. Secret-reference infrastructure is deliberately
+    /// outside this connector slice.
+    pub password: Option<String>,
+    /// Explicit opt-in to a passwordless Eidetica login.
+    #[serde(default)]
+    pub passwordless: bool,
+}
+
+impl std::fmt::Debug for EideticaLoginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EideticaLoginConfig")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("passwordless", &self.passwordless)
+            .finish()
+    }
+}
+
+/// Native sync concepts configured on an embedded Eidetica owner.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct EideticaSyncConfig {
+    /// Register the persisted native Iroh transport.
+    #[serde(default)]
+    pub iroh: bool,
+    /// Register an HTTP transport listening on this address.
+    pub http_listen: Option<String>,
+    /// Native Eidetica database tickets to reconcile at startup.
+    #[serde(default)]
+    pub tickets: Vec<String>,
 }
 
 /// Who claims the right to *run* the agent for a session.
@@ -1066,6 +1130,20 @@ fn known_config_keys() -> HashSet<&'static str> {
 
     // ── cli ──
     keys.insert("cli.auto_approved_tools");
+
+    // ── eidetica ──
+    for k in [
+        "eidetica.connection",
+        "eidetica.login.username",
+        "eidetica.login.password",
+        "eidetica.login.passwordless",
+        "eidetica.sync.iroh",
+        "eidetica.sync.http_listen",
+        "eidetica.sync.tickets",
+    ] {
+        keys.insert(k);
+    }
+    keys.insert("execution");
 
     // ── agent_state_allowlist.<extension_name> ── (dynamic keys)
     keys.insert("agent_state_allowlist.");
