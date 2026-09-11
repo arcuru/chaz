@@ -20,10 +20,23 @@ pub enum InstanceOwnership {
 }
 
 /// Capabilities startup code may install for this connection and role.
+///
+/// The fields are private so callers cannot mint an executor capability without
+/// going through [`connect`] or [`connect_with`].
+///
+/// ```compile_fail
+/// use chaz_core::config::ExecutionRole;
+/// use chaz_core::instance::{InstanceCapabilities, InstanceOwnership};
+///
+/// let _ = InstanceCapabilities {
+///     ownership: InstanceOwnership::Direct,
+///     execution: ExecutionRole::Executor,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstanceCapabilities {
-    pub ownership: InstanceOwnership,
-    pub execution: ExecutionRole,
+    ownership: InstanceOwnership,
+    execution: ExecutionRole,
 }
 
 /// Proof that startup may install an agent-execution runtime.
@@ -37,6 +50,14 @@ pub struct ExecutorCapability {
 }
 
 impl InstanceCapabilities {
+    pub fn ownership(self) -> InstanceOwnership {
+        self.ownership
+    }
+
+    pub fn execution(self) -> ExecutionRole {
+        self.execution
+    }
+
     pub fn administers_backend(self) -> bool {
         self.ownership == InstanceOwnership::Direct
     }
@@ -383,7 +404,10 @@ eidetica:
         .await
         .unwrap();
 
-        assert_eq!(connected.capabilities.ownership, InstanceOwnership::Direct);
+        assert_eq!(
+            connected.capabilities.ownership(),
+            InstanceOwnership::Direct
+        );
         assert!(connected.capabilities.runs_agents());
         assert_eq!(
             connected.user.get_default_key().unwrap().to_string(),
@@ -440,7 +464,10 @@ eidetica:
         let connected = connect_with(&settings(url, "legacy-chaz"), ExecutionRole::Client)
             .await
             .unwrap();
-        assert_eq!(connected.capabilities.ownership, InstanceOwnership::Direct);
+        assert_eq!(
+            connected.capabilities.ownership(),
+            InstanceOwnership::Direct
+        );
         assert_eq!(connected.user.get_default_key().unwrap(), identity);
         drop(connected);
 
@@ -478,23 +505,43 @@ eidetica:
         assert!(error.to_string().contains("wrong-user"));
     }
 
-    #[test]
-    fn required_role_is_enforced_by_an_unforgeable_executor_capability() {
-        let direct_client = InstanceCapabilities {
-            ownership: InstanceOwnership::Direct,
-            execution: ExecutionRole::Client,
-        };
+    #[tokio::test]
+    async fn required_role_is_enforced_by_an_unforgeable_executor_capability() {
+        let (client_dir, _, _) = populated_snapshot("client").await;
+        let direct_client = connect_with(
+            &settings(
+                format!(
+                    "memory://{}",
+                    client_dir.path().join("eidetica.json").display()
+                ),
+                "client",
+            ),
+            ExecutionRole::Client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            direct_client.capabilities.execution(),
+            ExecutionRole::Client
+        );
         assert!(matches!(
-            direct_client.executor(),
+            direct_client.capabilities.executor(),
             Err(ConnectError::Capability(_))
         ));
 
-        let service_executor = InstanceCapabilities {
-            ownership: InstanceOwnership::Service,
-            execution: ExecutionRole::Executor,
-        };
-        service_executor.executor().unwrap();
-        assert!(!service_executor.administers_sync());
+        let (_server_dir, shutdown, task, _server, url) = service_fixture("executor").await;
+        let service_executor = connect_with(&settings(url, "executor"), ExecutionRole::Executor)
+            .await
+            .unwrap();
+        assert_eq!(
+            service_executor.capabilities.execution(),
+            ExecutionRole::Executor
+        );
+        service_executor.capabilities.executor().unwrap();
+        assert!(!service_executor.capabilities.administers_sync());
+        drop(service_executor);
+        drop(shutdown);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -520,7 +567,7 @@ eidetica:
         let second = connect_with(&settings(url, "shared-chaz"), ExecutionRole::Client)
             .await
             .unwrap();
-        assert_eq!(first.capabilities.ownership, InstanceOwnership::Service);
+        assert_eq!(first.capabilities.ownership(), InstanceOwnership::Service);
         assert!(first.capabilities.runs_agents());
         assert!(!second.capabilities.runs_agents());
         assert!(!second.capabilities.administers_backend());
