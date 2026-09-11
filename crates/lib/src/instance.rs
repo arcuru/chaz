@@ -504,6 +504,12 @@ eidetica:
         let key = owner_user.add_private_key(Some("agent-key")).await.unwrap();
         let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
         let root = db.root_id().clone();
+        let default_key = owner_user.get_default_key().unwrap();
+        let callback_db = owner_user
+            .create_database(Doc::new(), &default_key)
+            .await
+            .unwrap();
+        let callback_root = callback_db.root_id().clone();
 
         let first = connect_with(
             &settings(url.clone(), "shared-chaz"),
@@ -532,6 +538,33 @@ eidetica:
                 .await
                 .unwrap();
         }
+
+        let observer_db = second.user.open_database(&callback_root).await.unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _callback = observer_db
+            .on_write(move |_, _| {
+                let event_tx = event_tx.clone();
+                async move {
+                    event_tx.send(()).unwrap();
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        let writer_db = first.user.open_database(&callback_root).await.unwrap();
+        writer_db
+            .with_transaction(|tx| async move {
+                tx.get_store::<DocStore>("fixture")
+                    .await?
+                    .set("from", "first-client")
+                    .await
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("the daemon must push another client's write")
+            .expect("the observer callback channel must remain open");
 
         drop(first);
         drop(second);
