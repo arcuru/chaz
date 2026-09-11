@@ -128,7 +128,9 @@ fn redact_connection_url(connection: &str) -> String {
     let Some((scheme, rest)) = connection.split_once("://") else {
         return connection.to_string();
     };
-    let Some((userinfo, endpoint)) = rest.split_once('@') else {
+    // Split at the last `@`: passwords may legally contain `@`, and splitting
+    // at the first would leave a password fragment in the endpoint.
+    let Some((userinfo, endpoint)) = rest.rsplit_once('@') else {
         return connection.to_string();
     };
     if userinfo.contains(':') {
@@ -1157,10 +1159,13 @@ fn known_config_keys() -> HashSet<&'static str> {
 
     // ── eidetica ──
     for k in [
+        "eidetica",
         "eidetica.connection",
+        "eidetica.login",
         "eidetica.login.username",
         "eidetica.login.password",
         "eidetica.login.passwordless",
+        "eidetica.sync",
         "eidetica.sync.iroh",
         "eidetica.sync.http_listen",
         "eidetica.sync.tickets",
@@ -1930,5 +1935,43 @@ agents:
         let unknown = check_unknown_config_keys(yaml);
         // `bogus` appears in two agent entries but should be reported once.
         assert_eq!(unknown, vec!["agents[].bogus"]);
+    }
+
+    #[test]
+    fn eidetica_block_is_known() {
+        let yaml = r#"
+execution: executor
+eidetica:
+  connection: memory://
+  login:
+    username: chaz
+    passwordless: true
+  sync:
+    iroh: true
+    http_listen: 127.0.0.1:8765
+    tickets: []
+"#;
+        assert!(
+            check_unknown_config_keys(yaml).is_empty(),
+            "valid eidetica block must not warn"
+        );
+    }
+
+    #[test]
+    fn connection_redaction_splits_at_last_at() {
+        let rendered = format!(
+            "{:?}",
+            EideticaConfig {
+                connection: "postgres://user:p@ss@db/chaz".into(),
+                login: EideticaLoginConfig {
+                    username: "u".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            }
+        );
+        assert!(!rendered.contains("p@ss"), "password fragment leaked");
+        assert!(rendered.contains("<redacted>"));
     }
 }
