@@ -102,7 +102,7 @@ pub enum ExecutionRole {
 }
 
 /// Eidetica connection settings shared by every Chaz executable.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct EideticaConfig {
     /// Native Eidetica connection URL (`sqlite:`, `postgres:`, `memory:`, or
     /// `unix:`). Eidetica validates the scheme and compiled feature support.
@@ -112,6 +112,30 @@ pub struct EideticaConfig {
     /// Direct-owner sync setup. Service clients must omit this block because
     /// the daemon owns transports, peers, and bootstrap.
     pub sync: Option<EideticaSyncConfig>,
+}
+
+impl std::fmt::Debug for EideticaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EideticaConfig")
+            .field("connection", &redact_connection_url(&self.connection))
+            .field("login", &self.login)
+            .field("sync", &self.sync)
+            .finish()
+    }
+}
+
+fn redact_connection_url(connection: &str) -> String {
+    let Some((scheme, rest)) = connection.split_once("://") else {
+        return connection.to_string();
+    };
+    let Some((userinfo, endpoint)) = rest.split_once('@') else {
+        return connection.to_string();
+    };
+    if userinfo.contains(':') {
+        format!("{scheme}://<redacted>@{endpoint}")
+    } else {
+        connection.to_string()
+    }
 }
 
 /// Login credentials for an existing Eidetica user.

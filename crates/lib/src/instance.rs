@@ -358,7 +358,7 @@ eidetica:
         let yaml = r#"
 execution: client
 eidetica:
-  connection: postgres://user@db/chaz
+  connection: postgres://user:db-secret@db/chaz
   login:
     username: shared-chaz
     password: secret
@@ -370,11 +370,13 @@ eidetica:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let (eidetica, role) = required_settings(&config).unwrap();
         assert_eq!(role, ExecutionRole::Client);
-        assert_eq!(eidetica.connection, "postgres://user@db/chaz");
+        assert_eq!(eidetica.connection, "postgres://user:db-secret@db/chaz");
         let sync = eidetica.sync.as_ref().unwrap();
         assert!(sync.iroh);
         assert_eq!(sync.http_listen.as_deref(), Some("127.0.0.1:8765"));
-        assert!(!format!("{:?}", eidetica.login).contains("secret"));
+        let debug = format!("{eidetica:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("user:db-secret"));
     }
 
     #[test]
