@@ -29,11 +29,32 @@ struct State {
     calls: Vec<RecordedCall>,
 }
 
+struct CallGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// Handle for pausing exactly one scripted call after it is recorded.
+pub(crate) struct MockCallGate {
+    gate: std::sync::Arc<CallGate>,
+}
+
+impl MockCallGate {
+    pub async fn wait_started(&self) {
+        self.gate.started.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.gate.release.notify_one();
+    }
+}
+
 /// Recording mock LLM backend with a FIFO response queue.
 pub(crate) struct MockBackend {
     state: Mutex<State>,
     default_model: String,
     supports_tools: bool,
+    next_call_gate: Mutex<Option<std::sync::Arc<CallGate>>>,
 }
 
 impl MockBackend {
@@ -42,6 +63,7 @@ impl MockBackend {
             state: Mutex::new(State::default()),
             default_model: "mock-model".to_string(),
             supports_tools: true,
+            next_call_gate: Mutex::new(None),
         }
     }
 
@@ -119,6 +141,15 @@ impl MockBackend {
     pub fn pending(&self) -> usize {
         self.state.lock().unwrap().script.len()
     }
+
+    pub fn block_next_call(&self) -> MockCallGate {
+        let gate = std::sync::Arc::new(CallGate {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.next_call_gate.lock().unwrap() = Some(gate.clone());
+        MockCallGate { gate }
+    }
 }
 
 impl BackendDispatch for MockBackend {
@@ -133,17 +164,25 @@ impl BackendDispatch for MockBackend {
         model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(RecordedCall {
-                messages: messages.to_vec(),
-                tools: tools.to_vec(),
-                model: model.to_string(),
-            });
-            state.script.pop_front().unwrap_or_else(|| {
-                Err(LlmError::Configuration {
-                    message: "MockBackend: chat_with_tools called with empty script".into(),
+            let response = {
+                let mut state = self.state.lock().unwrap();
+                state.calls.push(RecordedCall {
+                    messages: messages.to_vec(),
+                    tools: tools.to_vec(),
+                    model: model.to_string(),
+                });
+                state.script.pop_front().unwrap_or_else(|| {
+                    Err(LlmError::Configuration {
+                        message: "MockBackend: chat_with_tools called with empty script".into(),
+                    })
                 })
-            })
+            };
+            let gate = self.next_call_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.started.notify_one();
+                gate.release.notified().await;
+            }
+            response
         })
     }
 }

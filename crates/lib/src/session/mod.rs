@@ -101,6 +101,71 @@ pub struct SessionEntry {
     pub routing: Option<EntryRouting>,
 }
 
+/// Stable identity of a user or directive entry that may require an agent turn.
+///
+/// The identifier is derived from the entry's persisted contents, so every
+/// peer and every restart names the same request without adding a new field to
+/// the existing session-entry wire format.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TurnRequestId(String);
+
+impl TurnRequestId {
+    pub fn for_entry(entry: &SessionEntry) -> Self {
+        let encoded = serde_json::to_vec(entry).expect("SessionEntry serialization cannot fail");
+        Self(blake3::hash(&encoded).to_hex().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Build an id from its persisted text form.
+    pub fn parse(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl std::fmt::Display for TurnRequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Durable lifecycle state for one agent-turn attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnAttemptStatus {
+    Started,
+    Completed,
+}
+
+/// Append-only attempt record stored alongside session entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnAttempt {
+    pub attempt_id: String,
+    pub request_id: TurnRequestId,
+    pub started_at: DateTime<Utc>,
+    pub status: TurnAttemptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Reconciliation result surfaced to frontends and explicit retry callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnRequestState {
+    Queued,
+    InFlight { attempt_id: String },
+    Interrupted { attempt_id: String },
+    Completed { attempt_id: String },
+}
+
+/// A processable persisted entry paired with its stable identity and state.
+#[derive(Debug, Clone)]
+pub struct TurnRequest {
+    pub id: TurnRequestId,
+    pub entry: SessionEntry,
+    pub state: TurnRequestState,
+}
+
 /// Transport routing metadata for a [`SessionEntry`].
 ///
 /// The session DB is the only channel between bridges and the runtime: an
@@ -333,6 +398,7 @@ pub struct Session {
 }
 
 const META_STORE: &str = "meta";
+const TURN_ATTEMPTS_STORE: &str = "turn_attempts";
 
 impl Session {
     /// Open a session, loading existing entries from its database.
@@ -366,6 +432,23 @@ impl Session {
         }
     }
 
+    async fn load_entries_at(
+        database: &Database,
+        store_name: &str,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<Vec<SessionEntry>> {
+        let txn = database.new_transaction_at(snapshot).await?;
+        let store = txn.get_store::<Table<SessionEntry>>(store_name).await?;
+        let mut entries: Vec<SessionEntry> = store
+            .search(|_| true)
+            .await?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
+        entries.sort_by_key(|entry| entry.timestamp);
+        Ok(entries)
+    }
+
     /// Add an entry to the session, persisting it before it becomes visible
     /// in memory.
     ///
@@ -393,6 +476,208 @@ impl Session {
 
         self.entries.push(entry);
         Ok(())
+    }
+
+    /// Reconcile durable turn requests in session order.
+    ///
+    /// A started attempt is reported as `InFlight` only when its id is the
+    /// caller's live attempt. Every other unmatched start is interrupted: the
+    /// persisted record proves side effects may already have happened, so it
+    /// is never returned as queued work.
+    pub async fn turn_requests(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
+        let attempts = self.read_turn_attempts().await?;
+        self.turn_requests_with_attempts(is_agent, live_attempts, attempts)
+    }
+
+    fn turn_requests_with_attempts(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+        attempts: Vec<(String, TurnAttempt)>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
+        Ok(self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.entry_type == EntryType::Directive
+                    || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender))
+            })
+            .cloned()
+            .map(|entry| {
+                let id = TurnRequestId::for_entry(&entry);
+                let state = request_state(&id, &attempts, live_attempts);
+                TurnRequest { id, entry, state }
+            })
+            .collect())
+    }
+
+    /// Reconcile requests against one immutable database snapshot.
+    ///
+    /// Passing the pre-subscription snapshot is the catch-up half of
+    /// `on_write_at_tips`: anything committed after that frontier is handled by
+    /// the callback, while this read accounts for everything at the frontier.
+    pub async fn turn_requests_at(
+        &self,
+        snapshot: eidetica::Snapshot,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
+        let historical = Session {
+            conversation_id: self.conversation_id.clone(),
+            entries: Self::load_entries_at(&self.database, &self.store_name, &snapshot).await?,
+            database: self.database.clone(),
+            store_name: self.store_name.clone(),
+        };
+        let attempts = historical.read_turn_attempts_at(&snapshot).await?;
+        historical.turn_requests_with_attempts(is_agent, live_attempts, attempts)
+    }
+
+    /// Select the oldest durable request that may run on this process.
+    ///
+    /// Queued work runs normally. An in-flight request is selectable only
+    /// when its attempt id is in `live_attempts`, which is how an explicit
+    /// retry hands the already-created attempt to the executor. Completed and
+    /// interrupted requests are never selected automatically.
+    pub async fn next_turn_request(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Option<(TurnRequest, Option<String>)>> {
+        let requests = self.turn_requests(is_agent, live_attempts).await?;
+        Ok(requests
+            .iter()
+            .find_map(|request| match &request.state {
+                TurnRequestState::InFlight { attempt_id } if live_attempts.contains(attempt_id) => {
+                    Some((request.clone(), Some(attempt_id.clone())))
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                requests
+                    .into_iter()
+                    .find(|request| request.state == TurnRequestState::Queued)
+                    .map(|request| (request, None))
+            }))
+    }
+
+    /// Find a processable request by stable id, independent of lifecycle.
+    pub async fn turn_request(
+        &self,
+        request_id: &TurnRequestId,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Option<TurnRequest>> {
+        Ok(self
+            .turn_requests(is_agent, live_attempts)
+            .await?
+            .into_iter()
+            .find(|request| &request.id == request_id))
+    }
+
+    /// Read lifecycle state for an arbitrary processable entry.
+    ///
+    /// Agent-authored mention turns use this without joining the ordinary
+    /// human/directive queue, preserving the existing latest-message routing
+    /// while still gaining crash recovery.
+    pub async fn turn_state_for_entry(
+        &self,
+        entry: &SessionEntry,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<TurnRequestState> {
+        let id = TurnRequestId::for_entry(entry);
+        let attempts = self.read_turn_attempts().await?;
+        Ok(request_state(&id, &attempts, live_attempts))
+    }
+
+    /// Persist attempt start before model or tool execution.
+    pub async fn start_turn_attempt(
+        &self,
+        request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let attempt = TurnAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            request_id,
+            started_at: Utc::now(),
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        self.write_turn_attempt(&attempt).await?;
+        Ok(attempt)
+    }
+
+    /// Mark an attempt complete in the same transaction as its final entry.
+    pub async fn complete_turn_attempt(
+        &mut self,
+        attempt: &TurnAttempt,
+        final_entry: Option<SessionEntry>,
+    ) -> anyhow::Result<()> {
+        let completed = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(Utc::now()),
+            ..attempt.clone()
+        };
+        let txn = self.database.new_transaction().await?;
+        if let Some(entry) = final_entry.as_ref() {
+            txn.get_store::<Table<SessionEntry>>(&self.store_name)
+                .await?
+                .insert(entry.clone())
+                .await?;
+        }
+        let attempt_id = completed.attempt_id.clone();
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(attempt_id, completed)
+            .await?;
+        txn.commit().await?;
+        if let Some(entry) = final_entry {
+            self.entries.push(entry);
+        }
+        Ok(())
+    }
+
+    async fn read_turn_attempts(&self) -> anyhow::Result<Vec<(String, TurnAttempt)>> {
+        let txn = self.database.new_transaction().await?;
+        Ok(txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?)
+    }
+
+    async fn read_turn_attempts_at(
+        &self,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<Vec<(String, TurnAttempt)>> {
+        let txn = self.database.new_transaction_at(snapshot).await?;
+        Ok(txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?)
+    }
+
+    async fn write_turn_attempt(&self, attempt: &TurnAttempt) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(&attempt.attempt_id, attempt.clone())
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn attempts_for_test(&self) -> Vec<TurnAttempt> {
+        self.read_turn_attempts()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, attempt)| attempt)
+            .collect()
     }
 
     /// Merge backfill history from a bridge (e.g., Matrix room history).
@@ -458,6 +743,32 @@ impl Session {
     {
         update_meta_on_db(&self.database, mutator).await
     }
+}
+
+fn request_state(
+    id: &TurnRequestId,
+    attempts: &[(String, TurnAttempt)],
+    live_attempts: &std::collections::HashSet<String>,
+) -> TurnRequestState {
+    attempts
+        .iter()
+        .filter(|(_, attempt)| &attempt.request_id == id)
+        .max_by_key(|(_, attempt)| attempt.started_at)
+        .map_or(TurnRequestState::Queued, |(_, attempt)| {
+            match attempt.status {
+                TurnAttemptStatus::Completed => TurnRequestState::Completed {
+                    attempt_id: attempt.attempt_id.clone(),
+                },
+                TurnAttemptStatus::Started if live_attempts.contains(&attempt.attempt_id) => {
+                    TurnRequestState::InFlight {
+                        attempt_id: attempt.attempt_id.clone(),
+                    }
+                }
+                TurnAttemptStatus::Started => TurnRequestState::Interrupted {
+                    attempt_id: attempt.attempt_id.clone(),
+                },
+            }
+        })
 }
 
 /// Read the meta DocStore of a session DB. Returns default on any error.

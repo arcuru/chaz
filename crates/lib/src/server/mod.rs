@@ -22,7 +22,9 @@ use crate::extension::{ExtensionHub, HookContext};
 use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
-use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
+use crate::session::{
+    EntryType, Session, SessionEntry, SessionRegistry, TurnAttempt, TurnRequestId, TurnRequestState,
+};
 use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolProfile, ToolRegistry};
 use crate::tool_host::ToolHost;
 use crate::types::ConversationId;
@@ -156,6 +158,13 @@ struct SpawnContext {
     completion_tx: Option<mpsc::Sender<()>>,
     /// Per-session processing lock — cleared when the task completes
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Public recovery view for a persisted request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedTurn {
+    pub request_id: TurnRequestId,
+    pub attempt_id: String,
 }
 
 /// Built-in default for the agent→agent burst budget — the run of
@@ -347,6 +356,11 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Attempts started by this process and not yet durably completed.
+    /// This distinguishes a genuinely active task from a persisted start left
+    /// behind by a previous process. It is process-local coordination, not
+    /// distributed fencing.
+    live_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -475,6 +489,7 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -1473,8 +1488,13 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
+        // Pair the initial read cursor with registration so a write between
+        // subscription setup and catch-up cannot disappear. The callback only
+        // wakes reconciliation; persisted request/attempt state decides work.
+        let observed_tips = session_db.snapshot().await?;
+        let catch_up_tips = observed_tips.clone();
         session_db
-            .on_write(move |event, _db| {
+            .on_write_at_tips(observed_tips, move |event, _db| {
                 // Deliberately not gated on the source. A co-owner pushing
                 // into a shared session arrives as `Remote`, and that has to
                 // wake the agent here exactly as a local commit does — that
@@ -1505,11 +1525,103 @@ impl Server {
         // `process_session` on a session with nothing outstanding is a no-op.
         // A standalone bridge runs with no processing loop, so the send having
         // no receiver is expected there rather than a failure.
-        if self.notify_tx.send(session_db_id.clone()).await.is_err() {
+        let catch_up_session =
+            Session::new(ConversationId(session_db_id.clone()), session_db.clone()).await;
+        let has_catch_up = catch_up_session
+            .turn_requests_at(
+                catch_up_tips,
+                |name| self.agents.get(name).is_some(),
+                &self.live_attempts.lock().await.clone(),
+            )
+            .await?
+            .into_iter()
+            .any(|request| request.state == TurnRequestState::Queued);
+        if has_catch_up && self.notify_tx.send(session_db_id.clone()).await.is_err() {
             debug!(session_db_id = %session_db_id, "No processing loop; skipping catch-up");
         }
 
         Ok(())
+    }
+
+    /// Connector-gated executor registration.
+    ///
+    /// Holding [`crate::instance::ExecutorCapability`] proves the process was
+    /// configured with `execution = executor`; client connectors cannot call
+    /// this boundary or start model/tool work.
+    pub async fn register_executor_session(
+        &self,
+        _executor: &crate::instance::ExecutorCapability,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+        agent_override: Option<String>,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+    ) -> anyhow::Result<()> {
+        let agent_name = agent_override
+            .clone()
+            .unwrap_or_else(|| "agent".to_string());
+        self.watch_session(session_db, backend, agent_override, approval_tx)
+            .await?;
+        self.claim_runtime(session_db, agent_name, 0, self.runtime_mode())
+            .await?;
+        Ok(())
+    }
+
+    /// List interrupted attempts that require an explicit retry decision.
+    pub async fn interrupted_turns(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<Vec<InterruptedTurn>> {
+        let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
+        let session = Session::new(conversation_id, session_db).await;
+        let live = self.live_attempts.lock().await.clone();
+        Ok(session
+            .turn_requests(|name| self.agents.get(name).is_some(), &live)
+            .await?
+            .into_iter()
+            .filter_map(|request| match request.state {
+                TurnRequestState::Interrupted { attempt_id } => Some(InterruptedTurn {
+                    request_id: request.id,
+                    attempt_id,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Explicitly retry an interrupted request by creating a new attempt.
+    ///
+    /// The old attempt remains in the append-only history. The new attempt is
+    /// started durably before reconciliation can invoke model or tools.
+    pub async fn retry_interrupted_turn(
+        &self,
+        session_db_id: &str,
+        request_id: &TurnRequestId,
+    ) -> anyhow::Result<String> {
+        let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
+        let session = Session::new(conversation_id, session_db).await;
+        let live = self.live_attempts.lock().await.clone();
+        let request = session
+            .turn_request(request_id, |name| self.agents.get(name).is_some(), &live)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown turn request {request_id}"))?;
+        if !matches!(request.state, TurnRequestState::Interrupted { .. }) {
+            anyhow::bail!("turn request {request_id} is not interrupted");
+        }
+
+        let attempt = session.start_turn_attempt(request.id).await?;
+        self.live_attempts
+            .lock()
+            .await
+            .insert(attempt.attempt_id.clone());
+        if self
+            .notify_tx
+            .send(session_db_id.to_string())
+            .await
+            .is_err()
+        {
+            anyhow::bail!("no executor loop is running");
+        }
+        Ok(attempt.attempt_id)
     }
 
     /// Claim **runtime** ownership of a session — the runtime half of the old
@@ -1586,13 +1698,15 @@ impl Server {
         agent_override: Option<String>,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
-        let agent_name_for_hook = agent_override
+        // Legacy startup callers still reach this wrapper until the M4 binary
+        // conversion. New connector-based callers use
+        // `register_executor_session`, whose capability cannot be forged.
+        let agent_name = agent_override
             .clone()
             .unwrap_or_else(|| "agent".to_string());
-
         self.watch_session(session_db, backend, agent_override, approval_tx)
             .await?;
-        self.claim_runtime(session_db, agent_name_for_hook, 0, self.runtime_mode())
+        self.claim_runtime(session_db, agent_name, 0, self.runtime_mode())
             .await?;
 
         Ok(())
@@ -1803,10 +1917,48 @@ impl Server {
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
-        let latest = match session.latest_entry() {
-            Some(e) => e.clone(),
-            None => return Ok(()),
+        let live_attempts = self.live_attempts.lock().await.clone();
+        let queued = session
+            .next_turn_request(|name| self.agents.get(name).is_some(), &live_attempts)
+            .await?;
+        let latest_session_entry = session.latest_entry().cloned();
+        let agent_mention = match latest_session_entry {
+            Some(entry)
+                if entry.entry_type == EntryType::Message
+                    && self.agents.get(&entry.sender).is_some() =>
+            {
+                match session.turn_state_for_entry(&entry, &live_attempts).await? {
+                    TurnRequestState::Queued => Some((
+                        crate::session::TurnRequest {
+                            id: TurnRequestId::for_entry(&entry),
+                            entry,
+                            state: TurnRequestState::Queued,
+                        },
+                        None,
+                    )),
+                    TurnRequestState::InFlight { attempt_id }
+                        if live_attempts.contains(&attempt_id) =>
+                    {
+                        Some((
+                            crate::session::TurnRequest {
+                                id: TurnRequestId::for_entry(&entry),
+                                entry,
+                                state: TurnRequestState::InFlight {
+                                    attempt_id: attempt_id.clone(),
+                                },
+                            },
+                            Some(attempt_id),
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         };
+        let Some((request, existing_attempt_id)) = queued.or(agent_mention) else {
+            return Ok(());
+        };
+        let latest = request.entry.clone();
 
         let sender_is_agent = self.agents.get(&latest.sender).is_some();
 
@@ -1938,12 +2090,34 @@ impl Server {
         }
         self.reset_home_skip(session_db_id, &agent.name).await;
 
+        // This is the last boundary before model/tool side effects. A queued
+        // request remains queued through startup/runtime/home checks; only an
+        // executor that is actually about to run persists the attempt start.
+        let attempt = match existing_attempt_id {
+            Some(attempt_id) => TurnAttempt {
+                attempt_id,
+                request_id: request.id,
+                started_at: Utc::now(),
+                status: crate::session::TurnAttemptStatus::Started,
+                completed_at: None,
+            },
+            None => {
+                let attempt = session.start_turn_attempt(request.id).await?;
+                self.live_attempts
+                    .lock()
+                    .await
+                    .insert(attempt.attempt_id.clone());
+                attempt
+            }
+        };
+
         self.spawn_agent_task(
             session_db_id.to_string(),
             session,
             agent,
             approval_tx,
             backend,
+            attempt,
             spawn_ctx,
         )
         .await;
@@ -1951,6 +2125,7 @@ impl Server {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_agent_task(
         &self,
         session_db_id: String,
@@ -1958,6 +2133,7 @@ impl Server {
         agent: crate::agent::Agent,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
         backend: BackendManager,
+        attempt: TurnAttempt,
         spawn: SpawnContext,
     ) {
         let agent_name = agent.name.clone();
@@ -1996,6 +2172,8 @@ impl Server {
         let active_extensions = self
             .active_extensions_for_agent(&session_db_id, &agent_name)
             .await;
+        let live_attempts = self.live_attempts.clone();
+        let notify_tx = self.notify_tx.clone();
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
@@ -2188,7 +2366,7 @@ impl Server {
             drop(_permit);
 
             let mut s = session.lock().await;
-            match result {
+            let final_entry = match result {
                 Ok(outcome) if outcome.body.trim().is_empty() => {
                     // Silent turn — the agent acted via tools or chose
                     // not to speak. Write no Message: keeps the room
@@ -2203,45 +2381,44 @@ impl Server {
                         session = %session_db_id,
                         "Agent produced no message (silent turn) — no entry written"
                     );
+                    None
                 }
-                Ok(outcome) => {
-                    if let Err(e) = s
-                        .add_entry(SessionEntry {
-                            sender: agent_name,
-                            content: outcome.body,
-                            timestamp: Utc::now(),
-                            entry_type: EntryType::Message,
-                            metadata: outcome.metadata,
-                            routing: None,
-                        })
-                        .await
-                    {
-                        error!("Failed to write agent reply for {session_db_id}: {e}");
-                    }
-                }
+                Ok(outcome) => Some(SessionEntry {
+                    sender: agent_name,
+                    content: outcome.body,
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Message,
+                    metadata: outcome.metadata,
+                    routing: None,
+                }),
                 Err(err) => {
                     error!("Agent error for {}: {err}", session_db_id);
-                    if let Err(e) = s
-                        .add_entry(SessionEntry {
-                            sender: agent_name,
-                            content: format!("Error: {err}"),
-                            timestamp: Utc::now(),
-                            entry_type: EntryType::Error,
-                            metadata: None,
-                            routing: None,
-                        })
-                        .await
-                    {
-                        error!("Failed to write agent error for {session_db_id}: {e}");
-                    }
+                    Some(SessionEntry {
+                        sender: agent_name,
+                        content: format!("Error: {err}"),
+                        timestamp: Utc::now(),
+                        entry_type: EntryType::Error,
+                        metadata: None,
+                        routing: None,
+                    })
                 }
+            };
+            if let Err(e) = s.complete_turn_attempt(&attempt, final_entry).await {
+                error!("Failed to complete turn attempt for {session_db_id}: {e}");
             }
             drop(s);
+
+            live_attempts.lock().await.remove(&attempt.attempt_id);
 
             {
                 let mut proc = spawn.processing.lock().await;
                 proc.remove(&session_db_id);
             }
+
+            // Drain another durable queued request, if present. Self-writes
+            // also wake reconciliation, but this explicit wake avoids relying
+            // on callback timing after the processing slot is released.
+            let _ = notify_tx.send(session_db_id.clone()).await;
 
             if let Some(tx) = spawn.completion_tx {
                 let _ = tx.send(()).await;
