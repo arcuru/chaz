@@ -117,6 +117,38 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
     (instance, server, registry)
 }
 
+async fn server_fixture_from_registry(
+    registry: Arc<crate::session::SessionRegistry>,
+) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+    let instance = registry.instance().clone();
+    let agents = registry.agents.clone();
+    let security = SecurityContext {
+        leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::default()),
+        auto_approved_tools: std::collections::HashSet::new(),
+        approval_callback: None,
+    };
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let default_backend = crate::backends::BackendManager::new(&None, secrets);
+    let server = Server::new(
+        registry.clone(),
+        agents,
+        HostedIndex::empty("agent"),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        security,
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        default_backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        true,
+    );
+    (instance, server, registry)
+}
+
 #[tokio::test]
 async fn hydrate_picks_up_db_config_edits() {
     let (_instance, server, registry) = server_fixture().await;
@@ -2291,6 +2323,401 @@ async fn a_local_write_wakes_the_agent() {
         await_agent_reply(&session_db, &sid, "alpha").await,
         "a locally committed write must drive the agent loop"
     );
+}
+
+async fn write_user_message_with_content(
+    session_db: &eidetica::Database,
+    sid: &str,
+    content: &str,
+) -> crate::session::TurnRequestId {
+    let entry = crate::session::SessionEntry {
+        sender: "user".to_string(),
+        content: content.to_string(),
+        timestamp: Utc::now(),
+        entry_type: EntryType::Message,
+        metadata: None,
+        routing: None,
+    };
+    let id = crate::session::TurnRequestId::for_entry(&entry);
+    let mut session = crate::session::Session::new(
+        crate::types::ConversationId(sid.to_string()),
+        session_db.clone(),
+    )
+    .await;
+    session.add_entry(entry).await.unwrap();
+    id
+}
+
+async fn await_call_count(mock: &crate::test_support::MockBackend, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if mock.recorded_calls().len() >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("backend call count did not advance");
+}
+
+async fn await_no_processing(server: &Server, sid: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !server.processing.lock().await.contains(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn did not finish");
+}
+
+#[tokio::test]
+async fn request_before_observer_attach_is_reconciled_once() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "before attach").await;
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("only reply");
+    mock.push_text("duplicate reply");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    for _ in 0..3 {
+        server.notify_tx.send(sid.clone()).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(mock.recorded_calls().len(), 1);
+    let session = Session::new(ConversationId(sid), db).await;
+    assert!(
+        session
+            .attempts_for_test()
+            .await
+            .iter()
+            .all(|attempt| { attempt.status == crate::session::TurnAttemptStatus::Completed })
+    );
+}
+
+#[tokio::test]
+async fn request_before_attempt_start_survives_restart_as_queued() {
+    let (_instance, old_server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&old_server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&old_server);
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "queued across restart").await;
+    drop(old_server);
+
+    let (_instance2, restarted, _registry2) = server_fixture_from_registry(registry.clone()).await;
+    register_alpha_agent_runtime(&restarted);
+    restarted.agent_index().register(entry);
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("recovered");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    restarted
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&restarted, &sid).await;
+    assert!(restarted.interrupted_turns(&sid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn second_turn_during_first_response_is_preserved() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("first reply");
+    mock.push_text("second reply");
+    mock.push_text("duplicate reply");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+
+    write_user_message_with_content(&db, &sid, "first").await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_started())
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "second").await;
+    gate.release();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(mock.recorded_calls().len(), 2);
+    assert!(
+        mock.recorded_calls()[1]
+            .messages
+            .iter()
+            .any(|message| matches!(
+                message,
+                crate::runtime::RuntimeMessage::User(content) if content == "second"
+            ))
+    );
+}
+
+#[tokio::test]
+async fn interrupted_attempt_requires_explicit_retry() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, first_server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&first_server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&first_server);
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let request_id = write_user_message_with_content(&db, &sid, "side effect turn").await;
+
+    // Simulate process death after the durable start and an external effect:
+    // no completion is committed, and the new process has no live-attempt id.
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let old_attempt = session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    drop(first_server);
+
+    let (_instance2, restarted, _registry2) = server_fixture_from_registry(registry.clone()).await;
+    register_alpha_agent_runtime(&restarted);
+    restarted.agent_index().register(entry);
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("retry reply");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    restarted
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mock.recorded_calls().is_empty(), "restart must not replay");
+    assert_eq!(
+        restarted.interrupted_turns(&sid).await.unwrap(),
+        vec![super::InterruptedTurn {
+            request_id: request_id.clone(),
+            attempt_id: old_attempt.attempt_id.clone(),
+        }]
+    );
+
+    let retry_id = restarted
+        .retry_interrupted_turn(&sid, &request_id)
+        .await
+        .unwrap();
+    assert_ne!(retry_id, old_attempt.attempt_id);
+    await_call_count(&mock, 1).await;
+    await_no_processing(&restarted, &sid).await;
+    assert!(restarted.interrupted_turns(&sid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn crash_after_completed_relation_does_not_reexecute() {
+    let (_instance, old_server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&old_server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&old_server);
+    let (_conv, db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let request_id = write_user_message_with_content(&db, &sid, "already completed").await;
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let attempt = session.start_turn_attempt(request_id).await.unwrap();
+    session
+        .complete_turn_attempt(
+            &attempt,
+            Some(SessionEntry {
+                sender: "alpha".into(),
+                content: "durable reply".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            }),
+        )
+        .await
+        .unwrap();
+    drop(old_server);
+
+    let (_instance2, restarted, _registry2) = server_fixture_from_registry(registry.clone()).await;
+    register_alpha_agent_runtime(&restarted);
+    restarted.agent_index().register(entry);
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("duplicate reply");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    restarted
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mock.recorded_calls().is_empty());
+    let reopened = Session::new(ConversationId(sid), db).await;
+    assert_eq!(
+        reopened
+            .entries()
+            .iter()
+            .filter(|entry| entry.sender == "alpha" && entry.entry_type == EntryType::Message)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn shared_service_clients_observe_durable_attempt_completion() {
+    use eidetica::NewUser;
+    use eidetica::backend::database::InMemory;
+    use eidetica::crdt::Doc;
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("eidetica.sock");
+    let (owner, mut owner_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
+            .await
+            .unwrap();
+    let key = owner_user.get_default_key().unwrap();
+    let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
+    let root = db.root_id().clone();
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let url = format!("unix://{}", socket.display());
+    let settings = || crate::config::EideticaConfig {
+        connection: url.clone(),
+        login: crate::config::EideticaLoginConfig {
+            username: "shared".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let executor =
+        crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Executor)
+            .await
+            .unwrap();
+    let client = crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    assert!(client.capabilities.executor().is_err());
+    let executor_db = executor.user.open_database(&root).await.unwrap();
+    let client_db = client.user.open_database(&root).await.unwrap();
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cursor = client_db.snapshot().await.unwrap();
+    let _callback = client_db
+        .on_write_at_tips(cursor, move |_, _| {
+            let wake_tx = wake_tx.clone();
+            async move {
+                wake_tx.send(()).unwrap();
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let entry = SessionEntry {
+        sender: "user".into(),
+        content: "shared service turn".into(),
+        timestamp: Utc::now(),
+        entry_type: EntryType::Message,
+        metadata: None,
+        routing: None,
+    };
+    let request_id = crate::session::TurnRequestId::for_entry(&entry);
+    let mut executor_session = Session::new(ConversationId(root.to_string()), executor_db).await;
+    executor_session.add_entry(entry).await.unwrap();
+    let attempt = executor_session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    executor_session
+        .complete_turn_attempt(
+            &attempt,
+            Some(SessionEntry {
+                sender: "alpha".into(),
+                content: "shared response".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            }),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), wake_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let client_session = Session::new(ConversationId(root.to_string()), client_db).await;
+    let requests = client_session
+        .turn_requests(|name| name == "alpha", &Default::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        requests[0].state,
+        crate::session::TurnRequestState::Completed { .. }
+    ));
+    assert!(
+        client_session
+            .entries()
+            .iter()
+            .any(|entry| { entry.sender == "alpha" && entry.content == "shared response" })
+    );
+
+    drop(executor);
+    drop(client);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
 }
 
 /// Poll the session for a `Message` entry sent by `agent`, up to a few
