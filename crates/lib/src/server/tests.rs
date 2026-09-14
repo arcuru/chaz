@@ -2461,9 +2461,8 @@ async fn legacy_transcript_is_baselined_before_executor_registration() {
         .await
         .unwrap();
 
-    // Remove the fresh-session marker to model a DB created by an older
-    // binary, then write completed history including a sender no longer in
-    // the runtime registry.
+    // Remove the new-session marker to model an older database, then write
+    // completed history that includes a sender no longer in the registry.
     let txn = db.new_transaction().await.unwrap();
     let meta = txn
         .get_store::<eidetica::store::DocStore>("meta")
@@ -2712,8 +2711,8 @@ async fn interrupted_attempt_requires_explicit_retry() {
         .unwrap();
     let request_id = write_user_message_with_content(&db, &sid, "side effect turn").await;
 
-    // Simulate process death after the durable start and an external effect:
-    // no completion is committed, and the new process has no live-attempt id.
+    // Simulate a process dying after it records the start and causes an
+    // external effect. The new process has no completion or live attempt id.
     let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
     let old_attempt = session
         .start_turn_attempt(request_id.clone())

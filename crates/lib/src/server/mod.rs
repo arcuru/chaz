@@ -392,7 +392,7 @@ pub struct Server {
     active_extensions: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
     /// Internal notification channel — callbacks send session_db_id here
     notify_tx: mpsc::Sender<ProcessingCommand>,
-    /// Checked again at every model/tool execution and retry chokepoint.
+    /// Guards model, tool, and retry entry points.
     executor_authorized: bool,
     /// Agent→agent burst budget. Defaults to
     /// [`DEFAULT_AGENT_BURST_BUDGET`]; operators override it via
@@ -1503,9 +1503,9 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
-        // Pair the initial read cursor with registration so a write between
-        // subscription setup and catch-up cannot disappear. The callback only
-        // wakes reconciliation; persisted request/attempt state decides work.
+        // Capture the initial read cursor before subscribing. A write between
+        // subscription setup and catch-up then reaches either the callback or
+        // the catch-up read. The persisted request state decides what runs.
         let observed_tips = session_db.snapshot().await?;
         let catch_up_tips = observed_tips.clone();
         session_db
@@ -1566,10 +1566,9 @@ impl Server {
 
     /// Register a session for callback-driven agent processing.
     ///
-    /// The server itself carries executor authority minted by connector/build
-    /// startup. Client-role servers fail before installing a watcher or
-    /// mutating compatibility state; there is no parallel ungated execution
-    /// registration API.
+    /// The server holds executor authority from startup. A client server fails
+    /// before it installs a watcher or changes compatibility state. There is
+    /// no separate registration path without that check.
     pub async fn register_session(
         &self,
         session_db: &eidetica::Database,
@@ -2146,9 +2145,9 @@ impl Server {
         }
         self.reset_home_skip(session_db_id, &agent.name).await;
 
-        // This is the last boundary before model/tool side effects. A queued
-        // request remains queued through startup/runtime/home checks; only an
-        // executor that is actually about to run persists the attempt start.
+        // This is the last check before model or tool side effects. A request
+        // stays queued through startup, runtime, and home-peer checks. Only
+        // the executor about to run it records the attempt start.
         let attempt = match existing_attempt_id {
             Some(attempt_id) => session
                 .read_turn_attempt(&attempt_id)
@@ -2469,9 +2468,9 @@ impl Server {
                 proc.remove(&session_db_id);
             }
 
-            // Drain another durable queued request, if present. Self-writes
-            // also wake reconciliation, but this explicit wake avoids relying
-            // on callback timing after the processing slot is released.
+            // Start another queued request, if one is waiting. Self-writes
+            // also wake reconciliation, but this avoids depending on callback
+            // timing after the processing slot is released.
             let _ = notify_tx
                 .send(ProcessingCommand::Wake(session_db_id.clone()))
                 .await;
