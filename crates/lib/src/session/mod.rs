@@ -475,10 +475,10 @@ impl Session {
         Ok(request_id)
     }
 
-    /// Mark a freshly-created session as using durable turn requests.
+    /// Mark a new session as using durable turn requests.
     ///
-    /// Creation writes this before any request can be appended. Existing
-    /// sessions intentionally lack it and are baselined by the first executor.
+    /// Creation records this before any request is appended. Older sessions
+    /// have no marker and the first executor records their baseline.
     pub async fn initialize_turn_schema(database: &Database) -> anyhow::Result<()> {
         let txn = database.new_transaction().await?;
         let meta = txn.get_store::<DocStore>(META_STORE).await?;
@@ -489,11 +489,11 @@ impl Session {
         Ok(())
     }
 
-    /// Establish the compatibility boundary for a pre-durable session.
+    /// Record the compatibility boundary for an older session.
     ///
-    /// The marker and the exact entry row ids visible in the same transaction
-    /// commit atomically. A concurrent entry branched before this commit is
-    /// not in the baseline and remains legitimate queued work after merge.
+    /// This transaction writes the marker and the visible entry row ids
+    /// together. An entry from a concurrent branch is not in the baseline and
+    /// remains queued after the branches merge.
     pub async fn ensure_turn_schema_baseline(&self) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
         let meta = txn.get_store::<DocStore>(META_STORE).await?;
@@ -520,10 +520,9 @@ impl Session {
 
     /// Reconcile durable turn requests in session order.
     ///
-    /// A started attempt is reported as `InFlight` only when its id is the
-    /// caller's live attempt. Every other unmatched start is interrupted: the
-    /// persisted record proves side effects may already have happened, so it
-    /// is never returned as queued work.
+    /// A started attempt is `InFlight` only when it belongs to this process.
+    /// Any other unmatched start is interrupted. It may have caused external
+    /// effects, so it is never returned as queued work.
     pub async fn turn_requests(
         &self,
         is_agent: impl Fn(&str) -> bool,
@@ -562,9 +561,8 @@ impl Session {
 
     /// Reconcile requests against one immutable database snapshot.
     ///
-    /// Passing the pre-subscription snapshot is the catch-up half of
-    /// `on_write_at_tips`: anything committed after that frontier is handled by
-    /// the callback, while this read accounts for everything at the frontier.
+    /// This snapshot covers the state present before `on_write_at_tips` was
+    /// registered. The callback handles later commits.
     pub async fn turn_requests_at(
         &self,
         snapshot: eidetica::Snapshot,
@@ -587,10 +585,9 @@ impl Session {
 
     /// Select the oldest durable request that may run on this process.
     ///
-    /// Queued work runs normally. An in-flight request is selectable only
-    /// when its attempt id is in `live_attempts`, which is how an explicit
-    /// retry hands the already-created attempt to the executor. Completed and
-    /// interrupted requests are never selected automatically.
+    /// Queued work runs normally. An in-flight request is selectable only when
+    /// its attempt id is in `live_attempts`; explicit retry adds it there.
+    /// Completed and interrupted requests never run automatically.
     pub async fn next_turn_request(
         &self,
         is_agent: impl Fn(&str) -> bool,
@@ -629,9 +626,9 @@ impl Session {
 
     /// Read lifecycle state for an arbitrary processable entry.
     ///
-    /// Agent-authored mention turns use this without joining the ordinary
-    /// human/directive queue, preserving the existing latest-message routing
-    /// while still gaining crash recovery.
+    /// Agent mentions use this without joining the ordinary human/directive
+    /// queue. They keep the existing latest-message routing and gain crash
+    /// recovery.
     pub async fn turn_state_for_entry(
         &self,
         entry_id: &TurnRequestId,
