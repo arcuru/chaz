@@ -1,6 +1,6 @@
 # ReAct Runtime
 
-The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response.
+The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response. The server records a durable turn attempt before entering this loop and commits the final entry with completion; request recovery and explicit retry are described in [Session Model](sessions.md#durable-turn-recovery).
 
 ## Loop Flow
 

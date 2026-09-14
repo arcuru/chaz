@@ -73,14 +73,22 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 ### Server
 
-The callback-driven server watches session databases and spawns agent tasks:
+The callback-driven server watches session databases and reconciles durable
+turn requests:
 
-1. Bridges call `register_session` to set up `on_write` callbacks
-2. When a callback fires, the processing loop checks the latest entry
-3. If it's a `Message` from a non-agent or a `Directive`, the server spawns an agent task
-4. The agent writes its response to the session DB, triggering bridge callbacks
+1. An executor server calls `register_session` to set up `on_write` callbacks;
+   a transport-only client can watch a session without claiming execution
+2. Registration pairs a snapshot catch-up with the callback, so requests that
+   arrived before the observer attached are considered too
+3. A non-agent `Message` or `Directive` is selected from the queued request
+   rows, then the executor records an attempt before spawning an agent task
+4. The agent commits its final response or error entry with attempt completion;
+   a queued later request is then eligible to run
 
-Per-session serialization ensures only one agent task runs per session at a time, preventing duplicate responses from concurrent writes.
+Per-session serialization ensures one local executor task runs at a time. The
+durable attempt relation prevents a completed request from running again after
+restart, but it is not distributed fencing or an exactly-once guarantee for
+external effects. See [Session Model](sessions.md#durable-turn-recovery).
 
 The server also handles child session registration for `spawn_agent`, propagating call depth, tool scope, and completion signals.
 
