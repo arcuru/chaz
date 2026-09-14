@@ -19,14 +19,17 @@ use crate::security::SecurityContext;
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-/// Events emitted during the ReAct loop for audit trail / observability.
+/// Compatibility event stream for standalone runtime callers such as
+/// scheduled turns, which do not have a durable turn attempt.
 pub enum RuntimeEvent {
     ToolCall {
         id: String,
@@ -39,6 +42,46 @@ pub enum RuntimeEvent {
         output: String,
         is_error: bool,
     },
+}
+
+/// Awaited persistence boundary for completed runtime messages.
+pub trait RuntimeRecorder: Send + Sync {
+    fn record<'a>(
+        &'a self,
+        message: RuntimeRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeRecord {
+    ModelResponse {
+        model_sequence: u64,
+        content: Option<String>,
+        tool_calls: Vec<ToolCallRequest>,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
+        metadata: Option<ResponseMetadata>,
+        terminal: bool,
+    },
+    ToolResult {
+        model_sequence: u64,
+        call_index: usize,
+        call_id: String,
+        name: String,
+        output: String,
+        outcome: ToolResultOutcome,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolResultOutcome {
+    Success,
+    Error,
+    Denied,
+    ApprovalTimedOut,
+    RateLimited,
+    Blocked,
+    TimedOut,
+    Unavailable,
 }
 
 /// Fallback per-call ReAct cap used when `ToolContext::iteration_budget`
@@ -133,7 +176,7 @@ pub enum RuntimeMessage {
 }
 
 /// A tool call requested by the LLM
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
     pub id: String,
     pub name: String,
@@ -163,7 +206,7 @@ pub enum LLMResponse {
 /// Provenance + cost metadata for a single LLM call, normalized across
 /// backends. Backends populate whatever fields their wire format exposes —
 /// missing fields surface as `None`/`0` rather than failing.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResponseMetadata {
     /// The model that actually answered. May differ from the requested model
     /// when the backend (e.g. OpenRouter) falls back or routes elsewhere.
@@ -204,7 +247,7 @@ pub struct ResponseMetadata {
 /// - `cost_usd`: backend-reported cost in USD. Only populated when the
 ///   backend returns it (e.g. OpenRouter with `usage.include = true`); we do
 ///   not compute cost locally.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -422,10 +465,36 @@ pub async fn execute(
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
     hub: Option<&ExtensionHub>,
 ) -> Result<RuntimeOutcome, String> {
+    let recorder = event_sink.map(|sink| Arc::new(EventRecorder(sink)) as Arc<dyn RuntimeRecorder>);
+    execute_with_recorder(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_with_recorder(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
+    let mut model_sequence = 0;
 
     let hook_ctx = hub.map(|_| HookContext {
         agent_name: tool_ctx.agent_name.clone(),
@@ -449,6 +518,18 @@ pub async fn execute(
         .await
         {
             Ok(LLMResponse::Text { content, metadata }) => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(content.clone()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -531,6 +612,18 @@ pub async fn execute(
                 .await
                 {
                     Ok(LLMResponse::Text { content, metadata }) => {
+                        record_runtime(
+                            &recorder,
+                            RuntimeRecord::ModelResponse {
+                                model_sequence,
+                                content: Some(content.clone()),
+                                tool_calls: Vec::new(),
+                                provider_extra: Default::default(),
+                                metadata: metadata.clone(),
+                                terminal: true,
+                            },
+                        )
+                        .await?;
                         if let Some(m) = metadata {
                             acc.record(m);
                         }
@@ -563,6 +656,18 @@ pub async fn execute(
 
         match response {
             LLMResponse::Text { content, metadata } if !content.is_empty() => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(content.clone()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -580,6 +685,18 @@ pub async fn execute(
                 .await);
             }
             LLMResponse::Text { metadata, .. } if iteration > 0 => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(String::new()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -600,6 +717,18 @@ pub async fn execute(
                 return Err("Model returned empty response after tool execution".to_string());
             }
             LLMResponse::Text { content, metadata } => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(content.clone()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -619,6 +748,18 @@ pub async fn execute(
                 provider_extra,
                 metadata,
             } => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: content.clone(),
+                        tool_calls: tool_calls.clone(),
+                        provider_extra: provider_extra.clone(),
+                        metadata: metadata.clone(),
+                        terminal: false,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -649,18 +790,7 @@ pub async fn execute(
                 });
 
                 // Execute each tool with security checks
-                for call in &tool_calls {
-                    // Emit tool call event
-                    if let Some(ref sink) = event_sink {
-                        let _ = sink
-                            .send(RuntimeEvent::ToolCall {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            })
-                            .await;
-                    }
-
+                for (call_index, call) in tool_calls.iter().enumerate() {
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
                             let tool: &dyn crate::tool::Tool = &*tool;
@@ -673,9 +803,19 @@ pub async fn execute(
                                 && let Err(msg) = rate_limiter.check(&call.name, limit)
                             {
                                 warn!(tool = %call.name, "Rate limited");
+                                let result = msg;
+                                record_tool_result(
+                                    &recorder,
+                                    model_sequence,
+                                    call_index,
+                                    call,
+                                    &result,
+                                    ToolResultOutcome::RateLimited,
+                                )
+                                .await?;
                                 messages.push(RuntimeMessage::ToolResult {
                                     call_id: call.id.clone(),
-                                    content: wrap_tool_output(&call.name, &msg),
+                                    content: wrap_tool_output(&call.name, &result),
                                 });
                                 continue;
                             }
@@ -701,9 +841,19 @@ pub async fn execute(
                                         approve_all = true; // skip approval for rest of turn
                                     }
                                     ApprovalDecision::Deny => {
+                                        let result = "Tool execution denied by user".to_string();
+                                        record_tool_result(
+                                            &recorder,
+                                            model_sequence,
+                                            call_index,
+                                            call,
+                                            &result,
+                                            ToolResultOutcome::Denied,
+                                        )
+                                        .await?;
                                         messages.push(RuntimeMessage::ToolResult {
                                             call_id: call.id.clone(),
-                                            content: "Tool execution denied by user".to_string(),
+                                            content: result,
                                         });
                                         continue;
                                     }
@@ -711,10 +861,20 @@ pub async fn execute(
                                         // Tell the model nobody answered rather
                                         // than that it was refused: the two
                                         // warrant different next moves.
+                                        let result =
+                                            "Tool execution was not approved in time".to_string();
+                                        record_tool_result(
+                                            &recorder,
+                                            model_sequence,
+                                            call_index,
+                                            call,
+                                            &result,
+                                            ToolResultOutcome::ApprovalTimedOut,
+                                        )
+                                        .await?;
                                         messages.push(RuntimeMessage::ToolResult {
                                             call_id: call.id.clone(),
-                                            content: "Tool execution was not approved in time"
-                                                .to_string(),
+                                            content: result,
                                         });
                                         continue;
                                     }
@@ -732,16 +892,15 @@ pub async fn execute(
                                     "Tool call blocked by extension"
                                 );
                                 let blocked_msg = format!("Tool blocked by extension: {reason}");
-                                if let Some(ref sink) = event_sink {
-                                    let _ = sink
-                                        .send(RuntimeEvent::ToolResult {
-                                            id: call.id.clone(),
-                                            name: call.name.clone(),
-                                            output: blocked_msg.clone(),
-                                            is_error: true,
-                                        })
-                                        .await;
-                                }
+                                record_tool_result(
+                                    &recorder,
+                                    model_sequence,
+                                    call_index,
+                                    call,
+                                    &blocked_msg,
+                                    ToolResultOutcome::Blocked,
+                                )
+                                .await?;
                                 messages.push(RuntimeMessage::ToolResult {
                                     call_id: call.id.clone(),
                                     content: wrap_tool_output(&call.name, &blocked_msg),
@@ -832,19 +991,26 @@ pub async fn execute(
                         },
                     };
 
-                    // Emit tool result event
-                    if let Some(ref sink) = event_sink {
-                        let is_error = result.starts_with("Tool error:")
-                            || result.starts_with("Tool timed out");
-                        let _ = sink
-                            .send(RuntimeEvent::ToolResult {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                output: result.clone(),
-                                is_error,
-                            })
-                            .await;
-                    }
+                    let outcome = if result.starts_with("Tool error:") {
+                        ToolResultOutcome::Error
+                    } else if result.starts_with("Tool timed out") {
+                        ToolResultOutcome::TimedOut
+                    } else if result.starts_with("Unknown tool:")
+                        || result.contains(" is not available yet:")
+                    {
+                        ToolResultOutcome::Unavailable
+                    } else {
+                        ToolResultOutcome::Success
+                    };
+                    record_tool_result(
+                        &recorder,
+                        model_sequence,
+                        call_index,
+                        call,
+                        &result,
+                        outcome,
+                    )
+                    .await?;
 
                     debug!(
                         call_id = %call.id,
@@ -862,6 +1028,7 @@ pub async fn execute(
             }
         }
 
+        model_sequence += 1;
         iteration += 1;
     }
 
@@ -876,6 +1043,18 @@ pub async fn execute(
     }
     match llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries).await {
         Ok(LLMResponse::Text { content, metadata }) if !content.is_empty() => {
+            record_runtime(
+                &recorder,
+                RuntimeRecord::ModelResponse {
+                    model_sequence,
+                    content: Some(content.clone()),
+                    tool_calls: Vec::new(),
+                    provider_extra: Default::default(),
+                    metadata: metadata.clone(),
+                    terminal: true,
+                },
+            )
+            .await?;
             if let Some(m) = metadata {
                 acc.record(m);
             }
@@ -907,6 +1086,86 @@ pub async fn execute(
             Err("Agent reached maximum tool iterations without a final response".to_string())
         }
     }
+}
+
+struct EventRecorder(mpsc::Sender<RuntimeEvent>);
+
+impl RuntimeRecorder for EventRecorder {
+    fn record<'a>(
+        &'a self,
+        message: RuntimeRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            match message {
+                RuntimeRecord::ModelResponse { tool_calls, .. } => {
+                    for call in tool_calls {
+                        self.0
+                            .send(RuntimeEvent::ToolCall {
+                                id: call.id,
+                                name: call.name,
+                                arguments: call.arguments,
+                            })
+                            .await
+                            .map_err(|_| "runtime event receiver closed".to_string())?;
+                    }
+                }
+                RuntimeRecord::ToolResult {
+                    model_sequence: _,
+                    call_index: _,
+                    call_id,
+                    name,
+                    output,
+                    outcome,
+                } => {
+                    self.0
+                        .send(RuntimeEvent::ToolResult {
+                            id: call_id,
+                            name,
+                            output,
+                            is_error: outcome != ToolResultOutcome::Success,
+                        })
+                        .await
+                        .map_err(|_| "runtime event receiver closed".to_string())?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn record_runtime(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    record: RuntimeRecord,
+) -> Result<(), String> {
+    if let Some(recorder) = recorder {
+        recorder
+            .record(record)
+            .await
+            .map_err(|error| format!("runtime persistence failed: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn record_tool_result(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    model_sequence: u64,
+    call_index: usize,
+    call: &ToolCallRequest,
+    output: &str,
+    outcome: ToolResultOutcome,
+) -> Result<(), String> {
+    record_runtime(
+        recorder,
+        RuntimeRecord::ToolResult {
+            model_sequence,
+            call_index,
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            output: output.to_string(),
+            outcome,
+        },
+    )
+    .await
 }
 
 /// Wrap tool output in XML delimiters for injection defense.

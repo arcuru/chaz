@@ -1,6 +1,6 @@
 # ReAct Runtime
 
-The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response. The server records a durable turn attempt before entering this loop and commits the final entry with completion; request recovery and explicit retry are described in [Session Model](sessions.md#durable-turn-recovery).
+The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response. The server records a durable turn attempt before entering this loop, awaits structured transcript commits at completed model/tool boundaries, and commits the terminal model response and final entry with completion; request recovery and explicit retry are described in [Session Model](sessions.md#durable-turn-recovery).
 
 ## Loop Flow
 
@@ -46,14 +46,11 @@ kind and is active on the session.
 
 The `before_agent_start` and `agent_end` hooks bracket the whole turn (used today for skill prompt injection at the start and any cleanup the extension wants on completion).
 
-## Event Sink
+## Runtime recorder
 
-The runtime accepts an optional `RuntimeEventSink` (an `mpsc::Sender<RuntimeEvent>`). When provided, it emits events during the loop:
+Executor-backed turns pass an awaited `RuntimeRecorder` into the loop. It persists each completed model response before the runtime acts on tool calls, then persists each complete tool result before the next model request. Errors from this interface stop progression rather than becoming best-effort audit warnings.
 
-- `RuntimeEvent::ToolCall` -- before executing a tool
-- `RuntimeEvent::ToolResult` -- after a tool returns
-
-The server consumes these events and writes `ToolCall` and `ToolResult` entries to the session DB for audit trail and TUI display.
+Scheduled turns currently retain the compatibility `RuntimeEvent` adapter because they do not have a durable turn-attempt record. That adapter projects tool-call and tool-result events to ordinary session entries.
 
 ## Fallback Behavior
 
@@ -77,7 +74,7 @@ RuntimeMessage::ToolResult(result)
 ...
 ```
 
-`AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector (not written to the session during the loop -- the event sink handles that separately).
+`AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Their completed structured forms are also persisted, but a restarted process does not rebuild or resume that vector automatically.
 
 ## Concurrency
 

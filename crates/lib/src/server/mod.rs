@@ -23,13 +23,16 @@ use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{
-    EntryType, Session, SessionEntry, SessionRegistry, TurnAttempt, TurnRequestId, TurnRequestState,
+    EntryType, Session, SessionEntry, SessionRegistry, TurnAttempt, TurnRequestId,
+    TurnRequestState, TurnTranscriptMessage, TurnTranscriptRecord,
 };
 use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolProfile, ToolRegistry};
 use crate::tool_host::ToolHost;
 use crate::types::ConversationId;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -59,6 +62,136 @@ enum ProcessingCommand {
         request_id: TurnRequestId,
         response: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
     },
+}
+
+struct SessionRuntimeRecorder {
+    session: Arc<Mutex<Session>>,
+    request_id: TurnRequestId,
+    attempt_id: String,
+    sequence: AtomicU32,
+    terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
+    agent_name: String,
+    #[cfg(test)]
+    fail_after: Arc<std::sync::Mutex<Option<usize>>>,
+}
+
+impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
+    fn record<'a>(
+        &'a self,
+        message: runtime::RuntimeRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            #[cfg(test)]
+            {
+                let mut remaining = self.fail_after.lock().unwrap();
+                if let Some(value) = remaining.as_mut() {
+                    if *value == 0 {
+                        return Err("injected transcript failure".to_string());
+                    }
+                    *value -= 1;
+                }
+            }
+            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
+            let message = match message {
+                runtime::RuntimeRecord::ModelResponse {
+                    model_sequence,
+                    content,
+                    tool_calls,
+                    provider_extra,
+                    metadata,
+                    terminal,
+                } => TurnTranscriptMessage::ModelResponse {
+                    model_sequence,
+                    content,
+                    tool_calls,
+                    provider_extra,
+                    metadata,
+                    terminal,
+                },
+                runtime::RuntimeRecord::ToolResult {
+                    model_sequence,
+                    call_index,
+                    call_id,
+                    name,
+                    output,
+                    outcome,
+                } => TurnTranscriptMessage::ToolResult {
+                    model_sequence,
+                    call_index,
+                    call_id,
+                    name,
+                    output,
+                    outcome,
+                },
+            };
+            let record = TurnTranscriptRecord {
+                request_id: self.request_id.clone(),
+                attempt_id: self.attempt_id.clone(),
+                sequence,
+                timestamp: Utc::now(),
+                message,
+            };
+            if matches!(
+                record.message,
+                TurnTranscriptMessage::ModelResponse { terminal: true, .. }
+            ) {
+                *self.terminal.lock().unwrap() = Some(record);
+                return Ok(());
+            }
+            let display_entries = display_entries_for_record(&self.agent_name, &record);
+            self.session
+                .lock()
+                .await
+                .append_turn_transcript(record, display_entries)
+                .await
+                .map_err(|error| format!("failed to persist runtime transcript: {error}"))
+        })
+    }
+}
+
+fn display_entries_for_record(
+    agent_name: &str,
+    record: &TurnTranscriptRecord,
+) -> Vec<SessionEntry> {
+    match &record.message {
+        TurnTranscriptMessage::ModelResponse { tool_calls, .. } => tool_calls
+            .iter()
+            .map(|call| SessionEntry {
+                sender: agent_name.to_string(),
+                content: format!("{}({})", call.name, call.arguments),
+                timestamp: record.timestamp,
+                entry_type: EntryType::ToolCall,
+                metadata: None,
+                routing: None,
+            })
+            .collect(),
+        TurnTranscriptMessage::ToolResult {
+            name,
+            output,
+            outcome,
+            ..
+        } => {
+            let output = if *outcome != runtime::ToolResultOutcome::Success {
+                format!("{name}: ERROR: {output}")
+            } else {
+                let truncated = crate::util::truncate_chars(output, 500);
+                let suffix = if truncated.len() < output.len() {
+                    "…"
+                } else {
+                    ""
+                };
+                format!("{name}: {truncated}{suffix}")
+            };
+            vec![SessionEntry {
+                sender: agent_name.to_string(),
+                content: output,
+                timestamp: record.timestamp,
+                entry_type: EntryType::ToolResult,
+                metadata: None,
+                routing: None,
+            }]
+        }
+    }
 }
 
 /// Pure decider for the per-session home-peer gate. Given a session's
@@ -365,6 +498,8 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    #[cfg(test)]
+    transcript_fail_after: Arc<std::sync::Mutex<Option<usize>>>,
     /// Attempts started by this process and not yet durably completed.
     /// This distinguishes a genuinely active task from a persisted start left
     /// behind by a previous process. It is process-local coordination, not
@@ -460,6 +595,11 @@ pub struct Server {
 }
 
 impl Server {
+    #[cfg(test)]
+    fn fail_transcript_after(&self, successful_writes: usize) {
+        *self.transcript_fail_after.lock().unwrap() = Some(successful_writes);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<SessionRegistry>,
@@ -501,6 +641,8 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            #[cfg(test)]
+            transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
@@ -2227,6 +2369,8 @@ impl Server {
             .await;
         let live_attempts = self.live_attempts.clone();
         let notify_tx = self.notify_tx.clone();
+        #[cfg(test)]
+        let transcript_fail_after = self.transcript_fail_after.clone();
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
@@ -2343,82 +2487,34 @@ impl Server {
                 );
             }
 
-            let (event_tx, mut event_rx) = mpsc::channel::<runtime::RuntimeEvent>(64);
-            let event_session = session.clone();
-            let event_agent = agent_name.clone();
-            let event_writer = tokio::spawn(async move {
-                while let Some(event) = event_rx.recv().await {
-                    let mut s = event_session.lock().await;
-                    match event {
-                        runtime::RuntimeEvent::ToolCall {
-                            name, arguments, ..
-                        } => {
-                            if let Err(e) = s
-                                .add_entry(SessionEntry {
-                                    sender: event_agent.clone(),
-                                    content: format!("{name}({arguments})"),
-                                    timestamp: Utc::now(),
-                                    entry_type: EntryType::ToolCall,
-                                    metadata: None,
-                                    routing: None,
-                                })
-                                .await
-                            {
-                                error!("Failed to record tool call: {e}");
-                            }
-                        }
-                        runtime::RuntimeEvent::ToolResult {
-                            name,
-                            output,
-                            is_error,
-                            ..
-                        } => {
-                            let content = if is_error {
-                                format!("{name}: ERROR: {output}")
-                            } else {
-                                let t = crate::util::truncate_chars(&output, 500);
-                                let truncated = if t.len() < output.len() {
-                                    format!("{t}…")
-                                } else {
-                                    output
-                                };
-                                format!("{name}: {truncated}")
-                            };
-                            if let Err(e) = s
-                                .add_entry(SessionEntry {
-                                    sender: event_agent.clone(),
-                                    content,
-                                    timestamp: Utc::now(),
-                                    entry_type: EntryType::ToolResult,
-                                    metadata: None,
-                                    routing: None,
-                                })
-                                .await
-                            {
-                                error!("Failed to record tool result: {e}");
-                            }
-                        }
-                    }
-                }
+            let recorder = Arc::new(SessionRuntimeRecorder {
+                session: session.clone(),
+                request_id: attempt.request_id.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+                sequence: AtomicU32::new(0),
+                terminal: std::sync::Mutex::new(None),
+                agent_name: agent_name.clone(),
+                #[cfg(test)]
+                fail_after: transcript_fail_after,
             });
 
-            let result = runtime::execute(
+            let result = runtime::execute_with_recorder(
                 effective_model.as_deref(),
                 assembled.messages,
                 &backend,
                 &request_security,
                 &tool_ctx,
                 &policies,
-                Some(event_tx),
+                Some(recorder.clone()),
                 Some(spawn_extensions.as_ref()),
             )
             .await;
 
-            let _ = event_writer.await;
-
             drop(_permit);
 
             let mut s = session.lock().await;
+            let persistence_failed =
+                matches!(&result, Err(error) if error.starts_with("runtime persistence failed:"));
             let final_entry = match result {
                 Ok(outcome) if outcome.body.trim().is_empty() => {
                     // Silent turn — the agent acted via tools or chose
@@ -2456,8 +2552,19 @@ impl Server {
                     })
                 }
             };
-            if let Err(e) = s.complete_turn_attempt(&attempt, final_entry).await {
-                error!("Failed to complete turn attempt for {session_db_id}: {e}");
+            if persistence_failed {
+                error!(
+                    "Runtime transcript persistence stopped turn {} for {session_db_id}",
+                    attempt.attempt_id
+                );
+            } else {
+                let terminal = recorder.terminal.lock().unwrap().take();
+                if let Err(e) = s
+                    .complete_turn_attempt_with_transcript(&attempt, final_entry, terminal)
+                    .await
+                {
+                    error!("Failed to complete turn attempt for {session_db_id}: {e}");
+                }
             }
             drop(s);
 

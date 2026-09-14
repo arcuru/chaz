@@ -2697,6 +2697,405 @@ async fn second_turn_during_first_response_is_preserved() {
 }
 
 #[tokio::test]
+async fn transcript_commits_full_tool_exchange_before_progression() {
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct LongTool(Arc<AtomicUsize>);
+    impl Tool for LongTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "long".into(),
+                description: "returns a long result".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("x".repeat(700)) })
+        }
+    }
+
+    let (_instance, server, registry) = server_fixture().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    server.tools.register(LongTool(calls.clone()));
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("transcript")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let request_id = write_user_message_with_content(&db, &sid, "run it").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "call-stable".into(),
+        "long".into(),
+        "{\"k\":1}".into(),
+    )]);
+    mock.push_text("done");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+
+    let reopened = Session::new(ConversationId(sid), db).await;
+    let attempt = reopened
+        .attempts_for_test()
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    let transcript = reopened.turn_transcript(&attempt.attempt_id).await.unwrap();
+    assert_eq!(transcript.len(), 3);
+    assert!(
+        transcript
+            .iter()
+            .all(|record| record.request_id == request_id)
+    );
+    assert!(matches!(&transcript[0].message,
+        crate::session::TurnTranscriptMessage::ModelResponse { tool_calls, .. }
+        if tool_calls[0].id == "call-stable" && tool_calls[0].arguments == "{\"k\":1}"
+    ));
+    assert!(matches!(&transcript[1].message,
+        crate::session::TurnTranscriptMessage::ToolResult { call_id, output, .. }
+        if call_id == "call-stable" && output.len() == 700
+    ));
+    assert!(matches!(
+        &transcript[2].message,
+        crate::session::TurnTranscriptMessage::ModelResponse { terminal: true, .. }
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reopened
+            .entries()
+            .iter()
+            .filter(|e| e.content == "done")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transcript_failure_before_tool_prevents_side_effect_and_completion() {
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EffectTool(Arc<AtomicUsize>);
+    impl Tool for EffectTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "effect".into(),
+                description: "records a call".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("effect".into()) })
+        }
+    }
+
+    let (_instance, server, registry) = server_fixture().await;
+    let effects = Arc::new(AtomicUsize::new(0));
+    server.tools.register(EffectTool(effects.clone()));
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("failure")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let request_id = write_user_message_with_content(&db, &sid, "do not run").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("call".into(), "effect".into(), "{}".into())]);
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server.fail_transcript_after(0);
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+
+    let reopened = Session::new(ConversationId(sid), db).await;
+    let attempt = reopened
+        .attempts_for_test()
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(attempt.status, crate::session::TurnAttemptStatus::Started);
+    assert!(
+        reopened
+            .turn_transcript(&attempt.attempt_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert!(
+        reopened
+            .entries()
+            .iter()
+            .all(|entry| entry.entry_type != EntryType::Error)
+    );
+    assert_eq!(
+        reopened
+            .turn_request(&request_id, |name| name == "alpha", &Default::default())
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnRequestState::Interrupted {
+            attempt_id: attempt.attempt_id
+        }
+    );
+}
+
+#[tokio::test]
+async fn transcript_failure_after_tool_leaves_ambiguous_effect_interrupted() {
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EffectTool(Arc<AtomicUsize>);
+    impl Tool for EffectTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "effect".into(),
+                description: "records a call".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("effect happened".into()) })
+        }
+    }
+
+    let (_instance, server, registry) = server_fixture().await;
+    let effects = Arc::new(AtomicUsize::new(0));
+    server.tools.register(EffectTool(effects.clone()));
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("ambiguous")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "run once").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("call".into(), "effect".into(), "{}".into())]);
+    mock.push_text("must not be called");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server.fail_transcript_after(1);
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+
+    let reopened = Session::new(ConversationId(sid), db).await;
+    let attempt = reopened
+        .attempts_for_test()
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(attempt.status, crate::session::TurnAttemptStatus::Started);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.recorded_calls().len(), 1);
+    assert_eq!(
+        reopened
+            .turn_transcript(&attempt.attempt_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transcript_persists_denied_multi_tool_and_forced_summary_branches() {
+    use crate::bridge::ApprovalDecision;
+    use crate::test_support::MockBackend;
+    use crate::tool::{
+        ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
+    };
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+
+    enum BranchTool {
+        Gated,
+        Limited,
+        Failing,
+    }
+    impl Tool for BranchTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            let name = match self {
+                Self::Gated => "gated",
+                Self::Limited => "limited",
+                Self::Failing => "failing",
+            };
+            ToolDescriptor {
+                name: name.into(),
+                description: name.into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                match self {
+                    Self::Failing => Err(ToolError::Execution("failed".into())),
+                    _ => Ok("must not run".into()),
+                }
+            })
+        }
+        fn default_policy(&self) -> ToolPolicy {
+            match self {
+                Self::Gated => ToolPolicy {
+                    risk: RiskLevel::High,
+                    approval: ApprovalRequirement::Always,
+                    ..Default::default()
+                },
+                Self::Limited => ToolPolicy {
+                    rate_limit: Some(0),
+                    ..Default::default()
+                },
+                Self::Failing => ToolPolicy::default(),
+            }
+        }
+    }
+
+    let (_instance, server, registry) = server_fixture().await;
+    server.tools.register(BranchTool::Gated);
+    server.tools.register(BranchTool::Limited);
+    server.tools.register(BranchTool::Failing);
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("branches")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "branches").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![
+        ("denied".into(), "gated".into(), "{}".into()),
+        ("limited".into(), "limited".into(), "{}".into()),
+        ("failed".into(), "failing".into(), "{}".into()),
+        ("missing".into(), "missing".into(), "{\"full\":true}".into()),
+    ]);
+    mock.push_text("summarized");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let (approval_tx, mut approval_rx) =
+        tokio::sync::mpsc::channel::<crate::bridge::ApprovalExchange>(1);
+    tokio::spawn(async move {
+        let exchange = approval_rx.recv().await.unwrap();
+        exchange.decision_tx.send(ApprovalDecision::Deny).unwrap();
+    });
+    server
+        .register_session(&db, backend, Some("alpha".into()), Some(approval_tx))
+        .await
+        .unwrap();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+
+    let reopened = Session::new(ConversationId(sid), db).await;
+    let attempt = reopened
+        .attempts_for_test()
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    let transcript = reopened.turn_transcript(&attempt.attempt_id).await.unwrap();
+    assert!(matches!(
+        &transcript[1].message,
+        crate::session::TurnTranscriptMessage::ToolResult {
+            outcome: crate::runtime::ToolResultOutcome::Denied,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &transcript[2].message,
+        crate::session::TurnTranscriptMessage::ToolResult {
+            outcome: crate::runtime::ToolResultOutcome::RateLimited,
+            call_index: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &transcript[3].message,
+        crate::session::TurnTranscriptMessage::ToolResult {
+            outcome: crate::runtime::ToolResultOutcome::Error,
+            call_index: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &transcript[4].message,
+        crate::session::TurnTranscriptMessage::ToolResult {
+            outcome: crate::runtime::ToolResultOutcome::Unavailable,
+            call_index: 3,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &transcript[5].message,
+        crate::session::TurnTranscriptMessage::ModelResponse { terminal: true, .. }
+    ));
+}
+
+#[tokio::test]
 async fn interrupted_attempt_requires_explicit_retry() {
     use crate::test_support::MockBackend;
 
@@ -2993,6 +3392,22 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
             .state,
         crate::session::TurnRequestState::Completed { .. }
     ));
+    let attempt_id = match &requests
+        .iter()
+        .find(|request| request.id == request_id)
+        .unwrap()
+        .state
+    {
+        TurnRequestState::Completed { attempt_id } => attempt_id,
+        state => panic!("expected completed request, got {state:?}"),
+    };
+    let transcript = client_session.turn_transcript(attempt_id).await.unwrap();
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0].request_id, request_id);
+    assert!(matches!(
+        transcript[0].message,
+        crate::session::TurnTranscriptMessage::ModelResponse { terminal: true, .. }
+    ));
     assert!(
         client_session
             .entries()
@@ -3129,17 +3544,20 @@ async fn direct_peer_sync_preserves_request_identity_and_completion() {
         .unwrap();
 
     let peer_session = Session::new(ConversationId("peer".into()), peer_db).await;
-    assert!(matches!(
-        peer_session
-            .turn_requests(|name| name == "agent", &Default::default())
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|request| request.id == request_id)
-            .unwrap()
-            .state,
-        TurnRequestState::Completed { .. }
-    ));
+    let request = peer_session
+        .turn_requests(|name| name == "agent", &Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|request| request.id == request_id)
+        .unwrap();
+    let attempt_id = match request.state {
+        TurnRequestState::Completed { attempt_id } => attempt_id,
+        state => panic!("expected completed request, got {state:?}"),
+    };
+    let transcript = peer_session.turn_transcript(&attempt_id).await.unwrap();
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0].request_id, request_id);
     assert!(
         peer_session
             .entries()
