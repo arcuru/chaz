@@ -2,7 +2,7 @@
 
 > **Status: Implemented**
 >
-> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). The rest of the doc (entry types, server processing logic, `spawn_agent` flow, `OnceLock` wiring, `SpawnContext`, `RuntimeEventSink`) still matches the code.
+> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). The callback primitive, entry types, `spawn_agent` flow, `OnceLock` wiring, `SpawnContext`, and `RuntimeEventSink` still apply. Request selection is durable reconciliation rather than a latest-entry check; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
 
 ## Summary
 
@@ -53,13 +53,18 @@ graph LR
 
 ## Server Processing Logic
 
-The server's `process_session` decides whether to act on an entry:
+The server reconciles durable requests rather than deciding from only the
+latest entry. A non-agent `Message` and a `Directive` are processable requests;
+agent-authored messages use the mention path described in [Autonomous Agents in
+Shared Sessions](./autonomous_agents.md). The executor selects the next queued
+request, records an attempt before model or tool work, and commits completion
+with its final entry. See [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
 
 ```text
-match latest.entry_type {
-    Message  if sender is NOT a known agent  => spawn agent task
-    Directive                                 => spawn agent task
-    _                                         => ignore
+next request in session order {
+    non-agent Message => start an attempt, then spawn agent task
+    Directive         => start an attempt, then spawn agent task
+    completed or interrupted request => do not run automatically
 }
 ```
 
@@ -83,9 +88,9 @@ sequenceDiagram
     SV->>CA: spawn agent task
     CA->>CS: write Ack
     CA->>CS: write ToolCall / ToolResult (via event sink)
-    CA->>CS: write Message (response)
+    CA->>CS: commit Message (response) and completion
     CA-->>SA: completion_tx.send(())
-    SA->>CS: read latest entry
+    SA->>CS: read the completed request response
     SA-->>P: return response
 ```
 

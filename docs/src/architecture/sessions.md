@@ -18,7 +18,10 @@ enum EntryType {
 }
 ```
 
-Each entry has a sender (participant name), content, timestamp, and type.
+Each entry has a sender (participant name), content, timestamp, and type. Its
+Eidetica `Table` row key is also the stable identity of a processable turn
+request. The key travels with session sync, so two otherwise identical rows
+remain distinct requests.
 
 ### What Enters the LLM Context
 
@@ -47,14 +50,80 @@ sequenceDiagram
 
     U->>S: write Message entry
     S-->>SV: on_write callback
-    SV->>SV: check latest entry
+    SV->>SV: reconcile persisted requests
+    SV->>S: record attempt start
     SV->>A: spawn agent task
     A->>S: write Ack entry
     A->>S: write ToolCall entry
     A->>S: write ToolResult entry
-    A->>S: write Message entry (response)
+    A->>S: commit final entry and completion
     S-->>U: on_write callback
 ```
+
+### Durable turn recovery
+
+The server treats a non-agent `Message` and a `Directive` as a durable turn
+request. It reconciles the request rows rather than acting only on the latest
+entry. A queued second request stays pending while the first request runs and
+is selected after that attempt finishes.
+
+`turn_attempts` is an append-only table in the session database. A
+`TurnAttempt` records the request row key, an attempt ID, a durable generation,
+and whether the attempt started or completed. The executor writes the started
+record before it can call a model or a tool. It commits a completed record in
+the same transaction as the final response or error entry. A silent turn has
+no final message, but still records completion.
+
+Attempt generations establish lifecycle precedence; the start and completion
+timestamps are audit data, not the ordering authority. This avoids treating
+clock movement across processes or restarts as a newer attempt.
+
+For each request, reconciliation exposes one of four states:
+
+- **Queued** has no attempt and may run.
+- **In flight** has a started attempt owned by the current process.
+- **Interrupted** has a durable start without a completion but is not owned by
+  the current process.
+- **Completed** has a completion and never runs again automatically.
+
+On registration, the server captures a session snapshot, installs its
+write callback from that snapshot, and reconciles the snapshot for queued
+requests. The callback covers commits after the snapshot; the catch-up read
+covers work already present before registration. Repeated callbacks are safe:
+the persisted request and attempt state decides whether there is work to run.
+
+An interrupted attempt is deliberately not replayed. Model and tool work may
+already have caused an external effect before the process stopped. The public
+library API exposes `Server::interrupted_turns()` to inspect that state and
+`Server::retry_interrupted_turn()` to request an explicit retry. The retry is
+accepted by the executor loop, writes a new attempt, and leaves the old record
+in history. There is no CLI, TUI, bridge, or other frontend control for these
+APIs yet.
+
+#### Legacy sessions
+
+New sessions write a turn-schema marker before their first request. When an
+executor first registers an older session, it atomically records a baseline of
+the rows visible at that point. Those existing transcript rows are consumed;
+the server does not infer that they completed, and it does not replay them.
+Rows committed concurrently after that baseline are not included and remain
+queued. Bridge history backfill is likewise marked consumed rather than made
+into new work.
+
+#### Execution boundary and limits
+
+`Server::register_session()` and retry require executor authority. A
+client-role server can observe the synced session state, but cannot register
+execution, invoke agents, models, or tools, create execution child sessions,
+or run routines and schedules. Build-time validation also rejects runtime
+options that would give a client those responsibilities.
+
+This protocol assumes one executor for a session. The in-process processing
+and live-attempt sets serialize that executor's work, but they are not
+distributed fencing. The protocol does not provide exactly-once external
+effects. Tests cover both a shared Eidetica service with separate client and
+executor connections and direct peers syncing a session over HTTP; neither
+topology adds multi-executor election or fencing.
 
 ## Session Registry
 
