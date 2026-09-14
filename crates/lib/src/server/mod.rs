@@ -52,6 +52,15 @@ const MAX_CONCURRENT_LLM_CALLS: usize = 10;
 /// that have been silent for a sustained period.
 const HOME_SKIP_WARN_THRESHOLD: u32 = 3;
 
+enum ProcessingCommand {
+    Wake(String),
+    Retry {
+        session_db_id: String,
+        request_id: TurnRequestId,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
+    },
+}
+
 /// Pure decider for the per-session home-peer gate. Given a session's
 /// `AgentRef` list, the target agent's DB id, and this peer's pubkey on
 /// that agent DB, decide whether this peer should run the agent.
@@ -382,7 +391,9 @@ pub struct Server {
     /// `register_session` and on `/extensions add|remove`.
     active_extensions: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
     /// Internal notification channel — callbacks send session_db_id here
-    notify_tx: mpsc::Sender<String>,
+    notify_tx: mpsc::Sender<ProcessingCommand>,
+    /// Checked again at every model/tool execution and retry chokepoint.
+    executor_authorized: bool,
     /// Agent→agent burst budget. Defaults to
     /// [`DEFAULT_AGENT_BURST_BUDGET`]; operators override it via
     /// `multi_agent.burst_budget` (applied once at startup before the
@@ -465,9 +476,10 @@ impl Server {
         extensions: Arc<ExtensionHub>,
         default_backend: BackendManager,
         mcp_registry: Arc<crate::mcp::McpRegistry>,
-        run_agent_loop: bool,
+        executor: Option<crate::instance::ExecutorCapability>,
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
+        let executor_authorized = executor.is_some();
 
         let server = Arc::new(Self {
             registry,
@@ -494,6 +506,7 @@ impl Server {
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
+            executor_authorized,
             agent_burst_budget: AtomicUsize::new(DEFAULT_AGENT_BURST_BUDGET),
             default_agents: std::sync::RwLock::new(Vec::new()),
             agent_groups: std::sync::RwLock::new(HashMap::new()),
@@ -519,10 +532,10 @@ impl Server {
         // (a separate peer) watches the exposed sessions and runs them. With
         // the loop unspawned, `notify_rx` is dropped and the `notify_tx`
         // sends behind `register_session` become harmless no-ops.
-        if run_agent_loop {
-            let server_clone = server.clone();
+        if executor_authorized {
+            let server_weak = Arc::downgrade(&server);
             tokio::spawn(async move {
-                server_clone.processing_loop(notify_rx).await;
+                Server::processing_loop(server_weak, notify_rx).await;
             });
         }
 
@@ -652,7 +665,9 @@ impl Server {
     /// schedule mutation. First call wins (one engine per process);
     /// subsequent calls are ignored.
     pub fn set_routine_engine(&self, engine: Arc<crate::routine::RoutineEngine>) {
-        let _ = self.routine_engine.set(engine);
+        if self.executor_authorized {
+            let _ = self.routine_engine.set(engine);
+        }
     }
 
     /// The running `RoutineEngine`, if one has been registered. `None`
@@ -1505,7 +1520,7 @@ impl Server {
                 let tx = tx.clone();
                 let sid = sid.clone();
                 Box::pin(async move {
-                    let _ = tx.send(sid).await;
+                    let _ = tx.send(ProcessingCommand::Wake(sid)).await;
                     Ok(())
                 })
             })
@@ -1536,26 +1551,41 @@ impl Server {
             .await?
             .into_iter()
             .any(|request| request.state == TurnRequestState::Queued);
-        if has_catch_up && self.notify_tx.send(session_db_id.clone()).await.is_err() {
+        if has_catch_up
+            && self
+                .notify_tx
+                .send(ProcessingCommand::Wake(session_db_id.clone()))
+                .await
+                .is_err()
+        {
             debug!(session_db_id = %session_db_id, "No processing loop; skipping catch-up");
         }
 
         Ok(())
     }
 
-    /// Connector-gated executor registration.
+    /// Register a session for callback-driven agent processing.
     ///
-    /// Holding [`crate::instance::ExecutorCapability`] proves the process was
-    /// configured with `execution = executor`; client connectors cannot call
-    /// this boundary or start model/tool work.
-    pub async fn register_executor_session(
+    /// The server itself carries executor authority minted by connector/build
+    /// startup. Client-role servers fail before installing a watcher or
+    /// mutating compatibility state; there is no parallel ungated execution
+    /// registration API.
+    pub async fn register_session(
         &self,
-        _executor: &crate::instance::ExecutorCapability,
         session_db: &eidetica::Database,
         backend: BackendManager,
         agent_override: Option<String>,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
+        if !self.executor_authorized {
+            anyhow::bail!("server has no executor loop");
+        }
+        let session = Session::new(
+            ConversationId(session_db.root_id().to_string()),
+            session_db.clone(),
+        )
+        .await;
+        session.ensure_turn_schema_baseline().await?;
         let agent_name = agent_override
             .clone()
             .unwrap_or_else(|| "agent".to_string());
@@ -1597,31 +1627,31 @@ impl Server {
         session_db_id: &str,
         request_id: &TurnRequestId,
     ) -> anyhow::Result<String> {
-        let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
-        let session = Session::new(conversation_id, session_db).await;
-        let live = self.live_attempts.lock().await.clone();
-        let request = session
-            .turn_request(request_id, |name| self.agents.get(name).is_some(), &live)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("unknown turn request {request_id}"))?;
-        if !matches!(request.state, TurnRequestState::Interrupted { .. }) {
-            anyhow::bail!("turn request {request_id} is not interrupted");
+        if !self.executor_authorized {
+            anyhow::bail!("server has no executor loop");
         }
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.notify_tx
+            .send(ProcessingCommand::Retry {
+                session_db_id: session_db_id.to_string(),
+                request_id: request_id.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("no executor loop is running"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("executor loop stopped before accepting retry"))?
+    }
 
-        let attempt = session.start_turn_attempt(request.id).await?;
-        self.live_attempts
-            .lock()
-            .await
-            .insert(attempt.attempt_id.clone());
-        if self
-            .notify_tx
-            .send(session_db_id.to_string())
-            .await
-            .is_err()
-        {
-            anyhow::bail!("no executor loop is running");
-        }
-        Ok(attempt.attempt_id)
+    async fn accept_retry(
+        &self,
+        session_db_id: &str,
+        request_id: &TurnRequestId,
+    ) -> anyhow::Result<String> {
+        self.process_session(session_db_id, Some(request_id))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("executor did not accept retry {request_id}"))
     }
 
     /// Claim **runtime** ownership of a session — the runtime half of the old
@@ -1635,7 +1665,7 @@ impl Server {
     /// did not (mode `Never`, or mode `Auto` and the session is already
     /// owned). Mode `Always` returns `Err` if another owner already holds the
     /// claim. The claim is released by [`Server::deregister_session`].
-    pub async fn claim_runtime(
+    pub(crate) async fn claim_runtime(
         &self,
         session_db: &eidetica::Database,
         agent_name: String,
@@ -1682,36 +1712,6 @@ impl Server {
         Ok(true)
     }
 
-    /// Register a session for callback-driven agent processing.
-    ///
-    /// Back-compat convenience over [`Server::watch_session`] +
-    /// [`Server::claim_runtime`]: wires transport, then claims runtime using
-    /// this peer's configured [`RuntimeMode`] (see [`Server::set_runtime_mode`]).
-    /// A dumb bridge configured `runtime = never` watches without claiming.
-    ///
-    /// Safe to call multiple times — transport metadata is refreshed and the
-    /// runtime claim is idempotent (a second call under `Auto` skips).
-    pub async fn register_session(
-        &self,
-        session_db: &eidetica::Database,
-        backend: BackendManager,
-        agent_override: Option<String>,
-        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
-    ) -> anyhow::Result<()> {
-        // Legacy startup callers still reach this wrapper until the M4 binary
-        // conversion. New connector-based callers use
-        // `register_executor_session`, whose capability cannot be forged.
-        let agent_name = agent_override
-            .clone()
-            .unwrap_or_else(|| "agent".to_string());
-        self.watch_session(session_db, backend, agent_override, approval_tx)
-            .await?;
-        self.claim_runtime(session_db, agent_name, 0, self.runtime_mode())
-            .await?;
-
-        Ok(())
-    }
-
     /// Create and register a child session for agent-to-agent communication.
     ///
     /// Creates a fresh session DB via the registry, installs server callbacks,
@@ -1735,6 +1735,9 @@ impl Server {
         parent_session_db_id: Option<&str>,
         iteration_budget: Option<Arc<AtomicU32>>,
     ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
+        if !self.executor_authorized {
+            anyhow::bail!("client server cannot create agent execution sessions");
+        }
         let source = format!("spawn:{}", uuid::Uuid::new_v4());
         let (conversation_id, session_db) = match parent_session_db_id {
             Some(parent) => {
@@ -1781,7 +1784,7 @@ impl Server {
                     let tx = tx.clone();
                     let sid = sid.clone();
                     Box::pin(async move {
-                        let _ = tx.send(sid).await;
+                        let _ = tx.send(ProcessingCommand::Wake(sid)).await;
                         Ok(())
                     })
                 })
@@ -1860,18 +1863,48 @@ impl Server {
         sessions.remove(session_db_id);
     }
 
-    async fn processing_loop(&self, mut notify_rx: mpsc::Receiver<String>) {
-        while let Some(session_db_id) = notify_rx.recv().await {
+    async fn processing_loop(
+        server: std::sync::Weak<Self>,
+        mut notify_rx: mpsc::Receiver<ProcessingCommand>,
+    ) {
+        while let Some(command) = notify_rx.recv().await {
+            let Some(server) = server.upgrade() else {
+                break;
+            };
+            let session_db_id = match command {
+                ProcessingCommand::Wake(session_db_id) => session_db_id,
+                ProcessingCommand::Retry {
+                    session_db_id,
+                    request_id,
+                    response,
+                } => {
+                    let result = server.accept_retry(&session_db_id, &request_id).await;
+                    let _ = response.send(result);
+                    continue;
+                }
+            };
             // Debounce: drain any pending notifications, dedup
             let mut to_process = vec![session_db_id];
-            while let Ok(sid) = notify_rx.try_recv() {
-                if !to_process.contains(&sid) {
-                    to_process.push(sid);
+            while let Ok(command) = notify_rx.try_recv() {
+                match command {
+                    ProcessingCommand::Wake(sid) => {
+                        if !to_process.contains(&sid) {
+                            to_process.push(sid);
+                        }
+                    }
+                    ProcessingCommand::Retry {
+                        session_db_id,
+                        request_id,
+                        response,
+                    } => {
+                        let result = server.accept_retry(&session_db_id, &request_id).await;
+                        let _ = response.send(result);
+                    }
                 }
             }
 
             for sid in to_process {
-                if let Err(e) = self.process_session(&sid).await {
+                if let Err(e) = server.process_session(&sid, None).await {
                     error!("Error processing session {sid}: {e}");
                 }
             }
@@ -1912,51 +1945,74 @@ impl Server {
         }
     }
 
-    async fn process_session(&self, session_db_id: &str) -> anyhow::Result<()> {
+    async fn process_session(
+        &self,
+        session_db_id: &str,
+        retry_request_id: Option<&TurnRequestId>,
+    ) -> anyhow::Result<Option<String>> {
+        if !self.executor_authorized {
+            anyhow::bail!("client server cannot execute agent or tool turns");
+        }
         let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
         let live_attempts = self.live_attempts.lock().await.clone();
-        let queued = session
-            .next_turn_request(|name| self.agents.get(name).is_some(), &live_attempts)
-            .await?;
-        let latest_session_entry = session.latest_entry().cloned();
+        let queued = if let Some(request_id) = retry_request_id {
+            let request = session
+                .turn_request(
+                    request_id,
+                    |name| self.agents.get(name).is_some(),
+                    &live_attempts,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("unknown turn request {request_id}"))?;
+            if !matches!(request.state, TurnRequestState::Interrupted { .. }) {
+                anyhow::bail!("turn request {request_id} is not interrupted");
+            }
+            Some((request, None))
+        } else {
+            session
+                .next_turn_request(|name| self.agents.get(name).is_some(), &live_attempts)
+                .await?
+        };
+        let latest_session_entry = session
+            .latest_entry_with_id()
+            .map(|(id, entry)| (id.clone(), entry.clone()));
         let agent_mention = match latest_session_entry {
-            Some(entry)
+            Some((entry_id, entry))
                 if entry.entry_type == EntryType::Message
                     && self.agents.get(&entry.sender).is_some() =>
             {
-                match session.turn_state_for_entry(&entry, &live_attempts).await? {
+                match session
+                    .turn_state_for_entry(&entry_id, &live_attempts)
+                    .await?
+                {
                     TurnRequestState::Queued => Some((
                         crate::session::TurnRequest {
-                            id: TurnRequestId::for_entry(&entry),
+                            id: entry_id.clone(),
                             entry,
                             state: TurnRequestState::Queued,
                         },
                         None,
                     )),
-                    TurnRequestState::InFlight { attempt_id }
-                        if live_attempts.contains(&attempt_id) =>
-                    {
-                        Some((
-                            crate::session::TurnRequest {
-                                id: TurnRequestId::for_entry(&entry),
-                                entry,
-                                state: TurnRequestState::InFlight {
-                                    attempt_id: attempt_id.clone(),
-                                },
+                    TurnRequestState::InFlight { attempt_id } => Some((
+                        crate::session::TurnRequest {
+                            id: entry_id,
+                            entry,
+                            state: TurnRequestState::InFlight {
+                                attempt_id: attempt_id.clone(),
                             },
-                            Some(attempt_id),
-                        ))
-                    }
+                        },
+                        Some(attempt_id),
+                    )),
                     _ => None,
                 }
             }
             _ => None,
         };
         let Some((request, existing_attempt_id)) = queued.or(agent_mention) else {
-            return Ok(());
+            return Ok(None);
         };
         let latest = request.entry.clone();
 
@@ -2004,7 +2060,7 @@ impl Server {
             _ => false,
         };
         if !should_process {
-            return Ok(());
+            return Ok(None);
         }
 
         // Fast-start gate: the gateway may already be drawn and accepting
@@ -2023,7 +2079,7 @@ impl Server {
         {
             let mut processing = self.processing.lock().await;
             if !processing.insert(session_db_id.to_string()) {
-                return Ok(());
+                return Ok(None);
             }
         }
         let (backend, agent_override, approval_tx, spawn_ctx) = {
@@ -2045,7 +2101,7 @@ impl Server {
                 None => {
                     // Session not registered for processing — clear lock and bail.
                     self.processing.lock().await.remove(session_db_id);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         };
@@ -2086,7 +2142,7 @@ impl Server {
             );
             self.processing.lock().await.remove(session_db_id);
             self.record_home_skip(session_db_id, &agent.name).await;
-            return Ok(());
+            return Ok(None);
         }
         self.reset_home_skip(session_db_id, &agent.name).await;
 
@@ -2094,13 +2150,10 @@ impl Server {
         // request remains queued through startup/runtime/home checks; only an
         // executor that is actually about to run persists the attempt start.
         let attempt = match existing_attempt_id {
-            Some(attempt_id) => TurnAttempt {
-                attempt_id,
-                request_id: request.id,
-                started_at: Utc::now(),
-                status: crate::session::TurnAttemptStatus::Started,
-                completed_at: None,
-            },
+            Some(attempt_id) => session
+                .read_turn_attempt(&attempt_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("live attempt {attempt_id} disappeared"))?,
             None => {
                 let attempt = session.start_turn_attempt(request.id).await?;
                 self.live_attempts
@@ -2111,6 +2164,7 @@ impl Server {
             }
         };
 
+        let attempt_id = attempt.attempt_id.clone();
         self.spawn_agent_task(
             session_db_id.to_string(),
             session,
@@ -2122,7 +2176,7 @@ impl Server {
         )
         .await;
 
-        Ok(())
+        Ok(Some(attempt_id))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2418,7 +2472,9 @@ impl Server {
             // Drain another durable queued request, if present. Self-writes
             // also wake reconciliation, but this explicit wake avoids relying
             // on callback timing after the processing slot is released.
-            let _ = notify_tx.send(session_db_id.clone()).await;
+            let _ = notify_tx
+                .send(ProcessingCommand::Wake(session_db_id.clone()))
+                .await;
 
             if let Some(tx) = spawn.completion_tx {
                 let _ = tx.send(()).await;

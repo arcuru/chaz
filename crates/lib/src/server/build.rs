@@ -108,6 +108,18 @@ pub async fn build(
     mut user: eidetica::user::User,
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
+    if config.execution.is_some() {
+        let capabilities = crate::instance::required_settings(config)?.1;
+        let is_executor = capabilities == crate::config::ExecutionRole::Executor;
+        if opts.run_agent_loop != is_executor
+            || opts.run_routine_engine && !is_executor
+            || opts.bootstrap_agents_from_config && !is_executor
+        {
+            anyhow::bail!(
+                "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
+            );
+        }
+    }
     // Wall-clock instrumentation for the critical-path build. Individual
     // heavy steps log their own `elapsed_ms`; this bounds the whole
     // gateway-blocking prefix so regressions are visible in the log.
@@ -505,6 +517,9 @@ pub async fn build(
     let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
         as std::sync::Arc<dyn tool_host::ToolHost>;
 
+    let executor = opts
+        .run_agent_loop
+        .then(crate::instance::legacy_executor_capability);
     let server = Server::new(
         registry.clone(),
         agent_registry,
@@ -520,7 +535,7 @@ pub async fn build(
         extension_hub,
         default_backend.clone(),
         mcp_registry.clone(),
-        opts.run_agent_loop,
+        executor,
     );
     assert!(
         spawn_server_cell.set(server.clone()).is_ok(),

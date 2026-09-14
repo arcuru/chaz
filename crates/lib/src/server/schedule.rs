@@ -44,6 +44,9 @@ impl Server {
         &self,
         payload: crate::routine::AgentSchedulePayload,
     ) -> anyhow::Result<()> {
+        if !self.executor_authorized {
+            anyhow::bail!("client server cannot execute agent schedules");
+        }
         use crate::agent_db::{ScheduleFire, ScheduleTarget};
 
         // 1. Host check — unparseable IDs are silently skipped (they
@@ -616,6 +619,9 @@ impl Server {
         wake_prompt: &str,
         schedule_id: &str,
     ) -> anyhow::Result<crate::runtime::RuntimeOutcome> {
+        if !self.executor_authorized {
+            anyhow::bail!("client server cannot execute scheduled model or tool turns");
+        }
         // Load the agent: check the in-memory registry first; build from
         // DB config if not present (agent was never attached to a session
         // this boot).
