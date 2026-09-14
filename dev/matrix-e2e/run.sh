@@ -717,6 +717,7 @@ BACKENDS_MARKER="Known Models"
 HELP_MARKER="chaz commands"
 
 MENTION_BODY="mentioning the agent"
+BARE_BODY="bare message with no prefix and no mention"
 
 # How many turns the model has been asked to run. The bridge backfills room
 # history into the session, so the text of an ignored message still shows up in
@@ -747,7 +748,7 @@ log "Case 1a: bare message in the group room (must be ignored)"
 TURNS_BEFORE="$(stub_requests)"
 DROPS_BEFORE="$(gate_drops)"
 group_send "$PUPPET_TOKEN" \
-	"$(jq -nc '{msgtype:"m.text",body:"bare message with no prefix and no mention"}')"
+	"$(jq -nc --arg b "$BARE_BODY" '{msgtype:"m.text",body:$b}')"
 wait_for "the bridge to drop the bare group message as unaddressed" 60 \
 	gate_dropped_more_than "$DROPS_BEFORE"
 
@@ -760,9 +761,10 @@ mention_reached_the_model() {
 }
 wait_for "the mention to reach the model" "$REPLY_TIMEOUT" mention_reached_the_model
 
-TURNS_AFTER="$(stub_requests)"
-if [[ $((TURNS_AFTER - TURNS_BEFORE)) -ne 1 ]]; then
-	fail "bridge ran $((TURNS_AFTER - TURNS_BEFORE)) turns for the group room, expected 1 — a bare message was answered"
+GROUP_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+	grep -cF "$BARE_BODY" || true)"
+if [[ $GROUP_TURNS -ne 1 ]]; then
+	fail "bridge ran $GROUP_TURNS turns containing the group messages, expected 1 — a bare message was answered"
 fi
 
 wait_for "the mention reply in the group room" "$REPLY_TIMEOUT" \

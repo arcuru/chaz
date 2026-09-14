@@ -32,6 +32,15 @@ struct State {
 struct CallGate {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    stopped: tokio::sync::Notify,
+}
+
+struct CallGateWait(std::sync::Arc<CallGate>);
+
+impl Drop for CallGateWait {
+    fn drop(&mut self) {
+        self.0.stopped.notify_one();
+    }
 }
 
 /// Handle for pausing exactly one scripted call after it is recorded.
@@ -46,6 +55,10 @@ impl MockCallGate {
 
     pub fn release(&self) {
         self.gate.release.notify_one();
+    }
+
+    pub async fn wait_stopped(&self) {
+        self.gate.stopped.notified().await;
     }
 }
 
@@ -146,6 +159,7 @@ impl MockBackend {
         let gate = std::sync::Arc::new(CallGate {
             started: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            stopped: tokio::sync::Notify::new(),
         });
         *self.next_call_gate.lock().unwrap() = Some(gate.clone());
         MockCallGate { gate }
@@ -180,6 +194,7 @@ impl BackendDispatch for MockBackend {
             let gate = self.next_call_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.started.notify_one();
+                let _wait = CallGateWait(gate.clone());
                 gate.release.notified().await;
             }
             response

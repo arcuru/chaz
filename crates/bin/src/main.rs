@@ -141,6 +141,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config: Config = serde_yaml::from_str(&contents)?;
 
+    // Validate the connector contract before even creating log/state
+    // directories. A missing or mixed migration config must be a read-only
+    // failure, not the first mutation of a replacement layout.
+    instance::required_settings(&config)?;
+
     // Warn about unrecognised YAML keys before proceeding.
     let unknown = config::check_unknown_config_keys(&contents);
     if !unknown.is_empty() {
@@ -264,24 +269,39 @@ async fn main() -> anyhow::Result<()> {
         Vec::new()
     };
 
-    // Assemble the fully-wired server. Execution work is selected only by the
-    // explicit role; the executable/mode contributes no authority.
+    // Assemble the fully-wired server. The explicit role is the authority
+    // ceiling; one-shot command mode further suppresses all execution work.
     let t = Instant::now();
+    let build_options = if cmd_args.is_some() || args.print {
+        let bootstrap_agents = args.print
+            || (cmd_args.is_some()
+                && capabilities.ownership() == instance::InstanceOwnership::Direct);
+        server::BuildOptions::local_oneshot(
+            config_path.clone(),
+            capabilities,
+            args.print,
+            bootstrap_agents,
+            extra_auto_approved_tools,
+            if args.print {
+                server::McpReadiness::AwaitReady
+            } else {
+                server::McpReadiness::Deferred
+            },
+        )
+    } else {
+        server::BuildOptions::local(
+            config_path.clone(),
+            capabilities,
+            extra_auto_approved_tools,
+            server::McpReadiness::Deferred,
+        )
+    };
     let mut built = Some(
         server::build(
             &mut config,
             connected.instance,
             connected.user,
-            server::BuildOptions::local(
-                config_path.clone(),
-                capabilities,
-                extra_auto_approved_tools,
-                if args.print {
-                    server::McpReadiness::AwaitReady
-                } else {
-                    server::McpReadiness::Deferred
-                },
-            ),
+            build_options,
         )
         .await?,
     );

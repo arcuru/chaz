@@ -69,8 +69,9 @@ pub struct BuildOptions {
 }
 
 impl BuildOptions {
-    /// Options for the migrated local executable. Execution authority comes
-    /// solely from the connector capability, never from the selected UI mode.
+    /// Options for a long-lived local executable (daemon or TUI). The mode may
+    /// reduce what an executor starts, but can never grant work the connector
+    /// capability denied.
     pub fn local(
         config_path: PathBuf,
         capabilities: crate::instance::InstanceCapabilities,
@@ -87,6 +88,104 @@ impl BuildOptions {
             extra_auto_approved_tools,
             mcp_readiness,
         }
+    }
+
+    /// Options for one-shot local entry points. `--print` needs one agent
+    /// turn and may perform first-boot agent setup; `cmd` must never start
+    /// queued turns or autonomous work. A direct owner may still bootstrap
+    /// its config-declared agents for first-boot administration, while a
+    /// service client must not.
+    pub fn local_oneshot(
+        config_path: PathBuf,
+        capabilities: crate::instance::InstanceCapabilities,
+        run_agent_loop: bool,
+        bootstrap_agents_from_config: bool,
+        extra_auto_approved_tools: Vec<String>,
+        mcp_readiness: McpReadiness,
+    ) -> Self {
+        let executor = capabilities.runs_agents();
+        Self {
+            config_path,
+            enable_sync: false,
+            run_routine_engine: false,
+            bootstrap_agents_from_config: executor && bootstrap_agents_from_config,
+            run_agent_loop: executor && run_agent_loop,
+            extra_auto_approved_tools,
+            mcp_readiness,
+        }
+    }
+}
+
+#[cfg(test)]
+mod build_options_tests {
+    use super::*;
+    use crate::config::{EideticaConfig, EideticaLoginConfig, ExecutionRole};
+
+    fn capabilities(role: ExecutionRole) -> crate::instance::InstanceCapabilities {
+        let config = EideticaConfig {
+            connection: "unix:///tmp/chaz-test.sock".into(),
+            login: EideticaLoginConfig {
+                username: "chaz".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        crate::instance::capabilities_for_test(&config, role)
+    }
+
+    #[test]
+    fn command_mode_never_installs_execution_work() {
+        let options = BuildOptions::local_oneshot(
+            PathBuf::from("config.yaml"),
+            capabilities(ExecutionRole::Executor),
+            false,
+            false,
+            Vec::new(),
+            McpReadiness::Deferred,
+        );
+        assert!(!options.run_agent_loop);
+        assert!(!options.run_routine_engine);
+        assert!(!options.bootstrap_agents_from_config);
+    }
+
+    #[test]
+    fn direct_owner_command_mode_may_bootstrap_without_running_turns() {
+        let config = EideticaConfig {
+            connection: "sqlite:///tmp/chaz-test.db".into(),
+            login: EideticaLoginConfig {
+                username: "chaz".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let options = BuildOptions::local_oneshot(
+            PathBuf::from("config.yaml"),
+            crate::instance::capabilities_for_test(&config, ExecutionRole::Executor),
+            false,
+            true,
+            Vec::new(),
+            McpReadiness::Deferred,
+        );
+        assert!(!options.run_agent_loop);
+        assert!(!options.run_routine_engine);
+        assert!(options.bootstrap_agents_from_config);
+    }
+
+    #[test]
+    fn client_mode_cannot_gain_execution_from_print_mode() {
+        let options = BuildOptions::local_oneshot(
+            PathBuf::from("config.yaml"),
+            capabilities(ExecutionRole::Client),
+            true,
+            true,
+            Vec::new(),
+            McpReadiness::AwaitReady,
+        );
+        assert!(!options.run_agent_loop);
+        assert!(!options.run_routine_engine);
+        assert!(!options.bootstrap_agents_from_config);
     }
 }
 
@@ -165,9 +264,8 @@ pub async fn build(
     if config.execution.is_some() {
         let execution = crate::instance::required_settings(config)?.1;
         let is_executor = execution == crate::config::ExecutionRole::Executor;
-        if opts.run_agent_loop != is_executor
-            || opts.run_routine_engine != is_executor
-            || opts.bootstrap_agents_from_config != is_executor
+        if !is_executor
+            && (opts.run_agent_loop || opts.run_routine_engine || opts.bootstrap_agents_from_config)
         {
             anyhow::bail!(
                 "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
@@ -294,7 +392,9 @@ pub async fn build(
     // already-attached banks are skipped (grant_on_memory_bank is idempotent,
     // and attach_memory_bank overwrites by name). Missing banks/agents are
     // logged at warn and skipped so a typo in config doesn't fail startup.
-    if let Some(agent_configs) = &config.agents {
+    if opts.bootstrap_agents_from_config
+        && let Some(agent_configs) = &config.agents
+    {
         for ac in agent_configs {
             if let Some(banks) = &ac.default_memory_banks {
                 for bank_name in banks {
@@ -489,9 +589,14 @@ pub async fn build(
     }));
 
     // Collect MCP server configs from inline config + directory scanning.
-    let mut mcp_configs: Vec<config::McpServerConfig> =
-        config.mcp_servers.clone().unwrap_or_default();
-    if let Some(dir) = &config.mcp_server_dir {
+    let mut mcp_configs: Vec<config::McpServerConfig> = if opts.run_agent_loop {
+        config.mcp_servers.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if opts.run_agent_loop
+        && let Some(dir) = &config.mcp_server_dir
+    {
         let dir_path = std::path::Path::new(dir);
         let dir_configs = mcp::load_server_configs_from_dir(dir_path);
         if !dir_configs.is_empty() {
@@ -519,7 +624,7 @@ pub async fn build(
         backend_manager: default_backend.clone(),
         security: security_ctx.clone(),
     });
-    if !mcp_configs.is_empty() {
+    if opts.run_agent_loop && !mcp_configs.is_empty() {
         for config in &mcp_configs {
             extensions.push(Arc::new(extensions::mcp::McpExtension::new(config.clone())));
         }
@@ -573,6 +678,7 @@ pub async fn build(
 
     let executor = if config.execution.is_some() {
         crate::instance::required_settings(config)?.1 == crate::config::ExecutionRole::Executor
+            && opts.run_agent_loop
     } else {
         opts.run_agent_loop
     }
@@ -690,6 +796,7 @@ pub async fn build(
         let registry = registry.clone();
         let default_backend = default_backend.clone();
         let deferred_config = config.clone();
+        let reconcile_agents_from_config = opts.bootstrap_agents_from_config;
         let run_routine_engine = opts.run_routine_engine;
         let run_agent_loop = opts.run_agent_loop;
         let mcp_readiness = opts.mcp_readiness;
@@ -700,6 +807,7 @@ pub async fn build(
                 registry,
                 deferred_config,
                 default_backend,
+                reconcile_agents_from_config,
                 run_routine_engine,
                 run_agent_loop,
                 mcp_readiness,
@@ -749,6 +857,7 @@ async fn run_deferred_startup(
     registry: Arc<session::SessionRegistry>,
     config: Config,
     default_backend: backends::BackendManager,
+    reconcile_agents_from_config: bool,
     run_routine_engine: bool,
     run_agent_loop: bool,
     mcp_readiness: McpReadiness,
@@ -767,12 +876,14 @@ async fn run_deferred_startup(
 
     // 2. Reconcile each agent's DB config from yaml, then open the gate.
     //    `/agent reload` runs this same path on demand.
-    let t = Instant::now();
-    server.reconcile_agents_from_config(&config).await;
-    info!(
-        elapsed_ms = t.elapsed().as_millis() as u64,
-        "Deferred: reconciled agents from config"
-    );
+    if reconcile_agents_from_config {
+        let t = Instant::now();
+        server.reconcile_agents_from_config(&config).await;
+        info!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "Deferred: reconciled agents from config"
+        );
+    }
     // 2b. A one-shot run gets a single turn, so it must not start that turn
     //     against a half-loaded tool list. Reuse the turn gate rather than
     //     adding a second one: `process_session` already parks here, so the
@@ -964,9 +1075,9 @@ async fn run_deferred_startup(
         }
 
         let engine_clone = engine.clone();
-        tokio::spawn(async move {
+        server.track_task(tokio::spawn(async move {
             engine_clone.run().await;
-        });
+        }));
     }
 
     // 4. Watch each hosted agent DB's session registry so the daemon runs the
@@ -1244,12 +1355,16 @@ async fn register_one_exposed_session(
             // Proxy tool approvals over the session DB: the runtime
             // blocks on this channel, the proxy writes a request entry,
             // and the exposing bridge renders it + writes the decision.
-            let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
-                sdb.clone(),
-                entry.display_name.clone(),
-                server.approval_timeout(),
-            )
-            .await;
+            let (approval_tx, approval_tasks) =
+                super::approval_proxy::spawn_session_db_approval_proxy(
+                    sdb.clone(),
+                    entry.display_name.clone(),
+                    server.approval_timeout(),
+                )
+                .await;
+            for task in approval_tasks {
+                server.track_task(task);
+            }
             if let Err(e) = server
                 .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
                 .await

@@ -95,11 +95,12 @@ impl RoutineHandler for AgentScheduleRoutineHandler {
                 .ok_or_else(|| anyhow::anyhow!("agent_schedule fired before server initialized"))?;
 
             // Spawn the actual agent turn — don't block the engine's fire loop.
-            tokio::spawn(async move {
-                if let Err(e) = server.fire_agent_schedule(payload).await {
+            let task_server = server.clone();
+            server.track_task(tokio::spawn(async move {
+                if let Err(e) = task_server.fire_agent_schedule(payload).await {
                     tracing::error!(error = %e, "agent_schedule fire failed");
                 }
-            });
+            }));
 
             Ok(())
         })

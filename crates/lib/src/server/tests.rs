@@ -179,6 +179,56 @@ async fn client_server_fixture_from_registry(
 }
 
 #[tokio::test]
+async fn shutdown_aborts_an_in_flight_model_turn_before_replacement() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (sid, db) = registry
+        .create_session(Some("shutdown-test"))
+        .await
+        .unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("must not commit after shutdown");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    let mut session = Session::new(sid, db.clone()).await;
+    session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "block this turn".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_started())
+        .await
+        .expect("model turn must start");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), server.shutdown())
+        .await
+        .expect("shutdown must await cancellation");
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_stopped())
+        .await
+        .expect("shutdown must cancel the old model future before returning");
+
+    let observed = Session::new(ConversationId(db.root_id().to_string()), db).await;
+    assert!(
+        !observed
+            .entries()
+            .iter()
+            .any(|entry| entry.content == "must not commit after shutdown")
+    );
+}
+
+#[tokio::test]
 async fn hydrate_picks_up_db_config_edits() {
     let (_instance, server, registry) = server_fixture().await;
 
