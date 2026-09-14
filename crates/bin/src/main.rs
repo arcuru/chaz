@@ -551,4 +551,15 @@ mod tests {
             dirs::state_dir().map(|dir| dir.join("chaz"))
         );
     }
+
+    #[test]
+    fn invalid_connector_config_is_rejected_before_state_directory_creation() {
+        let state = tempfile::tempdir().unwrap().path().join("must-not-exist");
+        let config = Config {
+            state_dir: Some(state.display().to_string()),
+            ..Default::default()
+        };
+        assert!(chaz_core::instance::required_settings(&config).is_err());
+        assert!(!state.exists());
+    }
 }
