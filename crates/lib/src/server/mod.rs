@@ -428,6 +428,8 @@ fn spawn_model_window_fetch(
     inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     backend: BackendManager,
     model: String,
+    owned_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     if model.is_empty() || backend.context_window(&model).is_some() {
         return;
@@ -439,7 +441,7 @@ fn spawn_model_window_fetch(
         }
     }
     let store = crate::model_info_store::ModelInfoStore::new(chaz_peer);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         match backend.fetch_models_with_info().await {
             Ok(models) => {
                 if let Some(info) = models.into_iter().find(|m| m.id == model) {
@@ -457,6 +459,22 @@ fn spawn_model_window_fetch(
         }
         inflight.lock().unwrap().remove(&model);
     });
+    track_owned_task(&owned_tasks, &shutting_down, task);
+}
+
+fn track_owned_task(
+    owned_tasks: &std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    shutting_down: &AtomicBool,
+    task: tokio::task::JoinHandle<()>,
+) {
+    let mut tasks = owned_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if shutting_down.load(Ordering::Acquire) {
+        task.abort();
+    } else {
+        tasks.push(task);
+    }
 }
 
 /// Callback-driven agent server.
@@ -594,6 +612,7 @@ pub struct Server {
     runtime_mode: std::sync::RwLock<RuntimeMode>,
     shutting_down: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+    owned_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Server {
@@ -669,6 +688,7 @@ impl Server {
             runtime_mode: std::sync::RwLock::new(RuntimeMode::Auto),
             shutting_down: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            owned_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
 
         // The agent-running path. `processing_loop` drains `notify_tx` and
@@ -680,15 +700,15 @@ impl Server {
         // sends behind `register_session` become harmless no-ops.
         if executor_authorized {
             let server_weak = Arc::downgrade(&server);
-            tokio::spawn(async move {
+            server.track_task(tokio::spawn(async move {
                 Server::processing_loop(server_weak, notify_rx).await;
-            });
+            }));
         }
 
         let server_clone = server.clone();
-        tokio::spawn(async move {
+        server.track_task(tokio::spawn(async move {
             server_clone.new_session_watcher().await;
-        });
+        }));
 
         server
     }
@@ -829,7 +849,22 @@ impl Server {
         if let Some(engine) = self.routine_engine() {
             engine.stop();
         }
-        tokio::task::yield_now().await;
+        let tasks = self
+            .owned_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    pub(crate) fn track_task(&self, task: tokio::task::JoinHandle<()>) {
+        track_owned_task(&self.owned_tasks, &self.shutting_down, task);
     }
 
     /// The running `RoutineEngine`, if one has been registered. `None`
@@ -1491,6 +1526,8 @@ impl Server {
             self.model_fetch_inflight.clone(),
             backend.clone(),
             model.to_string(),
+            self.owned_tasks.clone(),
+            self.shutting_down.clone(),
         );
     }
 
@@ -2401,6 +2438,7 @@ impl Server {
         // the spawned task below has no `&self`.
         let chaz_peer = self.registry.chaz_peer().clone();
         let model_fetch_inflight = self.model_fetch_inflight.clone();
+        let owned_tasks = self.owned_tasks.clone();
         let active_extensions = self
             .active_extensions_for_agent(&session_db_id, &agent_name)
             .await;
@@ -2410,7 +2448,7 @@ impl Server {
         #[cfg(test)]
         let transcript_fail_after = self.transcript_fail_after.clone();
 
-        tokio::spawn(async move {
+        self.track_task(tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
             if shutting_down.load(Ordering::Acquire) {
                 return;
@@ -2499,6 +2537,8 @@ impl Server {
                         model_fetch_inflight.clone(),
                         backend.clone(),
                         m.to_string(),
+                        owned_tasks.clone(),
+                        shutting_down.clone(),
                     );
                 }
                 let max_tokens_override = resolve_context_max_tokens(
@@ -2630,7 +2670,7 @@ impl Server {
             if let Some(tx) = spawn.completion_tx {
                 let _ = tx.send(()).await;
             }
-        });
+        }));
     }
 }
 

@@ -115,6 +115,21 @@ impl InstanceCapabilities {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn capabilities_for_test(
+    config: &EideticaConfig,
+    execution: ExecutionRole,
+) -> InstanceCapabilities {
+    InstanceCapabilities {
+        ownership: if is_service_connection(&config.connection) {
+            InstanceOwnership::Service
+        } else {
+            InstanceOwnership::Direct
+        },
+        execution,
+    }
+}
+
 /// A strictly connected Eidetica instance and its existing logged-in user.
 pub struct ConnectedInstance {
     pub instance: Instance,
@@ -207,6 +222,7 @@ pub async fn connect_with(
             "`eidetica.sync` is owner-only and must be omitted for a service connection; configure sync on the Eidetica daemon".into(),
         ));
     }
+    validate_strict_target(config)?;
 
     // Strict connect is load-only for every native target. Provisioning uses
     // Eidetica's explicit create APIs and never happens as connector fallback.
@@ -232,6 +248,30 @@ pub async fn connect_with(
             execution,
         },
     })
+}
+
+/// Reject absent local targets before handing them to native drivers. Some
+/// drivers create schema/files while opening, but runtime connection is
+/// load-only: provisioning must be an explicit Eidetica operation.
+fn validate_strict_target(config: &EideticaConfig) -> Result<(), ConnectError> {
+    let connection = config.connection.trim();
+    let Some((scheme, rest)) = connection.split_once("://") else {
+        return Ok(());
+    };
+    if !scheme.eq_ignore_ascii_case("sqlite") {
+        return Ok(());
+    }
+
+    let path = rest.split('?').next().unwrap_or(rest);
+    if path.is_empty() || path == ":memory:" || connection.contains("mode=memory") {
+        return Ok(());
+    }
+    if !std::path::Path::new(path).exists() {
+        return Err(ConnectError::Config(format!(
+            "SQLite Eidetica store `{path}` does not exist; initialise it explicitly before starting Chaz"
+        )));
+    }
+    Ok(())
 }
 
 fn validate(config: &EideticaConfig) -> Result<(), ConnectError> {
@@ -471,6 +511,16 @@ eidetica:
         assert!(is_service_connection("UNIX:///run/eidetica.sock"));
         assert!(is_service_connection("  unix:///run/eidetica.sock  "));
         assert!(!is_service_connection("sqlite://./chaz.db"));
+    }
+
+    #[test]
+    fn strict_sqlite_validation_does_not_create_a_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.db");
+        let config = settings(format!("sqlite://{}", path.display()), "chaz");
+        let error = validate_strict_target(&config).unwrap_err();
+        assert!(error.to_string().contains("initialise it explicitly"));
+        assert!(!path.exists());
     }
 
     #[tokio::test]
