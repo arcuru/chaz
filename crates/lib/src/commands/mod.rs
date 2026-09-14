@@ -102,6 +102,11 @@ pub enum Command {
     Print,
     /// Aggregate LLM usage and cost across all sessions.
     ListCosts,
+    /// Show interrupted turns in the current session. These are never replayed
+    /// automatically because a model or tool effect may already have happened.
+    Interrupted,
+    /// Explicitly start a new attempt for an interrupted request.
+    RetryInterrupted(String),
 
     // --- Matrix channel management ---
     /// List Matrix rooms currently attached to the current session.
@@ -273,6 +278,8 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "schedules",
     "info",
     "costs",
+    "interrupted",
+    "retry",
     "print",
     "backends",
     "new",
@@ -374,6 +381,16 @@ pub enum CommandOutcome {
 }
 
 pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
+    if service_owner_only(&cmd)
+        && ctx
+            .server
+            .registry()
+            .instance()
+            .remote_connection()
+            .is_some()
+    {
+        return CommandOutcome::Error(owner_redirect(&cmd));
+    }
     match cmd {
         Command::ListSessions => session::list_sessions(ctx).await,
         Command::NewSession(group) => session::new_session(group.as_deref(), ctx).await,
@@ -381,6 +398,8 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SwitchSession(id) => session::switch_session(&id, ctx).await,
         Command::Info => session::info(ctx).await,
         Command::ListCosts => session::list_costs(ctx).await,
+        Command::Interrupted => session::interrupted(ctx).await,
+        Command::RetryInterrupted(request) => session::retry_interrupted(&request, ctx).await,
         Command::NameSession(name) => session::name_session(&name, ctx).await,
         Command::ClearSessionName => session::clear_session_name(ctx).await,
         Command::Share => session::share(ctx).await,
@@ -442,6 +461,37 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
     }
 }
 
+fn service_owner_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Share
+            | Command::Sync(_)
+            | Command::AgentShare(_)
+            | Command::AgentImport { .. }
+            | Command::SharingRequests
+            | Command::SharingApprove(_)
+            | Command::SharingReject(_)
+            | Command::SharingStatus
+    )
+}
+
+fn owner_redirect(command: &Command) -> String {
+    let action = match command {
+        Command::Share => "create the session ticket",
+        Command::Sync(_) => "bootstrap the session ticket",
+        Command::AgentShare(_) => "create the agent ticket",
+        Command::AgentImport { .. } => "bootstrap the agent ticket",
+        Command::SharingRequests => "inspect bootstrap requests",
+        Command::SharingApprove(_) => "approve the bootstrap request",
+        Command::SharingReject(_) => "reject the bootstrap request",
+        Command::SharingStatus => "inspect daemon sync state",
+        _ => unreachable!("redirect called for service-capable command"),
+    };
+    format!(
+        "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to {action}; this service client made no changes."
+    )
+}
+
 async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     use crate::extension::{ExtensionCommandOutcome, HookContext};
     use crate::session::Session;
@@ -485,5 +535,39 @@ async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) ->
         Some(ExtensionCommandOutcome::Text(s)) => CommandOutcome::Text(s),
         Some(ExtensionCommandOutcome::Error(s)) => CommandOutcome::Error(s),
         None => CommandOutcome::Error(format!("Unknown command: /{name}")),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn service_owner_commands_are_classified_before_dispatch() {
+        for command in [
+            Command::Share,
+            Command::Sync("ticket".into()),
+            Command::AgentShare("chaz".into()),
+            Command::AgentImport {
+                ticket: "ticket".into(),
+                permission: CoOwnerPermission::Write,
+            },
+            Command::SharingRequests,
+            Command::SharingApprove("request".into()),
+            Command::SharingReject("request".into()),
+            Command::SharingStatus,
+        ] {
+            assert!(service_owner_only(&command));
+            let message = owner_redirect(&command);
+            assert!(message.contains("Eidetica owner"));
+            assert!(message.contains("made no changes"));
+        }
+        assert!(!service_owner_only(&Command::ListSessions));
+        assert!(!service_owner_only(&Command::SessionUnshare));
+        assert!(!service_owner_only(&Command::AgentInvite {
+            agent_ref: "chaz".into(),
+            pubkey: "key".into(),
+            permission: CoOwnerPermission::Write,
+        }));
     }
 }

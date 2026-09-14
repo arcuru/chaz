@@ -592,6 +592,8 @@ pub struct Server {
     /// via [`Server::set_runtime_mode`]; a dumb bridge runs `Never`. Defaults
     /// to [`RuntimeMode::Auto`].
     runtime_mode: std::sync::RwLock<RuntimeMode>,
+    shutting_down: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Server {
@@ -665,6 +667,8 @@ impl Server {
             startup_ready_notify: Arc::new(tokio::sync::Notify::new()),
             runtime_lease: Arc::new(LocalRuntimeLease::new()),
             runtime_mode: std::sync::RwLock::new(RuntimeMode::Auto),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // The agent-running path. `processing_loop` drains `notify_tx` and
@@ -810,6 +814,22 @@ impl Server {
         if self.executor_authorized {
             let _ = self.routine_engine.set(engine);
         }
+    }
+
+    pub fn is_executor_authorized(&self) -> bool {
+        self.executor_authorized
+    }
+
+    /// Stop the generation's processing/watcher loops and routine engine.
+    /// Idempotent and intentionally awaited by reconnect supervision before a
+    /// replacement Server is built.
+    pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+        if let Some(engine) = self.routine_engine() {
+            engine.stop();
+        }
+        tokio::task::yield_now().await;
     }
 
     /// The running `RoutineEngine`, if one has been registered. `None`
@@ -2002,16 +2022,25 @@ impl Server {
 
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_db_id);
+        self.watched.lock().await.remove(session_db_id);
     }
 
     async fn processing_loop(
         server: std::sync::Weak<Self>,
         mut notify_rx: mpsc::Receiver<ProcessingCommand>,
     ) {
-        while let Some(command) = notify_rx.recv().await {
+        loop {
             let Some(server) = server.upgrade() else {
                 break;
             };
+            if server.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
+            let command = tokio::select! {
+                command = notify_rx.recv() => command,
+                _ = server.shutdown_notify.notified() => None,
+            };
+            let Some(command) = command else { break };
             let session_db_id = match command {
                 ProcessingCommand::Wake(session_db_id) => session_db_id,
                 ProcessingCommand::Retry {
@@ -2067,7 +2096,15 @@ impl Server {
             return;
         };
         let mut seen = std::collections::HashSet::new();
-        while let Some(event) = rx.recv().await {
+        loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                _ = self.shutdown_notify.notified() => None,
+            };
+            let Some(event) = event else { break };
             if !seen.insert(event.session_db_id.clone()) {
                 continue;
             }
@@ -2369,11 +2406,15 @@ impl Server {
             .await;
         let live_attempts = self.live_attempts.clone();
         let notify_tx = self.notify_tx.clone();
+        let shutting_down = self.shutting_down.clone();
         #[cfg(test)]
         let transcript_fail_after = self.transcript_fail_after.clone();
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
+            if shutting_down.load(Ordering::Acquire) {
+                return;
+            }
             let session = Arc::new(Mutex::new(session));
 
             {
@@ -2509,6 +2550,10 @@ impl Server {
                 Some(spawn_extensions.as_ref()),
             )
             .await;
+
+            if shutting_down.load(Ordering::Acquire) {
+                return;
+            }
 
             drop(_permit);
 

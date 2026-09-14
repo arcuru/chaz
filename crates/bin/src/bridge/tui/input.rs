@@ -38,6 +38,8 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/rename ", "alias for /name"),
         ("/info", "show current session info"),
         ("/costs", "aggregate LLM usage + cost across all sessions"),
+        ("/interrupted", "list turns requiring an explicit retry"),
+        ("/retry ", "retry one interrupted request by stable id"),
         ("/channels", "list Matrix rooms attached to this session"),
         ("/share", "generate shareable ticket for current session"),
         ("/sync ", "sync a remote session via ticket"),

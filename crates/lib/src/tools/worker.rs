@@ -1,12 +1,10 @@
 use crate::backends::BackendManager;
 use crate::security::SecurityContext;
-use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
 use tracing::info;
 
 /// Spawn a Worker — a configured one-shot LLM call declared per-Agent.
@@ -23,7 +21,7 @@ use tracing::info;
 /// For delegating to a long-lived peer Agent with its own keys and
 /// persistent state, use `spawn_agent`.
 pub struct SpawnWorker {
-    pub server: Arc<OnceLock<Arc<Server>>>,
+    pub server: crate::instance::ServerSlot,
     pub backend: BackendManager,
     pub security: SecurityContext,
 }
@@ -298,11 +296,12 @@ mod tests {
     use super::*;
     use crate::test_support::{empty_secrets, fresh_session, permissive_security, tool_context};
     use crate::tool::ToolRegistry;
+    use std::sync::Arc;
 
     async fn worker_tool() -> SpawnWorker {
         let secrets = empty_secrets().await;
         SpawnWorker {
-            server: Arc::new(OnceLock::new()),
+            server: crate::instance::ServerSlot::default(),
             backend: BackendManager::new(&None, secrets),
             security: permissive_security(),
         }

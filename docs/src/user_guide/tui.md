@@ -68,6 +68,8 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/name`           | Clear the session alias                                                |
 | `/info`           | Show current session details (name, DB ID, entry counts)               |
 | `/costs`          | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
+| `/interrupted`    | List turns that require an explicit retry decision                     |
+| `/retry <id>`     | Start a new attempt for an interrupted request                         |
 | `/channels`       | List Matrix rooms currently attached to this session                   |
 | `/share`          | Generate a shareable ticket URL for the current session                |
 | `/sync <ticket>`  | Sync a remote session via a ticket URL                                 |

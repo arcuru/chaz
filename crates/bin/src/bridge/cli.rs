@@ -91,10 +91,16 @@ impl Bridge for CliBridge {
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
-        // Approval channel = None → auto-deny any tool needing approval.
-        server
-            .register_session(&session_db, backend, None, None)
-            .await?;
+        if server.is_executor_authorized() {
+            // Approval channel = None → auto-deny any tool needing approval.
+            server
+                .register_session(&session_db, backend, None, None)
+                .await?;
+        } else {
+            server
+                .watch_session(&session_db, backend, None, None)
+                .await?;
+        }
 
         // Watch for the agent's response via on_write. The server already
         // installed its own callback during register_session; this is an additional

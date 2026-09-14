@@ -82,26 +82,24 @@ fn resolve_interval() -> Option<Duration> {
 
 /// Spawn the reconciler. No-op when sync is disabled on this peer or when
 /// [`INTERVAL_ENV`] is set to `0`.
-pub fn spawn(registry: Arc<SessionRegistry>) {
-    if registry.instance().sync().is_none() {
-        return;
-    }
+pub fn spawn(registry: Arc<SessionRegistry>) -> Option<tokio::task::JoinHandle<()>> {
+    registry.instance().sync()?;
     let Some(interval) = resolve_interval() else {
         info!("Keyed sync reconciler disabled by {INTERVAL_ENV}=0");
-        return;
+        return None;
     };
     info!(
         interval_secs = interval.as_secs(),
         "Keyed sync reconciler started (works around device-key-signed background sync)"
     );
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             reconcile_once(&registry).await;
         }
-    });
+    }))
 }
 
 /// One reconcile pass. Never returns an error: a peer being unreachable is the

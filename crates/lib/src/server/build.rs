@@ -6,8 +6,8 @@
 //! registry built, per-agent DBs bootstrapped, the secret store + extension hub
 //! assembled, the [`Server`] constructed with the spawn-tool cell wired, agent
 //! configs reconciled, YAML schedules materialized, and the routine engine
-//! spawned. That sequence is load-bearing (notably the `spawn_server_cell`
-//! `OnceLock` must be set *after* `Server::new`, and the extension hub must be
+//! spawned. That sequence is load-bearing (notably the replaceable server slot
+//! must be populated after `Server::new`, and the extension hub must be
 //! `install_all`'d before it) and historically lived inline in the `chaz`
 //! binary's `main`. [`build`] is the single shared implementation so external
 //! bridge binaries don't copy-paste it.
@@ -68,6 +68,28 @@ pub struct BuildOptions {
     pub mcp_readiness: McpReadiness,
 }
 
+impl BuildOptions {
+    /// Options for the migrated local executable. Execution authority comes
+    /// solely from the connector capability, never from the selected UI mode.
+    pub fn local(
+        config_path: PathBuf,
+        capabilities: crate::instance::InstanceCapabilities,
+        extra_auto_approved_tools: Vec<String>,
+        mcp_readiness: McpReadiness,
+    ) -> Self {
+        let executor = capabilities.runs_agents();
+        Self {
+            config_path,
+            enable_sync: false,
+            run_routine_engine: executor,
+            bootstrap_agents_from_config: executor,
+            run_agent_loop: executor,
+            extra_auto_approved_tools,
+            mcp_readiness,
+        }
+    }
+}
+
 /// When MCP tools have to exist, relative to the first turn.
 ///
 /// MCP servers always start off the critical path — [`build`] returns
@@ -94,6 +116,37 @@ pub struct BuiltServer {
     pub server: Arc<Server>,
     pub registry: Arc<session::SessionRegistry>,
     pub secret_store: security::SecretStore,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    server_slot: crate::instance::ServerSlot,
+}
+
+impl BuiltServer {
+    /// Stop every task owned by this application runtime, then release all
+    /// hooks/subscriptions by dropping the server and its Instance graph.
+    /// Call this to completion before replacing a service connection.
+    pub async fn shutdown(mut self) {
+        self.server_slot.clear();
+        self.server.shutdown().await;
+        self.server.mcp_registry().abort_pending_tasks();
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+        let sessions: Vec<String> = self
+            .server
+            .registry()
+            .list_sessions()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|session| session.session_db_id)
+            .collect();
+        for session in sessions {
+            self.server.deregister_session(&session).await;
+        }
+    }
 }
 
 /// Assemble a fully-wired [`Server`] from `config` and an opened eidetica
@@ -108,12 +161,13 @@ pub async fn build(
     mut user: eidetica::user::User,
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
+    let mut tasks = Vec::new();
     if config.execution.is_some() {
-        let capabilities = crate::instance::required_settings(config)?.1;
-        let is_executor = capabilities == crate::config::ExecutionRole::Executor;
+        let execution = crate::instance::required_settings(config)?.1;
+        let is_executor = execution == crate::config::ExecutionRole::Executor;
         if opts.run_agent_loop != is_executor
-            || opts.run_routine_engine && !is_executor
-            || opts.bootstrap_agents_from_config && !is_executor
+            || opts.run_routine_engine != is_executor
+            || opts.bootstrap_agents_from_config != is_executor
         {
             anyhow::bail!(
                 "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
@@ -400,7 +454,7 @@ pub async fn build(
     // SpawnAgent / SpawnWorker route through the server — a single OnceLock
     // is shared; it's set once after Server::new below. The core extension
     // takes ownership of the cell and constructs the spawn tools.
-    let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
+    let server_slot = crate::instance::ServerSlot::default();
 
     // Shared MCP server directory — populated by McpExtension::instantiate
     // below, exposed to readers (TUI Peer→MCP settings) via Server.
@@ -428,7 +482,7 @@ pub async fn build(
         skill_bank_index: skill_bank_index_store.clone(),
         embedder: embedder.clone(),
         secrets: Some(Arc::new(secret_store.clone())),
-        server_cell: spawn_server_cell.clone(),
+        server_slot: server_slot.clone(),
         mcp_registry: mcp_registry.clone(),
         agent_state_allowlist: config.agent_state_allowlist.clone(),
         tool_registry: tool_registry.clone(),
@@ -461,7 +515,7 @@ pub async fn build(
         session_registry: registry.clone(),
         embedder: embedder.clone(),
         web_search_backends,
-        spawn_server_cell: spawn_server_cell.clone(),
+        server_slot: server_slot.clone(),
         backend_manager: default_backend.clone(),
         security: security_ctx.clone(),
     });
@@ -517,9 +571,12 @@ pub async fn build(
     let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
         as std::sync::Arc<dyn tool_host::ToolHost>;
 
-    let executor = opts
-        .run_agent_loop
-        .then(crate::instance::legacy_executor_capability);
+    let executor = if config.execution.is_some() {
+        crate::instance::required_settings(config)?.1 == crate::config::ExecutionRole::Executor
+    } else {
+        opts.run_agent_loop
+    }
+    .then(crate::instance::legacy_executor_capability);
     let server = Server::new(
         registry.clone(),
         agent_registry,
@@ -537,10 +594,7 @@ pub async fn build(
         mcp_registry.clone(),
         executor,
     );
-    assert!(
-        spawn_server_cell.set(server.clone()).is_ok(),
-        "Spawn tool server cell already set"
-    );
+    server_slot.set(server.clone());
 
     // Apply operator multi-agent tuning before the bridge starts
     // delivering messages (set_agent_burst_budget is read by
@@ -640,7 +694,7 @@ pub async fn build(
         let run_agent_loop = opts.run_agent_loop;
         let mcp_readiness = opts.mcp_readiness;
         let mcp_registry = mcp_registry.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             run_deferred_startup(
                 server,
                 registry,
@@ -652,7 +706,7 @@ pub async fn build(
                 mcp_registry,
             )
             .await;
-        });
+        }));
     }
 
     // Sync every tracked database under the key it was actually granted, which
@@ -660,12 +714,16 @@ pub async fn build(
     // key). Without this, any database this peer reached by bootstrapping with a
     // named user key — every bridge's agent DB — is refused on every pull.
     // Delete this call with the module when eidetica signs with the tracked key.
-    keyed_sync::spawn(registry.clone());
+    if let Some(task) = keyed_sync::spawn(registry.clone()) {
+        tasks.push(task);
+    }
 
     Ok(BuiltServer {
         server,
         registry,
         secret_store,
+        tasks,
+        server_slot,
     })
 }
 

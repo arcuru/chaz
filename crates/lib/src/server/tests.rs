@@ -2613,6 +2613,18 @@ async fn client_server_cannot_register_execution_or_retry() {
     assert_eq!(session.attempts_for_test().await, vec![attempt]);
     assert!(mock.recorded_calls().is_empty());
     assert!(client.routine_engine().is_none());
+
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    client
+        .watch_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(client.interrupted_turns(&sid).await.is_ok());
+    assert!(mock.recorded_calls().is_empty());
 }
 
 #[tokio::test]

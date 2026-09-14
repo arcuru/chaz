@@ -346,11 +346,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Assemble the Server WITHOUT minting agent DBs (already ticket-bootstrapped
     // above) and WITHOUT the routine engine (pure I/O — the daemon runs agents).
-    let server::BuiltServer {
-        server,
-        secret_store,
-        ..
-    } = server::build(
+    let built_server = server::build(
         &mut config,
         instance,
         user,
@@ -367,6 +363,8 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
+    let server = built_server.server.clone();
+    let secret_store = built_server.secret_store.clone();
 
     // One MatrixBridge per ready login. The shutdown signal is never fired here
     // (the supervisor terminates the process); it exists to satisfy the bridge's

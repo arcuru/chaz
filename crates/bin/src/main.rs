@@ -2,7 +2,7 @@ mod bridge;
 
 use chaz_core::bridge::Bridge;
 use chaz_core::config::Config;
-use chaz_core::{agent, config, server, session};
+use chaz_core::{agent, config, instance, server, session};
 
 use clap::Parser;
 use std::time::Instant;
@@ -152,7 +152,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Resolve state directory for persistence
+    // Resolve state directory for logs and other Chaz-local files. Eidetica
+    // storage is selected only by the explicit connector configuration.
     let state_dir = resolve_state_dir(&config);
     if let Some(dir) = &state_dir {
         std::fs::create_dir_all(dir)?;
@@ -176,15 +177,11 @@ async fn main() -> anyhow::Result<()> {
                     .with_env_filter(filter)
                     .with_writer(std::io::stderr)
                     .init();
-                return run_usage_subcommand(usage_args, &config, state_dir.as_deref()).await;
+                return run_usage_subcommand(usage_args, &config).await;
             }
             Subcommand::Cmd(a) => cmd_args = Some(a),
         }
     }
-
-    // Both one-shot modes reserve stdout for their result, so neither can log
-    // to it.
-    let headless_oneshot = args.print || cmd_args.is_some();
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
     //
@@ -245,22 +242,9 @@ async fn main() -> anyhow::Result<()> {
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
 
-    // Initialize eidetica with SQLite backend for persistent storage
-    let eidetica_db_path = state_dir
-        .as_ref()
-        .map(|d| d.join("eidetica.db"))
-        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
     let t = Instant::now();
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz"),
-    )
-    .await?;
-    let user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz", None).await?,
-    };
+    let connected = instance::connect(&config).await?;
+    let capabilities = connected.capabilities;
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "eidetica opened"
@@ -280,44 +264,29 @@ async fn main() -> anyhow::Result<()> {
         Vec::new()
     };
 
-    // Assemble the fully-wired server (registry, agent DBs, secret store,
-    // extension hub, schedules, routine engine) from the opened eidetica
-    // instance. Sync and the routine engine are long-lived and skipped for a
-    // one-shot CLI run. See `chaz_core::server::build`.
+    // Assemble the fully-wired server. Execution work is selected only by the
+    // explicit role; the executable/mode contributes no authority.
     let t = Instant::now();
-    let server::BuiltServer {
-        server,
-        secret_store,
-        ..
-    } = server::build(
-        &mut config,
-        instance,
-        user,
-        server::BuildOptions {
-            config_path: config_path.clone(),
-            // Command mode needs sync even though it is one-shot: `/agent
-            // share` mints a ticket out of the sync layer and refuses outright
-            // without it, and minting tickets is most of the point.
-            enable_sync: cmd_args.is_some() || !args.print,
-            run_routine_engine: !headless_oneshot,
-            // The chaz daemon owns its agents — mint their DBs from config.
-            bootstrap_agents_from_config: true,
-            // Command mode administers the peer; it never runs a turn, and
-            // starting the loop would risk billing one as a side effect.
-            run_agent_loop: cmd_args.is_none(),
-            extra_auto_approved_tools,
-            // `--print` runs exactly one turn, so its tool list has to be
-            // complete before that turn starts. Long-lived modes take the
-            // tools whenever they land. `chaz cmd` runs no turn at all and
-            // so never reaches the gate either way.
-            mcp_readiness: if args.print {
-                server::McpReadiness::AwaitReady
-            } else {
-                server::McpReadiness::Deferred
-            },
-        },
-    )
-    .await?;
+    let mut built = Some(
+        server::build(
+            &mut config,
+            connected.instance,
+            connected.user,
+            server::BuildOptions::local(
+                config_path.clone(),
+                capabilities,
+                extra_auto_approved_tools,
+                if args.print {
+                    server::McpReadiness::AwaitReady
+                } else {
+                    server::McpReadiness::Deferred
+                },
+            ),
+        )
+        .await?,
+    );
+    let server = built.as_ref().unwrap().server.clone();
+    let secret_store = built.as_ref().unwrap().secret_store.clone();
     info!(
         build_ms = t.elapsed().as_millis() as u64,
         time_to_gateway_ms = startup_start.elapsed().as_millis() as u64,
@@ -347,6 +316,11 @@ async fn main() -> anyhow::Result<()> {
         // work continues, and let the runtime shut down through the same
         // `Drop` path any other mode uses.
         info!("chaz daemon ready; waiting for shutdown signal");
+        if capabilities.ownership() == instance::InstanceOwnership::Service {
+            supervise_daemon_service(config.clone(), config_path.clone(), built.take().unwrap())
+                .await?;
+            return Ok(());
+        }
         wait_for_shutdown().await;
         info!("Shutdown signal received; stopping");
         Ok(())
@@ -373,7 +347,67 @@ async fn main() -> anyhow::Result<()> {
         return Err(e);
     }
 
+    if let Some(built) = built {
+        built.shutdown().await;
+    }
     Ok(())
+}
+
+async fn supervise_daemon_service(
+    mut config: Config,
+    config_path: PathBuf,
+    mut built: server::BuiltServer,
+) -> anyhow::Result<()> {
+    let mut reconnect_attempt = 0u32;
+    loop {
+        let probe = instance::probe_service(built.registry.instance());
+        tokio::select! {
+            _ = wait_for_shutdown() => {
+                built.shutdown().await;
+                return Ok(());
+            }
+            result = probe => match result {
+                Ok(()) => {
+                    reconnect_attempt = 0;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(error) if error.is_transient_service() => {
+                    warn!(%error, "Eidetica service disconnected; tearing down runtime before reconnect");
+                    built.shutdown().await;
+                    loop {
+                        let delay = instance::service_reconnect_delay(reconnect_attempt);
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        tokio::select! {
+                            _ = wait_for_shutdown() => return Ok(()),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        match instance::connect(&config).await {
+                            Ok(connected) => {
+                                built = server::build(
+                                    &mut config,
+                                    connected.instance,
+                                    connected.user,
+                                    server::BuildOptions::local(
+                                        config_path.clone(),
+                                        connected.capabilities,
+                                        Vec::new(),
+                                        server::McpReadiness::Deferred,
+                                    ),
+                                ).await?;
+                                info!("Eidetica service reconnected; runtime reopened and reconciled");
+                                break;
+                            }
+                            Err(next) if next.is_transient_service() => {
+                                warn!(%next, "Eidetica service reconnect failed");
+                            }
+                            Err(next) => return Err(next.into()),
+                        }
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
 }
 
 /// Block until the process is asked to stop. Ctrl-C covers foreground and
@@ -406,11 +440,7 @@ async fn wait_for_shutdown() {
 /// session catalog, aggregate per-message `ResponseMetadata`, print either
 /// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
 /// setup since we never serve a session here.
-async fn run_usage_subcommand(
-    args: UsageArgs,
-    config: &Config,
-    state_dir: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Result<()> {
     let bridge_filter = match args.bridge.as_deref() {
         Some(s) => Some(session::BridgeKind::from_filter_str(s).ok_or_else(|| {
             anyhow::anyhow!(
@@ -420,25 +450,14 @@ async fn run_usage_subcommand(
         None => None,
     };
 
-    let eidetica_db_path = state_dir
-        .map(|d| d.join("eidetica.db"))
-        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz"),
-    )
-    .await?;
-    let user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz", None).await?,
-    };
+    let connected = instance::connect(config).await?;
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {
         agent_registry.register_default_chaz(config)?;
     }
-    let registry = session::SessionRegistry::new(instance, user, agent_registry).await?;
+    let registry =
+        session::SessionRegistry::new(connected.instance, connected.user, agent_registry).await?;
 
     let filter = session::usage::UsageFilter {
         since: None,

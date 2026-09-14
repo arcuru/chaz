@@ -31,6 +31,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, warn};
 
@@ -130,6 +131,7 @@ pub struct RoutineEngine {
     /// step-7 tests can exercise the engine in isolation; production
     /// builds always pass a real hub.
     hub: Option<Arc<ExtensionHub>>,
+    stopped: AtomicBool,
 }
 
 impl RoutineEngine {
@@ -152,6 +154,7 @@ impl RoutineEngine {
             notify: Arc::new(Notify::new()),
             chaz_peer,
             hub,
+            stopped: AtomicBool::new(false),
         });
         engine.load_globals().await?;
         Ok(engine)
@@ -590,9 +593,14 @@ impl RoutineEngine {
     /// dropped or aborted. Wire this onto a `tokio::spawn` at chaz
     /// startup.
     pub async fn run(self: Arc<Self>) {
-        loop {
+        while !self.stopped.load(Ordering::Acquire) {
             self.tick().await;
         }
+    }
+
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// Fire every routine whose `next_fire` is `<= now`. Records the
@@ -1553,7 +1561,7 @@ mod tests {
             skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
             embedder: None,
             secrets: None,
-            server_cell: Arc::new(std::sync::OnceLock::new()),
+            server_slot: crate::instance::ServerSlot::default(),
             mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
             tool_registry: Arc::new(ToolRegistry::new()),
