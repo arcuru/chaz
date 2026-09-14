@@ -344,6 +344,44 @@ pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
+pub(super) async fn interrupted(ctx: &CommandContext<'_>) -> CommandOutcome {
+    match ctx.server.interrupted_turns(ctx.session_db_id).await {
+        Ok(turns) if turns.is_empty() => CommandOutcome::Text("No interrupted turns.".into()),
+        Ok(turns) => CommandOutcome::Text(
+            turns
+                .into_iter()
+                .map(|turn| {
+                    format!(
+                        "{}\tattempt {}\tinterrupted; retry explicitly with `/retry {}`",
+                        turn.request_id, turn.attempt_id, turn.request_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Err(error) => {
+            CommandOutcome::Error(format!("Failed to inspect interrupted turns: {error}"))
+        }
+    }
+}
+
+pub(super) async fn retry_interrupted(
+    raw_request_id: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let request_id = crate::session::TurnRequestId::parse(raw_request_id);
+    match ctx
+        .server
+        .retry_interrupted_turn(ctx.session_db_id, &request_id)
+        .await
+    {
+        Ok(attempt_id) => CommandOutcome::Text(format!(
+            "Retry accepted for request {request_id} as attempt {attempt_id}."
+        )),
+        Err(error) => CommandOutcome::Error(format!("Retry refused: {error}")),
+    }
+}
+
 /// Disable sync on the current session so this peer stops serving it.
 pub(super) async fn unshare(ctx: &CommandContext<'_>) -> CommandOutcome {
     let db_id = ctx.session_db.root_id().clone();

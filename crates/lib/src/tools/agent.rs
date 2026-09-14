@@ -1,11 +1,9 @@
-use crate::server::Server;
 use crate::session::{EntryType, Session, SessionEntry};
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use eidetica::entry::ID;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
 use tracing::info;
 
 use crate::backends::BackendManager;
@@ -35,7 +33,7 @@ use crate::security::SecurityContext;
 /// For work owned by the calling Agent (no separate identity, anonymous
 /// one-shot LLM call signed by the parent), use `spawn_worker`.
 pub struct SpawnAgent {
-    pub server: Arc<OnceLock<Arc<Server>>>,
+    pub server: crate::instance::ServerSlot,
     pub backend: BackendManager,
     pub security: SecurityContext,
 }
@@ -251,6 +249,7 @@ mod tests {
     use super::*;
     use crate::test_support::{empty_secrets, fresh_session, permissive_security, tool_context};
     use crate::tool::ToolRegistry;
+    use std::sync::Arc;
 
     /// Build a SpawnAgent with no server wired in — sufficient for tests of
     /// the pre-server-lookup branches (descriptor, argument validation,
@@ -258,7 +257,7 @@ mod tests {
     async fn agent_tool() -> SpawnAgent {
         let secrets = empty_secrets().await;
         SpawnAgent {
-            server: Arc::new(OnceLock::new()),
+            server: crate::instance::ServerSlot::default(),
             backend: BackendManager::new(&None, secrets),
             security: permissive_security(),
         }

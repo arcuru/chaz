@@ -50,7 +50,14 @@ volumes:
 Create a `config.yaml`:
 
 ```yaml
-# For TUI-only testing, this is all you need:
+# An explicit existing Eidetica store/login and process role are required.
+execution: executor
+eidetica:
+  connection: "sqlite:///path/to/state/eidetica.db"
+  login:
+    username: chaz
+    passwordless: true
+
 backends:
   - name: openrouter
     type: openaicompatible
@@ -65,7 +72,7 @@ username: "my-bot"
 password: "hunter2"
 allow_list: "@myuser:matrix.org"
 
-# Optional: persistence directory (default: $XDG_STATE_HOME/chaz)
+# Optional: log/local-file directory (default: $XDG_STATE_HOME/chaz)
 state_dir: "/path/to/state"
 ```
 
@@ -103,9 +110,11 @@ subcommand:
 chaz --config config.yaml daemon
 ```
 
-This runs sync, schedules, the routine engine, and the agent loop with no user
-interface, logging to stdout for systemd, a container, or a supervisor to
-collect. It stops cleanly on Ctrl-C or `SIGTERM`.
+With `execution: executor`, this runs schedules, the routine engine, and the
+agent loop with no user interface, logging to stdout for systemd, a container,
+or a supervisor to collect. It stops cleanly on Ctrl-C or `SIGTERM`. A daemon
+using a `unix://` Eidetica service reconnects after transient service restarts,
+tearing down its old runtime before creating the replacement.
 
 This is also the process transport bridges sync against.
 
@@ -138,9 +147,10 @@ chaz --config config.yaml cmd '/sharing requests'
 ```
 
 The result goes to stdout, and a command that reports an error exits non-zero,
-so scripts can branch on it. Run it with the daemon stopped — it opens the same
-state directory, and two processes on one backend do not observe each other's
-writes.
+so scripts can branch on it. Configure `execution: client` with the same
+`unix://` service connection to run commands concurrently with the executor.
+Daemon-owned ticket/bootstrap and sync-administration commands must instead be
+run on the Eidetica owner and fail before mutation from a service client.
 
 ## Single-shot print mode
 
@@ -151,6 +161,16 @@ chaz --config config.yaml -p "Summarize the last meeting notes."
 ```
 
 There is no interactive approval — tools requiring approval are auto-denied unless they're in the print-mode auto-approved list (default: `shell`, `write_file`; override with the `cli:` config block). Pass `--session NAME` to reuse a named session across invocations instead of creating a fresh ephemeral one each time. Logs go to a rolling file in the state directory (`chaz-cli.log`); only the agent's reply goes to stdout so the output is pipe-friendly.
+
+With `execution: client`, print mode submits the stable session entry and waits
+for the configured executor to answer; it never calls the model or tools in the
+client process. If a prior executor stopped after recording an attempt start,
+inspect it with `chaz --config config.yaml cmd '/interrupted'` and retry only
+after deciding that replay is safe:
+
+```bash
+chaz --config config.yaml cmd '/retry <request_id>'
+```
 
 ## Aggregated cost / usage
 

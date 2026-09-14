@@ -1142,21 +1142,26 @@ async fn setup_session(
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
 
-    // Per-session raw approval channel → tagged forward to shared channel.
-    let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
-    let forwarder_id = session_db_id.clone();
-    let forwarder_tx = approval_tx.clone();
-    tokio::spawn(async move {
-        while let Some(ex) = raw_rx.recv().await {
-            if forwarder_tx.send((forwarder_id.clone(), ex)).await.is_err() {
-                break;
+    if server.is_executor_authorized() {
+        // Per-session raw approval channel → tagged forward to shared channel.
+        let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
+        let forwarder_id = session_db_id.clone();
+        let forwarder_tx = approval_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ex) = raw_rx.recv().await {
+                if forwarder_tx.send((forwarder_id.clone(), ex)).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
-
-    server
-        .register_session(session_db, backend, None, Some(raw_tx))
-        .await?;
+        });
+        server
+            .register_session(session_db, backend, None, Some(raw_tx))
+            .await?;
+    } else {
+        server
+            .watch_session(session_db, backend, None, None)
+            .await?;
+    }
 
     let notify_id = session_db_id;
     session_db

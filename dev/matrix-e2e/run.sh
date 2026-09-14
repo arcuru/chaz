@@ -214,9 +214,11 @@ log "transport: $TRANSPORT"
 if [[ $TRANSPORT == "http" ]]; then
 	SYNC_LISTEN_DAEMON="sync_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
 	SYNC_LISTEN_BRIDGE="sync_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
+	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
 else
 	SYNC_LISTEN_DAEMON=""
 	SYNC_LISTEN_BRIDGE=""
+	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true"
 fi
 
 # ---------------------------------------------------------------- stub LLM ---
@@ -329,6 +331,13 @@ BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
 
 cat >"$DAEMON_CONFIG" <<EOF
 state_dir: "$WORKSPACE/state-daemon"
+execution: executor
+eidetica:
+  connection: "sqlite://$WORKSPACE/state-daemon/eidetica.db"
+  login:
+    username: chaz
+    passwordless: true
+$(printf '%b' "$EIDETICA_SYNC_DAEMON")
 $SYNC_LISTEN_DAEMON
 
 backends:
@@ -347,6 +356,11 @@ agents:
 
 default_agents: [chaz]
 EOF
+
+mkdir -p "$WORKSPACE/state-daemon"
+nix run 'git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04' -- \
+	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
+	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
 
 # ------------------------------------------------------------- bring-up ------
 # The sequence that removes the human: ask the bridge which key to trust,
@@ -372,7 +386,7 @@ log "pre-authorizing the bridge on the daemon"
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "/agent invite failed (see $WORKSPACE/bringup.log)"
 
 log "minting the access ticket"
-TICKET="$("$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" |
+TICKET="$({ "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" || true; } |
 	grep -o 'eidetica:[^[:space:]]*' | head -1)"
 [[ -n $TICKET ]] || fail "/agent share produced no ticket (see $WORKSPACE/bringup.log)"
 
@@ -791,11 +805,9 @@ TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"react test"}')" >/dev/null
 
+wait_for "ReAct tool result" "$REPLY_TIMEOUT" \
+	grep -q "detected tool result" "$WORKSPACE/stub-llm.log"
 wait_for "sixth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 6
-
-if ! grep -q "detected tool result" "$WORKSPACE/stub-llm.log"; then
-	fail "ReAct loop did not complete: stub never received a tool result in a follow-up request"
-fi
 
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
 

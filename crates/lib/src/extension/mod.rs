@@ -992,7 +992,7 @@ impl ExtensionHub {
     /// Resolve and ensure per-agent instances by agent display name.
     ///
     /// Opens the agent's Living Agent DB through the running server
-    /// (reached via `peer_handles.server_cell`) and delegates to
+    /// (reached via `peer_handles.server_slot`) and delegates to
     /// [`Self::ensure_agent_instances`]. Returns empty when no extension
     /// declares [`Scope::PerAgent`], when the server isn't wired yet
     /// (isolated tests), or when the agent isn't hosted by this peer.
@@ -1006,7 +1006,7 @@ impl ExtensionHub {
         let Some(peer) = self.peer_handles.as_ref() else {
             return Vec::new();
         };
-        let Some(server) = peer.server_cell.get() else {
+        let Some(server) = peer.server_slot.get() else {
             return Vec::new();
         };
         let Some(adb) = server.open_agent_db_by_name(agent_name).await else {

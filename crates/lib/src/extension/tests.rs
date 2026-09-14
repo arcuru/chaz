@@ -273,7 +273,7 @@ fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandle
         skill_bank_index: HostedIndex::empty("skill_bank"),
         embedder: None,
         secrets: None,
-        server_cell: Arc::new(std::sync::OnceLock::new()),
+        server_slot: crate::instance::ServerSlot::default(),
         mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
         agent_state_allowlist: Default::default(),
         tool_registry: Arc::new(ToolRegistry::new()),

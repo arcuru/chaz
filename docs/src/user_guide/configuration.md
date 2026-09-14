@@ -2,6 +2,55 @@
 
 Chaz is configured via a YAML file passed with `--config`.
 
+## Eidetica connection and execution role
+
+Every local entry point (`chaz`, `daemon`, `--print`, `cmd`, and `usage`)
+requires an explicit Eidetica connection, existing login, and execution role.
+`executor` may call models and tools and runs routines/scheduled agents;
+`client` can observe, submit messages, approve requests, and use ordinary data
+commands without executing agent work.
+
+Direct ownership keeps Eidetica in this process:
+
+```yaml
+execution: executor
+eidetica:
+  connection: "sqlite:///var/lib/chaz/eidetica.db"
+  login: { username: chaz, passwordless: true }
+  sync:
+    iroh: true
+    http_listen: 127.0.0.1:8765
+```
+
+A service client uses the daemon-owned instance. It must not include `sync:`;
+the Eidetica daemon owns transports, peers, tickets, and bootstrap:
+
+```yaml
+execution: client
+eidetica:
+  connection: "unix:///run/eidetica/service.sock"
+  login: { username: chaz, passwordless: true }
+```
+
+The connector never creates a store or user and never falls back from a failed
+service connection to SQLite. To point an existing legacy configuration at its
+old data, set `connection` to its resolved `<state_dir>/eidetica.db` and retain
+the existing `chaz` login. Provisioning a new Eidetica store/user is a separate,
+explicit operation.
+
+Long-running service-mode daemons monitor the connection. A transient daemon
+restart tears down the old Chaz runtime before bounded-backoff reconnect,
+re-login, database reopen, hook installation, and persisted-state
+reconciliation. Bad credentials or invalid configuration fail immediately.
+Interrupted turns are displayed by `/interrupted` and run only after an
+explicit `/retry <request_id>`; Chaz never automatically replays a possibly
+completed model/tool effect.
+
+Ticket/bootstrap and daemon sync administration commands fail on a service
+client before mutation and direct the operator to run them on the Eidetica
+owner. Ordinary session, agent, approval, and user-level sync-preference data
+operations continue through the service API.
+
 ## Full Example
 
 ```yaml
@@ -14,7 +63,15 @@ allow_list: "@user:matrix.org|@other:matrix.org" # Regex matched against the sen
 # room_size_limit: 100         # Optional: refuse to respond in rooms with more than N members (Matrix only)
 # chat_summary_model: "gpt-4o-mini"  # Optional: separate model for chat summarization
 
-# Persistence
+# Process authority and Eidetica connection (required by chaz/TUI/CLI/daemon)
+execution: executor # or client
+eidetica:
+  connection: "sqlite:///path/to/state/eidetica.db"
+  login:
+    username: chaz
+    passwordless: true
+
+# Logs and other Chaz-local files (does not select the Eidetica database)
 state_dir: "/path/to/state" # Default: $XDG_STATE_HOME/chaz
 
 # LLM backends (OpenAI-compatible)

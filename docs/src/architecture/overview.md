@@ -2,6 +2,15 @@
 
 Chaz is structured as a layered system: bridges handle transport concerns, the server coordinates agent execution, and the runtime runs the ReAct loop.
 
+Each process obtains its Eidetica `Instance` from the shared connector. A
+direct connection owns its backend; a `unix://` connection logs into an
+independent Eidetica daemon. That ownership axis is separate from the explicit
+`execution: executor | client` role: only executors install model/tool and
+routine-driving runtime, while clients retain observation, submission,
+approval, discovery, and native data operations. Long-lived service executors
+replace a failed connection only after tearing down the complete prior Chaz
+runtime, then rebuild hooks and reconcile durable request state.
+
 ## System Diagram
 
 ```mermaid

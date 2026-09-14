@@ -18,16 +18,15 @@ use crate::extension::handler::{HandlerFuture, RoutineHandler};
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
-use crate::server::Server;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub struct AgentScheduleExtension {
-    server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl AgentScheduleExtension {
-    pub fn new(server_cell: Arc<OnceLock<Arc<Server>>>) -> Self {
-        Self { server_cell }
+    pub fn new(server_slot: crate::instance::ServerSlot) -> Self {
+        Self { server_slot }
     }
 }
 
@@ -53,11 +52,11 @@ impl Extension for AgentScheduleExtension {
 
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
-        let server_cell = self.server_cell.clone();
+        let server_slot = self.server_slot.clone();
         Box::pin(async move {
             Ok(Arc::new(AgentScheduleInstance {
                 manifest,
-                server_cell,
+                server_slot,
             }) as Arc<dyn ExtensionInstance>)
         })
     }
@@ -65,7 +64,7 @@ impl Extension for AgentScheduleExtension {
 
 struct AgentScheduleInstance {
     manifest: ExtensionManifest,
-    server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl ExtensionInstance for AgentScheduleInstance {
@@ -75,13 +74,13 @@ impl ExtensionInstance for AgentScheduleInstance {
 
     fn routine_handler(&self) -> Option<Arc<dyn RoutineHandler>> {
         Some(Arc::new(AgentScheduleRoutineHandler {
-            server_cell: self.server_cell.clone(),
+            server_slot: self.server_slot.clone(),
         }))
     }
 }
 
 struct AgentScheduleRoutineHandler {
-    server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl RoutineHandler for AgentScheduleRoutineHandler {
@@ -91,10 +90,9 @@ impl RoutineHandler for AgentScheduleRoutineHandler {
                 .map_err(|e| anyhow::anyhow!("invalid agent_schedule payload: {e}"))?;
 
             let server = self
-                .server_cell
+                .server_slot
                 .get()
-                .ok_or_else(|| anyhow::anyhow!("agent_schedule fired before server initialized"))?
-                .clone();
+                .ok_or_else(|| anyhow::anyhow!("agent_schedule fired before server initialized"))?;
 
             // Spawn the actual agent turn — don't block the engine's fire loop.
             tokio::spawn(async move {

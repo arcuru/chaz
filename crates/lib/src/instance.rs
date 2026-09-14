@@ -12,6 +12,9 @@ use eidetica::{Instance, user::User};
 
 use crate::config::{Config, EideticaConfig, EideticaLoginConfig, ExecutionRole};
 
+const SERVICE_RECONNECT_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+const SERVICE_RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Whether this process owns the embedded backend or uses a daemon-owned one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceOwnership {
@@ -47,6 +50,28 @@ pub struct InstanceCapabilities {
 #[derive(Debug)]
 pub struct ExecutorCapability {
     _private: (),
+}
+
+/// Replaceable server handle used by tools and extensions. A generation owns
+/// exactly one strong server reference; clearing it before reconnect prevents
+/// stale tasks from reaching a replacement runtime.
+#[derive(Clone, Default)]
+pub struct ServerSlot(
+    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<crate::server::Server>>>>,
+);
+
+impl ServerSlot {
+    pub fn set(&self, server: std::sync::Arc<crate::server::Server>) {
+        *self.0.write().expect("server slot lock poisoned") = Some(server);
+    }
+
+    pub fn get(&self) -> Option<std::sync::Arc<crate::server::Server>> {
+        self.0.read().expect("server slot lock poisoned").clone()
+    }
+
+    pub fn clear(&self) {
+        self.0.write().expect("server slot lock poisoned").take();
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +138,39 @@ pub enum ConnectError {
     Sync(#[source] eidetica::Error),
     #[error("Eidetica capability denied: {0}")]
     Capability(&'static str),
+}
+
+impl ConnectError {
+    /// Only transport-level service failures are worth reconnecting.
+    /// Configuration, login, capability, and direct-owner failures require an
+    /// operator decision and must not become an infinite retry loop.
+    pub fn is_transient_service(&self) -> bool {
+        matches!(self, Self::Connection(error) if error.is_io_error())
+    }
+}
+
+/// Exponential service reconnect delay, bounded so a daemon returning after a
+/// long outage is noticed promptly. `attempt` is zero-based.
+pub fn service_reconnect_delay(attempt: u32) -> std::time::Duration {
+    let factor = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+    SERVICE_RECONNECT_BASE
+        .saturating_mul(factor)
+        .min(SERVICE_RECONNECT_MAX)
+}
+
+/// A cheap authenticated read used by long-lived service clients to detect a
+/// dead socket. It does not mutate state and is deliberately separate from
+/// reconnect: callers must tear down their complete application runtime before
+/// constructing a replacement.
+pub async fn probe_service(instance: &Instance) -> Result<(), ConnectError> {
+    let connection = instance.remote_connection().ok_or_else(|| {
+        ConnectError::Config("service probe requires a `unix://` Eidetica connection".into())
+    })?;
+    connection
+        .get_instance_metadata()
+        .await
+        .map(|_| ())
+        .map_err(ConnectError::Connection)
 }
 
 /// Validate the required connector settings at the new API boundary.
@@ -688,6 +746,82 @@ eidetica:
                 .expect("a bad service login must fail"),
             ConnectError::Login { .. }
         ));
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(
+            service_reconnect_delay(0),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            service_reconnect_delay(1),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            service_reconnect_delay(20),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn server_slot_clear_prevents_stale_generation_access() {
+        let slot = ServerSlot::default();
+        assert!(slot.get().is_none());
+        slot.clear();
+        assert!(slot.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn service_probe_detects_shutdown_and_fresh_connect_recovers() {
+        let (dir, shutdown, task, _owner, url) = service_fixture("shared-chaz").await;
+        let config = settings(url.clone(), "shared-chaz");
+        let connected = connect_with(&config, ExecutionRole::Client).await.unwrap();
+        probe_service(&connected.instance).await.unwrap();
+
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            probe_service(&connected.instance),
+        )
+        .await
+        .expect("dead service probe must not hang")
+        .unwrap_err();
+        assert!(
+            error.is_transient_service(),
+            "unexpected probe error: {error}"
+        );
+        drop(connected);
+
+        let socket = dir.path().join("service.sock");
+        let (owner, _) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("shared-chaz"),
+        )
+        .await
+        .unwrap();
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let replacement = connect_with(&config, ExecutionRole::Client).await.unwrap();
+        probe_service(&replacement.instance).await.unwrap();
+        drop(replacement);
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_failure_is_terminal_not_reconnectable() {
+        let (_dir, shutdown, task, _owner, url) = service_fixture("real-user").await;
+        let error = connect_with(&settings(url, "wrong-user"), ExecutionRole::Executor)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, ConnectError::Login { .. }));
+        assert!(!error.is_transient_service());
         drop(shutdown);
         task.await.unwrap().unwrap();
     }

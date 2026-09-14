@@ -17,25 +17,24 @@ use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::mcp::McpServerStatus;
 use crate::security::SecurityContext;
-use crate::server::Server;
 use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnWorker};
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub struct CoreExtension {
-    pub spawn_server_cell: Arc<OnceLock<Arc<Server>>>,
+    pub server_slot: crate::instance::ServerSlot,
     pub backend: BackendManager,
     pub security: SecurityContext,
 }
 
 impl CoreExtension {
     pub fn new(
-        spawn_server_cell: Arc<OnceLock<Arc<Server>>>,
+        server_slot: crate::instance::ServerSlot,
         backend: BackendManager,
         security: SecurityContext,
     ) -> Self {
         Self {
-            spawn_server_cell,
+            server_slot,
             backend,
             security,
         }
@@ -64,13 +63,13 @@ impl Extension for CoreExtension {
 
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
-        let spawn_cell = self.spawn_server_cell.clone();
+        let server_slot = self.server_slot.clone();
         let backend = self.backend.clone();
         let security = self.security.clone();
         Box::pin(async move {
             Ok(Arc::new(CoreInstance {
                 manifest,
-                spawn_server_cell: spawn_cell,
+                server_slot,
                 backend,
                 security,
             }) as Arc<dyn ExtensionInstance>)
@@ -80,7 +79,7 @@ impl Extension for CoreExtension {
 
 struct CoreInstance {
     manifest: ExtensionManifest,
-    spawn_server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
     backend: BackendManager,
     security: SecurityContext,
 }
@@ -95,12 +94,12 @@ impl ExtensionInstance for CoreInstance {
             Arc::new(ShellExec),
             Arc::new(Compact),
             Arc::new(SpawnAgent {
-                server: self.spawn_server_cell.clone(),
+                server: self.server_slot.clone(),
                 backend: self.backend.clone(),
                 security: self.security.clone(),
             }),
             Arc::new(SpawnWorker {
-                server: self.spawn_server_cell.clone(),
+                server: self.server_slot.clone(),
                 backend: self.backend.clone(),
                 security: self.security.clone(),
             }),
@@ -109,7 +108,7 @@ impl ExtensionInstance for CoreInstance {
 
     fn status_segment(&self) -> Option<Arc<dyn StatusSegment>> {
         Some(Arc::new(McpStatus {
-            server: self.spawn_server_cell.clone(),
+            server: self.server_slot.clone(),
         }))
     }
 }
@@ -119,7 +118,7 @@ impl ExtensionInstance for CoreInstance {
 /// registry. Global, not per-agent — the first producer for the
 /// extension-output-store path. Empty when no MCP servers are configured.
 struct McpStatus {
-    server: Arc<OnceLock<Arc<Server>>>,
+    server: crate::instance::ServerSlot,
 }
 
 impl StatusSegment for McpStatus {
