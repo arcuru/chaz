@@ -29,7 +29,7 @@ Only `Message`, `Directive`, and `Summary` entries enter the conversation portio
 
 The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
 
-`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its own in-memory tool call history for the ReAct loop. Session-level tool entries exist for audit trail and TUI display only.
+`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store; those records support durable observation and audit, not automatic continuation after restart. Session-level tool entries are display projections of committed transcript records.
 
 `ApprovalRequest` and `ApprovalDecision` are **control entries** for the tool-approval protocol a dumb bridge relays over the session DB — also excluded from the LLM context, from bridge message delivery, and from waking an agent turn. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db).
 
@@ -54,9 +54,10 @@ sequenceDiagram
     SV->>S: record attempt start
     SV->>A: spawn agent task
     A->>S: write Ack entry
-    A->>S: write ToolCall entry
-    A->>S: write ToolResult entry
-    A->>S: commit final entry and completion
+    A->>S: commit model response + ToolCall display entries
+    A->>A: execute approved tool
+    A->>S: commit full ToolResult + display entry
+    A->>S: commit terminal model response, final entry, and completion
     S-->>U: on_write callback
 ```
 
@@ -77,6 +78,12 @@ no final message, but still records completion.
 Attempt generations establish lifecycle precedence; the start and completion
 timestamps are audit data, not the ordering authority. This avoids treating
 clock movement across processes or restarts as a newer attempt.
+
+Each completed model response and tool result is stored in `turn_transcript` with the request row key, attempt ID, a monotonic attempt-local sequence, and a timestamp. Model records retain optional text, normalized response metadata, opaque provider continuation fields, and ordered tool calls with their provider IDs, names, and full argument strings. Result records retain the model sequence, call index, call ID, tool name, full output, and a structured outcome.
+
+The recorder is awaited. A tool-call response commits before approval or execution begins, and every tool result commits before another model request. A persistence failure stops the turn. If the tool already caused an external effect, the unmatched attempt remains interrupted and is not replayed automatically. The visible final response and terminal model record commit in the same transaction as completion. Provider retries that have not produced a completed response and streamed tokens do not create records.
+
+The full arguments and results live in the transcript store. `ToolCall` and `ToolResult` session entries are presentation records created by the same successful transaction; result display remains truncated and bridge delivery continues to exclude tool entries. This does not widen approval prompts or bridge exposure of tool secrets.
 
 For each request, reconciliation exposes one of four states:
 
@@ -114,9 +121,12 @@ into new work.
 
 `Server::register_session()` and retry require executor authority. A
 client-role server can observe the synced session state, but cannot register
-execution, invoke agents, models, or tools, create execution child sessions,
-or run routines and schedules. Build-time validation also rejects runtime
-options that would give a client those responsibilities.
+execution, drive agents or models, create execution child sessions, or run
+routines and schedules. Build-time validation also rejects runtime options
+that would give a client those responsibilities. A future tool fulfiller may
+receive separate permission to satisfy selected durable tool requests without
+receiving agent/model-driving authority; no such routing, claim, or permission
+path exists here, and current tool execution remains local to the executor.
 
 This protocol assumes one executor for a session. The in-process processing
 and live-attempt sets serialize that executor's work, but they are not

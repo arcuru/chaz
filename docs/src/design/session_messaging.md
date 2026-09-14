@@ -16,7 +16,7 @@ Originally, `spawn_agent` called `runtime::execute` directly, bypassing the serv
 
 1. **Single invocation path**: All agent execution goes through `Server::process_session`
 2. **Rich entry types**: Sessions record not just chat messages but also directives, tool calls, and acknowledgments
-3. **Observable**: The full ReAct loop is visible in the session database for debugging and audit
+3. **Observable**: Completed ReAct model messages and tool results are durable in the session database for debugging and audit
 4. **Extensible**: New invocation sources (scheduler, inter-agent messages) use the same mechanism
 
 ## Entry Types
@@ -87,8 +87,8 @@ sequenceDiagram
     CS-->>SV: on_write callback
     SV->>CA: spawn agent task
     CA->>CS: write Ack
-    CA->>CS: write ToolCall / ToolResult (via event sink)
-    CA->>CS: commit Message (response) and completion
+    CA->>CS: commit model/tool transcript records and display entries
+    CA->>CS: commit terminal model record, Message, and completion
     CA-->>SA: completion_tx.send(())
     SA->>CS: read the completed request response
     SA-->>P: return response
@@ -112,9 +112,11 @@ Spawn-specific metadata is bundled in `SpawnContext`:
 - `parent_tools` — the parent's `ScopedTools` for transitive narrowing
 - `completion_tx` — signals the parent when the child finishes
 
-## RuntimeEventSink
+## Runtime persistence
 
-The runtime accepts an optional `mpsc::Sender<RuntimeEvent>`:
+Executor-backed turns use an awaited recorder rather than a concurrent best-effort event writer. A model response carrying tool calls commits before execution, and its full correlated result commits before the next model call. Display entries are projections of those successful commits and may truncate results; the structured transcript does not.
+
+Standalone scheduled turns keep a compatibility `mpsc::Sender<RuntimeEvent>` adapter because that path has no durable request attempt:
 
 ```text
 enum RuntimeEvent {
@@ -123,9 +125,7 @@ enum RuntimeEvent {
 }
 ```
 
-The server spawns an event writer task that consumes events and writes `ToolCall`/`ToolResult` entries to the session database. This runs concurrently with the ReAct loop.
-
-When `runtime::execute` returns, the event sender is dropped, the writer drains remaining events and exits.
+These scheduled audit writes remain outside the turn-attempt recovery protocol.
 
 ## Future: Scheduled Runs
 

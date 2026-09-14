@@ -398,9 +398,39 @@ pub struct Session {
 
 const META_STORE: &str = "meta";
 const TURN_ATTEMPTS_STORE: &str = "turn_attempts";
+const TURN_TRANSCRIPT_STORE: &str = "turn_transcript";
 const TURN_SCHEMA_KEY: &str = "turn_request_schema";
 const TURN_BASELINE_KEY: &str = "turn_request_baseline";
 const TURN_SCHEMA_VERSION: &str = "1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnTranscriptRecord {
+    pub request_id: TurnRequestId,
+    pub attempt_id: String,
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub message: TurnTranscriptMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TurnTranscriptMessage {
+    ModelResponse {
+        model_sequence: u64,
+        content: Option<String>,
+        tool_calls: Vec<crate::runtime::ToolCallRequest>,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
+        metadata: Option<crate::runtime::ResponseMetadata>,
+        terminal: bool,
+    },
+    ToolResult {
+        model_sequence: u64,
+        call_index: usize,
+        call_id: String,
+        name: String,
+        output: String,
+        outcome: crate::runtime::ToolResultOutcome,
+    },
+}
 
 impl Session {
     /// Open a session, loading existing entries from its database.
@@ -672,6 +702,18 @@ impl Session {
         attempt: &TurnAttempt,
         final_entry: Option<SessionEntry>,
     ) -> anyhow::Result<()> {
+        self.complete_turn_attempt_with_transcript(attempt, final_entry, None)
+            .await
+    }
+
+    /// Commit the final visible entry, terminal model record, and completion
+    /// as one fact.
+    pub async fn complete_turn_attempt_with_transcript(
+        &mut self,
+        attempt: &TurnAttempt,
+        final_entry: Option<SessionEntry>,
+        transcript: Option<TurnTranscriptRecord>,
+    ) -> anyhow::Result<()> {
         let completed = TurnAttempt {
             status: TurnAttemptStatus::Completed,
             completed_at: Some(Utc::now()),
@@ -693,6 +735,13 @@ impl Session {
             .await?
             .set(attempt_id, completed)
             .await?;
+        if let Some(record) = transcript {
+            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+            txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+                .await?
+                .set(key, record)
+                .await?;
+        }
         txn.commit().await?;
         if let Some(entry) = final_entry {
             self.entries.push(entry);
@@ -701,6 +750,44 @@ impl Session {
             ));
         }
         Ok(())
+    }
+
+    pub async fn append_turn_transcript(
+        &self,
+        record: TurnTranscriptRecord,
+        display_entries: Vec<SessionEntry>,
+    ) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+        txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .set(key, record)
+            .await?;
+        let entries = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await?;
+        for entry in display_entries {
+            entries.insert(entry).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub async fn turn_transcript(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Vec<TurnTranscriptRecord>> {
+        let txn = self.database.new_transaction().await?;
+        let mut records: Vec<_> = txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|record| record.attempt_id == attempt_id)
+            .await?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect();
+        records.sort_by_key(|record| record.sequence);
+        Ok(records)
     }
 
     async fn read_turn_attempts(&self) -> anyhow::Result<Vec<(String, TurnAttempt)>> {
