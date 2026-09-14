@@ -49,6 +49,17 @@ pub struct ExecutorCapability {
     _private: (),
 }
 
+#[cfg(test)]
+impl ExecutorCapability {
+    pub(crate) fn for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
+pub(crate) fn legacy_executor_capability() -> ExecutorCapability {
+    ExecutorCapability { _private: () }
+}
+
 impl InstanceCapabilities {
     pub fn ownership(self) -> InstanceOwnership {
         self.ownership

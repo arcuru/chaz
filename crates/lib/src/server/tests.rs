@@ -112,7 +112,7 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
         Arc::new(crate::extension::ExtensionHub::new()),
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
-        true,
+        Some(crate::instance::ExecutorCapability::for_test()),
     );
     (instance, server, registry)
 }
@@ -144,9 +144,38 @@ async fn server_fixture_from_registry(
         Arc::new(crate::extension::ExtensionHub::new()),
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
-        true,
+        Some(crate::instance::ExecutorCapability::for_test()),
     );
     (instance, server, registry)
+}
+
+async fn client_server_fixture_from_registry(
+    registry: Arc<crate::session::SessionRegistry>,
+) -> Arc<Server> {
+    let agents = registry.agents.clone();
+    let security = SecurityContext {
+        leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::default()),
+        auto_approved_tools: std::collections::HashSet::new(),
+        approval_callback: None,
+    };
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    Server::new(
+        registry,
+        agents,
+        HostedIndex::empty("agent"),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        security,
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        crate::backends::BackendManager::new(&None, secrets),
+        Arc::new(crate::mcp::McpRegistry::new()),
+        None,
+    )
 }
 
 #[tokio::test]
@@ -1446,7 +1475,7 @@ async fn process_session_skips_when_not_home_peer() {
         session.entries().len()
     };
 
-    server.process_session(&sid).await.unwrap();
+    server.process_session(&sid, None).await.unwrap();
 
     // Gate released the lock inline before returning.
     assert!(!server.processing.lock().await.contains(&sid));
@@ -1496,7 +1525,7 @@ async fn process_session_runs_when_home_pubkey_unset_legacy() {
 
     write_user_message(&session_db, &sid).await;
 
-    server.process_session(&sid).await.unwrap();
+    server.process_session(&sid, None).await.unwrap();
 
     // Gate passed → no home-skip was recorded. Asserted on the skip counter
     // rather than the `processing` set: the latter is cleared by the spawned
@@ -1529,7 +1558,7 @@ async fn process_session_runs_when_home_matches_self() {
 
     write_user_message(&session_db, &sid).await;
 
-    server.process_session(&sid).await.unwrap();
+    server.process_session(&sid, None).await.unwrap();
 
     // Gate passed → no home-skip recorded. See the note in the legacy test
     // above on why this is not asserted via the `processing` set.
@@ -2338,14 +2367,12 @@ async fn write_user_message_with_content(
         metadata: None,
         routing: None,
     };
-    let id = crate::session::TurnRequestId::for_entry(&entry);
     let mut session = crate::session::Session::new(
         crate::types::ConversationId(sid.to_string()),
         session_db.clone(),
     )
     .await;
-    session.add_entry(entry).await.unwrap();
-    id
+    session.add_entry(entry).await.unwrap()
 }
 
 async fn await_call_count(mock: &crate::test_support::MockBackend, expected: usize) {
@@ -2403,7 +2430,11 @@ async fn request_before_observer_attach_is_reconciled_once() {
     await_call_count(&mock, 1).await;
     await_no_processing(&server, &sid).await;
     for _ in 0..3 {
-        server.notify_tx.send(sid.clone()).await.unwrap();
+        server
+            .notify_tx
+            .send(ProcessingCommand::Wake(sid.clone()))
+            .await
+            .unwrap();
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -2416,6 +2447,173 @@ async fn request_before_observer_attach_is_reconciled_once() {
             .iter()
             .all(|attempt| { attempt.status == crate::session::TurnAttemptStatus::Completed })
     );
+}
+
+#[tokio::test]
+async fn legacy_transcript_is_baselined_before_executor_registration() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("legacy")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+
+    // Remove the fresh-session marker to model a DB created by an older
+    // binary, then write completed history including a sender no longer in
+    // the runtime registry.
+    let txn = db.new_transaction().await.unwrap();
+    let meta = txn
+        .get_store::<eidetica::store::DocStore>("meta")
+        .await
+        .unwrap();
+    meta.delete("turn_request_schema").await.unwrap();
+    meta.delete("turn_request_baseline").await.unwrap();
+    let entries = txn
+        .get_store::<eidetica::store::Table<SessionEntry>>("entries")
+        .await
+        .unwrap();
+    for (sender, content) in [
+        ("user", "old one"),
+        ("retired-agent", "old reply"),
+        ("user", "old two"),
+        ("alpha", "old reply two"),
+    ] {
+        entries
+            .insert(SessionEntry {
+                sender: sender.into(),
+                content: content.into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+    }
+    txn.commit().await.unwrap();
+
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("new reply");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mock.recorded_calls().is_empty());
+
+    write_user_message_with_content(&db, &sid, "new work").await;
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    assert_eq!(mock.recorded_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn rejected_retry_does_not_mutate_attempts() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (_conv, db) = registry.create_session(Some("retry")).await.unwrap();
+    let sid = db.root_id().to_string();
+    let request_id = write_user_message_with_content(&db, &sid, "retry me").await;
+    let session = Session::new(ConversationId(sid.clone()), db).await;
+    session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    let before = session.attempts_for_test().await.len();
+
+    let error = server
+        .retry_interrupted_turn(&sid, &request_id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not accept retry"));
+    assert_eq!(session.attempts_for_test().await.len(), before);
+}
+
+#[tokio::test]
+async fn concurrent_retries_accept_exactly_one_attempt() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("retry-race")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let request_id = write_user_message_with_content(&db, &sid, "retry once").await;
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("one retry");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+
+    let first = {
+        let server = server.clone();
+        let sid = sid.clone();
+        let request_id = request_id.clone();
+        tokio::spawn(async move { server.retry_interrupted_turn(&sid, &request_id).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_started())
+        .await
+        .unwrap();
+    let second = server.retry_interrupted_turn(&sid, &request_id).await;
+    gate.release();
+    assert!(first.await.unwrap().is_ok());
+    assert!(second.is_err());
+    await_no_processing(&server, &sid).await;
+    assert_eq!(mock.recorded_calls().len(), 1);
+    assert_eq!(session.attempts_for_test().await.len(), 2);
+}
+
+#[tokio::test]
+async fn client_server_cannot_register_execution_or_retry() {
+    let (_instance, executor, registry) = server_fixture().await;
+    let (_conv, db) = registry.create_session(Some("client")).await.unwrap();
+    let sid = db.root_id().to_string();
+    let request_id = write_user_message_with_content(&db, &sid, "client request").await;
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let attempt = session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    drop(executor);
+
+    let client = client_server_fixture_from_registry(registry.clone()).await;
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("must not run");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    assert!(
+        client
+            .register_session(&db, backend, Some("agent".into()), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no executor loop")
+    );
+    assert_eq!(session.attempts_for_test().await, vec![attempt]);
+    assert!(mock.recorded_calls().is_empty());
+    assert!(client.routine_engine().is_none());
 }
 
 #[tokio::test]
@@ -2557,6 +2755,69 @@ async fn interrupted_attempt_requires_explicit_retry() {
 }
 
 #[tokio::test]
+async fn abort_after_recorded_host_effect_stays_interrupted_until_retry() {
+    use crate::test_support::{MockBackend, MockHost};
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("effect")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+
+    let host = Arc::new(MockHost::new());
+    host.push_shell("effect recorded", "", 0);
+    host.request(
+        &crate::tool_host::Capability::Shell {
+            command: "external-side-effect".into(),
+            working_dir: None,
+        },
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(host.recorded_calls().len(), 1);
+
+    let request_id = write_user_message_with_content(&db, &sid, "ambiguous effect").await;
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    drop(server);
+
+    let (_instance2, restarted, _) = server_fixture_from_registry(registry.clone()).await;
+    register_alpha_agent_runtime(&restarted);
+    restarted.agent_index().register(entry);
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("explicit retry");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    restarted
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mock.recorded_calls().is_empty());
+    assert_eq!(
+        host.recorded_calls().len(),
+        1,
+        "restart must not repeat the effect"
+    );
+
+    restarted
+        .retry_interrupted_turn(&sid, &request_id)
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+}
+
+#[tokio::test]
 async fn crash_after_completed_relation_does_not_reexecute() {
     let (_instance, old_server, registry) = server_fixture().await;
     let (entry, _adb) = seed_agent(&old_server, &registry, "alpha").await;
@@ -2628,6 +2889,9 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
             .unwrap();
     let key = owner_user.get_default_key().unwrap();
     let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
+    crate::session::Session::initialize_turn_schema(&db)
+        .await
+        .unwrap();
     let root = db.root_id().clone();
     let service = ServiceServer::bind(owner, &socket).await.unwrap();
     let (shutdown, receiver) = watch::channel(());
@@ -2650,6 +2914,7 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
         .await
         .unwrap();
     assert!(client.capabilities.executor().is_err());
+    executor.capabilities.executor().unwrap();
     let executor_db = executor.user.open_database(&root).await.unwrap();
     let client_db = client.user.open_database(&root).await.unwrap();
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2665,59 +2930,225 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
         .await
         .unwrap();
 
-    let entry = SessionEntry {
-        sender: "user".into(),
-        content: "shared service turn".into(),
-        timestamp: Utc::now(),
-        entry_type: EntryType::Message,
-        metadata: None,
-        routing: None,
-    };
-    let request_id = crate::session::TurnRequestId::for_entry(&entry);
-    let mut executor_session = Session::new(ConversationId(root.to_string()), executor_db).await;
-    executor_session.add_entry(entry).await.unwrap();
-    let attempt = executor_session
-        .start_turn_attempt(request_id.clone())
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(executor.instance.clone(), executor.user, agents)
+            .await
+            .unwrap(),
+    );
+    let server = server_fixture_from_registry(registry.clone()).await.1;
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("shared response");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&executor_db, backend, Some("agent".into()), None)
         .await
         .unwrap();
-    executor_session
-        .complete_turn_attempt(
-            &attempt,
-            Some(SessionEntry {
-                sender: "alpha".into(),
-                content: "shared response".into(),
-                timestamp: Utc::now(),
-                entry_type: EntryType::Message,
-                metadata: None,
-                routing: None,
-            }),
-        )
+    let mut client_session =
+        Session::new(ConversationId(root.to_string()), client_db.clone()).await;
+    let request_id = client_session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "shared service turn".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), wake_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    await_call_count(&mock, 1).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            wake_rx.recv().await.unwrap();
+            let observed = Session::new(ConversationId(root.to_string()), client_db.clone()).await;
+            if observed
+                .turn_requests(|name| name == "agent", &Default::default())
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.id == request_id
+                        && matches!(request.state, TurnRequestState::Completed { .. })
+                })
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     let client_session = Session::new(ConversationId(root.to_string()), client_db).await;
     let requests = client_session
-        .turn_requests(|name| name == "alpha", &Default::default())
+        .turn_requests(|name| name == "agent", &Default::default())
         .await
         .unwrap();
     assert!(matches!(
-        requests[0].state,
+        requests
+            .iter()
+            .find(|request| request.id == request_id)
+            .unwrap()
+            .state,
         crate::session::TurnRequestState::Completed { .. }
     ));
     assert!(
         client_session
             .entries()
             .iter()
-            .any(|entry| { entry.sender == "alpha" && entry.content == "shared response" })
+            .any(|entry| entry.content == "shared response")
     );
 
-    drop(executor);
+    drop(server);
     drop(client);
     drop(shutdown);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_peer_sync_preserves_request_identity_and_completion() {
+    use eidetica::auth::Permission;
+    use eidetica::auth::types::AuthKey;
+    use eidetica::crdt::Doc;
+    use eidetica::sync::Address;
+    use eidetica::sync::transports::http::HttpTransport;
+
+    let (owner, mut owner_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("owner"))
+            .await
+            .unwrap();
+    owner.enable_sync().await.unwrap();
+    let owner_key = owner_user.get_default_key().unwrap();
+    let owner_db = owner_user
+        .create_database(Doc::new(), &owner_key)
+        .await
+        .unwrap();
+    Session::initialize_turn_schema(&owner_db).await.unwrap();
+    let txn = owner_db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_global_auth_key(AuthKey::active(None, Permission::Write(0)))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    owner_user.enable_sync(owner_db.root_id()).await.unwrap();
+    let owner_sync = owner.sync().unwrap();
+    owner_sync
+        .register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
+        .await
+        .unwrap();
+    owner_sync.accept_connections().await.unwrap();
+    let address = Address::http(owner_sync.get_server_address_for("http").await.unwrap());
+
+    let (peer, mut peer_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("peer"))
+            .await
+            .unwrap();
+    peer.enable_sync().await.unwrap();
+    let peer_key = peer_user.get_default_key().unwrap();
+    let peer_signing = peer_user.get_signing_key(&peer_key).unwrap();
+    let peer_sync = peer.sync().unwrap();
+    peer_sync
+        .register_transport("http", HttpTransport::builder())
+        .await
+        .unwrap();
+    peer_sync
+        .sync_with_peer_for_bootstrap_with_key(
+            &address,
+            owner_db.root_id(),
+            &peer_signing,
+            &peer_key.to_string(),
+            Permission::Write(10),
+        )
+        .await
+        .unwrap();
+    peer_sync.flush().await.unwrap();
+    let (sigkey, _) = eidetica::Database::find_sigkeys(&peer, owner_db.root_id(), &peer_key)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    peer_user
+        .map_key(&peer_key, owner_db.root_id(), sigkey)
+        .await
+        .unwrap();
+    let peer_db = peer_user.open_database(owner_db.root_id()).await.unwrap();
+
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(owner.clone(), owner_user, agents)
+            .await
+            .unwrap(),
+    );
+    let server = server_fixture_from_registry(registry.clone()).await.1;
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("synced response");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&owner_db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+
+    let mut peer_session = Session::new(ConversationId("peer".into()), peer_db.clone()).await;
+    let request_id = peer_session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "synced request".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    peer_sync
+        .sync_with_peer(&address, Some(owner_db.root_id()))
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    let owner_session = Session::new(ConversationId("owner".into()), owner_db.clone()).await;
+    assert_eq!(
+        owner_session
+            .turn_requests(|name| name == "agent", &Default::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.entry.content == "synced request")
+            .unwrap()
+            .id,
+        request_id
+    );
+    peer_sync
+        .sync_with_peer(&address, Some(owner_db.root_id()))
+        .await
+        .unwrap();
+
+    let peer_session = Session::new(ConversationId("peer".into()), peer_db).await;
+    assert!(matches!(
+        peer_session
+            .turn_requests(|name| name == "agent", &Default::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.id == request_id)
+            .unwrap()
+            .state,
+        TurnRequestState::Completed { .. }
+    ));
+    assert!(
+        peer_session
+            .entries()
+            .iter()
+            .any(|entry| entry.content == "synced response")
+    );
+    drop(server);
+    owner_sync.stop_server().await.unwrap();
 }
 
 /// Poll the session for a `Message` entry sent by `agent`, up to a few

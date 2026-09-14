@@ -1493,7 +1493,7 @@ async fn handle_chat_action(
                 })
                 .await
             {
-                Ok(()) => tab.waiting = true,
+                Ok(_) => tab.waiting = true,
                 Err(e) => tracing::error!("Failed to send message: {e}"),
             }
         }

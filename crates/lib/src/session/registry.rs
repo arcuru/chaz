@@ -187,6 +187,7 @@ impl SessionRegistry {
         let session_db_id = db.root_id().to_string();
         let conv_id = ConversationId(session_db_id.clone());
 
+        super::Session::initialize_turn_schema(&db).await?;
         crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source.unwrap_or("new"))
             .await?;
 
