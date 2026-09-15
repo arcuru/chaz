@@ -103,9 +103,28 @@ An interrupted attempt is deliberately not replayed. Model and tool work may
 already have caused an external effect before the process stopped. The public
 library API exposes `Server::interrupted_turns()` to inspect that state and
 `Server::retry_interrupted_turn()` to request an explicit retry. The retry is
-accepted by the executor loop, writes a new attempt, and leaves the old record
-in history. There is no CLI, TUI, bridge, or other frontend control for these
-APIs yet.
+submitted as a typed row in the session's `session_commands` store. The real
+executor accepts it only if its expected interrupted-attempt ID still matches,
+then atomically completes the command and writes the new target attempt.
+`/interrupted` and `/retry <request_id>` expose this path to TUI and command
+clients without granting those clients model or tool authority.
+
+### Durable session commands
+
+`/compact` and `/retry` are typed client-written requests. Their command IDs
+are generated before the write and may be reused after an uncertain write;
+reusing an ID with a different payload is rejected. They share the session
+watch/catch-up callback, per-session processing slot, and `turn_attempts`
+lifecycle with ordinary turns. A command start without a completion is
+interrupted and never replays automatically. Terminal status and output live
+in `session_command_results`, keyed by command ID, so command clients observe
+the executor's durable result rather than a local return value.
+
+Retry requests carry both the target turn row ID and the interrupted attempt
+ID the client observed. After one retry advances the target generation, a
+second command naming the old attempt is rejected as stale. This is durable
+deduplication under the documented one-executor assumption, not distributed
+fencing or exactly-once external effects.
 
 #### Legacy sessions
 
@@ -170,7 +189,7 @@ Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name
 `ContextBuilder` (in `context.rs`) assembles the LLM context within a token budget:
 
 1. Account for system prompt and tool definition tokens first
-2. Find the most recent `Summary` entry (context boundary — older entries excluded)
+2. Resolve a successful `/compact` snapshot boundary, or the most recent legacy `Summary`
 3. Filter for `Message`, `Directive`, and `Summary` entries
 4. Fill from newest messages backward until the token budget is exhausted
 5. Map senders to roles: current agent name = `assistant`, everything else = `user`
@@ -179,7 +198,15 @@ Token estimation uses tiktoken (`cl100k_base` BPE tokenizer) for accurate counti
 
 ### Compaction
 
-The `compact` tool and `/compact` TUI command write a `Summary` entry to the session. The `ContextBuilder` treats the most recent `Summary` as the conversation start boundary, effectively replacing older messages with the summary.
+The `compact` tool retains the legacy behavior of writing a `Summary` entry.
+`/compact` captures an Eidetica `Snapshot`, then the executor reads that native
+historical view and writes a typed compact result. Context assembly uses the
+snapshot's parent history as the coverage boundary: the persisted summary is
+followed by every current context entry outside that snapshot. A message
+committed while summarization is running therefore remains visible, even when
+its timestamp sorts before command completion. Successive compactions read the
+prior virtual boundary through the same snapshot-backed context path. No
+covered-entry list or parallel Chaz ancestry graph is stored.
 
 ## Eidetica Sync
 

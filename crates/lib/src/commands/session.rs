@@ -4,11 +4,8 @@
 //! switch, info, name, share/sync, compact, print, channel listing,
 //! scheduler pointers, and per-session LLM config (model/role/backend).
 
-use crate::backends::{ChatContext, Message, MessageRole};
-use crate::session::{EntryType, Session, SessionEntry, SessionIndex, SessionRegistry};
+use crate::session::{EntryType, Session, SessionIndex, SessionRegistry};
 use crate::types::ConversationId;
-
-use eidetica::store::Table;
 
 use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 
@@ -370,16 +367,26 @@ pub(super) async fn retry_interrupted(
     ctx: &CommandContext<'_>,
 ) -> CommandOutcome {
     let request_id = crate::session::TurnRequestId::parse(raw_request_id);
-    match ctx
-        .server
-        .retry_interrupted_turn(ctx.session_db_id, &request_id)
-        .await
-    {
-        Ok(attempt_id) => CommandOutcome::Text(format!(
-            "Retry accepted for request {request_id} as attempt {attempt_id}."
-        )),
-        Err(error) => CommandOutcome::Error(format!("Retry refused: {error}")),
-    }
+    let interrupted = match ctx.server.interrupted_turns(ctx.session_db_id).await {
+        Ok(turns) => turns,
+        Err(error) => return CommandOutcome::Error(format!("Retry refused: {error}")),
+    };
+    let Some(target) = interrupted
+        .into_iter()
+        .find(|turn| turn.request_id == request_id)
+    else {
+        return CommandOutcome::Error(format!(
+            "Retry refused: turn request {request_id} is not interrupted"
+        ));
+    };
+    submit_command(
+        crate::session::SessionCommand::Retry {
+            target_request_id: request_id,
+            expected_interrupted_attempt_id: target.attempt_id,
+        },
+        ctx,
+    )
+    .await
 }
 
 /// Disable sync on the current session so this peer stops serving it.
@@ -429,88 +436,74 @@ pub(super) async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> C
 }
 
 pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let source_snapshot = match ctx.session_db.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return CommandOutcome::Error(format!("Failed to snapshot session: {error}"));
+        }
+    };
+    submit_command(
+        crate::session::SessionCommand::Compact { source_snapshot },
+        ctx,
+    )
+    .await
+}
+
+async fn submit_command(
+    command: crate::session::SessionCommand,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let command_id = crate::session::TurnRequestId::parse(uuid::Uuid::new_v4().to_string());
+    let request = crate::session::SessionCommandRequest {
+        command_id: command_id.clone(),
+        sender: ctx.current_agent.to_string(),
+        created_at: chrono::Utc::now(),
+        command,
+    };
+    let observer = match ctx.server.observe_session_command(ctx.session_db_id).await {
+        Ok(observer) => observer,
+        Err(error) => {
+            return CommandOutcome::Error(format!(
+                "Command {command_id} was not submitted: {error}"
+            ));
+        }
+    };
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
     .await;
-    let entries: Vec<&SessionEntry> = session
-        .entries()
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.entry_type,
-                EntryType::Message | EntryType::Directive | EntryType::Summary
-            )
-        })
-        .collect();
-    if entries.len() < 3 {
-        return CommandOutcome::Error(
-            "Not enough messages to compact (need at least 3)".to_string(),
-        );
+    if let Err(error) = session.submit_command(request).await {
+        return CommandOutcome::Error(format!("Command {command_id} was not submitted: {error}"));
     }
-
-    let mut transcript = String::new();
-    for entry in &entries {
-        let role_label = if entry.sender == ctx.current_agent {
-            "assistant"
-        } else {
-            &entry.sender
-        };
-        let type_label = match entry.entry_type {
-            EntryType::Summary => " [previous summary]",
-            EntryType::Directive => " [directive]",
-            _ => "",
-        };
-        transcript.push_str(&format!("{role_label}{type_label}: {}\n\n", entry.content));
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        observer.wait(&command_id),
+    )
+    .await;
+    match waited {
+        Ok(Ok(result)) => match result.outcome {
+            crate::session::SessionCommandOutcome::Compact { summary } => {
+                CommandOutcome::Text(format!(
+                    "Session compacted by command {command_id}. Summary ({} chars) persisted.",
+                    summary.len()
+                ))
+            }
+            crate::session::SessionCommandOutcome::RetryAccepted { target_attempt_id } => {
+                CommandOutcome::Text(format!(
+                    "Retry command {command_id} accepted as attempt {target_attempt_id}."
+                ))
+            }
+            crate::session::SessionCommandOutcome::Rejected { message }
+            | crate::session::SessionCommandOutcome::Failed { message } => {
+                CommandOutcome::Error(format!("Command {command_id} failed: {message}"))
+            }
+        },
+        Ok(Err(error)) => CommandOutcome::Error(format!("Command {command_id}: {error}")),
+        Err(_) => CommandOutcome::Error(format!(
+            "Command {command_id} remains durable but did not finish within 30 seconds"
+        )),
     }
-
-    let system_prompt = "You are a conversation summarizer. Produce a thorough, structured summary of the conversation below. Include: key topics discussed, decisions made, tasks completed or in progress, important facts and state, and any open questions. The summary replaces older messages in the context window, so it must be complete enough for the assistant to continue working without the original messages.".to_string();
-
-    let chat_ctx = ChatContext {
-        messages: vec![
-            Message::new(MessageRole::System, system_prompt),
-            Message::new(
-                MessageRole::User,
-                format!(
-                    "Summarize this conversation:\n\n{transcript}\n\n\
-                     Produce a structured summary that captures everything needed to continue the conversation."
-                ),
-            ),
-        ],
-        model: None,
-        system_prompt: None,
-    };
-
-    let summary = match ctx.backend.execute(&chat_ctx).await {
-        Ok(s) => s,
-        Err(e) => return CommandOutcome::Error(format!("LLM summarization failed: {e}")),
-    };
-
-    let entry = SessionEntry {
-        sender: "system".to_string(),
-        content: summary.clone(),
-        timestamp: chrono::Utc::now(),
-        entry_type: EntryType::Summary,
-        metadata: None,
-        routing: None,
-    };
-
-    let write = async {
-        let txn = ctx.session_db.new_transaction().await?;
-        let store = txn.get_store::<Table<SessionEntry>>("entries").await?;
-        store.insert(entry).await?;
-        txn.commit().await?;
-        Ok::<_, anyhow::Error>(())
-    };
-    if let Err(e) = write.await {
-        return CommandOutcome::Error(format!("Failed to write summary: {e}"));
-    }
-
-    CommandOutcome::Text(format!(
-        "Session compacted. Summary ({} chars) written.",
-        summary.len()
-    ))
 }
 
 pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {

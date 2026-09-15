@@ -226,7 +226,7 @@ impl BuiltServer {
     pub async fn shutdown(mut self) {
         self.server_slot.clear();
         self.server.shutdown().await;
-        self.server.mcp_registry().abort_pending_tasks();
+        self.server.mcp_registry().shutdown().await;
         for task in &self.tasks {
             task.abort();
         }

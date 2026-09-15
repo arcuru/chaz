@@ -27,6 +27,8 @@ pub(crate) struct RecordedCall {
 struct State {
     script: std::collections::VecDeque<Result<LLMResponse, LlmError>>,
     calls: Vec<RecordedCall>,
+    simple_script: std::collections::VecDeque<Result<String, LlmError>>,
+    simple_calls: Vec<Vec<crate::backends::Message>>,
 }
 
 struct CallGate {
@@ -138,6 +140,18 @@ impl MockBackend {
         self.state.lock().unwrap().script.push_back(Err(err));
     }
 
+    pub fn push_simple_text(&self, content: impl Into<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .simple_script
+            .push_back(Ok(content.into()));
+    }
+
+    pub fn simple_call_count(&self) -> usize {
+        self.state.lock().unwrap().simple_calls.len()
+    }
+
     /// Queue an arbitrary response. Use when the `push_text` /
     /// `push_tool_calls` convenience constructors don't expose enough
     /// control over the response (e.g., to set custom `ResponseMetadata`).
@@ -167,6 +181,21 @@ impl MockBackend {
 }
 
 impl BackendDispatch for MockBackend {
+    fn execute<'a>(
+        &'a self,
+        context: &'a crate::backends::ChatContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().unwrap();
+            state.simple_calls.push(context.messages.clone());
+            state.simple_script.pop_front().unwrap_or_else(|| {
+                Err(LlmError::Configuration {
+                    message: "MockBackend: execute called with empty script".into(),
+                })
+            })
+        })
+    }
+
     fn supports_tools(&self) -> bool {
         self.supports_tools
     }

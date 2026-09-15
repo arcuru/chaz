@@ -112,6 +112,15 @@ impl McpServer {
         names
     }
 
+    pub async fn shutdown(&self) {
+        self.transport.shutdown().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_id(&self) -> Option<u32> {
+        self.transport.process_id().await
+    }
+
     /// Perform the MCP initialize handshake.
     ///
     /// Capture the server's negotiated `protocolVersion` from the response

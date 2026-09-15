@@ -23,7 +23,8 @@ use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
 use crate::session::{
-    EntryType, Session, SessionEntry, SessionRegistry, TurnAttempt, TurnRequestId,
+    EntryType, Session, SessionCommand, SessionCommandOutcome, SessionCommandRequest,
+    SessionCommandResult, SessionEntry, SessionRegistry, TurnAttempt, TurnRequestId,
     TurnRequestState, TurnTranscriptMessage, TurnTranscriptRecord,
 };
 use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolProfile, ToolRegistry};
@@ -57,11 +58,6 @@ const HOME_SKIP_WARN_THRESHOLD: u32 = 3;
 
 enum ProcessingCommand {
     Wake(String),
-    Retry {
-        session_db_id: String,
-        request_id: TurnRequestId,
-        response: tokio::sync::oneshot::Sender<anyhow::Result<String>>,
-    },
 }
 
 struct SessionRuntimeRecorder {
@@ -307,6 +303,23 @@ struct SpawnContext {
 pub struct InterruptedTurn {
     pub request_id: TurnRequestId,
     pub attempt_id: String,
+}
+
+pub struct SessionCommandObserver {
+    session: Session,
+    notify: Arc<tokio::sync::Notify>,
+    _callback: eidetica::instance::WriteCallback,
+}
+
+impl SessionCommandObserver {
+    pub async fn wait(&self, command_id: &TurnRequestId) -> anyhow::Result<SessionCommandResult> {
+        loop {
+            if let Some(result) = self.session.command_result(command_id).await? {
+                return Ok(result);
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// Built-in default for the agent→agent burst budget — the run of
@@ -1742,14 +1755,12 @@ impl Server {
         let catch_up_session =
             Session::new(ConversationId(session_db_id.clone()), session_db.clone()).await;
         let has_catch_up = catch_up_session
-            .turn_requests_at(
+            .has_queued_work_at(
                 catch_up_tips,
                 |name| self.agents.get(name).is_some(),
                 &self.live_attempts.lock().await.clone(),
             )
-            .await?
-            .into_iter()
-            .any(|request| request.state == TurnRequestState::Queued);
+            .await?;
         if has_catch_up
             && self
                 .notify_tx
@@ -1816,40 +1827,88 @@ impl Server {
             .collect())
     }
 
-    /// Explicitly retry an interrupted request by creating a new attempt.
-    ///
-    /// The old attempt remains in the append-only history. The new attempt is
-    /// started durably before reconciliation can invoke model or tools.
+    /// Start observing a persisted command from the current session cursor.
+    /// The cursor is captured before the write so completion cannot race the
+    /// waiter setup.
+    pub async fn observe_session_command(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<SessionCommandObserver> {
+        let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
+        let session = Session::new(conversation_id, session_db.clone()).await;
+        let cursor = session_db.snapshot().await?;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_callback = notify.clone();
+        let callback = session_db
+            .on_write_at_tips(cursor, move |_, _| {
+                let notify = notify_callback.clone();
+                async move {
+                    notify.notify_one();
+                    Ok(())
+                }
+            })
+            .await?;
+        Ok(SessionCommandObserver {
+            session,
+            notify,
+            _callback: callback,
+        })
+    }
+
+    /// Persist a typed command and wait for its executor-owned result.
+    pub async fn submit_session_command(
+        &self,
+        session_db_id: &str,
+        request: SessionCommandRequest,
+    ) -> anyhow::Result<SessionCommandResult> {
+        let observer = self.observe_session_command(session_db_id).await?;
+        let command_id = request.command_id.clone();
+        observer.session.submit_command(request).await?;
+        let wait = observer.wait(&command_id);
+        tokio::time::timeout(std::time::Duration::from_secs(30), wait)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "command {command_id} remains durable but did not finish within 30 seconds"
+                )
+            })?
+    }
+
+    /// Convenience for internal callers; the transport remains the durable
+    /// typed command record rather than an in-process executor channel.
     pub async fn retry_interrupted_turn(
         &self,
         session_db_id: &str,
         request_id: &TurnRequestId,
     ) -> anyhow::Result<String> {
-        if !self.executor_authorized {
-            anyhow::bail!("server has no executor loop");
-        }
-        let (response, result) = tokio::sync::oneshot::channel();
-        self.notify_tx
-            .send(ProcessingCommand::Retry {
-                session_db_id: session_db_id.to_string(),
-                request_id: request_id.clone(),
-                response,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("no executor loop is running"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("executor loop stopped before accepting retry"))?
-    }
-
-    async fn accept_retry(
-        &self,
-        session_db_id: &str,
-        request_id: &TurnRequestId,
-    ) -> anyhow::Result<String> {
-        self.process_session(session_db_id, Some(request_id))
+        let interrupted = self
+            .interrupted_turns(session_db_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("executor did not accept retry {request_id}"))
+            .into_iter()
+            .find(|turn| &turn.request_id == request_id)
+            .ok_or_else(|| anyhow::anyhow!("turn request {request_id} is not interrupted"))?;
+        let result = self
+            .submit_session_command(
+                session_db_id,
+                SessionCommandRequest {
+                    command_id: TurnRequestId::parse(uuid::Uuid::new_v4().to_string()),
+                    sender: "system".into(),
+                    created_at: Utc::now(),
+                    command: SessionCommand::Retry {
+                        target_request_id: request_id.clone(),
+                        expected_interrupted_attempt_id: interrupted.attempt_id,
+                    },
+                },
+            )
+            .await?;
+        match result.outcome {
+            SessionCommandOutcome::RetryAccepted { target_attempt_id } => Ok(target_attempt_id),
+            SessionCommandOutcome::Rejected { message }
+            | SessionCommandOutcome::Failed { message } => anyhow::bail!(message),
+            SessionCommandOutcome::Compact { .. } => {
+                anyhow::bail!("retry command returned a compact result")
+            }
+        }
     }
 
     /// Claim **runtime** ownership of a session — the runtime half of the old
@@ -2078,18 +2137,7 @@ impl Server {
                 _ = server.shutdown_notify.notified() => None,
             };
             let Some(command) = command else { break };
-            let session_db_id = match command {
-                ProcessingCommand::Wake(session_db_id) => session_db_id,
-                ProcessingCommand::Retry {
-                    session_db_id,
-                    request_id,
-                    response,
-                } => {
-                    let result = server.accept_retry(&session_db_id, &request_id).await;
-                    let _ = response.send(result);
-                    continue;
-                }
-            };
+            let ProcessingCommand::Wake(session_db_id) = command;
             // Debounce: drain any pending notifications, dedup
             let mut to_process = vec![session_db_id];
             while let Ok(command) = notify_rx.try_recv() {
@@ -2099,19 +2147,11 @@ impl Server {
                             to_process.push(sid);
                         }
                     }
-                    ProcessingCommand::Retry {
-                        session_db_id,
-                        request_id,
-                        response,
-                    } => {
-                        let result = server.accept_retry(&session_db_id, &request_id).await;
-                        let _ = response.send(result);
-                    }
                 }
             }
 
             for sid in to_process {
-                if let Err(e) = server.process_session(&sid, None).await {
+                if let Err(e) = server.process_session(&sid).await {
                     error!("Error processing session {sid}: {e}");
                 }
             }
@@ -2160,11 +2200,7 @@ impl Server {
         }
     }
 
-    async fn process_session(
-        &self,
-        session_db_id: &str,
-        retry_request_id: Option<&TurnRequestId>,
-    ) -> anyhow::Result<Option<String>> {
+    async fn process_session(&self, session_db_id: &str) -> anyhow::Result<Option<String>> {
         if !self.executor_authorized {
             anyhow::bail!("client server cannot execute agent or tool turns");
         }
@@ -2173,24 +2209,10 @@ impl Server {
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
         let live_attempts = self.live_attempts.lock().await.clone();
-        let queued = if let Some(request_id) = retry_request_id {
-            let request = session
-                .turn_request(
-                    request_id,
-                    |name| self.agents.get(name).is_some(),
-                    &live_attempts,
-                )
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("unknown turn request {request_id}"))?;
-            if !matches!(request.state, TurnRequestState::Interrupted { .. }) {
-                anyhow::bail!("turn request {request_id} is not interrupted");
-            }
-            Some((request, None))
-        } else {
-            session
-                .next_turn_request(|name| self.agents.get(name).is_some(), &live_attempts)
-                .await?
-        };
+        let command = session.next_command_request(&live_attempts).await?;
+        let queued = session
+            .next_turn_request(|name| self.agents.get(name).is_some(), &live_attempts)
+            .await?;
         let latest_session_entry = session
             .latest_entry_with_id()
             .map(|(id, entry)| (id.clone(), entry.clone()));
@@ -2226,6 +2248,30 @@ impl Server {
             }
             _ => None,
         };
+        if let Some((command, existing_attempt_id)) = command {
+            if self
+                .processing
+                .lock()
+                .await
+                .insert(session_db_id.to_string())
+            {
+                let result = self
+                    .process_session_command(
+                        session_db_id,
+                        session,
+                        command.request,
+                        existing_attempt_id,
+                    )
+                    .await;
+                self.processing.lock().await.remove(session_db_id);
+                let _ = self
+                    .notify_tx
+                    .send(ProcessingCommand::Wake(session_db_id.to_string()))
+                    .await;
+                return result.map(Some);
+            }
+            return Ok(None);
+        }
         let Some((request, existing_attempt_id)) = queued.or(agent_mention) else {
             return Ok(None);
         };
@@ -2394,6 +2440,181 @@ impl Server {
         Ok(Some(attempt_id))
     }
 
+    async fn process_session_command(
+        &self,
+        session_db_id: &str,
+        session: Session,
+        request: SessionCommandRequest,
+        existing_attempt_id: Option<String>,
+    ) -> anyhow::Result<String> {
+        if !self.is_startup_ready() {
+            self.await_startup_ready().await;
+        }
+        let attempt = match existing_attempt_id {
+            Some(attempt_id) => session
+                .read_turn_attempt(&attempt_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("live command attempt {attempt_id} disappeared"))?,
+            None => {
+                let attempt = session
+                    .start_turn_attempt(request.command_id.clone())
+                    .await?;
+                self.live_attempts
+                    .lock()
+                    .await
+                    .insert(attempt.attempt_id.clone());
+                attempt
+            }
+        };
+        let attempt_id = attempt.attempt_id.clone();
+        let outcome = match request.command {
+            SessionCommand::Compact { source_snapshot } => {
+                self.execute_compact_command(session_db_id, &session, &source_snapshot)
+                    .await
+            }
+            SessionCommand::Retry {
+                target_request_id,
+                expected_interrupted_attempt_id,
+            } => {
+                let live = self.live_attempts.lock().await.clone();
+                let target = session
+                    .turn_request(
+                        &target_request_id,
+                        |name| self.agents.get(name).is_some(),
+                        &live,
+                    )
+                    .await?;
+                match target {
+                    Some(target) => {
+                        let observed_state = target.state.clone();
+                        let accepted = session
+                            .accept_retry_command_if_interrupted(
+                                &attempt,
+                                target_request_id,
+                                &expected_interrupted_attempt_id,
+                                &live,
+                            )
+                            .await?;
+                        let Some(target_attempt) = accepted else {
+                            return self
+                                .complete_rejected_command(
+                                    &session,
+                                    &attempt,
+                                    format!(
+                                        "retry precondition failed: expected interrupted attempt {expected_interrupted_attempt_id}, found {observed_state:?}"
+                                    ),
+                                )
+                                .await;
+                        };
+                        self.live_attempts
+                            .lock()
+                            .await
+                            .insert(target_attempt.attempt_id.clone());
+                        self.live_attempts.lock().await.remove(&attempt_id);
+                        return Ok(target_attempt.attempt_id);
+                    }
+                    None => SessionCommandOutcome::Rejected {
+                        message: format!("unknown turn request {target_request_id}"),
+                    },
+                }
+            }
+        };
+        session.complete_command_attempt(&attempt, outcome).await?;
+        self.live_attempts.lock().await.remove(&attempt_id);
+        Ok(attempt_id)
+    }
+
+    async fn complete_rejected_command(
+        &self,
+        session: &Session,
+        attempt: &TurnAttempt,
+        message: String,
+    ) -> anyhow::Result<String> {
+        session
+            .complete_command_attempt(attempt, SessionCommandOutcome::Rejected { message })
+            .await?;
+        self.live_attempts.lock().await.remove(&attempt.attempt_id);
+        Ok(attempt.attempt_id.clone())
+    }
+
+    async fn execute_compact_command(
+        &self,
+        session_db_id: &str,
+        session: &Session,
+        source_snapshot: &eidetica::Snapshot,
+    ) -> SessionCommandOutcome {
+        let entries =
+            match Session::context_entries_at(session.database().clone(), source_snapshot.clone())
+                .await
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return SessionCommandOutcome::Failed {
+                        message: format!("failed to read compact snapshot: {error}"),
+                    };
+                }
+            };
+        let start = entries
+            .iter()
+            .rposition(|entry| entry.entry_type == EntryType::Summary)
+            .unwrap_or(0);
+        let entries: Vec<_> = entries[start..]
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.entry_type,
+                    EntryType::Message | EntryType::Directive | EntryType::Summary
+                )
+            })
+            .collect();
+        if entries.len() < 3 {
+            return SessionCommandOutcome::Rejected {
+                message: "not enough messages to compact (need at least 3)".into(),
+            };
+        }
+        let sessions = self.sessions.lock().await;
+        let Some(runtime) = sessions.get(session_db_id) else {
+            return SessionCommandOutcome::Failed {
+                message: "session is not registered with the executor".into(),
+            };
+        };
+        let backend = runtime.backend.clone();
+        drop(sessions);
+
+        let mut transcript = String::new();
+        for entry in entries {
+            let type_label = match entry.entry_type {
+                EntryType::Summary => " [previous summary]",
+                EntryType::Directive => " [directive]",
+                _ => "",
+            };
+            transcript.push_str(&format!(
+                "{}{type_label}: {}\n\n",
+                entry.sender, entry.content
+            ));
+        }
+        let context = crate::backends::ChatContext {
+            messages: vec![
+                crate::backends::Message::new(
+                    crate::backends::MessageRole::System,
+                    "You are a conversation summarizer. Produce a thorough, structured summary of the conversation below. Include key topics, decisions, completed and open tasks, important facts and state, and open questions. The summary replaces older context, so preserve everything needed to continue.",
+                ),
+                crate::backends::Message::new(
+                    crate::backends::MessageRole::User,
+                    format!("Summarize this conversation:\n\n{transcript}"),
+                ),
+            ],
+            model: None,
+            system_prompt: None,
+        };
+        match backend.execute(&context).await {
+            Ok(summary) => SessionCommandOutcome::Compact { summary },
+            Err(error) => SessionCommandOutcome::Failed {
+                message: format!("LLM summarization failed: {error}"),
+            },
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn spawn_agent_task(
         &self,
@@ -2519,6 +2740,13 @@ impl Server {
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
+                let context_entries = match s.context_entries().await {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        error!(%error, "Failed to load compacted session context; using visible transcript");
+                        s.entries().to_vec()
+                    }
+                };
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
                 // Per-agent override > session pin > backend default. The
@@ -2547,7 +2775,7 @@ impl Server {
                     max_context_tokens,
                 );
                 let assembled =
-                    ContextBuilder::new(s.entries(), &agent_name, &system_prompt, &context_config)
+                    ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config)
                         .with_tools(&tool_defs)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)

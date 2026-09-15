@@ -381,7 +381,7 @@ pub enum CommandOutcome {
 }
 
 pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
-    if service_owner_only(&cmd)
+    if (service_owner_only(&cmd) || extension_service_owner_only(&cmd))
         && ctx
             .server
             .registry()
@@ -475,6 +475,23 @@ fn service_owner_only(command: &Command) -> bool {
     )
 }
 
+fn extension_service_owner_only(command: &Command) -> bool {
+    let Command::Extension { name, args } = command else {
+        return false;
+    };
+    if !matches!(name.as_str(), "memory" | "skills") {
+        return false;
+    }
+    let mut words = args.split_whitespace();
+    match words.next() {
+        Some("share" | "unshare" | "import") => true,
+        Some("attach") => words
+            .next()
+            .is_some_and(|arg| arg.parse::<eidetica::sync::DatabaseTicket>().is_ok()),
+        _ => false,
+    }
+}
+
 fn owner_redirect(command: &Command) -> String {
     let action = match command {
         Command::Share => "create the session ticket",
@@ -485,6 +502,24 @@ fn owner_redirect(command: &Command) -> String {
         Command::SharingApprove(_) => "approve the bootstrap request",
         Command::SharingReject(_) => "reject the bootstrap request",
         Command::SharingStatus => "inspect daemon sync state",
+        Command::Extension { name, args } => match args.split_whitespace().next() {
+            Some("share") => {
+                return format!(
+                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to create the {name} bank ticket; this service client made no changes."
+                );
+            }
+            Some("unshare") => {
+                return format!(
+                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to disable {name} bank sync; this service client made no changes."
+                );
+            }
+            Some("import" | "attach") => {
+                return format!(
+                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to bootstrap the {name} bank ticket; this service client made no changes."
+                );
+            }
+            _ => unreachable!("redirect called for service-capable extension command"),
+        },
         _ => unreachable!("redirect called for service-capable command"),
     };
     format!(
@@ -568,6 +603,39 @@ mod capability_tests {
             agent_ref: "chaz".into(),
             pubkey: "key".into(),
             permission: CoOwnerPermission::Write,
+        }));
+        for command in [
+            Command::Extension {
+                name: "memory".into(),
+                args: "share bank".into(),
+            },
+            Command::Extension {
+                name: "memory".into(),
+                args: "unshare bank".into(),
+            },
+            Command::Extension {
+                name: "memory".into(),
+                args: "import not-a-ticket".into(),
+            },
+            Command::Extension {
+                name: "skills".into(),
+                args: "share bank".into(),
+            },
+            Command::Extension {
+                name: "skills".into(),
+                args: "unshare bank".into(),
+            },
+            Command::Extension {
+                name: "skills".into(),
+                args: "import not-a-ticket".into(),
+            },
+        ] {
+            assert!(extension_service_owner_only(&command));
+            assert!(owner_redirect(&command).contains("made no changes"));
+        }
+        assert!(!extension_service_owner_only(&Command::Extension {
+            name: "memory".into(),
+            args: "attach existing-bank".into(),
         }));
     }
 }
