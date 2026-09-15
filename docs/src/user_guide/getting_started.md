@@ -150,7 +150,10 @@ The result goes to stdout, and a command that reports an error exits non-zero,
 so scripts can branch on it. Configure `execution: client` with the same
 `unix://` service connection to run commands concurrently with the executor.
 Daemon-owned ticket/bootstrap and sync-administration commands must instead be
-run on the Eidetica owner and fail before mutation from a service client.
+run on the Eidetica owner and fail before mutation from a service client. This
+includes memory/skill bank share, unshare, import, and ticket-aware attach;
+ordinary bank list, attach-by-name, detach, and configuration remain native
+session data operations.
 
 ## Single-shot print mode
 
@@ -171,6 +174,11 @@ after deciding that replay is safe:
 ```bash
 chaz --config config.yaml cmd '/retry <request_id>'
 ```
+
+`/compact` follows the same topology: the client writes a stable typed command,
+the executor performs the one summarization call, and the client prints the
+persisted result. A disconnect or 30-second wait timeout reports the command ID;
+inspect that durable command rather than submitting a second intent blindly.
 
 ## Aggregated cost / usage
 

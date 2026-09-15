@@ -20,8 +20,8 @@
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::Database;
 use eidetica::store::{DocStore, Table};
+use eidetica::{Database, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
@@ -161,6 +161,52 @@ pub enum TurnRequestState {
 pub struct TurnRequest {
     pub id: TurnRequestId,
     pub entry: SessionEntry,
+    pub state: TurnRequestState,
+}
+
+/// The two frontend commands that require executor authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionCommand {
+    /// Summarize the context visible at this immutable database snapshot.
+    Compact { source_snapshot: Snapshot },
+    /// Retry one specifically observed interrupted turn attempt.
+    Retry {
+        target_request_id: TurnRequestId,
+        expected_interrupted_attempt_id: String,
+    },
+}
+
+/// A typed command request written by any session client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCommandRequest {
+    pub command_id: TurnRequestId,
+    pub sender: String,
+    pub created_at: DateTime<Utc>,
+    pub command: SessionCommand,
+}
+
+/// Terminal executor-owned command outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionCommandOutcome {
+    Compact { summary: String },
+    RetryAccepted { target_attempt_id: String },
+    Rejected { message: String },
+    Failed { message: String },
+}
+
+/// Durable result observed by the client that submitted a command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCommandResult {
+    pub command_id: TurnRequestId,
+    pub attempt_id: String,
+    pub completed_at: DateTime<Utc>,
+    pub outcome: SessionCommandOutcome,
+}
+
+/// A persisted command paired with its attempt-derived lifecycle state.
+#[derive(Debug, Clone)]
+pub struct SessionCommandWork {
+    pub request: SessionCommandRequest,
     pub state: TurnRequestState,
 }
 
@@ -399,6 +445,8 @@ pub struct Session {
 const META_STORE: &str = "meta";
 const TURN_ATTEMPTS_STORE: &str = "turn_attempts";
 const TURN_TRANSCRIPT_STORE: &str = "turn_transcript";
+const SESSION_COMMANDS_STORE: &str = "session_commands";
+const SESSION_COMMAND_RESULTS_STORE: &str = "session_command_results";
 const TURN_SCHEMA_KEY: &str = "turn_request_schema";
 const TURN_BASELINE_KEY: &str = "turn_request_baseline";
 const TURN_SCHEMA_VERSION: &str = "1";
@@ -472,6 +520,114 @@ impl Session {
         let txn = database.new_transaction_at(snapshot).await?;
         let store = txn.get_store::<Table<SessionEntry>>(store_name).await?;
         Ok(sort_persisted_entries(store.search(|_| true).await?))
+    }
+
+    /// Load the typed transcript view at an immutable Eidetica snapshot.
+    pub async fn entries_at_snapshot(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<SessionEntry>> {
+        Ok(Self::load_entries_at(database, "entries", snapshot)
+            .await?
+            .1)
+    }
+
+    /// Check whether this database contains any queued durable work at a
+    /// pinned snapshot. Used by reconnect reconciliation.
+    pub async fn has_queued_work_at(
+        &self,
+        snapshot: Snapshot,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .turn_requests_at(snapshot.clone(), is_agent, live_attempts)
+            .await?
+            .into_iter()
+            .any(|request| request.state == TurnRequestState::Queued)
+            || self
+                .command_requests_at(&snapshot, live_attempts)
+                .await?
+                .into_iter()
+                .any(|request| request.state == TurnRequestState::Queued))
+    }
+
+    async fn entries_with_ids_at_snapshot(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<(TurnRequestId, SessionEntry)>> {
+        let (ids, entries) = Self::load_entries_at(database, "entries", snapshot).await?;
+        Ok(ids.into_iter().zip(entries).collect())
+    }
+
+    /// Assemble the transcript view using snapshot-backed compact results.
+    /// Coverage is derived from native historical table views; no entry-id
+    /// ancestry is stored alongside the summary.
+    pub async fn context_entries(&self) -> anyhow::Result<Vec<SessionEntry>> {
+        let snapshot = self.database.snapshot().await?;
+        Self::context_entries_at(self.database.clone(), snapshot).await
+    }
+
+    pub async fn context_entries_at(
+        database: Database,
+        snapshot: Snapshot,
+    ) -> anyhow::Result<Vec<SessionEntry>> {
+        let txn = database.new_transaction_at(&snapshot).await?;
+        let results = txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .search(|result| matches!(result.outcome, SessionCommandOutcome::Compact { .. }))
+            .await?;
+        let mut candidates = Vec::new();
+        let commands = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?;
+        for (id, result) in results {
+            let SessionCommandOutcome::Compact { summary } = result.outcome else {
+                continue;
+            };
+            let request = commands.get(&id).await?;
+            let SessionCommand::Compact { source_snapshot } = request.command else {
+                continue;
+            };
+            candidates.push((id, result.completed_at, source_snapshot, summary));
+        }
+        let Some(mut selected) = candidates.pop() else {
+            return Self::entries_at_snapshot(&database, &snapshot).await;
+        };
+        for candidate in candidates {
+            let selected_to_candidate = database.ids_added(&selected.2, &candidate.2).await?;
+            let candidate_to_selected = database.ids_added(&candidate.2, &selected.2).await?;
+            let candidate_covers_more =
+                !selected_to_candidate.is_empty() && candidate_to_selected.is_empty();
+            let incomparable_or_equal =
+                selected_to_candidate.is_empty() == candidate_to_selected.is_empty();
+            if candidate_covers_more
+                || (incomparable_or_equal
+                    && (candidate.1, &candidate.0) > (selected.1, &selected.0))
+            {
+                selected = candidate;
+            }
+        }
+
+        let source_entries = Self::entries_with_ids_at_snapshot(&database, &selected.2).await?;
+        let covered_ids: HashSet<_> = source_entries.iter().map(|(id, _)| id.clone()).collect();
+        let mut entries = vec![SessionEntry {
+            sender: "system".into(),
+            content: selected.3,
+            timestamp: selected.1,
+            entry_type: EntryType::Summary,
+            metadata: None,
+            routing: None,
+        }];
+        entries.extend(
+            Self::entries_with_ids_at_snapshot(&database, &snapshot)
+                .await?
+                .into_iter()
+                .filter(|(id, _)| !covered_ids.contains(id))
+                .map(|(_, entry)| entry),
+        );
+        Ok(entries)
     }
 
     /// Add an entry to the session, persisting it before it becomes visible
@@ -652,6 +808,238 @@ impl Session {
             .await?
             .into_iter()
             .find(|request| &request.id == request_id))
+    }
+
+    /// Submit an executor-owned command under a caller-generated stable id.
+    /// Repeating the same id with an identical payload is idempotent; changing
+    /// the payload under that id is rejected.
+    pub async fn submit_command(&self, request: SessionCommandRequest) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?;
+        match store.get(request.command_id.as_str()).await {
+            Ok(existing) if existing == request => return Ok(()),
+            Ok(_) => anyhow::bail!(
+                "command {} already exists with a different payload",
+                request.command_id
+            ),
+            Err(error) if error.is_not_found() => {}
+            Err(error) => return Err(error.into()),
+        }
+        let command_id = request.command_id.to_string();
+        store.set(command_id, request).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Return command requests in stable session order with derived states.
+    pub async fn command_requests(
+        &self,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Vec<SessionCommandWork>> {
+        let txn = self.database.new_transaction().await?;
+        let mut requests = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?
+            .search(|_| true)
+            .await?;
+        requests.sort_by(|(left_id, left), (right_id, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let states = index_attempt_states(self.read_turn_attempts().await?, live_attempts);
+        Ok(requests
+            .into_iter()
+            .map(|(_, request)| SessionCommandWork {
+                state: states
+                    .get(&request.command_id)
+                    .cloned()
+                    .unwrap_or(TurnRequestState::Queued),
+                request,
+            })
+            .collect())
+    }
+
+    pub async fn command_requests_at(
+        &self,
+        snapshot: &Snapshot,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Vec<SessionCommandWork>> {
+        let txn = self.database.new_transaction_at(snapshot).await?;
+        let mut requests = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?
+            .search(|_| true)
+            .await?;
+        requests.sort_by(|(left_id, left), (right_id, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let states =
+            index_attempt_states(self.read_turn_attempts_at(snapshot).await?, live_attempts);
+        Ok(requests
+            .into_iter()
+            .map(|(_, request)| SessionCommandWork {
+                state: states
+                    .get(&request.command_id)
+                    .cloned()
+                    .unwrap_or(TurnRequestState::Queued),
+                request,
+            })
+            .collect())
+    }
+
+    pub async fn next_command_request(
+        &self,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Option<(SessionCommandWork, Option<String>)>> {
+        let requests = self.command_requests(live_attempts).await?;
+        Ok(requests
+            .iter()
+            .find_map(|request| match &request.state {
+                TurnRequestState::InFlight { attempt_id } => {
+                    Some((request.clone(), Some(attempt_id.clone())))
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                requests
+                    .into_iter()
+                    .find(|request| request.state == TurnRequestState::Queued)
+                    .map(|request| (request, None))
+            }))
+    }
+
+    pub async fn command_result(
+        &self,
+        command_id: &TurnRequestId,
+    ) -> anyhow::Result<Option<SessionCommandResult>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?;
+        match store.get(command_id.as_str()).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Complete a command atomically with its typed result.
+    pub async fn complete_command_attempt(
+        &self,
+        attempt: &TurnAttempt,
+        outcome: SessionCommandOutcome,
+    ) -> anyhow::Result<SessionCommandResult> {
+        let completed_at = Utc::now();
+        let completed = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(completed_at),
+            ..attempt.clone()
+        };
+        let result = SessionCommandResult {
+            command_id: attempt.request_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            completed_at,
+            outcome,
+        };
+        let txn = self.database.new_transaction().await?;
+        let completed_attempt_id = completed.attempt_id.clone();
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(completed_attempt_id, completed)
+            .await?;
+        txn.get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .set(result.command_id.as_str(), result.clone())
+            .await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    /// Atomically accept a retry command and start the target turn attempt.
+    pub async fn accept_retry_command(
+        &self,
+        command_attempt: &TurnAttempt,
+        target_request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let generation = self
+            .read_turn_attempts()
+            .await?
+            .into_iter()
+            .filter(|(_, attempt)| attempt.request_id == target_request_id)
+            .map(|(_, attempt)| attempt.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let target_attempt = TurnAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            request_id: target_request_id,
+            started_at: Utc::now(),
+            generation,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        let completed_at = Utc::now();
+        let completed_command = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(completed_at),
+            ..command_attempt.clone()
+        };
+        let result = SessionCommandResult {
+            command_id: command_attempt.request_id.clone(),
+            attempt_id: command_attempt.attempt_id.clone(),
+            completed_at,
+            outcome: SessionCommandOutcome::RetryAccepted {
+                target_attempt_id: target_attempt.attempt_id.clone(),
+            },
+        };
+        let txn = self.database.new_transaction().await?;
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        attempts
+            .set(&target_attempt.attempt_id, target_attempt.clone())
+            .await?;
+        let completed_command_id = completed_command.attempt_id.clone();
+        attempts
+            .set(completed_command_id, completed_command)
+            .await?;
+        let command_id = result.command_id.to_string();
+        txn.get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .set(command_id, result)
+            .await?;
+        txn.commit().await?;
+        Ok(target_attempt)
+    }
+
+    /// Re-read and validate the retry precondition immediately before the
+    /// serialized executor accepts it.
+    pub async fn accept_retry_command_if_interrupted(
+        &self,
+        command_attempt: &TurnAttempt,
+        target_request_id: TurnRequestId,
+        expected_interrupted_attempt_id: &str,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Option<TurnAttempt>> {
+        let attempts = self.read_turn_attempts().await?;
+        let state = index_attempt_states(attempts, live_attempts)
+            .remove(&target_request_id)
+            .unwrap_or(TurnRequestState::Queued);
+        if !matches!(
+            state,
+            TurnRequestState::Interrupted { ref attempt_id }
+                if attempt_id == expected_interrupted_attempt_id
+        ) {
+            return Ok(None);
+        }
+        self.accept_retry_command(command_attempt, target_request_id)
+            .await
+            .map(Some)
     }
 
     /// Read lifecycle state for an arbitrary processable entry.

@@ -150,6 +150,10 @@ pub trait LLMBackend {
 /// implements this narrower interface — which is exactly what `BackendManager`
 /// needs for its ReAct-loop call sites.
 pub trait BackendDispatch: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        context: &'a ChatContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + 'a>>;
     fn supports_tools(&self) -> bool;
     fn chat_with_tools<'a>(
         &'a self,
@@ -219,7 +223,7 @@ pub struct BackendManager {
 }
 
 /// A generic Message
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
@@ -464,6 +468,9 @@ impl BackendManager {
     /// Execute a ChatContext (simple, no tools).
     /// Used by Matrix commands and /compact — not by the runtime.
     pub async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
+        if let Some(mock) = &self.mock {
+            return mock.execute(context).await;
+        }
         if self.backends.is_empty() {
             return Err(LlmError::Configuration {
                 message: "No backends configured".to_string(),
