@@ -4027,7 +4027,31 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
         TurnRequestState::Interrupted { ref attempt_id }
             if attempt_id == &interrupted_attempt.attempt_id
     ));
-    assert_eq!(mock.recorded_calls().len(), 1);
+    let attempts = observed.attempts_for_test().await;
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt.request_id == queued)
+            .count(),
+        1,
+        "queued work must run exactly once after service restart"
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt.request_id == completed_attempt.request_id)
+            .count(),
+        1,
+        "completed work must not replay after service restart"
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt.request_id == interrupted_id)
+            .count(),
+        1,
+        "interrupted work must not replay after service restart"
+    );
     drop(server);
     drop(shutdown2);
     task2.await.unwrap().unwrap();
