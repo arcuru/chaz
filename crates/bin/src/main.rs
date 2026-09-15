@@ -393,41 +393,61 @@ async fn supervise_daemon_service(
                 }
                 Err(error) if error.is_transient_service() => {
                     warn!(%error, "Eidetica service disconnected; tearing down runtime before reconnect");
-                    built.shutdown().await;
-                    loop {
-                        let delay = instance::service_reconnect_delay(reconnect_attempt);
-                        reconnect_attempt = reconnect_attempt.saturating_add(1);
-                        tokio::select! {
-                            _ = wait_for_shutdown() => return Ok(()),
-                            _ = tokio::time::sleep(delay) => {}
-                        }
-                        match instance::connect(&config).await {
-                            Ok(connected) => {
-                                built = server::build(
-                                    &mut config,
-                                    connected.instance,
-                                    connected.user,
-                                    server::BuildOptions::local(
-                                        config_path.clone(),
-                                        connected.capabilities,
-                                        Vec::new(),
-                                        server::McpReadiness::Deferred,
-                                    ),
-                                ).await?;
-                                info!("Eidetica service reconnected; runtime reopened and reconciled");
-                                break;
+                    built = replace_service_generation(
+                        built,
+                        |old| async move { old.shutdown().await },
+                        || async {
+                            loop {
+                                let delay = instance::service_reconnect_delay(reconnect_attempt);
+                                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                tokio::select! {
+                                    _ = wait_for_shutdown() => anyhow::bail!("shutdown requested"),
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                                match instance::connect(&config).await {
+                                    Ok(connected) => {
+                                        let replacement = server::build(
+                                            &mut config,
+                                            connected.instance,
+                                            connected.user,
+                                            server::BuildOptions::local(
+                                                config_path.clone(),
+                                                connected.capabilities,
+                                                Vec::new(),
+                                                server::McpReadiness::Deferred,
+                                            ),
+                                        ).await?;
+                                        info!("Eidetica service reconnected; runtime reopened and reconciled");
+                                        return Ok(replacement);
+                                    }
+                                    Err(next) if next.is_transient_service() => {
+                                        warn!(%next, "Eidetica service reconnect failed");
+                                    }
+                                    Err(next) => return Err(next.into()),
+                                }
                             }
-                            Err(next) if next.is_transient_service() => {
-                                warn!(%next, "Eidetica service reconnect failed");
-                            }
-                            Err(next) => return Err(next.into()),
-                        }
-                    }
+                        },
+                    ).await?;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
     }
+}
+
+async fn replace_service_generation<T, Shutdown, ShutdownFuture, Reconnect, ReconnectFuture>(
+    generation: T,
+    shutdown: Shutdown,
+    reconnect: Reconnect,
+) -> anyhow::Result<T>
+where
+    Shutdown: FnOnce(T) -> ShutdownFuture,
+    ShutdownFuture: std::future::Future<Output = ()>,
+    Reconnect: FnOnce() -> ReconnectFuture,
+    ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
+{
+    shutdown(generation).await;
+    reconnect().await
 }
 
 /// Block until the process is asked to stop. Ctrl-C covers foreground and
@@ -496,7 +516,7 @@ async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_config_path, resolve_state_dir};
+    use super::{replace_service_generation, resolve_config_path, resolve_state_dir};
     use chaz_core::config::Config;
     use std::path::PathBuf;
 
@@ -561,5 +581,29 @@ mod tests {
         };
         assert!(chaz_core::instance::required_settings(&config).is_err());
         assert!(!state.exists());
+    }
+
+    #[tokio::test]
+    async fn replacement_waits_for_shutdown_before_reconnect() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown_events = events.clone();
+        let reconnect_events = events.clone();
+        let replacement = replace_service_generation(
+            1,
+            move |_| async move {
+                shutdown_events.lock().unwrap().push("shutdown-complete");
+            },
+            move || async move {
+                reconnect_events.lock().unwrap().push("reconnected");
+                Ok(2)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement, 2);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["shutdown-complete", "reconnected"]
+        );
     }
 }
