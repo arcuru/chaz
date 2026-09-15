@@ -4004,6 +4004,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
         .unwrap();
     await_call_count(&mock, 1).await;
     await_no_processing(&server, &sid).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let observed = Session::new(ConversationId(sid.clone()), reopened).await;
     let states = observed
         .turn_requests(|name| name == "agent", &Default::default())
