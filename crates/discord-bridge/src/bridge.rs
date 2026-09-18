@@ -9,21 +9,23 @@
 //! [`chaz_core::bridge::inbound_user_entry`]. The bridge never runs the agent;
 //! the daemon, watching the exposed session, does.
 //!
-//! Outbound: [`chaz_core::bridge::attach_reconciler`] installs an `on_write`
-//! callback that converges the channel to DB state; the only Discord-specific
-//! part is the `send` closure (`ChannelId::say`). The reconcile rule, the
-//! delivered-set, and the `[guest]` prefixing all live in the lib — the same
-//! code the Matrix bridge runs.
+//! Outbound: [`chaz_core::bridge::delivery`] installs a durable reconciler
+//! that converges the channel to DB state; the only Discord-specific part is
+//! the `send` closure (`ChannelId::send_message` with an enforced nonce). The
+//! reconcile rule, persisted per-channel progress, retry schedule, and the
+//! `[guest]` prefixing all live in the lib — the same code the Matrix bridge
+//! runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chaz_core::backends::BackendManager;
+use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
 use chaz_core::bridge::outbound::{
     chunk_message_chars, is_transient_outbound_status, retry_outbound_chunk,
 };
-use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
+use chaz_core::bridge::{ApprovalDecision, Bridge, inbound_user_entry};
 use chaz_core::commands::{self, CommandContext, CommandOutcome, Parsed};
 use chaz_core::config::Config;
 use chaz_core::hosted_index::DbEntry;
@@ -33,13 +35,14 @@ use chaz_core::session::Session;
 use chaz_core::types::ConversationId;
 
 use serenity::async_trait;
+use serenity::builder::CreateMessage;
 use serenity::http::Http;
-use serenity::model::channel::{Message, Reaction, ReactionType};
+use serenity::model::channel::{Message, Nonce, Reaction, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
 use crate::credentials::DiscordCredentials;
@@ -53,6 +56,9 @@ pub struct DiscordBridge {
     pub creds: DiscordCredentials,
     pub config: Config,
     pub secrets: SecretStore,
+    /// Cooperative shutdown signal: when notified, the gateway connection is
+    /// closed and `run` returns `Ok(())`.
+    pub shutdown: Arc<Notify>,
 }
 
 impl DiscordBridge {
@@ -62,6 +68,7 @@ impl DiscordBridge {
         creds: DiscordCredentials,
         config: Config,
         secrets: SecretStore,
+        shutdown: Arc<Notify>,
     ) -> Self {
         Self {
             login_id,
@@ -69,6 +76,7 @@ impl DiscordBridge {
             creds,
             config,
             secrets,
+            shutdown,
         }
     }
 }
@@ -92,7 +100,7 @@ impl Bridge for DiscordBridge {
             secrets: self.secrets.clone(),
             config: self.config.clone(),
             allowed_users: self.creds.allowed_users.clone(),
-            attached: Arc::new(Mutex::new(HashSet::new())),
+            attached: Arc::new(Mutex::new(HashMap::new())),
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             message_counts: Arc::new(Mutex::new(HashMap::new())),
             // No timeout here: the daemon owns the clock and stamps each
@@ -112,10 +120,26 @@ impl Bridge for DiscordBridge {
             agent = %self.owning_agent,
             "Starting Discord bridge"
         );
-        client.start().await?;
-        Ok(())
+        let shard_manager = client.shard_manager.clone();
+        tokio::select! {
+            biased;
+            _ = self.shutdown.notified() => {
+                info!("Discord bridge received shutdown signal");
+                shard_manager.shutdown_all().await;
+                Ok(())
+            }
+            result = client.start() => {
+                result?;
+                Ok(())
+            }
+        }
     }
 }
+
+/// Channels with outbound delivery installed, keyed by
+/// `(channel, session_db_id)` — the binding delivery progress is persisted
+/// under — and the reconciler owning each one's progress.
+type AttachedChannels = Arc<Mutex<HashMap<(String, String), Arc<DeliveryReconciler>>>>;
 
 /// All shared state the serenity event loop needs. serenity gives each handler
 /// method an owned `Context` (with `ctx.http` for sends) but no per-callback
@@ -127,9 +151,7 @@ struct Handler {
     secrets: SecretStore,
     config: Config,
     allowed_users: HashSet<u64>,
-    /// Session db ids that already have a reconciler installed — guards the
-    /// `on_write` callback against double-install on later messages.
-    attached: Arc<Mutex<HashSet<String>>>,
+    attached: AttachedChannels,
     /// Message ids already ingested this process. The gateway replays messages
     /// when the connection is resumed, and a replay must not write the inbound
     /// entry a second time or re-run a `!chaz approve` against a later prompt.
@@ -258,9 +280,12 @@ impl Handler {
         Ok(())
     }
 
-    /// Install the outbound reconciler for a channel exactly once, guarded by
-    /// the `attached` set. The reconcile rule lives in `chaz_core`; the only
-    /// Discord-specific part is the `ChannelId::say` send closure.
+    /// Install durable outbound delivery for `(channel, session)` exactly once
+    /// per process. The reconcile rule and persisted progress live in
+    /// `chaz_core`; the only Discord-specific part is the send closure, which
+    /// posts each chunk under its stable nonce with enforcement on, so Discord
+    /// collapses a chunk repeated after a lost acknowledgement within its
+    /// deduplication window.
     async fn attach_once(
         &self,
         http: Arc<Http>,
@@ -268,34 +293,45 @@ impl Handler {
         session_db: &eidetica::Database,
         session_db_id: &str,
     ) -> anyhow::Result<()> {
+        let key = (channel_id.get().to_string(), session_db_id.to_string());
         let mut attached = self.attached.lock().await;
-        if !attached.insert(session_db_id.to_string()) {
+        if attached.contains_key(&key) {
             return Ok(());
         }
-        drop(attached);
         // Same session DB, two watchers: deliver agent replies, and surface
         // tool-approval prompts the daemon proxied here.
         attach_approval_watcher(session_db, http.clone(), channel_id, self.pending.clone()).await?;
-        attach_reconciler(
-            session_db,
+        let binding = DeliveryBinding::new("discord", &self.login_id, &key.0, session_db_id);
+        let reconciler = DeliveryReconciler::attach(
+            session_db.clone(),
+            DeliveryStore::new(self.server.registry().chaz_peer().clone()),
+            binding,
             self.server.agents_arc(),
             self.owning_agent.clone(),
             |body| chunk_message_chars(body, DISCORD_MESSAGE_LIMIT),
-            move |body| {
+            move |chunk| {
                 let http = http.clone();
-                async move {
-                    info!("→ Discord({channel_id}): {}", body.replace('\n', " "));
+                Box::pin(async move {
+                    info!("→ Discord({channel_id}): {}", chunk.body.replace('\n', " "));
                     retry_outbound_chunk(
-                        || async { channel_id.say(&http, body.clone()).await.map(|_| ()) },
+                        || {
+                            let message = CreateMessage::new()
+                                .content(chunk.body.clone())
+                                .nonce(Nonce::String(chunk.idempotency_key.clone()))
+                                .enforce_nonce(true);
+                            let http = http.clone();
+                            async move { channel_id.send_message(&http, message).await.map(|_| ()) }
+                        },
                         is_transient_discord_send_error,
                     )
                     .await?;
                     Ok(())
-                }
+                })
             },
         )
         .await?;
-        info!(session_db_id, "Discord reconciler installed");
+        attached.insert(key, reconciler);
+        info!(session_db_id, "Discord outbound delivery installed");
         Ok(())
     }
 

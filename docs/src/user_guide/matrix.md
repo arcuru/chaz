@@ -1,9 +1,9 @@
 # Matrix Bot
 
 Chaz connects to Matrix as a bot, responding to messages in rooms it's invited
-to. The Matrix bridge runs as its own process and eidetica peer (`chaz-matrix`),
-separate from the `chaz` daemon — read [Transport Bridges](bridges.md) first for
-the architecture and the one-time approval flow. This page covers Matrix-specific
+to. The Matrix bridge runs as its own process (`chaz-matrix`), separate from
+the `chaz` daemon — read [Transport Bridges](bridges.md) first for the
+architecture, the connection settings, and the one-time approval flow. This page covers Matrix-specific
 configuration and behavior.
 
 ## Setup
@@ -37,6 +37,11 @@ configuration and behavior.
 
    # chaz runtime keys the embedded server needs:
    state_dir: /var/lib/chaz-matrix
+   execution: client
+   eidetica:
+     connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
+     login: { username: chaz-matrix, passwordless: true }
+     sync: { iroh: true }
    backends:
      - name: openai
        api_key: ${OPENAI_API_KEY}
@@ -44,6 +49,9 @@ configuration and behavior.
      - name: chaz
    ```
 
+   `execution:` and `eidetica:` are the connector settings every Chaz process
+   carries — see [Connection settings](bridges.md#connection-settings) for the
+   direct-owner and shared-login forms and what each one needs.
    `homeserver_url`, `username`, and `password` are the bot's login; `password`
    (and `unlock_password`) accept `${ENV}` references so no secret has to live in
    the file. `allow_list` / `room_size_limit` may be set per-login or as global
@@ -91,7 +99,7 @@ Two things worth knowing:
   revises what was already recorded, so a pasted iroh address outlives the run
   that published it. Sync tries every recorded address, and each dead one costs
   a full timeout on every pass. A `pr=http:` hint pointing at the daemon's
-  `sync_listen` is what actually connects host-local.
+  `eidetica.sync.http_listen` is what actually connects host-local.
 - **`/agent share` also writes the ticket to `$XDG_CONFIG_HOME/chaz/shares/`.**
   Point `XDG_CONFIG_HOME` somewhere disposable if you do not want that.
 

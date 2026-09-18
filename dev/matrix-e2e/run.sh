@@ -211,15 +211,17 @@ log "workspace: $WORKSPACE"
 log "synapse :$SYNAPSE_PORT  stub-llm :$STUB_PORT  daemon-sync :$DAEMON_SYNC_PORT  bridge-sync :$BRIDGE_SYNC_PORT"
 log "transport: $TRANSPORT"
 
+# Both peers are direct Eidetica owners with explicit connector settings. In
+# http mode the bridge binds only loopback HTTP, so the run stays hermetic; in
+# iroh mode both peers register the P2P transport and nothing else.
 if [[ $TRANSPORT == "http" ]]; then
-	SYNC_LISTEN_DAEMON="sync_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
-	SYNC_LISTEN_BRIDGE="sync_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
 	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
+	EIDETICA_SYNC_BRIDGE="  sync:\n    http_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
 else
-	SYNC_LISTEN_DAEMON=""
-	SYNC_LISTEN_BRIDGE=""
 	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true"
+	EIDETICA_SYNC_BRIDGE="  sync:\n    iroh: true"
 fi
+EIDETICA_BIN="git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04"
 
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
@@ -338,7 +340,6 @@ eidetica:
     username: chaz
     passwordless: true
 $(printf '%b' "$EIDETICA_SYNC_DAEMON")
-$SYNC_LISTEN_DAEMON
 
 backends:
   - name: stub
@@ -357,10 +358,25 @@ agents:
 default_agents: [chaz]
 EOF
 
-mkdir -p "$WORKSPACE/state-daemon"
-nix run 'git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04' -- \
+mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
+nix run "$EIDETICA_BIN" -- \
 	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
+# The bridge's store is provisioned the same explicit way: the connector
+# never creates one, and the legacy `chaz-matrix` login is what its config
+# names.
+nix run "$EIDETICA_BIN" -- \
+	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
+	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
+
+# The bridge's connector block, shared by both renderings of its config.
+BRIDGE_EIDETICA="execution: client
+eidetica:
+  connection: \"sqlite://$WORKSPACE/state-bridge/eidetica.db\"
+  login:
+    username: chaz-matrix
+    passwordless: true
+$(printf '%b' "$EIDETICA_SYNC_BRIDGE")"
 
 # ------------------------------------------------------------- bring-up ------
 # The sequence that removes the human: ask the bridge which key to trust,
@@ -371,7 +387,7 @@ cat >"$BRIDGE_CONFIG" <<EOF
 unlock_password: e2e-bridge-unlock
 label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
-$SYNC_LISTEN_BRIDGE
+$BRIDGE_EIDETICA
 logins: []
 agents:
   - name: chaz
@@ -411,10 +427,10 @@ if [[ $TRANSPORT == "http" ]]; then
 	*) fail "ticket carries no loopback address hint: $TICKET" ;;
 	esac
 else
-	# Assert the run is actually on the P2P path. Today the daemon only binds
-	# an http sync listener when `sync_listen` is set, which this mode leaves
-	# empty — but a future default that reintroduces a bind would turn this
-	# mode back into the http mode under a different name, silently.
+	# Assert the run is actually on the P2P path. The daemon only binds an
+	# http sync listener when `eidetica.sync.http_listen` is set, which this
+	# mode leaves out — but a future default that reintroduces a bind would
+	# turn this mode back into the http mode under a different name, silently.
 	case "$TICKET" in
 	*"pr=iroh:"*) ;;
 	*) fail "ticket carries no iroh address hint: $TICKET" ;;
@@ -428,7 +444,7 @@ cat >"$BRIDGE_CONFIG" <<EOF
 unlock_password: e2e-bridge-unlock
 label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
-$SYNC_LISTEN_BRIDGE
+$BRIDGE_EIDETICA
 
 logins:
   - agent: chaz

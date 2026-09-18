@@ -188,6 +188,165 @@ pub async fn probe_service(instance: &Instance) -> Result<(), ConnectError> {
         .map_err(ConnectError::Connection)
 }
 
+/// One application generation supervised over a service connection: the
+/// runtime built on one connected [`Instance`], torn down whole before a
+/// replacement is connected.
+#[allow(async_fn_in_trait)]
+pub trait ServiceGeneration: Sized {
+    /// The connection this generation was built on; probed for liveness.
+    fn instance(&self) -> Instance;
+
+    /// Resolves when the generation ends on its own — a transport task
+    /// exiting, for example. A generation that only ends on request stays
+    /// pending forever.
+    async fn finished(&mut self) -> anyhow::Result<()>;
+
+    /// Stop every task, hook, and subscription this generation owns. Runs to
+    /// completion before a replacement is constructed.
+    async fn shutdown(self);
+}
+
+impl ServiceGeneration for crate::server::BuiltServer {
+    fn instance(&self) -> Instance {
+        self.registry.instance().clone()
+    }
+
+    async fn finished(&mut self) -> anyhow::Result<()> {
+        std::future::pending().await
+    }
+
+    async fn shutdown(self) {
+        crate::server::BuiltServer::shutdown(self).await;
+    }
+}
+
+/// Whether a rebuild failure is worth another bounded-backoff attempt. Only
+/// transport-level service failures are; a configuration, login, or
+/// capability error surfaces to the operator instead of looping.
+fn is_transient_rebuild_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ConnectError>()
+        .is_some_and(ConnectError::is_transient_service)
+}
+
+/// Supervise a service-connected application generation until shutdown.
+///
+/// The connection is probed periodically. On a transient service failure the
+/// current generation is shut down completely, then `rebuild` is retried with
+/// [`service_reconnect_delay`] between attempts until it yields a replacement
+/// that reconnected, re-logged-in, reopened its databases, reinstalled its
+/// hooks, and reconciled persisted state. `shutdown` resolves when the process
+/// is asked to stop; it is honoured while probing and while waiting to
+/// reconnect. A generation that finishes on its own ends supervision with its
+/// result after its own teardown.
+pub async fn supervise_service<G, Rebuild, RebuildFuture, Shutdown, ShutdownFuture>(
+    mut generation: G,
+    mut rebuild: Rebuild,
+    shutdown: Shutdown,
+) -> anyhow::Result<()>
+where
+    G: ServiceGeneration,
+    Rebuild: FnMut() -> RebuildFuture,
+    RebuildFuture: std::future::Future<Output = anyhow::Result<G>>,
+    Shutdown: Fn() -> ShutdownFuture,
+    ShutdownFuture: std::future::Future<Output = ()>,
+{
+    let mut reconnect_attempt = 0u32;
+    loop {
+        let instance = generation.instance();
+        let probe = async {
+            probe_service(&instance).await?;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok::<(), ConnectError>(())
+        };
+        tokio::select! {
+            _ = shutdown() => {
+                generation.shutdown().await;
+                return Ok(());
+            }
+            result = generation.finished() => {
+                generation.shutdown().await;
+                return result;
+            }
+            result = probe => match result {
+                Ok(()) => reconnect_attempt = 0,
+                Err(error) if error.is_transient_service() => {
+                    tracing::warn!(%error, "Eidetica service disconnected; tearing down runtime before reconnect");
+                    generation = replace_service_generation(
+                        generation,
+                        |old| async move { old.shutdown().await },
+                        || async {
+                            loop {
+                                let delay = service_reconnect_delay(reconnect_attempt);
+                                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                tokio::select! {
+                                    _ = shutdown() => anyhow::bail!("shutdown requested"),
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                                match rebuild().await {
+                                    Ok(replacement) => {
+                                        tracing::info!("Eidetica service reconnected; runtime reopened and reconciled");
+                                        return Ok(replacement);
+                                    }
+                                    Err(next) if is_transient_rebuild_error(&next) => {
+                                        tracing::warn!(error = %next, "Eidetica service reconnect failed");
+                                    }
+                                    Err(next) => return Err(next),
+                                }
+                            }
+                        },
+                    )
+                    .await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+/// Shut the old generation down to completion, then construct its
+/// replacement. Split out so the ordering is testable without a service.
+pub async fn replace_service_generation<T, Shutdown, ShutdownFuture, Reconnect, ReconnectFuture>(
+    generation: T,
+    shutdown: Shutdown,
+    reconnect: Reconnect,
+) -> anyhow::Result<T>
+where
+    Shutdown: FnOnce(T) -> ShutdownFuture,
+    ShutdownFuture: std::future::Future<Output = ()>,
+    Reconnect: FnOnce() -> ReconnectFuture,
+    ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
+{
+    shutdown(generation).await;
+    reconnect().await
+}
+
+/// Block until the process is asked to stop. Ctrl-C covers foreground and
+/// container use; SIGTERM is what systemd and a test harness's teardown send,
+/// and without it a stop degrades into the kill that follows the timeout.
+pub async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler, Ctrl-C only: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Validate the required connector settings at the new API boundary.
 pub fn required_settings(
     config: &Config,
@@ -872,6 +1031,191 @@ eidetica:
             .unwrap();
         assert!(matches!(error, ConnectError::Login { .. }));
         assert!(!error.is_transient_service());
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_waits_for_shutdown_before_reconnect() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown_events = events.clone();
+        let reconnect_events = events.clone();
+        let replacement = replace_service_generation(
+            1,
+            move |_| async move {
+                shutdown_events.lock().unwrap().push("shutdown-complete");
+            },
+            move || async move {
+                reconnect_events.lock().unwrap().push("reconnected");
+                Ok(2)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement, 2);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["shutdown-complete", "reconnected"]
+        );
+    }
+
+    /// A generation whose transport work ends on its own, plus a record of
+    /// the order supervision tore it down in.
+    struct FinishingGeneration {
+        instance: Instance,
+        finish: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl ServiceGeneration for FinishingGeneration {
+        fn instance(&self) -> Instance {
+            self.instance.clone()
+        }
+
+        async fn finished(&mut self) -> anyhow::Result<()> {
+            match self.finish.take() {
+                Some(receiver) => receiver.await.unwrap_or_else(|_| Ok(())),
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.events.lock().unwrap().push("shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn supervision_tears_down_a_generation_that_finishes_on_its_own() {
+        let (_dir, shutdown, task, _owner, url) = service_fixture("shared").await;
+        let connected = connect_with(&settings(url.clone(), "shared"), ExecutionRole::Client)
+            .await
+            .unwrap();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let generation = FinishingGeneration {
+            instance: connected.instance,
+            finish: Some(finish_rx),
+            events: events.clone(),
+        };
+        let rebuilds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rebuild_count = rebuilds.clone();
+        let supervisor = tokio::spawn(supervise_service(
+            generation,
+            move || {
+                rebuild_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { anyhow::bail!("not expected") }
+            },
+            std::future::pending::<()>,
+        ));
+        finish_tx
+            .send(Err(anyhow::anyhow!("transport exited")))
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "transport exited");
+        assert_eq!(events.lock().unwrap().as_slice(), ["shutdown"]);
+        assert_eq!(rebuilds.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervision_rebuilds_after_the_service_goes_away() {
+        let (dir, shutdown, task, _owner, url) = service_fixture("shared").await;
+        let connected = connect_with(&settings(url.clone(), "shared"), ExecutionRole::Client)
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let generation = FinishingGeneration {
+            instance: connected.instance,
+            finish: None,
+            events: events.clone(),
+        };
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let rebuilt = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rebuilt_slot = rebuilt.clone();
+        let rebuild_events = events.clone();
+        let rebuild_url = url.clone();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let finish_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(finish_rx)));
+        let supervisor = tokio::spawn(supervise_service(
+            generation,
+            move || {
+                let events = rebuild_events.clone();
+                let url = rebuild_url.clone();
+                let rebuilt = rebuilt_slot.clone();
+                let finish_rx = finish_rx.clone();
+                async move {
+                    events.lock().unwrap().push("rebuild-attempt");
+                    let connected =
+                        connect_with(&settings(url, "shared"), ExecutionRole::Client).await?;
+                    *rebuilt.lock().unwrap() = Some(());
+                    Ok(FinishingGeneration {
+                        instance: connected.instance,
+                        finish: finish_rx.lock().unwrap().take(),
+                        events,
+                    })
+                }
+            },
+            move || {
+                let mut stop_rx = stop_rx.clone();
+                async move {
+                    while !*stop_rx.borrow() {
+                        if stop_rx.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            },
+        ));
+
+        // Kill the daemon: the first generation must be torn down before any
+        // rebuild attempt, and rebuilds keep failing while the socket is gone.
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let seen = events.lock().unwrap().clone();
+                if seen.len() >= 2 {
+                    assert_eq!(seen[0], "shutdown");
+                    assert!(seen[1..].iter().all(|event| *event == "rebuild-attempt"));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Bring the daemon back on the same socket and the replacement lands.
+        let socket = dir.path().join("service.sock");
+        let _ = std::fs::remove_file(&socket);
+        let (instance, _) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
+                .await
+                .unwrap();
+        let server = ServiceServer::bind(instance, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(server.run(receiver));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while rebuilt.lock().unwrap().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Ordinary shutdown ends supervision through the replacement's teardown.
+        stop_tx.send(true).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+        assert_eq!(events.lock().unwrap().last(), Some(&"shutdown"));
+        drop(finish_tx);
         drop(shutdown);
         task.await.unwrap().unwrap();
     }
