@@ -4633,3 +4633,231 @@ async fn auto_attach_honours_the_selected_agent_group() {
     assert_eq!(server.agent_group("solo"), Some(vec!["beta".to_string()]));
     assert!(server.agent_group("nope").is_none());
 }
+
+/// A transport-like frontend and an observer-like frontend share one Eidetica
+/// daemon login with the executor. Both submit turns, both observe every
+/// reply, only the executor calls the model, and the transport frontend's
+/// delivery progress is its own: a restart of that frontend re-delivers
+/// nothing, and the observer never consumes its pending output.
+#[tokio::test]
+async fn shared_login_transport_and_observer_frontends_keep_independent_progress() {
+    use crate::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
+    use eidetica::NewUser;
+    use eidetica::backend::database::InMemory;
+    use eidetica::crdt::Doc;
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("eidetica.sock");
+    let (owner, mut owner_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
+            .await
+            .unwrap();
+    let key = owner_user.get_default_key().unwrap();
+    let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
+    crate::session::Session::initialize_turn_schema(&db)
+        .await
+        .unwrap();
+    let root = db.root_id().clone();
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let url = format!("unix://{}", socket.display());
+    let settings = || crate::config::EideticaConfig {
+        connection: url.clone(),
+        login: crate::config::EideticaLoginConfig {
+            username: "shared".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let agents = || Arc::new(AgentRegistry::with_default_agent());
+
+    // The executor.
+    let executor =
+        crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Executor)
+            .await
+            .unwrap();
+    let executor_db = executor.user.open_database(&root).await.unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(executor.instance.clone(), executor.user, agents())
+            .await
+            .unwrap(),
+    );
+    let server = server_fixture_from_registry(registry.clone()).await.1;
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("reply to transport");
+    mock.push_text("reply to observer");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&executor_db, backend, Some("default".into()), None)
+        .await
+        .unwrap();
+
+    // The transport frontend: a client that delivers agent replies to a
+    // recording "room" with durable progress in the shared peer DB.
+    let transport =
+        crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
+    assert!(transport.capabilities.executor().is_err());
+    let transport_db = transport.user.open_database(&root).await.unwrap();
+    let transport_registry =
+        crate::session::SessionRegistry::new(transport.instance.clone(), transport.user, agents())
+            .await
+            .unwrap();
+    assert_eq!(
+        transport_registry.chaz_peer().root_id(),
+        registry.chaz_peer().root_id(),
+        "one login resolves one daemon-local chaz_peer"
+    );
+    let store = DeliveryStore::new(transport_registry.chaz_peer().clone());
+    let binding =
+        DeliveryBinding::new("matrix", "@chaz:example", "!room:example", root.to_string());
+    let room = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let attach_transport = {
+        let store = store.clone();
+        let binding = binding.clone();
+        let transport_db = transport_db.clone();
+        let room = room.clone();
+        move || {
+            let store = store.clone();
+            let binding = binding.clone();
+            let transport_db = transport_db.clone();
+            let room = room.clone();
+            async move {
+                DeliveryReconciler::attach(
+                    transport_db,
+                    store,
+                    binding,
+                    agents(),
+                    "default".into(),
+                    |body| vec![body.to_string()],
+                    move |chunk| {
+                        let room = room.clone();
+                        Box::pin(async move {
+                            room.lock().await.push(chunk.body);
+                            Ok(())
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        }
+    };
+    let reconciler = attach_transport().await;
+
+    // The observer frontend: a second client that only watches.
+    let observer = crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    assert!(observer.capabilities.executor().is_err());
+    let observer_db = observer.user.open_database(&root).await.unwrap();
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cursor = observer_db.snapshot().await.unwrap();
+    let _observer_callback = observer_db
+        .on_write_at_tips(cursor, move |_, _| {
+            let wake_tx = wake_tx.clone();
+            async move {
+                let _ = wake_tx.send(());
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let observed_reply = |content: &'static str| {
+        let observer_db = observer_db.clone();
+        let root = root.to_string();
+        async move {
+            let observed = Session::new(ConversationId(root), observer_db).await;
+            observed
+                .entries()
+                .iter()
+                .any(|entry| entry.sender == "default" && entry.content == content)
+        }
+    };
+
+    // Transport submits; executor answers; transport delivers; observer sees.
+    let mut transport_session =
+        Session::new(ConversationId(root.to_string()), transport_db.clone()).await;
+    transport_session
+        .add_entry(SessionEntry {
+            sender: "@human:example".into(),
+            content: "from the room".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let observed_reply = &observed_reply;
+        while room.lock().await.as_slice() != ["reply to transport"] {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        while !observed_reply("reply to transport").await {
+            wake_rx.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    // Observer submits; executor answers; the transport delivers that too.
+    let mut observer_session =
+        Session::new(ConversationId(root.to_string()), observer_db.clone()).await;
+    observer_session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "from the tui".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 2).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let observed_reply = &observed_reply;
+        while room.lock().await.len() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        while !observed_reply("reply to observer").await {
+            wake_rx.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        room.lock().await.as_slice(),
+        ["reply to transport", "reply to observer"]
+    );
+
+    // Only the executor ever ran a model turn.
+    assert_eq!(mock.recorded_calls().len(), 2);
+
+    // Restarting the transport frontend reconciles against its persisted
+    // progress: nothing is delivered twice.
+    reconciler.stop();
+    drop(reconciler);
+    let progress = store.load(&binding).await.unwrap().unwrap();
+    assert!(progress.delivered_through.is_some());
+    let reconciler = attach_transport().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(room.lock().await.len(), 2);
+    reconciler.stop();
+
+    drop(server);
+    drop(transport_registry);
+    drop(observer);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}

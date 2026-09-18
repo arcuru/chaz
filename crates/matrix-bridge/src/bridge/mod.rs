@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod history;
 
+use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
 use chaz_core::bridge::outbound::{
     chunk_message_bytes, is_transient_outbound_status, retry_outbound_chunk,
 };
@@ -21,7 +22,7 @@ use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
-use matrix_sdk::ruma::{OwnedEventId, TransactionId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedTransactionId};
 use matrix_sdk::{Room, RoomState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -103,40 +104,60 @@ fn owning_agent_entry(server: &Server, owning_agent: &str) -> Option<DbEntry> {
     server.agent_index().find_by_name(owning_agent)
 }
 
-/// Install the reconciling response callback for a Matrix room.
+/// Channels this login has outbound delivery installed for, keyed by
+/// `(room_id, session_db_id)` — the binding delivery progress is persisted
+/// under. A session bound to several rooms gets one reconciler per room, each
+/// with its own progress.
+type AttachedChannels = Arc<Mutex<HashMap<(String, String), Arc<DeliveryReconciler>>>>;
+
+/// Install durable outbound delivery and the approval watcher for a Matrix
+/// room.
 ///
-/// Thin transport adapter over [`chaz_core::bridge::attach_reconciler`]: the
-/// reconcile rule (delta scan, delivered-set, `[guest]` prefixing) lives in
-/// the lib; this only supplies the Matrix `send` closure — render markdown and
-/// hand it to `room.send`. This is the bridge's whole outbound path: the
-/// daemon writes the agent's reply into the (synced) session DB, the callback
-/// fires here, and the reply lands in the room.
+/// Thin transport adapter over [`chaz_core::bridge::delivery`]: the
+/// reconcile rule, persisted progress, retry schedule, and `[guest]`
+/// prefixing live in the lib; this only supplies the Matrix `send` closure —
+/// render markdown and hand it to `room.send` under the chunk's stable
+/// transaction ID, which lets the homeserver collapse a chunk repeated after
+/// a lost acknowledgement. This is the bridge's whole outbound path: the
+/// executor writes the agent's reply into the session DB, the callback fires
+/// here, and the reply lands in the room.
 async fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
-    agents: Arc<chaz_core::agent::AgentRegistry>,
+    server: &Server,
+    login_id: &str,
     owning_agent: String,
     pending: PendingApprovals,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<DeliveryReconciler>> {
     // Same session DB, two watchers: deliver agent replies, and surface tool
     // approval prompts the daemon proxied here.
     attach_approval_watcher(session_db, room.clone(), pending).await?;
-    chaz_core::bridge::attach_reconciler(
-        session_db,
-        agents,
+    let binding = DeliveryBinding::new(
+        "matrix",
+        login_id,
+        room.room_id().as_str(),
+        session_db.root_id().to_string(),
+    );
+    DeliveryReconciler::attach(
+        session_db.clone(),
+        DeliveryStore::new(server.registry().chaz_peer().clone()),
+        binding,
+        server.agents_arc(),
         owning_agent,
         |body| chunk_message_bytes(body, MATRIX_MESSAGE_LIMIT),
-        move |body| {
+        move |chunk| {
             let room = room.clone();
-            async move {
+            Box::pin(async move {
                 info!(
                     room_id = %room.room_id(),
-                    body_bytes = body.len(),
+                    body_bytes = chunk.body.len(),
                     "Delivering Matrix response"
                 );
-                let content = RoomMessageEventContent::text_markdown(&body);
-                // Reuse this ID across retries so the homeserver can deduplicate them.
-                let txn_id = TransactionId::new();
+                let content = RoomMessageEventContent::text_markdown(&chunk.body);
+                // Stable across in-call retries, durable retries, and
+                // restarts, so the homeserver deduplicates every repeat of
+                // this chunk it still remembers.
+                let txn_id = OwnedTransactionId::from(chunk.idempotency_key);
                 retry_outbound_chunk(
                     || {
                         let room = room.clone();
@@ -153,7 +174,7 @@ async fn attach_response_callback(
                 )
                 .await?;
                 Ok(())
-            }
+            })
         },
     )
     .await
@@ -274,7 +295,7 @@ fn help_text() -> String {
 
 /// `!chaz attach <session>` — bind this room to a specific session and install
 /// the response callback so future writes reach the room. Bridge-local because
-/// it touches the live `attached_sessions` set and matrix `Room`.
+/// it touches the live attached-channel map and matrix `Room`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     arg: &str,
@@ -282,7 +303,7 @@ async fn handle_attach(
     server: Arc<Server>,
     login_id: &str,
     owning_agent: &str,
-    attached_sessions: Arc<Mutex<HashSet<String>>>,
+    attached_channels: AttachedChannels,
     pending: PendingApprovals,
 ) {
     let arg = arg.trim();
@@ -332,22 +353,20 @@ async fn handle_attach(
         }
     }
 
-    // Install the response callback on the newly-attached session so future
+    // Install outbound delivery on the newly-attached session so future
     // writes (the daemon's replies, scheduler fires) reach this room.
-    let mut attached = attached_sessions.lock().await;
-    if attached.insert(target_sid.clone()) {
-        drop(attached);
-        if let Err(e) = attach_response_callback(
-            &target_db,
-            room.clone(),
-            server.agents_arc(),
-            owning_agent.to_string(),
-            pending.clone(),
-        )
-        .await
-        {
-            error!("Failed to attach response callback: {e}");
-        }
+    if let Err(e) = attach_once(
+        &attached_channels,
+        &target_db,
+        room.clone(),
+        &server,
+        login_id,
+        owning_agent,
+        pending.clone(),
+    )
+    .await
+    {
+        error!("Failed to attach response callback: {e}");
     }
 
     let _ = room
@@ -442,10 +461,9 @@ impl Bridge for MatrixBridge {
 
         info!("The client is ready! Listening to new messages…");
 
-        // Track which session DBs have the Matrix response callback installed.
-        // Keyed by session_db_id because a single session may be attached to
-        // multiple rooms (fan-out delivery).
-        let attached_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Rooms with outbound delivery installed, and the reconciler that
+        // owns each one's persisted progress.
+        let attached_channels: AttachedChannels = Arc::new(Mutex::new(HashMap::new()));
 
         // Posted tool-approval prompts awaiting a reaction/command, keyed by the
         // prompt's event id. Shared across the startup attach, the message
@@ -465,7 +483,7 @@ impl Bridge for MatrixBridge {
         {
             let server = server.clone();
             let client = mc.client().clone();
-            let attached_sessions = attached_sessions.clone();
+            let attached_channels = attached_channels.clone();
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let pending_approvals = pending_approvals.clone();
@@ -502,7 +520,8 @@ impl Bridge for MatrixBridge {
                         attach_existing_channel(
                             &server,
                             &client,
-                            &attached_sessions,
+                            &attached_channels,
+                            &login_id,
                             &owning_agent,
                             &room_id,
                             &r.session_db_id,
@@ -531,7 +550,7 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let allow_list = allow_list.clone();
-            let attached_sessions = attached_sessions.clone();
+            let attached_channels = attached_channels.clone();
             let message_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
@@ -547,7 +566,7 @@ impl Bridge for MatrixBridge {
                     let login_id = login_id.clone();
                     let owning_agent = owning_agent.clone();
                     let allow_list = allow_list.clone();
-                    let attached_sessions = attached_sessions.clone();
+                    let attached_channels = attached_channels.clone();
                     let message_counts = message_counts.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
                     let seen_events = seen_events.clone();
@@ -653,7 +672,7 @@ impl Bridge for MatrixBridge {
                                         server.clone(),
                                         &login_id,
                                         &owning_agent,
-                                        attached_sessions.clone(),
+                                        attached_channels.clone(),
                                         pending_approvals.clone(),
                                     )
                                     .await;
@@ -764,30 +783,20 @@ impl Bridge for MatrixBridge {
                         };
                         let session_db_id = session_db.root_id().to_string();
 
-                        // Install response callback if we haven't already, so
+                        // Install outbound delivery if we haven't already, so
                         // the daemon's reply reaches this room.
+                        if let Err(e) = attach_once(
+                            &attached_channels,
+                            &session_db,
+                            room.clone(),
+                            &server,
+                            &login_id,
+                            &owning_agent,
+                            pending_approvals.clone(),
+                        )
+                        .await
                         {
-                            let mut attached = attached_sessions.lock().await;
-                            if attached.insert(session_db_id.clone()) {
-                                drop(attached);
-                                if let Err(e) = attach_response_callback(
-                                    &session_db,
-                                    room.clone(),
-                                    server.agents_arc(),
-                                    owning_agent.clone(),
-                                    pending_approvals.clone(),
-                                )
-                                .await
-                                {
-                                    error!("Failed to register response callback: {e}");
-                                } else {
-                                    info!(
-                                        session_db_id = %session_db_id,
-                                        room_id = %room_id,
-                                        "Matrix response callback installed"
-                                    );
-                                }
-                            }
+                            error!("Failed to register response callback: {e}");
                         }
 
                         // Backfill room history on first message per room.
@@ -891,16 +900,54 @@ impl Bridge for MatrixBridge {
     }
 }
 
-/// Install the response-delivery callback for a persisted channel at startup.
-/// Skips rooms the bot isn't joined to, or sessions that fail to open. The
-/// bridge does not register the session for processing — the daemon does that
-/// when it sees the session exposed in the agent registry — so this only wires
-/// up outbound delivery.
+/// Install outbound delivery for `(room, session)` exactly once per process.
+/// A second call for the same binding is a no-op; the persisted progress is
+/// what makes a repeat install after a restart resume rather than replay.
+#[allow(clippy::too_many_arguments)]
+async fn attach_once(
+    attached: &AttachedChannels,
+    session_db: &eidetica::Database,
+    room: Room,
+    server: &Arc<Server>,
+    login_id: &str,
+    owning_agent: &str,
+    pending: PendingApprovals,
+) -> anyhow::Result<()> {
+    let key = (room.room_id().to_string(), session_db.root_id().to_string());
+    let mut attached = attached.lock().await;
+    if attached.contains_key(&key) {
+        return Ok(());
+    }
+    let reconciler = attach_response_callback(
+        session_db,
+        room,
+        server,
+        login_id,
+        owning_agent.to_string(),
+        pending,
+    )
+    .await?;
+    info!(
+        session_db_id = %key.1,
+        room_id = %key.0,
+        "Matrix outbound delivery installed"
+    );
+    attached.insert(key, reconciler);
+    Ok(())
+}
+
+/// Install outbound delivery for a persisted channel at startup. Skips rooms
+/// the bot isn't joined to, or sessions that fail to open. The bridge does not
+/// register the session for processing — the executor does that when it sees
+/// the session exposed in the agent registry — so this only wires up outbound
+/// delivery, and the first pass delivers whatever was committed while this
+/// bridge was down.
 #[allow(clippy::too_many_arguments)]
 async fn attach_existing_channel(
     server: &Arc<Server>,
     client: &matrix_sdk::Client,
-    attached_sessions: &Arc<Mutex<HashSet<String>>>,
+    attached: &AttachedChannels,
+    login_id: &str,
     owning_agent: &str,
     room_id: &str,
     session_db_id: &str,
@@ -919,28 +966,18 @@ async fn attach_existing_channel(
         return;
     };
 
-    {
-        let mut attached = attached_sessions.lock().await;
-        if !attached.insert(session_db_id.to_string()) {
-            return;
-        }
-    }
-
-    if let Err(e) = attach_response_callback(
+    if let Err(e) = attach_once(
+        attached,
         &session_db,
         room,
-        server.agents_arc(),
-        owning_agent.to_string(),
+        server,
+        login_id,
+        owning_agent,
         pending,
     )
     .await
     {
         error!("Failed to attach response callback at startup: {e}");
-    } else {
-        info!(
-            session_db_id,
-            room_id, "Matrix channel response callback installed at startup"
-        );
     }
 }
 

@@ -554,7 +554,11 @@ impl Session {
                 .any(|request| request.state == TurnRequestState::Queued))
     }
 
-    async fn entries_with_ids_at_snapshot(
+    /// Load the transcript rows with their stable row identities at an
+    /// immutable Eidetica snapshot. Row identity survives sync and rebase,
+    /// which makes it the key durable consumers (transport delivery progress)
+    /// track instead of timestamps or content.
+    pub async fn entries_with_ids_at_snapshot(
         database: &Database,
         snapshot: &Snapshot,
     ) -> anyhow::Result<Vec<(TurnRequestId, SessionEntry)>> {
@@ -1318,6 +1322,11 @@ impl Session {
     /// Get all entries in the session
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
+    }
+
+    /// Every loaded entry paired with its stable row identity, in transcript order.
+    pub fn entries_with_ids(&self) -> impl Iterator<Item = (&TurnRequestId, &SessionEntry)> {
+        self.entry_ids.iter().zip(self.entries.iter())
     }
 
     /// Get the underlying eidetica Database handle (for sharing with tools)

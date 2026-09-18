@@ -6,6 +6,7 @@ use chaz_core::config::Config;
 use chaz_core::{agent, config, instance, server, session};
 
 use clap::Parser;
+use std::sync::Arc;
 use std::time::Instant;
 use std::{fs::File, io::Read, path::PathBuf};
 use tracing::{error, info, warn};
@@ -368,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             return Ok(());
         }
-        wait_for_shutdown().await;
+        instance::wait_for_shutdown().await;
         info!("Shutdown signal received; stopping");
         Ok(())
     } else if let Some(a) = cmd_args {
@@ -401,106 +402,40 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn supervise_daemon_service(
-    mut config: Config,
+    config: Config,
     config_path: PathBuf,
-    mut built: server::BuiltServer,
+    built: server::BuiltServer,
 ) -> anyhow::Result<()> {
-    let mut reconnect_attempt = 0u32;
-    loop {
-        let probe = instance::probe_service(built.registry.instance());
-        tokio::select! {
-            _ = wait_for_shutdown() => {
-                built.shutdown().await;
-                return Ok(());
+    let config = Arc::new(config);
+    instance::supervise_service(
+        built,
+        move || {
+            let config = config.clone();
+            let config_path = config_path.clone();
+            async move {
+                let connected = instance::connect(&config).await?;
+                // A rebuild applies the same first-boot reconcile to a fresh
+                // copy of the parsed configuration; nothing here mutates the
+                // file or the previous generation's view of it.
+                let mut config = (*config).clone();
+                let replacement = server::build(
+                    &mut config,
+                    connected.instance,
+                    connected.user,
+                    server::BuildOptions::local(
+                        config_path,
+                        connected.capabilities,
+                        Vec::new(),
+                        server::McpReadiness::Deferred,
+                    ),
+                )
+                .await?;
+                Ok(replacement)
             }
-            result = probe => match result {
-                Ok(()) => {
-                    reconnect_attempt = 0;
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                Err(error) if error.is_transient_service() => {
-                    warn!(%error, "Eidetica service disconnected; tearing down runtime before reconnect");
-                    built = replace_service_generation(
-                        built,
-                        |old| async move { old.shutdown().await },
-                        || async {
-                            loop {
-                                let delay = instance::service_reconnect_delay(reconnect_attempt);
-                                reconnect_attempt = reconnect_attempt.saturating_add(1);
-                                tokio::select! {
-                                    _ = wait_for_shutdown() => anyhow::bail!("shutdown requested"),
-                                    _ = tokio::time::sleep(delay) => {}
-                                }
-                                match instance::connect(&config).await {
-                                    Ok(connected) => {
-                                        let replacement = server::build(
-                                            &mut config,
-                                            connected.instance,
-                                            connected.user,
-                                            server::BuildOptions::local(
-                                                config_path.clone(),
-                                                connected.capabilities,
-                                                Vec::new(),
-                                                server::McpReadiness::Deferred,
-                                            ),
-                                        ).await?;
-                                        info!("Eidetica service reconnected; runtime reopened and reconciled");
-                                        return Ok(replacement);
-                                    }
-                                    Err(next) if next.is_transient_service() => {
-                                        warn!(%next, "Eidetica service reconnect failed");
-                                    }
-                                    Err(next) => return Err(next.into()),
-                                }
-                            }
-                        },
-                    ).await?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-}
-
-async fn replace_service_generation<T, Shutdown, ShutdownFuture, Reconnect, ReconnectFuture>(
-    generation: T,
-    shutdown: Shutdown,
-    reconnect: Reconnect,
-) -> anyhow::Result<T>
-where
-    Shutdown: FnOnce(T) -> ShutdownFuture,
-    ShutdownFuture: std::future::Future<Output = ()>,
-    Reconnect: FnOnce() -> ReconnectFuture,
-    ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
-{
-    shutdown(generation).await;
-    reconnect().await
-}
-
-/// Block until the process is asked to stop. Ctrl-C covers foreground and
-/// container use; SIGTERM is what systemd and a test harness's teardown send,
-/// and without it a stop degrades into the kill that follows the timeout.
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to install SIGTERM handler, Ctrl-C only: {e}");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+        },
+        instance::wait_for_shutdown,
+    )
+    .await
 }
 
 /// `chaz usage` — open the eidetica DB read-only, walk the user-central
@@ -543,7 +478,7 @@ async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_service_generation, resolve_config_path, resolve_state_dir};
+    use super::{resolve_config_path, resolve_state_dir};
     use chaz_core::config::Config;
     use std::path::PathBuf;
 
@@ -608,29 +543,5 @@ mod tests {
         };
         assert!(chaz_core::instance::required_settings(&config).is_err());
         assert!(!state.exists());
-    }
-
-    #[tokio::test]
-    async fn replacement_waits_for_shutdown_before_reconnect() {
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let shutdown_events = events.clone();
-        let reconnect_events = events.clone();
-        let replacement = replace_service_generation(
-            1,
-            move |_| async move {
-                shutdown_events.lock().unwrap().push("shutdown-complete");
-            },
-            move || async move {
-                reconnect_events.lock().unwrap().push("reconnected");
-                Ok(2)
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(replacement, 2);
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            ["shutdown-complete", "reconnected"]
-        );
     }
 }

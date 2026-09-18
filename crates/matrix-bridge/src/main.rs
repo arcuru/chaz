@@ -1,39 +1,39 @@
-//! `chaz-matrix` — the standalone Matrix bridge, run as its own eidetica peer.
+//! `chaz-matrix` — the standalone Matrix bridge.
 //!
 //! This is its own process and `fn main()`, linking `chaz-core` + the
-//! `chaz-matrix-bridge` library. Unlike the old in-process path, it does **not**
-//! share the chaz daemon's database: it opens its **own** backend file, holds
-//! its **own** key, and reaches each agent's DB through an access ticket
-//! (`/agent share` on the daemon → `bootstrap_with_ticket` here), exactly the
-//! way `/agent import` works. It owns no agents and runs no routine engine —
-//! it is pure transport I/O: inbound Matrix messages are proxied into the
-//! session DBs, and the daemon (a separate peer syncing those DBs) runs the
-//! agents whose replies sync back and get delivered to the room.
+//! `chaz-matrix-bridge` library. It connects to Eidetica through the shared
+//! connector like every other Chaz process: its configuration names the
+//! connection, the existing login, and the execution role explicitly. As a
+//! direct owner it is its own Eidetica peer — its own backend, its own key —
+//! and reaches each agent's DB through an access ticket (`/agent share` on the
+//! executor → ticket bootstrap here). As a service client it shares the
+//! Eidetica daemon's login with the executor and holds the agent DBs already.
+//! Either way it is transport I/O: inbound Matrix messages are proxied into
+//! the session DBs, and the configured executor runs the agents whose replies
+//! are delivered to the room with durable per-room progress.
 //!
-//! Bring-up order is load-bearing: sync must be enabled before access can be
-//! bootstrapped, and the agent DBs must be ticket-bootstrapped before the
-//! `Server` is assembled (so the hosted index discovers them rather than
-//! minting local copies — see `BuildOptions::bootstrap_agents_from_config`).
+//! Bring-up order is load-bearing for a direct owner: sync is configured by
+//! the connector before access can be bootstrapped, and the agent DBs must be
+//! ticket-bootstrapped before the `Server` is assembled (so the hosted index
+//! discovers them rather than minting local copies).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chaz_core::agent_db::LoginRef;
 use chaz_core::bridge::Bridge;
+use chaz_core::bridge::process::{self, BridgeGeneration, LoginOutcome, LoginSpec, SyncIdentity};
 use chaz_core::bridge_db::{create_bridge_db, find_bridge_db};
-use chaz_core::bridge_identity::{
-    BRIDGE_KEY_NAME, BridgeIdentity, SyncBootstrap, ensure_bridge_key, establish_login,
-};
+use chaz_core::bridge_identity::{BRIDGE_KEY_NAME, BridgeIdentity, ensure_bridge_key};
 use chaz_core::config::Config;
+use chaz_core::instance::{self, ConnectedInstance, InstanceOwnership};
 use chaz_core::server;
-use chaz_core::session::BootstrapOutcome;
 
 use chaz_matrix_bridge::{MatrixBridge, MatrixBridgeConfig, MatrixCredentials};
 
 use clap::Parser;
-use eidetica::sync::DatabaseTicket;
+use eidetica::auth::crypto::PublicKey;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about = "Standalone Matrix bridge for chaz", long_about = None)]
@@ -137,9 +137,9 @@ fn parse_delay_ms(s: &str) -> Result<u64, String> {
 
 /// A login that bootstrapped access and has its credentials in hand, ready to
 /// spawn a [`MatrixBridge`].
+#[derive(Clone)]
 struct ReadyLogin {
-    login_id: String,
-    owning_agent: String,
+    spec: LoginSpec,
     creds: MatrixCredentials,
 }
 
@@ -212,8 +212,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!(config = %config_path.display(), label = %bridge_cfg.label, "Starting chaz-matrix");
 
-    // The bridge's OWN state dir — distinct from the chaz daemon's, since it is
-    // a separate peer with a separate backend.
+    // The bridge's own state dir: the Matrix client's sync token and session
+    // live here, and a direct owner's legacy store is expected at
+    // `<state_dir>/eidetica.db`.
     let base = bridge_cfg
         .state_dir
         .clone()
@@ -221,120 +222,71 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(|| dirs::state_dir().map(|d| d.join("chaz-matrix")))
         .ok_or_else(|| anyhow::anyhow!("could not determine a state directory"))?;
+
+    // Connect through the shared connector. Nothing is created implicitly:
+    // missing settings stop here with the exact example for this binary.
+    let mut connected = process::connect(&config, process::MATRIX, &base).await?;
     std::fs::create_dir_all(&base)?;
 
-    // Open this bridge's own eidetica peer (its own backend file, NOT the
-    // daemon's eidetica.db).
-    let eidetica_db_path = base.join("eidetica.db");
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz-matrix"),
-    )
-    .await?;
-    let mut user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz-matrix", None).await?,
-    };
-
-    // `--print-pubkey` resolves the bridge's identity and stops here,
-    // deliberately ahead of sync: binding a transport is pointless for a
-    // question about a key, and it would make the lookup fail on an
-    // already-taken port.
+    // `--print-pubkey` resolves the bridge's identity and stops here.
     if args.print_pubkey {
-        let key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await?;
+        let key = ensure_bridge_key(&mut connected.user, BRIDGE_KEY_NAME).await?;
         println!("{key}");
         return Ok(());
     }
 
-    // Enable sync up front — access bootstrap needs the live Sync handle, and
-    // it must be reachable so the daemon can serve the agent DBs we request.
-    instance.enable_sync().await?;
-    let sync = instance
-        .sync()
-        .ok_or_else(|| anyhow::anyhow!("sync failed to enable"))?;
-    {
-        use eidetica::sync::transports::iroh::IrohTransport;
-        sync.register_transport("iroh", IrohTransport::builder())
-            .await?;
-        if let Some(addr) = &config.sync_listen {
-            use eidetica::sync::transports::http::HttpTransport;
-            sync.register_transport("http", HttpTransport::builder().bind(addr))
-                .await?;
-            info!("Sync HTTP transport listening on {addr}");
-        }
-        sync.accept_connections().await?;
-        if let Ok(addr) = sync.get_server_address().await {
-            info!("chaz-matrix sync address: {addr}");
-        }
-    }
-
     // Bridge identity + its own settings DB, then seed credentials (idempotent).
-    let bridge_key = ensure_bridge_key(&mut user, BRIDGE_KEY_NAME).await?;
-    let (bridge_db, _) = match find_bridge_db(&user, &bridge_cfg.label).await {
+    let bridge_key = ensure_bridge_key(&mut connected.user, BRIDGE_KEY_NAME).await?;
+    let (bridge_db, _) = match find_bridge_db(&connected.user, &bridge_cfg.label).await {
         Some(found) => found,
-        None => create_bridge_db(&mut user, &bridge_cfg.label).await?,
+        None => create_bridge_db(&mut connected.user, &bridge_cfg.label).await?,
     };
     bridge_cfg.seed_into(&bridge_db).await?;
     let unlock = bridge_cfg.resolve_unlock_password()?;
     let bridge_db_id = bridge_db.id().to_string();
 
-    // Bring each configured login online: ticket-bootstrap Write on its agent
-    // DB, register the public pointer, and stash its resolved credentials.
-    // Logins still pending owner approval are skipped until a re-run.
-    // Where this bridge's sync identity is currently reachable. Published with
-    // every login pointer so the daemon can correct a record that would
-    // otherwise still name the address of a previous run — see `LoginRef`.
-    let peer_pubkey = sync.get_device_pubkey().ok().map(|k| k.to_string());
-    let sync_addresses = sync.get_all_server_addresses().await.unwrap_or_default();
+    // Bring each configured login online. A direct owner ticket-bootstraps
+    // Write on its agent DB and publishes where its sync identity is
+    // reachable; a service client already holds the agent DB. Logins still
+    // pending owner approval are skipped until a re-run.
+    let sync_identity = SyncIdentity::of(&connected).await;
     info!(
-        pubkey = ?peer_pubkey,
-        addresses = ?sync_addresses,
-        "Publishing this bridge's sync identity with its logins"
+        pubkey = ?sync_identity.peer_pubkey,
+        addresses = ?sync_identity.sync_addresses,
+        ownership = ?connected.capabilities.ownership(),
+        "Bringing Matrix logins online"
     );
-
-    let bootstrap = SyncBootstrap::new(sync.clone());
     let identity = BridgeIdentity {
         key: &bridge_key,
         key_name: BRIDGE_KEY_NAME,
     };
     let mut ready: Vec<ReadyLogin> = Vec::new();
     for entry in &bridge_cfg.logins {
-        let login_id = entry.login.login_id().to_string();
-        let ticket: DatabaseTicket = entry
-            .ticket
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid ticket for login {login_id}: {e}"))?;
-        let login_ref = LoginRef {
-            kind: "matrix".to_string(),
-            identifier: login_id.clone(),
-            bridge_db_id: bridge_db_id.clone(),
-            peer_pubkey: peer_pubkey.clone(),
-            // Stamped by `establish_login` from the key actually bootstrapped.
-            agent_pubkey: None,
-            sync_addresses: sync_addresses.clone(),
+        let spec = LoginSpec {
+            login_id: entry.login.login_id().to_string(),
+            agent: entry.agent.clone(),
+            ticket: entry.ticket.clone(),
         };
-        match establish_login(&mut user, &bootstrap, &sync, &identity, &ticket, login_ref).await? {
-            BootstrapOutcome::Approved => {
+        match process::bring_up_login(
+            &mut connected,
+            process::MATRIX,
+            &bridge_db_id,
+            &identity,
+            &sync_identity,
+            &spec,
+        )
+        .await?
+        {
+            LoginOutcome::Ready => {
                 let creds: MatrixCredentials = bridge_db
-                    .read_credentials(&login_id, &unlock)
+                    .read_credentials(&spec.login_id, &unlock)
                     .await?
                     .ok_or_else(|| {
-                        anyhow::anyhow!("no seeded credentials found for login {login_id}")
+                        anyhow::anyhow!("no seeded credentials found for login {}", spec.login_id)
                     })?;
-                ready.push(ReadyLogin {
-                    login_id,
-                    owning_agent: entry.agent.clone(),
-                    creds,
-                });
+                ready.push(ReadyLogin { spec, creds });
             }
-            BootstrapOutcome::Pending { message, .. } => {
-                warn!(
-                    login = %login_id,
-                    "Access pending owner approval ({message}); skipping. \
-                     Approve with /sharing approve on the daemon, then restart."
-                );
-            }
+            LoginOutcome::Pending(_) => {}
         }
     }
 
@@ -344,69 +296,137 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Assemble the Server WITHOUT minting agent DBs (already ticket-bootstrapped
-    // above) and WITHOUT the routine engine (pure I/O — the daemon runs agents).
-    let built_server = server::build(
+    let ownership = connected.capabilities.ownership();
+    let generation = build_generation(
         &mut config,
-        instance,
-        user,
-        server::BuildOptions {
-            config_path: config_path.clone(),
-            enable_sync: true, // idempotent — already enabled above
-            run_routine_engine: false,
-            bootstrap_agents_from_config: false,
-            // Dumb bridge: proxy + deliver only. The daemon runs agents.
-            run_agent_loop: false,
-            extra_auto_approved_tools: Vec::new(),
-            // Long-lived: MCP tools land whenever their servers finish.
-            mcp_readiness: server::McpReadiness::Deferred,
-            targeted_session: None,
-        },
+        &config_path,
+        &base,
+        connected,
+        &bridge_key,
+        &bridge_db_id,
+        &ready,
     )
     .await?;
-    let server = built_server.server.clone();
-    let secret_store = built_server.secret_store.clone();
 
-    // One MatrixBridge per ready login. The shutdown signal is never fired here
-    // (the supervisor terminates the process); it exists to satisfy the bridge's
-    // cooperative-shutdown contract.
-    let shutdown = Arc::new(Notify::new());
-    let mut handles = Vec::new();
-    for r in ready {
+    match ownership {
+        InstanceOwnership::Direct => process::run_direct(generation).await,
+        InstanceOwnership::Service => {
+            let context = Arc::new(RebuildContext {
+                config,
+                config_path,
+                base,
+                bridge_key,
+                bridge_db_id,
+                ready,
+            });
+            instance::supervise_service(
+                generation,
+                move || {
+                    let context = context.clone();
+                    async move {
+                        let connected = instance::connect(&context.config).await?;
+                        let mut config = context.config.clone();
+                        build_generation(
+                            &mut config,
+                            &context.config_path,
+                            &context.base,
+                            connected,
+                            &context.bridge_key,
+                            &context.bridge_db_id,
+                            &context.ready,
+                        )
+                        .await
+                    }
+                },
+                instance::wait_for_shutdown,
+            )
+            .await
+        }
+    }
+}
+
+/// Everything a service reconnect needs to rebuild the generation. The
+/// credentials were read before the first generation; a rebuild reuses them
+/// rather than reopening the bridge DB on the new connection.
+struct RebuildContext {
+    config: Config,
+    config_path: PathBuf,
+    base: PathBuf,
+    bridge_key: PublicKey,
+    bridge_db_id: String,
+    ready: Vec<ReadyLogin>,
+}
+
+/// Assemble the runtime on a connection and start one [`MatrixBridge`] per
+/// ready login against it. A service reconnect calls this again on a fresh
+/// connection after the previous generation is fully torn down.
+async fn build_generation(
+    config: &mut Config,
+    config_path: &Path,
+    base: &Path,
+    connected: ConnectedInstance,
+    bridge_key: &PublicKey,
+    bridge_db_id: &str,
+    ready: &[ReadyLogin],
+) -> anyhow::Result<BridgeGeneration> {
+    let capabilities = connected.capabilities;
+    // The explicit execution role decides whether this process runs agents;
+    // the bridge binary neither assumes nor forces client mode.
+    let built = server::build(
+        config,
+        connected.instance,
+        connected.user,
+        server::BuildOptions::local(
+            config_path.to_path_buf(),
+            capabilities,
+            Vec::new(),
+            // Long-lived: MCP tools land whenever their servers finish.
+            server::McpReadiness::Deferred,
+        ),
+    )
+    .await?;
+    let mut generation = BridgeGeneration::new(built, Arc::new(Notify::new()));
+    let server = generation.server();
+    let secret_store = generation.secret_store();
+    let shutdown = generation.shutdown_signal();
+
+    if capabilities.ownership() == InstanceOwnership::Service {
+        let identity = BridgeIdentity {
+            key: bridge_key,
+            key_name: BRIDGE_KEY_NAME,
+        };
+        for login in ready {
+            process::publish_service_login(
+                &server,
+                process::MATRIX,
+                bridge_db_id,
+                &identity,
+                &login.spec,
+            )
+            .await?;
+        }
+    }
+
+    for login in ready {
         let login_state_dir = base
             .join("matrix")
-            .join(sanitize_login_id(&r.login_id))
+            .join(sanitize_login_id(&login.spec.login_id))
             .to_string_lossy()
             .into_owned();
         let bridge = MatrixBridge::new(
-            r.creds,
-            r.login_id.clone(),
-            r.owning_agent.clone(),
+            login.creds.clone(),
+            login.spec.login_id.clone(),
+            login.spec.agent.clone(),
             Some(login_state_dir),
             config.clone(),
             secret_store.clone(),
             shutdown.clone(),
         )?;
         let server = server.clone();
-        info!(login = %r.login_id, agent = %r.owning_agent, "Matrix login spawned");
-        handles.push(tokio::spawn(async move { bridge.run(server).await }));
+        info!(login = %login.spec.login_id, agent = %login.spec.agent, "Matrix login spawned");
+        generation.spawn(async move { bridge.run(server).await });
     }
-
-    // Await every login bridge; surface the first error.
-    let mut result = Ok(());
-    for handle in handles {
-        let res = match handle.await {
-            Ok(res) => res,
-            Err(join) => Err(anyhow::anyhow!("matrix bridge task panicked: {join}")),
-        };
-        if let Err(e) = res {
-            error!("Matrix bridge error: {e}");
-            if result.is_ok() {
-                result = Err(e);
-            }
-        }
-    }
-    result
+    Ok(generation)
 }
 
 /// Per-login matrix-client state-dir component: keep it filesystem-safe by

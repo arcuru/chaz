@@ -150,15 +150,43 @@ DB hasn't synced over yet, `open_session` fails, the ref is skipped, and the nex
 registry sync-write re-runs the scan and retries. Registration is idempotent
 (`register_session` early-returns for an already-watched session).
 
-## Outbound: reconcile replies onto the transport
+## Outbound: durable delivery onto the transport
 
-Delivery is the transport-generic reconciler `attach_reconciler`
-(`chaz_core::bridge`), installed once per session. On every session write it
-re-derives the set of agent `Message` entries the transport hasn't shown yet
-(`undelivered_agent_messages`) and sends them in order, marking each delivered
-only **after** the transport `send` succeeds. A failed send stops the pass and
-leaves the tail for the next write — at-least-once, never silently dropped. The
-only transport-specific part is the `send` closure (`room.send` / `ChannelId::say`).
+Delivery is the transport-generic `DeliveryReconciler`
+(`chaz_core::bridge::delivery`), installed once per **binding** — the
+`(transport, login, channel, session)` tuple a bridge routes on. Progress is
+persisted per binding in the peer-local `chaz_peer` database (store
+`transport_delivery`), so two frontends sharing one Eidetica login keep
+independent progress and a session bound to several channels is delivered to
+each of them separately.
+
+A progress record has two parts: `delivered_through`, an Eidetica snapshot of
+the session at which every agent `Message` then present had been delivered, and
+`entries`, per-row marks (acknowledged chunk prefix, or complete) for rows
+delivered since that snapshot. A pass reads the session at its current
+snapshot, treats rows present at `delivered_through` as shown, sends the
+remaining agent messages in order, and writes a mark only **after** the
+transport acknowledged each chunk. When a pass ends converged, the snapshot
+advances and the marks are cleared, so the record stays bounded by in-flight
+work rather than session length. Rows are identified by their Eidetica table
+row key, which sync preserves; timestamps and content are not identity.
+
+Startup and reconnect reconcile against the record: a reply the executor
+committed while the bridge was down is delivered on the first pass, and a
+chunk prefix acknowledged before a crash is not re-sent. A binding with no
+record — a channel bound before progress was persisted — is baselined at the
+current snapshot once and reconciled thereafter. A failed send stops the pass
+in order and schedules a bounded-backoff retry (1s doubling to 60s) that does
+not wait for unrelated session activity; a later session write also triggers a
+pass.
+
+Every chunk carries a stable idempotency key derived from its binding, row, and
+index. Matrix sends it as the event transaction ID and Discord as an enforced
+message nonce, so a chunk repeated after a lost acknowledgement is collapsed by
+the transport within its deduplication window. Outside that window — a
+long-dead process, or a transport that cannot deduplicate — the repeat is
+visible. Delivery is at-least-once; nothing here claims exactly-once external
+delivery. The only transport-specific part is the `send` closure.
 
 ## Tool approvals over the session DB
 
@@ -178,8 +206,8 @@ Two `EntryType`s carry the protocol, correlated by a `request_id` (a UUID):
 
 Both are **control entries**, handled like `ToolCall`/`ToolResult`: excluded from
 LLM context (the context builder allowlists only `Message`/`Directive`/`Summary`),
-excluded from bridge message delivery (`undelivered_agent_messages` matches only
-`Message`), and ignored by `process_session` (its `should_process` match falls
+excluded from bridge message delivery (the reconciler delivers only agent
+`Message` rows), and ignored by `process_session` (its `should_process` match falls
 through to `_ => false`) so an approval entry **never wakes an agent turn**. The
 builders, parsers, and scan helpers are transport-generic, in `chaz_core::bridge`
 (`approval_request_entry`, `approval_decision_entry`, `parse_approval_*`,
@@ -309,7 +337,8 @@ ask in the first place (see [Security → Tool Approval](../user_guide/security.
 | Transport bindings               | `session::transport` (`bind_transport`, `transport_bindings`)                                                  |
 | Channel→session lookup           | `session::transport` (`get_or_create_channel_session`, `find_channel_session`)                                 |
 | Daemon registry-watch            | `server/build.rs` (`watch_agent_session_registries`, `register_exposed_sessions`)                              |
-| Outbound reconcile               | `chaz_core::bridge` (`attach_reconciler`, `undelivered_agent_messages`)                                        |
+| Outbound delivery                | `chaz_core::bridge::delivery` (`DeliveryReconciler`, `DeliveryStore`, `DeliveryBinding`)                       |
+| Bridge process startup           | `chaz_core::bridge::process` (`connect`, `bring_up_login`, `BridgeGeneration`), `instance::supervise_service`  |
 | Approval entry types + helpers   | `session::EntryType`, `chaz_core::bridge` (`approval_*`, `resolved_decisions`, `unrendered_approval_requests`) |
 | Approval proxy (daemon)          | `server/approval_proxy.rs` (`spawn_session_db_approval_proxy`)                                                 |
 | Approval render/capture (bridge) | `attach_approval_watcher`, `handle_approval_reaction`, `resolve_pending_approval` in each bridge crate         |
