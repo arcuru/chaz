@@ -246,6 +246,10 @@ again. Two bridges sharing one Eidetica login keep separate progress. A failed
 send is retried with bounded backoff (one second doubling to a minute) without
 waiting for new activity in the session.
 
+On the first start after upgrading a channel that has no delivery-progress
+record yet, existing agent messages can be repeated. The bridge treats them as
+unacknowledged rather than risk dropping a reply committed during the upgrade.
+
 The one window that can repeat a message is a crash between the transport
 accepting a chunk and the bridge recording it. Each chunk carries a stable
 idempotency key — a Matrix transaction ID, an enforced Discord nonce — so the
