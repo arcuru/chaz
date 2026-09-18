@@ -35,7 +35,7 @@ use eidetica::store::DocStore;
 use eidetica::{Database, Snapshot};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use super::render_outbound;
 use crate::agent::AgentRegistry;
@@ -218,14 +218,13 @@ pub struct DeliveryReconciler {
 }
 
 impl DeliveryReconciler {
-    /// Load or seed persisted progress, subscribe to session writes, and run
+    /// Load persisted progress, subscribe to session writes, and run
     /// the first pass so responses committed while this frontend was offline
     /// deliver without waiting for new activity.
     ///
-    /// A binding with no record — a channel bound before progress was
-    /// persisted — is seeded at the current session snapshot: the history it
-    /// already shows is the baseline, and only later writes deliver. Every
-    /// later start reconciles against the record instead.
+    /// A binding with no record starts with no acknowledged progress. This can
+    /// repeat history when upgrading a pre-progress bridge, but it cannot
+    /// silently discard a response committed while that bridge was offline.
     pub async fn attach(
         session_db: Database,
         store: DeliveryStore,
@@ -263,18 +262,9 @@ impl DeliveryReconciler {
         let progress = match store.load(&binding).await? {
             Some(progress) => progress,
             None => {
-                let seeded = DeliveryProgress {
-                    delivered_through: Some(session_db.snapshot().await?),
-                    entries: BTreeMap::new(),
-                };
-                store.save(&binding, &seeded).await?;
-                info!(
-                    transport = %binding.transport,
-                    channel = %binding.channel,
-                    session_db_id = %binding.session_db_id,
-                    "No persisted delivery progress for this binding; baselined at current history"
-                );
-                seeded
+                let progress = DeliveryProgress::default();
+                store.save(&binding, &progress).await?;
+                progress
             }
         };
         let (stop, _) = watch::channel(false);
@@ -329,7 +319,7 @@ impl DeliveryReconciler {
     /// Cancel any pending durable retry. Session writes still reach this
     /// reconciler until its database handle's instance is dropped.
     pub fn stop(&self) {
-        let _ = self.stop.send(true);
+        self.stop.send_replace(true);
     }
 
     /// Run one pass and, if anything is still undelivered, schedule a retry.
@@ -607,9 +597,8 @@ mod tests {
     async fn a_response_committed_while_offline_delivers_on_reattach() {
         let fx = fixture().await;
         write(&fx.session_db, "user", "hello").await;
-        write(&fx.session_db, "default", "shown already").await;
 
-        // First attach: no record, so existing history is the baseline.
+        // Establish acknowledged progress before the frontend goes offline.
         let transport = Arc::new(Transport::default());
         let reconciler = attach(&fx, "room", &transport, one_chunk).await;
         assert!(transport.bodies().await.is_empty());
@@ -636,6 +625,27 @@ mod tests {
         assert_eq!(
             transport.bodies().await,
             vec!["answered offline", "and again"]
+        );
+        reconciler.stop();
+    }
+
+    #[tokio::test]
+    async fn a_missing_progress_record_never_discards_existing_responses() {
+        let fx = fixture().await;
+        write(&fx.session_db, "user", "hello").await;
+        write(
+            &fx.session_db,
+            "default",
+            "possibly committed while offline",
+        )
+        .await;
+
+        let transport = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "room", &transport, one_chunk).await;
+
+        assert_eq!(
+            transport.bodies().await,
+            vec!["possibly committed while offline"]
         );
         reconciler.stop();
     }

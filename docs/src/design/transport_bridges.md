@@ -174,11 +174,12 @@ row key, which sync preserves; timestamps and content are not identity.
 Startup and reconnect reconcile against the record: a reply the executor
 committed while the bridge was down is delivered on the first pass, and a
 chunk prefix acknowledged before a crash is not re-sent. A binding with no
-record — a channel bound before progress was persisted — is baselined at the
-current snapshot once and reconciled thereafter. A failed send stops the pass
-in order and schedules a bounded-backoff retry (1s doubling to 60s) that does
-not wait for unrelated session activity; a later session write also triggers a
-pass.
+record starts with no acknowledged progress. An upgrade from a pre-progress
+bridge can therefore repeat existing agent messages, but it cannot silently
+discard a response committed while the bridge was offline. A failed send stops
+the pass in order and schedules a bounded-backoff retry (1s doubling to 60s)
+that does not wait for unrelated session activity; a later session write also
+triggers a pass.
 
 Every chunk carries a stable idempotency key derived from its binding, row, and
 index. Matrix sends it as the event transaction ID and Discord as an enforced
