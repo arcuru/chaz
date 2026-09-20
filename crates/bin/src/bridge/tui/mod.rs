@@ -33,6 +33,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
 mod bridge_impl;
@@ -1402,10 +1403,10 @@ fn spawn_session_metadata_load<F, Fut>(
     app: &mut App,
     requested: Vec<SessionIndex>,
     tx: mpsc::Sender<SessionLoad>,
-    mut load: F,
+    load: F,
 ) where
-    F: FnMut(SessionIndex) -> Fut + Send + 'static,
-    Fut: Future<Output = SessionInfo> + Send,
+    F: Fn(SessionIndex) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = SessionInfo> + Send + 'static,
 {
     let generation = app.session_generation;
     let limit = app.session_metadata_limit.clone();
@@ -1417,20 +1418,26 @@ fn spawn_session_metadata_load<F, Fut>(
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let worker_cancel = cancel.clone();
     tokio::spawn(async move {
+        let load = Arc::new(load);
+        let mut rows = JoinSet::new();
         for index in requested {
-            if worker_cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let Ok(_permit) = limit.acquire().await else {
-                break;
-            };
-            if worker_cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let info = load(index).await;
-            if worker_cancel.load(Ordering::Relaxed) {
-                break;
-            }
+            let limit = limit.clone();
+            let load = load.clone();
+            let worker_cancel = worker_cancel.clone();
+            rows.spawn(async move {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let _permit = limit.acquire_owned().await.ok()?;
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let info = load(index).await;
+                (!worker_cancel.load(Ordering::Relaxed)).then_some(info)
+            });
+        }
+
+        while let Some(Ok(Some(info))) = rows.join_next().await {
             if tx
                 .send(SessionLoad::Row { generation, info })
                 .await
@@ -2313,13 +2320,22 @@ mod session_picker_tests {
         assert!(requested.len() < app.session_list.len());
 
         let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = opens.clone();
+        let observed_active = active.clone();
+        let observed_max = max_active.clone();
         let (tx, mut rx) = mpsc::channel(32);
         spawn_session_metadata_load(&mut app, requested, tx, move |index| {
             let observed = observed.clone();
+            let active = observed_active.clone();
+            let max_active = observed_max.clone();
             async move {
                 observed.fetch_add(1, Ordering::Relaxed);
+                let now_active = active.fetch_add(1, Ordering::Relaxed) + 1;
+                max_active.fetch_max(now_active, Ordering::Relaxed);
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                active.fetch_sub(1, Ordering::Relaxed);
                 let mut row = SessionInfo::placeholder(&index);
                 row.loaded = true;
                 row
@@ -2327,11 +2343,12 @@ mod session_picker_tests {
         });
 
         tokio::task::yield_now().await;
-        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        assert_eq!(opens.load(Ordering::Relaxed), 4);
+        assert_eq!(max_active.load(Ordering::Relaxed), 4);
         app.cancel_session_fill();
         tokio::time::advance(std::time::Duration::from_secs(10)).await;
         tokio::task::yield_now().await;
-        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        assert_eq!(opens.load(Ordering::Relaxed), 4);
         assert!(rx.try_recv().is_err());
     }
 }

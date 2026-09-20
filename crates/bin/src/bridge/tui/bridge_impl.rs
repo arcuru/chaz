@@ -300,6 +300,9 @@ impl Bridge for TuiBridge {
                             }
                         }
                     }
+                    if matches!(app.mode, TuiMode::SessionPicker) {
+                        request_session_metadata(&mut app, &server, &session_rows_tx);
+                    }
                 }
                 Action::SessionChanged(id) => {
                     if let Some(idx) = app.tab_index_for(&id) {
