@@ -40,14 +40,17 @@ pub async fn collect_session_infos(registry: &SessionRegistry) -> anyhow::Result
 /// Load mutable metadata for one picker row without constructing a `Session`
 /// or reading its transcript. A failed open leaves the catalog row usable.
 pub async fn load_session_metadata(registry: &SessionRegistry, index: SessionIndex) -> SessionInfo {
-    let meta = match registry.open_session(&index.session_db_id).await {
-        Ok((_conv_id, db)) => Some(crate::session::read_meta_from_db(&db).await),
-        Err(_) => None,
+    let (agent_name, meta_name) = match registry.open_session(&index.session_db_id).await {
+        Ok((_conv_id, db)) => {
+            let meta = crate::session::read_meta_from_db(&db).await;
+            (meta.agent_name, meta.name)
+        }
+        Err(_) => (None, None),
     };
     SessionInfo {
         session_db_id: index.session_db_id,
-        agent_name: meta.as_ref().and_then(|meta| meta.agent_name.clone()),
-        name: index.name.or_else(|| meta.and_then(|meta| meta.name)),
+        agent_name,
+        name: meta_name.or(index.name),
         bridge: index.bridge,
         created_at: index.created_at,
         status: index.status,
@@ -817,6 +820,19 @@ mod listing_tests {
             .await
             .unwrap();
         assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+
+        let mut stale_index = registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.session_db_id == id)
+            .unwrap();
+        stale_index.name = Some("stale-alias".into());
+        let canonical = load_session_metadata(&registry, stale_index).await;
+        assert_eq!(canonical.name.as_deref(), Some("large-session"));
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+
         let rows = collect_session_infos(&registry).await.unwrap();
 
         let row = rows.iter().find(|row| row.session_db_id == id).unwrap();
