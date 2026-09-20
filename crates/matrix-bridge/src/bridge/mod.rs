@@ -234,13 +234,7 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
                         .as_deref()
                         .map(|n| format!(" \"{n}\""))
                         .unwrap_or_default();
-                    s.push_str(&format!(
-                        "\n  {}{} ({}, {} entries)",
-                        info.session_db_id, name, agent, info.entry_count
-                    ));
-                    if let Some(preview) = &info.last_message {
-                        s.push_str(&format!("\n    {preview}"));
-                    }
+                    s.push_str(&format!("\n  {}{} ({})", info.session_db_id, name, agent));
                 }
                 s
             }

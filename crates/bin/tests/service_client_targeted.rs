@@ -138,6 +138,10 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(elapsed < std::time::Duration::from_secs(10));
+    let listing = String::from_utf8_lossy(&output.stdout);
+    assert!(listing.contains("selected-session"));
+    assert!(!listing.contains(" entries"));
+    assert!(!listing.contains('$'));
     let command_log = std::fs::read_dir(&state_dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -172,6 +176,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     let (output, elapsed) = run(&["cmd", "/sessions"]);
     assert!(output.status.success());
     assert!(elapsed < std::time::Duration::from_secs(10));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(" entries"));
     assert_eq!(
         registry.list_sessions().await.unwrap().len(),
         initial_count + 1

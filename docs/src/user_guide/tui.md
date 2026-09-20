@@ -225,21 +225,18 @@ Open with `/sessions` or `/s`:
 ```text
 +--[ Sessions ]---------------------------------------+
 |                                                     |
-| > sha256:abc… "tui" * (default, 15 entries)         |
-|     user: What's the current time?                  |
+| > sha256:abc… "tui" * [tui] default • 2h ago       |
 |                                                     |
-|   sha256:def… (default, 42 entries)                 |
-|     user: Tell me about quantum computing           |
+|   sha256:def… [matrix] default • 1d ago             |
 |                                                     |
-|   sha256:xyz… (researcher, 3 entries)               |
-|     default: Research the latest AI papers          |
+|   sha256:xyz… [spawn] researcher • 4d ago           |
 |                                                     |
 +-----------------------------------------------------+
 | [Up/Down] navigate | [Enter] select | [n] new | ... |
 +-----------------------------------------------------+
 ```
 
-Sessions are listed by their eidetica DB root ID; any attached Matrix rooms or human-friendly names appear alongside. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows around the cursor, so navigation and cancel remain available while storage is slow. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
 
 ## Named Sessions
 

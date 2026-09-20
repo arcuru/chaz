@@ -355,6 +355,9 @@ pub struct SessionIndex {
     pub bridge: BridgeKind,
     pub created_at: Option<DateTime<Utc>>,
     pub status: SessionStatus,
+    /// Human-friendly alias from the peer-local name index. Unlike
+    /// per-session metadata, this is available without opening the session DB.
+    pub name: Option<String>,
 }
 
 /// Normalized bridge-of-origin derived from the session's `source` tag.
@@ -416,9 +419,8 @@ pub enum SessionStatus {
 ///
 /// Stored in `chaz_group`'s `session_catalog` DocStore (one entry per session
 /// ever created on this peer). Caches only fields that don't drift after
-/// creation — `name` and `agent_name` are intentionally NOT cached here, since
-/// they live canonically in `SessionMeta` inside each session's own DB and
-/// would require an update hook at every meta-write site.
+/// creation. Mutable names come from the companion `session_names` index;
+/// agent metadata remains canonical in each session DB and is loaded on demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCatalogEntry {
     pub session_db_id: String,
@@ -1534,27 +1536,6 @@ async fn write_field(store: &DocStore, key: &str, value: Option<&str>) -> anyhow
     Ok(())
 }
 
-/// Find the most recent `Message` entry and produce a short single-line
-/// preview ("sender: first line of content…") suitable for session listings.
-/// Returns `None` if no `Message` entry exists. Shared between the
-/// `list_sessions()` cold path and the TUI picker's row-patch warm path so
-/// both code paths produce identical previews.
-pub fn summarize_last_message(entries: &[SessionEntry]) -> Option<String> {
-    entries
-        .iter()
-        .rev()
-        .find(|e| e.entry_type == EntryType::Message)
-        .map(|e| {
-            let preview = e.content.lines().next().unwrap_or("");
-            let truncated = crate::util::truncate_chars(preview, 60);
-            if truncated.len() < preview.len() {
-                format!("{}: {truncated}…", e.sender)
-            } else {
-                format!("{}: {preview}", e.sender)
-            }
-        })
-}
-
 /// What a session's own entries say about where it began: the timestamp of
 /// its earliest entry, and the `"{transport}:{channel}"` source tag of the
 /// first entry that arrived over a bridge.
@@ -1576,29 +1557,6 @@ pub fn session_origin(entries: &[SessionEntry]) -> (Option<DateTime<Utc>>, Optio
         .find_map(|e| e.routing.as_ref()?.source.as_ref())
         .map(|s| format!("{}:{}", s.transport, s.channel));
     (started_at, source)
-}
-
-/// Sum `ResponseMetadata.usage.cost_usd` across an in-memory entry slice.
-/// Returns `(total_cost_usd, cost_reported, llm_call_count)`.
-///
-/// Shared between `list_sessions()` (which walks every session's entries on
-/// catalog open) and the TUI's per-row cache-patch path (which recomputes
-/// just one row's totals when a watched session DB fires `on_write`). Both
-/// see the same in-memory entries, so the cache stays in lock-step with
-/// what `list_sessions()` would have produced from a cold read.
-pub fn sum_session_cost(entries: &[SessionEntry]) -> (f64, bool, u32) {
-    let mut total = 0.0_f64;
-    let mut reported = false;
-    let mut calls = 0u32;
-    for entry in entries {
-        let Some(m) = &entry.metadata else { continue };
-        calls += 1;
-        if let Some(c) = m.usage.cost_usd {
-            total += c;
-            reported = true;
-        }
-    }
-    (total, reported, calls)
 }
 
 /// Extract `@<token>` mentions from free-form text. Returns the tokens

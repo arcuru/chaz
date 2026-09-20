@@ -13,10 +13,7 @@ impl Bridge for TuiBridge {
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
-        // Async session-picker fill: the background walk streams one loaded
-        // row per session here. Buffered generously so a fast walk over a
-        // large catalog doesn't stall on the render cadence.
-        let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionInfo>(128);
+        let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
 
         let (_conv_id, session_db) = default_tui_session(&server).await?;
         let session_db_id = session_db.root_id().to_string();
@@ -62,24 +59,10 @@ impl Bridge for TuiBridge {
         // skipped when an initial prompt was supplied — the user already
         // signalled "I want to send something now," not "show me sessions."
         if self.initial_prompt.is_none() {
-            // Decide whether to auto-open the picker from the cheap catalog
-            // walk (one registry txn, no per-session DB opens) — a fresh
-            // install with only the just-created empty default session goes
-            // straight to chat. When there's prior history, open the picker
-            // via the async-fill path so a large catalog doesn't block launch.
-            // `entry_count > 0` on the lone default session also counts as
-            // "known" — its entries are already loaded on the active tab, so
-            // check them directly rather than opening the DB again.
-            let has_known = match server.registry().list_sessions().await {
-                Ok(indices) => indices.len() > 1 || !app.active().entries.is_empty(),
-                Err(_) => false,
-            };
-            if has_known {
-                // Placeholder rows appear instantly; real counts / cost /
-                // names stream in as `Action::SessionRowReady`. Always land
-                // on the "New session" row when the picker first opens.
-                open_session_picker(&mut app, &server, &session_rows_tx).await;
-            }
+            // Enter a responsive loading state before touching the catalog.
+            // Once it arrives, a truly fresh one-session state falls through
+            // to chat; prior history keeps the picker open.
+            open_session_picker(&mut app, &server, &session_rows_tx, true);
         }
 
         loop {
@@ -96,7 +79,7 @@ impl Bridge for TuiBridge {
                 Some(id) = notify_rx.recv() => Action::SessionChanged(id),
                 Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                 Some(res) = models_rx.recv() => Action::ModelsFetched(res),
-                Some(info) = session_rows_rx.recv() => Action::SessionRowReady(info),
+                Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
             };
 
             match action {
@@ -191,15 +174,7 @@ impl Bridge for TuiBridge {
                                 session_db_id,
                                 name,
                             } => {
-                                apply_picker_rename(
-                                    &mut app,
-                                    &server,
-                                    &backend,
-                                    &self.secrets,
-                                    session_db_id,
-                                    name,
-                                )
-                                .await;
+                                apply_picker_rename(&mut app, &server, session_db_id, name).await;
                                 continue;
                             }
                             input::OverlayKey::NotConsumed => {}
@@ -236,11 +211,7 @@ impl Bridge for TuiBridge {
                                     )
                                     .await;
                                 } else {
-                                    // Navigation (or a no-op key) — bring the
-                                    // rows around the new cursor to the front
-                                    // of the fill queue so the visible window
-                                    // loads first.
-                                    app.reprioritize_session_fill();
+                                    request_session_metadata(&mut app, &server, &session_rows_tx);
                                 }
                             }
                             TuiMode::ModelPicker => {
@@ -399,25 +370,16 @@ impl Bridge for TuiBridge {
                             seed_session_settings_snapshot(&mut app, &server).await;
                         }
 
-                        // Keep the picker cache in lock-step with this tab's
-                        // entries so the next picker open doesn't show stale
-                        // counts / cost / name.
+                        // Keep mutable row metadata in lock-step without
+                        // deriving transcript summaries for the picker.
                         if let Some(row) = app
                             .session_list
                             .iter_mut()
                             .find(|s| s.session_db_id == db_id)
                         {
-                            let entries_ref = &app.tabs[idx].entries;
-                            row.entry_count = entries_ref.len();
                             row.name = meta.name.clone();
                             row.agent_name = meta.agent_name.clone();
-                            row.last_message =
-                                chaz_core::session::summarize_last_message(entries_ref);
-                            let (cost, reported, calls) =
-                                chaz_core::session::sum_session_cost(entries_ref);
-                            row.total_cost_usd = cost;
-                            row.cost_reported = reported;
-                            row.llm_call_count = calls;
+                            row.loaded = true;
                         }
                     }
                 }
@@ -447,32 +409,23 @@ impl Bridge for TuiBridge {
                         }
                     }
                 }
-                Action::SessionRowReady(info) => {
-                    // Patch the placeholder row in place by id (not index) —
-                    // the user may have scrolled since the walk queued it, and
-                    // ordering is stable so a stale index would corrupt rows.
-                    if let Some(row) = app
-                        .session_list
-                        .iter_mut()
-                        .find(|s| s.session_db_id == info.session_db_id)
-                    {
-                        // Only a still-placeholder row counts toward the
-                        // remaining tally; a row already refreshed by
-                        // Action::SessionChanged (in-tab edit) shouldn't
-                        // double-decrement.
-                        if !row.loaded {
-                            app.session_fill_remaining =
-                                app.session_fill_remaining.saturating_sub(1);
+                Action::SessionLoad(load) => match load {
+                    SessionLoad::Catalog { generation, result } => {
+                        match apply_session_catalog_result(&mut app, generation, result) {
+                            CatalogLoadOutcome::Loaded { fresh_default } if fresh_default => {
+                                app.mode = TuiMode::Chat;
+                                app.cancel_session_fill();
+                            }
+                            CatalogLoadOutcome::Loaded { .. } => {
+                                request_session_metadata(&mut app, &server, &session_rows_tx)
+                            }
+                            CatalogLoadOutcome::Ignored | CatalogLoadOutcome::Failed => {}
                         }
-                        *row = info;
                     }
-                    // Whole catalog loaded — mark the cache fresh so the next
-                    // open short-circuits, and drop the (now-drained) worker.
-                    if app.session_fill_remaining == 0 {
-                        app.session_list_fresh = true;
-                        app.cancel_session_fill();
+                    SessionLoad::Row { generation, info } => {
+                        apply_session_row(&mut app, generation, info);
                     }
-                }
+                },
             }
 
             // The picker owns the background fill; the moment we're not in it,

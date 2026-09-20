@@ -6,6 +6,7 @@
 
 use crate::session::{EntryType, Session, SessionIndex, SessionRegistry};
 use crate::types::ConversationId;
+use futures::{StreamExt, stream};
 
 use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 
@@ -24,77 +25,40 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
 /// One-shot `/sessions` uses this so a read-only catalog command does not
 /// manufacture and attach a throwaway CLI session first.
 pub async fn collect_session_infos(registry: &SessionRegistry) -> anyhow::Result<Vec<SessionInfo>> {
-    let indices = match registry.list_sessions().await {
-        Ok(b) => b,
-        Err(e) => return Err(e),
-    };
-
-    let mut sessions = Vec::with_capacity(indices.len());
-    for index in indices {
-        sessions.push(load_single_session_info(registry, index).await);
-    }
+    let indices = registry.list_sessions().await?;
+    let mut sessions: Vec<_> = stream::iter(indices)
+        .map(|index| load_session_metadata(registry, index))
+        .buffer_unordered(8)
+        .collect()
+        .await;
 
     sort_session_infos(&mut sessions);
 
     Ok(sessions)
 }
 
-/// Load the full per-session `SessionInfo` for one catalog index. Opens the
-/// session DB and folds its entries to compute entry_count, last_message,
-/// cost rollup, and reads meta for name/agent. This is the expensive part of
-/// listing — one DB open + entry fold per session.
-///
-/// Factored out of `list_sessions` so a bridge can fill picker rows one at a
-/// time (async fill): the synchronous `list_sessions` is now a thin loop over
-/// this helper, and the TUI walks the catalog off-thread calling it per row.
-/// A failed open yields a zeroed-but-`loaded` row rather than dropping the
-/// session, matching the pre-refactor behavior.
-pub async fn load_single_session_info(
-    registry: &SessionRegistry,
-    index: SessionIndex,
-) -> SessionInfo {
-    let (entry_count, last_message, meta_name, meta_agent, cost_total, cost_reported, calls) =
-        match registry.open_session(&index.session_db_id).await {
-            Ok((conv_id, db)) => {
-                let session = Session::new(conv_id, db).await;
-                let meta = session.read_meta().await;
-                let entries = session.entries();
-                let count = entries.len();
-                let last = crate::session::summarize_last_message(entries);
-                let (cost_total, cost_reported, calls) = crate::session::sum_session_cost(entries);
-                (
-                    count,
-                    last,
-                    meta.name,
-                    meta.agent_name,
-                    cost_total,
-                    cost_reported,
-                    calls,
-                )
-            }
-            Err(_) => (0, None, None, None, 0.0, false, 0),
-        };
+/// Load mutable metadata for one picker row without constructing a `Session`
+/// or reading its transcript. A failed open leaves the catalog row usable.
+pub async fn load_session_metadata(registry: &SessionRegistry, index: SessionIndex) -> SessionInfo {
+    let meta = match registry.open_session(&index.session_db_id).await {
+        Ok((_conv_id, db)) => Some(crate::session::read_meta_from_db(&db).await),
+        Err(_) => None,
+    };
     SessionInfo {
         session_db_id: index.session_db_id,
-        agent_name: meta_agent,
-        name: meta_name,
-        entry_count,
-        last_message,
+        agent_name: meta.as_ref().and_then(|meta| meta.agent_name.clone()),
+        name: index.name.or_else(|| meta.and_then(|meta| meta.name)),
         bridge: index.bridge,
         created_at: index.created_at,
         status: index.status,
-        total_cost_usd: cost_total,
-        cost_reported,
-        llm_call_count: calls,
         loaded: true,
     }
 }
 
 /// Order sessions for display: most-recently created first, with legacy
 /// (`created_at = None`) sessions sorted to the end so fresh sessions are
-/// always near the top. Shared by the synchronous `list_sessions` and the
-/// TUI's async fill so placeholder rows and loaded rows land in the same
-/// stable order (rows patch in place by id, not by position).
+/// always near the top. Rows patch in place by id and never reorder as lazy
+/// metadata arrives.
 pub fn sort_session_infos(sessions: &mut [SessionInfo]) {
     sessions.sort_by(|a, b| match (a.created_at, b.created_at) {
         (Some(x), Some(y)) => y.cmp(&x),
@@ -808,4 +772,68 @@ pub(super) async fn list_backends(ctx: &CommandContext<'_>) -> CommandOutcome {
         ctx.backend.list_known_models().join("\n")
     );
     CommandOutcome::Text(msg)
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::session::{EntryType, Session, SessionEntry};
+    use crate::test_support::fresh_session_registry;
+
+    #[tokio::test]
+    async fn listing_is_metadata_only_regardless_of_transcript_size() {
+        let (instance, registry) = fresh_session_registry().await;
+        let (conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let id = db.root_id().to_string();
+        registry
+            .set_session_name(&id, "large-session".into())
+            .await
+            .unwrap();
+
+        let mut session = Session::new(conv, db).await;
+        for n in 0..128 {
+            session
+                .add_entry(SessionEntry {
+                    sender: "user".into(),
+                    content: format!("transcript payload {n}"),
+                    timestamp: chrono::Utc::now(),
+                    entry_type: EntryType::Message,
+                    metadata: None,
+                    routing: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let engine = instance.backend().local_engine().unwrap();
+        let memory = engine
+            .as_any()
+            .downcast_ref::<eidetica::backend::database::InMemory>()
+            .unwrap();
+        let root = eidetica::entry::ID::parse(&id).unwrap();
+        instance
+            .backend()
+            .clear_derived_store_state()
+            .await
+            .unwrap();
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+        let rows = collect_session_infos(&registry).await.unwrap();
+
+        let row = rows.iter().find(|row| row.session_db_id == id).unwrap();
+        assert_eq!(row.name.as_deref(), Some("large-session"));
+        assert_eq!(
+            memory.store_state_record_count(&root, "entries"),
+            0,
+            "listing must not materialize transcript rows"
+        );
+
+        let (_conv, db) = registry.open_session(&id).await.unwrap();
+        let loaded = Session::new(crate::types::ConversationId(id), db).await;
+        assert_eq!(loaded.entries().len(), 128);
+        assert_eq!(
+            memory.store_state_record_count(loaded.database().root_id(), "entries"),
+            128,
+            "negative control: constructing Session materializes transcript rows"
+        );
+    }
 }

@@ -1211,8 +1211,15 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     if app.session_list.is_empty() {
+        let message = if app.session_catalog_loading {
+            "  Loading sessions…"
+        } else if app.session_picker_error.is_some() {
+            "  Failed to load sessions — close and reopen to retry."
+        } else {
+            "  No saved sessions yet — select \"New session\" above."
+        };
         lines.push(Line::from(vec![Span::styled(
-            "  No saved sessions yet — select \"New session\" above.",
+            message,
             Style::default().fg(COLOR_DIM),
         )]));
     } else {
@@ -1237,25 +1244,14 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 chaz_core::session::SessionStatus::Active => "",
             };
 
-            // Show cost only when the backend reported one. Sessions whose
-            // entries predate the metadata commit (or backends that don't
-            // surface cost) just omit the suffix rather than printing $0.00.
-            let cost_suffix = if info.cost_reported {
-                format!(" • ${:.4}", info.total_cost_usd)
-            } else {
-                String::new()
-            };
-            // Placeholder rows (async fill not yet done for this session) show
-            // `…` for the fields that require a DB open, keeping the id, bridge
-            // and age (all cheap catalog metadata) so the row is still
-            // recognizable while it loads.
+            // Name is available from the peer-local index. Agent metadata is
+            // loaded only for rows around the cursor.
             let header = if info.loaded {
                 format!(
-                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {} entries • {age}{cost_suffix}{closed_suffix}",
-                    info.entry_count
+                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}"
                 )
             } else {
-                format!("{marker}{title}{current_marker} [{bridge}] … • … entries • {age}")
+                format!("{marker}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}")
             };
 
             let is_closed = matches!(info.status, chaz_core::session::SessionStatus::Closed);
@@ -1274,11 +1270,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 Style::default().fg(COLOR_USER)
             };
 
-            // One click region per session spanning its header + optional
-            // preview + trailing blank. Blank line padding at the bottom isn't
-            // captured, but clicking the gap between rows resolves to the
-            // row immediately above, which feels natural.
-            let row_h: u16 = if info.last_message.is_some() { 3 } else { 2 };
+            let row_h: u16 = 2;
             if y_off < inner_h {
                 let clipped_h = row_h.min(inner_h - y_off);
                 if clipped_h > 0 {
@@ -1293,13 +1285,6 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             }
 
             lines.push(Line::from(vec![Span::styled(header, style)]));
-
-            if let Some(ref preview) = info.last_message {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("    {preview}"),
-                    Style::default().fg(COLOR_DIM),
-                )]));
-            }
 
             lines.push(Line::from(""));
             y_off = y_off.saturating_add(row_h);
