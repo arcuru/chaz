@@ -31,6 +31,30 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     )
     .await
     .unwrap();
+    create_agent_db(
+        &mut user,
+        "overridden",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("overridden".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for n in 0..24 {
+        create_agent_db(
+            &mut user,
+            &format!("unrelated-{n}"),
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some(format!("unrelated-{n}")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
     let registry = Arc::new(
         SessionRegistry::new(
             owner.clone(),
@@ -59,6 +83,10 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
         )
         .await
         .unwrap();
+    registry
+        .save_peer_default_agents(&["overridden".into()])
+        .await
+        .unwrap();
     for n in 0..24 {
         registry
             .create_session(Some(&format!("history-{n}")))
@@ -76,7 +104,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     std::fs::write(
         &config_path,
         format!(
-            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    passwordless: true\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\ndefault_agents: [selected]\n",
+            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    passwordless: true\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\n  - name: overridden\n    system_prompt: test\n    autonomous: false\ndefault_agents: [selected]\n",
             state_dir.display(),
             socket.display()
         ),
@@ -103,6 +131,13 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
         assert!(String::from_utf8_lossy(&output.stdout).contains(&selected_id));
         assert!(elapsed < std::time::Duration::from_secs(10));
     }
+    let (output, elapsed) = run(&["cmd", "/sessions", "--session", "ignored"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(elapsed < std::time::Duration::from_secs(10));
     let command_log = std::fs::read_dir(&state_dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -127,7 +162,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("selected"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("overridden"));
     assert!(elapsed < std::time::Duration::from_secs(10));
     assert_eq!(
         registry.list_sessions().await.unwrap().len(),
@@ -141,6 +176,16 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
         registry.list_sessions().await.unwrap().len(),
         initial_count + 1
     );
+
+    let command_log = std::fs::read_dir(&state_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("chaz-cmd"))
+        .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+        .unwrap();
+    assert!(!command_log.contains("Built hosted indices from user.databases()"));
+    assert!(command_log.contains("tracked_catalog_reads=0 agent_database_opens=1"));
+    assert!(command_log.contains("tracked_catalog_reads=1 agent_database_opens=1"));
 
     drop(shutdown);
     service_task.await.unwrap().unwrap();

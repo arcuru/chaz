@@ -255,34 +255,39 @@ pub async fn extend_targeted(
     skill_banks: &HostedIndex,
 ) -> anyhow::Result<TargetedBuildStats> {
     let mut stats = TargetedBuildStats::default();
+    let mut targeted_agents = Vec::new();
 
     for (db_id, display_name) in explicit_agents {
         if let Some(pubkey) = user.find_key(db_id)? {
-            agents.register(DbEntry {
+            let entry = DbEntry {
                 db_id: db_id.clone(),
                 display_name: display_name.clone(),
                 pubkey,
-            });
+            };
+            agents.register(entry.clone());
+            targeted_agents.push(entry);
         }
     }
 
-    if agents.is_empty() && !agent_names.is_empty() {
+    if targeted_agents.is_empty() && !agent_names.is_empty() {
         let tracked = user.databases().await?;
         stats.tracked_catalog_reads = 1;
         for name in agent_names {
             let key_name = format!("agent:{name}");
             let keys = user.find_keys_by_display_name(&key_name);
             if let Some(td) = tracked.iter().find(|td| keys.contains(&td.key_id)) {
-                agents.register(DbEntry {
+                let entry = DbEntry {
                     db_id: td.database_id.clone(),
                     display_name: name.clone(),
                     pubkey: td.key_id.clone(),
-                });
+                };
+                agents.register(entry.clone());
+                targeted_agents.push(entry);
             }
         }
     }
 
-    for entry in agents.list() {
+    for entry in targeted_agents {
         let db = user
             .open_database_with_key(&entry.db_id, &entry.pubkey)
             .await?;
@@ -488,6 +493,46 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert!(agents.find_by_name("selected").is_some());
         assert_eq!(stats.tracked_catalog_reads, 1);
+        assert_eq!(stats.agent_database_opens, 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_extension_does_not_reopen_agents_from_prior_sessions() {
+        let (_inst, mut user) = fresh_user().await;
+        let mut entries = Vec::new();
+        for name in ["prior", "selected"] {
+            let (db, pubkey) = create_agent_db(
+                &mut user,
+                name,
+                &AgentDbConfig::default(),
+                &AgentMeta {
+                    display_name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            entries.push(DbEntry {
+                db_id: db.id(),
+                display_name: name.into(),
+                pubkey,
+            });
+        }
+
+        let agents = HostedIndex::empty("agent");
+        agents.register(entries[0].clone());
+        let stats = extend_targeted(
+            &user,
+            &[(entries[1].db_id.clone(), "selected".into())],
+            &[],
+            &agents,
+            &HostedIndex::empty("memory_bank"),
+            &HostedIndex::empty("skill_bank"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(agents.len(), 2);
         assert_eq!(stats.agent_database_opens, 1);
     }
 

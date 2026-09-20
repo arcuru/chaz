@@ -258,7 +258,6 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(command) = cmd_args
         .as_ref()
-        .filter(|args| args.session.is_none())
         .and_then(|args| match commands::parse(&args.command) {
             Parsed::Command(command) if commands::is_session_independent(&command) => Some(command),
             _ => None,

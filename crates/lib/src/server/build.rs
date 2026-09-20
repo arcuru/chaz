@@ -406,9 +406,10 @@ pub async fn build(
     } else {
         Vec::new()
     };
-    let configured_defaults = config
-        .default_agents
+    let peer_default_agents = registry.load_peer_default_agents().await;
+    let configured_defaults = peer_default_agents
         .clone()
+        .or_else(|| config.default_agents.clone())
         .filter(|names| !names.is_empty())
         .unwrap_or_else(|| vec![agent_registry.default_agent().name]);
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
@@ -774,8 +775,7 @@ pub async fn build(
     // Precedence: peer-DB override (Settings → Defaults) beats yaml so
     // runtime edits survive restart. Falling back to yaml when the DB
     // hasn't been written keeps fresh installs honouring config.
-    let db_defaults = server.registry().load_peer_default_agents().await;
-    if let Some(default_agents) = db_defaults {
+    if let Some(default_agents) = peer_default_agents {
         info!(
             agents = ?default_agents,
             "Applied default_agents (peer DB override) — these will auto-attach to new sessions"
