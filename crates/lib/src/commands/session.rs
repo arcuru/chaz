@@ -14,12 +14,21 @@ use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 // -----------------------------------------------------------------------------
 
 pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let indices = match ctx.server.registry().list_sessions().await {
+    match collect_session_infos(ctx.server.registry()).await {
+        Ok(sessions) => CommandOutcome::SessionsList(sessions),
+        Err(e) => CommandOutcome::Error(format!("Failed to list sessions: {e}")),
+    }
+}
+
+/// Build the complete session listing without requiring a current session.
+/// One-shot `/sessions` uses this so a read-only catalog command does not
+/// manufacture and attach a throwaway CLI session first.
+pub async fn collect_session_infos(registry: &SessionRegistry) -> anyhow::Result<Vec<SessionInfo>> {
+    let indices = match registry.list_sessions().await {
         Ok(b) => b,
-        Err(e) => return CommandOutcome::Error(format!("Failed to list sessions: {e}")),
+        Err(e) => return Err(e),
     };
 
-    let registry = ctx.server.registry();
     let mut sessions = Vec::with_capacity(indices.len());
     for index in indices {
         sessions.push(load_single_session_info(registry, index).await);
@@ -27,7 +36,7 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
 
     sort_session_infos(&mut sessions);
 
-    CommandOutcome::SessionsList(sessions)
+    Ok(sessions)
 }
 
 /// Load the full per-session `SessionInfo` for one catalog index. Opens the

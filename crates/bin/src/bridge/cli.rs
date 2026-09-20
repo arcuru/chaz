@@ -88,6 +88,7 @@ impl Bridge for CliBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let (conv_id, session_db) =
             resolve_cli_session(&server, self.session_name.as_deref()).await?;
+        server.load_session_entities(&session_db).await?;
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 

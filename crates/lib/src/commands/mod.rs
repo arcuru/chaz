@@ -33,7 +33,7 @@ mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
 pub use parse::{Parsed, parse};
-pub use session::{load_single_session_info, sort_session_infos};
+pub use session::{collect_session_infos, load_single_session_info, sort_session_infos};
 
 /// User-visible permission level for co-ownership grants on an Agent DB.
 /// Stays separate from eidetica's `Permission` so the CLI grammar is
@@ -391,6 +391,11 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
     {
         return CommandOutcome::Error(owner_redirect(&cmd));
     }
+    if command_needs_complete_hosted_indices(&cmd)
+        && let Err(e) = ctx.server.ensure_hosted_indices_complete().await
+    {
+        return CommandOutcome::Error(format!("Failed to load hosted entities: {e}"));
+    }
     match cmd {
         Command::ListSessions => session::list_sessions(ctx).await,
         Command::NewSession(group) => session::new_session(group.as_deref(), ctx).await,
@@ -459,6 +464,24 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::Quit => CommandOutcome::Quit,
         Command::Extension { name, args } => dispatch_extension(&name, &args, ctx).await,
     }
+}
+
+fn command_needs_complete_hosted_indices(command: &Command) -> bool {
+    match command {
+        Command::AgentHosted
+        | Command::AgentHomeStatus(None)
+        | Command::SharingRequests
+        | Command::SharingStatus => true,
+        Command::Extension { name, .. } => matches!(name.as_str(), "memory" | "skills"),
+        _ => false,
+    }
+}
+
+/// Commands whose result is independent of the current session. Frontends may
+/// dispatch these before resolving a session, avoiding an otherwise unused
+/// create/attach cycle.
+pub fn is_session_independent(command: &Command) -> bool {
+    matches!(command, Command::ListSessions | Command::Quit)
 }
 
 fn service_owner_only(command: &Command) -> bool {

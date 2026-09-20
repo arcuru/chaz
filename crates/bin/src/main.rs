@@ -1,6 +1,7 @@
 mod bridge;
 
 use chaz_core::bridge::Bridge;
+use chaz_core::commands::{self, Parsed};
 use chaz_core::config::Config;
 use chaz_core::{agent, config, instance, server, session};
 
@@ -255,6 +256,23 @@ async fn main() -> anyhow::Result<()> {
         "eidetica opened"
     );
 
+    if let Some(command) = cmd_args
+        .as_ref()
+        .filter(|args| args.session.is_none())
+        .and_then(|args| match commands::parse(&args.command) {
+            Parsed::Command(command) if commands::is_session_independent(&command) => Some(command),
+            _ => None,
+        })
+    {
+        let agents = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
+        if agents.is_empty() {
+            agents.register_default_chaz(&config)?;
+        }
+        let registry =
+            session::SessionRegistry::new(connected.instance, connected.user, agents).await?;
+        return bridge::cmd::CommandBridge::run_session_independent(command, &registry).await;
+    }
+
     // In non-interactive --print mode there is no approval UI; pass the
     // configured (or default) CLI auto-approved tools so shell/write_file work
     // in the one-shot loop. Long-lived modes leave the set empty (interactive
@@ -276,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
         let bootstrap_agents = args.print
             || (cmd_args.is_some()
                 && capabilities.ownership() == instance::InstanceOwnership::Direct);
-        server::BuildOptions::local_oneshot(
+        let mut options = server::BuildOptions::local_oneshot(
             config_path.clone(),
             capabilities,
             args.print,
@@ -287,14 +305,24 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 server::McpReadiness::Deferred
             },
-        )
+        );
+        options.targeted_session = args
+            .session
+            .clone()
+            .or_else(|| cmd_args.as_ref().and_then(|args| args.session.clone()))
+            .or(options.targeted_session);
+        options
     } else {
-        server::BuildOptions::local(
+        let mut options = server::BuildOptions::local(
             config_path.clone(),
             capabilities,
             extra_auto_approved_tools,
             server::McpReadiness::Deferred,
-        )
+        );
+        if options.targeted_session.is_some() && !daemon_mode {
+            options.targeted_session = Some("tui".to_string());
+        }
+        options
     };
     let mut built = Some(
         server::build(

@@ -51,6 +51,24 @@ impl CommandBridge {
             session_name,
         }
     }
+
+    /// Run a command that needs only the session registry. Main calls this
+    /// before constructing a Server so catalog reads avoid secret hydration,
+    /// extensions, tools, callbacks, and shutdown work.
+    pub(crate) async fn run_session_independent(
+        command: shared_commands::Command,
+        registry: &chaz_core::session::SessionRegistry,
+    ) -> anyhow::Result<()> {
+        match command {
+            shared_commands::Command::ListSessions => {
+                let list = shared_commands::collect_session_infos(registry).await?;
+                print!("{}", render_sessions(&list));
+                Ok(())
+            }
+            shared_commands::Command::Quit => Ok(()),
+            _ => anyhow::bail!("command requires a current session"),
+        }
+    }
 }
 
 /// Render a `SessionsList` outcome as one line per session. The interactive
@@ -85,8 +103,13 @@ impl Bridge for CommandBridge {
             ),
         };
 
+        if shared_commands::is_session_independent(&cmd) {
+            return Self::run_session_independent(cmd, server.registry()).await;
+        }
+
         let (_conv_id, session_db) =
             super::cli::resolve_cli_session(&server, self.session_name.as_deref()).await?;
+        server.load_session_entities(&session_db).await?;
         let session_db_id = session_db.root_id().to_string();
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
@@ -134,6 +157,7 @@ impl Bridge for CommandBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chaz_core::commands::Command;
     use chaz_core::session::{BridgeKind, SessionStatus};
 
     fn info(name: Option<&str>, agent: Option<&str>) -> SessionInfo {
@@ -174,5 +198,16 @@ mod tests {
         let out = render_sessions(&[info(Some("a"), Some("b")), info(None, None)]);
         let counts: Vec<usize> = out.lines().map(|l| l.matches('\t').count()).collect();
         assert_eq!(counts, vec![4, 4]);
+    }
+
+    #[test]
+    fn only_catalog_commands_bypass_session_resolution() {
+        assert!(shared_commands::is_session_independent(
+            &Command::ListSessions
+        ));
+        assert!(shared_commands::is_session_independent(&Command::Quit));
+        assert!(!shared_commands::is_session_independent(
+            &Command::AgentsList
+        ));
     }
 }

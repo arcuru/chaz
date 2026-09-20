@@ -501,6 +501,7 @@ pub struct Server {
     /// PerSession migration are what start reading it.
     #[allow(dead_code)]
     skill_bank_index: HostedIndex,
+    hosted_indices_complete: AtomicBool,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -661,6 +662,7 @@ impl Server {
             agent_index,
             memory_bank_index,
             skill_bank_index,
+            hosted_indices_complete: AtomicBool::new(false),
             tools,
             policies,
             security,
@@ -728,6 +730,39 @@ impl Server {
 
     pub fn agent_index(&self) -> &HostedIndex {
         &self.agent_index
+    }
+
+    pub fn mark_hosted_indices_complete(&self) {
+        self.hosted_indices_complete.store(true, Ordering::Release);
+    }
+
+    /// Populate peer-global discovery caches on demand. Targeted service
+    /// clients skip this at startup, but commands such as `/agent add` and
+    /// `/memory list` retain their complete peer-wide view when requested.
+    pub async fn ensure_hosted_indices_complete(&self) -> anyhow::Result<()> {
+        if self.hosted_indices_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (agents, memory_banks, skill_banks) = {
+            let user = self.registry.user_lock().await;
+            crate::hosted_index::build_from_user(&user).await?
+        };
+        for entry in agents.list() {
+            self.agent_index.register(entry);
+        }
+        for entry in memory_banks.list() {
+            self.memory_bank_index.register(entry);
+        }
+        for entry in skill_banks.list() {
+            self.skill_bank_index.register(entry);
+        }
+        self.hosted_indices_complete.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hosted_indices_are_complete(&self) -> bool {
+        self.hosted_indices_complete.load(Ordering::Acquire)
     }
 
     /// Whether this server already watches the given session (its `on_write`
@@ -923,6 +958,41 @@ impl Server {
     /// an orphan DB.
     pub async fn is_session_open(&self, session_db_id: &str) -> bool {
         self.sessions.lock().await.contains_key(session_db_id)
+    }
+
+    /// Session runtimes owned by this process. Shutdown uses this instead of
+    /// enumerating the durable catalog and reopening unrelated sessions.
+    pub async fn registered_session_ids(&self) -> Vec<String> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Load only the agents and attached banks referenced by `session_db` into
+    /// this service client's live indices. A TUI can switch to any catalog row
+    /// without paying for unrelated entities at startup.
+    pub async fn load_session_entities(
+        &self,
+        session_db: &eidetica::Database,
+    ) -> anyhow::Result<crate::hosted_index::TargetedBuildStats> {
+        let meta = crate::session::read_meta_from_db(session_db).await;
+        let explicit_agents = meta
+            .agents
+            .into_iter()
+            .filter_map(|agent| {
+                eidetica::entry::ID::parse(&agent.db_id)
+                    .ok()
+                    .map(|id| (id, agent.display_name))
+            })
+            .collect::<Vec<_>>();
+        let user = self.registry.user_lock().await;
+        crate::hosted_index::extend_targeted(
+            &user,
+            &explicit_agents,
+            &[],
+            &self.agent_index,
+            &self.memory_bank_index,
+            &self.skill_bank_index,
+        )
+        .await
     }
 
     /// Best-effort attach of the configured default agents to a
