@@ -224,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
             extra_auto_approved_tools: Vec::new(),
             // Long-lived: MCP tools land whenever their servers finish.
             mcp_readiness: server::McpReadiness::Deferred,
+            targeted_session: None,
         },
     )
     .await?;

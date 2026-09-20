@@ -66,6 +66,10 @@ pub struct BuildOptions {
     /// Whether a turn may run before the configured MCP servers have
     /// finished starting. See [`McpReadiness`].
     pub mcp_readiness: McpReadiness,
+    /// Limit hosted-index loading to the agents referenced by this session, or
+    /// to configured defaults when the session will be created by the gateway.
+    /// Used only by service-client TUI and one-shot paths.
+    pub targeted_session: Option<String>,
 }
 
 impl BuildOptions {
@@ -87,6 +91,10 @@ impl BuildOptions {
             run_agent_loop: executor,
             extra_auto_approved_tools,
             mcp_readiness,
+            targeted_session: (capabilities.ownership()
+                == crate::instance::InstanceOwnership::Service
+                && !executor)
+                .then_some(String::new()),
         }
     }
 
@@ -112,6 +120,10 @@ impl BuildOptions {
             run_agent_loop: executor && run_agent_loop,
             extra_auto_approved_tools,
             mcp_readiness,
+            targeted_session: (capabilities.ownership()
+                == crate::instance::InstanceOwnership::Service
+                && !executor)
+                .then_some(String::new()),
         }
     }
 }
@@ -225,6 +237,10 @@ impl BuiltServer {
     /// Call this to completion before replacing a service connection.
     pub async fn shutdown(mut self) {
         self.server_slot.clear();
+        let sessions = self.server.registered_session_ids().await;
+        for session in sessions {
+            self.server.deregister_session(&session).await;
+        }
         self.server.shutdown().await;
         self.server.mcp_registry().shutdown().await;
         for task in &self.tasks {
@@ -232,18 +248,6 @@ impl BuiltServer {
         }
         for task in self.tasks.drain(..) {
             let _ = task.await;
-        }
-        let sessions: Vec<String> = self
-            .server
-            .registry()
-            .list_sessions()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|session| session.session_db_id)
-            .collect();
-        for session in sessions {
-            self.server.deregister_session(&session).await;
         }
     }
 }
@@ -375,9 +379,47 @@ pub async fn build(
     // walking eidetica's tracked-DBs list. Each entry's `meta.kind` marker
     // classifies it. `/agent new`, `/memory new`, `/agent delete`, etc.
     // mutate these caches at runtime.
+    let targeted_agents = if let Some(identifier) = opts
+        .targeted_session
+        .as_deref()
+        .filter(|identifier| !identifier.is_empty())
+    {
+        let session_db_id = registry.find_by_name(identifier).await?.or_else(|| {
+            eidetica::entry::ID::parse(identifier)
+                .ok()
+                .map(|id| id.to_string())
+        });
+        if let Some(session_db_id) = session_db_id {
+            let (_, db) = registry.open_session(&session_db_id).await?;
+            let meta = session::read_meta_from_db(&db).await;
+            meta.agents
+                .into_iter()
+                .filter_map(|agent| {
+                    eidetica::entry::ID::parse(&agent.db_id)
+                        .ok()
+                        .map(|id| (id, agent.display_name))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let configured_defaults = config
+        .default_agents
+        .clone()
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| vec![agent_registry.default_agent().name]);
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
-        hosted_index::build_from_user(&user).await?
+        if opts.targeted_session.is_some() {
+            let (agents, memory_banks, skill_banks, _) =
+                hosted_index::build_targeted(&user, &targeted_agents, &configured_defaults).await?;
+            (agents, memory_banks, skill_banks)
+        } else {
+            hosted_index::build_from_user(&user).await?
+        }
     };
 
     // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
@@ -386,7 +428,9 @@ pub async fn build(
     // race the home-peer system exists to fix. WARN with the recovery
     // command so operators see actionable migration guidance instead of
     // silent forks.
-    warn_unset_home_pubkey_on_coowned(&registry, &agent_index_store).await;
+    if opts.targeted_session.is_none() {
+        warn_unset_home_pubkey_on_coowned(&registry, &agent_index_store).await;
+    }
 
     // Attach default memory banks declared in agent configs. Idempotent —
     // already-attached banks are skipped (grant_on_memory_bank is idempotent,
@@ -700,6 +744,9 @@ pub async fn build(
         mcp_registry.clone(),
         executor,
     );
+    if opts.targeted_session.is_none() {
+        server.mark_hosted_indices_complete();
+    }
     server_slot.set(server.clone());
 
     // Apply operator multi-agent tuning before the bridge starts

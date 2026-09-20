@@ -3901,6 +3901,158 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
 }
 
 #[tokio::test]
+async fn populated_service_targeted_indices_resume_and_create_without_history_opens() {
+    use eidetica::NewUser;
+    use eidetica::backend::database::InMemory;
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("eidetica-targeted.sock");
+    let (owner, mut owner_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("targeted"))
+            .await
+            .unwrap();
+    let (selected_agent, _) = crate::agent_db::create_agent_db(
+        &mut owner_user,
+        "selected",
+        &Default::default(),
+        &crate::agent_db::AgentMeta {
+            display_name: Some("selected".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for n in 0..24 {
+        crate::agent_db::create_agent_db(
+            &mut owner_user,
+            &format!("unrelated-{n}"),
+            &Default::default(),
+            &crate::agent_db::AgentMeta {
+                display_name: Some(format!("unrelated-{n}")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let owner_registry = crate::session::SessionRegistry::new(owner.clone(), owner_user, agents)
+        .await
+        .unwrap();
+    let (_, selected_session) = owner_registry
+        .create_session(Some("selected"))
+        .await
+        .unwrap();
+    crate::session::update_meta_on_db(&selected_session, |meta| {
+        meta.agents.push(crate::session::AgentRef {
+            db_id: selected_agent.id().to_string(),
+            display_name: "selected".into(),
+            home_pubkey: None,
+        });
+    })
+    .await
+    .unwrap();
+    for n in 0..64 {
+        owner_registry
+            .create_session(Some(&format!("history-{n}")))
+            .await
+            .unwrap();
+    }
+
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let config = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "targeted".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let connected = crate::instance::connect_with(&config, crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    let resumed = vec![(selected_agent.id(), "selected".to_string())];
+    let (_, _, _, resume_stats) =
+        crate::hosted_index::build_targeted(&connected.user, &resumed, &[])
+            .await
+            .unwrap();
+    let (_, _, _, create_stats) =
+        crate::hosted_index::build_targeted(&connected.user, &[], &["selected".to_string()])
+            .await
+            .unwrap();
+
+    assert_eq!(resume_stats.tracked_catalog_reads, 0);
+    assert_eq!(resume_stats.agent_database_opens, 1);
+    assert_eq!(create_stats.tracked_catalog_reads, 1);
+    assert_eq!(create_stats.agent_database_opens, 1);
+
+    drop(connected);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
+    use eidetica::NewUser;
+    use eidetica::backend::database::InMemory;
+
+    let (instance, mut user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("targeted"))
+            .await
+            .unwrap();
+    for name in ["selected", "unrelated"] {
+        crate::agent_db::create_agent_db(
+            &mut user,
+            name,
+            &Default::default(),
+            &crate::agent_db::AgentMeta {
+                display_name: Some(name.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            instance,
+            user,
+            Arc::new(AgentRegistry::with_default_agent()),
+        )
+        .await
+        .unwrap(),
+    );
+    let server = server_fixture_from_registry(registry.clone()).await.1;
+    let selected = {
+        let user = registry.user_lock().await;
+        let keys = user.find_keys_by_display_name("agent:selected");
+        let tracked = user.databases().await.unwrap();
+        let row = tracked
+            .iter()
+            .find(|row| keys.contains(&row.key_id))
+            .unwrap();
+        crate::hosted_index::DbEntry {
+            db_id: row.database_id.clone(),
+            display_name: "selected".into(),
+            pubkey: row.key_id.clone(),
+        }
+    };
+    server.agent_index().register(selected);
+
+    assert!(!server.hosted_indices_are_complete());
+    assert_eq!(server.agent_index().len(), 1);
+    server.ensure_hosted_indices_complete().await.unwrap();
+    assert!(server.hosted_indices_are_complete());
+    assert_eq!(server.agent_index().len(), 2);
+    assert!(server.agent_index().find_by_name("unrelated").is_some());
+}
+
+#[tokio::test]
 async fn service_restart_reopens_and_reconciles_persisted_work() {
     use eidetica::NewUser;
     use eidetica::backend::database::InMemory;

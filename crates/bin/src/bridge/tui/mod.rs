@@ -1142,6 +1142,8 @@ async fn setup_session(
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
 
+    server.load_session_entities(session_db).await?;
+
     if server.is_executor_authorized() {
         // Per-session raw approval channel → tagged forward to shared channel.
         let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);

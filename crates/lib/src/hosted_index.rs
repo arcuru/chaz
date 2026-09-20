@@ -25,6 +25,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
+/// Work performed while assembling a targeted hosted index. Kept explicit so
+/// service-backed regression tests can prove unrelated history does not add DB
+/// opens without relying on wall-clock timing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TargetedBuildStats {
+    pub tracked_catalog_reads: usize,
+    pub agent_database_opens: usize,
+}
+
 /// One row in a hosted-DBs index. Same shape for agents and memory banks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DbEntry {
@@ -204,6 +213,119 @@ pub async fn build_from_user(
     Ok((agents, memory_banks, skill_banks))
 }
 
+/// Build the hosted indices needed by one selected (or newly-created)
+/// session. Explicit agent references come from `SessionMeta`; `agent_names`
+/// are the configured defaults used when the session does not exist yet.
+///
+/// Unlike [`build_from_user`], this never opens an unrelated tracked DB. A
+/// default agent name needs one read of the user's tracked-DB catalog to map
+/// its `agent:<name>` key to a DB id; selected-session references already carry
+/// their ids and skip even that catalog read.
+pub async fn build_targeted(
+    user: &User,
+    explicit_agents: &[(ID, String)],
+    agent_names: &[String],
+) -> anyhow::Result<(HostedIndex, HostedIndex, HostedIndex, TargetedBuildStats)> {
+    let agents = HostedIndex::empty("agent");
+    let memory_banks = HostedIndex::empty("memory_bank");
+    let skill_banks = HostedIndex::empty("skill_bank");
+    let stats = extend_targeted(
+        user,
+        explicit_agents,
+        agent_names,
+        &agents,
+        &memory_banks,
+        &skill_banks,
+    )
+    .await?;
+
+    Ok((agents, memory_banks, skill_banks, stats))
+}
+
+/// Add one session's entities to already-live hosted indices. This is used
+/// when the TUI opens another session after startup; the indices are shared by
+/// the server and extensions, so the selected session becomes usable without
+/// rebuilding from every tracked DB.
+pub async fn extend_targeted(
+    user: &User,
+    explicit_agents: &[(ID, String)],
+    agent_names: &[String],
+    agents: &HostedIndex,
+    memory_banks: &HostedIndex,
+    skill_banks: &HostedIndex,
+) -> anyhow::Result<TargetedBuildStats> {
+    let mut stats = TargetedBuildStats::default();
+
+    for (db_id, display_name) in explicit_agents {
+        if let Some(pubkey) = user.find_key(db_id)? {
+            agents.register(DbEntry {
+                db_id: db_id.clone(),
+                display_name: display_name.clone(),
+                pubkey,
+            });
+        }
+    }
+
+    if agents.is_empty() && !agent_names.is_empty() {
+        let tracked = user.databases().await?;
+        stats.tracked_catalog_reads = 1;
+        for name in agent_names {
+            let key_name = format!("agent:{name}");
+            let keys = user.find_keys_by_display_name(&key_name);
+            if let Some(td) = tracked.iter().find(|td| keys.contains(&td.key_id)) {
+                agents.register(DbEntry {
+                    db_id: td.database_id.clone(),
+                    display_name: name.clone(),
+                    pubkey: td.key_id.clone(),
+                });
+            }
+        }
+    }
+
+    for entry in agents.list() {
+        let db = user
+            .open_database_with_key(&entry.db_id, &entry.pubkey)
+            .await?;
+        stats.agent_database_opens += 1;
+        let agent_db = crate::agent_db::AgentDb::from_database(db);
+        for bank in agent_db.list_memory_banks().await.unwrap_or_default() {
+            let Ok(db_id) = ID::parse(&bank.db_id) else {
+                continue;
+            };
+            if let Some(pubkey) = user.find_key(&db_id)? {
+                memory_banks.register(DbEntry {
+                    db_id,
+                    display_name: bank.name,
+                    pubkey,
+                });
+            }
+        }
+        for bank in agent_db.list_skill_banks().await.unwrap_or_default() {
+            let Ok(db_id) = ID::parse(&bank.db_id) else {
+                continue;
+            };
+            if let Some(pubkey) = user.find_key(&db_id)? {
+                skill_banks.register(DbEntry {
+                    db_id,
+                    display_name: bank.name,
+                    pubkey,
+                });
+            }
+        }
+    }
+
+    info!(
+        agents = agents.len(),
+        memory_banks = memory_banks.len(),
+        skill_banks = skill_banks.len(),
+        tracked_catalog_reads = stats.tracked_catalog_reads,
+        agent_database_opens = stats.agent_database_opens,
+        "Built targeted hosted indices"
+    );
+
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +423,72 @@ mod tests {
         assert!(agents.find_by_name("alpha").is_some());
         assert!(memory_banks.find_by_name("patrick").is_some());
         assert!(skill_banks.find_by_name("devops").is_some());
+    }
+
+    #[tokio::test]
+    async fn targeted_build_opens_only_selected_agents_as_history_grows() {
+        let (_inst, mut user) = fresh_user().await;
+        let mut selected = None;
+        for name in ["selected", "unrelated-a", "unrelated-b", "unrelated-c"] {
+            let (db, _) = create_agent_db(
+                &mut user,
+                name,
+                &AgentDbConfig::default(),
+                &AgentMeta {
+                    display_name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            if name == "selected" {
+                selected = Some(db.id());
+            }
+        }
+        for n in 0..32 {
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", format!("session:{n}").as_str());
+            let key = user.get_default_key().unwrap();
+            let db = user.create_database(settings, &key).await.unwrap();
+            crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, "history")
+                .await
+                .unwrap();
+        }
+
+        let selected = selected.unwrap();
+        let explicit = vec![(selected.clone(), "selected".to_string())];
+        let (agents, _, _, stats) = build_targeted(&user, &explicit, &[]).await.unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert!(agents.find_by_id(&selected).is_some());
+        assert_eq!(stats.tracked_catalog_reads, 0);
+        assert_eq!(stats.agent_database_opens, 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_build_resolves_new_session_default_with_one_entity_open() {
+        let (_inst, mut user) = fresh_user().await;
+        for name in ["selected", "unrelated-a", "unrelated-b"] {
+            create_agent_db(
+                &mut user,
+                name,
+                &AgentDbConfig::default(),
+                &AgentMeta {
+                    display_name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let defaults = vec!["selected".to_string()];
+        let (agents, _, _, stats) = build_targeted(&user, &[], &defaults).await.unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert!(agents.find_by_name("selected").is_some());
+        assert_eq!(stats.tracked_catalog_reads, 1);
+        assert_eq!(stats.agent_database_opens, 1);
     }
 
     #[tokio::test]
