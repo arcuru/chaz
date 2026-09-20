@@ -10,6 +10,7 @@ use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
 use eidetica::store::DocStore;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
@@ -82,14 +83,28 @@ impl SessionRegistry {
         mut user: eidetica::user::User,
         agents: Arc<AgentRegistry>,
     ) -> anyhow::Result<Self> {
+        let started = Instant::now();
+        let stage = Instant::now();
         let chaz_group = find_or_create_db(&mut user, "chaz_group").await?;
+        info!(
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            "Session registry chaz_group ready"
+        );
+        let stage = Instant::now();
         let chaz_peer = find_or_create_db(&mut user, "chaz_peer").await?;
+        info!(
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            "Session registry chaz_peer ready"
+        );
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
 
         // Watch the chaz_group for writes (including remote sync).
         // On each write, re-scan the sessions index and fire events for each known session.
         // Consumers dedupe via their own `seen` set.
         let sync_tx = new_session_tx.clone();
+        let stage = Instant::now();
         chaz_group
             .on_write(move |event, db| {
                 tracing::debug!(
@@ -116,6 +131,11 @@ impl SessionRegistry {
             })
             .await?
             .detach();
+        info!(
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            "Session registry callback installed"
+        );
 
         Ok(Self {
             instance,
@@ -305,8 +325,18 @@ impl SessionRegistry {
         let txn = self.chaz_group.new_transaction().await?;
         let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let names = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
         let routing_doc = sessions.get_all().await?;
         let catalog_doc = catalog.get_all().await?;
+        let names_doc = names.get_all().await?;
+
+        let names_by_id: std::collections::HashMap<String, String> = names_doc
+            .iter()
+            .filter_map(|(name, value)| {
+                let session_db_id: String = value.try_into().ok()?;
+                Some((session_db_id, name.clone()))
+            })
+            .collect();
 
         let mut out: Vec<SessionIndex> = Vec::with_capacity(routing_doc.iter().count());
         for (key, value) in routing_doc.iter() {
@@ -340,6 +370,7 @@ impl SessionRegistry {
                 bridge,
                 created_at,
                 status,
+                name: names_by_id.get(key).cloned(),
             });
         }
         Ok(out)
@@ -636,6 +667,7 @@ mod tests {
         assert_eq!(cli.bridge, BridgeKind::Cli);
         assert_eq!(cli.source.as_deref(), Some("cli"));
         assert_eq!(cli.status, SessionStatus::Active);
+        assert_eq!(cli.name, None);
         let cli_created = cli.created_at.expect("cli session should have created_at");
         assert!(cli_created >= before && cli_created <= after);
 
@@ -647,6 +679,50 @@ mod tests {
         assert_eq!(bare.bridge, BridgeKind::Other);
         assert_eq!(bare.source, None);
         assert!(bare.created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_joins_names_without_opening_session_databases() {
+        let (instance, registry) = make_registry().await;
+        let (conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let id = db.root_id().to_string();
+        registry
+            .set_session_name(&id, "named-session".into())
+            .await
+            .unwrap();
+
+        let mut session = super::super::Session::new(conv, db).await;
+        for n in 0..32 {
+            session
+                .add_entry(super::super::SessionEntry {
+                    sender: "user".into(),
+                    content: format!("message {n}"),
+                    timestamp: chrono::Utc::now(),
+                    entry_type: super::super::EntryType::Message,
+                    metadata: None,
+                    routing: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let engine = instance.backend().local_engine().unwrap();
+        let memory = engine
+            .as_any()
+            .downcast_ref::<eidetica::backend::database::InMemory>()
+            .unwrap();
+        instance
+            .backend()
+            .clear_derived_store_state()
+            .await
+            .unwrap();
+        let root = eidetica::entry::ID::parse(&id).unwrap();
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+        let rows = registry.list_sessions().await.unwrap();
+
+        let row = rows.iter().find(|row| row.session_db_id == id).unwrap();
+        assert_eq!(row.name.as_deref(), Some("named-session"));
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
     }
 
     /// Adoption re-runs on every rescan and every daemon restart. It used to

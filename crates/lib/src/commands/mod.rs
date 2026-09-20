@@ -33,7 +33,7 @@ mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
 pub use parse::{Parsed, parse};
-pub use session::{collect_session_infos, load_single_session_info, sort_session_infos};
+pub use session::{collect_session_infos, load_session_metadata, sort_session_infos};
 
 /// User-visible permission level for co-ownership grants on an Agent DB.
 /// Stays separate from eidetica's `Permission` so the CLI grammar is
@@ -300,53 +300,33 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "switch",
 ];
 
-/// Data about a session, used to render a picker (TUI) or a listing (Matrix).
+/// Metadata about a session, used to render a picker or command listing.
+#[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub session_db_id: String,
     pub agent_name: Option<String>,
     pub name: Option<String>,
-    pub entry_count: usize,
-    pub last_message: Option<String>,
     /// Normalized bridge-of-origin from the session catalog.
     pub bridge: crate::session::BridgeKind,
     /// Catalog creation timestamp. `None` for sessions that predate the
     /// catalog (legacy rows in the routing index).
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub status: crate::session::SessionStatus,
-    /// Sum of `cost_usd` across every assistant entry with `ResponseMetadata`.
-    /// `cost_reported` distinguishes "$0.00 because no calls had cost data"
-    /// from "$0.00 because every call was free".
-    pub total_cost_usd: f64,
-    pub cost_reported: bool,
-    /// Number of assistant messages with recorded metadata. Useful for
-    /// distinguishing "no LLM activity" from "LLM activity but uncosted".
-    pub llm_call_count: u32,
-    /// `false` for a placeholder row emitted before its session DB has been
-    /// opened — the async picker fill shows these with `…` markers and
-    /// patches them to `true` once `load_single_session_info` completes.
-    /// The synchronous `list_sessions` path always produces `true` rows.
+    /// `false` while mutable per-session metadata is still loading.
     pub loaded: bool,
 }
 
 impl SessionInfo {
-    /// A not-yet-loaded row carrying only the cheap catalog metadata (id,
-    /// bridge, created_at, status). The DB-derived fields (entry_count,
-    /// name, agent, last_message, cost) are left blank and `loaded` is
-    /// `false` so the bridge can render `…` placeholders and patch the row
-    /// in place when the async fill emits the real `SessionInfo`.
+    /// A row carrying catalog and peer-local name-index metadata. Agent data
+    /// remains unloaded until a frontend asks for that row.
     pub fn placeholder(index: &crate::session::SessionIndex) -> Self {
         SessionInfo {
             session_db_id: index.session_db_id.clone(),
             agent_name: None,
-            name: None,
-            entry_count: 0,
-            last_message: None,
+            name: index.name.clone(),
             bridge: index.bridge,
             created_at: index.created_at,
             status: index.status,
-            total_cost_usd: 0.0,
-            cost_reported: false,
-            llm_call_count: 0,
             loaded: false,
         }
     }

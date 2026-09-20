@@ -82,8 +82,8 @@ fn render_sessions(list: &[SessionInfo]) -> String {
         let name = info.name.as_deref().unwrap_or("-");
         let agent = info.agent_name.as_deref().unwrap_or("default");
         out.push_str(&format!(
-            "{}\t{}\t{}\t{:?}\t{} entries\n",
-            info.session_db_id, name, agent, info.bridge, info.entry_count
+            "{}\t{}\t{}\t{:?}\n",
+            info.session_db_id, name, agent, info.bridge
         ));
     }
     out
@@ -165,14 +165,9 @@ mod tests {
             session_db_id: "bafyabc".to_string(),
             agent_name: agent.map(str::to_string),
             name: name.map(str::to_string),
-            entry_count: 3,
-            last_message: None,
             bridge: BridgeKind::Cli,
             created_at: None,
             status: SessionStatus::default(),
-            total_cost_usd: 0.0,
-            cost_reported: false,
-            llm_call_count: 0,
             loaded: true,
         }
     }
@@ -197,7 +192,7 @@ mod tests {
     fn every_row_has_the_same_field_count() {
         let out = render_sessions(&[info(Some("a"), Some("b")), info(None, None)]);
         let counts: Vec<usize> = out.lines().map(|l| l.matches('\t').count()).collect();
-        assert_eq!(counts, vec![4, 4]);
+        assert_eq!(counts, vec![3, 3]);
     }
 
     #[test]
