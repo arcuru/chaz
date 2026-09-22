@@ -167,7 +167,9 @@ There is no interactive approval — tools requiring approval are auto-denied un
 
 With `execution: client`, print mode submits the stable session entry and waits
 for the configured executor to answer; it never calls the model or tools in the
-client process. If a prior executor stopped after recording an attempt start,
+client process. If the executor restarts after the client writes the prompt but
+before it adopts the session, its startup scan recovers the queued turn. If a
+prior executor instead stopped after recording an attempt start,
 inspect it with `chaz --config config.yaml cmd '/interrupted'` and retry only
 after deciding that replay is safe:
 

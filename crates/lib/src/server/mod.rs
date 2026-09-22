@@ -2240,6 +2240,7 @@ impl Server {
             return;
         };
         let mut seen = std::collections::HashSet::new();
+        self.adopt_indexed_local_client_sessions(&mut seen).await;
         loop {
             if self.shutting_down.load(Ordering::Acquire) {
                 break;
@@ -2248,102 +2249,115 @@ impl Server {
                 event = rx.recv() => event,
                 _ = self.shutdown_notify.notified() => None,
             };
-            let Some(event) = event else { break };
-            if !seen.insert(event.session_db_id.clone()) {
-                continue;
+            let Some(_event) = event else { break };
+            while rx.try_recv().is_ok() {}
+            self.adopt_indexed_local_client_sessions(&mut seen).await;
+        }
+    }
+
+    /// Re-scan rather than trusting the bounded notification channel to name
+    /// every row. Each callback is only a change signal; the durable registry
+    /// is the source of truth, including after an executor restart.
+    async fn adopt_indexed_local_client_sessions(
+        &self,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        let sessions = match self.registry.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                error!(%error, "Failed to scan indexed sessions for resident execution");
+                return;
             }
-            if self
-                .registry
-                .created_session_locally(&event.session_db_id)
+        };
+        let candidates = sessions
+            .into_iter()
+            .filter(|session| !seen.contains(&session.session_db_id))
+            .collect::<Vec<_>>();
+
+        use futures::StreamExt as _;
+        let settled = futures::stream::iter(candidates.into_iter().map(|session| async move {
+            let session_db_id = session.session_db_id.clone();
+            self.adopt_local_client_session(session)
                 .await
-            {
-                continue;
-            }
-            if event
+                .then_some(session_db_id)
+        }))
+        .buffer_unordered(16)
+        .filter_map(futures::future::ready)
+        .collect::<Vec<_>>()
+        .await;
+        seen.extend(settled);
+    }
+
+    /// Return true when the row is settled for this process. A transient open
+    /// or registration failure stays unseen so the next index write retries it.
+    async fn adopt_local_client_session(&self, session: crate::session::SessionIndex) -> bool {
+        if self
+            .registry
+            .created_session_locally(&session.session_db_id)
+            .await
+            || session.status == crate::session::SessionStatus::Closed
+            || session
                 .source
                 .as_deref()
-                .is_some_and(|s| s.starts_with("spawn:"))
-            {
-                continue;
-            }
-            info!(
-                session_db_id = %event.session_db_id,
-                source = ?event.source,
-                "New session detected"
-            );
-            let mut opened = self
-                .registry
-                .open_local_client_session(&event.session_db_id)
-                .await;
-            if opened.is_err() {
-                // The service can publish the group-index write just before
-                // the session's auth tree is visible. Bound the race rather
-                // than misclassifying the session as bridge-owned forever.
-                for _ in 0..20 {
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    opened = self
-                        .registry
-                        .open_local_client_session(&event.session_db_id)
-                        .await;
-                    if opened.is_ok() {
-                        break;
-                    }
-                }
-            }
-            let Ok((_conversation_id, session_db)) = opened else {
-                debug!(
-                    session_db_id = %event.session_db_id,
-                    "New session is not owned by this local client/executor; leaving it to bridge adoption"
-                );
-                continue;
-            };
-            let claimed = match self
-                .claim_runtime(&session_db, "agent".to_string(), 0, RuntimeMode::Auto)
-                .await
-            {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    error!(
-                        session_db_id = %event.session_db_id,
-                        %error,
-                        "Failed to claim resident runtime for new session"
-                    );
-                    continue;
-                }
-            };
-            if !claimed {
-                continue;
-            }
-            let (approval_tx, approval_tasks) = approval_proxy::spawn_session_db_approval_proxy(
-                session_db.clone(),
-                "daemon".to_string(),
-                self.approval_timeout(),
-            )
+                .is_some_and(|source| source.starts_with("spawn:"))
+        {
+            return true;
+        }
+        info!(
+            session_db_id = %session.session_db_id,
+            source = ?session.source,
+            "New session detected"
+        );
+        let mut opened = self
+            .registry
+            .open_local_client_session(&session.session_db_id)
             .await;
-            for task in approval_tasks {
-                self.track_task(task);
+        if opened.is_err() {
+            // The service can publish the group-index write just before the
+            // session's auth tree is visible. Bound the race rather than
+            // misclassifying the session as bridge-owned forever.
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                opened = self
+                    .registry
+                    .open_local_client_session(&session.session_db_id)
+                    .await;
+                if opened.is_ok() {
+                    break;
+                }
             }
-            if let Err(error) = self
-                .watch_session(
-                    &session_db,
-                    self.default_backend.clone(),
-                    None,
-                    Some(approval_tx),
-                )
-                .await
-            {
-                self.runtime_lease.release(&event.session_db_id);
-                error!(
-                    session_db_id = %event.session_db_id,
-                    %error,
-                    "Failed to watch newly claimed local session"
-                );
-            } else {
-                info!(
-                    session_db_id = %event.session_db_id,
-                    "Resident executor registered local client session"
-                );
-            }
+        }
+        let Ok((_conversation_id, session_db)) = opened else {
+            debug!(
+                session_db_id = %session.session_db_id,
+                "New session is not owned by this local client/executor; leaving it to bridge adoption"
+            );
+            return false;
+        };
+        if let Err(error) = self
+            .register_session(
+                &session_db,
+                self.default_backend.clone(),
+                None,
+                // Local CLI/TUI clients have no bridge approval relay. Match
+                // their direct-executor behavior by denying gated tools
+                // immediately instead of creating a request nobody can answer.
+                None,
+            )
+            .await
+        {
+            error!(
+                session_db_id = %session.session_db_id,
+                %error,
+                "Failed to register resident runtime for local session"
+            );
+            false
+        } else {
+            info!(
+                session_db_id = %session.session_db_id,
+                "Resident executor registered local client session"
+            );
+            true
         }
     }
 

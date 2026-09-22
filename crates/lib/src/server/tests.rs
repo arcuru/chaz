@@ -4095,19 +4095,49 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     };
 
     let agents = Arc::new(AgentRegistry::with_default_agent());
-    let executor_registry = Arc::new(
-        crate::session::SessionRegistry::new(owner, owner_user, agents.clone())
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("resident reply");
+    let agent_index = HostedIndex::empty("agent");
+    agent_index.register(agent.clone());
+
+    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    let client_registry = Arc::new(
+        crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
             .await
             .unwrap(),
     );
-    let mock = Arc::new(crate::test_support::MockBackend::new());
-    mock.push_text("resident reply");
+    let client_server = client_server_fixture_from_registry(client_registry.clone()).await;
+    assert!(!client_server.is_executor_authorized());
+    let (_conversation_id, client_db) = client_registry
+        .create_session(Some("local-client"))
+        .await
+        .unwrap();
+    let sid = client_db.root_id().to_string();
+    client_registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    assert!(!client_server.is_watching_session(&sid).await);
+    assert!(client_server.runtime_owner_of(&sid).is_none());
+    write_user_message_with_content(&client_db, &sid, "hello resident executor").await;
+
+    // Connect and construct the resident after the client has queued its turn.
+    // This is the daemon-restart shape: the new registry has no in-memory
+    // notification to inherit, so adoption must come from its durable index.
+    let resident = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+        .await
+        .unwrap();
+    let executor_registry = Arc::new(
+        crate::session::SessionRegistry::new(resident.instance, resident.user, agents.clone())
+            .await
+            .unwrap(),
+    );
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
         crate::security::SecretStore::new(executor_registry.chaz_peer().clone()).await,
     );
-    let agent_index = HostedIndex::empty("agent");
-    agent_index.register(agent.clone());
     let executor = Server::new(
         executor_registry.clone(),
         agents.clone(),
@@ -4131,29 +4161,6 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
     );
-
-    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
-        .await
-        .unwrap();
-    let client_registry = Arc::new(
-        crate::session::SessionRegistry::new(client.instance, client.user, agents)
-            .await
-            .unwrap(),
-    );
-    let client_server = client_server_fixture_from_registry(client_registry.clone()).await;
-    assert!(!client_server.is_executor_authorized());
-    let (_conversation_id, client_db) = client_registry
-        .create_session(Some("local-client"))
-        .await
-        .unwrap();
-    let sid = client_db.root_id().to_string();
-    client_registry
-        .attach_agent_to_session(&sid, &agent)
-        .await
-        .unwrap();
-    assert!(!client_server.is_watching_session(&sid).await);
-    assert!(client_server.runtime_owner_of(&sid).is_none());
-    write_user_message_with_content(&client_db, &sid, "hello resident executor").await;
 
     await_call_count(&mock, 1).await;
     assert!(
@@ -4267,17 +4274,45 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
         .unwrap(),
     );
     let (_, reopened) = registry2.open_session(&sid).await.unwrap();
-    let server = server_fixture_from_registry(registry2.clone()).await.1;
     let mock = Arc::new(crate::test_support::MockBackend::new());
     mock.push_text("processed after service restart");
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
         crate::security::SecretStore::new(registry2.chaz_peer().clone()).await,
     );
+    let server = Server::new(
+        registry2.clone(),
+        registry2.agents.clone(),
+        HostedIndex::empty("agent"),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
     server
-        .register_session(&reopened, backend, Some("agent".into()), None)
+        .register_session(
+            &reopened,
+            server.default_backend.clone(),
+            Some("agent".into()),
+            None,
+        )
         .await
         .unwrap();
+    server.mark_startup_ready();
     await_call_count(&mock, 1).await;
     await_no_processing(&server, &sid).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
