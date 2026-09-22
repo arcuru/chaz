@@ -4053,6 +4053,130 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 }
 
 #[tokio::test]
+async fn resident_executor_adopts_and_processes_local_client_session() {
+    use eidetica::NewUser;
+    use eidetica::backend::database::InMemory;
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("resident-executor.sock");
+    let (owner, mut owner_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("resident"))
+            .await
+            .unwrap();
+    let (agent_db, agent_pubkey) = create_agent_db(
+        &mut owner_user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey: agent_pubkey,
+    };
+    let service = ServiceServer::bind(owner.clone(), &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "resident".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let executor_registry = Arc::new(
+        crate::session::SessionRegistry::new(owner, owner_user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("resident reply");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(executor_registry.chaz_peer().clone()).await,
+    );
+    let agent_index = HostedIndex::empty("agent");
+    agent_index.register(agent.clone());
+    let executor = Server::new(
+        executor_registry.clone(),
+        agents.clone(),
+        agent_index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+
+    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    let client_registry = Arc::new(
+        crate::session::SessionRegistry::new(client.instance, client.user, agents)
+            .await
+            .unwrap(),
+    );
+    let client_server = client_server_fixture_from_registry(client_registry.clone()).await;
+    assert!(!client_server.is_executor_authorized());
+    let (_conversation_id, client_db) = client_registry
+        .create_session(Some("local-client"))
+        .await
+        .unwrap();
+    let sid = client_db.root_id().to_string();
+    client_registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    assert!(!client_server.is_watching_session(&sid).await);
+    assert!(client_server.runtime_owner_of(&sid).is_none());
+    write_user_message_with_content(&client_db, &sid, "hello resident executor").await;
+
+    await_call_count(&mock, 1).await;
+    assert!(
+        await_agent_reply(&client_db, &sid, "default").await,
+        "the resident executor must write the reply into the client-created session"
+    );
+    assert!(executor.is_watching_session(&sid).await);
+    assert!(executor.runtime_owner_of(&sid).is_some());
+    let session_ref = agent_db.find_session_ref(&sid).await.unwrap().unwrap();
+    assert!(
+        session_ref.exposed_on.is_empty(),
+        "local execution must not fabricate transport exposure metadata"
+    );
+
+    drop(client_server);
+    drop(executor);
+    drop(client_registry);
+    drop(executor_registry);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn service_restart_reopens_and_reconciles_persisted_work() {
     use eidetica::NewUser;
     use eidetica::backend::database::InMemory;

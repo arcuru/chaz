@@ -55,6 +55,15 @@ pub struct SessionRegistry {
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
+    /// Sessions created by a local service client may predate the daemon's
+    /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
+    /// later opens use the same signing identity.
+    local_client_sessions: Mutex<std::collections::HashMap<String, Database>>,
+    /// Sessions created through this registry already have an explicit owner
+    /// path (frontend watch, schedule, child registration, or test setup).
+    /// The generic resident watcher only adopts sessions created through a
+    /// different service client.
+    locally_created_sessions: Mutex<std::collections::HashSet<String>>,
     /// Per-`(transport, login_id, channel)` locks serializing get-or-create in
     /// [`super::transport`], so two concurrent inbound messages on a brand-new
     /// channel can't both miss the registry walk and both create a session.
@@ -145,6 +154,8 @@ impl SessionRegistry {
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
+            local_client_sessions: Mutex::new(std::collections::HashMap::new()),
+            locally_created_sessions: Mutex::new(std::collections::HashSet::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -206,6 +217,10 @@ impl SessionRegistry {
 
         let session_db_id = db.root_id().to_string();
         let conv_id = ConversationId(session_db_id.clone());
+        self.locally_created_sessions
+            .lock()
+            .await
+            .insert(session_db_id.clone());
 
         super::Session::initialize_turn_schema(&db).await?;
         crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source.unwrap_or("new"))
@@ -244,6 +259,14 @@ impl SessionRegistry {
         });
 
         Ok((conv_id, db))
+    }
+
+    /// Whether this registry itself created the session during this process.
+    pub async fn created_session_locally(&self, session_db_id: &str) -> bool {
+        self.locally_created_sessions
+            .lock()
+            .await
+            .contains(session_db_id)
     }
 
     /// Create a child session and wire a `DelegatedTreeRef { max: Admin(0) }`
@@ -306,8 +329,58 @@ impl SessionRegistry {
     ) -> anyhow::Result<(ConversationId, Database)> {
         let root_id = eidetica::entry::ID::parse(session_db_id)
             .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        if let Some(db) = self
+            .local_client_sessions
+            .lock()
+            .await
+            .get(session_db_id)
+            .cloned()
+        {
+            return Ok((ConversationId(session_db_id.to_string()), db));
+        }
         let user = self.user.lock().await;
         let db = user.open_database(&root_id).await?;
+        Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Open a session created through this daemon's local Eidetica service.
+    ///
+    /// The client records the new per-database key mapping in its own `User`
+    /// handle, so the daemon's older handle cannot use `User::open_database`.
+    /// Local client sessions use the shared user's default key; resolve that
+    /// key against the session's auth settings and bind the proven identity.
+    /// This refuses bridge-owned sessions whose trees do not authorize that
+    /// key, leaving them on the existing bridge-adoption path.
+    pub async fn open_local_client_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let root_id = eidetica::entry::ID::parse(session_db_id)
+            .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let user = self.user.lock().await;
+        let default_key = user.get_default_key()?;
+        let (identity, permission) = Database::find_sigkeys(&self.instance, &root_id, &default_key)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Session {session_db_id} does not authorize this peer's default key"
+                )
+            })?;
+        if !permission.can_write() {
+            anyhow::bail!(
+                "Session {session_db_id} grants this peer's default key {permission:?}, which cannot run a turn"
+            );
+        }
+        let signing_key = user.get_signing_key(&default_key)?;
+        let db = Database::open(&self.instance, &root_id).await?.with_key(
+            eidetica::database::DatabaseKey::with_identity(signing_key, identity),
+        );
+        self.local_client_sessions
+            .lock()
+            .await
+            .insert(session_db_id.to_string(), db.clone());
         Ok((ConversationId(session_db_id.to_string()), db))
     }
 
