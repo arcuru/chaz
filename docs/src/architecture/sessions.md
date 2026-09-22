@@ -99,6 +99,15 @@ requests. The callback covers commits after the snapshot; the catch-up read
 covers work already present before registration. Repeated callbacks are safe:
 the persisted request and attempt state decides whether there is work to run.
 
+When a local service client creates a session, the resident executor treats the
+peer-local session index as a durable adoption queue. It proves that the shared
+user's default key has write authority on the new session, binds that signing
+identity, claims the runtime, and registers the ordinary watch/catch-up path.
+The executor scans existing rows on startup and rescans after index writes, so
+a queued turn survives notification loss and executor restart. This path does
+not add transport exposure metadata; bridge-created sessions continue through
+the agent registry's `exposed_on` adoption path.
+
 An interrupted attempt is deliberately not replayed. Model and tool work may
 already have caused an external effect before the process stopped. The public
 library API exposes `Server::interrupted_turns()` to inspect that state and

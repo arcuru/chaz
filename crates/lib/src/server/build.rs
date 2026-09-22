@@ -748,6 +748,10 @@ pub async fn build(
     if opts.targeted_session.is_none() {
         server.mark_hosted_indices_complete();
     }
+    // Close the processing gate before the first await below can schedule the
+    // resident session-adoption watcher. On restart that watcher scans durable
+    // queued turns immediately; none may run until agent config is reconciled.
+    server.mark_startup_pending();
     server_slot.set(server.clone());
 
     // Apply operator multi-agent tuning before the bridge starts
@@ -837,7 +841,6 @@ pub async fn build(
         critical_path_ms = build_start.elapsed().as_millis() as u64,
         "Critical-path build complete; deferring at-startup work to background"
     );
-    server.mark_startup_pending();
     {
         let server = server.clone();
         let registry = registry.clone();

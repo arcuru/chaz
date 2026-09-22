@@ -38,6 +38,12 @@ old data, set `connection` to its resolved `<state_dir>/eidetica.db` and retain
 the existing `chaz` login. Provisioning a new Eidetica store/user is a separate,
 explicit operation.
 
+CLI and TUI clients may create sessions and queue turns through that service
+connection. The resident executor adopts those sessions from the durable local
+index and runs them; the client process remains an observer and never calls the
+model or tools. This local handoff does not mark the session as exposed on a
+Matrix or Discord login.
+
 Long-running service-mode daemons monitor the connection. A transient daemon
 restart tears down the old Chaz runtime before bounded-backoff reconnect,
 re-login, database reopen, hook installation, and persisted-state
