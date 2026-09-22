@@ -2228,17 +2228,14 @@ impl Server {
         }
     }
 
-    /// Watch for new sessions appearing in the registry (local creates, sync, etc.)
-    /// and log them. Bridges are responsible for calling `register_session` to
-    /// wire up agent processing and response delivery for their channels.
-    ///
-    /// Log-only for now. This is the future `claim_runtime` driver: once an
-    /// auto-claiming daemon (Track D) watches registry-surfaced sessions, it
-    /// will call `watch_session` + `claim_runtime(RuntimeMode::Auto)` here so a
-    /// session exposed by a dumb bridge gets its runtime owner without a
-    /// per-bridge wiring path. Left log-only until the multi-process lease
-    /// lands.
+    /// Adopt sessions created through the resident executor's local Eidetica
+    /// service. Local frontends only write and observe session state; this
+    /// executor claims and watches the session. Transport bridges keep using
+    /// the separate agent-registry adoption path in `server::build`.
     async fn new_session_watcher(&self) {
+        if !self.executor_authorized {
+            return;
+        }
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;
         };
@@ -2255,6 +2252,13 @@ impl Server {
             if !seen.insert(event.session_db_id.clone()) {
                 continue;
             }
+            if self
+                .registry
+                .created_session_locally(&event.session_db_id)
+                .await
+            {
+                continue;
+            }
             if event
                 .source
                 .as_deref()
@@ -2267,6 +2271,79 @@ impl Server {
                 source = ?event.source,
                 "New session detected"
             );
+            let mut opened = self
+                .registry
+                .open_local_client_session(&event.session_db_id)
+                .await;
+            if opened.is_err() {
+                // The service can publish the group-index write just before
+                // the session's auth tree is visible. Bound the race rather
+                // than misclassifying the session as bridge-owned forever.
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    opened = self
+                        .registry
+                        .open_local_client_session(&event.session_db_id)
+                        .await;
+                    if opened.is_ok() {
+                        break;
+                    }
+                }
+            }
+            let Ok((_conversation_id, session_db)) = opened else {
+                debug!(
+                    session_db_id = %event.session_db_id,
+                    "New session is not owned by this local client/executor; leaving it to bridge adoption"
+                );
+                continue;
+            };
+            let claimed = match self
+                .claim_runtime(&session_db, "agent".to_string(), 0, RuntimeMode::Auto)
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    error!(
+                        session_db_id = %event.session_db_id,
+                        %error,
+                        "Failed to claim resident runtime for new session"
+                    );
+                    continue;
+                }
+            };
+            if !claimed {
+                continue;
+            }
+            let (approval_tx, approval_tasks) = approval_proxy::spawn_session_db_approval_proxy(
+                session_db.clone(),
+                "daemon".to_string(),
+                self.approval_timeout(),
+            )
+            .await;
+            for task in approval_tasks {
+                self.track_task(task);
+            }
+            if let Err(error) = self
+                .watch_session(
+                    &session_db,
+                    self.default_backend.clone(),
+                    None,
+                    Some(approval_tx),
+                )
+                .await
+            {
+                self.runtime_lease.release(&event.session_db_id);
+                error!(
+                    session_db_id = %event.session_db_id,
+                    %error,
+                    "Failed to watch newly claimed local session"
+                );
+            } else {
+                info!(
+                    session_db_id = %event.session_db_id,
+                    "Resident executor registered local client session"
+                );
+            }
         }
     }
 
