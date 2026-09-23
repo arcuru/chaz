@@ -24,14 +24,14 @@ That coupling is gone. Now:
 
 - **A login belongs to exactly one agent.** A bridge's job is to route one
   transport account's traffic to one owning agent's sessions.
-- **Credentials never sit in the daemon's config or database.** Each bridge owns
-  an encrypted settings database (a `PasswordStore`) holding its own
-  homeserver/token/allow-list, unlocked by a password the daemon never sees. The
-  daemon stores only a non-secret pointer (a `LoginRef`) in the agent's database
-  saying "a login of this kind exists, managed by this bridge DB."
-- **The daemon owns no transport config at all.** It runs agents, the TUI, and
-  the CLI. Bridges are independently deployable — a different host, a separate
-  `systemd` unit, its own restart lifecycle.
+- **Transport secrets stay out of the agent's config and DB.** Each bridge
+  stores credentials in an encrypted settings database (`PasswordStore`),
+  unlocked by a password held by that bridge process. A service-client bridge
+  stores this encrypted DB on the shared Eidetica backend; a direct owner uses
+  its own backend. The agent DB holds only a non-secret `LoginRef` pointer.
+- **The daemon runs no transport.** It runs agents, the TUI, and the CLI.
+  Bridges have their own restart lifecycle. Direct-owner bridges can run on a
+  different host; service clients need access to the same Unix service.
 
 The following diagram shows **direct-owner** bridges. Service clients instead
 share the Eidetica daemon login and use its Unix socket, without tickets or
