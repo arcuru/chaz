@@ -4690,6 +4690,7 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     let mock = Arc::new(crate::test_support::MockBackend::new());
     mock.push_text("reply to transport");
     mock.push_text("reply to observer");
+    mock.push_text("reply to discord");
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
         crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
@@ -4720,38 +4721,38 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     let binding =
         DeliveryBinding::new("matrix", "@chaz:example", "!room:example", root.to_string());
     let room = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-    let attach_transport = {
+    let attach_transport = |db, binding, room: Arc<tokio::sync::Mutex<Vec<String>>>| {
         let store = store.clone();
-        let binding = binding.clone();
-        let transport_db = transport_db.clone();
-        let room = room.clone();
-        move || {
-            let store = store.clone();
-            let binding = binding.clone();
-            let transport_db = transport_db.clone();
-            let room = room.clone();
-            async move {
-                DeliveryReconciler::attach(
-                    transport_db,
-                    store,
-                    binding,
-                    agents(),
-                    "default".into(),
-                    |body| vec![body.to_string()],
-                    move |chunk| {
-                        let room = room.clone();
-                        Box::pin(async move {
-                            room.lock().await.push(chunk.body);
-                            Ok(())
-                        })
-                    },
-                )
-                .await
-                .unwrap()
-            }
+        async move {
+            DeliveryReconciler::attach(
+                db,
+                store,
+                binding,
+                agents(),
+                "default".into(),
+                |body| vec![body.to_string()],
+                move |chunk| {
+                    let room = room.clone();
+                    Box::pin(async move {
+                        room.lock().await.push(chunk.body);
+                        Ok(())
+                    })
+                },
+            )
+            .await
+            .unwrap()
         }
     };
-    let reconciler = attach_transport().await;
+    let reconciler = attach_transport(transport_db.clone(), binding.clone(), room.clone()).await;
+
+    // The second bridge has the same service login but its own delivery cursor.
+    let discord = crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    assert!(discord.capabilities.executor().is_err());
+    let discord_db = discord.user.open_database(&root).await.unwrap();
+    let discord_binding = DeliveryBinding::new("discord", "bot-id", "channel-id", root.to_string());
+    let discord_room = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
 
     // The observer frontend: a second client that only watches.
     let observer = crate::instance::connect_with(&settings(), crate::config::ExecutionRole::Client)
@@ -4841,8 +4842,63 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
         ["reply to transport", "reply to observer"]
     );
 
-    // Only the executor ever ran a model turn.
-    assert_eq!(mock.recorded_calls().len(), 2);
+    // Attach Discord only after Matrix acknowledged the first two replies.
+    // Sharing Matrix's cursor would now skip them, so the late replay checks
+    // that both frontends retain independent progress on one service login.
+    let discord_reconciler = attach_transport(
+        discord_db.clone(),
+        discord_binding.clone(),
+        discord_room.clone(),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while discord_room.lock().await.len() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        discord_room.lock().await.as_slice(),
+        room.lock().await.as_slice()
+    );
+
+    // The second client submits through the same service; only the executor
+    // performs a model turn, and both bridge bindings deliver independently.
+    let mut discord_session =
+        Session::new(ConversationId(root.to_string()), discord_db.clone()).await;
+    discord_session
+        .add_entry(SessionEntry {
+            sender: "discord-user".into(),
+            content: "from discord".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while room.lock().await.len() != 3 || discord_room.lock().await.len() != 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        room.lock().await.as_slice(),
+        [
+            "reply to transport",
+            "reply to observer",
+            "reply to discord"
+        ]
+    );
+    assert_eq!(
+        discord_room.lock().await.as_slice(),
+        room.lock().await.as_slice()
+    );
+    assert_eq!(mock.recorded_calls().len(), 3);
 
     // Restarting the transport frontend reconciles against its persisted
     // progress: nothing is delivered twice.
@@ -4850,10 +4906,25 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     drop(reconciler);
     let progress = store.load(&binding).await.unwrap().unwrap();
     assert!(progress.delivered_through.is_some());
-    let reconciler = attach_transport().await;
+    discord_reconciler.stop();
+    drop(discord_reconciler);
+    assert!(
+        store
+            .load(&discord_binding)
+            .await
+            .unwrap()
+            .unwrap()
+            .delivered_through
+            .is_some()
+    );
+    let reconciler = attach_transport(transport_db, binding, room.clone()).await;
+    let discord_reconciler =
+        attach_transport(discord_db, discord_binding, discord_room.clone()).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(room.lock().await.len(), 2);
+    assert_eq!(room.lock().await.len(), 3);
+    assert_eq!(discord_room.lock().await.len(), 3);
     reconciler.stop();
+    discord_reconciler.stop();
 
     drop(server);
     drop(transport_registry);
