@@ -16,7 +16,7 @@ This page covers the architecture and the one-time setup/approval flow common to
 both bridges. For transport-specific configuration see [Matrix Bot](matrix.md)
 and [Discord Bot](discord.md).
 
-## Why bridges are separate peers
+## Why bridges are separate processes
 
 Earlier versions ran the Matrix bridge inside the `chaz` process and read its
 credentials (`homeserver_url`, `username`, `password`) from the central config.
@@ -32,6 +32,11 @@ That coupling is gone. Now:
 - **The daemon owns no transport config at all.** It runs agents, the TUI, and
   the CLI. Bridges are independently deployable — a different host, a separate
   `systemd` unit, its own restart lifecycle.
+
+The following diagram shows **direct-owner** bridges. Service clients instead
+share the Eidetica daemon login and use its Unix socket, without tickets or
+peer-to-peer sync. Both layouts keep transport processes separate from the
+agent executor.
 
 ```mermaid
 graph LR
@@ -53,10 +58,10 @@ graph LR
     DB2 -.->|Discord| Chan[Discord channels]
 ```
 
-Three peers, three separate backend files, syncing over eidetica's iroh
-transport. No process opens another's database directly — access to an agent's
-DB is granted with a ticket (see below), exactly the way one chaz peer shares an
-agent with another in [Sharing & Sync](session_sharing.md).
+In this direct-owner layout, three peers have separate backend files and sync
+over iroh. Access to an agent DB is granted with a ticket (see below), as in
+[Sharing & Sync](session_sharing.md). Service clients connect to one daemon
+backend through Eidetica instead; they do not use this ticket flow.
 
 ## Connection settings
 
