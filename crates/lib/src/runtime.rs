@@ -434,6 +434,16 @@ async fn llm_call_with_retry(
     }))
 }
 
+/// An exact final response token lets the agent choose a silent turn even
+/// when the backend refuses to produce an empty completion.
+fn agent_reply_body(content: String) -> String {
+    if content.trim() == "[[NO_REPLY]]" {
+        String::new()
+    } else {
+        content
+    }
+}
+
 /// Fire `agent_end` for all registered hooks and return the outcome unchanged.
 /// Centralizes the hook fire across every exit site of `execute`.
 async fn finalize_outcome(
@@ -537,7 +547,7 @@ pub async fn execute_with_recorder(
                     hub,
                     hook_ctx.as_ref(),
                     RuntimeOutcome {
-                        body: content,
+                        body: agent_reply_body(content),
                         metadata: acc.finalize(),
                     },
                 )
@@ -631,7 +641,7 @@ pub async fn execute_with_recorder(
                             hub,
                             hook_ctx.as_ref(),
                             RuntimeOutcome {
-                                body: content,
+                                body: agent_reply_body(content),
                                 metadata: acc.finalize(),
                             },
                         )
@@ -678,7 +688,7 @@ pub async fn execute_with_recorder(
                     hub,
                     hook_ctx.as_ref(),
                     RuntimeOutcome {
-                        body: content,
+                        body: agent_reply_body(content),
                         metadata: acc.finalize(),
                     },
                 )
@@ -736,7 +746,7 @@ pub async fn execute_with_recorder(
                     hub,
                     hook_ctx.as_ref(),
                     RuntimeOutcome {
-                        body: content,
+                        body: agent_reply_body(content),
                         metadata: acc.finalize(),
                     },
                 )
@@ -1062,7 +1072,7 @@ pub async fn execute_with_recorder(
                 hub,
                 hook_ctx.as_ref(),
                 RuntimeOutcome {
-                    body: content,
+                    body: agent_reply_body(content),
                     metadata: acc.finalize(),
                 },
             )

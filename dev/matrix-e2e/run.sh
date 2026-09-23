@@ -684,10 +684,24 @@ group_member_joined() {
 }
 wait_for "the stranger to join the group room" 90 group_member_joined "$STRANGER_MXID"
 
+# A pre-join message is imported as context, never as a model request.
+PRECLEAR_BODY="history before the clear marker"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$PRECLEAR_BODY" '{msgtype:"m.text",body:$b}')" >/dev/null
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz clear"}' >/dev/null
+PREJOIN_BODY="history before the agent joined"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$PREJOIN_BODY" '{msgtype:"m.text",body:$b}')" >/dev/null
+
 # The bridge auto-joins when invited by a user in its allow_list.
 mx POST "/_matrix/client/v3/rooms/$GROUP_URI/invite" "$PUPPET_TOKEN" \
 	"$(jq -nc --arg a "$AGENT_MXID" '{user_id:$a}')" >/dev/null
 wait_for "the agent to join the group room" 90 group_member_joined "$AGENT_MXID"
+wait_for "join-time room history backfill" 90 grep -q "Backfilled 1 entries" "$BRIDGE_LOG"
 
 # Count what the agent actually said in the group room. Restricted to
 # `m.room.message`: /messages returns state events too, and the agent's own
@@ -735,10 +749,8 @@ HELP_MARKER="chaz commands"
 MENTION_BODY="mentioning the agent"
 BARE_BODY="bare message with no prefix and no mention"
 
-# How many turns the model has been asked to run. The bridge backfills room
-# history into the session, so the text of an ignored message still shows up in
-# a later turn's context — the count of requests is what says whether it became
-# a turn of its own.
+# How many turns the model has been asked to run. Join-time history is
+# context only; messages after join that aren't addressed are ignored.
 stub_requests() { grep -c "^stub_llm: request:" "$WORKSPACE/stub-llm.log" || true; }
 
 # The bridge writes a line for every message it drops for not being addressed
@@ -779,8 +791,16 @@ wait_for "the mention to reach the model" "$REPLY_TIMEOUT" mention_reached_the_m
 
 GROUP_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
 	grep -cF "$BARE_BODY" || true)"
-if [[ $GROUP_TURNS -ne 1 ]]; then
-	fail "bridge ran $GROUP_TURNS turns containing the group messages, expected 1 — a bare message was answered"
+PREJOIN_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+    grep -cF "$PREJOIN_BODY" || true)"
+[[ $PREJOIN_TURNS -eq 1 ]] || fail "pre-join history did not appear exactly once in the mention turn (found $PREJOIN_TURNS)"
+if grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -qF "$PRECLEAR_BODY"; then
+    fail "history before !chaz clear reached the model"
+fi
+[[ "$(stub_requests)" -eq $((TURNS_BEFORE + 1)) ]] || fail "history triggered an extra model turn"
+
+if [[ $GROUP_TURNS -ne 0 ]]; then
+    fail "bridge included an unaddressed post-join message in $GROUP_TURNS model turn(s)"
 fi
 
 wait_for "the mention reply in the group room" "$REPLY_TIMEOUT" \
@@ -877,3 +897,43 @@ for out in rooms-dryrun rooms-execute rooms-dryrun2; do
 done
 
 printf '\033[1;32mPASS\033[0m — room reset passed (dry-run lists, --execute leaves, re-run idempotent, no secret leaked)\n' >&2
+
+# Rejoining the same room imports only messages between joins. In particular,
+# the old live prompts and bot replies must not be backfilled a second time.
+log "rejoin: inviting the bridge back into the DM"
+sleep 3 # Let the running bridge observe the leave before posting absent-period history.
+ROOM_URI="$(jq -rn --arg r "$ROOM_ID" '$r|@uri')"
+REJOIN_CLEARED="older history during the absence"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_CLEARED" '{msgtype:"m.text",body:$b}')" >/dev/null
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz clear"}' >/dev/null
+REJOIN_HISTORY="history while the bridge was absent"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_HISTORY" '{msgtype:"m.text",body:$b}')" >/dev/null
+TURNS_BEFORE_REJOIN="$(stub_requests)"
+BACKFILLS_BEFORE="$(grep -c 'Backfilled 1 entries' "$BRIDGE_LOG" || true)"
+mx POST "/_matrix/client/v3/rooms/$ROOM_URI/invite" "$PUPPET_TOKEN" \
+    "$(jq -nc --arg a "$AGENT_MXID" '{user_id:$a}')" >/dev/null
+wait_for "bridge to rejoin the DM" 90 agent_joined
+rejoin_backfilled() {
+    [[ "$(grep -c 'Backfilled 1 entries' "$BRIDGE_LOG" || true)" -gt "$BACKFILLS_BEFORE" ]]
+}
+wait_for "rejoin history backfill" 90 rejoin_backfilled
+REJOIN_PROMPT="addressed after rejoin"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
+wait_for "rejoin prompt to reach the model" "$REPLY_TIMEOUT" \
+    grep -qF "$REJOIN_PROMPT" "$WORKSPACE/stub-llm.log"
+wait_for "seventh reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 7
+[[ "$(stub_requests)" -eq $((TURNS_BEFORE_REJOIN + 1)) ]] ||
+    fail "rejoin history triggered a model turn"
+REJOIN_CONTEXT="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
+[[ "$REJOIN_CONTEXT" == *"$REJOIN_HISTORY"* ]] || fail "rejoin history missing from context"
+[[ "$REJOIN_CONTEXT" != *"$REJOIN_CLEARED"* ]] || fail "history before clear was imported on rejoin"
+[[ "$REJOIN_CONTEXT" != *"second turn"* ]] || fail "previous live room events were reimported on rejoin"
+printf '\033[1;32mPASS\033[0m — rejoin imported absent-period context without replaying old turns\n' >&2

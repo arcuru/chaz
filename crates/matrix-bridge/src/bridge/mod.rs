@@ -22,6 +22,8 @@ use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{
     Request as TypingRequest, Typing, TypingInfo,
 };
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
+use matrix_sdk::ruma::events::room::member::MembershipState;
+use matrix_sdk::ruma::events::room::member::{OriginalSyncRoomMemberEvent, RoomMemberEventContent};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
@@ -105,6 +107,80 @@ impl MatrixBridge {
 /// session work rather than fork a session against a missing agent.
 fn owning_agent_entry(server: &Server, owning_agent: &str) -> Option<DbEntry> {
     server.agent_index().find_by_name(owning_agent)
+}
+
+struct BackfilledRoom {
+    join_id: String,
+    prejoin_ids: HashSet<String>,
+}
+
+/// Bootstrap a joined room before any live event is written. The per-room lock
+/// serializes join handling with concurrent inbound sync events. Retry after a
+/// failed fetch; never mark a partial import complete.
+async fn backfill_joined_room(
+    room: &Room,
+    server: &Server,
+    login_id: &str,
+    owning_agent: &str,
+    backfilled: &Mutex<HashMap<String, BackfilledRoom>>,
+) -> anyhow::Result<()> {
+    if room.state() != RoomState::Joined {
+        return Ok(());
+    }
+    let room_id = room.room_id().to_string();
+    let mut done = backfilled.lock().await;
+    let agent = owning_agent_entry(server, owning_agent)
+        .ok_or_else(|| anyhow::anyhow!("owning agent {owning_agent} not hosted"))?;
+    let client = room.client();
+    let user_id = client
+        .user_id()
+        .ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+    let join_event = room
+        .get_state_event_static_for_key::<RoomMemberEventContent, _>(user_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("own membership state missing"))?;
+    let join_id = match join_event {
+        matrix_sdk::deserialized_responses::RawSyncOrStrippedState::Sync(raw) => raw
+            .get_field::<String>("event_id")?
+            .ok_or_else(|| anyhow::anyhow!("join event has no ID"))?,
+        _ => anyhow::bail!("own membership state is not a joined event"),
+    };
+    if done
+        .get(&room_id)
+        .is_some_and(|value| value.join_id == join_id)
+    {
+        return Ok(());
+    }
+    // The session is published with no newly imported entries. A transaction
+    // below makes the history, consumed baseline and join checkpoint visible
+    // together, even if this is a rejoin after a previous run.
+    let (conv, db) = server
+        .registry()
+        .get_or_create_channel_session(&agent, login_id, "matrix", login_id, &room_id)
+        .await?;
+    let mut session = Session::new(conv, db).await;
+    let previous = session.last_backfilled_join(&room_id).await?;
+    let mut prejoin_ids = HashSet::new();
+    if previous.as_deref() != Some(&join_id) {
+        let (history, ids) = read_room_history(
+            room,
+            &join_id,
+            previous.as_deref(),
+            user_id.as_str(),
+            login_id,
+        )
+        .await?;
+        session.backfill(history, (&room_id, &join_id)).await?;
+        prejoin_ids = ids;
+    }
+    done.insert(
+        room_id,
+        BackfilledRoom {
+            join_id,
+            prejoin_ids,
+        },
+    );
+    Ok(())
 }
 
 /// Channels this login has outbound delivery installed for, keyed by
@@ -549,6 +625,51 @@ impl Bridge for MatrixBridge {
         // installed, so room history is not replayed through them on startup.
         mc.initial_sync().await;
 
+        let backfilled_rooms: Arc<Mutex<HashMap<String, BackfilledRoom>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        for room in mc.client().joined_rooms() {
+            if let Err(e) =
+                backfill_joined_room(&room, &server, &login_id, &owning_agent, &backfilled_rooms)
+                    .await
+            {
+                error!(room_id = %room.room_id(), "Join history backfill failed: {e}");
+            }
+        }
+
+        // Subsequent joins (including invite auto-joins) bootstrap at join,
+        // not when the room first addresses the agent.
+        {
+            let server = server.clone();
+            let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
+            let backfilled_rooms = backfilled_rooms.clone();
+            mc.client()
+                .add_event_handler(move |event: OriginalSyncRoomMemberEvent, room: Room| {
+                    let server = server.clone();
+                    let login_id = login_id.clone();
+                    let owning_agent = owning_agent.clone();
+                    let backfilled_rooms = backfilled_rooms.clone();
+                    async move {
+                        if room.client().user_id() != Some(event.state_key.as_ref())
+                            || event.content.membership != MembershipState::Join
+                        {
+                            return;
+                        }
+                        if let Err(e) = backfill_joined_room(
+                            &room,
+                            &server,
+                            &login_id,
+                            &owning_agent,
+                            &backfilled_rooms,
+                        )
+                        .await
+                        {
+                            error!(room_id = %room.room_id(), "Join history backfill failed: {e}");
+                        }
+                    }
+                });
+        }
+
         info!("The client is ready! Listening to new messages…");
 
         // Rooms with outbound delivery installed, and the reconciler that
@@ -643,8 +764,6 @@ impl Bridge for MatrixBridge {
             let attached_channels = attached_channels.clone();
             let message_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
-            let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
-                Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             let pending_approvals = pending_approvals.clone();
 
@@ -843,6 +962,21 @@ impl Bridge for MatrixBridge {
 
                         let room_id = room.room_id().to_string();
 
+                        // A join callback can race the first live sync event.
+                        // It must finish (or fail closed) before this live row is
+                        // inserted, so history never queues an extra turn.
+                        if let Err(e) = backfill_joined_room(
+                            &room, &server, &login_id, &owning_agent, &backfilled_rooms,
+                        ).await {
+                            error!(room_id, "Join history backfill failed: {e}");
+                        }
+
+                        if backfilled_rooms.lock().await.get(&room_id).is_some_and(
+                            |value| value.prejoin_ids.contains(event.event_id.as_str()),
+                        ) {
+                            return;
+                        }
+
                         // Resolve (or create) the session bound to this room.
                         // On create this binds the room into the session DB,
                         // attaches the owning agent as host (delegating session
@@ -889,21 +1023,6 @@ impl Bridge for MatrixBridge {
                             error!("Failed to register response callback: {e}");
                         }
 
-                        // Backfill room history on first message per room.
-                        {
-                            let mut backfilled = backfilled_rooms.lock().await;
-                            if backfilled.insert(room_id.clone()) {
-                                info!("Backfilling history for room {room_id}");
-                                let history = read_room_history(&room).await;
-                                let mut session = Session::new(
-                                    chaz_core::types::ConversationId(session_db_id.clone()),
-                                    session_db.clone(),
-                                )
-                                .await;
-                                session.backfill(history).await;
-                            }
-                        }
-
                         // Write the user entry to the session DB. This is the
                         // bridge's whole inbound job — the daemon, watching the
                         // exposed session, runs the agent and writes the reply,
@@ -913,6 +1032,17 @@ impl Bridge for MatrixBridge {
                             session_db,
                         )
                         .await;
+                        // A sync after rejoining can deliver pre-join timeline
+                        // events as if they were live. Backfilled event IDs are
+                        // context-only, never another inbound request.
+                        if session.entries().iter().any(|entry| {
+                            entry.routing.as_ref()
+                                .and_then(|routing| routing.source.as_ref())
+                                .and_then(|source| source.message_id.as_deref())
+                                == Some(event.event_id.as_str())
+                        }) {
+                            return;
+                        }
                         // Stamp transport provenance so an agent's reply can
                         // be routed back to this room on this login.
                         if let Err(e) = session
