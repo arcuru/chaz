@@ -44,8 +44,8 @@ pub struct BuildOptions {
     /// Materialize an eidetica AgentDb per config-declared agent (minting one
     /// locally on this peer). True for the chaz daemon, which owns its agents.
     /// A standalone bridge sets this **false**: it owns no agents — it
-    /// ticket-bootstraps each agent DB from the daemon before calling `build`,
-    /// and the hosted index then discovers those synced DBs. Minting locally
+    /// either ticket-bootstraps agent DBs as a direct owner or opens them
+    /// through the shared service. Minting locally
     /// here would fork a second, divergent agent DB against the daemon's.
     pub bootstrap_agents_from_config: bool,
     /// Spawn the agent-running `processing_loop`. True for the chaz daemon,
@@ -323,9 +323,9 @@ pub async fn build(
     // Materialize an eidetica DB per yaml-declared agent. Idempotent on
     // re-runs (yaml is a first-boot template; AgentDb is the source of
     // truth afterwards). Skipped for a standalone bridge, which owns no
-    // agents and instead ticket-bootstraps the daemon's agent DBs (minting
-    // here would fork a divergent copy); the hosted index below discovers
-    // those already-synced DBs.
+    // agents: it either ticket-bootstraps (direct owner) or shares the
+    // service login. Minting here could fork a divergent agent DB; the
+    // hosted index below discovers the existing DBs.
     if opts.bootstrap_agents_from_config {
         let t = Instant::now();
         let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
@@ -1125,11 +1125,12 @@ async fn run_deferred_startup(
 
 /// Run the agent on sessions that a dumb bridge created and exposed.
 ///
-/// A bridge (a separate peer) creates a session DB, attaches a daemon-owned
+/// A bridge (direct peer or service client) creates a session DB, attaches a daemon-owned
 /// agent to it (granting the agent Write + delegating session auth to the agent
-/// DB), and records a [`agent_db::SessionRef`] in the agent DB's synced session
-/// registry with the bridge in `exposed_on`. That registry write syncs to the
-/// daemon. This installs an `on_write` on each hosted agent DB and, on every
+/// DB), and records a [`agent_db::SessionRef`] in the agent DB's session
+/// registry with the bridge in `exposed_on`. That write reaches the daemon
+/// through sync or the shared service. This installs an `on_write` on each hosted
+/// agent DB and, on every
 /// write (local *or* remote/synced — eidetica's `on_write` fires for both),
 /// re-scans the registry and `register_session`s any exposed session not yet
 /// watched, so the daemon's ReAct loop answers it.

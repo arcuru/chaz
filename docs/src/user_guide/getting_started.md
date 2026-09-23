@@ -116,22 +116,25 @@ or a supervisor to collect. It stops cleanly on Ctrl-C or `SIGTERM`. A daemon
 using a `unix://` Eidetica service reconnects after transient service restarts,
 tearing down its old runtime before creating the replacement.
 
-This is also the process transport bridges sync against.
+Direct-owner transport bridges sync against this process. Service-client
+bridges instead connect to the same Eidetica service login.
 
 ## Running the Matrix Bot
 
-The Matrix bridge is its own binary and its own peer — `chaz-matrix`, started
-separately from the agent process rather than spawned inside it:
+The Matrix bridge is its own binary, `chaz-matrix`, started separately from
+the agent process rather than spawned inside it. This example uses a
+direct-owner bridge with its own Eidetica peer:
 
 ```bash
 chaz --config config.yaml daemon &          # the peer that runs agents
 chaz-matrix --config matrix-bridge.yaml     # pure Matrix transport
 ```
 
-The bridge holds the Matrix login, and reaches the agent's database through an
-access ticket. It runs no agents and calls no LLM itself: inbound messages are
-written into session databases, and the daemon's replies sync back out to the
-room.
+The bridge holds the Matrix login and reaches the agent's database through
+an access ticket. It runs no agents and calls no LLM itself: inbound messages
+are written into session databases, and the daemon's replies sync back out
+to the room. For a shared-service setup without a ticket, see
+[Connection settings](bridges.md#connection-settings).
 
 The bot logs in to Matrix, accepts room invites from allowed users, and responds to messages. In DMs it responds to everything; in group rooms it responds to `!chaz` prefixed messages or messages that @-mention the bot.
 
