@@ -1325,60 +1325,58 @@ impl Session {
             .collect()
     }
 
-    /// Merge backfill history from a bridge (e.g., Matrix room history).
-    /// Only inserts entries that are older than our earliest entry or fill gaps.
-    /// Deduplicates by timestamp+content.
-    pub async fn backfill(&mut self, history: Vec<SessionEntry>) {
-        if history.is_empty() {
-            return;
-        }
-
-        let mut new_count = 0;
-        let mut backfilled_ids = Vec::new();
-        for entry in history {
-            let already_exists = self.entries.iter().any(|existing| {
-                existing.timestamp == entry.timestamp && existing.content == entry.content
-            });
-            if !already_exists {
-                if let Ok(txn) = self.database.new_transaction().await
-                    && let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await
-                    && let Ok(row_id) = store.insert(entry.clone()).await
-                {
-                    let _ = txn.commit().await;
-                    backfilled_ids.push(row_id.clone());
-                    self.entry_ids.push(TurnRequestId::parse(row_id));
-                }
-                self.entries.push(entry);
-                new_count += 1;
-            }
-        }
-
-        if new_count > 0 {
-            if let Err(error) = self.extend_turn_baseline(backfilled_ids).await {
-                error!("Failed to mark backfilled entries consumed: {error}");
-            }
-            self.load_from_db().await;
-            info!(
-                "Backfilled {} entries for {}",
-                new_count, self.conversation_id
-            );
-        }
-    }
-
-    async fn extend_turn_baseline(&self, row_ids: Vec<String>) -> anyhow::Result<()> {
-        if row_ids.is_empty() {
-            return Ok(());
-        }
+    /// The last join event whose history was imported for this room.
+    pub async fn last_backfilled_join(&self, room_id: &str) -> anyhow::Result<Option<String>> {
         let txn = self.database.new_transaction().await?;
         let meta = txn.get_store::<DocStore>(META_STORE).await?;
+        Ok(meta
+            .get_string(&format!("matrix_join:{room_id}"))
+            .await
+            .ok())
+    }
+
+    /// Merge historical context and its consumed-turn baseline in one commit.
+    /// A daemon snapshot can never observe a historical row as a live request.
+    pub async fn backfill(
+        &mut self,
+        history: Vec<SessionEntry>,
+        join_marker: (&str, &str),
+    ) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await?;
+        let meta = txn.get_store::<DocStore>(META_STORE).await?;
         let mut baseline = read_turn_baseline_from(&meta).await?;
-        baseline.extend(row_ids);
-        meta.set_string(
-            TURN_BASELINE_KEY,
-            serde_json::to_string(&baseline.into_iter().collect::<Vec<_>>())?,
-        )
-        .await?;
+        let mut new_entries = Vec::new();
+        for entry in history {
+            if self
+                .entries
+                .iter()
+                .chain(new_entries.iter().map(|(_, entry)| entry))
+                .any(|existing: &SessionEntry| {
+                    existing.timestamp == entry.timestamp && existing.content == entry.content
+                })
+            {
+                continue;
+            }
+            let row_id = store.insert(entry.clone()).await?;
+            baseline.insert(row_id.clone());
+            new_entries.push((row_id, entry));
+        }
+        if !new_entries.is_empty() {
+            meta.set_string(
+                TURN_BASELINE_KEY,
+                serde_json::to_string(&baseline.into_iter().collect::<Vec<_>>())?,
+            )
+            .await?;
+        }
+        meta.set_string(&format!("matrix_join:{}", join_marker.0), join_marker.1)
+            .await?;
         txn.commit().await?;
+        let count = new_entries.len();
+        self.load_from_db().await;
+        info!("Backfilled {} entries for {}", count, self.conversation_id);
         Ok(())
     }
 
@@ -1916,6 +1914,99 @@ mod tests {
         assert_eq!(session.entries().len(), 1);
         let reread = Session::new(ConversationId("c1".to_string()), db).await;
         assert_eq!(reread.entries().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backfill_is_context_only_and_live_entry_is_single_request() {
+        let (_instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let mut session = Session::new(ConversationId("matrix".into()), db.clone()).await;
+        let older = entry_at("user", 3, None);
+        let newer = entry_at("user", 2, None);
+        session
+            .backfill(vec![older.clone(), newer.clone()], ("!room", "$join"))
+            .await
+            .unwrap();
+        // Read from storage, not the in-memory session; a daemon may observe
+        // this commit immediately after the bridge makes it visible.
+        let mut reopened = Session::new(ConversationId("matrix".into()), db.clone()).await;
+        assert_eq!(reopened.entries().len(), 2);
+        assert_eq!(
+            reopened
+                .last_backfilled_join("!room")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("$join")
+        );
+        assert!(
+            reopened
+                .turn_requests(|_| false, &HashSet::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reopened
+            .backfill(vec![older, newer], ("!room", "$join"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.entries().len(),
+            2,
+            "restart/rejoin must deduplicate"
+        );
+        let live = reopened.add_entry(entry_at("user", 0, None)).await.unwrap();
+        let after_live = Session::new(ConversationId("matrix".into()), db).await;
+        let requests = after_live
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, live);
+    }
+
+    #[tokio::test]
+    async fn backfill_on_an_attached_existing_session_keeps_live_requests() {
+        let (_instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let mut session = Session::new(ConversationId("attached".into()), db.clone()).await;
+        let live = session.add_entry(entry_at("user", 0, None)).await.unwrap();
+        session
+            .backfill(vec![entry_at("user", 5, None)], ("!room", "$join"))
+            .await
+            .unwrap();
+        let reopened = Session::new(ConversationId("attached".into()), db).await;
+        assert_eq!(reopened.entries().len(), 2);
+        let requests = reopened
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, live);
+    }
+
+    #[tokio::test]
+    async fn failed_backfill_does_not_claim_uncommitted_history() {
+        let (instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let unwritable = Database::open(&instance, db.root_id()).await.unwrap();
+        let mut session = Session::new(ConversationId("matrix".into()), unwritable).await;
+        assert!(
+            session
+                .backfill(vec![entry_at("user", 1, None)], ("!room", "$join"))
+                .await
+                .is_err()
+        );
+        assert!(session.entries().is_empty());
+        let reopened = Session::new(ConversationId("matrix".into()), db).await;
+        assert!(reopened.entries().is_empty());
+        assert!(
+            reopened
+                .last_backfilled_join("!room")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

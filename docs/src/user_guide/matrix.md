@@ -94,6 +94,16 @@ Example with a shared room:
 
 The bot then logs in, accepts invites from allowed users, and starts responding.
 
+On joining a room, the bridge creates or reuses its session and imports only
+messages before the bot's join as context; that history never triggers an agent
+turn. On rejoin it imports only messages from the time the bot was away.
+`!chaz clear` stops the historical import at that marker. Restarting or
+attaching a room to an existing session does not replay history as live input.
+A new addressed message is handled once. Agents may deliberately decline to
+reply by returning exactly `[[NO_REPLY]]` as their final response (without any
+other text). Chaz records the turn but sends no Matrix message; add this
+convention to an agent's system prompt if it should use it.
+
 ### Scripted bring-up
 
 The approval round-trip in step 5 exists because the bridge's key is unknown
@@ -232,9 +242,9 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ## Session Attachment
 
-A Matrix room is connected to a session through an explicit _channel_ record (`room_id → session_db_id`). The first time you talk to the bot in a new room it auto-creates a session and attaches the room to it.
+A Matrix room is connected to a session through an explicit _channel_ record (`room_id → session_db_id`). Joining a new room creates the session and attaches the room before an addressed message arrives.
 
-Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next message in the room creates a fresh session.
+Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next addressed message in the room creates a fresh session.
 
 At bridge startup, the bot re-installs response-delivery callbacks for every persisted channel whose room it's joined to. This is what makes scheduled-task responses reach a Matrix room even when no user is currently active there.
 
