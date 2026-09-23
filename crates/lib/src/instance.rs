@@ -81,8 +81,12 @@ impl ExecutorCapability {
     }
 }
 
-pub(crate) fn legacy_executor_capability() -> ExecutorCapability {
-    ExecutorCapability { _private: () }
+pub(crate) fn executor_for_role(role: ExecutionRole) -> Result<ExecutorCapability, ConnectError> {
+    (role == ExecutionRole::Executor)
+        .then_some(ExecutorCapability { _private: () })
+        .ok_or(ConnectError::Capability(
+            "client role cannot install agent execution or autonomous routines",
+        ))
 }
 
 impl InstanceCapabilities {
@@ -107,11 +111,7 @@ impl InstanceCapabilities {
     }
 
     pub fn executor(self) -> Result<ExecutorCapability, ConnectError> {
-        self.runs_agents()
-            .then_some(ExecutorCapability { _private: () })
-            .ok_or(ConnectError::Capability(
-                "client role cannot install agent execution or autonomous routines",
-            ))
+        executor_for_role(self.execution)
     }
 }
 

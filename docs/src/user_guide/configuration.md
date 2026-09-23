@@ -33,9 +33,10 @@ eidetica:
 ```
 
 The connector never creates a store or user and never falls back from a failed
-service connection to SQLite. To point an existing legacy configuration at its
+service connection to SQLite. To keep using an existing direct-owner configuration with its
 old data, set `connection` to its resolved `<state_dir>/eidetica.db` and retain
-the existing `chaz` login. Provisioning a new Eidetica store/user is a separate,
+the existing `chaz` login. Switching to a service connection does not import
+that data; see the [fresh-state rehearsal](bridges.md#fresh-state-service-rehearsal-no-automatic-migration). Provisioning a new Eidetica store/user is a separate,
 explicit operation.
 
 CLI and TUI clients may create sessions and queue turns through that service

@@ -38,10 +38,6 @@ pub struct BuildOptions {
     /// Path the config was loaded from; recorded on the server so `/agent
     /// reload` (and config reconcile) can re-read it.
     pub config_path: PathBuf,
-    /// Enable eidetica P2P sync (iroh transport + optional HTTP bind from
-    /// `config.sync_listen`). A one-shot CLI invocation leaves this off — the
-    /// engine and public endpoint would outlive the single ReAct loop.
-    pub enable_sync: bool,
     /// Spawn the routine engine (heartbeats + schedulers) and register every
     /// hosted session/agent with it. Off for one-shot CLI runs.
     pub run_routine_engine: bool,
@@ -85,7 +81,6 @@ impl BuildOptions {
         let executor = capabilities.runs_agents();
         Self {
             config_path,
-            enable_sync: false,
             run_routine_engine: executor,
             bootstrap_agents_from_config: executor,
             run_agent_loop: executor,
@@ -114,7 +109,6 @@ impl BuildOptions {
         let executor = capabilities.runs_agents();
         Self {
             config_path,
-            enable_sync: false,
             run_routine_engine: false,
             bootstrap_agents_from_config: executor && bootstrap_agents_from_config,
             run_agent_loop: executor && run_agent_loop,
@@ -144,6 +138,45 @@ mod build_options_tests {
             sync: None,
         };
         crate::instance::capabilities_for_test(&config, role)
+    }
+
+    #[tokio::test]
+    async fn missing_role_cannot_reach_runtime_build() {
+        use eidetica::NewUser;
+        use eidetica::backend::database::InMemory;
+
+        let (instance, user) = eidetica::Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("fixture"),
+        )
+        .await
+        .unwrap();
+        let mut config = Config {
+            eidetica: Some(EideticaConfig {
+                connection: "memory://fixture".into(),
+                login: EideticaLoginConfig {
+                    username: "fixture".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            }),
+            ..Default::default()
+        };
+        let opts = BuildOptions::local(
+            PathBuf::from("config.yaml"),
+            capabilities(ExecutionRole::Executor),
+            Vec::new(),
+            McpReadiness::Deferred,
+        );
+        let error = build(&mut config, instance, user, opts)
+            .await
+            .err()
+            .expect("runtime build must reject an absent role before bootstrapping agents");
+        assert!(
+            error.to_string().contains("missing required `execution:"),
+            "unexpected build error: {error:#}"
+        );
     }
 
     #[test]
@@ -265,70 +298,18 @@ pub async fn build(
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
     let mut tasks = Vec::new();
-    if config.execution.is_some() {
-        let execution = crate::instance::required_settings(config)?.1;
-        let is_executor = execution == crate::config::ExecutionRole::Executor;
-        if !is_executor
-            && (opts.run_agent_loop || opts.run_routine_engine || opts.bootstrap_agents_from_config)
-        {
-            anyhow::bail!(
-                "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
-            );
-        }
+    let execution = crate::instance::required_settings(config)?.1;
+    if execution != crate::config::ExecutionRole::Executor
+        && (opts.run_agent_loop || opts.run_routine_engine || opts.bootstrap_agents_from_config)
+    {
+        anyhow::bail!(
+            "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
+        );
     }
     // Wall-clock instrumentation for the critical-path build. Individual
     // heavy steps log their own `elapsed_ms`; this bounds the whole
     // gateway-blocking prefix so regressions are visible in the log.
     let build_start = Instant::now();
-
-    // Enable eidetica sync for session sharing. Register iroh P2P transport
-    // by default (stable peer identity, no address config needed). If
-    // sync_listen is configured, also bind HTTP for traditional access.
-    if opts.enable_sync {
-        instance.enable_sync().await?;
-        if let Some(sync) = instance.sync() {
-            // Registering a transport under a name that already has one
-            // *replaces* it: the endpoint that was serving is dropped and a
-            // fresh one is minted under a different address. A caller that set
-            // sync up before calling build — the bridges do, because access
-            // bootstrap needs a live Sync handle — would therefore change its
-            // own address partway through startup, and every peer holding the
-            // old one would be left dialing an endpoint nobody is listening on.
-            // Nothing reports that: the peer is registered, the address is
-            // recorded, and requests simply go unanswered.
-            //
-            // So each transport is registered only if it is not already
-            // serving, which is what callers passing `enable_sync` on an
-            // already-synced instance have always assumed this does.
-            let mut registered_any = false;
-
-            if sync.get_server_address_for("iroh").await.is_err() {
-                use eidetica::sync::transports::iroh::IrohTransport;
-                sync.register_transport("iroh", IrohTransport::builder())
-                    .await?;
-                registered_any = true;
-            }
-
-            if let Some(ref addr) = config.sync_listen
-                && sync.get_server_address_for("http").await.is_err()
-            {
-                use eidetica::sync::transports::http::HttpTransport;
-                sync.register_transport("http", HttpTransport::builder().bind(addr))
-                    .await?;
-                info!("Sync HTTP transport listening on {addr}");
-                registered_any = true;
-            }
-
-            if registered_any {
-                sync.accept_connections().await?;
-                if let Ok(addr) = sync.get_server_address().await {
-                    info!("Eidetica sync address: {addr}");
-                }
-            } else {
-                info!("Sync already accepting connections; keeping the existing address");
-            }
-        }
-    }
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {
@@ -721,13 +702,11 @@ pub async fn build(
     let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
         as std::sync::Arc<dyn tool_host::ToolHost>;
 
-    let executor = if config.execution.is_some() {
-        crate::instance::required_settings(config)?.1 == crate::config::ExecutionRole::Executor
-            && opts.run_agent_loop
+    let executor = if opts.run_agent_loop {
+        Some(crate::instance::executor_for_role(execution)?)
     } else {
-        opts.run_agent_loop
-    }
-    .then(crate::instance::legacy_executor_capability);
+        None
+    };
     let server = Server::new(
         registry.clone(),
         agent_registry,

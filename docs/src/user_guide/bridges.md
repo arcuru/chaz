@@ -103,6 +103,33 @@ backoff, re-logs in, reopens the databases, reinstalls its hooks, and
 reconciles delivery progress. Bad credentials or invalid configuration fail
 immediately.
 
+## Fresh-state service rehearsal (no automatic migration)
+
+1. Back up the old Chaz config and Eidetica/bridge state together; keep an
+   untouched, **compatible** copy for rollback. An older binary may not safely
+   reopen state written by the new version.
+2. On disposable storage, stop all old direct owners. Provision the Eidetica
+   daemon's store and login explicitly using Eidetica's CLI; start the service.
+   Configure exactly one Chaz `execution: executor` process against its
+   `unix://` endpoint, with the same login as the clients. Check its startup
+   log and ensure no second executor is running for those sessions.
+3. Configure CLI/TUI and each Matrix/Discord bridge with `execution: client`,
+   the same service endpoint and login, and **no** `eidetica.sync` or login
+   `ticket`. Provision fresh bridge settings/identities deliberately; old
+   bridge databases, identities, delivery progress and channel bindings are
+   **not** imported into this layout. Reattach channels and verify an inbound
+   message and one reply on a disposable Matrix room before any live cutover.
+4. Test a client and bridge restart while the executor stays up, then an
+   executor restart. Check committed replies arrive and already acknowledged
+   chunks do not resend. Roll back by stopping the new processes and restoring
+   the preserved compatible copy with its old config and binaries, not by
+   pointing an old binary at the newly written store.
+
+This is a rehearsal, not a data move or production cutover. Service selection
+never searches for or silently shadows old direct-owner state. Delivery remains
+at-least-once across the transport-acknowledgement window (see
+[Delivery guarantees](#delivery-guarantees)).
+
 ## The bridge config file
 
 A bridge reads its own YAML file — `chaz-matrix` defaults to
