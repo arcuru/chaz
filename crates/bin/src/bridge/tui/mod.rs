@@ -474,7 +474,7 @@ pub(super) struct Tab {
     pub entries: Vec<SessionEntry>,
     pub scroll_offset: u16,
     pub pending_approval: Option<ApprovalExchange>,
-    pub waiting: bool,
+    pub active_turns: usize,
     pub current_agent: String,
     pub session_name: Option<String>,
     /// The model the runtime would actually use for this session's next
@@ -1477,13 +1477,17 @@ async fn build_tab(
     let context_budget =
         server.effective_context_budget(&effective_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
+    let active_turns = Session::active_turn_attempts(&session_db)
+        .await
+        .unwrap_or_default()
+        .len();
     Tab {
         session_db_id,
         session_db,
         entries,
         scroll_offset: 0,
         pending_approval: None,
-        waiting: false,
+        active_turns,
         current_agent: agent.name.clone(),
         session_name,
         effective_model,
@@ -1491,6 +1495,12 @@ async fn build_tab(
         context_budget,
         expanded_entries: HashSet::new(),
     }
+}
+
+/// Refresh live activity independently of historical transcript entries.
+async fn refresh_tab_activity(tab: &mut Tab) -> anyhow::Result<()> {
+    tab.active_turns = Session::active_turn_attempts(&tab.session_db).await?.len();
+    Ok(())
 }
 
 /// Shift the active tab by `delta` (wraps around).
@@ -1552,7 +1562,7 @@ async fn handle_chat_action(
                 })
                 .await
             {
-                Ok(_) => tab.waiting = true,
+                Ok(_) => {}
                 Err(e) => tracing::error!("Failed to send message: {e}"),
             }
         }
@@ -2150,6 +2160,10 @@ async fn render_outcome(
             }
             let session = Session::new(conv_id, db.clone()).await;
             let entries = session.entries().to_vec();
+            let active_turns = Session::active_turn_attempts(&db)
+                .await
+                .unwrap_or_default()
+                .len();
             // Mirror `build_tab` — resolve through the backend so the status
             // bar reflects what the runtime would actually use.
             let agent = server.agents().get(&agent_name);
@@ -2164,7 +2178,7 @@ async fn render_outcome(
                 entries,
                 scroll_offset: 0,
                 pending_approval: None,
-                waiting: false,
+                active_turns,
                 current_agent: agent_name,
                 session_name,
                 effective_model,
@@ -2227,7 +2241,7 @@ mod session_picker_tests {
             entries: Vec::new(),
             scroll_offset: 0,
             pending_approval: None,
-            waiting: false,
+            active_turns: 0,
             current_agent: "chaz".into(),
             session_name: None,
             effective_model: String::new(),
@@ -2235,6 +2249,51 @@ mod session_picker_tests {
             context_budget: 0,
             expanded_entries: HashSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn tab_activity_follows_persisted_claim_not_old_ack() {
+        // Keep the backend alive: the picker fixture normally drops it because
+        // picker tests only inspect tab metadata, not session DB writes.
+        let (_instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("live-tab"))
+                .await
+                .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let mut tab = test_tab().await;
+        tab.session_db_id = db.root_id().to_string();
+        tab.session_db = db;
+        let mut session = Session::new(
+            chaz_core::types::ConversationId(tab.session_db_id.clone()),
+            tab.session_db.clone(),
+        )
+        .await;
+        let attempt = session
+            .start_turn_attempt(chaz_core::session::TurnRequestId::parse("tui-message"))
+            .await
+            .unwrap();
+        refresh_tab_activity(&mut tab).await.unwrap();
+        assert_eq!(tab.active_turns, 1);
+        assert!(view::turn_activity_line(tab.active_turns).is_some());
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        session
+            .add_entry(SessionEntry {
+                sender: "chaz".into(),
+                content: String::new(),
+                timestamp: chrono::Utc::now(),
+                entry_type: EntryType::Ack,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        refresh_tab_activity(&mut tab).await.unwrap();
+        assert_eq!(tab.active_turns, 0);
+        assert!(view::turn_activity_line(tab.active_turns).is_none());
     }
 
     fn index(n: usize) -> SessionIndex {

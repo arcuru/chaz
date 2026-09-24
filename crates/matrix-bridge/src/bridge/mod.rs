@@ -129,6 +129,7 @@ async fn attach_response_callback(
     owning_agent: String,
     pending: PendingApprovals,
 ) -> anyhow::Result<Arc<DeliveryReconciler>> {
+    attach_typing_watcher(session_db, room.clone()).await?;
     // Same session DB, two watchers: deliver agent replies, and surface tool
     // approval prompts the daemon proxied here.
     attach_approval_watcher(session_db, room.clone(), pending).await?;
@@ -178,6 +179,67 @@ async fn attach_response_callback(
         },
     )
     .await
+}
+
+/// Observe the executor's per-turn claim through session sync. Timer reads
+/// both renew Matrix's short typing timeout and expire orphaned starts if a
+/// remote executor dies without a final write.
+async fn update_typing<E, F, Fut>(typing: &mut bool, active: bool, send: F) -> Result<(), E>
+where
+    F: FnOnce(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    // True is renewed on every timer pass; false is sent once on release.
+    if active || *typing {
+        send(active).await?;
+        *typing = active;
+    }
+    Ok(())
+}
+
+async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> anyhow::Result<()> {
+    let db = session_db.clone();
+    let changed = Arc::new(Notify::new());
+    let wake = changed.clone();
+    session_db
+        .on_write(move |_, _| {
+            let wake = wake.clone();
+            Box::pin(async move {
+                wake.notify_one();
+                Ok(())
+            })
+        })
+        .await?
+        .detach();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        let mut typing = false;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = changed.notified() => {},
+            }
+            if room.state() != RoomState::Joined {
+                break;
+            }
+            let active = match Session::active_turn_attempts(&db).await {
+                Ok(attempts) => !attempts.is_empty(),
+                Err(error) => {
+                    error!(%error, "Could not read Matrix turn activity");
+                    continue;
+                }
+            };
+            if let Err(error) =
+                update_typing(&mut typing, active, |state| room.typing_notice(state)).await
+            {
+                error!(%error, "Could not update Matrix typing notice");
+            }
+        }
+        if typing {
+            let _ = room.typing_notice(false).await;
+        }
+    });
+    Ok(())
 }
 
 fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
@@ -1256,6 +1318,63 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn matrix_typing_renews_and_cancels_when_claim_released() {
+        use chaz_core::session::{Session, TurnRequestId};
+        use chaz_core::types::ConversationId;
+        use eidetica::backend::database::InMemory;
+        use eidetica::{Instance, NewUser};
+
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("typing-test"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        let mut sent = Vec::new();
+        let mut typing = false;
+        let attempt = session
+            .start_turn_attempt(TurnRequestId::parse("message"))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let active = !Session::active_turn_attempts(session.database())
+                .await
+                .unwrap()
+                .is_empty();
+            super::update_typing(&mut typing, active, |state| {
+                sent.push(state);
+                async { Ok::<(), ()>(()) }
+            })
+            .await
+            .unwrap();
+        }
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        let active = !Session::active_turn_attempts(session.database())
+            .await
+            .unwrap()
+            .is_empty();
+        super::update_typing(&mut typing, active, |state| {
+            sent.push(state);
+            async { Ok::<(), ()>(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sent, [true, true, false]);
+        assert!(!typing);
+        let result = super::update_typing(&mut typing, true, |_| async { Err::<(), _>(()) }).await;
+        assert!(result.is_err());
+        assert!(
+            !typing,
+            "a failed Matrix request must be retried on the next tick"
+        );
+    }
     use super::{MATRIX_MESSAGE_LIMIT, is_transient_matrix_send_error};
     use chaz_core::bridge::outbound::chunk_message_bytes as chunk_message;
     use matrix_sdk::{Error as MatrixSdkError, HttpError};

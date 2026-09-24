@@ -446,6 +446,44 @@ pub struct Session {
 
 const META_STORE: &str = "meta";
 const TURN_ATTEMPTS_STORE: &str = "turn_attempts";
+const TURN_ACTIVITY_STORE: &str = "turn_activity";
+/// A lost executor heartbeat expires visible activity even after a crash.
+pub const TURN_ACTIVITY_TIMEOUT: chrono::Duration = chrono::Duration::seconds(45);
+
+fn fresh_activity(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(at);
+    age >= chrono::Duration::zero() && age < TURN_ACTIVITY_TIMEOUT
+}
+
+fn visible_attempts(
+    attempts: Vec<TurnAttempt>,
+    heartbeats: &HashMap<String, DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    // A late heartbeat cannot resurrect a completed attempt.
+    let completed: HashSet<_> = attempts
+        .iter()
+        .filter(|a| a.status == TurnAttemptStatus::Completed)
+        .map(|a| a.attempt_id.clone())
+        .collect();
+    attempts
+        .into_iter()
+        .filter(|a| {
+            a.status == TurnAttemptStatus::Started && !completed.contains(a.attempt_id.as_str())
+        })
+        .filter(|a| {
+            fresh_activity(
+                heartbeats
+                    .get(&a.attempt_id)
+                    .copied()
+                    .unwrap_or(a.started_at),
+                now,
+            )
+        })
+        .map(|a| a.attempt_id)
+        .collect()
+}
+
 const TURN_TRANSCRIPT_STORE: &str = "turn_transcript";
 const SESSION_COMMANDS_STORE: &str = "session_commands";
 const SESSION_COMMAND_RESULTS_STORE: &str = "session_command_results";
@@ -1184,6 +1222,40 @@ impl Session {
         Ok(records)
     }
 
+    /// Visible, unexpired per-turn claims. Never infer activity from Ack or
+    /// session-level runtime ownership. Clients re-read this on sync and timer.
+    pub async fn active_turn_attempts(database: &Database) -> anyhow::Result<Vec<String>> {
+        let txn = database.new_transaction().await?;
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        let heartbeats = txn
+            .get_store::<Table<DateTime<Utc>>>(TURN_ACTIVITY_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+            .into_iter()
+            .collect();
+        Ok(visible_attempts(attempts, &heartbeats, Utc::now()))
+    }
+
+    /// Renew only the activity timestamp; the original started_at remains an
+    /// audit fact. Completion lives in a separate store from these writes.
+    pub async fn renew_turn_activity(database: &Database, attempt_id: &str) -> anyhow::Result<()> {
+        let txn = database.new_transaction().await?;
+        txn.get_store::<Table<DateTime<Utc>>>(TURN_ACTIVITY_STORE)
+            .await?
+            .set(attempt_id, Utc::now())
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     async fn read_turn_attempts(&self) -> anyhow::Result<Vec<(String, TurnAttempt)>> {
         let txn = self.database.new_transaction().await?;
         Ok(txn
@@ -1642,6 +1714,70 @@ async fn find_or_create_db(
 mod tests {
     use super::test_helpers::*;
     use super::*;
+
+    #[tokio::test]
+    async fn client_activity_tracks_claim_heartbeat_completion_and_orphan_expiry() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        assert!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let attempt = session
+            .start_turn_attempt(TurnRequestId::parse("request"))
+            .await
+            .unwrap();
+        assert_eq!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap(),
+            vec![attempt.attempt_id.clone()]
+        );
+        Session::renew_turn_activity(session.database(), &attempt.attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap(),
+            vec![attempt.attempt_id.clone()]
+        );
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        assert!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let now = Utc::now();
+        let orphan = TurnAttempt {
+            attempt_id: "orphan".into(),
+            started_at: now - TURN_ACTIVITY_TIMEOUT,
+            ..attempt.clone()
+        };
+        assert!(visible_attempts(vec![orphan.clone()], &HashMap::new(), now).is_empty());
+        let heartbeats = HashMap::from([(orphan.attempt_id.clone(), now)]);
+        assert_eq!(
+            visible_attempts(vec![orphan.clone()], &heartbeats, now),
+            vec!["orphan"]
+        );
+        let terminal = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            ..orphan.clone()
+        };
+        assert!(visible_attempts(vec![orphan, terminal], &heartbeats, now).is_empty());
+        assert!(
+            visible_attempts(
+                vec![attempt],
+                &HashMap::new(),
+                now + chrono::Duration::hours(1)
+            )
+            .is_empty()
+        );
+    }
 
     /// A concurrent write from two peers, resolved by the CRDT — the case the
     /// approval protocol has to survive.
