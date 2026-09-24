@@ -80,8 +80,8 @@ per-turn activity. A separate `turn_activity` timestamp store is refreshed
 by the executor every ten seconds while an agent turn is alive, including
 semaphore waits and tool approval. Clients treat a start as visible only for
 45 seconds after its last heartbeat (or its original start), and completion
-wins even over a late synced heartbeat. Matrix renews its short-lived typing
-notice on a three-second timer; the TUI refreshes every five seconds. This
+wins even over a late synced heartbeat. Matrix renews its ten-second typing
+lease on a three-second timer; the TUI refreshes every five seconds. This
 bounded presentation lease is not the session-wide `claim_runtime` lease and
 has no effect on reconciliation or retry safety.
 
