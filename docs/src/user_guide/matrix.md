@@ -15,7 +15,7 @@ configuration and behavior.
 The bridge only observes the per-turn claim; it does not run the agent or infer
 activity from a room binding, an old acknowledgement, or session runtime
 ownership. Typing is renewed every three seconds while the claim remains
-fresh, because Matrix notices expire after a few seconds. On release it sends
+fresh, with a ten-second server timeout, avoiding gaps if a renewal is delayed. On release it sends
 a cancellation. A missing executor heartbeat times out instead of showing
 permanent typing after a crash; network or sync lag can delay observation.
 Discord does not publish this signal.

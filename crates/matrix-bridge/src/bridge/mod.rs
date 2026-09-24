@@ -18,6 +18,9 @@ use chaz_core::session::{Session, bind_transport, transport_bindings, unbind_tra
 
 use crate::credentials::MatrixCredentials;
 
+use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{
+    Request as TypingRequest, Typing, TypingInfo,
+};
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
@@ -181,6 +184,31 @@ async fn attach_response_callback(
     .await
 }
 
+// Give the server ample time beyond the renewal interval; the SDK typing_notice
+// helper uses a four-second timeout and suppresses sends within three seconds.
+const TYPING_LEASE: std::time::Duration = std::time::Duration::from_secs(10);
+const TYPING_RENEWAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn turn_typing(active: bool) -> Typing {
+    if active {
+        Typing::Yes(TypingInfo::new(TYPING_LEASE))
+    } else {
+        Typing::No
+    }
+}
+
+async fn send_turn_typing(room: &Room, active: bool) -> matrix_sdk::Result<()> {
+    room.client()
+        .send(TypingRequest::new(
+            room.own_user_id().to_owned(),
+            room.room_id().to_owned(),
+            turn_typing(active),
+        ))
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 /// Observe the executor's per-turn claim through session sync. Timer reads
 /// both renew Matrix's short typing timeout and expire orphaned starts if a
 /// remote executor dies without a final write.
@@ -212,7 +240,7 @@ async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> a
         .await?
         .detach();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        let mut tick = tokio::time::interval(TYPING_RENEWAL);
         let mut typing = false;
         loop {
             tokio::select! {
@@ -230,13 +258,13 @@ async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> a
                 }
             };
             if let Err(error) =
-                update_typing(&mut typing, active, |state| room.typing_notice(state)).await
+                update_typing(&mut typing, active, |state| send_turn_typing(&room, state)).await
             {
                 error!(%error, "Could not update Matrix typing notice");
             }
         }
         if typing {
-            let _ = room.typing_notice(false).await;
+            let _ = send_turn_typing(&room, false).await;
         }
     });
     Ok(())
@@ -1318,6 +1346,19 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn matrix_typing_wire_lease_exceeds_renewal() {
+        assert!(super::TYPING_LEASE > super::TYPING_RENEWAL * 2);
+        assert_eq!(
+            serde_json::to_value(super::turn_typing(true)).unwrap(),
+            serde_json::json!({"typing": true, "timeout": 10000})
+        );
+        assert_eq!(
+            serde_json::to_value(super::turn_typing(false)).unwrap(),
+            serde_json::json!({"typing": false})
+        );
+    }
+
     #[tokio::test]
     async fn matrix_typing_renews_and_cancels_when_claim_released() {
         use chaz_core::session::{Session, TurnRequestId};
