@@ -75,6 +75,16 @@ record before it can call a model or a tool. It commits a completed record in
 the same transaction as the final response or error entry. A silent turn has
 no final message, but still records completion.
 
+Clients read started attempts and completions from the session DB to show
+per-turn activity. A separate `turn_activity` timestamp store is refreshed
+by the executor every ten seconds while an agent turn is alive, including
+semaphore waits and tool approval. Clients treat a start as visible only for
+45 seconds after its last heartbeat (or its original start), and completion
+wins even over a late synced heartbeat. Matrix renews its short-lived typing
+notice on a three-second timer; the TUI refreshes every five seconds. This
+bounded presentation lease is not the session-wide `claim_runtime` lease and
+has no effect on reconciliation or retry safety.
+
 Attempt generations establish lifecycle precedence; the start and completion
 timestamps are audit data, not the ordering authority. This avoids treating
 clock movement across processes or restarts as a newer attempt.

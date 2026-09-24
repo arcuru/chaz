@@ -6,6 +6,31 @@ the `chaz` daemon — read [Transport Bridges](bridges.md) first for the
 architecture, the connection settings, and the one-time approval flow. This page covers Matrix-specific
 configuration and behavior.
 
+## Live typing during a turn
+
+| Signal                    | Starts                                                                | Ends                                                                    |
+| ------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Matrix room typing notice | The bridge sees a fresh executor per-turn start in the shared session | Completion, error, silent release, or a heartbeat older than 45 seconds |
+
+The bridge only observes the per-turn claim; it does not run the agent or infer
+activity from a room binding, an old acknowledgement, or session runtime
+ownership. Typing is renewed every three seconds while the claim remains
+fresh, because Matrix notices expire after a few seconds. On release it sends
+a cancellation. A missing executor heartbeat times out instead of showing
+permanent typing after a crash; network or sync lag can delay observation.
+Discord does not publish this signal.
+
+Example with a shared room:
+
+1. Send `@chaz:example summarize this` in the room. When the executor starts,
+   the Matrix client displays `chaz is typing` while the turn runs.
+2. On a reply, error, or silent completion, the typing indicator stops even if
+   the bridge remains connected to the room. A second message starts a new turn.
+3. If the executor crashes, the typing notice expires and the bridge stops
+   renewing it when the last heartbeat ages out (within 45 seconds plus sync
+   and polling delay). The turn is interrupted; inspect `/interrupted` from a
+   client and use `/retry <request_id>` only after checking for external effects.
+
 ## Setup
 
 1. **Create a Matrix account** for the bot on any homeserver.

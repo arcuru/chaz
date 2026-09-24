@@ -310,6 +310,31 @@ Typing in the search box does fzf-style fuzzy matching across model ids and capa
 
 There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open.
 
+## Live turn activity
+
+| Display                            | Source                            | Clears when                                                                       |
+| ---------------------------------- | --------------------------------- | --------------------------------------------------------------------------------- |
+| `thinking...` in the messages area | Unexpired executor per-turn start | The attempt completes (including errors or silent turns) or its heartbeat expires |
+| `_agent_ acknowledged turn`        | Historical Ack entry              | Never a live indicator; remains in history                                        |
+
+The TUI watches the shared session database, not its own submitted-message state.
+A remote executor's start and completion arrive through sync, so a tab opened
+mid-turn shows the same indicator. A crashed executor cannot leave it visible
+forever: without a heartbeat, the TUI clears it within 45 seconds, checked
+on its five-second refresh. The runtime's ownership of the session is not a
+turn claim; an idle session shows no activity. An interrupted turn requires
+`/interrupted` and an explicit `/retry` before another attempt can start.
+
+For example, after sending `@chaz:example` a question in a shared Matrix room:
+
+1. Open that session in the TUI. During the executor's turn, the bottom of the
+   messages area shows `thinking...` even though the prompt was not typed here.
+2. After the reply, `thinking...` disappears; an older `chaz acknowledged turn`
+   line may remain as history. On a silent turn or error it also disappears.
+3. If the executor exits before completion, `thinking...` clears after the
+   heartbeat expires. `/interrupted` then lists the interrupted request;
+   `/retry <request_id>` starts a new claim after you decide retrying is safe.
+
 ## Entry Types
 
 The TUI renders different entry types with distinct styles:
@@ -318,7 +343,7 @@ The TUI renders different entry types with distinct styles:
 | ---------- | -------------------------------------- | -------------------------------------------------------------- |
 | Message    | **Bold colored sender** + content      | Chat messages from users and agents                            |
 | Directive  | **Bold sender (directive):** + content | Task instructions (from spawn_agent / spawn_worker, scheduler) |
-| Ack        | Dimmed "_agent_ thinking..."           | Agent is processing                                            |
+| Ack        | Dimmed "_agent_ acknowledged turn"     | Historical audit entry; not live activity                      |
 | ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                                           |
 | ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                                         |
 | Error      | Red `ERROR sender: message`            | An error occurred                                              |

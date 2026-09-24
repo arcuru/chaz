@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 mod approval_proxy;
 mod build;
@@ -2831,6 +2831,20 @@ impl Server {
         let transcript_fail_after = self.transcript_fail_after.clone();
 
         self.track_task(tokio::spawn(async move {
+            // The persisted start is the per-turn claim. Refresh its bounded
+            // visibility even while waiting for a semaphore or tool approval.
+            let heartbeat_db = session.database().clone();
+            let heartbeat_id = attempt.attempt_id.clone();
+            let heartbeat = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    if let Err(error) = Session::renew_turn_activity(&heartbeat_db, &heartbeat_id).await {
+                        warn!(%error, "Could not renew turn activity");
+                    }
+                }
+            });
+            let _heartbeat = ActivityHeartbeat(heartbeat);
             let _permit = semaphore.acquire().await.expect("semaphore closed");
             if shutting_down.load(Ordering::Acquire) {
                 return;
@@ -3060,6 +3074,15 @@ impl Server {
                 let _ = tx.send(()).await;
             }
         }));
+    }
+}
+
+// Aborting the owning turn (including on panic/shutdown) stops its heartbeat.
+struct ActivityHeartbeat(tokio::task::JoinHandle<()>);
+
+impl Drop for ActivityHeartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

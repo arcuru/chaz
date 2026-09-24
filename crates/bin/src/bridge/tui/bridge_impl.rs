@@ -65,6 +65,7 @@ impl Bridge for TuiBridge {
             open_session_picker(&mut app, &server, &session_rows_tx, true);
         }
 
+        let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             terminal.draw(|f| view::ui(f, &mut app, &server, &backend, &self.config))?;
 
@@ -77,6 +78,12 @@ impl Bridge for TuiBridge {
                     }
                 }
                 Some(id) = notify_rx.recv() => Action::SessionChanged(id),
+                _ = activity_tick.tick() => {
+                    for tab in &mut app.tabs {
+                        refresh_tab_activity(tab).await?;
+                    }
+                    continue;
+                },
                 Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                 Some(res) = models_rx.recv() => Action::ModelsFetched(res),
                 Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
@@ -315,13 +322,6 @@ impl Bridge for TuiBridge {
                         let entries = session.entries().to_vec();
                         let meta = session.read_meta().await;
 
-                        // Decide waiting state from the fresh entries before
-                        // moving them into the tab.
-                        let clear_waiting = entries.last().is_some_and(|latest| {
-                            app.agent_names.contains(&latest.sender)
-                                && latest.entry_type == EntryType::Message
-                        });
-
                         // Refresh effective_model from the fresh meta: if
                         // `/model X` or `/model <agent> Y` ran on this
                         // session (or a remote peer pinned a model), the
@@ -357,9 +357,7 @@ impl Bridge for TuiBridge {
                         tab.effective_model = effective_model;
                         tab.context_budget = context_budget;
                         tab.roster = roster;
-                        if clear_waiting {
-                            tab.waiting = false;
-                        }
+                        refresh_tab_activity(tab).await?;
 
                         // If Settings(Session) is up on the same tab,
                         // refresh the snapshot so meta edits (model pin,

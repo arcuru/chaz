@@ -457,7 +457,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             }
             EntryType::Ack => {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}{} thinking...", entry.sender),
+                    format!("{debug_prefix}{} acknowledged turn", entry.sender),
                     dim,
                 )]));
             }
@@ -596,11 +596,8 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
         }
     }
 
-    if tab.waiting {
-        lines.push(Line::from(vec![Span::styled(
-            "  thinking...",
-            Style::default().fg(COLOR_DIM),
-        )]));
+    if let Some(line) = turn_activity_line(tab.active_turns) {
+        lines.push(line);
     }
 
     // Snapshot what we need from `tab` before releasing the borrow so the
@@ -954,6 +951,15 @@ fn render_completion_popup(
 /// active tab highlighted, with a clickable × close marker on each tab when
 /// there's more than one tab. Also records click regions for tab-activate
 /// and tab-close.
+pub(super) fn turn_activity_line(active_turns: usize) -> Option<Line<'static>> {
+    (active_turns > 0).then(|| {
+        Line::from(Span::styled(
+            "  thinking...",
+            Style::default().fg(COLOR_DIM),
+        ))
+    })
+}
+
 fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let n = app.tabs.len();
     let show_close = n > 1;
@@ -1581,6 +1587,31 @@ fn scroll_indicator(scroll: usize, end: usize, total: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thinking_indicator_is_drawn_only_for_a_live_claim() {
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+        let mut terminal = Terminal::new(TestBackend::new(24, 1)).unwrap();
+        assert!(super::turn_activity_line(0).is_none());
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(super::turn_activity_line(1).unwrap()),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("thinking..."),
+            "actual TUI buffer: {rendered}"
+        );
+    }
     use super::*;
 
     #[test]
