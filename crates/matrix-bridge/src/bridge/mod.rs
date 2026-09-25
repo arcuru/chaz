@@ -18,12 +18,13 @@ use chaz_core::session::{Session, bind_transport, transport_bindings, unbind_tra
 
 use crate::credentials::MatrixCredentials;
 
+use matrix_sdk::ruma::api::client::state::get_state_events::v3::Request as RoomStateRequest;
 use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{
     Request as TypingRequest, Typing, TypingInfo,
 };
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::room::member::MembershipState;
-use matrix_sdk::ruma::events::room::member::{OriginalSyncRoomMemberEvent, RoomMemberEventContent};
+use matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
@@ -135,16 +136,35 @@ async fn backfill_joined_room(
     let user_id = client
         .user_id()
         .ok_or_else(|| anyhow::anyhow!("not logged in"))?;
-    let join_event = room
-        .get_state_event_static_for_key::<RoomMemberEventContent, _>(user_id)
-        .await?
+    // The SDK's local state cache can lack our own member event after a
+    // restored login. Read current state from the homeserver instead.
+    let state = client
+        .send(RoomStateRequest::new(room.room_id().to_owned()))
+        .await?;
+    let join_id = state
+        .room_state
+        .iter()
+        .find(|raw| {
+            raw.get_field::<String>("state_key")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(user_id.as_str())
+                && raw.get_field::<String>("type").ok().flatten().as_deref()
+                    == Some("m.room.member")
+        })
         .ok_or_else(|| anyhow::anyhow!("own membership state missing"))?;
-    let join_id = match join_event {
-        matrix_sdk::deserialized_responses::RawSyncOrStrippedState::Sync(raw) => raw
-            .get_field::<String>("event_id")?
-            .ok_or_else(|| anyhow::anyhow!("join event has no ID"))?,
-        _ => anyhow::bail!("own membership state is not a joined event"),
-    };
+    anyhow::ensure!(
+        join_id
+            .get_field::<serde_json::Value>("content")?
+            .and_then(|content| content.get("membership")?.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("join"),
+        "own membership state is not a joined event"
+    );
+    let join_id = join_id
+        .get_field::<String>("event_id")?
+        .ok_or_else(|| anyhow::anyhow!("join event has no ID"))?;
     if done
         .get(&room_id)
         .is_some_and(|value| value.join_id == join_id)
@@ -160,18 +180,23 @@ async fn backfill_joined_room(
         .await?;
     let mut session = Session::new(conv, db).await;
     let previous = session.last_backfilled_join(&room_id).await?;
-    let mut prejoin_ids = HashSet::new();
-    if previous.as_deref() != Some(&join_id) {
-        let (history, ids) = read_room_history(
-            room,
-            &join_id,
-            previous.as_deref(),
-            user_id.as_str(),
-            login_id,
-        )
-        .await?;
+    // Reconstruct the cutoff even after restart: the checkpoint alone cannot
+    // distinguish a delayed pre-join command or a message before !chaz clear.
+    let already_imported = previous.as_deref() == Some(join_id.as_str());
+    let (history, prejoin_ids) = read_room_history(
+        room,
+        &join_id,
+        if already_imported {
+            None
+        } else {
+            previous.as_deref()
+        },
+        user_id.as_str(),
+        login_id,
+    )
+    .await?;
+    if !already_imported {
         session.backfill(history, (&room_id, &join_id)).await?;
-        prejoin_ids = ids;
     }
     done.insert(
         room_id,
@@ -787,13 +812,6 @@ impl Bridge for MatrixBridge {
                         let MessageType::Text(text_content) = &event.content.msgtype else {
                             return;
                         };
-                        // Dedupe: the sync loop can redeliver on reconnect.
-                        {
-                            let mut seen = seen_events.lock().await;
-                            if !seen.insert(event.event_id.to_string()) {
-                                return;
-                            }
-                        }
                         let Some(bot_uid) = room.client().user_id().map(|u| u.to_string()) else {
                             return;
                         };
@@ -801,6 +819,28 @@ impl Bridge for MatrixBridge {
                             return;
                         }
 
+                        // Apply the join cutoff before commands or address checks:
+                        // delayed history must not execute an old command either.
+                        let room_id = room.room_id().to_string();
+                        if let Err(e) = backfill_joined_room(
+                            &room, &server, &login_id, &owning_agent, &backfilled_rooms,
+                        ).await {
+                            error!(room_id, "Join history backfill failed: {e}");
+                            return;
+                        }
+                        if backfilled_rooms.lock().await.get(&room_id).is_some_and(
+                            |value| value.prejoin_ids.contains(event.event_id.as_str()),
+                        ) {
+                            return;
+                        }
+                        // Dedupe after successful bootstrap, so a failed fetch
+                        // does not consume the event on a later sync retry.
+                        {
+                            let mut seen = seen_events.lock().await;
+                            if !seen.insert(event.event_id.to_string()) {
+                                return;
+                            }
+                        }
                         let raw = text_content.body.trim_start();
 
                         // Command channel: `!chaz` optionally followed by args.
@@ -957,23 +997,6 @@ impl Bridge for MatrixBridge {
                         }
 
                         if rate_limit(&room, &event.sender, &config, &message_counts).await {
-                            return;
-                        }
-
-                        let room_id = room.room_id().to_string();
-
-                        // A join callback can race the first live sync event.
-                        // It must finish (or fail closed) before this live row is
-                        // inserted, so history never queues an extra turn.
-                        if let Err(e) = backfill_joined_room(
-                            &room, &server, &login_id, &owning_agent, &backfilled_rooms,
-                        ).await {
-                            error!(room_id, "Join history backfill failed: {e}");
-                        }
-
-                        if backfilled_rooms.lock().await.get(&room_id).is_some_and(
-                            |value| value.prejoin_ids.contains(event.event_id.as_str()),
-                        ) {
                             return;
                         }
 
