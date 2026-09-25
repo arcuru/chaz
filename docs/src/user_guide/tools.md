@@ -154,7 +154,7 @@ Returns the full description and JSON Schema for any registered tool. Useful whe
 
 ### compact
 
-Summarizes the conversation history via an LLM call and writes a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, effectively compacting older messages.
+Summarizes the conversation history via an LLM call and writes a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, including for earlier tool calls.
 
 ### spawn_agent
 
@@ -351,6 +351,16 @@ The legacy `security.shell_allowlist` / `security.shell_denylist` / `security.al
 ### Leak detection
 
 All tool outputs are scanned for secret patterns (API keys, tokens, etc.) before entering the LLM context. The leak detector supports 12 patterns and can either redact or block the output.
+
+### Tool history on later turns
+
+Completed tool calls and their results can appear as paired native tool messages in later model context. The call ID and tool-result boundary remain intact, and the latest user message and assistant replies take priority over older tool output. Results are leak-scanned and capped at 100 KB before storage, including custom tools. A large previous result may appear only as a marked preview or be omitted when the context is tight. An interrupted turn, a missing result, or a call covered by `/compact` is not replayed.
+
+For example, in one session:
+
+1. Ask: `Search for the release notes.` The assistant calls `kagi__search` and replies: `I found the release notes.`
+2. Ask: `What did that search return?` The next model request includes the earlier assistant call and matching result, alongside the prior reply. It can refer to the search instead of claiming no search happened.
+3. If the tool turn was interrupted before completion, the next request has no fabricated result. Use `/interrupted` and explicitly retry with `/retry <request_id>` if appropriate; a completed retry becomes the single replay source. After `/compact`, covered calls are replaced by the summary.
 
 ### Output safety
 

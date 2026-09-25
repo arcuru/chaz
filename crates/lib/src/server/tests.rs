@@ -3271,6 +3271,105 @@ async fn transcript_commits_full_tool_exchange_before_progression() {
 }
 
 #[tokio::test]
+async fn next_turn_replays_prior_native_tool_exchange() {
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+
+    struct Search;
+    impl Tool for Search {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "kagi__search".into(),
+                description: "search".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(format!("the retrieved result {}", "é".repeat(60_000))) })
+        }
+    }
+    let (_instance, server, registry) = server_fixture().await;
+    server.tools.register(Search);
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("replay")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "search it").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "kagi-id".into(),
+        "kagi__search".into(),
+        "{\"q\":\"topic\"}".into(),
+    )]);
+    mock.push_text("I found it");
+    mock.push_text("Yes, I searched");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    write_user_message_with_content(&db, &sid, "Did you search?").await;
+    await_call_count(&mock, 3).await;
+    await_no_processing(&server, &sid).await;
+    let reopened = Session::new(ConversationId(sid), db).await;
+    let (_, history) = reopened.context_with_tool_history().await.unwrap();
+    let output = history
+        .iter()
+        .flatten()
+        .find_map(|record| match &record.message {
+            crate::session::TurnTranscriptMessage::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert!(output.len() <= 100 * 1024);
+    assert!(output.contains("[tool output truncated at 100 KB]"));
+    let messages = &mock.recorded_calls()[2].messages;
+    assert!(
+        messages.iter().any(
+            |m| matches!(m, crate::runtime::RuntimeMessage::Assistant(s) if s == "I found it")
+        )
+    );
+    assert!(
+        matches!(messages.last(), Some(crate::runtime::RuntimeMessage::User(s)) if s == "Did you search?")
+    );
+    let pairs: Vec<_> = messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                crate::runtime::RuntimeMessage::AssistantToolCalls { .. }
+                    | crate::runtime::RuntimeMessage::ToolResult { .. }
+            )
+        })
+        .collect();
+    assert_eq!(pairs.len(), 2);
+    assert!(
+        matches!(pairs[0], crate::runtime::RuntimeMessage::AssistantToolCalls { tool_calls, .. }
+        if tool_calls[0].id == "kagi-id" && tool_calls[0].arguments == "{\"q\":\"topic\"}")
+    );
+    assert!(
+        matches!(pairs[1], crate::runtime::RuntimeMessage::ToolResult { call_id, content }
+        if call_id == "kagi-id" && content.contains("the retrieved result") && content.starts_with("<tool_output"))
+    );
+}
+
+#[tokio::test]
 async fn transcript_failure_before_tool_prevents_side_effect_and_completion() {
     use crate::test_support::MockBackend;
     use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
@@ -3422,6 +3521,15 @@ async fn transcript_failure_after_tool_leaves_ambiguous_effect_interrupted() {
         .next()
         .unwrap();
     assert_eq!(attempt.status, crate::session::TurnAttemptStatus::Started);
+    assert!(
+        reopened
+            .context_with_tool_history()
+            .await
+            .unwrap()
+            .1
+            .iter()
+            .all(Vec::is_empty)
+    );
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     assert_eq!(mock.recorded_calls().len(), 1);
     assert_eq!(
@@ -3814,7 +3922,36 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
             .unwrap(),
     );
     let server = server_fixture_from_registry(registry.clone()).await.1;
+    struct SharedTool;
+    impl crate::tool::Tool for SharedTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: "shared_tool".into(),
+                description: "returns a shared result".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: serde_json::Value,
+            _: &'a crate::tool::ToolContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<String, crate::tool::ToolError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok("shared result".into()) })
+        }
+    }
+    server.tools.register(SharedTool);
     let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "shared-id".into(),
+        "shared_tool".into(),
+        "{}".into(),
+    )]);
     mock.push_text("shared response");
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
@@ -3837,7 +3974,7 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
         })
         .await
         .unwrap();
-    await_call_count(&mock, 1).await;
+    await_call_count(&mock, 2).await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             wake_rx.recv().await.unwrap();
@@ -3881,12 +4018,26 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
         state => panic!("expected completed request, got {state:?}"),
     };
     let transcript = client_session.turn_transcript(attempt_id).await.unwrap();
-    assert_eq!(transcript.len(), 1);
-    assert_eq!(transcript[0].request_id, request_id);
-    assert!(matches!(
-        transcript[0].message,
-        crate::session::TurnTranscriptMessage::ModelResponse { terminal: true, .. }
-    ));
+    assert_eq!(transcript.len(), 3);
+    assert!(
+        transcript
+            .iter()
+            .all(|record| record.request_id == request_id)
+    );
+    let (entries, history) = client_session.context_with_tool_history().await.unwrap();
+    let config = crate::config::ContextConfig {
+        max_context_tokens: 1000,
+        reserved_output_tokens: 100,
+    };
+    let context = crate::context::ContextBuilder::new(&entries, "agent", "", &config)
+        .with_tool_history(&history)
+        .build()
+        .await;
+    assert!(context.messages.windows(2).any(|pair| matches!(&pair[0],
+        crate::runtime::RuntimeMessage::AssistantToolCalls { tool_calls, .. }
+            if tool_calls[0].id == "shared-id")
+        && matches!(&pair[1],
+        crate::runtime::RuntimeMessage::ToolResult { call_id, .. } if call_id == "shared-id")));
     assert!(
         client_session
             .entries()

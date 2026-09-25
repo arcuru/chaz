@@ -1002,6 +1002,9 @@ pub async fn execute_with_recorder(
                     } else {
                         ToolResultOutcome::Success
                     };
+                    // A shared session syncs full results to its authorized peers.
+                    // Bound native/custom tools just as MCP tools are bounded.
+                    let result = bound_tool_output(&result);
                     record_tool_result(
                         &recorder,
                         model_sequence,
@@ -1168,12 +1171,24 @@ async fn record_tool_result(
     .await
 }
 
+/// Cap synced native/custom results as strictly as MCP output, including
+/// the truncation marker. Old unbounded records receive the same cap on replay.
+pub(crate) fn bound_tool_output(output: &str) -> String {
+    const LIMIT: usize = 100 * 1024;
+    const MARKER: &str = "\n[tool output truncated at 100 KB]";
+    if output.len() <= LIMIT {
+        return output.to_owned();
+    }
+    let mut end = LIMIT - MARKER.len();
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &output[..end], MARKER)
+}
+
 /// Wrap tool output in XML delimiters for injection defense.
-///
-/// Escapes angle brackets in the tool output so injected content can't close
-/// the delimiter and inject instructions. The LLM sees clearly-bounded tool
-/// output that can't be confused with system-level markup.
-fn wrap_tool_output(tool_name: &str, output: &str) -> String {
+/// Escapes angle brackets so content cannot close the delimiter.
+pub(crate) fn wrap_tool_output(tool_name: &str, output: &str) -> String {
     // Escape < and > in tool output to prevent delimiter breakout
     let escaped = output.replace('<', "&lt;").replace('>', "&gt;");
     format!("<tool_output tool=\"{tool_name}\">\n{escaped}\n</tool_output>")
@@ -1617,5 +1632,17 @@ mod tests {
         .expect("did not time out");
         assert!(matches!(result, Err(ToolError::Timeout { .. })));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod tool_output_bound_tests {
+    #[test]
+    fn caps_utf8_results_including_marker() {
+        let text = "é".repeat(60_000);
+        let bounded = super::bound_tool_output(&text);
+        assert!(bounded.len() <= 100 * 1024);
+        assert!(bounded.ends_with("[tool output truncated at 100 KB]"));
+        assert_eq!(super::bound_tool_output("small"), "small");
     }
 }

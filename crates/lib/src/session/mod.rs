@@ -616,6 +616,17 @@ impl Session {
         database: Database,
         snapshot: Snapshot,
     ) -> anyhow::Result<Vec<SessionEntry>> {
+        Ok(Self::context_entries_with_ids_at(database, snapshot)
+            .await?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect())
+    }
+
+    async fn context_entries_with_ids_at(
+        database: Database,
+        snapshot: Snapshot,
+    ) -> anyhow::Result<Vec<(Option<TurnRequestId>, SessionEntry)>> {
         let txn = database.new_transaction_at(&snapshot).await?;
         let results = txn
             .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
@@ -637,7 +648,11 @@ impl Session {
             candidates.push((id, result.completed_at, source_snapshot, summary));
         }
         let Some(mut selected) = candidates.pop() else {
-            return Self::entries_at_snapshot(&database, &snapshot).await;
+            return Ok(Self::entries_with_ids_at_snapshot(&database, &snapshot)
+                .await?
+                .into_iter()
+                .map(|(id, entry)| (Some(id), entry))
+                .collect());
         };
         for candidate in candidates {
             let selected_to_candidate = database.ids_added(&selected.2, &candidate.2).await?;
@@ -656,22 +671,73 @@ impl Session {
 
         let source_entries = Self::entries_with_ids_at_snapshot(&database, &selected.2).await?;
         let covered_ids: HashSet<_> = source_entries.iter().map(|(id, _)| id.clone()).collect();
-        let mut entries = vec![SessionEntry {
-            sender: "system".into(),
-            content: selected.3,
-            timestamp: selected.1,
-            entry_type: EntryType::Summary,
-            metadata: None,
-            routing: None,
-        }];
+        let mut entries = vec![(
+            None,
+            SessionEntry {
+                sender: "system".into(),
+                content: selected.3,
+                timestamp: selected.1,
+                entry_type: EntryType::Summary,
+                metadata: None,
+                routing: None,
+            },
+        )];
         entries.extend(
             Self::entries_with_ids_at_snapshot(&database, &snapshot)
                 .await?
                 .into_iter()
                 .filter(|(id, _)| !covered_ids.contains(id))
-                .map(|(_, entry)| entry),
+                .map(|(id, entry)| (Some(id), entry)),
         );
         Ok(entries)
+    }
+
+    /// One immutable view of compacted entries and selected completed attempts.
+    pub async fn context_with_tool_history(
+        &self,
+    ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
+        let snapshot = self.database.snapshot().await?;
+        let rows =
+            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone()).await?;
+        let txn = self.database.new_transaction_at(&snapshot).await?;
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?;
+        let states = index_attempt_states(attempts, &HashSet::new());
+        let selected: HashMap<_, _> = states
+            .into_iter()
+            .filter_map(|(id, state)| {
+                if let TurnRequestState::Completed { attempt_id } = state {
+                    Some((id, attempt_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut records: HashMap<TurnRequestId, Vec<TurnTranscriptRecord>> = HashMap::new();
+        for (_, record) in txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+        {
+            if selected.get(&record.request_id) == Some(&record.attempt_id) {
+                records
+                    .entry(record.request_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        let (entries, history) = rows
+            .into_iter()
+            .map(|(id, entry)| {
+                let history = id.and_then(|id| records.remove(&id)).unwrap_or_default();
+                (entry, history)
+            })
+            .unzip();
+        Ok((entries, history))
     }
 
     /// Add an entry to the session, persisting it before it becomes visible

@@ -74,7 +74,7 @@ RuntimeMessage::ToolResult(result)
 ...
 ```
 
-`AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Their completed structured forms are also persisted, but a restarted process does not rebuild or resume that vector automatically.
+`AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Completed structured forms are persisted. Later turns can reconstruct complete prior call/result groups from completed attempts inside the conversation budget, but interrupted attempts are never resumed automatically.
 
 ## Concurrency
 
