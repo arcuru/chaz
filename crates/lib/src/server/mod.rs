@@ -2915,11 +2915,11 @@ impl Server {
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
-                let context_entries = match s.context_entries().await {
+                let (context_entries, tool_history) = match s.context_with_tool_history().await {
                     Ok(entries) => entries,
                     Err(error) => {
                         error!(%error, "Failed to load compacted session context; using visible transcript");
-                        s.entries().to_vec()
+                        (s.entries().to_vec(), vec![Vec::new(); s.entries().len()])
                     }
                 };
                 let roster: Vec<String> =
@@ -2952,6 +2952,7 @@ impl Server {
                 let assembled =
                     ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config)
                         .with_tools(&tool_defs)
+                        .with_tool_history(&tool_history)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())

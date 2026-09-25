@@ -15,7 +15,7 @@
 use crate::config::ContextConfig;
 use crate::extension::ExtensionHub;
 use crate::runtime::RuntimeMessage;
-use crate::session::{EntryType, SessionEntry};
+use crate::session::{EntryType, SessionEntry, TurnTranscriptMessage, TurnTranscriptRecord};
 use crate::tool::ToolDefinition;
 use eidetica::Database;
 use std::sync::Arc;
@@ -111,6 +111,7 @@ pub struct AssembledContext {
 /// Builds LLM context from session entries within a token budget.
 pub struct ContextBuilder<'a> {
     entries: &'a [SessionEntry],
+    tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
     agent_name: &'a str,
     system_prompt: &'a str,
     /// Tool definitions for this turn. Also the set that `requires_tools`
@@ -140,6 +141,7 @@ impl<'a> ContextBuilder<'a> {
     ) -> Self {
         Self {
             entries,
+            tool_history: None,
             agent_name,
             system_prompt,
             tool_defs: &[],
@@ -163,6 +165,11 @@ impl<'a> ContextBuilder<'a> {
     /// per-system-prompt editing.
     pub fn with_room_participants(mut self, participants: &'a [String]) -> Self {
         self.room_participants = participants;
+        self
+    }
+
+    pub fn with_tool_history(mut self, history: &'a [Vec<TurnTranscriptRecord>]) -> Self {
+        self.tool_history = Some(history);
         self
     }
 
@@ -327,7 +334,22 @@ impl<'a> ContextBuilder<'a> {
             messages.push(RuntimeMessage::System(system_prompt));
         }
 
-        for (_, entry) in included_entries {
+        // Give visible conversation priority; replay complete native groups from
+        // newest to oldest only with the remaining token budget.
+        let mut replay = vec![Vec::new(); self.entries.len()];
+        if let Some(history) = self.tool_history.filter(|h| h.len() == self.entries.len()) {
+            let mut spare = remaining_budget.saturating_sub(message_tokens);
+            for (index, _) in included_entries.iter().rev() {
+                if let Some(group) = replay_turn(&history[*index], spare) {
+                    let cost = group.iter().map(message_cost).sum::<usize>();
+                    spare -= cost;
+                    used_tokens += cost;
+                    replay[*index] = group;
+                }
+            }
+        }
+
+        for (index, entry) in included_entries {
             let rm = if entry.sender == self.agent_name {
                 RuntimeMessage::Assistant(entry.content.clone())
             } else {
@@ -335,6 +357,7 @@ impl<'a> ContextBuilder<'a> {
                 RuntimeMessage::User(entry.content.clone())
             };
             messages.push(rm);
+            messages.append(&mut replay[*index]);
         }
 
         // 8. Context tails — memory surfacing, etc. Appended after the
@@ -351,6 +374,131 @@ impl<'a> ContextBuilder<'a> {
             truncated,
         }
     }
+}
+
+// Reject interrupted or malformed groups instead of inventing tool results.
+fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<RuntimeMessage>> {
+    if records.is_empty() || budget == 0 {
+        return None;
+    }
+    let mut sorted = records.to_vec();
+    sorted.sort_by_key(|r| r.sequence);
+    let mut messages = Vec::new();
+    let mut previous = None;
+    let mut model_sequence = None;
+    let mut terminal = false;
+    let mut i = 0;
+    while i < sorted.len() {
+        let record = &sorted[i];
+        if previous.is_some_and(|p| record.sequence != p + 1)
+            || record.attempt_id != sorted[0].attempt_id
+            || record.request_id != sorted[0].request_id
+        {
+            return None;
+        }
+        previous = Some(record.sequence);
+        let TurnTranscriptMessage::ModelResponse {
+            model_sequence: seq,
+            content,
+            tool_calls,
+            provider_extra,
+            terminal: end,
+            ..
+        } = &record.message
+        else {
+            return None;
+        };
+        if model_sequence.is_some_and(|p| *seq != p + 1) {
+            return None;
+        }
+        model_sequence = Some(*seq);
+        i += 1;
+        if *end {
+            if !tool_calls.is_empty() || i != sorted.len() {
+                return None;
+            }
+            terminal = true;
+            break;
+        }
+        if tool_calls.is_empty() {
+            return None;
+        }
+        messages.push(RuntimeMessage::AssistantToolCalls {
+            content: content.clone(),
+            tool_calls: tool_calls.clone(),
+            provider_extra: provider_extra.clone(),
+        });
+        for (call_index, call) in tool_calls.iter().enumerate() {
+            let result = sorted.get(i)?;
+            let TurnTranscriptMessage::ToolResult {
+                model_sequence,
+                call_index: index,
+                call_id,
+                name,
+                output,
+                ..
+            } = &result.message
+            else {
+                return None;
+            };
+            if result.sequence != previous? + 1
+                || result.attempt_id != record.attempt_id
+                || result.request_id != record.request_id
+                || *model_sequence != *seq
+                || *index != call_index
+                || call_id != &call.id
+                || name != &call.name
+            {
+                return None;
+            }
+            previous = Some(result.sequence);
+            messages.push(RuntimeMessage::ToolResult {
+                call_id: call.id.clone(),
+                content: crate::runtime::wrap_tool_output(
+                    &call.name,
+                    &crate::runtime::bound_tool_output(output),
+                ),
+            });
+            i += 1;
+        }
+    }
+    if !terminal || messages.is_empty() {
+        return None;
+    }
+    if messages.iter().map(message_cost).sum::<usize>() > budget {
+        for msg in &mut messages {
+            if let RuntimeMessage::ToolResult { content, .. } = msg {
+                let start = content.find('\n')? + 1;
+                let preview = crate::util::truncate_chars(&content[start..], 256);
+                *content = format!(
+                    "{}{}\n[prior tool output truncated for context]\n</tool_output>",
+                    &content[..start],
+                    preview
+                );
+            }
+        }
+    }
+    (messages.iter().map(message_cost).sum::<usize>() <= budget).then_some(messages)
+}
+
+fn message_cost(msg: &RuntimeMessage) -> usize {
+    let text = match msg {
+        RuntimeMessage::AssistantToolCalls {
+            content,
+            tool_calls,
+            provider_extra,
+        } => {
+            format!(
+                "{}{}{}",
+                content.as_deref().unwrap_or_default(),
+                serde_json::to_string(tool_calls).unwrap_or_default(),
+                serde_json::Value::Object(provider_extra.clone())
+            )
+        }
+        RuntimeMessage::ToolResult { call_id, content } => format!("{call_id}{content}"),
+        _ => return 0,
+    };
+    estimate_tokens(&text) + MESSAGE_OVERHEAD_TOKENS
 }
 
 #[cfg(test)]
@@ -374,6 +522,168 @@ mod tests {
             max_context_tokens: 1000,
             reserved_output_tokens: 100,
         }
+    }
+
+    fn records(output: &str) -> Vec<TurnTranscriptRecord> {
+        let request_id = crate::session::TurnRequestId::parse("request");
+        let mk = |sequence, message| TurnTranscriptRecord {
+            request_id: request_id.clone(),
+            attempt_id: "complete".into(),
+            sequence,
+            timestamp: Utc::now(),
+            message,
+        };
+        vec![
+            mk(
+                0,
+                TurnTranscriptMessage::ModelResponse {
+                    model_sequence: 0,
+                    content: None,
+                    tool_calls: vec![crate::runtime::ToolCallRequest {
+                        id: "id".into(),
+                        name: "search".into(),
+                        arguments: "{}".into(),
+                    }],
+                    provider_extra: Default::default(),
+                    metadata: None,
+                    terminal: false,
+                },
+            ),
+            mk(
+                1,
+                TurnTranscriptMessage::ToolResult {
+                    model_sequence: 0,
+                    call_index: 0,
+                    call_id: "id".into(),
+                    name: "search".into(),
+                    output: output.into(),
+                    outcome: crate::runtime::ToolResultOutcome::Success,
+                },
+            ),
+            mk(
+                2,
+                TurnTranscriptMessage::ModelResponse {
+                    model_sequence: 1,
+                    content: Some("answer".into()),
+                    tool_calls: vec![],
+                    provider_extra: Default::default(),
+                    metadata: None,
+                    terminal: true,
+                },
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_conversation_and_budget() {
+        let entries = vec![
+            make_entry("user", "old", EntryType::Message),
+            make_entry("agent", "answer", EntryType::Message),
+            make_entry("user", "new", EntryType::Message),
+        ];
+        let history = vec![records(&"<malicious>".repeat(30_000)), vec![], vec![]];
+        let config = ContextConfig {
+            max_context_tokens: 320,
+            reserved_output_tokens: 100,
+        };
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .with_tool_history(&history)
+            .build()
+            .await;
+        assert_eq!(result.entries_included, 3);
+        assert!(result.estimated_tokens <= 220);
+        assert!(matches!(result.messages.last(), Some(RuntimeMessage::User(s)) if s == "new"));
+        let tool = result
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                RuntimeMessage::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("preview available");
+        assert!(tool.contains("[prior tool output truncated for context]"));
+        assert!(tool.contains("&lt;malicious&gt;"));
+    }
+
+    #[test]
+    fn malformed_or_incomplete_turns_never_replay() {
+        let valid = records("ok");
+        assert_eq!(replay_turn(&valid, 1000).unwrap().len(), 2);
+        let mut missing = valid.clone();
+        missing.remove(1);
+        assert!(replay_turn(&missing, 1000).is_none());
+        let mut wrong = valid.clone();
+        if let TurnTranscriptMessage::ToolResult { call_id, .. } = &mut wrong[1].message {
+            *call_id = "wrong".into();
+        }
+        assert!(replay_turn(&wrong, 1000).is_none());
+        let mut retry = valid.clone();
+        retry[1].attempt_id = "interrupted".into();
+        assert!(replay_turn(&retry, 1000).is_none());
+        assert!(replay_turn(&valid[..2], 1000).is_none());
+        assert!(replay_turn(&[], 1000).is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_excludes_covered_tool_history() {
+        let entries = vec![
+            make_entry("user", "old", EntryType::Message),
+            make_entry("system", "summary", EntryType::Summary),
+            make_entry("user", "new", EntryType::Message),
+        ];
+        let history = vec![records("old result"), vec![], vec![]];
+        let config = default_config();
+        let context = ContextBuilder::new(&entries, "agent", "", &config)
+            .with_tool_history(&history)
+            .build()
+            .await;
+        assert_eq!(context.entries_included, 2);
+        assert_eq!(context.messages.len(), 2);
+        assert!(matches!(&context.messages[0], RuntimeMessage::User(s) if s == "summary"));
+    }
+
+    #[test]
+    fn parallel_results_keep_call_order_and_ids() {
+        let mut rows = records("one");
+        if let TurnTranscriptMessage::ModelResponse { tool_calls, .. } = &mut rows[0].message {
+            tool_calls.push(crate::runtime::ToolCallRequest {
+                id: "second".into(),
+                name: "extract".into(),
+                arguments: "{}".into(),
+            });
+        }
+        rows.insert(
+            2,
+            TurnTranscriptRecord {
+                request_id: rows[0].request_id.clone(),
+                attempt_id: "complete".into(),
+                sequence: 2,
+                timestamp: Utc::now(),
+                message: TurnTranscriptMessage::ToolResult {
+                    model_sequence: 0,
+                    call_index: 1,
+                    call_id: "second".into(),
+                    name: "extract".into(),
+                    output: "two".into(),
+                    outcome: crate::runtime::ToolResultOutcome::Success,
+                },
+            },
+        );
+        rows[3].sequence = 3;
+        let messages = replay_turn(&rows, 1000).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            matches!(&messages[0], RuntimeMessage::AssistantToolCalls { tool_calls, .. }
+            if tool_calls.len() == 2)
+        );
+        assert!(
+            matches!(&messages[1], RuntimeMessage::ToolResult { call_id, .. } if call_id == "id")
+        );
+        assert!(
+            matches!(&messages[2], RuntimeMessage::ToolResult { call_id, .. } if call_id == "second")
+        );
+        rows[2].sequence = 4;
+        assert!(replay_turn(&rows, 1000).is_none());
     }
 
     #[test]
