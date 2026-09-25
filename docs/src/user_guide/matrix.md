@@ -99,10 +99,7 @@ messages before the bot's join as context; that history never triggers an agent
 turn. On rejoin it imports only messages from the time the bot was away.
 `!chaz clear` stops the historical import at that marker. Restarting or
 attaching a room to an existing session does not replay history as live input.
-A new addressed message is handled once. Agents may deliberately decline to
-reply by returning exactly `[[NO_REPLY]]` as their final response (without any
-other text). Chaz records the turn but sends no Matrix message; add this
-convention to an agent's system prompt if it should use it.
+A new addressed message is handled once.
 
 ### Scripted bring-up
 

@@ -146,32 +146,6 @@ impl Tool for GatedTool {
 // ---- Tests -----------------------------------------------------------------
 
 #[tokio::test]
-async fn agent_can_explicitly_choose_a_silent_turn() {
-    let (_instance, session) = fresh_session().await;
-    let secrets = empty_secrets().await;
-    let registry = ToolRegistry::new();
-    registry.register(EchoTool::new());
-    let ctx = tool_context(session, Arc::new(registry));
-    let mock = Arc::new(MockBackend::new());
-    mock.push_text("  [[NO_REPLY]]  ");
-    let backend = BackendManager::with_mock(mock.clone(), secrets);
-    let outcome = runtime::execute(
-        Some("mock-model"),
-        vec![RuntimeMessage::User("hello".into())],
-        &backend,
-        &permissive_security(),
-        &ctx,
-        &ToolPolicyRegistry::empty(),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(outcome.body.is_empty(), "silent turn must not be delivered");
-    assert_eq!(mock.recorded_calls().len(), 1);
-}
-
-#[tokio::test]
 async fn react_loop_dispatches_tool_call_and_returns_final_text() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
