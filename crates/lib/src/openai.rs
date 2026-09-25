@@ -448,7 +448,9 @@ impl OpenAI {
 
         tracing::debug!(
             "LLM response: content={:?} tool_calls={:?} extra_fields={:?} finish_reason={:?} usage={:?}",
-            content.as_deref().map(|c| &c[..c.len().min(100)]),
+            content
+                .as_deref()
+                .map(|c| crate::util::truncate_chars(c, 100)),
             tool_calls.as_ref().map(|tc| tc.len()),
             extra.keys().collect::<Vec<_>>(),
             choice.finish_reason,
