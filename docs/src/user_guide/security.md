@@ -36,7 +36,7 @@ Two more orthogonal layers wrap everything:
 - **Secret store** keeps API keys out of LLM context entirely — they're resolved at the HTTP client boundary, never quoted to the model.
 - **Agent-level controls** (`allowed_tools`, per-Agent `workers:` list, depth caps) shrink which layers even get a chance to run for a given Agent.
 
-The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Tools never call OS APIs directly — they request a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host.
+The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; the opt-in `BubblewrapToolHost` (`tool_host: bubblewrap`) runs shell commands in OS-level namespaces without any tool-code changes, and a WASM host is planned. Tools never call OS APIs directly — they request a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host.
 
 ## Tool Approval
 
@@ -86,7 +86,7 @@ An answer that arrives after the expiry does not revive the request. The daemon 
 
 ## Capability Grants
 
-Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure _what_ each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.
+Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure _what_ each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; the opt-in `BubblewrapToolHost` (`tool_host: bubblewrap`) adds OS-level shell sandboxing, and a WASM host is planned — both without changing any tool code.
 
 ### Capability tiers and attenuation
 
@@ -186,7 +186,7 @@ security:
 
 Paths are normalized lexically before the check — `.`/`..` are resolved and the match is on path boundaries, so `/work` permits `/work/sub/x` but **not** `/workother/x` or `/work/../etc/passwd`.
 
-> This is **advisory** confinement: symlinks are not followed, so a symlink under an allowed root can still point outside it. True confinement (a process that physically cannot see other paths) is the job of a sandboxed host — bubblewrap mounts or WASI preopens — which is planned. Until then, treat fs grants as a guardrail against accidental writes, not a boundary against a hostile tool.
+> This is **advisory** confinement: symlinks are not followed, so a symlink under an allowed root can still point outside it. True confinement (a process that physically cannot see other paths) is the job of a sandboxed host — the `BubblewrapToolHost` (`tool_host: bubblewrap`) provides it for `shell` commands, which run in a mount namespace with only the system directories, `/tmp`, and the working directory present. Until then, treat fs grants as a guardrail against accidental writes, not a boundary against a hostile tool.
 
 ### Agent and session ceilings
 
@@ -214,7 +214,7 @@ The session ceiling lives on the session itself (`SessionMeta.capabilities`) rat
 >     endpoints: [] # deny-all egress
 > ```
 >
-> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — that lands with the sandboxed host. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
+> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — the `BubblewrapToolHost` (`tool_host: bubblewrap`) provides that for `shell` commands, which run with `--unshare-net`. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
 
 ## Leak Detection
 

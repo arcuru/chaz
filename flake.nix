@@ -57,6 +57,11 @@
         rustSrc = fenixStable.rust-src;
         toolChain = fenixStable.completeToolchain;
 
+        # bubblewrap is the optional runtime sandbox for the shell tool. It is
+        # Linux-only; on Darwin the list is empty and chaz simply never finds
+        # `bwrap` on PATH (the host degrades to native execution).
+        bwrapInputs = lib.optionals pkgs.stdenv.isLinux [pkgs.bubblewrap];
+
         # Use the toolchain with the crane helper functions
         craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
 
@@ -86,12 +91,14 @@
           LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
         };
 
-        # Test-only extras: subprocess tests spawn python3, and tests that
-        # touch $HOME need it to point at a writable path inside the sandbox.
+        # Test-only extras: subprocess tests spawn python3, tests that touch
+        # $HOME need it to point at a writable path inside the sandbox, and the
+        # bubblewrap host's integration tests need bwrap on PATH (they skip
+        # gracefully where unprivileged user namespaces are unavailable).
         testArgs =
           buildArgs
           // {
-            nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.python3];
+            nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.python3] ++ bwrapInputs;
             preCheck = ''
               export HOME=$TMPDIR
             '';
@@ -116,7 +123,7 @@
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz $out/bin
             wrapProgram $out/bin/chaz \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix PATH : ${lib.makeBinPath ([pkgs.aichat] ++ bwrapInputs)} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
@@ -132,7 +139,7 @@
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz-discord $out/bin
             wrapProgram $out/bin/chaz-discord \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix PATH : ${lib.makeBinPath ([pkgs.aichat] ++ bwrapInputs)} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
@@ -148,7 +155,7 @@
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz-matrix $out/bin
             wrapProgram $out/bin/chaz-matrix \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix PATH : ${lib.makeBinPath ([pkgs.aichat] ++ bwrapInputs)} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
@@ -309,20 +316,22 @@
             chaz-clippy
           ];
 
-          nativeBuildInputs = with pkgs; [
-            alejandra
-            cargo-deny
-            cargo-nextest
-            cargo-tarpaulin
-            deadnix
-            git-cliff
-            just
-            mdbook
-            prettier
-            nix-fast-build
-            statix
-            config.treefmt.build.wrapper
-          ];
+          nativeBuildInputs = with pkgs;
+            [
+              alejandra
+              cargo-deny
+              cargo-nextest
+              cargo-tarpaulin
+              deadnix
+              git-cliff
+              just
+              mdbook
+              prettier
+              nix-fast-build
+              statix
+              config.treefmt.build.wrapper
+            ]
+            ++ bwrapInputs;
 
           RUST_SRC_PATH = "${rustSrc}/lib/rustlib/src/rust/library";
 
