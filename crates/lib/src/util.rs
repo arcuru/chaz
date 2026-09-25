@@ -29,6 +29,17 @@ mod tests {
     }
 
     #[test]
+    fn log_preview_bounds_are_panic_free() {
+        // Debug previews of tool output and model replies bound at 100/200.
+        // A raw `&s[..s.len().min(100)]` slice panics when the bound lands
+        // inside a multibyte character, as it does here at byte 100.
+        let s = format!("{}\u{2014}{}", "a".repeat(99), "b".repeat(200));
+        assert!(!s.is_char_boundary(100));
+        assert_eq!(truncate_chars(&s, 100).chars().count(), 100);
+        assert_eq!(truncate_chars(&s, 200).chars().count(), 200);
+    }
+
+    #[test]
     fn noop_when_under_limit() {
         assert_eq!(truncate_chars("abc", 10), "abc");
     }

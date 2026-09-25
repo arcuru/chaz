@@ -427,7 +427,9 @@ impl Anthropic {
 
             tracing::debug!(
                 "Anthropic response: content={:?} tool_calls={} usage={:?}",
-                content.as_deref().map(|c| &c[..c.len().min(100)]),
+                content
+                    .as_deref()
+                    .map(|c| crate::util::truncate_chars(c, 100)),
                 tool_calls.len(),
                 metadata.as_ref().map(|m| &m.usage),
             );

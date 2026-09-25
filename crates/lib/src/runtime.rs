@@ -927,7 +927,7 @@ pub async fn execute_with_recorder(
                                         tool = %call.name,
                                         len = output.len(),
                                         "Tool returned: {}",
-                                        &output[..output.len().min(200)]
+                                        crate::util::truncate_chars(&output, 200)
                                     );
 
                                     // --- Extension hook: tool_result ---
@@ -1019,7 +1019,7 @@ pub async fn execute_with_recorder(
                         call_id = %call.id,
                         tool = %call.name,
                         "Tool result: {}",
-                        &result[..result.len().min(200)]
+                        crate::util::truncate_chars(&result, 200)
                     );
                     // Wrap tool output in XML delimiters to prevent injection
                     let wrapped = wrap_tool_output(&call.name, &result);
