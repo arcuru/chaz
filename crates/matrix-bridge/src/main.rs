@@ -101,6 +101,12 @@ struct LeaveAllArgs {
     #[arg(long)]
     execute: bool,
 
+    /// True reset: also reject every pending invite and forget each room
+    /// after leaving it. Stop the bridge first — its invite auto-joiner
+    /// otherwise undoes the reset on the next bridge start.
+    #[arg(long)]
+    reset: bool,
+
     /// Leave attempts per room before giving up.
     #[arg(long, default_value_t = 3, value_parser = parse_retries)]
     retries: u32,
@@ -174,11 +180,12 @@ async fn main() -> anyhow::Result<()> {
     // The `rooms` maintenance subcommand runs once and exits; it never starts
     // the bridge or opens the bridge's own backend.
     if let Some(Command::Rooms(rooms)) = &args.command {
-        let (login, execute, retries, delay_ms) = match &rooms.command {
-            RoomsCommand::List(selection) => (selection.login.as_deref(), false, 3, 250),
+        let (login, execute, reset, retries, delay_ms) = match &rooms.command {
+            RoomsCommand::List(selection) => (selection.login.as_deref(), false, false, 3, 250),
             RoomsCommand::LeaveAll(args) => (
                 args.selection.login.as_deref(),
                 args.execute,
+                args.reset,
                 args.retries,
                 args.delay_ms,
             ),
@@ -196,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             &bridge_cfg,
             login,
             execute,
+            reset,
             retries,
             delay_ms,
         )
@@ -517,8 +525,9 @@ mod tests {
     }
 
     /// Parse a `rooms leave-all` invocation through the real clap wiring,
-    /// returning `(execute, retries, delay_ms)` or `None` when clap rejects it.
-    fn parse_leave_all(args: &[&str]) -> Option<(bool, u32, u64)> {
+    /// returning `(execute, reset, retries, delay_ms)` or `None` when clap
+    /// rejects it.
+    fn parse_leave_all(args: &[&str]) -> Option<(bool, bool, u32, u64)> {
         let argv = ["chaz-matrix", "rooms", "leave-all"]
             .into_iter()
             .chain(args.iter().copied())
@@ -528,7 +537,9 @@ mod tests {
             return None;
         };
         match rooms.command {
-            RoomsCommand::LeaveAll(args) => Some((args.execute, args.retries, args.delay_ms)),
+            RoomsCommand::LeaveAll(args) => {
+                Some((args.execute, args.reset, args.retries, args.delay_ms))
+            }
             RoomsCommand::List(_) => None,
         }
     }
@@ -543,11 +554,19 @@ mod tests {
             panic!("rooms list parsed as the wrong command");
         };
 
-        assert_eq!(parse_leave_all(&[]), Some((false, 3, 250)));
-        assert_eq!(parse_leave_all(&["--execute"]), Some((true, 3, 250)));
+        assert_eq!(parse_leave_all(&[]), Some((false, false, 3, 250)));
+        assert_eq!(parse_leave_all(&["--execute"]), Some((true, false, 3, 250)));
+        // --reset previews the true reset on its own and combines with
+        // --execute; it exists only on leave-all.
+        assert_eq!(parse_leave_all(&["--reset"]), Some((false, true, 3, 250)));
+        assert_eq!(
+            parse_leave_all(&["--execute", "--reset"]),
+            Some((true, true, 3, 250))
+        );
         assert!(Args::try_parse_from(["chaz-matrix", "rooms"]).is_err());
         assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--execute"]).is_err());
         assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--retries", "3"]).is_err());
+        assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--reset"]).is_err());
     }
 
     #[test]
@@ -562,18 +581,21 @@ mod tests {
 
     #[test]
     fn leave_all_args_accept_boundaries_and_defaults() {
-        assert_eq!(parse_leave_all(&["--retries", "1"]), Some((false, 1, 250)));
+        assert_eq!(
+            parse_leave_all(&["--retries", "1"]),
+            Some((false, false, 1, 250))
+        );
         assert_eq!(
             parse_leave_all(&["--retries", "10"]),
-            Some((false, 10, 250))
+            Some((false, false, 10, 250))
         );
         assert_eq!(
             parse_leave_all(&["--delay-ms", "100"]),
-            Some((false, 3, 100))
+            Some((false, false, 3, 100))
         );
         assert_eq!(
             parse_leave_all(&["--delay-ms", "60000"]),
-            Some((false, 3, 60000))
+            Some((false, false, 3, 60000))
         );
     }
 }

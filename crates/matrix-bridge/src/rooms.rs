@@ -5,9 +5,20 @@
 //! in with a fresh throwaway device — never the bridge's own persisted session
 //! file or device — lists the account's joined rooms, and in `--execute` mode
 //! leaves them one by one before logging the throwaway device back out. The
-//! bridge's own session is untouched, and pending invitations are left alone:
-//! only rooms the account is already joined to are enumerated and left, so a
-//! re-run after a reset sees fewer (or zero) rooms.
+//! bridge's own session is untouched.
+//!
+//! Plain `leave-all` is only a *membership* reset: pending invitations survive
+//! it and left rooms keep their history. `--reset` upgrades an execute run (or
+//! its dry-run preview) to a true reset — it also enumerates and rejects every
+//! pending invite (leaving an invited-but-not-joined room rejects the invite
+//! per spec) and forgets each room after leaving it, which drops the account's
+//! history access. The bridge's invite auto-joiner will rejoin any invite it
+//! sees, so the bridge must be stopped for the duration of a reset run.
+//!
+//! This path must stay crypto-free: the throwaway login never enables
+//! encryption or uploads keys, which is what keeps the ephemeral device
+//! invisible to other clients' device lists. Do not add a crypto store or
+//! cross-signing here, even once the bridge itself gains E2EE.
 
 use std::io::Write;
 use std::path::Path;
@@ -18,16 +29,22 @@ use crate::config::{MatrixBridgeConfig, MatrixLoginConfig};
 use crate::credentials::MatrixCredentials;
 
 use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::ruma::api::client::filter::FilterDefinition;
+use matrix_sdk::ruma::api::client::membership::forget_room::v3 as forget_room;
 use matrix_sdk::ruma::api::client::membership::joined_rooms::v3 as joined_rooms;
 use matrix_sdk::ruma::api::client::membership::leave_room::v3 as leave_room;
+use matrix_sdk::ruma::api::client::sync::sync_events::v3 as sync_events;
+use matrix_sdk::ruma::presence::PresenceState;
 use tokio::time::sleep;
 
-/// Whether `rooms` only reports or actually leaves rooms.
+/// Whether `rooms` only reports or actually changes membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// List joined rooms and mutate nothing.
+    /// List joined rooms (and, with `reset`, pending invites) and mutate
+    /// nothing.
     DryRun,
-    /// Leave every joined room.
+    /// Leave every joined room — and, with `reset`, reject every pending
+    /// invite and forget each room afterwards.
     Execute,
 }
 
@@ -36,6 +53,9 @@ enum Mode {
 #[derive(Debug, Clone, Copy)]
 struct EngineConfig {
     mode: Mode,
+    /// True-reset scope: reject pending invites and forget rooms after
+    /// leaving them, on top of the plain leave-all behavior.
+    reset: bool,
     /// Leave attempts per room before giving up.
     retries: u32,
     /// Base backoff between leave attempts; doubles each attempt (1s, 2s, 4s…).
@@ -49,7 +69,13 @@ struct EngineConfig {
 /// keep fakes trivial; the real implementation converts to and from ruma types.
 trait RoomEndpoint {
     async fn joined_rooms(&mut self) -> anyhow::Result<Vec<String>>;
+    /// Rooms the account has been invited to but not joined. Rejecting an
+    /// invite is `leave_room` on one of these, per spec.
+    async fn invited_rooms(&mut self) -> anyhow::Result<Vec<String>>;
     async fn leave_room(&mut self, room_id: &str) -> anyhow::Result<()>;
+    /// Drop the account's history access to an already-left room. Valid only
+    /// after the room has been left (or its invite rejected).
+    async fn forget_room(&mut self, room_id: &str) -> anyhow::Result<()>;
 }
 
 /// The real endpoint, backed by a logged-in [`matrix_sdk::Client`].
@@ -67,9 +93,34 @@ impl RoomEndpoint for ClientEndpoint {
             .collect())
     }
 
+    async fn invited_rooms(&mut self) -> anyhow::Result<Vec<String>> {
+        // There is no dedicated "list invites" endpoint; an initial /sync with
+        // a zero-length timeline is the cheapest read that surfaces the
+        // invite section. Presence stays offline so a maintenance run — taken
+        // while the bridge is stopped — does not flip the account online.
+        let mut filter = FilterDefinition::default();
+        filter.room.timeline.limit = Some(0u32.into());
+        let mut request = sync_events::Request::new();
+        request.filter = Some(filter.into());
+        request.set_presence = PresenceState::Offline;
+        let response = self.client.send(request).await?;
+        Ok(response
+            .rooms
+            .invite
+            .into_keys()
+            .map(|id| id.to_string())
+            .collect())
+    }
+
     async fn leave_room(&mut self, room_id: &str) -> anyhow::Result<()> {
         let id: OwnedRoomId = matrix_sdk::ruma::RoomId::parse(room_id)?;
         self.client.send(leave_room::Request::new(id)).await?;
+        Ok(())
+    }
+
+    async fn forget_room(&mut self, room_id: &str) -> anyhow::Result<()> {
+        let id: OwnedRoomId = matrix_sdk::ruma::RoomId::parse(room_id)?;
+        self.client.send(forget_room::Request::new(id)).await?;
         Ok(())
     }
 }
@@ -79,7 +130,9 @@ const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Run the `rooms` subcommand against a bridge config: select one login, sign
 /// in with a throwaway device, enumerate (and in execute mode leave) the joined
-/// rooms, and log the throwaway device back out. Returns the process exit code.
+/// rooms — plus, in reset mode, reject the pending invites and forget each
+/// room after leaving it — and log the throwaway device back out. Returns the
+/// process exit code.
 ///
 /// All human-facing output goes to stdout; tracing stays on stderr. The
 /// password is never written to either.
@@ -88,6 +141,7 @@ pub async fn run_rooms(
     bridge_cfg: &MatrixBridgeConfig,
     selected_login: Option<&str>,
     execute: bool,
+    reset: bool,
     retries: u32,
     delay_ms: u64,
 ) -> u8 {
@@ -176,6 +230,7 @@ pub async fn run_rooms(
     };
     let cfg = EngineConfig {
         mode: if execute { Mode::Execute } else { Mode::DryRun },
+        reset,
         retries,
         retry_backoff: DEFAULT_RETRY_BACKOFF,
         inter_room_delay: Duration::from_millis(delay_ms),
@@ -236,9 +291,16 @@ fn select_login<'a>(
     }
 }
 
-/// The decision/reporting core: print the banner, enumerate rooms, and (in
-/// execute mode) leave them, reporting each outcome. Returns the exit code.
-/// All output goes through `out`; the password is never in `creds`' output.
+/// The decision/reporting core: print the banner, enumerate rooms (and, in
+/// reset mode, pending invites), and (in execute mode) act on them — leaving
+/// every joined room, and with `reset` also rejecting every pending invite and
+/// forgetting each room after leaving it — reporting each outcome. Returns the
+/// exit code. All output goes through `out`; the password is never in `creds`'
+/// output.
+///
+/// In reset mode a forget that ultimately fails is a warning, not a failure:
+/// forget support varies by server (some already forget on leave), so only the
+/// membership operations — leaves and invite rejections — affect the exit code.
 async fn run_reset<E: RoomEndpoint>(
     cfg: &EngineConfig,
     creds: &MatrixCredentials,
@@ -250,9 +312,11 @@ async fn run_reset<E: RoomEndpoint>(
 ) -> u8 {
     // Banner — account, homeserver, mode, and (in execute mode) the retry/delay
     // settings. Never the password.
-    let mode_str = match cfg.mode {
-        Mode::DryRun => "dry-run",
-        Mode::Execute => "execute",
+    let mode_str = match (cfg.mode, cfg.reset) {
+        (Mode::DryRun, false) => "dry-run",
+        (Mode::DryRun, true) => "dry-run (reset)",
+        (Mode::Execute, false) => "execute",
+        (Mode::Execute, true) => "execute (reset: reject invites, forget after leave)",
     };
     let _ = writeln!(out, "config: {}", config_path.display());
     let _ = writeln!(out, "login: {login_id}");
@@ -279,52 +343,174 @@ async fn run_reset<E: RoomEndpoint>(
     };
     rooms.sort();
 
-    if rooms.is_empty() {
-        let _ = writeln!(out, "nothing to do (no joined rooms)");
+    // Pending invites only matter for the reset path; plain leave-all
+    // deliberately leaves them alone.
+    let mut invites = Vec::new();
+    if cfg.reset {
+        invites = match endpoint.invited_rooms().await {
+            Ok(invites) => invites,
+            Err(e) => {
+                let _ = writeln!(out, "failed to enumerate pending invites: {e}");
+                return 2;
+            }
+        };
+        invites.sort();
+    }
+
+    if rooms.is_empty() && invites.is_empty() {
+        if cfg.reset {
+            let _ = writeln!(out, "nothing to do (no joined rooms, no pending invites)");
+        } else {
+            let _ = writeln!(out, "nothing to do (no joined rooms)");
+        }
         return 0;
     }
 
     match cfg.mode {
         Mode::DryRun => {
-            for room in &rooms {
-                let _ = writeln!(out, "{room}");
+            if cfg.reset {
+                for invite in &invites {
+                    let _ = writeln!(out, "pending invite {invite}");
+                }
+                for room in &rooms {
+                    let _ = writeln!(out, "joined {room}");
+                }
+                let _ = writeln!(
+                    out,
+                    "{} pending invite(s) to reject, {} joined room(s) to leave and forget; nothing was changed (dry-run)",
+                    invites.len(),
+                    rooms.len()
+                );
+                let _ = writeln!(
+                    out,
+                    "re-run `rooms leave-all --execute --reset` for a true reset (stop the bridge first)"
+                );
+            } else {
+                for room in &rooms {
+                    let _ = writeln!(out, "{room}");
+                }
+                let _ = writeln!(
+                    out,
+                    "{} joined room(s); nothing was left (dry-run)",
+                    rooms.len()
+                );
+                let _ = writeln!(out, "re-run `rooms leave-all --execute` to leave them");
             }
-            let _ = writeln!(
-                out,
-                "{} joined room(s); nothing was left (dry-run)",
-                rooms.len()
-            );
-            let _ = writeln!(out, "re-run `rooms leave-all --execute` to leave them");
             0
         }
         Mode::Execute => {
-            let mut left = 0usize;
-            let mut failed = 0usize;
-            for (i, room) in rooms.iter().enumerate() {
-                if i > 0 {
-                    sleep(cfg.inter_room_delay).await;
-                }
-                match leave_with_retries(endpoint, room, cfg.retries, cfg.retry_backoff).await {
-                    Ok(()) => {
-                        let _ = writeln!(out, "left {room}");
-                        left += 1;
+            let mut stats = ExecuteStats::default();
+            // Invites first: each rejection is one less invite the bridge's
+            // auto-joiner could act on if it were started mid-reset.
+            let mut first_target = true;
+            if cfg.reset {
+                for invite in &invites {
+                    if !first_target {
+                        sleep(cfg.inter_room_delay).await;
                     }
-                    Err(e) => {
-                        let _ = writeln!(out, "FAILED {room} ({} attempts): {e}", cfg.retries);
-                        failed += 1;
-                    }
+                    first_target = false;
+                    execute_target(endpoint, cfg, invite, Target::Invited, out, &mut stats).await;
                 }
             }
-            let _ = writeln!(out, "summary: left {left}, failed {failed}");
-            if failed > 0 { 1 } else { 0 }
+            for room in &rooms {
+                if !first_target {
+                    sleep(cfg.inter_room_delay).await;
+                }
+                first_target = false;
+                execute_target(endpoint, cfg, room, Target::Joined, out, &mut stats).await;
+            }
+            if cfg.reset {
+                let _ = writeln!(
+                    out,
+                    "summary: rejected {}, left {}, failed {}, forgot {}, forget-failed {}",
+                    stats.rejected, stats.left, stats.failed, stats.forgot, stats.forget_failed
+                );
+            } else {
+                let _ = writeln!(out, "summary: left {}, failed {}", stats.left, stats.failed);
+            }
+            if stats.failed > 0 { 1 } else { 0 }
         }
     }
 }
 
-/// Leave `room`, retrying up to `retries` attempts with a doubling backoff
-/// (1s, 2s, 4s… — zero in tests).
-async fn leave_with_retries<E: RoomEndpoint>(
+/// What an execute run is acting on for one room id.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// A pending invite, rejected by leaving the invited room (per spec).
+    Invited,
+    /// A joined room, left.
+    Joined,
+}
+
+/// Counters behind the execute-mode summary line.
+#[derive(Debug, Default)]
+struct ExecuteStats {
+    rejected: usize,
+    left: usize,
+    failed: usize,
+    forgot: usize,
+    forget_failed: usize,
+}
+
+/// One execute-mode target: reject it or leave it (both are a leave call), and
+/// in reset mode follow a successful membership change with a best-effort
+/// forget of the same room. Reports every outcome through `out`.
+async fn execute_target<E: RoomEndpoint>(
     endpoint: &mut E,
+    cfg: &EngineConfig,
+    room: &str,
+    target: Target,
+    out: &mut impl Write,
+    stats: &mut ExecuteStats,
+) {
+    let label = match target {
+        Target::Invited => "rejected invite",
+        Target::Joined => "left",
+    };
+    match with_retries(endpoint, Op::Leave, room, cfg.retries, cfg.retry_backoff).await {
+        Ok(()) => {
+            let _ = writeln!(out, "{label} {room}");
+            match target {
+                Target::Invited => stats.rejected += 1,
+                Target::Joined => stats.left += 1,
+            }
+            if cfg.reset {
+                match with_retries(endpoint, Op::Forget, room, cfg.retries, cfg.retry_backoff).await
+                {
+                    Ok(()) => {
+                        let _ = writeln!(out, "forgot {room}");
+                        stats.forgot += 1;
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            out,
+                            "warning: forget failed for {room} ({} attempts): {e}",
+                            cfg.retries
+                        );
+                        stats.forget_failed += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "FAILED {room} ({} attempts): {e}", cfg.retries);
+            stats.failed += 1;
+        }
+    }
+}
+
+/// A membership call the retry loop can make.
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    Leave,
+    Forget,
+}
+
+/// Run one membership `op` on `room`, retrying up to `retries` attempts with a
+/// doubling backoff (1s, 2s, 4s… — zero in tests).
+async fn with_retries<E: RoomEndpoint>(
+    endpoint: &mut E,
+    op: Op,
     room: &str,
     retries: u32,
     backoff: Duration,
@@ -332,7 +518,11 @@ async fn leave_with_retries<E: RoomEndpoint>(
     let mut delay = backoff;
     let mut last_err = None;
     for attempt in 1..=retries {
-        match endpoint.leave_room(room).await {
+        let result = match op {
+            Op::Leave => endpoint.leave_room(room).await,
+            Op::Forget => endpoint.forget_room(room).await,
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);
@@ -345,7 +535,7 @@ async fn leave_with_retries<E: RoomEndpoint>(
     }
     match last_err {
         Some(e) => Err(e),
-        None => anyhow::bail!("no leave attempts were made"),
+        None => anyhow::bail!("no attempts were made"),
     }
 }
 
@@ -367,6 +557,7 @@ mod tests {
     fn dry_cfg() -> EngineConfig {
         EngineConfig {
             mode: Mode::DryRun,
+            reset: false,
             retries: 3,
             retry_backoff: Duration::ZERO,
             inter_room_delay: Duration::ZERO,
@@ -376,6 +567,27 @@ mod tests {
     fn exec_cfg() -> EngineConfig {
         EngineConfig {
             mode: Mode::Execute,
+            reset: false,
+            retries: 3,
+            retry_backoff: Duration::ZERO,
+            inter_room_delay: Duration::ZERO,
+        }
+    }
+
+    fn reset_dry_cfg() -> EngineConfig {
+        EngineConfig {
+            mode: Mode::DryRun,
+            reset: true,
+            retries: 3,
+            retry_backoff: Duration::ZERO,
+            inter_room_delay: Duration::ZERO,
+        }
+    }
+
+    fn reset_exec_cfg() -> EngineConfig {
+        EngineConfig {
+            mode: Mode::Execute,
+            reset: true,
             retries: 3,
             retry_backoff: Duration::ZERO,
             inter_room_delay: Duration::ZERO,
@@ -401,19 +613,34 @@ mod tests {
         (code, String::from_utf8(buf).unwrap())
     }
 
-    /// Scripted endpoint: `joined_rooms` returns `rooms` verbatim; `leave_room`
-    /// fails the first `fail_then_succeed[room]` times before succeeding, or
-    /// forever for rooms in `always_fail`. Every attempt is recorded.
+    /// Scripted, stateful endpoint: `joined_rooms`/`invited_rooms` return the
+    /// current membership, and a successful `leave_room` drops the room from
+    /// joined (a leave) or from invited (an invite rejection) — so tests can
+    /// assert on the end state the way a homeserver would report it.
+    /// `fail_then_succeed` fails the first N leave attempts for a room before
+    /// succeeding; `always_fail` fails forever; `forget_fail` fails every
+    /// forget for a room. Every attempt is recorded.
     struct FakeEndpoint {
         rooms: Vec<String>,
+        invited: Vec<String>,
         fail_then_succeed: HashMap<String, u32>,
         always_fail: HashSet<String>,
+        forget_fail: HashSet<String>,
+        fail_invite_enumeration: bool,
         leave_attempts: Vec<String>,
+        forget_attempts: Vec<String>,
     }
 
     impl RoomEndpoint for FakeEndpoint {
         async fn joined_rooms(&mut self) -> anyhow::Result<Vec<String>> {
             Ok(self.rooms.clone())
+        }
+
+        async fn invited_rooms(&mut self) -> anyhow::Result<Vec<String>> {
+            if self.fail_invite_enumeration {
+                anyhow::bail!("cannot sync");
+            }
+            Ok(self.invited.clone())
         }
 
         async fn leave_room(&mut self, room_id: &str) -> anyhow::Result<()> {
@@ -427,6 +654,16 @@ mod tests {
                 *remaining -= 1;
                 anyhow::bail!("transient for {room_id}");
             }
+            self.rooms.retain(|r| r != room_id);
+            self.invited.retain(|r| r != room_id);
+            Ok(())
+        }
+
+        async fn forget_room(&mut self, room_id: &str) -> anyhow::Result<()> {
+            self.forget_attempts.push(room_id.to_string());
+            if self.forget_fail.contains(room_id) {
+                anyhow::bail!("no forget for {room_id}");
+            }
             Ok(())
         }
     }
@@ -434,10 +671,20 @@ mod tests {
     fn fake(rooms: Vec<String>) -> FakeEndpoint {
         FakeEndpoint {
             rooms,
+            invited: Vec::new(),
             fail_then_succeed: HashMap::new(),
             always_fail: HashSet::new(),
+            forget_fail: HashSet::new(),
+            fail_invite_enumeration: false,
             leave_attempts: Vec::new(),
+            forget_attempts: Vec::new(),
         }
+    }
+
+    fn fake_reset(rooms: Vec<String>, invited: Vec<String>) -> FakeEndpoint {
+        let mut ep = fake(rooms);
+        ep.invited = invited;
+        ep
     }
 
     #[tokio::test]
@@ -525,6 +772,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_dry_run_previews_invites_and_rooms_without_mutating() {
+        let mut ep = fake_reset(vec!["!b:example".into()], vec!["!inv:example".into()]);
+        let (code, out) = run(&reset_dry_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 0);
+        assert!(out.contains("pending invite !inv:example"), "output: {out}");
+        assert!(out.contains("joined !b:example"), "output: {out}");
+        assert!(out.contains("mode: dry-run (reset)"), "output: {out}");
+        assert!(
+            out.contains("1 pending invite(s) to reject, 1 joined room(s)"),
+            "output: {out}"
+        );
+        assert!(out.contains("--execute --reset"), "output: {out}");
+        assert!(ep.leave_attempts.is_empty());
+        assert!(ep.forget_attempts.is_empty());
+        assert_eq!(ep.rooms.len(), 1);
+        assert_eq!(ep.invited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_execute_leaves_no_joined_rooms_and_no_pending_invites() {
+        let mut ep = fake_reset(
+            vec!["!a:example".into(), "!b:example".into()],
+            vec!["!i2:example".into(), "!i1:example".into()],
+        );
+        let (code, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 0);
+        // The reset's contract: zero joined rooms AND zero pending invites.
+        assert!(ep.rooms.is_empty(), "joined rooms remain: {:?}", ep.rooms);
+        assert!(ep.invited.is_empty(), "invites remain: {:?}", ep.invited);
+        // Invites are rejected first (sorted), then rooms are left (sorted),
+        // and every one of the four is forgotten afterwards.
+        assert_eq!(
+            ep.leave_attempts,
+            vec![
+                "!i1:example".to_string(),
+                "!i2:example".to_string(),
+                "!a:example".to_string(),
+                "!b:example".to_string(),
+            ]
+        );
+        assert!(out.contains("rejected invite !i1:example"), "output: {out}");
+        assert!(out.contains("rejected invite !i2:example"), "output: {out}");
+        assert!(out.contains("left !a:example"), "output: {out}");
+        assert!(out.contains("left !b:example"), "output: {out}");
+        assert_eq!(ep.forget_attempts.len(), 4);
+        assert!(
+            out.contains("summary: rejected 2, left 2, failed 0, forgot 4, forget-failed 0"),
+            "output: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_execute_continues_past_failures() {
+        let mut ep = fake_reset(
+            vec!["!a:example".into(), "!bad:example".into()],
+            vec!["!inv:example".into()],
+        );
+        ep.always_fail.insert("!bad:example".into());
+        let (code, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 1);
+        assert!(out.contains("FAILED !bad:example"), "output: {out}");
+        assert!(
+            out.contains("rejected invite !inv:example"),
+            "output: {out}"
+        );
+        assert!(out.contains("left !a:example"), "output: {out}");
+        // A room whose leave failed is never forgotten (spec requires leaving
+        // first); the others are.
+        assert_eq!(ep.forget_attempts.len(), 2);
+        assert_eq!(ep.rooms, vec!["!bad:example".to_string()]);
+        assert!(ep.invited.is_empty());
+        assert!(
+            out.contains("summary: rejected 1, left 1, failed 1, forgot 2, forget-failed 0"),
+            "output: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_forget_failure_is_a_warning_not_a_run_failure() {
+        let mut ep = fake_reset(vec!["!a:example".into()], vec![]);
+        ep.forget_fail.insert("!a:example".into());
+        let (code, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("warning: forget failed for !a:example"),
+            "output: {out}"
+        );
+        // The leave itself still happened, and the forget was retried.
+        assert!(ep.rooms.is_empty());
+        assert_eq!(ep.forget_attempts.len(), 3);
+        assert!(
+            out.contains("summary: rejected 0, left 1, failed 0, forgot 0, forget-failed 1"),
+            "output: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_execute_leaves_invites_and_forgetting_alone() {
+        let mut ep = fake_reset(vec!["!a:example".into()], vec!["!inv:example".into()]);
+        let (code, out) = run(&exec_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 0);
+        assert!(out.contains("left !a:example"), "output: {out}");
+        assert!(!out.contains("rejected invite"), "output: {out}");
+        assert_eq!(ep.invited.len(), 1);
+        assert!(ep.forget_attempts.is_empty());
+        assert!(out.contains("summary: left 1, failed 0"), "output: {out}");
+    }
+
+    #[tokio::test]
+    async fn reset_with_nothing_to_do_is_success() {
+        let mut ep = fake_reset(vec![], vec![]);
+        let (code, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("nothing to do (no joined rooms, no pending invites)"),
+            "output: {out}"
+        );
+        assert!(ep.leave_attempts.is_empty());
+        assert!(ep.forget_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_invite_enumeration_failure_is_a_setup_failure() {
+        let mut ep = fake_reset(vec!["!a:example".into()], vec!["!inv:example".into()]);
+        ep.fail_invite_enumeration = true;
+        let (code, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
+        assert_eq!(code, 2);
+        assert!(
+            out.contains("failed to enumerate pending invites"),
+            "output: {out}"
+        );
+        assert!(ep.leave_attempts.is_empty());
+    }
+
+    #[tokio::test]
     async fn secret_never_appears_in_output() {
         let secret = MatrixCredentials {
             homeserver_url: "https://matrix.example".to_string(),
@@ -549,6 +931,11 @@ mod tests {
         ep.always_fail.insert("!a:example".into());
         let (_, out) = run(&exec_cfg(), &secret, &mut ep).await;
         assert!(!out.contains("<sentinel-secret>"), "output: {out}");
+
+        // Reset execute.
+        let mut ep = fake_reset(vec!["!a:example".into()], vec!["!inv:example".into()]);
+        let (_, out) = run(&reset_exec_cfg(), &secret, &mut ep).await;
+        assert!(!out.contains("<sentinel-secret>"), "output: {out}");
     }
 
     #[tokio::test]
@@ -565,5 +952,17 @@ mod tests {
         let mut ep = fake(vec![]);
         let (_, out) = run(&exec_cfg(), &creds(), &mut ep).await;
         assert!(out.contains("mode: execute"), "output: {out}");
+
+        let mut ep = fake(vec![]);
+        let (_, out) = run(&reset_dry_cfg(), &creds(), &mut ep).await;
+        assert!(out.contains("mode: dry-run (reset)"), "output: {out}");
+
+        let mut ep = fake(vec![]);
+        let (_, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
+        assert!(
+            out.contains("mode: execute (reset: reject invites, forget after leave)"),
+            "output: {out}"
+        );
+        assert!(out.contains("retries=3"), "output: {out}");
     }
 }

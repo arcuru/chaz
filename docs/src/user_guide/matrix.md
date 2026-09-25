@@ -158,17 +158,59 @@ chaz-matrix --config matrix-bridge.yaml rooms leave-all \
 `--retries` and `--delay-ms` tune only `leave-all`; listing has no leave policy
 to tune.
 
+### True reset: `--reset`
+
+Plain `leave-all` is only a _membership_ reset. Pending invitations survive it,
+left rooms keep their history, and re-entering an invite-only room needs just
+one more invite. Add `--reset` for a true account-level reset — the flag works
+on both the dry-run preview and `--execute`, and closes those gaps in the same
+run:
+
+- **Pending invites are rejected.** Leaving a room you are invited to but not
+  joined in rejects the invite, per spec. `--reset` enumerates the invite list
+  (via a one-shot sync) and rejects each one, so no invite survives the run.
+- **Each room is forgotten after leaving it.** Forget drops the account's
+  history access to the room; once every local user has forgotten a room it
+  becomes eligible for deletion from the homeserver.
+
+```bash
+chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset            # preview
+chaz-matrix --config matrix-bridge.yaml rooms leave-all --execute --reset  # true reset
+```
+
+**Stop the bridge before a reset and leave it stopped until the run exits.**
+The steady-state bridge installs an invite auto-joiner at startup and joins
+every allowed invite it sees. A reset raced against a live bridge can be
+silently undone: an invite that arrives mid-run, or is still pending when the
+bridge next starts, puts the account right back in the room that was just
+left. There is no protocol way for the maintenance command to prevent this —
+the only fix is ordering.
+
+A forget that ultimately fails is reported as a warning and does not fail the
+run: forget behavior varies by server — those that already forget on leave
+(the `m.forget_forced_upon_leave` capability) may reject the redundant forget,
+and forget support outside Synapse is unverified. The exit code reflects the
+membership operations only.
+
 Exit codes: `0` for a successful run, an empty room list, or a dry-run; `1`
-when one or more rooms failed to leave; `2` for a setup failure — no or
-ambiguous login, an unresolved password, a failed login, or an authenticated
-account that does not match the configured username.
+when one or more rooms failed to leave or invites failed to reject; `2` for a
+setup failure — no or ambiguous login, an unresolved password, a failed login,
+an authenticated account that does not match the configured username, or (with
+`--reset`) a failed invite enumeration.
 
 Safety notes:
 
 - Each run signs in with a **fresh throwaway device** that is logged out at the
-  end, so it never disturbs the bridge's own persisted session or device.
-- **Pending invitations are untouched** — only rooms the account is already
-  joined to are enumerated and left.
+  end, so it never disturbs the bridge's own persisted session or device. The
+  login path is deliberately crypto-free — no keys are uploaded — which keeps
+  the ephemeral device invisible to other clients.
+- Every run costs one login from each of Synapse's two login rate-limit
+  buckets (0.003/s, burst 5): fine at human or cron cadence, exhaustible by
+  tight retry loops around the command. `--reset` roughly doubles the per-room
+  API calls (leave plus forget).
+- **Pending invitations are untouched by plain `leave-all`** — only rooms the
+  account is already joined to are enumerated and left. `--reset` rejects them
+  instead.
 - Run it **with the bridge stopped** for a quiescent reset: a running bridge
   auto-joins allowed invitations it sees, so a room it re-joins mid-run is not
   part of the enumeration.
