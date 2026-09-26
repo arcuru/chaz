@@ -903,6 +903,9 @@ impl Bridge for MatrixBridge {
             // mode becomes a long-lived feature across bridge restarts.
             let participation_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            // Serialize setting commands so an expired enable cannot clear a
+            // newer enable (or undo an off) while waiting for its receipt.
+            let participation_command_lock = Arc::new(Mutex::new(()));
             let pending_approvals = pending_approvals.clone();
 
             mc.client().add_event_handler(
@@ -918,6 +921,7 @@ impl Bridge for MatrixBridge {
                     let backfilled_rooms = backfilled_rooms.clone();
                     let seen_events = seen_events.clone();
                     let participation_counts = participation_counts.clone();
+                    let participation_command_lock = participation_command_lock.clone();
                     let pending_approvals = pending_approvals.clone();
                     async move {
                         if room.state() != RoomState::Joined {
@@ -1029,6 +1033,7 @@ impl Bridge for MatrixBridge {
                                 }
                                 "participation" => {
                                     let args = inner.strip_prefix("participation").unwrap_or("").trim();
+                                    let _guard = participation_command_lock.lock().await;
                                     let result = handle_participation(
                                         args, &room, &server, &login_id, &owning_agent,
                                         allow_list.as_deref(), event.sender.as_str(),

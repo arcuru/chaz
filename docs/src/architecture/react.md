@@ -62,11 +62,12 @@ Scheduled turns currently retain the compatibility `RuntimeEvent` adapter becaus
 ## Opt-in silent completion
 
 The runtime reserves `no_reply` as a terminal tool action when the caller sets
-`ToolContext.allow_no_reply` for a turn. Every production caller currently leaves
-that flag off; bridge ingress, DM/mention behavior, and agent configuration do not
-change in this slice. A later explicit bridge policy can opt in per turn and
-add behavioral guidance to the budgeted agent context; a tool definition alone
-does not make every model choose silence reliably.
+`ToolContext.allow_no_reply` for a turn. Matrix bridge ingress marks eligible
+messages from an explicitly enabled group room, and the executor rechecks the
+room-bound policy before opting that turn in. DMs, other rooms, schedules, and
+agent configuration retain their default-off behavior. An opted-in turn adds
+behavioral guidance to the budgeted agent context; a tool definition alone does
+not make every model choose silence reliably.
 
 On an opted-in turn the model sees that ordinary final text is sent verbatim to
 chat and may instead make a sole `no_reply({})` call with no reply text. The
