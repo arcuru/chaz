@@ -788,9 +788,9 @@ pub async fn execute_with_recorder(
                         &recorder,
                         RuntimeRecord::ModelResponse {
                             model_sequence,
-                            content,
+                            content: None,
                             tool_calls,
-                            provider_extra,
+                            provider_extra: Default::default(),
                             metadata: metadata.clone(),
                             terminal: true,
                         },

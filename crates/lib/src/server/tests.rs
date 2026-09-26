@@ -18,7 +18,19 @@ async fn terminal_no_reply_completes_durably_without_a_deliverable_message() {
     let mut ctx = tool_context(session.clone(), Arc::new(ToolRegistry::new()));
     ctx.allow_no_reply = true;
     let mock = Arc::new(MockBackend::new());
-    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
+    mock.push_response(Ok(runtime::LLMResponse::ToolCalls {
+        content: Some("  ".into()),
+        tool_calls: vec![runtime::ToolCallRequest {
+            id: "stop".into(),
+            name: "no_reply".into(),
+            arguments: "{}".into(),
+        }],
+        provider_extra: serde_json::Map::from_iter([(
+            "reasoning".into(),
+            serde_json::json!("private model trace"),
+        )]),
+        metadata: None,
+    }));
     let backend = BackendManager::with_mock(mock, empty_secrets().await);
     let recorder = Arc::new(SessionRuntimeRecorder {
         session: session.clone(),
@@ -66,8 +78,8 @@ async fn terminal_no_reply_completes_durably_without_a_deliverable_message() {
     let records = reopened.turn_transcript(&attempt.attempt_id).await.unwrap();
     assert_eq!(records.len(), 1);
     assert!(matches!(&records[0].message,
-        TurnTranscriptMessage::ModelResponse { terminal: true, tool_calls, .. }
-        if tool_calls.len() == 1 && tool_calls[0].name == "no_reply"));
+        TurnTranscriptMessage::ModelResponse { terminal: true, content: None, provider_extra, tool_calls, .. }
+        if provider_extra.is_empty() && tool_calls.len() == 1 && tool_calls[0].name == "no_reply"));
 }
 
 #[test]
