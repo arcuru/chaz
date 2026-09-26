@@ -2368,6 +2368,16 @@ impl Server {
         let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
+        // Receipt proves the executor observed this generation through session
+        // sync. A bridge never acknowledges enablement on its own write alone.
+        if let Some(policy) = session.read_meta().await.matrix_participation
+            && crate::session::is_bound(&session_db, "matrix", &policy.login_id, &policy.room_id)
+                .await
+                .unwrap_or(false)
+        {
+            crate::session::acknowledge_matrix_participation(&session_db, &policy.generation)
+                .await?;
+        }
 
         let live_attempts = self.live_attempts.lock().await.clone();
         let command = session.next_command_request(&live_attempts).await?;
@@ -2594,6 +2604,7 @@ impl Server {
             approval_tx,
             backend,
             attempt,
+            latest,
             spawn_ctx,
         )
         .await;
@@ -2785,6 +2796,7 @@ impl Server {
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
         backend: BackendManager,
         attempt: TurnAttempt,
+        request_entry: SessionEntry,
         spawn: SpawnContext,
     ) {
         let agent_name = agent.name.clone();
@@ -2894,13 +2906,20 @@ impl Server {
                 .clone()
                 .unwrap_or_else(|| Arc::new(AtomicU32::new(agent.max_iterations)));
 
+            let allow_no_reply = {
+                let s = session.lock().await;
+                crate::session::matrix_participation_for_entry(s.database(), &request_entry).await
+            };
+            let system_prompt = if allow_no_reply {
+                format!("{system_prompt}\n\nYou are participating in a Matrix group room. Every normal final text reply is posted to the room. If no response is useful, call no_reply({{}}) as the sole action to end this turn silently, even when mentioned. Do not call it alongside other tools or final text. Reply only when you have something useful to add.")
+            } else { system_prompt };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
                 call_depth: spawn.call_depth,
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
-                allow_no_reply: false,
+                allow_no_reply,
                 session: session.clone(),
                 grants: Default::default(),
                 session_capabilities,

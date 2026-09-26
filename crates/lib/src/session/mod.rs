@@ -222,6 +222,9 @@ pub struct EntryRouting {
     /// transport/login/channel this entry arrived on, and from whom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<TransportRef>,
+    /// Only a bridge-confirmed opted-in group-room message may carry this.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub matrix_participation: bool,
     /// Default-reply pointer: the transport `message_id` of the inbound
     /// entry this is a reply to. The publisher resolves the destination by
     /// finding the referenced entry and reading its `source`. Lets the
@@ -233,6 +236,10 @@ pub struct EntryRouting {
     /// `(transport, login_id)`. Empty for the implicit reply-to-source path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destinations: Vec<TransportRef>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// A transport-scoped address: where a message came from or should go.
@@ -320,12 +327,36 @@ pub struct SessionMeta {
     /// Per-session agent→agent burst budget override. `Some(n)` replaces
     /// the global `multi_agent.burst_budget`; `None` falls back to it.
     pub burst_budget_override: Option<usize>,
+    /// Explicit Matrix group participation, scoped to one login and room.
+    pub matrix_participation: Option<MatrixParticipation>,
     /// Session-wide capability ceiling. Attenuates every tool call by every
     /// agent in this session — the outermost tier, above the agent-wide cap
     /// and per-tool grants. "This is a private, no-network session" lives
     /// here. Default (all-permissive) imposes no ceiling.
     #[serde(default)]
     pub capabilities: crate::grants::Grants,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatrixParticipation {
+    pub login_id: String,
+    pub room_id: String,
+    /// Fresh per enable operation; the executor echoes this after sync.
+    pub generation: String,
+}
+
+impl MatrixParticipation {
+    pub fn new(login_id: &str, room_id: &str) -> Self {
+        Self {
+            login_id: login_id.into(),
+            room_id: room_id.into(),
+            generation: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    pub fn matches(&self, login_id: &str, room_id: &str) -> bool {
+        self.login_id == login_id && self.room_id == room_id
+    }
 }
 
 impl SessionMeta {
@@ -1589,7 +1620,14 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         Err(_) => Default::default(),
     };
 
+    let matrix_participation = store
+        .get_string("matrix_participation")
+        .await
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok());
+
     SessionMeta {
+        matrix_participation,
         name: store.get_string("name").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
         agents,
@@ -1638,6 +1676,12 @@ where
         let json = serde_json::to_string(&current.agent_models)?;
         store.set_string("agent_models", json).await?;
     }
+    let participation = current
+        .matrix_participation
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    write_field(&store, "matrix_participation", participation.as_deref()).await?;
     write_field(&store, "role_name", current.role_name.as_deref()).await?;
     write_field(&store, "role_prompt", current.role_prompt.as_deref()).await?;
     write_field(&store, "backend_name", current.backend_name.as_deref()).await?;
@@ -1664,6 +1708,55 @@ where
         store.set_string("capabilities", json).await?;
     }
 
+    txn.commit().await?;
+    Ok(())
+}
+
+/// No action can opt in without both the bridge's per-entry mark and a
+/// current matching, still-bound session policy on the executor.
+pub async fn matrix_participation_for_entry(database: &Database, entry: &SessionEntry) -> bool {
+    let Some(source) = entry
+        .routing
+        .as_ref()
+        .filter(|routing| routing.matrix_participation)
+        .and_then(|routing| routing.source.as_ref())
+    else {
+        return false;
+    };
+    if entry.entry_type != EntryType::Message || source.transport != "matrix" {
+        return false;
+    }
+    let Some(policy) = read_meta_from_db(database).await.matrix_participation else {
+        return false;
+    };
+    policy.matches(&source.login_id, &source.channel)
+        && is_bound(database, "matrix", &source.login_id, &source.channel)
+            .await
+            .unwrap_or(false)
+}
+
+/// Executor receipt for an enable operation. A separate store avoids rewriting
+/// the bridge-owned policy from a concurrently synced metadata snapshot.
+pub async fn matrix_participation_receipt(database: &Database) -> anyhow::Result<Option<String>> {
+    let txn = database.new_transaction().await?;
+    let store = txn
+        .get_store::<DocStore>("matrix_participation_receipt")
+        .await?;
+    Ok(store.get_string("generation").await.ok())
+}
+
+pub async fn acknowledge_matrix_participation(
+    database: &Database,
+    generation: &str,
+) -> anyhow::Result<()> {
+    if matrix_participation_receipt(database).await?.as_deref() == Some(generation) {
+        return Ok(());
+    }
+    let txn = database.new_transaction().await?;
+    let store = txn
+        .get_store::<DocStore>("matrix_participation_receipt")
+        .await?;
+    store.set_string("generation", generation).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -2247,6 +2340,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_participation_is_persisted_bound_and_fail_closed() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut entry = crate::bridge::inbound_user_entry(
+            "matrix",
+            "@bot:test",
+            "!one:test",
+            "@human:test",
+            None,
+            "hi",
+            None,
+        );
+        assert!(read_meta_from_db(&db).await.matrix_participation.is_none());
+        bind_transport(&db, "matrix", "@bot:test", "!one:test")
+            .await
+            .unwrap();
+        let policy = MatrixParticipation::new("@bot:test", "!one:test");
+        update_meta_on_db(&db, |meta| meta.matrix_participation = Some(policy.clone()))
+            .await
+            .unwrap();
+        // An existing addressed message is never retroactively opted in.
+        assert!(!matrix_participation_for_entry(&db, &entry).await);
+        entry.routing.as_mut().unwrap().matrix_participation = true;
+        assert!(matrix_participation_for_entry(&db, &entry).await);
+        let roundtrip: SessionEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert!(matrix_participation_for_entry(&db, &roundtrip).await);
+        assert_eq!(
+            read_meta_from_db(&db).await.matrix_participation,
+            Some(policy.clone())
+        );
+        assert!(matrix_participation_receipt(&db).await.unwrap().is_none());
+        acknowledge_matrix_participation(&db, &policy.generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            matrix_participation_receipt(&db).await.unwrap(),
+            Some(policy.generation.clone())
+        );
+
+        // Attaching a second room does not inherit the first room's setting.
+        bind_transport(&db, "matrix", "@bot:test", "!two:test")
+            .await
+            .unwrap();
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .channel = "!two:test".into();
+        assert!(!matrix_participation_for_entry(&db, &entry).await);
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .channel = "!one:test".into();
+        unbind_transport(&db, "matrix", "@bot:test", "!one:test")
+            .await
+            .unwrap();
+        assert!(!matrix_participation_for_entry(&db, &entry).await);
+        bind_transport(&db, "matrix", "@bot:test", "!one:test")
+            .await
+            .unwrap();
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .login_id = "@other:test".into();
+        assert!(!matrix_participation_for_entry(&db, &entry).await);
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .login_id = "@bot:test".into();
+        update_meta_on_db(&db, |meta| meta.matrix_participation = None)
+            .await
+            .unwrap();
+        assert!(!matrix_participation_for_entry(&db, &entry).await);
+        assert!(read_meta_from_db(&db).await.matrix_participation.is_none());
+        // A receipt from the previous generation cannot confirm a new enable.
+        let next = MatrixParticipation::new("@bot:test", "!one:test");
+        assert_ne!(
+            matrix_participation_receipt(&db).await.unwrap().as_deref(),
+            Some(next.generation.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn session_meta_agents_round_trip() {
         let (_instance, _user, db) = test_session_db().await;
 
@@ -2561,6 +2752,7 @@ mod tests {
                 }),
                 reply_to: None,
                 destinations: Vec::new(),
+                matrix_participation: false,
             }),
         };
         let json = serde_json::to_string(&entry).unwrap();

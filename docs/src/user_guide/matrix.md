@@ -176,7 +176,7 @@ Safety notes:
 ## Message Handling
 
 - **DMs**: The bot responds to every message
-- **Group rooms**: The bot responds to messages prefixed with `!chaz` or that mention the bot
+- **Group rooms**: By default, the bot responds to `!chaz` commands or messages that mention it. An explicitly enabled room can invite participation on every eligible text message.
 
 To send a message with room context:
 
@@ -192,19 +192,22 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ### Session
 
-| Command                  | Description                                          |
-| ------------------------ | ---------------------------------------------------- |
-| `!chaz sessions`         | List every session known to the registry             |
-| `!chaz info`             | Show details for the session attached to this room   |
-| `!chaz name [<alias>]`   | Set (or clear, with no arg) a human-friendly alias   |
-| `!chaz attach <session>` | Bind this room to a specific session (name or DB ID) |
-| `!chaz detach`           | Detach this room from its session                    |
-| `!chaz channels`         | List Matrix rooms currently attached to this session |
-| `!chaz share`            | Generate a shareable ticket URL for this session     |
-| `!chaz unshare`          | Stop sharing the current session                     |
-| `!chaz sync <ticket>`    | Sync a remote session via ticket URL                 |
-| `!chaz compact`          | Summarize and compact conversation history           |
-| `!chaz print`            | Print the current conversation context               |
+| Command                      | Description                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------- |
+| `!chaz sessions`             | List every session known to the registry                                      |
+| `!chaz info`                 | Show details for the session attached to this room                            |
+| `!chaz name [<alias>]`       | Set (or clear, with no arg) a human-friendly alias                            |
+| `!chaz attach <session>`     | Bind this room to a specific session (name or DB ID)                          |
+| `!chaz detach`               | Detach this room from its session                                             |
+| `!chaz participation on`     | Enable agent-selected replies for this group room after executor confirmation |
+| `!chaz participation status` | Report whether this login and room are confirmed enabled                      |
+| `!chaz participation off`    | Disable participation in this room                                            |
+| `!chaz channels`             | List Matrix rooms currently attached to this session                          |
+| `!chaz share`                | Generate a shareable ticket URL for this session                              |
+| `!chaz unshare`              | Stop sharing the current session                                              |
+| `!chaz sync <ticket>`        | Sync a remote session via ticket URL                                          |
+| `!chaz compact`              | Summarize and compact conversation history                                    |
+| `!chaz print`                | Print the current conversation context                                        |
 
 ### Living Agents
 
@@ -236,6 +239,43 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz clear`                  | Ignore all messages before this point                                       |
 | `!chaz rename`                 | Rename the Matrix room based on conversation content                        |
 | `!chaz party`                  | 🎉                                                                          |
+
+## Choosing when to speak in a group
+
+Participation is **off by default**. In a group room, a sender matching the
+bridge login's explicit nonempty `allow_list` can use `!chaz participation on`.
+The setting lives in the synced session metadata, tied to the login and room:
+attaching the session to another room does not opt that room in, and detaching
+this room stops its policy from authorizing turns. The bridge waits for the
+executor to observe the setting before confirming it; if the executor is
+unavailable, enabling times out and switches off again. `status` and `off`
+work only for allowlisted senders. DMs are unchanged.
+
+While enabled, every eligible text message from an allowed sender (including
+@mentions) starts a turn. The agent may post final text or end with a sole
+`no_reply({})` tool call without posting. Other tools cannot be mixed with that
+terminal action. Commands, bot messages, pre-join history, duplicates, and
+unauthorized senders never start participating turns. The ordinary configured
+per-sender message limit still applies, plus a pilot ceiling of 20 participating
+turns per room per bridge process. The ceiling resets on bridge restart; disable
+the mode when finished, and set a finite `message_limit` for longer runs.
+
+For example, in a three-person room whose bridge login allows `@you:example`:
+
+1. `@stranger:example` sends `!chaz participation on`. The bridge ignores it;
+   `@you:example` sends `!chaz participation status` and sees
+   `Matrix participation: off`.
+2. `@you:example` sends `!chaz participation on` and receives
+   `Matrix participation: on` only after executor confirmation. A bare room
+   message now reaches the model; a `no_reply({})` decision sends no room reply,
+   while a final-text decision sends exactly one.
+3. If the executor is offline, the command instead returns
+   `!chaz Error: executor did not confirm participation; mode is off`.
+   Restore the executor, then send `!chaz participation on` again; check
+   `!chaz participation status` before sending an unaddressed message.
+4. Send `!chaz participation off`; the response is
+   `Matrix participation: off`. Bare messages are ignored again; explicit
+   mentions still receive normal turns.
 
 ## Session Attachment
 

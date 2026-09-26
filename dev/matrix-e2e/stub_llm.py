@@ -124,7 +124,31 @@ class Handler(BaseHTTPRequestHandler):
         # turn produced which reply — a case that needs to know asserts here.
         sys.stderr.write("stub_llm: request: " + user_text + "\n")
 
-        if has_tool_result:
+        latest_user = next((msg.get("content") for msg in reversed(messages)
+                            if isinstance(msg, dict) and msg.get("role") == "user"
+                            and isinstance(msg.get("content"), str)
+                            and not msg["content"].startswith("## Relevant Memories")), "")
+        if "participation silence test" in latest_user:
+            system_text = " ".join(msg.get("content", "") for msg in messages
+                                   if isinstance(msg, dict) and msg.get("role") == "system")
+            if "Every normal final text reply is posted to the room" not in system_text:
+                self._send({"error": "participation guidance missing"}, status=400)
+                return
+            tools = [tool.get("function", {}).get("name") for tool in json.loads(body).get("tools", [])]
+            if "no_reply" not in tools:
+                self._send({"error": "participating turn did not advertise no_reply"}, status=400)
+                return
+            sys.stderr.write("stub_llm: participation no_reply call\n")
+            self._send({
+                "id": "chatcmpl-e2e", "object": "chat.completion", "created": 0,
+                "model": "stub", "choices": [{"index": 0, "message": {
+                    "role": "assistant", "content": None, "tool_calls": [{
+                        "id": "silent-e2e", "type": "function", "function": {
+                            "name": "no_reply", "arguments": "{}"}}]},
+                    "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })
+        elif has_tool_result:
             sys.stderr.write(
                 "stub_llm: detected tool result in request, returning final reply\n"
             )
