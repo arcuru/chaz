@@ -253,6 +253,9 @@ fn strip_param_descriptions(params: &Value) -> Value {
     result
 }
 
+/// Reserved runtime control action; it never executes through the tool registry.
+pub const NO_REPLY_TOOL: &str = "no_reply";
+
 /// Context provided by the runtime to tools during execution.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -266,6 +269,8 @@ pub struct ToolContext {
     pub tools: ScopedTools,
     /// Controls how tool definitions are presented to the LLM
     pub profile: ToolProfile,
+    /// A caller-controlled, default-off terminal action for this one turn.
+    pub allow_no_reply: bool,
     /// Handle to the current session (for tools that need to write entries, e.g. compact)
     pub session: std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
     /// Per-session active-extension set, used by `HookContext` to filter
@@ -309,6 +314,20 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Include the opt-in terminal action in both the prompt budget and model call.
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let mut defs = self.tools.definitions(&self.profile);
+        if self.allow_no_reply {
+            defs.push(ToolDefinition {
+                name: NO_REPLY_TOOL.into(),
+                description: "End this turn without sending a chat message. Use this only if you have nothing useful to say; any normal final text is sent verbatim to the chat.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                strict: false,
+            });
+        }
+        defs
+    }
+
     /// Read the resolved capability grants for the currently-executing tool.
     pub fn grants(&self) -> &Grants {
         &self.grants

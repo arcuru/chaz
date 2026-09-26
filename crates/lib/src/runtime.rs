@@ -16,7 +16,7 @@ use crate::bridge::ApprovalDecision;
 use crate::error::LlmError;
 use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::security::SecurityContext;
-use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
+use crate::tool::{NO_REPLY_TOOL, RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -89,6 +89,12 @@ pub enum ToolResultOutcome {
 /// machinery; primarily tests). Top-level Agent calls populate the
 /// budget so this value is unused under normal operation.
 const MAX_TOOL_ITERATIONS: usize = 10;
+
+fn no_reply_arguments_empty(arguments: &str) -> bool {
+    arguments.trim().is_empty()
+        || serde_json::from_str::<serde_json::Value>(arguments)
+            .is_ok_and(|value| value.as_object().is_some_and(|object| object.is_empty()))
+}
 
 /// Atomically consume one unit from a shared iteration budget.
 /// Returns `true` if a unit was claimed; `false` when the budget is
@@ -491,6 +497,14 @@ pub async fn execute_with_recorder(
     hub: Option<&ExtensionHub>,
 ) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
+    if tool_ctx.allow_no_reply {
+        if tools.get(NO_REPLY_TOOL).is_some() {
+            return Err("no_reply is reserved for the runtime terminal action".into());
+        }
+        if !backend.supports_tools_for_model(model) {
+            return Err("no_reply requires a tool-capable model".into());
+        }
+    }
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
@@ -506,7 +520,7 @@ pub async fn execute_with_recorder(
     });
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
-    if tools.is_empty() || !backend.supports_tools_for_model(model) {
+    if (tools.is_empty() && !tool_ctx.allow_no_reply) || !backend.supports_tools_for_model(model) {
         return match llm_call_with_retry(
             backend,
             model,
@@ -550,7 +564,7 @@ pub async fn execute_with_recorder(
         };
     }
 
-    let tool_defs = tools.definitions(&tool_ctx.profile);
+    let tool_defs = tool_ctx.definitions();
     let mut messages = initial_messages;
 
     // Hook: before_agent_start — append extension-injected messages.
@@ -595,6 +609,9 @@ pub async fn execute_with_recorder(
         {
             Ok(resp) => resp,
             Err(ref e) if e.is_retryable() && iteration == 0 => {
+                if tool_ctx.allow_no_reply {
+                    return Err(format!("no_reply tool-aware call failed: {e}"));
+                }
                 // All retries exhausted on first call with tools — try without tools
                 // in case this model/provider doesn't support function calling.
                 info!(
@@ -655,6 +672,11 @@ pub async fn execute_with_recorder(
         };
 
         match response {
+            LLMResponse::Text { ref content, .. }
+                if tool_ctx.allow_no_reply && content.trim().is_empty() =>
+            {
+                return Err("opted-in turn returned empty text without calling no_reply".into());
+            }
             LLMResponse::Text { content, metadata } if !content.is_empty() => {
                 record_runtime(
                     &recorder,
@@ -748,6 +770,45 @@ pub async fn execute_with_recorder(
                 provider_extra,
                 metadata,
             } => {
+                if tool_ctx.allow_no_reply
+                    && tool_calls.iter().any(|call| call.name == NO_REPLY_TOOL)
+                {
+                    if tool_calls.len() != 1
+                        || content
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                        || !no_reply_arguments_empty(&tool_calls[0].arguments)
+                    {
+                        return Err(
+                            "no_reply must be the sole tool call with no arguments or reply text"
+                                .into(),
+                        );
+                    }
+                    record_runtime(
+                        &recorder,
+                        RuntimeRecord::ModelResponse {
+                            model_sequence,
+                            content,
+                            tool_calls,
+                            provider_extra,
+                            metadata: metadata.clone(),
+                            terminal: true,
+                        },
+                    )
+                    .await?;
+                    if let Some(m) = metadata {
+                        acc.record(m);
+                    }
+                    return Ok(finalize_outcome(
+                        hub,
+                        hook_ctx.as_ref(),
+                        RuntimeOutcome {
+                            body: String::new(),
+                            metadata: acc.finalize(),
+                        },
+                    )
+                    .await);
+                }
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -1035,6 +1096,10 @@ pub async fn execute_with_recorder(
         iteration += 1;
     }
 
+    // Do not fall back to unstructured output when the caller requires a terminal action.
+    if tool_ctx.allow_no_reply {
+        return Err("no_reply turn exhausted its tool-iteration budget".into());
+    }
     // Hit the cap or loop detected — make one final call without tools to force a text summary
     info!("Forcing final response (max iterations or loop detected)");
     // Only add summary prompt if the last message isn't already a loop-break prompt
@@ -1102,6 +1167,9 @@ impl RuntimeRecorder for EventRecorder {
             match message {
                 RuntimeRecord::ModelResponse { tool_calls, .. } => {
                     for call in tool_calls {
+                        if call.name == NO_REPLY_TOOL {
+                            continue;
+                        }
                         self.0
                             .send(RuntimeEvent::ToolCall {
                                 id: call.id,
@@ -1554,6 +1622,7 @@ mod tests {
             max_call_depth: 5,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
             profile: ToolProfile::default(),
+            allow_no_reply: false,
             session,
             grants: Default::default(),
             session_capabilities: Default::default(),

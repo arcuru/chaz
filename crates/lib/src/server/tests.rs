@@ -2,6 +2,74 @@
 
 use super::*;
 
+#[tokio::test]
+async fn terminal_no_reply_completes_durably_without_a_deliverable_message() {
+    use crate::test_support::{
+        MockBackend, empty_secrets, fresh_session, permissive_security, tool_context,
+    };
+
+    let (_instance, session) = fresh_session().await;
+    let attempt = session
+        .lock()
+        .await
+        .start_turn_attempt(TurnRequestId::parse("silent-request"))
+        .await
+        .unwrap();
+    let mut ctx = tool_context(session.clone(), Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
+    let backend = BackendManager::with_mock(mock, empty_secrets().await);
+    let recorder = Arc::new(SessionRuntimeRecorder {
+        session: session.clone(),
+        request_id: attempt.request_id.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        sequence: AtomicU32::new(0),
+        terminal: std::sync::Mutex::new(None),
+        agent_name: "alpha".into(),
+        fail_after: Arc::new(std::sync::Mutex::new(None)),
+    });
+
+    let outcome = runtime::execute_with_recorder(
+        Some("mock-model"),
+        vec![runtime::RuntimeMessage::User("already handled".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        Some(recorder.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.body.is_empty());
+    let terminal = recorder.terminal.lock().unwrap().take().unwrap();
+    session
+        .lock()
+        .await
+        .complete_turn_attempt_with_transcript(&attempt, None, Some(terminal))
+        .await
+        .unwrap();
+
+    let db = session.lock().await.database().clone();
+    drop(ctx);
+    drop(session);
+    let reopened = Session::new(ConversationId(db.root_id().to_string()), db).await;
+    assert!(
+        reopened.entries().is_empty(),
+        "no Message or TUI tool row to deliver"
+    );
+    assert_eq!(
+        reopened.attempts_for_test().await[0].status,
+        crate::session::TurnAttemptStatus::Completed
+    );
+    let records = reopened.turn_transcript(&attempt.attempt_id).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(&records[0].message,
+        TurnTranscriptMessage::ModelResponse { terminal: true, tool_calls, .. }
+        if tool_calls.len() == 1 && tool_calls[0].name == "no_reply"));
+}
+
 #[test]
 fn budget_clamps_to_model_window() {
     // Known window drives the budget — no static default caps it. A small

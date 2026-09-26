@@ -16,7 +16,7 @@ use crate::config::ContextConfig;
 use crate::extension::ExtensionHub;
 use crate::runtime::RuntimeMessage;
 use crate::session::{EntryType, SessionEntry, TurnTranscriptMessage, TurnTranscriptRecord};
-use crate::tool::ToolDefinition;
+use crate::tool::{NO_REPLY_TOOL, ToolDefinition};
 use eidetica::Database;
 use std::sync::Arc;
 
@@ -414,7 +414,10 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
         model_sequence = Some(*seq);
         i += 1;
         if *end {
-            if !tool_calls.is_empty() || i != sorted.len() {
+            // A terminal no_reply call has no tool result and is not replayed,
+            // but completed tool exchanges before it still belong in context.
+            let silent = tool_calls.len() == 1 && tool_calls[0].name == NO_REPLY_TOOL;
+            if (!tool_calls.is_empty() && !silent) || i != sorted.len() {
                 return None;
             }
             terminal = true;
@@ -603,6 +606,41 @@ mod tests {
             .expect("preview available");
         assert!(tool.contains("[prior tool output truncated for context]"));
         assert!(tool.contains("&lt;malicious&gt;"));
+    }
+
+    #[test]
+    fn terminal_no_reply_preserves_earlier_completed_tool_exchange() {
+        let mut history = records("search result");
+        if let TurnTranscriptMessage::ModelResponse {
+            tool_calls,
+            content,
+            ..
+        } = &mut history[2].message
+        {
+            *content = None;
+            tool_calls.push(crate::runtime::ToolCallRequest {
+                id: "silent".into(),
+                name: NO_REPLY_TOOL.into(),
+                arguments: "{}".into(),
+            });
+        }
+        let replayed = replay_turn(&history, 1000).expect("prior exchange remains usable");
+        assert_eq!(replayed.len(), 2);
+        assert!(
+            matches!(&replayed[0], RuntimeMessage::AssistantToolCalls { tool_calls, .. }
+            if tool_calls.len() == 1 && tool_calls[0].name == "search")
+        );
+        assert!(
+            matches!(&replayed[1], RuntimeMessage::ToolResult { content, .. }
+            if content.contains("search result"))
+        );
+        if let TurnTranscriptMessage::ModelResponse { tool_calls, .. } = &mut history[2].message {
+            tool_calls[0].name = "ordinary_tool".into();
+        }
+        assert!(
+            replay_turn(&history, 1000).is_none(),
+            "other terminal calls are incomplete"
+        );
     }
 
     #[test]

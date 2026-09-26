@@ -2900,6 +2900,7 @@ impl Server {
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
+                allow_no_reply: false,
                 session: session.clone(),
                 grants: Default::default(),
                 session_capabilities,
@@ -2911,7 +2912,7 @@ impl Server {
                 routine_engine: routine_engine.clone(),
             };
 
-            let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+            let tool_defs = tool_ctx.definitions();
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
