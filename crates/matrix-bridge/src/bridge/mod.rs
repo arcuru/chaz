@@ -466,6 +466,36 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomKind {
+    Direct,
+    Group,
+    Unknown,
+}
+
+fn classify_room(is_direct: Option<bool>, members: Result<usize, ()>) -> RoomKind {
+    match (is_direct, members) {
+        (Some(true), _) | (Some(false), Ok(0..=2)) => RoomKind::Direct,
+        (Some(false), Ok(_)) => RoomKind::Group,
+        _ => RoomKind::Unknown,
+    }
+}
+
+async fn room_kind(room: &Room) -> RoomKind {
+    // The sync summary count can be absent even in a populated room. The SDK
+    // fetches members only while its local member list is unsynced.
+    let direct = room.is_direct().await.ok();
+    if direct != Some(false) {
+        return classify_room(direct, Err(()));
+    }
+    let members = room
+        .members(matrix_sdk::RoomMemberships::JOIN)
+        .await
+        .map(|members| members.len())
+        .map_err(|_| ());
+    classify_room(direct, members)
+}
+
 fn participation_sender_allowed(allow_list: Option<&str>, sender: &str, bot_uid: &str) -> bool {
     allow_list.is_some_and(|list| !list.trim().is_empty())
         && is_allowed(allow_list, sender, bot_uid)
@@ -489,7 +519,7 @@ async fn handle_participation(
     ) {
         return Ok("!chaz Error: participation requires an explicit allowlisted sender".into());
     }
-    if room.is_direct().await.unwrap_or(true) || room.joined_members_count() < 3 {
+    if room_kind(room).await != RoomKind::Group {
         return Ok("!chaz Error: participation is only available in group rooms".into());
     }
     let Some(agent) = owning_agent_entry(server, owning_agent) else {
@@ -1103,8 +1133,8 @@ impl Bridge for MatrixBridge {
                         }
 
                         // Plain message: only engage when addressed.
-                        let is_direct = room.is_direct().await.unwrap_or(false)
-                            || room.joined_members_count() < 3;
+                        let kind = room_kind(&room).await;
+                        let is_direct = kind == RoomKind::Direct;
                         let mentions_bot = event
                             .content
                             .mentions
@@ -1116,7 +1146,7 @@ impl Bridge for MatrixBridge {
                                     .any(|mention| mention == room.client().user_id().unwrap())
                             })
                             .unwrap_or(false);
-                        let participating = if !is_direct {
+                        let participating = if kind == RoomKind::Group {
                             if let Some(agent) = owning_agent_entry(&server, &owning_agent) {
                                 match server.registry().find_channel_session(
                                     &agent, &login_id, "matrix", &login_id, &room_id,
@@ -1650,6 +1680,19 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn group_eligibility_uses_joined_members_not_sync_summary() {
+        let group = super::classify_room;
+        use super::RoomKind;
+        // /sync can omit summary even though /joined_members reports three.
+        assert_eq!(group(Some(false), Ok(3)), RoomKind::Group);
+        assert_eq!(group(Some(false), Ok(2)), RoomKind::Direct);
+        assert_eq!(group(Some(false), Ok(1)), RoomKind::Direct);
+        assert_eq!(group(Some(true), Ok(3)), RoomKind::Direct);
+        assert_eq!(group(None, Ok(3)), RoomKind::Unknown);
+        assert_eq!(group(Some(false), Err(())), RoomKind::Unknown);
+    }
+
     #[test]
     fn participation_requires_explicit_matching_allowlist() {
         let allowed = super::participation_sender_allowed;
