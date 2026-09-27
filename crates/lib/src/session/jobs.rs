@@ -518,7 +518,7 @@ impl SessionRegistry {
         anyhow::ensure!(
             row.source
                 .as_deref()
-                .is_some_and(|s| s.starts_with("job-stage:")),
+                .is_some_and(|s| s.starts_with("job-stage:") || s.starts_with("workflow-stage:")),
             "session is not a locally staged job"
         );
         let root = eidetica::entry::ID::parse(session_db_id)?;

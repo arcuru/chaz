@@ -32,6 +32,7 @@ mod keys;
 mod registry;
 mod transport;
 pub mod usage;
+pub mod workflow_jobs;
 
 pub use keys::BootstrapOutcome;
 #[cfg(test)]
@@ -166,7 +167,7 @@ pub struct TurnRequest {
 }
 
 /// The two frontend commands that require executor authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum SessionCommand {
     /// Summarize the context visible at this immutable database snapshot.
@@ -183,10 +184,14 @@ pub enum SessionCommand {
         agent_ref: String,
         task: String,
     },
+    /// Inline normalized graph; only the executor may admit the parent.
+    SubmitWorkflow {
+        flow: crate::extensions::orchestrator::spec::FlowSpec,
+    },
 }
 
 /// A typed command request written by any session client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCommandRequest {
     pub command_id: TurnRequestId,
     pub sender: String,
@@ -199,6 +204,7 @@ pub struct SessionCommandRequest {
 pub enum SessionCommandOutcome {
     // A committed child session DB handle, not its eventual agent reply.
     AgentJobAccepted { session_db_id: String },
+    WorkflowParentAccepted { session_db_id: String },
     Compact { summary: String },
     RetryAccepted { target_attempt_id: String },
     Rejected { message: String },
@@ -942,8 +948,10 @@ impl Session {
         match store.get(request.command_id.as_str()).await {
             Ok(existing) if existing == request => return Ok(()),
             Ok(existing)
-                if matches!(existing.command, SessionCommand::SubmitAgent { .. })
-                    && existing.command == request.command =>
+                if matches!(
+                    existing.command,
+                    SessionCommand::SubmitAgent { .. } | SessionCommand::SubmitWorkflow { .. }
+                ) && existing.command == request.command =>
             {
                 return Ok(());
             }
