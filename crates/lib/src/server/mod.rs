@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 mod approval_proxy;
 mod build;
+mod jobs;
 mod runtime_lease;
 mod schedule;
 
@@ -287,6 +288,7 @@ struct SessionRuntime {
 
 /// Context for spawned agent tasks (call depth, tool scope, completion signal).
 struct SpawnContext {
+    job_authority: Option<crate::session::jobs::AcceptedAgentJob>,
     call_depth: usize,
     max_call_depth: usize,
     parent_tools: Option<ScopedTools>,
@@ -537,6 +539,8 @@ pub struct Server {
     /// behind by a previous process. It is process-local coordination, not
     /// distributed fencing.
     live_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
+    // coding: global local-executor admission lock; shard by parent if throughput needs it.
+    job_submission_lock: Mutex<()>,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -680,6 +684,7 @@ impl Server {
             #[cfg(test)]
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            job_submission_lock: Mutex::new(()),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -1981,6 +1986,9 @@ impl Server {
             SessionCommandOutcome::Compact { .. } => {
                 anyhow::bail!("retry command returned a compact result")
             }
+            SessionCommandOutcome::AgentJobAccepted { .. } => {
+                anyhow::bail!("retry command returned a job receipt")
+            }
         }
     }
 
@@ -2244,15 +2252,20 @@ impl Server {
         };
         let mut seen = std::collections::HashSet::new();
         self.adopt_indexed_local_client_sessions(&mut seen).await;
+        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(60));
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if self.shutting_down.load(Ordering::Acquire) {
                 break;
             }
-            let event = tokio::select! {
-                event = rx.recv() => event,
-                _ = self.shutdown_notify.notified() => None,
+            let should_rescan = tokio::select! {
+                event = rx.recv() => event.is_some(),
+                _ = reconcile.tick() => true,
+                _ = self.shutdown_notify.notified() => false,
             };
-            let Some(_event) = event else { break };
+            if !should_rescan {
+                break;
+            }
             while rx.try_recv().is_ok() {}
             self.adopt_indexed_local_client_sessions(&mut seen).await;
         }
@@ -2294,14 +2307,41 @@ impl Server {
     /// Return true when the row is settled for this process. A transient open
     /// or registration failure stays unseen so the next index write retries it.
     async fn adopt_local_client_session(&self, session: crate::session::SessionIndex) -> bool {
+        if session
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("job-stage:"))
+        {
+            if session.status == crate::session::SessionStatus::Closed {
+                return true;
+            }
+            let opened = match self.registry.open_session(&session.session_db_id).await {
+                Ok(db) => Ok(db),
+                Err(_) => self.registry.open_job_session(&session.session_db_id).await,
+            };
+            return match opened {
+                Ok((_, db)) => match self.register_accepted_job(&db).await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        warn!(session_db_id = %session.session_db_id, %error, "Job adoption refused");
+                        false
+                    }
+                },
+                Err(error) => {
+                    debug!(session_db_id = %session.session_db_id, %error, "Job DB unavailable for adoption");
+                    false
+                }
+            };
+        }
         if self
             .registry
             .created_session_locally(&session.session_db_id)
             .await
             || session.status == crate::session::SessionStatus::Closed
-            || session.source.as_deref().is_some_and(|source| {
-                source.starts_with("spawn:") || source.starts_with("job-stage:")
-            })
+            || session
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("spawn:"))
         {
             return true;
         }
@@ -2368,6 +2408,15 @@ impl Server {
             anyhow::bail!("client server cannot execute agent or tool turns");
         }
         let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
+        let job_authority = if crate::session::jobs::is_staged_job(&session_db).await {
+            Some(
+                self.validate_accepted_job(&session_db)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("staged job has no executor acceptance"))?,
+            )
+        } else {
+            None
+        };
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
@@ -2438,6 +2487,11 @@ impl Server {
         let Some((request, existing_attempt_id)) = queued.or(agent_mention) else {
             return Ok(None);
         };
+        if let Some(job) = &job_authority
+            && request.id.as_str() != job.directive_id
+        {
+            anyhow::bail!("job session contains an unauthorized turn request");
+        }
         let latest = request.entry.clone();
 
         let sender_is_agent = self.agents.get(&latest.sender).is_some();
@@ -2514,6 +2568,7 @@ impl Server {
                     m.agent_override.clone(),
                     m.approval_tx.clone(),
                     SpawnContext {
+                        job_authority: job_authority.clone(),
                         call_depth: m.call_depth,
                         max_call_depth: m.max_call_depth,
                         parent_tools: m.parent_tools.clone(),
@@ -2613,6 +2668,11 @@ impl Server {
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
+        let _job_admission = if matches!(request.command, SessionCommand::SubmitAgent { .. }) {
+            Some(self.job_submission_lock.lock().await)
+        } else {
+            None
+        };
         let attempt = match existing_attempt_id {
             Some(attempt_id) => session
                 .read_turn_attempt(&attempt_id)
@@ -2634,6 +2694,15 @@ impl Server {
             SessionCommand::Compact { source_snapshot } => {
                 self.execute_compact_command(session_db_id, &session, &source_snapshot)
                     .await
+            }
+            SessionCommand::SubmitAgent { agent_ref, task } => {
+                self.execute_submit_agent_command(
+                    session_db_id,
+                    &request.command_id,
+                    &agent_ref,
+                    &task,
+                )
+                .await
             }
             SessionCommand::Retry {
                 target_request_id,
@@ -2795,7 +2864,13 @@ impl Server {
         let allowed_tools = agent.allowed_tools.clone();
         let session_capabilities = session.read_meta().await.capabilities;
         let agent_capabilities = agent.capabilities.clone();
-        let agent_grants = agent.grants.clone();
+        let mut agent_grants = agent.grants.clone();
+        if let Some(job) = &spawn.job_authority {
+            for (name, parent_ceiling) in &job.definition.tool_ceilings {
+                let effective = parent_ceiling.attenuate(agent_grants.get(name));
+                agent_grants.insert(name.clone(), effective);
+            }
+        }
         let max_call_depth = if spawn.max_call_depth > 0 {
             spawn.max_call_depth
         } else {
@@ -2898,6 +2973,8 @@ impl Server {
 
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
+                turn_request_id: Some(attempt.request_id.clone()),
+                tool_call_key: None,
                 call_depth: spawn.call_depth,
                 max_call_depth,
                 tools: scoped_tools,

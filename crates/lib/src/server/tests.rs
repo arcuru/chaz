@@ -5198,7 +5198,7 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
         crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
     );
     let agent_index = HostedIndex::empty("agent");
-    agent_index.register(agent);
+    agent_index.register(agent.clone());
     let executor = Server::new(
         registry,
         agents,
@@ -5249,13 +5249,401 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
     );
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
-        mock.simple_call_count(),
+        mock.recorded_calls().len(),
         0,
         "staged child must remain inert"
     );
     assert!(!executor.is_watching_session(&staged.session_db_id).await);
     assert!(executor.runtime_owner_of(&staged.session_db_id).is_none());
+    let narrow_executor = executor.clone();
+    let narrow_parent = parent.clone();
+    let narrow_parent_id = parent_id.clone();
+    tokio::spawn(async move {
+        let parent_session = Session::new(
+            ConversationId(narrow_parent_id.clone()), narrow_parent,
+        ).await;
+        parent_session.update_meta(|meta| {
+            meta.capabilities.shell = Some(crate::grants::ShellGrant {
+                allow: crate::grants::Allowlist::Only(vec![]),
+                ..Default::default()
+            });
+        }).await.unwrap();
+        let command_id = crate::session::TurnRequestId::parse("narrow-job-rejected");
+        parent_session.submit_command(crate::session::SessionCommandRequest {
+            command_id: command_id.clone(), sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitAgent {
+                agent_ref: "default".into(), task: "not in broad mode".into(),
+            },
+        }).await.unwrap();
+        let observer = narrow_executor.observe_session_command(&narrow_parent_id).await.unwrap();
+        let rejected = tokio::time::timeout(
+            std::time::Duration::from_secs(10), observer.wait(&command_id)
+        ).await.unwrap().unwrap();
+        assert!(matches!(rejected.outcome,
+            crate::session::SessionCommandOutcome::Rejected { ref message } if message.contains("narrow")));
+        assert!(narrow_executor.registry().lookup_job_by_key(&narrow_parent_id, command_id.as_str())
+            .await.unwrap().is_none());
+        parent_session.update_meta(|meta| meta.capabilities = Default::default())
+            .await.unwrap();
+    }).await.unwrap();
+    let gate = mock.block_next_call();
+    // A typed request in the writable parent is different: the executor
+    // validates it and alone admits its child. It returns a DB handle before
+    // the eventual agent response and never runs the earlier forged child.
+    let command_id = crate::session::TurnRequestId::parse("trusted-job-request");
+    Session::new(ConversationId(parent_id.clone()), parent.clone())
+        .await
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: command_id.clone(),
+            sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitAgent {
+                agent_ref: "default".into(),
+                task: "trusted child work".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let observer = executor.observe_session_command(&parent_id).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observer.wait(&command_id),
+    )
+    .await
+    .expect("executor must settle the accepted request")
+    .unwrap();
+    let accepted_id = match result.outcome {
+        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
+        other => panic!("expected job handle, got {other:?}"),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !executor.is_watching_session(&accepted_id).await || mock.recorded_calls().is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("executor must adopt and execute accepted child");
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "forged child must remain inert"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+        .await
+        .expect("accepted job must begin its model call");
+    assert!(
+        !executor
+            .job_status(&accepted_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal(),
+        "the handle must be returned before the child finishes"
+    );
+    gate.release();
+    let finished = executor
+        .wait_job(&accepted_id, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        finished.state,
+        crate::session::jobs::JobState::Succeeded {
+            text: Some("incorrect execution".into())
+        }
+    );
+    let (_, client_child) = client_registry
+        .open_job_session(&accepted_id)
+        .await
+        .unwrap();
+    let client_view =
+        crate::session::jobs::status_from_db(&client_child, &Default::default(), false)
+            .await
+            .unwrap();
+    assert_eq!(client_view, finished);
+    // The same service remains alive while its executor generation dies.
+    // A started model call may already have acted, so restart must not replay.
+    mock.push_text("aborted response");
+    let interrupted_gate = mock.block_next_call();
+    let interrupted_command = crate::session::TurnRequestId::parse("interrupted-job-request");
+    Session::new(ConversationId(parent_id.clone()), parent.clone())
+        .await
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: interrupted_command.clone(),
+            sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitAgent {
+                agent_ref: "default".into(),
+                task: "possibly acted before restart".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let observer = executor.observe_session_command(&parent_id).await.unwrap();
+    let interrupted_id = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observer.wait(&interrupted_command),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .outcome
+    {
+        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
+        other => panic!("expected durable child handle, got {other:?}"),
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        interrupted_gate.wait_started(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.recorded_calls().len(), 2);
+    let (_, interrupted_db) = executor
+        .registry()
+        .open_session(&interrupted_id)
+        .await
+        .unwrap();
+    let request_id = crate::session::TurnRequestId::parse(
+        crate::session::jobs::read_accepted_job(&interrupted_db)
+            .await
+            .unwrap()
+            .unwrap()
+            .directive_id,
+    );
+    executor.shutdown().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        interrupted_gate.wait_stopped(),
+    )
+    .await
+    .unwrap();
     drop(executor);
+
+    let restarted_connection =
+        crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+            .await
+            .unwrap();
+    let restarted_agents = Arc::new(AgentRegistry::with_default_agent());
+    let restarted_registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            restarted_connection.instance,
+            restarted_connection.user,
+            restarted_agents.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let restarted_backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(restarted_registry.chaz_peer().clone()).await,
+    );
+    let restarted_index = HostedIndex::empty("agent");
+    restarted_index.register(agent.clone());
+    let restarted = Server::new(
+        restarted_registry,
+        restarted_agents,
+        restarted_index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        restarted_backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !restarted.is_watching_session(&interrupted_id).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("restart must adopt accepted job");
+    let interrupted = restarted.interrupted_turns(&interrupted_id).await.unwrap();
+    assert_eq!(interrupted.len(), 1);
+    assert_eq!(interrupted[0].request_id, request_id);
+    assert!(matches!(
+        restarted.job_status(&interrupted_id).await.unwrap().state,
+        crate::session::jobs::JobState::Interrupted { .. }
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        mock.recorded_calls().len(),
+        2,
+        "ambiguous effect must not replay"
+    );
+    mock.push_text("retry completed");
+    restarted
+        .retry_interrupted_turn(&interrupted_id, &request_id)
+        .await
+        .unwrap();
+    let retry_status = restarted
+        .wait_job(&interrupted_id, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_status.state,
+        crate::session::jobs::JobState::Succeeded {
+            text: Some("retry completed".into())
+        }
+    );
+    assert_eq!(mock.recorded_calls().len(), 3);
+    // Hold watcher installation at the exact accepted-but-not-started edge.
+    // The parent command may settle while the child remains queued; a new
+    // executor must discover it from the catalog without any fresh write.
+    let hold_watcher = restarted.watched.lock().await;
+    mock.push_text("queued resumed");
+    let queued_command = crate::session::TurnRequestId::parse("queued-job-request");
+    Session::new(ConversationId(parent_id.clone()), parent.clone())
+        .await
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: queued_command.clone(),
+            sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitAgent {
+                agent_ref: "default".into(),
+                task: "queued before executor exit".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let observer = restarted.observe_session_command(&parent_id).await.unwrap();
+    let queued_id = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observer.wait(&queued_command),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .outcome
+    {
+        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
+        other => panic!("expected queued child handle, got {other:?}"),
+    };
+    assert_eq!(
+        restarted.job_status(&queued_id).await.unwrap().state,
+        crate::session::jobs::JobState::Queued
+    );
+    assert_eq!(mock.recorded_calls().len(), 3);
+    restarted.shutdown().await;
+    drop(hold_watcher);
+    drop(restarted);
+
+    let next = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+        .await
+        .unwrap();
+    let next_agents = Arc::new(AgentRegistry::with_default_agent());
+    let next_registry = Arc::new(
+        crate::session::SessionRegistry::new(next.instance, next.user, next_agents.clone())
+            .await
+            .unwrap(),
+    );
+    let next_backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(next_registry.chaz_peer().clone()).await,
+    );
+    let next_index = HostedIndex::empty("agent");
+    next_index.register(agent.clone());
+    let next_executor = Server::new(
+        next_registry,
+        next_agents,
+        next_index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        next_backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    let resumed = next_executor
+        .wait_job(&queued_id, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.state,
+        crate::session::jobs::JobState::Succeeded {
+            text: Some("queued resumed".into())
+        }
+    );
+    assert_eq!(mock.recorded_calls().len(), 4, "queued job must run once");
+    let inline_executor = next_executor.clone();
+    let inline_parent = parent.clone();
+    let inline_parent_id = parent_id.clone();
+    let inline_mock = mock.clone();
+    tokio::spawn(async move {
+        use crate::tool::Tool as _;
+        let mut parent_session =
+            Session::new(ConversationId(inline_parent_id), inline_parent).await;
+        let turn_id = parent_session
+            .add_entry(SessionEntry {
+                sender: "client".into(),
+                content: "delegation turn".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Summary,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        let session = Arc::new(tokio::sync::Mutex::new(parent_session));
+        let mut ctx = crate::test_support::tool_context(session, Arc::new(ToolRegistry::new()));
+        ctx.agent_name = "default".into();
+        ctx.turn_request_id = Some(turn_id);
+        ctx.tool_call_key = Some("0:0:model-call-id".into());
+        let slot = crate::instance::ServerSlot::default();
+        slot.set(inline_executor.clone());
+        let tool = crate::tools::SpawnAgent { server: slot };
+        inline_mock.push_text("inline finished");
+        let input = serde_json::json!({ "agent_ref": "default", "task": "from model tool" });
+        let first = tool.execute(input.clone(), &ctx).await.unwrap();
+        let second = tool.execute(input, &ctx).await.unwrap();
+        assert_eq!(
+            first, second,
+            "same parent turn and call site must return one job"
+        );
+        let handle = serde_json::from_str::<serde_json::Value>(&first).unwrap()["session_db_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let status = inline_executor
+            .wait_job(&handle, std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            status.state,
+            crate::session::jobs::JobState::Succeeded {
+                text: Some("inline finished".into())
+            }
+        );
+        assert_eq!(inline_mock.recorded_calls().len(), 5);
+    })
+    .await
+    .unwrap();
+    next_executor.shutdown().await;
     drop(shutdown);
     task.await.unwrap().unwrap();
 }

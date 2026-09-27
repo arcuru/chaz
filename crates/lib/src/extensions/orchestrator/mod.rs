@@ -233,21 +233,15 @@ impl Tool for WorkflowTool {
 /// tool can reach `spawn_agent` once the server cell is filled in.
 pub struct OrchestratorExtension {
     spawn_server_cell: ServerSlot,
-    backend: BackendManager,
-    security: SecurityContext,
 }
 
 impl OrchestratorExtension {
     pub fn new(
         spawn_server_cell: ServerSlot,
-        backend: BackendManager,
-        security: SecurityContext,
+        _backend: BackendManager,
+        _security: SecurityContext,
     ) -> Self {
-        Self {
-            spawn_server_cell,
-            backend,
-            security,
-        }
+        Self { spawn_server_cell }
     }
 }
 
@@ -275,8 +269,6 @@ impl Extension for OrchestratorExtension {
         let manifest = self.manifest();
         let spawn = SpawnAgent {
             server: self.spawn_server_cell.clone(),
-            backend: self.backend.clone(),
-            security: self.security.clone(),
         };
         Box::pin(async move {
             let delegate: Arc<dyn Delegate> = Arc::new(SpawnDelegate { spawn });

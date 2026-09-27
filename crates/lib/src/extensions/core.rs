@@ -17,7 +17,7 @@ use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::mcp::McpServerStatus;
 use crate::security::SecurityContext;
-use crate::tools::{Compact, ShellExec, SpawnAgent, SpawnWorker};
+use crate::tools::{Compact, JobStatusTool, JobWaitTool, ShellExec, SpawnAgent, SpawnWorker};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -95,8 +95,12 @@ impl ExtensionInstance for CoreInstance {
             Arc::new(Compact),
             Arc::new(SpawnAgent {
                 server: self.server_slot.clone(),
-                backend: self.backend.clone(),
-                security: self.security.clone(),
+            }),
+            Arc::new(JobStatusTool {
+                server: self.server_slot.clone(),
+            }),
+            Arc::new(JobWaitTool {
+                server: self.server_slot.clone(),
             }),
             Arc::new(SpawnWorker {
                 server: self.server_slot.clone(),

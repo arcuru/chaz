@@ -167,13 +167,21 @@ pub struct TurnRequest {
 
 /// The two frontend commands that require executor authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SessionCommand {
     /// Summarize the context visible at this immutable database snapshot.
-    Compact { source_snapshot: Snapshot },
+    Compact {
+        source_snapshot: Snapshot,
+    },
     /// Retry one specifically observed interrupted turn attempt.
     Retry {
         target_request_id: TurnRequestId,
         expected_interrupted_attempt_id: String,
+    },
+    // Requests a child under the existing session; only an executor may accept it.
+    SubmitAgent {
+        agent_ref: String,
+        task: String,
     },
 }
 
@@ -189,6 +197,8 @@ pub struct SessionCommandRequest {
 /// Terminal executor-owned command outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionCommandOutcome {
+    // A committed child session DB handle, not its eventual agent reply.
+    AgentJobAccepted { session_db_id: String },
     Compact { summary: String },
     RetryAccepted { target_attempt_id: String },
     Rejected { message: String },
@@ -931,6 +941,12 @@ impl Session {
             .await?;
         match store.get(request.command_id.as_str()).await {
             Ok(existing) if existing == request => return Ok(()),
+            Ok(existing)
+                if matches!(existing.command, SessionCommand::SubmitAgent { .. })
+                    && existing.command == request.command =>
+            {
+                return Ok(());
+            }
             Ok(_) => anyhow::bail!(
                 "command {} already exists with a different payload",
                 request.command_id
@@ -1240,6 +1256,32 @@ impl Session {
                 .await?
                 .set(key, record)
                 .await?;
+        }
+        if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
+            && accepted.directive_id == attempt.request_id.as_str()
+        {
+            let terminal = match final_entry.as_ref() {
+                Some(entry) if entry.entry_type == EntryType::Message => {
+                    crate::session::jobs::JobTerminal::Success {
+                        text: Some(entry.content.clone()),
+                    }
+                }
+                Some(entry) if entry.entry_type == EntryType::Error => {
+                    crate::session::jobs::JobTerminal::Failure {
+                        message: entry.content.clone(),
+                    }
+                }
+                None => crate::session::jobs::JobTerminal::Success { text: None },
+                Some(_) => anyhow::bail!("job completion has an invalid terminal entry"),
+            };
+            crate::session::jobs::write_job_result_in_txn(
+                &txn,
+                &crate::session::jobs::JobResult {
+                    attempt_id: attempt.attempt_id.clone(),
+                    terminal,
+                },
+            )
+            .await?;
         }
         txn.commit().await?;
         if let Some(entry) = final_entry {

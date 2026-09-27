@@ -58,7 +58,7 @@ pub struct SessionRegistry {
     /// Sessions created by a local service client may predate the daemon's
     /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
     /// later opens use the same signing identity.
-    local_client_sessions: Mutex<std::collections::HashMap<String, Database>>,
+    pub(super) local_client_sessions: Mutex<std::collections::HashMap<String, Database>>,
     /// Sessions created through this registry already have an explicit owner
     /// path (frontend watch, schedule, child registration, or test setup).
     /// The generic resident watcher only adopts sessions created through a

@@ -812,6 +812,8 @@ mod tests {
     fn make_ctx(agent_name: &str, session: Arc<TokioMutex<Session>>) -> ToolContext {
         ToolContext {
             agent_name: agent_name.to_string(),
+            turn_request_id: None,
+            tool_call_key: None,
             call_depth: 0,
             max_call_depth: 10,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
