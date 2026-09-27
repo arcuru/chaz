@@ -288,6 +288,7 @@ struct SessionRuntime {
 
 /// Context for spawned agent tasks (call depth, tool scope, completion signal).
 struct SpawnContext {
+    job_incarnation: Option<String>,
     job_authority: Option<crate::session::jobs::AcceptedAgentJob>,
     call_depth: usize,
     max_call_depth: usize,
@@ -541,6 +542,8 @@ pub struct Server {
     live_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
     // coding: global local-executor admission lock; shard by parent if throughput needs it.
     job_submission_lock: Mutex<()>,
+    /// Unique to this Server generation, even under the same service login.
+    job_incarnation: String,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -685,6 +688,7 @@ impl Server {
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_submission_lock: Mutex::new(()),
+            job_incarnation: uuid::Uuid::new_v4().to_string(),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -2418,6 +2422,13 @@ impl Server {
             None
         };
 
+        if job_authority.is_some()
+            && crate::session::jobs::read_job_result(&session_db)
+                .await?
+                .is_some()
+        {
+            return Ok(None);
+        }
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
 
         let live_attempts = self.live_attempts.lock().await.clone();
@@ -2491,6 +2502,12 @@ impl Server {
             && request.id.as_str() != job.directive_id
         {
             anyhow::bail!("job session contains an unauthorized turn request");
+        }
+        if let Some(job) = &job_authority
+            && !self.claim_accepted_job(&session_db, job).await?
+        {
+            self.processing.lock().await.remove(session_db_id);
+            return Ok(None);
         }
         let latest = request.entry.clone();
 
@@ -2568,6 +2585,9 @@ impl Server {
                     m.agent_override.clone(),
                     m.approval_tx.clone(),
                     SpawnContext {
+                        job_incarnation: job_authority
+                            .as_ref()
+                            .map(|_| self.job_incarnation.clone()),
                         job_authority: job_authority.clone(),
                         call_depth: m.call_depth,
                         max_call_depth: m.max_call_depth,
@@ -2624,6 +2644,15 @@ impl Server {
             return Ok(None);
         }
         self.reset_home_skip(session_db_id, &agent.name).await;
+
+        if job_authority.is_some()
+            && crate::session::jobs::read_job_result(&session_db)
+                .await?
+                .is_some()
+        {
+            self.processing.lock().await.remove(session_db_id);
+            return Ok(None);
+        }
 
         // This is the last check before model or tool side effects. A request
         // stays queued through startup, runtime, and home-peer checks. Only
@@ -2908,6 +2937,9 @@ impl Server {
         let transcript_fail_after = self.transcript_fail_after.clone();
 
         self.track_task(tokio::spawn(async move {
+            let claim_db = session.database().clone();
+            let incarnation = spawn.job_incarnation.clone();
+            let work = async {
             // The persisted start is the per-turn claim. Refresh its bounded
             // visibility even while waiting for a semaphore or tool approval.
             let heartbeat_db = session.database().clone();
@@ -3120,6 +3152,15 @@ impl Server {
                     })
                 }
             };
+            if let Some(ref token) = incarnation {
+                match crate::session::jobs::owns_job(&claim_db, token).await {
+                    Ok(true) => {},
+                    other => {
+                        warn!(?other, session_db_id, "Job lost claim before settlement");
+                        return;
+                    }
+                }
+            }
             if persistence_failed {
                 error!(
                     "Runtime transcript persistence stopped turn {} for {session_db_id}",
@@ -3135,6 +3176,23 @@ impl Server {
                 }
             }
             drop(s);
+            };
+            if let Some(ref token) = incarnation {
+                tokio::select! {
+                    biased;
+                    loss = crate::session::jobs::wait_for_claim_loss(&claim_db, token) => {
+                        match loss {
+                            Ok(winner) => {
+                                if let Err(error) = crate::session::jobs::record_job_stop(&claim_db, &attempt.attempt_id, token, &winner).await {
+                                    error!(%error, session_db_id, "Failed to persist job claim-loss marker");
+                                }
+                            },
+                            Err(error) => error!(%error, session_db_id, "Job claim watch failed; stopping attempt"),
+                        }
+                    },
+                    () = work => {},
+                }
+            } else { work.await; }
 
             live_attempts.lock().await.remove(&attempt.attempt_id);
 
