@@ -50,6 +50,8 @@ blake3 = "1"
 sha2 = "0.10"
 base64 = "0.22"
 unicode-normalization = "0.1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 futures = "0.3"
 
 # Dev-deps shared.
