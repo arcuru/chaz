@@ -7,12 +7,11 @@
 //! pi-orchestrator's `workflow` so supported inline flow definitions are portable between
 //! the two (see [`spec`]).
 //!
-//! Phase 1 (this module) leans entirely on `spawn_agent` for the actual
-//! delegation — [`SpawnDelegate`] wraps a [`SpawnAgent`] and the
-//! [`executor`] walks the flow tree, calling it per `spawn` node. No new
-//! spawn machinery; fork is N `spawn_agent` futures awaited together under
-//! a `tokio::sync::Semaphore`.
+//! Durable `spawn_agent` returns a session DB handle, not a child reply.
+//! Until the parent coordinator exists, the tool refuses execution rather
+//! than returning handles as if fork/join nodes had completed.
 
+#[cfg(test)]
 mod executor;
 mod spec;
 
@@ -25,36 +24,13 @@ use crate::security::SecurityContext;
 use crate::tool::{
     ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
 };
-use crate::tools::SpawnAgent;
-use executor::{Delegate, execute_flow};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Production [`Delegate`]: forwards each spawn to `spawn_agent`, which
-/// resolves the target agent on this Peer, opens a child session, and
-/// (synchronously) waits for the reply.
-struct SpawnDelegate {
-    spawn: SpawnAgent,
-}
-
-impl Delegate for SpawnDelegate {
-    fn spawn<'a>(
-        &'a self,
-        agent: &'a str,
-        task: &'a str,
-        ctx: &'a ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
-        let args = serde_json::json!({ "agent_ref": agent, "task": task });
-        self.spawn.execute(args, ctx)
-    }
-}
-
 /// The `workflow` tool.
-pub struct WorkflowTool {
-    delegate: Arc<dyn Delegate>,
-}
+pub struct WorkflowTool;
 
 impl WorkflowTool {
     /// Build the canonical flow value from the tool's top-level params,
@@ -147,7 +123,7 @@ impl Tool for WorkflowTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "workflow".to_string(),
-            description: "Delegate work to other agents on this Peer, composed as a graph. Modes: \
+            description: "Unavailable until a durable workflow parent coordinator is installed. Modes: \
                 single ({agent, task}); parallel ({tasks: [{agent, task}, ...], concurrency: N}); \
                 or an inline flow graph ({flow: {kind: \"sequence\"|\"fork\"|\"join\", ...}}). A \
                 sequence threads each step's output into the next via the {previous} placeholder; \
@@ -212,36 +188,31 @@ impl Tool for WorkflowTool {
     fn execute<'a>(
         &'a self,
         arguments: Value,
-        ctx: &'a ToolContext,
+        _ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let raw_flow = Self::resolve_flow(&arguments).map_err(ToolError::InvalidArgument)?;
-            let flow = spec::parse_flow(&raw_flow).map_err(ToolError::InvalidArgument)?;
-            let output = execute_flow(&flow, self.delegate.as_ref(), ctx).await?;
-            // Text outputs flow straight back; structured outputs are
-            // returned as pretty JSON so the caller sees branch/errors maps.
-            Ok(match output {
-                Value::String(s) => s,
-                other => serde_json::to_string_pretty(&other).unwrap_or_else(|_| other.to_string()),
-            })
+            let _flow = spec::parse_flow(&raw_flow).map_err(ToolError::InvalidArgument)?;
+            // A durable spawn returns a handle, not a reply. Never feed that
+            // handle into the old synchronous graph or submit partial fan-out.
+            Err(ToolError::Execution(
+                "workflow is unavailable until durable parent coordination is installed".into(),
+            ))
         })
     }
 }
 
-/// The orchestrator extension. Constructed with the same late-bound spawn
-/// deps as [`crate::extensions::core::CoreExtension`] so its `workflow`
-/// tool can reach `spawn_agent` once the server cell is filled in.
-pub struct OrchestratorExtension {
-    spawn_server_cell: ServerSlot,
-}
+/// The orchestrator extension. The constructor retains the existing wiring
+/// while the durable parent replaces synchronous delegation.
+pub struct OrchestratorExtension;
 
 impl OrchestratorExtension {
     pub fn new(
-        spawn_server_cell: ServerSlot,
+        _spawn_server_cell: ServerSlot,
         _backend: BackendManager,
         _security: SecurityContext,
     ) -> Self {
-        Self { spawn_server_cell }
+        Self
     }
 }
 
@@ -267,19 +238,14 @@ impl Extension for OrchestratorExtension {
 
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
-        let spawn = SpawnAgent {
-            server: self.spawn_server_cell.clone(),
-        };
         Box::pin(async move {
-            let delegate: Arc<dyn Delegate> = Arc::new(SpawnDelegate { spawn });
-            Ok(Arc::new(OrchestratorInstance { manifest, delegate }) as Arc<dyn ExtensionInstance>)
+            Ok(Arc::new(OrchestratorInstance { manifest }) as Arc<dyn ExtensionInstance>)
         })
     }
 }
 
 struct OrchestratorInstance {
     manifest: ExtensionManifest,
-    delegate: Arc<dyn Delegate>,
 }
 
 impl ExtensionInstance for OrchestratorInstance {
@@ -288,9 +254,7 @@ impl ExtensionInstance for OrchestratorInstance {
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        vec![Arc::new(WorkflowTool {
-            delegate: self.delegate.clone(),
-        })]
+        vec![Arc::new(WorkflowTool)]
     }
 }
 
@@ -336,23 +300,9 @@ mod tests {
         assert!(WorkflowTool::resolve_flow(&args).is_err());
     }
 
-    struct NoopDelegate;
-    impl Delegate for NoopDelegate {
-        fn spawn<'a>(
-            &'a self,
-            _agent: &'a str,
-            _task: &'a str,
-            _ctx: &'a ToolContext,
-        ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
-            Box::pin(async { Ok(String::new()) })
-        }
-    }
-
     #[test]
     fn descriptor_is_named_workflow_with_object_params() {
-        let tool = WorkflowTool {
-            delegate: Arc::new(NoopDelegate),
-        };
+        let tool = WorkflowTool;
         let d = tool.descriptor();
         assert_eq!(d.name, "workflow");
         assert_eq!(d.parameters["type"], "object");
@@ -360,27 +310,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_late_step_never_spawns() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct CountingDelegate(AtomicUsize);
-        impl Delegate for CountingDelegate {
-            fn spawn<'a>(
-                &'a self,
-                _agent: &'a str,
-                _task: &'a str,
-                _ctx: &'a ToolContext,
-            ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async { Ok("spent".into()) })
-            }
-        }
+    async fn valid_flow_cannot_run_the_legacy_synchronous_executor() {
         let (_instance, session) = crate::test_support::fresh_session().await;
         let ctx =
             crate::test_support::tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
-        let delegate = Arc::new(CountingDelegate(AtomicUsize::new(0)));
-        let tool = WorkflowTool {
-            delegate: delegate.clone(),
-        };
+        let tool = WorkflowTool;
+        let error = tool
+            .execute(
+                serde_json::json!({ "flow": {
+                    "kind": "sequence", "steps": [
+                        {"kind":"fork", "id":"f", "branches": {
+                            "a":{"agent":"a", "task":"one"},
+                            "b":{"agent":"b", "task":"two"}
+                        }},
+                        {"kind":"join", "from":"f", "mode":"all"}
+                    ]
+                }}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("durable parent"));
+    }
+
+    #[tokio::test]
+    async fn malformed_late_step_never_spawns() {
+        let (_instance, session) = crate::test_support::fresh_session().await;
+        let ctx =
+            crate::test_support::tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        let tool = WorkflowTool;
         for bad in [
             serde_json::json!({"flow":{"kind":"sequence","steps":[{"agent":"a","task":"first"},{"kind":"loop","id":"l","body":{"agent":"a","task":"later"},"maxIterations":2}]}}),
             serde_json::json!({"flow":{"kind":"sequence","steps":[{"agent":"a","task":"first"},{"kind":"join","from":"missing","mode":"all"}]}}),
@@ -388,11 +346,6 @@ mod tests {
             serde_json::json!({"flow":{"kind":"sequence","steps":[{"agent":"a","task":"first"},{"agent":"b","task":"later","cwd":"/tmp"}]}}),
         ] {
             assert!(tool.execute(bad, &ctx).await.is_err());
-            assert_eq!(
-                delegate.0.load(Ordering::SeqCst),
-                0,
-                "invalid flow spawned a child"
-            );
         }
     }
 }

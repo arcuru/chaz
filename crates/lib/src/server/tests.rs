@@ -5842,3 +5842,219 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
     drop(shutdown);
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn accepted_agent_job_can_submit_one_attenuated_child_while_running() {
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("nested-job-test"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(instance, user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let index = HostedIndex::empty("agent");
+    index.register(agent.clone());
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("parent result");
+    mock.push_text("nested result");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(crate::tools::Calculate);
+    let server = Server::new(
+        registry.clone(),
+        agents,
+        index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        tools,
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend.clone(),
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    let (_, parent_db) = registry.create_session(Some("local-client")).await.unwrap();
+    let parent_id = parent_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&parent_id, &agent)
+        .await
+        .unwrap();
+    server
+        .register_session(&parent_db, backend, None, None)
+        .await
+        .unwrap();
+    let parent_command = crate::session::TurnRequestId::parse("root-parent");
+    let root = Session::new(ConversationId(parent_id.clone()), parent_db).await;
+    root.submit_command(crate::session::SessionCommandRequest {
+        command_id: parent_command.clone(),
+        sender: "client".into(),
+        created_at: Utc::now(),
+        command: crate::session::SessionCommand::SubmitAgent {
+            agent_ref: "default".into(),
+            task: "first job".into(),
+        },
+    })
+    .await
+    .unwrap();
+    let observed = server.observe_session_command(&parent_id).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observed.wait(&parent_command),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let parent_job = match result.outcome {
+        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
+        other => panic!("expected accepted parent, got {other:?}"),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_started())
+        .await
+        .unwrap();
+    let nested_key = crate::session::TurnRequestId::parse("job:nested-call");
+    let nested = server
+        .submit_agent_job_inline(
+            &parent_job,
+            nested_key.clone(),
+            "default",
+            Utc::now(),
+            "default",
+            "nested work",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .lookup_job(&parent_job, nested_key.as_str())
+            .await
+            .unwrap(),
+        Some(nested.clone())
+    );
+    assert_eq!(
+        server
+            .submit_agent_job_inline(
+                &parent_job,
+                nested_key,
+                "default",
+                Utc::now(),
+                "default",
+                "nested work"
+            )
+            .await
+            .unwrap(),
+        nested
+    );
+    let (_, db) = registry.open_session(&nested).await.unwrap();
+    let definition = crate::session::jobs::read_accepted_job(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .definition;
+    assert_eq!(definition.call_depth, 2);
+    assert_eq!(definition.allowed_tools, vec!["calculate"]);
+    assert_eq!(definition.tool_ceilings.len(), 1);
+    assert!(server.validate_accepted_job(&db).await.unwrap().is_some());
+    let (_, parent_job_db) = registry.open_session(&parent_job).await.unwrap();
+    let parent_session =
+        Session::new(ConversationId(parent_job.clone()), parent_job_db.clone()).await;
+    parent_session
+        .update_meta(|meta| {
+            meta.capabilities.shell = Some(crate::grants::ShellGrant {
+                allow: crate::grants::Allowlist::Only(vec![]),
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap();
+    let error = server
+        .submit_agent_job_inline(
+            &parent_job,
+            crate::session::TurnRequestId::parse("job:narrow"),
+            "default",
+            Utc::now(),
+            "default",
+            "should not run",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("ceiling") || error.to_string().contains("scope"),
+        "{error}"
+    );
+    assert!(
+        server.validate_accepted_job(&db).await.is_err(),
+        "changed parent scope must invalidate child"
+    );
+    parent_session
+        .update_meta(|meta| meta.capabilities = Default::default())
+        .await
+        .unwrap();
+    gate.release();
+    assert!(
+        server
+            .wait_job(&parent_job, std::time::Duration::from_secs(10))
+            .await
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+    assert!(
+        server
+            .wait_job(&nested, std::time::Duration::from_secs(10))
+            .await
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+    let after = Box::pin(server.submit_agent_job_inline(
+        &parent_job,
+        crate::session::TurnRequestId::parse("job:after-terminal"),
+        "default",
+        Utc::now(),
+        "default",
+        "not allowed after completion",
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        after.to_string().contains("active claimed attempt"),
+        "{after}"
+    );
+    assert_eq!(mock.recorded_calls().len(), 2);
+    server.shutdown().await;
+}
