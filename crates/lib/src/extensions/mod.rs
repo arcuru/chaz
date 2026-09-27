@@ -11,6 +11,7 @@ pub mod core;
 pub mod fs;
 pub mod mcp;
 pub mod memory;
+pub mod orchestrator;
 pub mod path_normalizer;
 pub mod schedule;
 pub mod security_warnings;
@@ -52,6 +53,11 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
     let session_registry = deps.session_registry;
     vec![
         Arc::new(core::CoreExtension::new(
+            server_slot.clone(),
+            deps.backend_manager.clone(),
+            deps.security.clone(),
+        )),
+        Arc::new(orchestrator::OrchestratorExtension::new(
             server_slot.clone(),
             deps.backend_manager,
             deps.security,
