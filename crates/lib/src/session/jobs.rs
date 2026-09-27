@@ -258,6 +258,324 @@ impl SessionRegistry {
     }
 }
 
+/// The executor's accepted command binds a staged definition to exactly one
+/// runnable Directive. A parent command receipt may lag this child commit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AcceptedAgentJob {
+    pub parent_id: String,
+    pub request_key_hash: String,
+    pub definition: StagedAgentDefinition,
+    pub directive_id: String,
+}
+
+const ACCEPTANCE: &str = "job_acceptance";
+
+pub(crate) async fn read_accepted_job(
+    db: &eidetica::Database,
+) -> anyhow::Result<Option<AcceptedAgentJob>> {
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(ACCEPTANCE).await?;
+    let doc = store.get_all().await?;
+    match doc.get("v1") {
+        Some(value) => {
+            let json: String = value.try_into()?;
+            Ok(Some(serde_json::from_str(&json)?))
+        }
+        None => Ok(None),
+    }
+}
+
+pub(crate) async fn acceptance_matches_staging(
+    db: &eidetica::Database,
+    accepted: &AcceptedAgentJob,
+) -> anyhow::Result<bool> {
+    Ok(read_child(db).await?
+        == Some(ChildDefinition {
+            parent_id: accepted.parent_id.clone(),
+            request_hash: accepted.request_key_hash.clone(),
+            definition: accepted.definition.clone(),
+        }))
+}
+
+impl SessionRegistry {
+    /// Caller must be the executor after validating the parent command, target,
+    /// inherited authority, and child metadata. No direct client uses this API.
+    /// Recovery reuses the same accepted handle or holds a conflicting record.
+    pub(crate) async fn accept_staged_agent_job(
+        &self,
+        staged: &StagedJob,
+        parent_id: &str,
+        request_key: &str,
+        definition: &StagedAgentDefinition,
+        sender: &str,
+    ) -> anyhow::Result<AcceptedAgentJob> {
+        let (id, child) = self.open_session(&staged.session_db_id).await?;
+        let expected = ChildDefinition {
+            parent_id: parent_id.to_string(),
+            request_hash: request_hash(request_key),
+            definition: definition.clone(),
+        };
+        anyhow::ensure!(
+            read_child(&child).await? == Some(expected),
+            "uncertain job acceptance: staged child definition differs"
+        );
+        if let Some(existing) = read_accepted_job(&child).await? {
+            anyhow::ensure!(
+                existing.parent_id == parent_id
+                    && existing.request_key_hash == request_hash(request_key)
+                    && existing.definition == *definition,
+                "uncertain job acceptance: accepted record differs"
+            );
+            return Ok(existing);
+        }
+        let txn = child.new_transaction().await?;
+        let entries = txn
+            .get_store::<eidetica::store::Table<super::SessionEntry>>("entries")
+            .await?;
+        anyhow::ensure!(
+            entries.search(|_| true).await?.is_empty(),
+            "uncertain job acceptance: child contains entries before admission"
+        );
+        let directive_id = entries
+            .insert(super::SessionEntry {
+                sender: sender.to_string(),
+                content: definition.task.clone(),
+                timestamp: chrono::Utc::now(),
+                entry_type: super::EntryType::Directive,
+                metadata: None,
+                routing: None,
+            })
+            .await?;
+        let accepted = AcceptedAgentJob {
+            parent_id: parent_id.to_string(),
+            request_key_hash: request_hash(request_key),
+            definition: definition.clone(),
+            directive_id,
+        };
+        txn.get_store::<DocStore>(ACCEPTANCE)
+            .await?
+            .set_string("v1", serde_json::to_string(&accepted)?)
+            .await?;
+        txn.commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("uncertain job acceptance for session {}: {e}", id.0))?;
+        // The initial catalog notification may predate this commit. Trigger a
+        // new scan; startup performs the same scan without relying on events.
+        if self
+            .new_session_tx
+            .send(super::registry::NewSessionEvent {
+                session_db_id: id.0.clone(),
+                source: None,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(session_db_id = %id.0, "Accepted job will be picked up on executor restart");
+        }
+        Ok(accepted)
+    }
+}
+
+/// A typed result, committed with the matching turn completion rather than
+/// inferred from whichever chat entry happens to be last.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobTerminal {
+    Success { text: Option<String> },
+    Failure { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobResult {
+    pub attempt_id: String,
+    pub terminal: JobTerminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum JobState {
+    Queued,
+    Running {
+        attempt_id: String,
+    },
+    StartedUnknown {
+        attempt_id: String,
+        activity_recent: bool,
+    },
+    Interrupted {
+        attempt_id: String,
+    },
+    Succeeded {
+        text: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl JobState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded { .. } | Self::Failed { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct JobStatus {
+    pub session_db_id: String,
+    pub state: JobState,
+}
+
+const JOB_RESULT: &str = "job_result";
+
+pub(crate) async fn read_job_result(db: &eidetica::Database) -> anyhow::Result<Option<JobResult>> {
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(JOB_RESULT).await?;
+    let doc = store.get_all().await?;
+    match doc.get("v1") {
+        Some(value) => {
+            let json: String = value.try_into()?;
+            Ok(Some(serde_json::from_str(&json)?))
+        }
+        None => Ok(None),
+    }
+}
+
+pub(crate) async fn write_job_result_in_txn(
+    txn: &eidetica::transaction::Transaction,
+    result: &JobResult,
+) -> anyhow::Result<()> {
+    txn.get_store::<DocStore>(JOB_RESULT)
+        .await?
+        .set_string("v1", serde_json::to_string(result)?)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn status_from_db(
+    db: &eidetica::Database,
+    live_attempts: &std::collections::HashSet<String>,
+    executor_observer: bool,
+) -> anyhow::Result<JobStatus> {
+    let accepted = read_accepted_job(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session has no accepted agent job"))?;
+    let session_db_id = db.root_id().to_string();
+    let session =
+        super::Session::new(super::ConversationId(session_db_id.clone()), db.clone()).await;
+    let request_id = super::TurnRequestId::parse(accepted.directive_id);
+    let request = session
+        .turn_request(&request_id, |_| false, live_attempts)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("accepted job Directive is missing"))?;
+    let state = match request.state {
+        super::TurnRequestState::Queued => JobState::Queued,
+        super::TurnRequestState::InFlight { attempt_id } => JobState::Running { attempt_id },
+        super::TurnRequestState::Interrupted { attempt_id } => {
+            if executor_observer {
+                JobState::Interrupted { attempt_id }
+            } else {
+                let activity_recent = super::Session::active_turn_attempts(db)
+                    .await?
+                    .contains(&attempt_id);
+                JobState::StartedUnknown {
+                    attempt_id,
+                    activity_recent,
+                }
+            }
+        }
+        super::TurnRequestState::Completed { attempt_id } => {
+            let receipt = read_job_result(db)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("completed job lacks terminal receipt"))?;
+            anyhow::ensure!(
+                receipt.attempt_id == attempt_id,
+                "job receipt attempt differs"
+            );
+            match receipt.terminal {
+                JobTerminal::Success { text } => JobState::Succeeded { text },
+                JobTerminal::Failure { message } => JobState::Failed { message },
+            }
+        }
+    };
+    Ok(JobStatus {
+        session_db_id,
+        state,
+    })
+}
+impl SessionRegistry {
+    /// Open a locally indexed job created by another same-login service
+    /// process after this client's User key-map snapshot was loaded.
+    /// Mapping a key is only a lookup hint; the service still verifies the
+    /// key against the child DB's auth settings on every operation.
+    pub async fn open_job_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(super::ConversationId, eidetica::Database)> {
+        let row = self
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|row| row.session_db_id == session_db_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown job session"))?;
+        anyhow::ensure!(
+            row.source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("job-stage:")),
+            "session is not a locally staged job"
+        );
+        let root = eidetica::entry::ID::parse(session_db_id)?;
+        let mut user = self.user.lock().await;
+        let key = user.get_default_key()?;
+        user.map_key(&key, &root, eidetica::auth::SigKey::from_pubkey(&key))
+            .await?;
+        let db = user.open_database_with_key(&root, &key).await?;
+        self.local_client_sessions
+            .lock()
+            .await
+            .insert(session_db_id.to_string(), db.clone());
+        Ok((super::ConversationId(session_db_id.to_string()), db))
+    }
+}
+
+impl SessionRegistry {
+    /// Resolve a lost acknowledgement from the peer-local catalog and the
+    /// accepted child record. An incomplete stage remains uncertain, not a
+    /// free key on which to create a duplicate child.
+    pub async fn lookup_job_by_key(
+        &self,
+        parent_id: &str,
+        request_key: &str,
+    ) -> anyhow::Result<Option<StagedJob>> {
+        anyhow::ensure!(!request_key.is_empty(), "job request key must not be empty");
+        let label = source(parent_id, request_key);
+        let rows = self.list_sessions().await?;
+        let matches = matching_rows(&rows, &label);
+        anyhow::ensure!(
+            matches.len() <= 1,
+            "uncertain job request: multiple catalog children"
+        );
+        let Some(row) = matches.first() else {
+            let (_, parent) = self.open_session(parent_id).await?;
+            anyhow::ensure!(
+                read_intent(&parent, request_key).await?.is_none(),
+                "uncertain job request: parent intent has no discoverable child"
+            );
+            return Ok(None);
+        };
+        let (_, db) = self.open_job_session(&row.session_db_id).await?;
+        let accepted = read_accepted_job(&db)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("uncertain job request: child is not accepted"))?;
+        anyhow::ensure!(
+            accepted.parent_id == parent_id
+                && accepted.request_key_hash == request_hash(request_key)
+                && acceptance_matches_staging(&db, &accepted).await?,
+            "uncertain job request: child acceptance differs from parent key"
+        );
+        Ok(Some(StagedJob {
+            session_db_id: row.session_db_id.clone(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +847,118 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot.get("calculate"), Some(&bound));
         assert!(!snapshot.contains_key("get_time"));
+    }
+    #[tokio::test]
+    async fn acceptance_commits_one_directive_and_reuses_the_handle() {
+        let (_, registry) = make_registry().await;
+        let (_, parent) = registry.create_session(Some("cli")).await.unwrap();
+        let pid = parent.root_id().to_string();
+        let staged = registry
+            .stage_agent_job(&pid, "stable-command", definition())
+            .await
+            .unwrap();
+        let accepted = registry
+            .accept_staged_agent_job(&staged, &pid, "stable-command", &definition(), "caller")
+            .await
+            .unwrap();
+        let again = registry
+            .accept_staged_agent_job(&staged, &pid, "stable-command", &definition(), "caller")
+            .await
+            .unwrap();
+        assert_eq!(accepted, again);
+        assert_eq!(
+            registry
+                .lookup_job_by_key(&pid, "stable-command")
+                .await
+                .unwrap(),
+            Some(staged.clone())
+        );
+        let (id, db) = registry.open_session(&staged.session_db_id).await.unwrap();
+        assert_eq!(
+            read_accepted_job(&db).await.unwrap(),
+            Some(accepted.clone())
+        );
+        let session = Session::new(id, db).await;
+        assert_eq!(session.entries().len(), 1);
+        let requests = session
+            .turn_requests(|_| false, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id.as_str(), accepted.directive_id);
+        assert_eq!(requests[0].state, super::super::TurnRequestState::Queued);
+    }
+
+    #[tokio::test]
+    async fn forged_child_entry_blocks_later_acceptance() {
+        let (_, registry) = make_registry().await;
+        let (_, parent) = registry.create_session(Some("cli")).await.unwrap();
+        let pid = parent.root_id().to_string();
+        let staged = registry
+            .stage_agent_job(&pid, "spoofed", definition())
+            .await
+            .unwrap();
+        let (id, child) = registry.open_session(&staged.session_db_id).await.unwrap();
+        let mut session = Session::new(id, child.clone()).await;
+        session
+            .add_entry(super::super::SessionEntry {
+                sender: "client".into(),
+                content: "untrusted".into(),
+                timestamp: chrono::Utc::now(),
+                entry_type: super::super::EntryType::Directive,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .accept_staged_agent_job(&staged, &pid, "spoofed", &definition(), "caller")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("entries before admission")
+        );
+        assert!(read_accepted_job(&child).await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn parent_submit_command_retries_by_key_without_requiring_original_timestamp() {
+        let (_, registry) = make_registry().await;
+        let (id, db) = registry.create_session(Some("cli")).await.unwrap();
+        let session = Session::new(id, db).await;
+        let request_id = super::super::TurnRequestId::parse("stable-job-key");
+        let original = super::super::SessionCommandRequest {
+            command_id: request_id.clone(),
+            sender: "client".into(),
+            created_at: chrono::Utc::now(),
+            command: super::super::SessionCommand::SubmitAgent {
+                agent_ref: "researcher".into(),
+                task: "check it".into(),
+            },
+        };
+        session.submit_command(original.clone()).await.unwrap();
+        let mut retry = original.clone();
+        retry.created_at += chrono::Duration::seconds(3);
+        session.submit_command(retry.clone()).await.unwrap();
+        assert_eq!(
+            session
+                .command_requests(&Default::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        retry.command = super::super::SessionCommand::SubmitAgent {
+            agent_ref: "researcher".into(),
+            task: "different task".into(),
+        };
+        assert!(
+            session
+                .submit_command(retry)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("different payload")
+        );
     }
 }

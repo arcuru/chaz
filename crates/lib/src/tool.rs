@@ -258,6 +258,10 @@ fn strip_param_descriptions(params: &Value) -> Value {
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
+    // Persisted parent request identity; absent on non-turn callers.
+    pub turn_request_id: Option<crate::session::TurnRequestId>,
+    // Stable model-response call site, set by the runtime before dispatch.
+    pub tool_call_key: Option<String>,
     /// Current spawn depth (0 = root agent from bridge)
     pub call_depth: usize,
     /// Maximum allowed spawn depth

@@ -916,6 +916,8 @@ pub async fn execute_with_recorder(
                             let call_grants =
                                 tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             let mut call_ctx = tool_ctx.clone();
+                            call_ctx.tool_call_key =
+                                Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.grants = call_grants;
                             let exec_result =
                                 execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
@@ -1550,6 +1552,8 @@ mod tests {
         ));
         ToolContext {
             agent_name: "t".into(),
+            turn_request_id: None,
+            tool_call_key: None,
             call_depth: 0,
             max_call_depth: 5,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
