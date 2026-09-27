@@ -1,8 +1,7 @@
 //! Flow-spec types, normalization, and validation for the orchestrator.
 //!
-//! The shapes here mirror pi-orchestrator's `FlowSpec` (see
-//! `~/.dotfiles/home/agents/pi/extensions/pi-orchestrator/src/runtime/types.ts`)
-//! for supported inline graph forms only; this tool does not support loops or cwd. The
+//! The shapes here mirror pi-orchestrator's `FlowSpec` for supported inline
+//! graph forms only; this tool does not support loops or cwd. The
 //! canonical (normalized) form is what serde serializes; the
 //! [`normalize_value`] pass accepts pi's compact authoring sugar (bare
 //! strings, omitted `kind`, fork `taskTemplate` / `{branch}`) and lowers
