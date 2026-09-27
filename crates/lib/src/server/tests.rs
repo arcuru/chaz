@@ -82,6 +82,111 @@ async fn terminal_no_reply_completes_durably_without_a_deliverable_message() {
         if provider_extra.is_empty() && tool_calls.len() == 1 && tool_calls[0].name == "no_reply"));
 }
 
+#[tokio::test]
+async fn agent_mention_may_end_silently_without_waking_on_unmentioned_messages() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (alpha, _alpha_db) = seed_agent(&server, &registry, "alpha").await;
+    let (beta, _beta_db) = seed_agent(&server, &registry, "beta").await;
+    register_alpha_agent_runtime(&server);
+    let mut beta_runtime = server.agents().get("alpha").unwrap();
+    beta_runtime.name = "beta".into();
+    server.agents().upsert(beta_runtime);
+
+    let (_conv, db) = registry.create_session(Some("room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &alpha)
+        .await
+        .unwrap();
+    registry.attach_agent_to_session(&sid, &beta).await.unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("quiet".into(), "no_reply".into(), "{}".into())]);
+    mock.push_text("human reply");
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, None, None)
+        .await
+        .unwrap();
+
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    session
+        .add_entry(SessionEntry {
+            sender: "alpha".into(),
+            content: "@beta, anything to add?".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    assert!(
+        mock.recorded_calls()[0]
+            .tools
+            .iter()
+            .any(|t| t.name == "no_reply")
+    );
+    assert!(mock.recorded_calls()[0].messages.iter().any(|m| matches!(m,
+        crate::runtime::RuntimeMessage::System(text) if text.contains("does not obligate you"))));
+    let after_silence = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert_eq!(
+        after_silence
+            .entries()
+            .iter()
+            .filter(|e| e.entry_type == EntryType::Message)
+            .count(),
+        1,
+        "silent turn must write no deliverable Message"
+    );
+    assert_eq!(
+        after_silence.attempts_for_test().await[0].status,
+        crate::session::TurnAttemptStatus::Completed
+    );
+
+    session
+        .add_entry(SessionEntry {
+            sender: "alpha".into(),
+            content: "Just a note for the room.".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    assert!(server.process_session(&sid).await.unwrap().is_none());
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "unmentioned agent message must not wake"
+    );
+
+    write_user_message_with_content(&db, &sid, "please answer").await;
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    assert!(
+        !mock.recorded_calls()[1]
+            .tools
+            .iter()
+            .any(|t| t.name == "no_reply"),
+        "ordinary human turns remain mandatory outside Matrix participation"
+    );
+    let final_session = Session::new(ConversationId(sid.clone()), db).await;
+    assert!(
+        final_session
+            .entries()
+            .iter()
+            .any(|e| e.content == "human reply")
+    );
+}
+
 #[test]
 fn budget_clamps_to_model_window() {
     // Known window drives the budget — no static default caps it. A small

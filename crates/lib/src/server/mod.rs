@@ -2541,6 +2541,7 @@ impl Server {
         // For the agent→agent case the speaker is already pinned to the
         // mentioned agent (computed in the gate above); only the
         // human/Directive path runs the full resolution precedence.
+        let agent_to_agent_turn = agent_to_agent_target.is_some();
         let agent = match agent_to_agent_target {
             Some(a) => a,
             None => {
@@ -2605,6 +2606,7 @@ impl Server {
             backend,
             attempt,
             latest,
+            agent_to_agent_turn,
             spawn_ctx,
         )
         .await;
@@ -2797,6 +2799,7 @@ impl Server {
         backend: BackendManager,
         attempt: TurnAttempt,
         request_entry: SessionEntry,
+        agent_to_agent_turn: bool,
         spawn: SpawnContext,
     ) {
         let agent_name = agent.name.clone();
@@ -2906,11 +2909,14 @@ impl Server {
                 .clone()
                 .unwrap_or_else(|| Arc::new(AtomicU32::new(agent.max_iterations)));
 
-            let allow_no_reply = {
+            let matrix_participation = {
                 let s = session.lock().await;
                 crate::session::matrix_participation_for_entry(s.database(), &request_entry).await
             };
-            let system_prompt = if allow_no_reply {
+            let allow_no_reply = agent_to_agent_turn || matrix_participation;
+            let system_prompt = if agent_to_agent_turn {
+                format!("{system_prompt}\n\nAnother agent @mentioned you in this shared session. A mention invites your input; it does not obligate you to respond. If you have useful work or a substantive answer, do it and reply. Otherwise call no_reply({{}}) alone to end silently. Do not send acknowledgments, thanks, or a reply merely to keep the conversation going. Do not mix no_reply with another tool call or final text.")
+            } else if matrix_participation {
                 format!("{system_prompt}\n\nYou are participating in a Matrix group room. Every normal final text reply is posted to the room. If no response is useful, call no_reply({{}}) as the sole action to end this turn silently, even when mentioned. Do not call it alongside other tools or final text. Reply only when you have something useful to add.")
             } else { system_prompt };
             let tool_ctx = ToolContext {

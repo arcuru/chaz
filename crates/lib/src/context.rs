@@ -91,9 +91,10 @@ fn room_note(participants: &[String], agent_name: &str) -> Option<String> {
         .join(", ");
     Some(format!(
         "You are in a shared session with other agents: {list}. \
-         To address a participant directly, @mention them by display name. \
-         They will see your message and may reply. Messages with no @mention \
-         are not routed to other agents."
+         Only @mention another agent by display name when you want their \
+         input or action. A mention wakes that agent, but does not require a \
+         reply; they can end the turn silently. Messages with no @mention \
+         do not wake other agents."
     ))
 }
 
