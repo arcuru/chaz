@@ -522,7 +522,17 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
     }
 
     match key.code {
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+        // Hard line break. `Alt+Enter` is the portable binding: without the
+        // keyboard-enhancement protocol a terminal sends bare `\r` for
+        // `Shift+Enter`, so it is indistinguishable from send (same reason
+        // there's no `Ctrl+M` binding). `Alt+Enter` arrives as `ESC \r`, which
+        // does carry a modifier. `Shift+Enter` is still accepted for terminals
+        // that do negotiate the enhanced protocol.
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
             app.input.insert(app.cursor, '\n');
             app.cursor += 1;
             app.completion_dismissed = false;

@@ -1605,6 +1605,144 @@ fn scroll_indicator(scroll: usize, end: usize, total: usize) -> String {
 }
 
 #[cfg(test)]
+mod chat_frame_tests {
+    //! Frame-level checks on the composer: the growth cap, the scroll offset
+    //! that keeps the cursor visible, and the cursor's terminal coordinates.
+    //! `composer::layout` is tested in isolation next door; these cover the
+    //! arithmetic in `ui_chat` that turns that layout into a drawn frame.
+
+    use super::super::{App, Tab};
+    use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::collections::HashSet;
+
+    async fn test_app(input: &str, cursor: usize) -> App {
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("composer-frame"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let tab = Tab {
+            session_db_id: db.root_id().to_string(),
+            session_db: db,
+            entries: Vec::new(),
+            scroll_offset: 0,
+            pending_approval: None,
+            active_turns: 0,
+            current_agent: "chaz".into(),
+            session_name: None,
+            effective_model: String::new(),
+            roster: Vec::new(),
+            context_budget: 0,
+            expanded_entries: HashSet::new(),
+        };
+        let mut app = App::new(HashSet::new(), tab);
+        app.input = input.to_string();
+        app.cursor = cursor;
+        app
+    }
+
+    /// Draw one chat frame and return (rows, cursor position).
+    fn draw(app: &mut App, width: u16, height: u16) -> (Vec<String>, (u16, u16)) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| super::ui_chat(f, app, &[]))
+            .expect("draw");
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, (cursor.x, cursor.y))
+    }
+
+    /// Composer rows for a frame: the bordered box occupies the bottom rows, so
+    /// read them back off the tail of the buffer.
+    fn composer_rows(rows: &[String], box_height: usize) -> Vec<String> {
+        rows[rows.len() - box_height..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn long_draft_wraps_and_grows_instead_of_running_off_the_edge() {
+        // 18 cells of draft in a 12-wide terminal: 10 usable columns inside the
+        // border, so two full rows plus a partial third.
+        let draft = "a".repeat(18);
+        let mut app = test_app(&draft, draft.len()).await;
+        let (rows, cursor) = draw(&mut app, 12, 14);
+        // Two wrapped rows plus the top and bottom border: the box grew from 3.
+        let box_rows = composer_rows(&rows, 4);
+        assert_eq!(box_rows[1], "│aaaaaaaaaa│");
+        assert_eq!(box_rows[2], "│aaaaaaaa  │");
+        // Cursor sits just past the last grapheme on the second wrapped row,
+        // inside the border — not off the right edge.
+        assert_eq!(cursor, (9, 12));
+    }
+
+    #[tokio::test]
+    async fn wide_graphemes_place_the_cursor_by_display_cell() {
+        // Byte-indexed cursor math would put this at x=7 (6 bytes + border);
+        // three double-width cells are 6 display cells, so x=7 by cells too —
+        // use a draft where the two disagree: 3 chars, 6 bytes, 6 cells.
+        let draft = "界界界";
+        let mut app = test_app(draft, draft.len()).await;
+        let (_rows, cursor) = draw(&mut app, 20, 14);
+        assert_eq!(draft.len(), 9, "3-byte chars: byte math would give x=10");
+        assert_eq!(cursor, (7, 12));
+    }
+
+    #[tokio::test]
+    async fn tall_draft_is_capped_and_scrolls_to_keep_the_cursor_visible() {
+        // 40 rows of wrapped draft in a 10-row terminal cannot all be drawn.
+        let draft = "b".repeat(200);
+        let mut app = test_app(&draft, draft.len()).await;
+        let (rows, cursor) = draw(&mut app, 12, 10);
+        // The composer is capped rather than swallowing the frame: the tab bar,
+        // the transcript region and the status line all still get a row, and the
+        // box starts below them.
+        assert!(
+            rows[3].starts_with("╭ > "),
+            "composer top row {:?}",
+            rows[3]
+        );
+        assert!(
+            rows[9].starts_with('╰'),
+            "composer bottom row {:?}",
+            rows[9]
+        );
+        // The draft is 20 wrapped rows; only the tail around the cursor is
+        // drawn, and the cursor lands on the last row inside the box.
+        assert_eq!(cursor, (1, 8));
+        assert_eq!(rows[7], "│bbbbbbbbbb│");
+    }
+
+    #[tokio::test]
+    async fn empty_draft_keeps_the_three_row_box_and_home_cursor() {
+        let mut app = test_app("", 0).await;
+        let (rows, cursor) = draw(&mut app, 20, 14);
+        let box_rows = composer_rows(&rows, 3);
+        assert!(box_rows[0].starts_with('╭'), "top border {:?}", box_rows[0]);
+        assert!(
+            box_rows[2].starts_with('╰'),
+            "bottom border {:?}",
+            box_rows[2]
+        );
+        assert_eq!(cursor, (1, 12));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn thinking_indicator_is_drawn_only_for_a_live_claim() {

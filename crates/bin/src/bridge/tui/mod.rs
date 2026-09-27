@@ -2320,6 +2320,26 @@ mod session_picker_tests {
         input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).await;
         assert_eq!(app.input, "a界\ne\u{301}z");
         assert_eq!(app.cursor, "a界\n".len());
+        // Alt+Enter is the break that legacy terminals can actually deliver —
+        // bare Shift+Enter reaches us as an unmodified Enter (i.e. send).
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)).await;
+        assert_eq!(app.input, "a界\n\ne\u{301}z");
+        assert_eq!(app.cursor, "a界\n\n".len());
+    }
+
+    /// An unmodified Enter still submits rather than inserting a break: the
+    /// draft is taken and the cursor resets.
+    #[tokio::test]
+    async fn chat_composer_plain_enter_still_submits() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        input::handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        )
+        .await;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
     }
 
     fn index(n: usize) -> SessionIndex {
