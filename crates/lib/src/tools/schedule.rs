@@ -818,6 +818,7 @@ mod tests {
             max_call_depth: 10,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
             profile: ToolProfile::default(),
+            allow_no_reply: false,
             session,
             grants: crate::grants::Grants::default(),
             session_capabilities: crate::grants::Grants::default(),

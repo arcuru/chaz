@@ -1305,6 +1305,37 @@ mod tests {
         let json = serde_json::to_value(&wire[0]).unwrap();
         assert_eq!(json["function"]["strict"], serde_json::Value::Bool(true));
     }
+
+    #[test]
+    fn matrix_send_name_is_provider_safe_in_definitions_and_history() {
+        let defs = vec![ToolDefinition {
+            name: "matrix__send".into(),
+            description: "Post to an attached Matrix room".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            strict: false,
+        }];
+        let wire_name = &convert_tool_definitions(&defs)[0].function.name;
+        assert_eq!(wire_name, "matrix__send");
+        assert!(
+            wire_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
+
+        let history = convert_runtime_messages(&[RuntimeMessage::AssistantToolCalls {
+            content: None,
+            tool_calls: vec![ToolCallRequest {
+                id: "call_1".into(),
+                name: "matrix__send".into(),
+                arguments: r#"{"body":"hello"}"#.into(),
+            }],
+            provider_extra: Map::new(),
+        }]);
+        assert_eq!(
+            history[0].tool_calls.as_ref().unwrap()[0].function.name,
+            "matrix__send"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -35,8 +35,7 @@ impl Server {
     /// 3. Acquire the session's `processing` lock; skip if busy.
     /// 4. Load the agent, build context with the wake-prompt as a private
     ///    System message, run the ReAct loop.
-    /// 5. Write ToolCall/ToolResult entries + a terminal Message (only if
-    ///    non-empty; silent turns produce no entry).
+    /// 5. Write ToolCall/ToolResult entries + a terminal Message.
     /// 6. Record a [`crate::agent_db::ScheduleFire`] with usage on the
     ///    agent's DB.
     /// 7. One-shot cleanup: delete the Schedule row from the agent DB.
@@ -664,6 +663,14 @@ impl Server {
         .await;
         let session_capabilities = session.read_meta().await.capabilities;
         let session = Arc::new(tokio::sync::Mutex::new(session));
+        let matrix_binding = {
+            let all = crate::session::transport_bindings(session_db).await?;
+            let matrix: Vec<_> = all
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "matrix")
+                .collect();
+            (matrix.len() == 1).then(|| (matrix[0].1.clone(), matrix[0].2.clone()))
+        };
 
         let tool_ctx = ToolContext {
             agent_name: agent_name.to_string(),
@@ -673,6 +680,7 @@ impl Server {
             max_call_depth,
             tools: scoped_tools,
             profile,
+            allow_no_reply: matrix_binding.is_some(),
             session: session.clone(),
             grants: Default::default(),
             session_capabilities,
@@ -683,7 +691,7 @@ impl Server {
             routine_engine: self.routine_engine().cloned(),
         };
 
-        let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+        let tool_defs = tool_ctx.definitions();
         let (session_model, mut assembled) = {
             let s = session.lock().await;
             let meta = s.read_meta().await;
@@ -707,19 +715,23 @@ impl Server {
                 budget_model.as_deref(),
                 max_context_tokens,
             );
-            let assembled = ContextBuilder::new(
+            let mut builder = ContextBuilder::new(
                 s.entries(),
                 agent_name,
                 &agent.system_prompt,
                 &self.context_config,
-            )
-            .with_tools(&tool_defs)
-            .with_max_tokens_override(max_tokens_override)
-            .with_room_participants(&roster)
-            .with_extension_hub(self.extensions.clone())
-            .with_session_db(session_db)
-            .build()
-            .await;
+            );
+            if let Some((login, room)) = &matrix_binding {
+                builder = builder.with_matrix_binding(login, room);
+            }
+            let assembled = builder
+                .with_tools(&tool_defs)
+                .with_max_tokens_override(max_tokens_override)
+                .with_room_participants(&roster)
+                .with_extension_hub(self.extensions.clone())
+                .with_session_db(session_db)
+                .build()
+                .await;
             (session_model, assembled)
         };
         // Effective model resolution: per-agent override (new) > session pin
@@ -827,16 +839,10 @@ impl Server {
 
         let _ = event_writer.await;
 
-        // Write the terminal Message (conditional — skip empty).
+        // Write the terminal Message unless the Matrix-bound turn ended with no_reply.
         let mut s = session.lock().await;
         match &result {
-            Ok(outcome) if outcome.body.trim().is_empty() => {
-                tracing::debug!(
-                    agent = %agent_name,
-                    schedule = %schedule_id,
-                    "Silent schedule turn — no Message written"
-                );
-            }
+            Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {}
             Ok(outcome) => {
                 if let Err(e) = s
                     .add_entry(SessionEntry {

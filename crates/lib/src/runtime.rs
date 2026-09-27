@@ -16,7 +16,7 @@ use crate::bridge::ApprovalDecision;
 use crate::error::LlmError;
 use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::security::SecurityContext;
-use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
+use crate::tool::{NO_REPLY_TOOL, RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -79,6 +79,12 @@ pub enum ToolResultOutcome {
     Blocked,
     TimedOut,
     Unavailable,
+}
+
+fn no_reply_arguments_empty(arguments: &str) -> bool {
+    arguments.trim().is_empty()
+        || serde_json::from_str::<serde_json::Value>(arguments)
+            .is_ok_and(|value| value.as_object().is_some_and(|object| object.is_empty()))
 }
 
 // === Message types for the ReAct loop ===
@@ -422,6 +428,14 @@ pub async fn execute_with_recorder(
     hub: Option<&ExtensionHub>,
 ) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
+    if tool_ctx.allow_no_reply {
+        if tools.get(NO_REPLY_TOOL).is_some() {
+            return Err("no_reply is reserved for the runtime terminal action".into());
+        }
+        if !backend.supports_tools_for_model(model) {
+            return Err("no_reply requires a tool-capable model".into());
+        }
+    }
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
@@ -437,7 +451,7 @@ pub async fn execute_with_recorder(
     });
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
-    if tools.is_empty() || !backend.supports_tools_for_model(model) {
+    if (tools.is_empty() && !tool_ctx.allow_no_reply) || !backend.supports_tools_for_model(model) {
         return match llm_call_with_retry(
             backend,
             model,
@@ -448,7 +462,7 @@ pub async fn execute_with_recorder(
         )
         .await
         {
-            Ok(LLMResponse::Text { content, metadata }) => {
+            Ok(LLMResponse::Text { content, metadata }) if !content.trim().is_empty() => {
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -474,6 +488,7 @@ pub async fn execute_with_recorder(
                 )
                 .await)
             }
+            Ok(LLMResponse::Text { .. }) => Err("Model returned empty final response".into()),
             Ok(LLMResponse::ToolCalls { .. }) => {
                 Err("Unexpected tool calls in no-tools fallback".to_string())
             }
@@ -481,7 +496,7 @@ pub async fn execute_with_recorder(
         };
     }
 
-    let tool_defs = tools.definitions(&tool_ctx.profile);
+    let tool_defs = tool_ctx.definitions();
     let mut messages = initial_messages;
 
     // Hook: before_agent_start — append extension-injected messages.
@@ -498,6 +513,7 @@ pub async fn execute_with_recorder(
 
     let mut approve_all = false; // tracks if user chose "approve all" this turn
     let mut rate_limiter = RateLimiter::new();
+    let mut matrix_send_queued = false;
 
     let mut iteration: usize = 0;
     loop {
@@ -526,7 +542,12 @@ pub async fn execute_with_recorder(
         };
 
         match response {
-            LLMResponse::Text { content, metadata } if !content.is_empty() => {
+            LLMResponse::Text { ref content, .. }
+                if tool_ctx.allow_no_reply && content.trim().is_empty() =>
+            {
+                return Err("opted-in turn returned empty text without calling no_reply".into());
+            }
+            LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -587,38 +608,55 @@ pub async fn execute_with_recorder(
                 }
                 return Err("Model returned empty response after tool execution".to_string());
             }
-            LLMResponse::Text { content, metadata } => {
-                record_runtime(
-                    &recorder,
-                    RuntimeRecord::ModelResponse {
-                        model_sequence,
-                        content: Some(content.clone()),
-                        tool_calls: Vec::new(),
-                        provider_extra: Default::default(),
-                        metadata: metadata.clone(),
-                        terminal: true,
-                    },
-                )
-                .await?;
-                if let Some(m) = metadata {
-                    acc.record(m);
-                }
-                return Ok(finalize_outcome(
-                    hub,
-                    hook_ctx.as_ref(),
-                    RuntimeOutcome {
-                        body: content,
-                        metadata: acc.finalize(),
-                    },
-                )
-                .await);
-            }
+            LLMResponse::Text { .. } => return Err("Model returned empty final response".into()),
             LLMResponse::ToolCalls {
                 content,
                 tool_calls,
                 provider_extra,
                 metadata,
             } => {
+                if tool_ctx.allow_no_reply
+                    && tool_calls.iter().any(|call| call.name == NO_REPLY_TOOL)
+                {
+                    if tool_calls.len() != 1
+                        || content
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                        || !no_reply_arguments_empty(&tool_calls[0].arguments)
+                    {
+                        return Err(
+                            "no_reply must be the sole tool call with no arguments or reply text"
+                                .into(),
+                        );
+                    }
+                    if matrix_send_queued {
+                        return Err("no_reply cannot retract a queued Matrix send".into());
+                    }
+                    record_runtime(
+                        &recorder,
+                        RuntimeRecord::ModelResponse {
+                            model_sequence,
+                            content: None,
+                            tool_calls,
+                            provider_extra: Default::default(),
+                            metadata: metadata.clone(),
+                            terminal: true,
+                        },
+                    )
+                    .await?;
+                    if let Some(m) = metadata {
+                        acc.record(m);
+                    }
+                    return Ok(finalize_outcome(
+                        hub,
+                        hook_ctx.as_ref(),
+                        RuntimeOutcome {
+                            body: String::new(),
+                            metadata: acc.finalize(),
+                        },
+                    )
+                    .await);
+                }
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -864,6 +902,8 @@ pub async fn execute_with_recorder(
                     // A shared session syncs full results to its authorized peers.
                     // Bound native/custom tools just as MCP tools are bounded.
                     let result = bound_tool_output(&result);
+                    let queued_this_call =
+                        call.name == "matrix__send" && outcome == ToolResultOutcome::Success;
                     record_tool_result(
                         &recorder,
                         model_sequence,
@@ -873,6 +913,7 @@ pub async fn execute_with_recorder(
                         outcome,
                     )
                     .await?;
+                    matrix_send_queued |= queued_this_call;
 
                     debug!(
                         call_id = %call.id,
@@ -906,6 +947,9 @@ impl RuntimeRecorder for EventRecorder {
             match message {
                 RuntimeRecord::ModelResponse { tool_calls, .. } => {
                     for call in tool_calls {
+                        if call.name == NO_REPLY_TOOL {
+                            continue;
+                        }
                         self.0
                             .send(RuntimeEvent::ToolCall {
                                 id: call.id,
@@ -1265,6 +1309,7 @@ mod tests {
             max_call_depth: 5,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
             profile: ToolProfile::default(),
+            allow_no_reply: false,
             session,
             grants: Default::default(),
             session_capabilities: Default::default(),

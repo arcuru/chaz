@@ -538,7 +538,19 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
                     lines.push(Line::from(vec![Span::styled(rule, dim)]));
                 }
 
-                let label = format!("{}{}:", debug_prefix, entry.sender);
+                let source = entry
+                    .routing
+                    .as_ref()
+                    .and_then(|r| r.source.as_ref())
+                    .map(|r| format!(" [via {} {}]", r.transport, r.channel))
+                    .unwrap_or_else(|| {
+                        if is_agent {
+                            " [local]".into()
+                        } else {
+                            String::new()
+                        }
+                    });
+                let label = format!("{}{}{}:", debug_prefix, entry.sender, source);
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
@@ -547,6 +559,32 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
                 }
                 lines.push(Line::from(""));
             }
+            EntryType::MatrixObserved | EntryType::MatrixSend => {
+                let (label, source) = if entry.entry_type == EntryType::MatrixObserved {
+                    (
+                        "observed, no wake",
+                        entry.routing.as_ref().and_then(|r| r.source.as_ref()),
+                    )
+                } else {
+                    let dest = entry.routing.as_ref().and_then(|r| r.destinations.first());
+                    let id = dest.and_then(|d| d.message_id.as_deref());
+                    let delivered = tab.entries.iter().any(|e| {
+                        e.entry_type == EntryType::MatrixSent
+                            && e.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == id
+                    });
+                    (if delivered { "sent" } else { "pending" }, dest)
+                };
+                let room = source.map(|s| s.channel.as_str()).unwrap_or("unknown room");
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}{} [Matrix {label} in {room}]:", entry.sender),
+                    dim,
+                )]));
+                for content_line in entry.content.lines() {
+                    lines.push(Line::from(format!("  {content_line}")));
+                }
+                lines.push(Line::from(""));
+            }
+            EntryType::MatrixSent => {} // The send row above shows its confirmed status.
             // Directives, ToolCall, ToolResult are collapsible. Per-entry
             // override flips the global default (`app.expand_all`).
             EntryType::Directive => {

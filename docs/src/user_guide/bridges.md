@@ -123,7 +123,7 @@ immediately.
    `ticket`. Provision fresh bridge settings/identities deliberately; old
    bridge databases, identities, delivery progress and channel bindings are
    **not** imported into this layout. Reattach channels and verify an inbound
-   message and one reply on a disposable Matrix room before any live cutover.
+   ordinary final, terminal `no_reply({})`, and one explicit `matrix__send` on a disposable Matrix room before any live cutover.
 4. Test a client and bridge restart while the executor stays up, then an
    executor restart. Check committed replies arrive and already acknowledged
    chunks do not resend. Roll back by stopping the new processes and restoring

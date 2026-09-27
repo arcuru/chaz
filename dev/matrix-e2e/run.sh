@@ -90,7 +90,7 @@ for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN" "$E2EE_PROBE_BIN"; do
 		exit 2
 	fi
 done
-for tool in synapse_homeserver register_new_matrix_user curl jq python3; do
+for tool in synapse_homeserver register_new_matrix_user curl jq sqlite3 python3; do
 	command -v "$tool" >/dev/null || {
 		echo "missing tool: $tool (try 'just e2e', which provides them)" >&2
 		exit 2
@@ -707,12 +707,12 @@ wait_for "fifth reply" "$REPLY_TIMEOUT" replies_at_least 5
 printf '\033[1;32mPASS\033[0m — all restart cases passed (bridge + daemon)\n' >&2
 
 # -------------------------------------------------------- group-room cases ---
-# Case 1a — a bare message in a group room is ignored
+# Case 1a — a bare message in a group room is observed, not executed
 # Case 2  — an @-mention in a group room is answered
 # Case 1b — the `!chaz` prefix is answered without a mention
 # Case 3  — a sender outside allow_list is ignored even with the `!chaz` prefix
 #
-# Each "must be ignored" case is asserted with a barrier rather than a fixed
+# Each no-wake case is asserted with a barrier rather than a fixed
 # wait: send the message that must not be answered, then one that must be, and
 # wait for the second to be answered before requiring the first produced
 # nothing. Both travel the same path in that order, so the second answer is
@@ -820,16 +820,16 @@ BARE_BODY="bare message with no prefix and no mention"
 
 # How many turns the model has been asked to run. Join-time history is
 # context only; messages after join that aren't addressed are ignored.
-stub_requests() { grep -c "^stub_llm: request:" "$WORKSPACE/stub-llm.log" || true; }
+stub_requests() { grep -c "^stub_llm: turn:" "$WORKSPACE/stub-llm.log" || true; }
 
 # The bridge writes a line for every message it drops for not being addressed
-# to it. That line is the observable for a message that must be ignored: the
+# to it. That line is the observable for a message that must not wake: the
 # absence of a reply is not, because absence is also what a reply that has not
 # arrived yet looks like, and it stays true with the gate deleted.
-gate_drops() { grep -c "not addressed to the bot" "$BRIDGE_LOG" || true; }
+gate_drops() { grep -Ec "Unbound Matrix room observation ignored|Recorded unaddressed Matrix observation" "$BRIDGE_LOG" || true; }
 gate_dropped_more_than() { [[ "$(gate_drops)" -gt "$1" ]]; }
 
-# Case 1a + Case 2 — the bare message must be ignored, the mention answered.
+# Case 1a + Case 2 — the bare message must not wake; the mention does.
 #
 # The bare message is asserted on the bridge's drop line, and waiting for it
 # also orders the pair: the mention is not sent until the bridge has finished
@@ -841,7 +841,7 @@ gate_dropped_more_than() { [[ "$(gate_drops)" -gt "$1" ]]; }
 # that is logged but not performed. Counting requests rather than replies in
 # the room is deliberate: every reply this stub sends is the same string, so a
 # wrongly sent first reply reads exactly like the mention's.
-log "Case 1a: bare message in the group room (must be ignored)"
+log "Case 1a: bare message in the group room (no wake)"
 TURNS_BEFORE="$(stub_requests)"
 DROPS_BEFORE="$(gate_drops)"
 group_send "$PUPPET_TOKEN" \
@@ -858,22 +858,48 @@ mention_reached_the_model() {
 }
 wait_for "the mention to reach the model" "$REPLY_TIMEOUT" mention_reached_the_model
 
-GROUP_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+GROUP_TURNS="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" |
 	grep -cF "$BARE_BODY" || true)"
-PREJOIN_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+PREJOIN_TURNS="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" |
     grep -cF "$PREJOIN_BODY" || true)"
 [[ $PREJOIN_TURNS -eq 1 ]] || fail "pre-join history did not appear exactly once in the mention turn (found $PREJOIN_TURNS)"
-if grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -qF "$PRECLEAR_BODY"; then
+if grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -qF "$PRECLEAR_BODY"; then
     fail "history before !chaz clear reached the model"
 fi
 [[ "$(stub_requests)" -eq $((TURNS_BEFORE + 1)) ]] || fail "history triggered an extra model turn"
 
-if [[ $GROUP_TURNS -ne 0 ]]; then
-    fail "bridge included an unaddressed post-join message in $GROUP_TURNS model turn(s)"
-fi
+[[ $GROUP_TURNS -eq 1 ]] || fail "unaddressed observation missing from the mention context (found $GROUP_TURNS)"
 
 wait_for "the mention reply in the group room" "$REPLY_TIMEOUT" \
 	group_said_at_least "$MARKER" 1
+
+# This room is now attached. Unaddressed speech becomes shared context but
+# must not wake a model. A later mention is its causal barrier.
+TURNS_BEFORE="$(stub_requests)"
+DROPS_BEFORE="$(gate_drops)"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"observed after attachment"}'
+wait_for "bare message recorded without wake" 60 gate_dropped_more_than "$DROPS_BEFORE"
+[[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "observation started a model turn"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+    '{msgtype:"m.text",body:"observation barrier"} + {"m.mentions":{user_ids:[$a]}}')"
+wait_for "observation visible in next turn" "$REPLY_TIMEOUT" \
+    sh -c "grep '^stub_llm: turn:' '$WORKSPACE/stub-llm.log' | grep -qF 'observed after attachment'"
+[[ "$(stub_requests)" -eq $((TURNS_BEFORE + 1)) ]] || fail "observation triggered extra turns"
+wait_for "second explicit send" "$REPLY_TIMEOUT" group_said_at_least "$MARKER" 2
+
+# A normal Matrix-origin final is now the room reply; the next turn uses the
+# explicit send tool and its later final must not produce a duplicate post.
+GROUP_BEFORE="$(group_agent_said "$MARKER")"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+    '{msgtype:"m.text",body:"local final test"} + {"m.mentions":{user_ids:[$a]}}')"
+wait_for "normal final posted to Matrix" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((GROUP_BEFORE + 1))"
+group_said_count_is "$MARKER" "$((GROUP_BEFORE + 1))" "normal final posted twice"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+    '{msgtype:"m.text",body:"barrier after local final"} + {"m.mentions":{user_ids:[$a]}}')"
+wait_for "explicit send after normal final" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((GROUP_BEFORE + 2))"
+group_said_count_is "$MARKER" "$((GROUP_BEFORE + 2))" "explicit send final posted twice"
 
 # Case 1b — the `!chaz` prefix is answered without a mention.
 log "Case 1b: !chaz command in the group room (must be answered)"
@@ -882,8 +908,8 @@ wait_for "the !chaz reply in the group room" "$REPLY_TIMEOUT" \
 	group_said_at_least "$BACKENDS_MARKER" 1
 
 # Case 3 — allow_list rejection. The stranger uses the `!chaz` prefix on
-# purpose: the prefix clears the "only engage when addressed" gate that Case 1a
-# already covers, which leaves allow_list as the only thing that can produce
+# purpose: the prefix takes the command path rather than Case 1a's
+# observation-only path, leaving allow_list as the only thing that can produce
 # silence. A bare message here would be dropped by the addressing gate, and the
 # case would still pass with allow_list deleted entirely.
 log "Case 3: stranger sends !chaz (must be ignored — not in allow_list)"
@@ -894,7 +920,57 @@ wait_for "the !chaz help reply in the group room" "$REPLY_TIMEOUT" \
 group_said_count_is "$BACKENDS_MARKER" 1 \
 	"bridge answered a sender outside allow_list"
 
-printf '\033[1;32mPASS\033[0m — group room cases passed (bare ignored, !chaz prefix, @-mention, allow_list rejection)\n' >&2
+printf '\033[1;32mPASS\033[0m — group room cases passed (bare observed without wake, !chaz prefix, @-mention, allow_list rejection)\n' >&2
+
+# An unauthorized sender cannot enable the new mode; a valid sender waits for
+# the daemon's synced receipt. The local-only case is followed by an addressed
+# reply barrier so no outbound event can hide behind an arbitrary sleep.
+log "participation: reject unauthorized toggle"
+group_send "$STRANGER_TOKEN" '{"msgtype":"m.text","body":"!chaz participation on"}'
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation status"}'
+wait_for "default-off participation status" 60 group_said_at_least "Matrix participation: off" 1
+group_said_count_is "Matrix participation: on" 0 "unauthorized toggle enabled participation"
+log "participation: enable with executor receipt"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation on"}'
+wait_for "executor-confirmed participation" 90 group_said_at_least "Matrix participation: on" 1
+PARTICIPATION_TURNS="$(stub_requests)"
+PARTICIPATION_REPLIES="$(group_agent_said "$MARKER")"
+PARTICIPATION_OUTBOUND="$(group_agent_said "")"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation local-only test"}'
+wait_for "ambient terminal no_reply reached model" "$REPLY_TIMEOUT" \
+    grep -q "stub_llm: participation terminal no_reply" "$WORKSPACE/stub-llm.log"
+# The following explicit send is a barrier: the daemon serializes turns per session.
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation reply test"}'
+wait_for "participating explicit send" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 1))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 2)) ]] || fail "participation did not produce exactly two model requests"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 1))" "terminal no_reply emitted a room reply"
+group_said_count_is "" "$((PARTICIPATION_OUTBOUND + 1))" "terminal no_reply or tool audit leaked an outbound event"
+# No tool call: the ordinary final itself must be queued for room delivery.
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation auto-final test"}'
+wait_for "ambient ordinary final posted" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 2))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 3)) ]] || fail "ambient ordinary final triggered extra model turns"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 2))" "ambient ordinary final posted twice"
+group_said_count_is "" "$((PARTICIPATION_OUTBOUND + 2))" "ambient ordinary final leaked another outbound event"
+log "participation: restart executor and confirm synced policy persists"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon exit with participation enabled" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+spawn daemon-participation "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon restart with participation enabled" 120 grep -q "daemon ready" "$WORKSPACE/daemon-participation.log"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation after restart"}'
+wait_for "reply with persisted participation after restart" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 3))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 4)) ]] || fail "restart participation request count changed"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 3))" "restart turn posted twice"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation off"}'
+wait_for "participation disabled" 60 group_said_at_least "Matrix participation: off" 2
+DROPS_BEFORE="$(gate_drops)"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"bare again after participation off"}'
+wait_for "default address gate restored" 60 gate_dropped_more_than "$DROPS_BEFORE"
+printf '\033[1;32mPASS\033[0m — opt-in group participation: terminal no_reply, ordinary final reply, explicit send without duplicate, authorization and off\n' >&2
 
 # -------------------------------------------------------- ReAct case ---
 # The stub answers a request whose user messages ask for a tool call with a
@@ -914,7 +990,10 @@ mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.r
 
 wait_for "ReAct tool result" "$REPLY_TIMEOUT" \
 	grep -q "detected tool result" "$WORKSPACE/stub-llm.log"
-wait_for "sixth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 6
+# A ReAct tool result ends with a local final; it must not be delivered to Matrix.
+if replies_at_least 6 >/dev/null; then
+    fail "ReAct local final leaked to the Matrix room"
+fi
 
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
 
@@ -1102,11 +1181,34 @@ mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
     "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
 wait_for "rejoin prompt to reach the model" "$REPLY_TIMEOUT" \
     grep -qF "$REJOIN_PROMPT" "$WORKSPACE/stub-llm.log"
-wait_for "seventh reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 7
+wait_for "sixth explicit send after rejoin" "$REPLY_TIMEOUT" replies_at_least 6
 [[ "$(stub_requests)" -eq $((TURNS_BEFORE_REJOIN + 1)) ]] ||
     fail "rejoin history triggered a model turn"
-REJOIN_CONTEXT="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
+REJOIN_CONTEXT="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
 [[ "$REJOIN_CONTEXT" == *"$REJOIN_HISTORY"* ]] || fail "rejoin history missing from context"
 [[ "$REJOIN_CONTEXT" != *"$REJOIN_CLEARED"* ]] || fail "history before clear was imported on rejoin"
 [[ "$REJOIN_CONTEXT" != *"second turn"* ]] || fail "previous live room events were reimported on rejoin"
-printf '\033[1;32mPASS\033[0m — rejoin imported absent-period context without replaying old turns\n' >&2
+# Count real Matrix messages, not model finals or bridge progress rows.
+DM_OUTBOUND="$(mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" \
+    "$PUPPET_TOKEN" | jq --arg a "$AGENT_MXID" --arg m "$MARKER" \
+    '[.chunk[] | select(.type == "m.room.message" and .sender == $a) | select(.content.body // "" | contains($m))] | length')"
+[[ "$DM_OUTBOUND" == 6 ]] || fail "expected six explicit Matrix sends across the DM lifecycle; found $DM_OUTBOUND"
+
+# The daemon's disposable SQLite store-state projection retains Completed
+# attempt records. Query only this room's DB; the original first turn is
+# restored from the bridge on the copied-state recovery path.
+DM_SESSION_ID="$(sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' "$WORKSPACE/bridge.log" | \
+    sed -nE '/Channel bound to session/s/.*session_db_id=([^ ]+).*/\1/p' | head -1)"
+[[ "$DM_SESSION_ID" =~ ^[a-z0-9]+$ ]] || fail "could not identify disposable DM session ID"
+completed_attempts() {
+    sqlite3 "$WORKSPACE/state-daemon/eidetica.db" \
+    "select count(distinct json_extract(cast(r.record_value as text),'\$.attempt_id'))
+     from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
+     where n.database_id='$DM_SESSION_ID' and n.store_name='turn_attempts'
+     and json_extract(cast(r.record_value as text),'\$.status')='Completed'"
+}
+seven_completed_attempts() { [[ "$(completed_attempts)" -ge 7 ]]; }
+wait_for "seven durable completed DM attempts" 60 seven_completed_attempts
+COMPLETED="$(completed_attempts)"
+printf '\033[1;32mPASS\033[0m — rejoin and durable delivery: %s DM sends, %s completed attempts\n' \
+    "$DM_OUTBOUND" "$COMPLETED" >&2

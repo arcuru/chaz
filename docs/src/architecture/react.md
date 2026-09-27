@@ -53,10 +53,32 @@ Scheduled turns currently retain the compatibility `RuntimeEvent` adapter becaus
 
 ## Fallback Behavior
 
-- If the scoped tool set is empty, or the backend does not support tool calling, the runtime makes a single-shot call without tool definitions.
+- Unbound sessions without tool support fall back to a single-shot LLM call. A Matrix-bound session requires tool support so `no_reply({})` remains available on every turn.
 - Otherwise every model request in the turn offers the same tool definitions. The runtime never withholds tools to force a final answer: withholding them lets a model that still wants a tool print its call as plain text.
 - A retryable provider error (rate limit, 5xx, timeout, network) is retried with backoff up to the backend's `max_retries`. When retries are exhausted, or the error is not retryable, the turn fails with that error. It is not retried without tools.
-- If the model returns an empty response after tool calls, the last tool result becomes the reply.
+- If the model returns an empty response after tool calls, the last tool result becomes the reply on unbound turns. Matrix-bound turns reject empty text without terminal `no_reply`.
+
+## Turn finals, terminal silence and addressed Matrix sends
+
+A normal final from a Matrix-origin turn is a local session `Message` and an
+addressed `MatrixSend` outbox row committed with the completed attempt in one
+transaction. The local copy references that outbox identity and is framed as
+a `matrix_reply` with pending/sent status in later context, not as private text. A TUI, scheduled, or local-agent final in the same Matrix-bound
+session remains local only. Blank model text is an error, not deliberate
+silence; `no_reply({})` is a sole terminal model action that completes without
+a `Message` or room post. Its definition remains stable across all turns in
+a Matrix-bound session to preserve the model-call tool prefix.
+
+The optional `matrix__send` tool checks the executing agent's registered Matrix
+login and the session's singular binding. A successful explicit send during a
+Matrix-origin turn counts as its room reply: its later final remains local and
+cannot create a second post. The Matrix bridge alone sends addressed outbox
+rows to its own room, with durable per-binding progress and stable transaction
+IDs; it records `MatrixSent` after acknowledgement. Local-only finals, tool
+audit rows, and agent-to-agent wakes cannot leak into Matrix. The local copy
+of a Matrix reply is also excluded from other bridges' generic Message fan-out.
+Source and outbound state come from typed metadata, not mutable message-body
+headers.
 
 ## Context Assembly
 
