@@ -72,8 +72,8 @@ is selected after that attempt finishes.
 `TurnAttempt` records the request row key, an attempt ID, a durable generation,
 and whether the attempt started or completed. The executor writes the started
 record before it can call a model or a tool. It commits a completed record in
-the same transaction as the final response or error entry. A silent turn has
-no final message, but still records completion.
+the same transaction as the final local response or error entry. Empty model
+output is an error, not an intentional message-free completion.
 
 Clients read started attempts and completions from the session DB to show
 per-turn activity. A separate `turn_activity` timestamp store is refreshed
@@ -175,29 +175,24 @@ topology adds multi-executor election or fencing.
 
 ## Session Registry
 
-A session is identified solely by the root ID of its own eidetica `Database`. The `SessionRegistry` holds three index stores inside the peer-local `chaz_group` DB — nothing load-bearing about a session lives here:
+A session is identified solely by the root ID of its own eidetica `Database`. The `SessionRegistry` holds two index stores inside the peer-local `chaz_group` DB — nothing load-bearing about a session lives here:
 
 - **`sessions`**: every known `session_db_id` → origin tag (for debugging/listing)
-- **`matrix_channels`**: Matrix `room_id` → `session_db_id` (fan-out supported — one session may receive responses on many rooms)
 - **`session_names`**: human-friendly `name` → `session_db_id`
 
 The canonical per-session configuration (name, agent, model, role, backend) lives in each session's own DB under a `meta` DocStore as a `SessionMeta`. Because it lives in the session, it syncs with the session via eidetica — sharing a session also shares its config.
 
 ```mermaid
 graph LR
-    ROOM["Matrix room !r:ex.org"] -->|matrix_channels| SID1["session_db_id A"]
-    SID1 --> DB1[(Session DB A<br/>entries + meta)]
-    ROOM2["Matrix room !q:ex.org"] -->|matrix_channels| SID1
-    NAME["name 'daily-standup'"] -->|session_names| SID1
+    ROOM["Matrix room !r:ex.org"] -->|one binding| DB1[(Session DB A<br/>entries + meta + binding)]
+    NAME["name 'daily-standup'"] -->|session_names| DB1
     SID2["spawn:abc-123"] --> DB2[(Session DB B)]
-    REG[(Registry<br/>indices only)] -.-> ROOM
-    REG -.-> ROOM2
-    REG -.-> NAME
+    REG[(Registry<br/>sessions + names only)] -.-> NAME
 ```
 
 ### Matrix channels
 
-A Matrix channel is an explicit `(room_id → session_db_id)` attachment. A room's first message auto-creates a session and a channel. `!chaz attach <session>` rebinds a room to a different session; `!chaz detach` removes the binding; `!chaz channels` lists rooms attached to the current session. At Matrix bridge startup, every persisted channel for a joined room receives both server-processing and response-delivery callbacks — this is how scheduled-session responses reach Matrix even when no user is active in the room.
+A Matrix attachment is an explicit `(login_id, room_id)` record in the session DB. There can be only one per session. An addressed message in a new room creates and attaches a session; an unaddressed message in an attached room enters context as `MatrixObserved`, not a turn request. `!chaz attach <session>` rejects another Matrix binding until explicit detach or migration, and `!chaz channels` lists attachments. Matrix delivery watches only addressed `MatrixSend` entries for its own login/room and confirms with `MatrixSent`. A final from a Matrix-origin turn enters that outbox atomically with its local copy; a TUI, schedule, or local-agent final never fans out. Startup reconciliation and per-binding progress retry queued sends even when the agent is offline. See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
 ### Named Sessions
 

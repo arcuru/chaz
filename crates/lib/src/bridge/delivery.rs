@@ -1,7 +1,10 @@
 //! Durable outbound delivery for transport bridges.
 //!
-//! A bridge delivers a session's agent `Message` entries to one transport
-//! channel. Progress is persisted per [`DeliveryBinding`] — the transport,
+//! Matrix bridges deliver only addressed `MatrixSend` entries (automatic
+//! Matrix-origin finals or explicit tool sends) for their
+//! own login and room. Other transports keep their normal message delivery,
+//! but do not re-send a final explicitly paired with a Matrix outbox event.
+//! Progress is persisted per [`DeliveryBinding`] — the transport,
 //! login, channel, and session a bridge routes on — in the peer-local
 //! `chaz_peer` database. Two frontends sharing one Eidetica login therefore
 //! keep independent progress, and a restarted or reconnected bridge resumes
@@ -39,7 +42,8 @@ use tracing::{debug, error, warn};
 
 use super::render_outbound;
 use crate::agent::AgentRegistry;
-use crate::session::{EntryType, Session, SessionEntry, TurnRequestId};
+use crate::session::{EntryRouting, EntryType, Session, SessionEntry, TurnRequestId};
+use chrono::Utc;
 
 /// `chaz_peer` store holding one [`DeliveryProgress`] document per binding.
 const DELIVERY_STORE: &str = "transport_delivery";
@@ -52,8 +56,8 @@ const IDEMPOTENCY_KEY_LEN: usize = 24;
 /// The stable frontend identity delivery progress is scoped to.
 ///
 /// A login belongs to one bridge process, a channel is bound to one session,
-/// and the same session may be bound to several channels (fan-out), so the
-/// full tuple is what makes progress independent per frontend.
+/// and different transports have independent delivery semantics, so the full
+/// tuple scopes progress to one frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeliveryBinding {
     pub transport: String,
@@ -301,7 +305,10 @@ impl DeliveryReconciler {
                             source,
                             "Session write; reconciling the transport"
                         );
-                        reconciler.run_pass().await;
+                        // A Matrix confirmation is itself a session write. Run
+                        // reconciliation after callback dispatch, never while
+                        // the confirming commit waits for callbacks to settle.
+                        tokio::spawn(async move { reconciler.run_pass().await });
                     }
                     Ok(())
                 })
@@ -373,6 +380,19 @@ impl DeliveryReconciler {
     /// converged; `Ok(false)` when a send failed and the tail remains.
     async fn reconcile_once(&self) -> anyhow::Result<bool> {
         let mut state = self.state.lock().await;
+        // A detached room or an ambiguous legacy session must never receive a
+        // pending request even if the bridge is still watching its old DB.
+        if self.binding.transport == "matrix"
+            && !crate::session::is_bound(
+                &self.session_db,
+                "matrix",
+                &self.binding.login_id,
+                &self.binding.channel,
+            )
+            .await?
+        {
+            anyhow::bail!("Matrix room is detached");
+        }
         let snapshot = self.session_db.snapshot().await?;
         let rows = Session::entries_with_ids_at_snapshot(&self.session_db, &snapshot).await?;
         let baseline = self.baseline_ids(&mut state).await?;
@@ -380,15 +400,37 @@ impl DeliveryReconciler {
         let pending: Vec<&(TurnRequestId, SessionEntry)> = rows
             .iter()
             .filter(|(id, entry)| {
-                entry.entry_type == EntryType::Message
-                    && self.agents.get(&entry.sender).is_some()
-                    && !baseline.contains(id.as_str())
+                (if self.binding.transport == "matrix" {
+                    entry.entry_type == EntryType::MatrixSend
+                        && entry.sender == self.owning_agent
+                        && self.agents.get(&entry.sender).is_some()
+                        && entry.routing.as_ref().is_some_and(|routing| {
+                            routing.source.is_none()
+                                && routing.destinations.len() == 1
+                                && routing.destinations[0].transport == "matrix"
+                                && routing.destinations[0].login_id == self.binding.login_id
+                                && routing.destinations[0].channel == self.binding.channel
+                                && routing.destinations[0].message_id.is_some()
+                        })
+                } else {
+                    entry.entry_type == EntryType::Message
+                        && entry
+                            .routing
+                            .as_ref()
+                            .and_then(|routing| routing.matrix_send_id.as_ref())
+                            .is_none()
+                        && self.agents.get(&entry.sender).is_some()
+                }) && !baseline.contains(id.as_str())
                     && state.progress.entries.get(id.as_str()) != Some(&DeliveryMark::Complete)
             })
             .collect();
 
         for (id, entry) in pending {
-            let body = render_outbound(&self.owning_agent, &entry.sender, &entry.content);
+            let body = if self.binding.transport == "matrix" {
+                entry.content.clone()
+            } else {
+                render_outbound(&self.owning_agent, &entry.sender, &entry.content)
+            };
             let chunks = (self.chunk)(&body);
             let start = match state.progress.entries.get(id.as_str()) {
                 Some(DeliveryMark::Chunks(count)) => *count,
@@ -416,6 +458,13 @@ impl DeliveryReconciler {
                 } else {
                     DeliveryMark::Chunks(index + 1)
                 };
+                // Write the shared confirmation before marking the final chunk
+                // complete. If this commit fails the same transport transaction
+                // ID safely retries. A second pass sees the confirmation and
+                // doesn't append another acknowledgement.
+                if mark == DeliveryMark::Complete && self.binding.transport == "matrix" {
+                    self.confirm_matrix_send(entry, &rows).await?;
+                }
                 state.progress.entries.insert(id.as_str().to_string(), mark);
                 self.store.save(&self.binding, &state.progress).await?;
             }
@@ -443,6 +492,52 @@ impl DeliveryReconciler {
             ));
         }
         Ok(true)
+    }
+
+    async fn confirm_matrix_send(
+        &self,
+        entry: &SessionEntry,
+        rows: &[(TurnRequestId, SessionEntry)],
+    ) -> anyhow::Result<()> {
+        let id = entry
+            .routing
+            .as_ref()
+            .and_then(|r| r.destinations.first())
+            .and_then(|d| d.message_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("Matrix send missing durable message identity"))?;
+        if rows.iter().any(|(_, row)| {
+            row.entry_type == EntryType::MatrixSent
+                && row.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(id)
+        }) {
+            return Ok(());
+        }
+        let mut session = Session::new(
+            crate::types::ConversationId(self.binding.session_db_id.clone()),
+            self.session_db.clone(),
+        )
+        .await;
+        // Re-read after a retry or concurrent peer write; this is an audit
+        // projection, not another request or external send.
+        if session.entries().iter().any(|row| {
+            row.entry_type == EntryType::MatrixSent
+                && row.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(id)
+        }) {
+            return Ok(());
+        }
+        session
+            .add_entry(SessionEntry {
+                sender: self.owning_agent.clone(),
+                content: String::new(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::MatrixSent,
+                metadata: None,
+                routing: Some(EntryRouting {
+                    reply_to: Some(id.to_owned()),
+                    ..Default::default()
+                }),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn baseline_ids(&self, state: &mut ReconcileState) -> anyhow::Result<HashSet<String>> {
@@ -594,6 +689,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_delivers_only_owned_addressed_rows_with_ack_and_restart_dedupe() {
+        let fx = fixture().await;
+        crate::session::bind_transport(&fx.session_db, "matrix", "@default:s", "!room:s")
+            .await
+            .unwrap();
+        let binding = DeliveryBinding::new(
+            "matrix",
+            "@default:s",
+            "!room:s",
+            fx.session_db.root_id().to_string(),
+        );
+        write(&fx.session_db, "default", "local final @friend").await;
+        let mut session = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        let send = |sender: &str, login: &str, room: &str, id: &str| SessionEntry {
+            sender: sender.into(),
+            content: "addressed".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::MatrixSend,
+            metadata: None,
+            routing: Some(EntryRouting {
+                destinations: vec![crate::session::TransportRef {
+                    transport: "matrix".into(),
+                    login_id: login.into(),
+                    channel: room.into(),
+                    sender: None,
+                    sender_display: None,
+                    message_id: Some(id.into()),
+                }],
+                ..Default::default()
+            }),
+        };
+        session
+            .add_entry(send("other", "@default:s", "!room:s", "wrong-agent"))
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@other:s", "!room:s", "wrong-login"))
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@default:s", "!other:s", "wrong-room"))
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@default:s", "!room:s", "the-send"))
+            .await
+            .unwrap();
+        let wire = Arc::new(Transport::default());
+        let attach = || {
+            DeliveryReconciler::attach_with_backoff(
+                fx.session_db.clone(),
+                fx.store.clone(),
+                binding.clone(),
+                fx.agents.clone(),
+                "default".into(),
+                one_chunk,
+                wire.send_fn(),
+                |_| Duration::from_millis(20),
+            )
+        };
+        let first = attach().await.unwrap();
+        assert_eq!(wire.bodies().await, ["addressed"]);
+        let entries = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        assert_eq!(
+            entries
+                .entries()
+                .iter()
+                .filter(|e| e.entry_type == EntryType::MatrixSent)
+                .count(),
+            1
+        );
+        assert!(
+            entries
+                .entries()
+                .iter()
+                .any(|e| e.entry_type == EntryType::MatrixSent
+                    && e.routing.as_ref().unwrap().reply_to.as_deref() == Some("the-send"))
+        );
+        assert_eq!(
+            fx.store
+                .load(&binding)
+                .await
+                .unwrap()
+                .unwrap()
+                .entries
+                .len(),
+            0
+        );
+        first.stop();
+        drop(first);
+        let restarted = attach().await.unwrap();
+        restarted.run_pass().await;
+        assert_eq!(
+            wire.attempts.load(Ordering::SeqCst),
+            1,
+            "restart must not repeat acknowledged sends"
+        );
+        crate::session::unbind_transport(&fx.session_db, "matrix", "@default:s", "!room:s")
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@default:s", "!room:s", "after-detach"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            wire.attempts.load(Ordering::SeqCst),
+            1,
+            "detached rooms must receive nothing"
+        );
+        restarted.stop();
+    }
+
+    #[tokio::test]
     async fn a_response_committed_while_offline_delivers_on_reattach() {
         let fx = fixture().await;
         write(&fx.session_db, "user", "hello").await;
@@ -629,6 +846,34 @@ mod tests {
         reconciler.stop();
     }
 
+    #[tokio::test]
+    async fn non_matrix_bridge_skips_final_already_addressed_to_matrix() {
+        let fx = fixture().await;
+        write(&fx.session_db, "default", "local reply").await;
+        let mut session = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        session
+            .add_entry(SessionEntry {
+                sender: "default".into(),
+                content: "Matrix room reply".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: Some(EntryRouting {
+                    matrix_send_id: Some("room-send-id".into()),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        let transport = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "other-transport-room", &transport, one_chunk).await;
+        assert_eq!(transport.bodies().await, vec!["local reply"]);
+        reconciler.stop();
+    }
     #[tokio::test]
     async fn a_missing_progress_record_never_discards_existing_responses() {
         let fx = fixture().await;

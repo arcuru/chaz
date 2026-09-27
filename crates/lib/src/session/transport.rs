@@ -5,9 +5,9 @@
 //! The binding moved out of the peer-local `chaz_group` (the old
 //! `external_channels` index) and into each session's own DB, so it syncs with
 //! the session: whichever peer holds the session — the bridge that created it
-//! or the daemon that runs it — sees the same binding. A session can carry
-//! several bindings (fan-out: one session surfaced in multiple rooms), keyed by
-//! the `(transport, login_id, channel)` triple.
+//! or the daemon that runs it — sees the same binding. A session carries at
+//! most one Matrix binding, keyed by the `(transport, login_id, channel)` triple.
+//! Other transports retain their own binding semantics.
 //!
 //! There is no central channel→session index anymore. A bridge finds the
 //! session for an inbound channel by walking its owning agent's synced session
@@ -19,6 +19,8 @@ use crate::hosted_index::DbEntry;
 use crate::types::ConversationId;
 
 use eidetica::Database;
+use eidetica::crdt::Doc;
+use eidetica::crdt::doc::Value;
 use eidetica::store::DocStore;
 use tracing::info;
 
@@ -44,6 +46,32 @@ fn parse_channel_key(key: &str) -> Option<(String, String, String)> {
     serde_json::from_str(key).ok()
 }
 
+/// DocStore interprets dots in keys as nested paths. MXIDs and room IDs
+/// contain domains, so get_all() must walk leaves and reconstruct each path.
+fn binding_keys(doc: &Doc) -> Vec<(String, String, String)> {
+    fn walk(doc: &Doc, prefix: &str, out: &mut Vec<(String, String, String)>) {
+        for (part, value) in doc.iter() {
+            let key = if prefix.is_empty() {
+                part.clone()
+            } else {
+                format!("{prefix}.{part}")
+            };
+            match value {
+                Value::Doc(child) => walk(child, &key, out),
+                Value::Text(_) => {
+                    if let Some(binding) = parse_channel_key(&key) {
+                        out.push(binding);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, "", &mut out);
+    out
+}
+
 /// Record that `session_db` is bound to `(transport, login_id, channel)`.
 /// Idempotent — re-binding the same channel overwrites the same key.
 pub async fn bind_transport(
@@ -54,6 +82,19 @@ pub async fn bind_transport(
 ) -> anyhow::Result<()> {
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
+    if transport == "matrix" {
+        let existing: Vec<_> = binding_keys(&store.get_all().await?)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "matrix")
+            .collect();
+        anyhow::ensure!(
+            existing.len() <= 1
+                && existing
+                    .iter()
+                    .all(|(_, login, room)| login == login_id && room == channel),
+            "session has a different or conflicting Matrix binding; detach or migrate it explicitly"
+        );
+    }
     store
         .set_string(channel_key(transport, login_id, channel), transport)
         .await?;
@@ -79,6 +120,16 @@ pub async fn unbind_transport(
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
     let key = channel_key(transport, login_id, channel);
+    if transport == "matrix" {
+        let count = binding_keys(&store.get_all().await?)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "matrix")
+            .count();
+        anyhow::ensure!(
+            count <= 1,
+            "conflicting legacy Matrix bindings; explicit migration required"
+        );
+    }
     let existed = store.get_string(&key).await.is_ok();
     let _ = store.delete(&key).await;
     txn.commit().await?;
@@ -94,6 +145,16 @@ pub async fn is_bound(
 ) -> anyhow::Result<bool> {
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
+    if transport == "matrix" {
+        let existing: Vec<_> = binding_keys(&store.get_all().await?)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "matrix")
+            .collect();
+        anyhow::ensure!(
+            existing.len() <= 1,
+            "conflicting legacy Matrix bindings; explicit migration required"
+        );
+    }
     Ok(store
         .get_string(&channel_key(transport, login_id, channel))
         .await
@@ -107,10 +168,7 @@ pub async fn transport_bindings(
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
     let doc = store.get_all().await?;
-    Ok(doc
-        .iter()
-        .filter_map(|(k, _v)| parse_channel_key(k))
-        .collect())
+    Ok(binding_keys(&doc))
 }
 
 impl SessionRegistry {
@@ -318,6 +376,28 @@ mod tests {
             .await
             .unwrap();
         assert!(is_bound(&db, "matrix", "@bot:s", "!r:s").await.unwrap());
+        // Dot-containing Matrix domains become nested DocStore paths on sync.
+        // Binding enumeration must reconstruct the original JSON key.
+        unbind_transport(&db, "matrix", "@bot:s", "!r:s")
+            .await
+            .unwrap();
+        bind_transport(&db, "matrix", "@bot:example.com", "!r:example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            transport_bindings(&db).await.unwrap(),
+            vec![(
+                "matrix".into(),
+                "@bot:example.com".into(),
+                "!r:example.com".into()
+            )]
+        );
+        unbind_transport(&db, "matrix", "@bot:example.com", "!r:example.com")
+            .await
+            .unwrap();
+        bind_transport(&db, "matrix", "@bot:s", "!r:s")
+            .await
+            .unwrap();
         // A different login on the same room is a distinct binding.
         assert!(!is_bound(&db, "matrix", "@other:s", "!r:s").await.unwrap());
         assert_eq!(
@@ -340,6 +420,32 @@ mod tests {
             !unbind_transport(&db, "matrix", "@bot:s", "!r:s")
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_binding_rejects_other_rooms_and_legacy_conflicts() {
+        let (_inst, reg) = make_registry().await;
+        let (_cv, db) = reg.create_session(Some("local")).await.unwrap();
+        bind_transport(&db, "matrix", "@a:s", "!a:s").await.unwrap();
+        bind_transport(&db, "matrix", "@a:s", "!a:s").await.unwrap();
+        assert!(bind_transport(&db, "matrix", "@b:s", "!a:s").await.is_err());
+        assert!(bind_transport(&db, "matrix", "@a:s", "!b:s").await.is_err());
+        bind_transport(&db, "discord", "bot", "room").await.unwrap();
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
+            .await
+            .unwrap()
+            .set_string(channel_key("matrix", "@legacy:s", "!legacy:s"), "matrix")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(is_bound(&db, "matrix", "@a:s", "!a:s").await.is_err());
+        assert!(bind_transport(&db, "matrix", "@a:s", "!a:s").await.is_err());
+        assert!(
+            unbind_transport(&db, "matrix", "@a:s", "!a:s")
+                .await
+                .is_err()
         );
     }
 

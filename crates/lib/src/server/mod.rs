@@ -67,6 +67,7 @@ struct SessionRuntimeRecorder {
     attempt_id: String,
     sequence: AtomicU32,
     terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
+    explicit_matrix_send: AtomicBool,
     agent_name: String,
     #[cfg(test)]
     fail_after: Arc<std::sync::Mutex<Option<usize>>>,
@@ -88,6 +89,14 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                     *value -= 1;
                 }
             }
+            let explicit_send = matches!(
+                &message,
+                runtime::RuntimeRecord::ToolResult {
+                    name,
+                    outcome: runtime::ToolResultOutcome::Success,
+                    ..
+                } if name == "matrix__send"
+            );
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
             let message = match message {
                 runtime::RuntimeRecord::ModelResponse {
@@ -141,9 +150,61 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 .await
                 .append_turn_transcript(record, display_entries)
                 .await
-                .map_err(|error| format!("failed to persist runtime transcript: {error}"))
+                .map_err(|error| format!("failed to persist runtime transcript: {error}"))?;
+            if explicit_send {
+                self.explicit_matrix_send.store(true, Ordering::Release);
+            }
+            Ok(())
         })
     }
+}
+
+/// A local or agent-to-agent request never acquires a Matrix destination merely
+/// because it shares the session. Validate the triggering row and current
+/// binding again at completion; the bridge repeats the binding check at send.
+async fn matrix_reply_for_turn(
+    session: &Session,
+    registry: &SessionRegistry,
+    attempt: &TurnAttempt,
+    agent_name: &str,
+    matrix_binding: Option<&(String, String)>,
+    body: &str,
+) -> anyhow::Result<Option<SessionEntry>> {
+    let request = session
+        .entries_with_ids()
+        .find(|(id, _)| *id == &attempt.request_id)
+        .map(|(_, entry)| entry)
+        .ok_or_else(|| anyhow::anyhow!("turn request entry is missing"))?;
+    if request.entry_type != EntryType::Message {
+        return Ok(None);
+    }
+    let Some(source) = request
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.source.as_ref())
+    else {
+        return Ok(None);
+    };
+    if source.transport != "matrix" {
+        return Ok(None);
+    }
+    let (login, room) = matrix_binding
+        .ok_or_else(|| anyhow::anyhow!("Matrix-origin turn has no unambiguous room binding"))?;
+    if source.login_id != *login || source.channel != *room {
+        anyhow::bail!("Matrix-origin turn does not match its current room binding");
+    }
+    if body.trim().is_empty() {
+        anyhow::bail!("Matrix-origin final is empty without no_reply");
+    }
+    if !crate::session::is_bound(session.database(), "matrix", login, room).await? {
+        anyhow::bail!("Matrix-origin turn was detached before its reply completed");
+    }
+    crate::tools::ensure_agent_owns_login(registry, session, agent_name, login)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(Some(
+        crate::tools::addressed_send_entry(agent_name, body, login, room).0,
+    ))
 }
 
 fn display_entries_for_record(
@@ -2417,6 +2478,16 @@ impl Server {
             return Ok(None);
         }
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
+        // Receipt proves the executor observed this generation through session
+        // sync. A bridge never acknowledges enablement on its own write alone.
+        if let Some(policy) = session.read_meta().await.matrix_participation
+            && crate::session::is_bound(&session_db, "matrix", &policy.login_id, &policy.room_id)
+                .await
+                .unwrap_or(false)
+        {
+            crate::session::acknowledge_matrix_participation(&session_db, &policy.generation)
+                .await?;
+        }
 
         let live_attempts = self.live_attempts.lock().await.clone();
         let command = session.next_command_request(&live_attempts).await?;
@@ -3034,6 +3105,7 @@ impl Server {
             .unwrap_or_default();
 
         let tools = self.tools.clone();
+        let registry = self.registry.clone();
         let policies = self.policies.clone();
         let security = self.security.clone();
         let semaphore = self.semaphore.clone();
@@ -3117,6 +3189,19 @@ impl Server {
             }
             .with_active_extensions(Some(active_extensions.clone()));
 
+            // Stable for the session, independent of whether this turn came
+            // from Matrix, the TUI, or another locally attached agent.
+            let matrix_binding = {
+                let s = session.lock().await;
+                let bindings = crate::session::transport_bindings(s.database()).await;
+                match bindings {
+                    Ok(all) => {
+                        let matrix: Vec<_> = all.into_iter().filter(|(kind, _, _)| kind == "matrix").collect();
+                        (matrix.len() == 1).then(|| (matrix[0].1.clone(), matrix[0].2.clone()))
+                    }
+                    Err(_) => None,
+                }
+            };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
                 turn_request_id: Some(attempt.request_id.clone()),
@@ -3125,6 +3210,7 @@ impl Server {
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
+                allow_no_reply: matrix_binding.is_some(),
                 session: session.clone(),
                 grants: Default::default(),
                 session_capabilities,
@@ -3135,7 +3221,7 @@ impl Server {
                 routine_engine: routine_engine.clone(),
             };
 
-            let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+            let tool_defs = tool_ctx.definitions();
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
@@ -3173,9 +3259,11 @@ impl Server {
                     budget_model.as_deref(),
                     max_context_tokens,
                 );
-                let assembled =
-                    ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config)
-                        .with_tools(&tool_defs)
+                let mut builder = ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config);
+                if let Some((login, room)) = &matrix_binding {
+                    builder = builder.with_matrix_binding(login, room);
+                }
+                let assembled = builder.with_tools(&tool_defs)
                         .with_tool_history(&tool_history)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
@@ -3202,6 +3290,7 @@ impl Server {
                 attempt_id: attempt.attempt_id.clone(),
                 sequence: AtomicU32::new(0),
                 terminal: std::sync::Mutex::new(None),
+                explicit_matrix_send: AtomicBool::new(false),
                 agent_name: agent_name.clone(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
@@ -3228,41 +3317,62 @@ impl Server {
             let mut s = session.lock().await;
             let persistence_failed =
                 matches!(&result, Err(error) if error.starts_with("runtime persistence failed:"));
-            let final_entry = match result {
-                Ok(outcome) if outcome.body.trim().is_empty() => {
-                    // Silent turn — the agent acted via tools or chose
-                    // not to speak. Write no Message: keeps the room
-                    // and LLM context uncluttered and doesn't trip the
-                    // multi-agent burst counter. The turn's cost is not
-                    // dropped silently — for autonomous wakes the fire
-                    // path attributes it to the agent's own fire log
-                    // (see agent-owned schedules); session usage stays
-                    // Message-only by design.
-                    debug!(
-                        agent = %agent_name,
-                        session = %session_db_id,
-                        "Agent produced no message (silent turn) — no entry written"
-                    );
-                    None
+            let mut reply_preflight_failed = false;
+            let (final_entry, outbound) = match result {
+                Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {
+                    // The terminal no_reply was recorded as the turn's model fact.
+                    (None, None)
                 }
-                Ok(outcome) => Some(SessionEntry {
-                    sender: agent_name,
-                    content: outcome.body,
-                    timestamp: Utc::now(),
-                    entry_type: EntryType::Message,
-                    metadata: outcome.metadata,
-                    routing: None,
-                }),
+                Ok(outcome) => {
+                    let outbound = if recorder.explicit_matrix_send.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        match matrix_reply_for_turn(
+                            &s,
+                            &registry,
+                            &attempt,
+                            &agent_name,
+                            matrix_binding.as_ref(),
+                            &outcome.body,
+                        )
+                        .await
+                        {
+                            Ok(outbound) => outbound,
+                            Err(error) => {
+                                error!(%error, "Matrix turn reply failed its binding or ownership check");
+                                reply_preflight_failed = true;
+                                None
+                            }
+                        }
+                    };
+                    let final_routing = outbound
+                        .as_ref()
+                        .and_then(|entry| entry.routing.as_ref())
+                        .and_then(|routing| routing.destinations.first())
+                        .and_then(|destination| destination.message_id.clone())
+                        .map(|id| crate::session::EntryRouting {
+                            matrix_send_id: Some(id),
+                            ..Default::default()
+                        });
+                    (Some(SessionEntry {
+                        sender: agent_name,
+                        content: outcome.body,
+                        timestamp: Utc::now(),
+                        entry_type: EntryType::Message,
+                        metadata: outcome.metadata,
+                        routing: final_routing,
+                    }), outbound)
+                }
                 Err(err) => {
                     error!("Agent error for {}: {err}", session_db_id);
-                    Some(SessionEntry {
+                    (Some(SessionEntry {
                         sender: agent_name,
                         content: format!("Error: {err}"),
                         timestamp: Utc::now(),
                         entry_type: EntryType::Error,
                         metadata: None,
                         routing: None,
-                    })
+                    }), None)
                 }
             };
             if let Some(ref token) = incarnation {
@@ -3274,18 +3384,18 @@ impl Server {
                     }
                 }
             }
-            if persistence_failed {
+            if persistence_failed || reply_preflight_failed {
                 error!(
-                    "Runtime transcript persistence stopped turn {} for {session_db_id}",
+                    "Turn {} for {session_db_id} remains interrupted: transcript or Matrix reply preflight failed",
                     attempt.attempt_id
                 );
             } else {
                 let terminal = recorder.terminal.lock().unwrap().take();
-                if let Err(e) = s
-                    .complete_turn_attempt_with_transcript(&attempt, final_entry, terminal)
+                if let Err(error) = s
+                    .complete_turn_attempt_with_outbound(&attempt, final_entry, outbound, terminal)
                     .await
                 {
-                    error!("Failed to complete turn attempt for {session_db_id}: {e}");
+                    error!("Failed to complete turn attempt for {session_db_id}: {error}");
                 }
             }
             drop(s);

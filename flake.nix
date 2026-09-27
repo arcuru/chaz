@@ -341,6 +341,7 @@
           nativeBuildInputs = with pkgs; [
             curl
             jq
+            sqlite
             matrix-synapse
             uv
             (python3.withPackages (ps: [ps.pyyaml]))

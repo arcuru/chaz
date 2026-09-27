@@ -1,7 +1,8 @@
 # Matrix bridge end-to-end test
 
 Stands up a throwaway Matrix homeserver, drives a real conversation through the
-bridge, and asserts the reply comes back out of the room.
+bridge, and checks ordinary Matrix-origin finals, terminal `no_reply({})`, and
+explicit `matrix__send` delivery to the attached room.
 
 ```bash
 just e2e                        # from inside `nix develop`
@@ -20,13 +21,16 @@ Synapse into the closure. It needs no secrets.
 ## What it covers
 
 A message enters over Matrix, crosses into a session database, syncs to the
-agent peer, gets answered, and syncs back out to the room. That round trip
-spans four processes and the sync layer between them, and it is the part that
-unit tests cannot reach.
+agent peer, and syncs an addressed outbox event back to the bridge. An
+ordinary final from a Matrix-origin turn is saved locally and posted through
+the same outbox; a local-origin final never posts. That round trip spans four
+processes and the sync layer between them, which unit tests cannot reach.
 
-It is deliberately not a test of the model, the prompt, or the tools. The LLM
-is a stub that returns one fixed string, so a pass means the transport carried
-it and a failure is never someone else's outage.
+It does not use a paid model. The stub deterministically uses `matrix__send`
+for explicit-send cases (with a later local-only final), calls terminal
+`no_reply({})` on ambient chatter, and produces an ordinary final for a
+separate ambient reply case. A transport pass checks exact outbound counts,
+not merely whether final text was generated.
 
 ### The split it exercises
 
@@ -41,7 +45,7 @@ between them moves through eidetica sync.
                                   no LLM       ▼
                                               chaz daemon
                                               runs the agent ──▶ stub LLM
-                                              reply syncs back out
+                                              addressed send syncs out
 ```
 
 Four things have to hold for a run to pass, and each is a distinct failure:
@@ -49,7 +53,7 @@ Four things have to hold for a run to pass, and each is a distinct failure:
 1. The bridge bootstraps into the agent's DB with the key it was granted.
 2. An inbound room message becomes an entry in a session DB.
 3. That session DB reaches the daemon, which notices and runs a turn.
-4. The reply syncs back and the bridge delivers it to the room.
+4. The addressed send syncs back; only the matching bridge delivers it to the room.
 
 Because the harness waits on a specific observable at each step — the daemon's
 readiness line, the bridge's Matrix login, the agent's join, then the reply —
@@ -90,9 +94,9 @@ A third room holds the cases about who the bridge answers, with the puppet, the
 stranger, and the agent all joined:
 
 - **Bare message (Case 1a):** unaddressed text in a group room must not become
-  a turn. Asserted on the line the bridge writes when it drops a message for
-  not being addressed to it, then on the stub's request count: the first says
-  the bridge made the decision, the second says no turn ran anyway. The bridge
+  a turn. An attached room records it as observation; the next mention
+  exposes it in model context. Asserted on the bridge's observation log,
+  the stub turn count, and that later context. The bridge
   runs with `chaz_matrix_bridge=debug` so that line is in its log.
 - **@-mention (Case 2):** the same text with the agent mentioned must be
   answered.
