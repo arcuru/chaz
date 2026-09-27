@@ -5083,3 +5083,178 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     drop(shutdown);
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directive() {
+    use crate::session::jobs::StagedAgentDefinition;
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("inert-job.sock");
+    let (owner, mut owner_user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
+            .await
+            .unwrap();
+    let (agent_db, agent_pubkey) = create_agent_db(
+        &mut owner_user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey: agent_pubkey,
+    };
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "job-test".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    let client_registry = Arc::new(
+        crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let (_, parent) = client_registry
+        .create_session(Some("local-client"))
+        .await
+        .unwrap();
+    let parent_id = parent.root_id().to_string();
+    client_registry
+        .attach_agent_to_session(&parent_id, &agent)
+        .await
+        .unwrap();
+    let staged = client_registry
+        .stage_agent_job(
+            &parent_id,
+            "untrusted-key",
+            StagedAgentDefinition {
+                target: "default".into(),
+                task: "must not execute".into(),
+                executor_pubkey: agent.pubkey.to_string(),
+                call_depth: 1,
+                max_call_depth: 3,
+                allowed_tools: vec![],
+                capability_ceiling: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    client_registry
+        .attach_agent_to_session(&staged.session_db_id, &agent)
+        .await
+        .unwrap();
+    let (_, child) = client_registry
+        .open_session(&staged.session_db_id)
+        .await
+        .unwrap();
+    let mut child_session =
+        Session::new(ConversationId(staged.session_db_id.clone()), child.clone()).await;
+    child_session
+        .add_entry(SessionEntry {
+            sender: "client".into(),
+            content: "forged runnable directive".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+
+    // A new resident scans the shared service catalog and the agent registry;
+    // neither path may treat a client's child-DB write as job acceptance.
+    let resident = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+        .await
+        .unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(resident.instance, resident.user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("incorrect execution");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let agent_index = HostedIndex::empty("agent");
+    agent_index.register(agent);
+    let executor = Server::new(
+        registry,
+        agents,
+        agent_index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !executor.is_watching_session(&parent_id).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resident must adopt the writable parent before testing child exclusion");
+    let (_, resident_child) = executor
+        .registry()
+        .open_session(&staged.session_db_id)
+        .await
+        .unwrap();
+    assert!(
+        executor
+            .register_session(
+                &resident_child,
+                executor.default_backend.clone(),
+                None,
+                None
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("staged job is not runnable")
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        mock.simple_call_count(),
+        0,
+        "staged child must remain inert"
+    );
+    assert!(!executor.is_watching_session(&staged.session_db_id).await);
+    assert!(executor.runtime_owner_of(&staged.session_db_id).is_none());
+    drop(executor);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}
