@@ -6058,3 +6058,585 @@ async fn accepted_agent_job_can_submit_one_attenuated_child_while_running() {
     assert_eq!(mock.recorded_calls().len(), 2);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn workflow_parent_service_admission_is_parked_idempotent_and_validated() {
+    use crate::extensions::orchestrator::spec::parse_flow;
+    use crate::session::workflow_jobs::{AcceptedWorkflowParent, WorkflowParentState};
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("workflow-parent.sock");
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("workflow-parent-test"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "workflow-parent-test".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let client_registry = Arc::new(
+        crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let (_, parent_db) = client_registry
+        .create_session(Some("local-client"))
+        .await
+        .unwrap();
+    let parent_id = parent_db.root_id().to_string();
+    client_registry
+        .attach_agent_to_session(&parent_id, &agent)
+        .await
+        .unwrap();
+    let resident = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+        .await
+        .unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(resident.instance, resident.user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let index = HostedIndex::empty("agent");
+    index.register(agent.clone());
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let executor = Server::new(
+        registry.clone(),
+        agents,
+        index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !executor.is_watching_session(&parent_id).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let flow = parse_flow(&serde_json::json!({"kind":"sequence","steps":[
+        {"agent":"default","task":"first"},
+        {"kind":"fork","id":"parallel","branches":{
+            "a":{"agent":"default","task":"one"},
+            "b":{"agent":"default","task":"two"}}},
+        {"kind":"join","from":"parallel","mode":"all"}
+    ]}))
+    .unwrap();
+    let parent = Session::new(ConversationId(parent_id.clone()), parent_db.clone()).await;
+    let command_id = crate::session::TurnRequestId::parse("workflow-parent-key");
+    parent
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: command_id.clone(),
+            sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitWorkflow { flow: flow.clone() },
+        })
+        .await
+        .unwrap();
+    let observer = executor.observe_session_command(&parent_id).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observer.wait(&command_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let handle = match result.outcome {
+        crate::session::SessionCommandOutcome::WorkflowParentAccepted { session_db_id } => {
+            session_db_id
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let (_, workflow_db) = client_registry.open_job_session(&handle).await.unwrap();
+    let accepted = crate::session::workflow_jobs::read_accepted_workflow(&workflow_db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.flow, flow);
+    assert_eq!(accepted.authority.agent_db_id, agent.db_id.to_string());
+    assert_eq!(accepted.authority.home_pubkey, agent.pubkey.to_string());
+    assert_eq!(accepted.authority.call_depth, 1);
+    assert_eq!(accepted.authority.capability_ceiling, Default::default());
+    assert!(accepted.authority.tool_ceilings.is_empty());
+    assert_eq!(
+        executor
+            .workflow_parent_status(&handle)
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Accepted
+    );
+    let client_server = Server::new(
+        client_registry.clone(),
+        Arc::new(AgentRegistry::with_default_agent()),
+        HostedIndex::empty("agent"),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        executor.default_backend.clone(),
+        Arc::new(crate::mcp::McpRegistry::new()),
+        None,
+    );
+    assert_eq!(
+        client_server
+            .workflow_parent_status(&handle)
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Accepted
+    );
+    client_server.shutdown().await;
+    assert_eq!(
+        executor
+            .lookup_workflow_parent(&parent_id, command_id.as_str())
+            .await
+            .unwrap(),
+        Some(handle.clone())
+    );
+    assert_eq!(
+        executor
+            .submit_workflow_parent_inline(
+                &parent_id,
+                command_id.clone(),
+                "client",
+                Utc::now(),
+                flow.clone()
+            )
+            .await
+            .unwrap(),
+        handle
+    );
+    assert!(
+        executor
+            .submit_workflow_parent_inline(
+                &parent_id,
+                command_id.clone(),
+                "client",
+                Utc::now(),
+                parse_flow(&serde_json::json!({"agent":"default","task":"different"})).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different payload")
+    );
+    assert!(
+        Session::new(ConversationId(handle.clone()), workflow_db.clone())
+            .await
+            .entries()
+            .is_empty()
+    );
+    assert!(!executor.is_watching_session(&handle).await);
+    assert!(executor.runtime_owner_of(&handle).is_none());
+    assert!(
+        executor
+            .register_session(&workflow_db, executor.default_backend.clone(), None, None)
+            .await
+            .is_err()
+    );
+    // A forged graph/marker in a child does not supply the parent intent or
+    // an executor-started matching command. A partial catalog parent stays inert.
+    let label = crate::session::workflow_jobs::source(&parent_id, "forged-key");
+    let (forged_id, forged_db) = client_registry
+        .create_child_session(&parent_id, Some(&label))
+        .await
+        .unwrap();
+    client_registry
+        .attach_agent_to_session(&forged_id.0, &agent)
+        .await
+        .unwrap();
+    let forged = AcceptedWorkflowParent {
+        parent_id: parent_id.clone(),
+        request_key_hash: blake3::hash(b"forged-key").to_hex().to_string(),
+        flow: flow.clone(),
+        authority: accepted.authority.clone(),
+    };
+    let txn = forged_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&forged).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(executor.validate_workflow_parent(&forged_db).await.is_err());
+    assert!(
+        executor
+            .lookup_workflow_parent(&parent_id, "forged-key")
+            .await
+            .is_err()
+    );
+    let partial_label = crate::session::workflow_jobs::source(&parent_id, "partial-key");
+    let (partial_id, partial_db) = client_registry
+        .create_child_session(&parent_id, Some(&partial_label))
+        .await
+        .unwrap();
+    assert_eq!(
+        executor
+            .workflow_parent_status(&partial_id.0)
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Staged
+    );
+    assert!(!executor.is_watching_session(&partial_id.0).await);
+    assert!(
+        executor
+            .register_session(&partial_db, executor.default_backend.clone(), None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        executor
+            .lookup_workflow_parent(&parent_id, "partial-key")
+            .await
+            .is_err()
+    );
+    let mut narrowed = accepted.clone();
+    narrowed.authority.call_depth = 129;
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&narrowed).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        executor
+            .validate_workflow_parent(&workflow_db)
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.recorded_calls().len(), 0);
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&accepted).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert_eq!(
+        executor
+            .workflow_parent_status(&handle)
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Accepted
+    );
+    executor.shutdown().await;
+    drop(executor);
+    drop(observer);
+    let connection =
+        crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+            .await
+            .unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            connection.instance,
+            connection.user,
+            Arc::new(AgentRegistry::with_default_agent()),
+        )
+        .await
+        .unwrap(),
+    );
+    let index = HostedIndex::empty("agent");
+    index.register(agent);
+    let restarted = Server::new(
+        registry.clone(),
+        Arc::new(AgentRegistry::with_default_agent()),
+        index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        crate::backends::BackendManager::with_mock(
+            mock.clone(),
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        ),
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !restarted.is_watching_session(&parent_id).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        restarted
+            .workflow_parent_status(&handle)
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Accepted
+    );
+    assert_eq!(
+        restarted
+            .lookup_workflow_parent(&parent_id, command_id.as_str())
+            .await
+            .unwrap(),
+        Some(handle.clone())
+    );
+    assert!(!restarted.is_watching_session(&handle).await);
+    assert!(!restarted.is_watching_session(&partial_id.0).await);
+    assert_eq!(mock.recorded_calls().len(), 0);
+    restarted.shutdown().await;
+    drop(restarted);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}
+#[tokio::test]
+async fn workflow_parent_inherits_claimed_agent_job_ceiling() {
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("nested-job-test"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(instance, user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let index = HostedIndex::empty("agent");
+    index.register(agent.clone());
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("parent result");
+    mock.push_text("nested result");
+    let gate = mock.block_next_call();
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(crate::tools::Calculate);
+    let server = Server::new(
+        registry.clone(),
+        agents,
+        index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        tools,
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend.clone(),
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    let (_, parent_db) = registry.create_session(Some("local-client")).await.unwrap();
+    let parent_id = parent_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&parent_id, &agent)
+        .await
+        .unwrap();
+    server
+        .register_session(&parent_db, backend, None, None)
+        .await
+        .unwrap();
+    let parent_command = crate::session::TurnRequestId::parse("root-parent");
+    let root = Session::new(ConversationId(parent_id.clone()), parent_db).await;
+    root.submit_command(crate::session::SessionCommandRequest {
+        command_id: parent_command.clone(),
+        sender: "client".into(),
+        created_at: Utc::now(),
+        command: crate::session::SessionCommand::SubmitAgent {
+            agent_ref: "default".into(),
+            task: "first job".into(),
+        },
+    })
+    .await
+    .unwrap();
+    let observed = server.observe_session_command(&parent_id).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observed.wait(&parent_command),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let parent_job = match result.outcome {
+        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
+        other => panic!("expected accepted parent, got {other:?}"),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_started())
+        .await
+        .unwrap();
+    let flow = crate::extensions::orchestrator::spec::parse_flow(
+        &serde_json::json!({"agent":"default","task":"parked nested work"}),
+    )
+    .unwrap();
+    let key = crate::session::TurnRequestId::parse("workflow:nested");
+    let handle = server
+        .submit_workflow_parent_inline(
+            &parent_job,
+            key.clone(),
+            "default",
+            Utc::now(),
+            flow.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .submit_workflow_parent_inline(&parent_job, key.clone(), "default", Utc::now(), flow)
+            .await
+            .unwrap(),
+        handle
+    );
+    assert_eq!(
+        server
+            .lookup_workflow_parent(&parent_job, key.as_str())
+            .await
+            .unwrap(),
+        Some(handle.clone())
+    );
+    let (_, db) = registry.open_session(&handle).await.unwrap();
+    let authority = server
+        .validate_workflow_parent(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .authority;
+    assert_eq!(authority.call_depth, 2);
+    assert_eq!(authority.agent, "default");
+    assert_eq!(
+        authority.tool_ceilings.keys().cloned().collect::<Vec<_>>(),
+        vec!["calculate"]
+    );
+    assert!(
+        Session::new(ConversationId(handle.clone()), db)
+            .await
+            .entries()
+            .is_empty()
+    );
+    assert!(!server.is_watching_session(&handle).await);
+    gate.release();
+    let finished = server
+        .wait_job(&parent_job, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(finished.state.is_terminal());
+    let refused = server
+        .submit_workflow_parent_inline(
+            &parent_job,
+            crate::session::TurnRequestId::parse("workflow:after-terminal"),
+            "default",
+            Utc::now(),
+            crate::extensions::orchestrator::spec::parse_flow(
+                &serde_json::json!({"agent":"default","task":"late"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("active claimed attempt"),
+        "{refused}"
+    );
+    assert_eq!(mock.recorded_calls().len(), 1);
+    server.shutdown().await;
+}

@@ -45,6 +45,7 @@ mod build;
 mod jobs;
 mod runtime_lease;
 mod schedule;
+mod workflow_jobs;
 
 pub use build::{BuildOptions, BuiltServer, McpReadiness, build};
 pub use runtime_lease::{LeaseError, LocalRuntimeLease, OwnerId, RuntimeLease};
@@ -1868,7 +1869,9 @@ impl Server {
         if !self.executor_authorized {
             anyhow::bail!("server has no executor loop");
         }
-        if crate::session::jobs::is_staged_job(session_db).await {
+        if crate::session::jobs::is_staged_job(session_db).await
+            || crate::session::workflow_jobs::is_workflow_parent(session_db).await
+        {
             anyhow::bail!("staged job is not runnable");
         }
         let session = Session::new(
@@ -1992,6 +1995,9 @@ impl Server {
             }
             SessionCommandOutcome::AgentJobAccepted { .. } => {
                 anyhow::bail!("retry command returned a job receipt")
+            }
+            SessionCommandOutcome::WorkflowParentAccepted { .. } => {
+                anyhow::bail!("retry command returned a workflow parent receipt")
             }
         }
     }
@@ -2311,6 +2317,14 @@ impl Server {
     /// Return true when the row is settled for this process. A transient open
     /// or registration failure stays unseen so the next index write retries it.
     async fn adopt_local_client_session(&self, session: crate::session::SessionIndex) -> bool {
+        if session
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("workflow-stage:"))
+        {
+            // Parked, never register a runtime or execute a graph here.
+            return true;
+        }
         if session
             .source
             .as_deref()
@@ -2697,7 +2711,10 @@ impl Server {
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
-        let _job_admission = if matches!(request.command, SessionCommand::SubmitAgent { .. }) {
+        let _job_admission = if matches!(
+            request.command,
+            SessionCommand::SubmitAgent { .. } | SessionCommand::SubmitWorkflow { .. }
+        ) {
             Some(self.job_submission_lock.lock().await)
         } else {
             None
@@ -2732,6 +2749,10 @@ impl Server {
                     &task,
                 )
                 .await
+            }
+            SessionCommand::SubmitWorkflow { flow } => {
+                self.execute_submit_workflow_command(session_db_id, &request.command_id, &flow)
+                    .await
             }
             SessionCommand::Retry {
                 target_request_id,

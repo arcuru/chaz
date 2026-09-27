@@ -1,19 +1,11 @@
 //! Orchestrator extension — the `workflow` tool.
 //!
-//! Gives an agent compositional delegation over the Peer's other agents:
-//! single delegation, parallel fan-out with a concurrency cap, sequential
-//! pipelines that thread each step's output into the next, and fork+join
-//! with an optional reducer agent. The tool schema mirrors
-//! pi-orchestrator's `workflow` so supported inline flow definitions are portable between
-//! the two (see [`spec`]).
-//!
-//! Durable `spawn_agent` returns a session DB handle, not a child reply.
-//! Until the parent coordinator exists, the tool refuses execution rather
-//! than returning handles as if fork/join nodes had completed.
+//! Parses inline graphs and submits a parked parent session DB. No graph
+//! nodes run until the durable driver is implemented; a handle is not a result.
 
 #[cfg(test)]
 mod executor;
-mod spec;
+pub mod spec;
 
 use crate::backends::BackendManager;
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
@@ -30,13 +22,36 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 /// The `workflow` tool.
-pub struct WorkflowTool;
+pub struct WorkflowTool {
+    pub server: ServerSlot,
+}
 
 impl WorkflowTool {
     /// Build the canonical flow value from the tool's top-level params,
     /// resolving the three compact entry forms (single `{agent, task}`,
     /// parallel `{tasks: [...]}`, and explicit `{flow}`) into one flow.
     fn resolve_flow(arguments: &Value) -> Result<Value, String> {
+        let args = arguments
+            .as_object()
+            .ok_or("workflow arguments must be an object")?;
+        if let Some(unknown) = args.keys().find(|key| {
+            !["agent", "task", "tasks", "flow", "concurrency", "output"].contains(&key.as_str())
+        }) {
+            return Err(format!("unsupported workflow argument {unknown:?}"));
+        }
+        if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
+            for (i, item) in tasks.iter().enumerate() {
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| format!("tasks[{i}] must be an object"))?;
+                if let Some(unknown) = obj
+                    .keys()
+                    .find(|key| !["agent", "task", "output"].contains(&key.as_str()))
+                {
+                    return Err(format!("tasks[{i}] has unsupported field {unknown:?}"));
+                }
+            }
+        }
         if arguments.get("concurrency").is_some() && arguments.get("tasks").is_none() {
             return Err("'concurrency' requires 'tasks'.".into());
         }
@@ -123,14 +138,7 @@ impl Tool for WorkflowTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "workflow".to_string(),
-            description: "Unavailable until a durable workflow parent coordinator is installed. Modes: \
-                single ({agent, task}); parallel ({tasks: [{agent, task}, ...], concurrency: N}); \
-                or an inline flow graph ({flow: {kind: \"sequence\"|\"fork\"|\"join\", ...}}). A \
-                sequence threads each step's output into the next via the {previous} placeholder; \
-                a fork fans out its branches concurrently (Semaphore-capped) and collects them into \
-                {branches, errors}; a join folds a fork's results, optionally through a reducer \
-                agent. Per-spawn output: \"text\" (default) or \"json\" (reply parsed + validated). \
-                Supports pi-orchestrator-style inline flows, excluding loops and cwd."
+            description: "Store an inline workflow graph as a parked parent session and return its DB handle. NO AGENTS RUN and no graph result is produced yet. Supports single {agent, task}, parallel {tasks: [...]}, or {flow: {...}}; loops, cwd and scoped runs are unavailable."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -145,7 +153,7 @@ impl Tool for WorkflowTool {
                     },
                     "tasks": {
                         "type": "array",
-                        "description": "Parallel mode: tasks run concurrently, auto-wrapped into a fork.",
+                        "description": "Parallel graph mode: tasks are stored as fork branches; they do not run yet.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -162,7 +170,7 @@ impl Tool for WorkflowTool {
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Max concurrent branches for parallel/fork mode (default 4)."
+                        "description": "Future fork limit recorded in the graph (default 4); no branches run yet."
                     },
                     "output": {
                         "type": "string",
@@ -188,31 +196,61 @@ impl Tool for WorkflowTool {
     fn execute<'a>(
         &'a self,
         arguments: Value,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let raw_flow = Self::resolve_flow(&arguments).map_err(ToolError::InvalidArgument)?;
-            let _flow = spec::parse_flow(&raw_flow).map_err(ToolError::InvalidArgument)?;
-            // A durable spawn returns a handle, not a reply. Never feed that
-            // handle into the old synchronous graph or submit partial fan-out.
-            Err(ToolError::Execution(
-                "workflow is unavailable until durable parent coordination is installed".into(),
-            ))
+            let flow = spec::parse_flow(&raw_flow).map_err(ToolError::InvalidArgument)?;
+            let server = self
+                .server
+                .get()
+                .ok_or_else(|| ToolError::Execution("workflow server not initialized".into()))?;
+            let turn_id = ctx.turn_request_id.as_ref().ok_or_else(|| {
+                ToolError::Execution("workflow needs a persisted parent turn".into())
+            })?;
+            let call_key = ctx.tool_call_key.as_deref().ok_or_else(|| {
+                ToolError::Execution("workflow needs a stable tool-call key".into())
+            })?;
+            let (parent_id, created_at) = {
+                let session = ctx.session.lock().await;
+                let (_, entry) = session
+                    .entries_with_ids()
+                    .find(|(id, _)| *id == turn_id)
+                    .ok_or_else(|| ToolError::Execution("parent turn is not persisted".into()))?;
+                (session.database().root_id().to_string(), entry.timestamp)
+            };
+            let command_id =
+                crate::session::TurnRequestId::parse(format!("workflow:{turn_id}:{call_key}"));
+            let session_db_id = server
+                .submit_workflow_parent_inline(
+                    &parent_id,
+                    command_id,
+                    &ctx.agent_name,
+                    created_at,
+                    flow,
+                )
+                .await
+                .map_err(|e| ToolError::Execution(format!("Workflow submission failed: {e}")))?;
+            Ok(serde_json::json!({"session_db_id":session_db_id,"state":"accepted","execution":"unavailable"}).to_string())
         })
     }
 }
 
 /// The orchestrator extension. The constructor retains the existing wiring
 /// while the durable parent replaces synchronous delegation.
-pub struct OrchestratorExtension;
+pub struct OrchestratorExtension {
+    server: ServerSlot,
+}
 
 impl OrchestratorExtension {
     pub fn new(
-        _spawn_server_cell: ServerSlot,
+        spawn_server_cell: ServerSlot,
         _backend: BackendManager,
         _security: SecurityContext,
     ) -> Self {
-        Self
+        Self {
+            server: spawn_server_cell,
+        }
     }
 }
 
@@ -239,13 +277,17 @@ impl Extension for OrchestratorExtension {
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
         Box::pin(async move {
-            Ok(Arc::new(OrchestratorInstance { manifest }) as Arc<dyn ExtensionInstance>)
+            Ok(Arc::new(OrchestratorInstance {
+                manifest,
+                server: self.server.clone(),
+            }) as Arc<dyn ExtensionInstance>)
         })
     }
 }
 
 struct OrchestratorInstance {
     manifest: ExtensionManifest,
+    server: ServerSlot,
 }
 
 impl ExtensionInstance for OrchestratorInstance {
@@ -254,7 +296,9 @@ impl ExtensionInstance for OrchestratorInstance {
     }
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        vec![Arc::new(WorkflowTool)]
+        vec![Arc::new(WorkflowTool {
+            server: self.server.clone(),
+        })]
     }
 }
 
@@ -302,7 +346,9 @@ mod tests {
 
     #[test]
     fn descriptor_is_named_workflow_with_object_params() {
-        let tool = WorkflowTool;
+        let tool = WorkflowTool {
+            server: ServerSlot::default(),
+        };
         let d = tool.descriptor();
         assert_eq!(d.name, "workflow");
         assert_eq!(d.parameters["type"], "object");
@@ -314,7 +360,9 @@ mod tests {
         let (_instance, session) = crate::test_support::fresh_session().await;
         let ctx =
             crate::test_support::tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
-        let tool = WorkflowTool;
+        let tool = WorkflowTool {
+            server: ServerSlot::default(),
+        };
         let error = tool
             .execute(
                 serde_json::json!({ "flow": {
@@ -330,7 +378,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("durable parent"));
+        assert!(error.to_string().contains("server not initialized"));
     }
 
     #[tokio::test]
@@ -338,7 +386,9 @@ mod tests {
         let (_instance, session) = crate::test_support::fresh_session().await;
         let ctx =
             crate::test_support::tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
-        let tool = WorkflowTool;
+        let tool = WorkflowTool {
+            server: ServerSlot::default(),
+        };
         for bad in [
             serde_json::json!({"flow":{"kind":"sequence","steps":[{"agent":"a","task":"first"},{"kind":"loop","id":"l","body":{"agent":"a","task":"later"},"maxIterations":2}]}}),
             serde_json::json!({"flow":{"kind":"sequence","steps":[{"agent":"a","task":"first"},{"kind":"join","from":"missing","mode":"all"}]}}),

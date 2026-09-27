@@ -24,7 +24,7 @@ pub enum OutputMode {
 /// A node in the workflow graph. Internally tagged on `kind`, matching
 /// pi's discriminated union.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FlowSpec {
     Spawn(SpawnSpec),
     Sequence(SequenceSpec),
@@ -53,7 +53,7 @@ impl FlowSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpawnSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -66,7 +66,7 @@ pub struct SpawnSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SequenceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -76,7 +76,7 @@ pub struct SequenceSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ForkSpec {
     /// Required — the matching join references this id.
     pub id: String,
@@ -106,7 +106,7 @@ pub enum OnFailure {
 
 /// How a join folds the fork's branch results.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JoinReducer {
     /// Return the `{branches, errors}` structure verbatim.
     Collect,
@@ -115,7 +115,7 @@ pub enum JoinReducer {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentReducer {
     pub agent: String,
     pub task: String,
@@ -124,7 +124,7 @@ pub struct AgentReducer {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JoinSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -238,6 +238,34 @@ fn normalize_value_inner(
         .ok_or_else(|| format!("{label} must be an object or agent-name string."))?;
 
     let kind = obj.get("kind").and_then(|v| v.as_str());
+    let allowed: &[&str] = match kind {
+        None | Some("spawn") => &["kind", "id", "label", "agent", "task", "output"],
+        Some("sequence") => &["kind", "id", "label", "steps"],
+        Some("fork") => &[
+            "kind",
+            "id",
+            "label",
+            "branches",
+            "agent",
+            "taskTemplate",
+            "output",
+            "concurrency",
+        ],
+        Some("join") => &[
+            "kind",
+            "id",
+            "label",
+            "from",
+            "mode",
+            "quorum",
+            "reducer",
+            "onFailure",
+        ],
+        _ => &[],
+    };
+    if let Some(unknown) = obj.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{label} has unsupported field {unknown:?}."));
+    }
     match kind {
         None | Some("spawn") => normalize_spawn(obj, label, defaults),
         Some("sequence") => {
@@ -571,5 +599,33 @@ mod tests {
             canonical, back,
             "flow spec must round-trip byte-identically"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_scope_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_scope_hidden_in_late_node_or_reducer() {
+        assert!(
+            serde_json::from_value::<FlowSpec>(serde_json::json!({
+                "kind":"spawn", "agent":"a", "task":"do it", "workspace":"/tmp"
+            }))
+            .is_err()
+        );
+        for graph in [
+            serde_json::json!({"kind":"sequence","steps":[
+                {"agent":"a","task":"early"},
+                {"agent":"b","task":"later","workspace":"/tmp"}
+            ]}),
+            serde_json::json!({"kind":"sequence","steps":[
+                {"kind":"fork","id":"f","branches":{"a":{"agent":"a","task":"early"}}},
+                {"kind":"join","from":"f","mode":"all","reducer":{
+                    "kind":"agent","agent":"a","task":"reduce","scope":"private"}}
+            ]}),
+        ] {
+            assert!(parse_flow(&graph).is_err(), "unexpectedly accepted {graph}");
+        }
     }
 }
