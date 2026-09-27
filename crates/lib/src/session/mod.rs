@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 mod agents;
+pub mod jobs;
 mod keys;
 mod registry;
 mod transport;

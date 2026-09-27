@@ -1859,6 +1859,9 @@ impl Server {
         if !self.executor_authorized {
             anyhow::bail!("server has no executor loop");
         }
+        if crate::session::jobs::is_staged_job(session_db).await {
+            anyhow::bail!("staged job is not runnable");
+        }
         let session = Session::new(
             ConversationId(session_db.root_id().to_string()),
             session_db.clone(),
@@ -2296,10 +2299,9 @@ impl Server {
             .created_session_locally(&session.session_db_id)
             .await
             || session.status == crate::session::SessionStatus::Closed
-            || session
-                .source
-                .as_deref()
-                .is_some_and(|source| source.starts_with("spawn:"))
+            || session.source.as_deref().is_some_and(|source| {
+                source.starts_with("spawn:") || source.starts_with("job-stage:")
+            })
         {
             return true;
         }
