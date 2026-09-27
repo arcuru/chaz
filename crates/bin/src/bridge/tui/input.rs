@@ -6,6 +6,7 @@ use chaz_core::bridge::ApprovalDecision;
 use chaz_core::commands::Parsed;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     AgentDiffMode, App, ChatAction, ClickTarget, Completion, ModelPickerScope, Overlay,
@@ -521,6 +522,12 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
     }
 
     match key.code {
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.input.insert(app.cursor, '\n');
+            app.cursor += 1;
+            app.completion_dismissed = false;
+            recompute_completion(app);
+        }
         KeyCode::Enter => {
             // With the popup open, Enter completes the highlighted command
             // while there's still more of it to type. Once it's fully typed
@@ -570,7 +577,7 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::Backspace => {
             if app.cursor > 0 {
                 let prev = app.input[..app.cursor]
-                    .char_indices()
+                    .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -583,7 +590,7 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::Left => {
             if app.cursor > 0 {
                 app.cursor = app.input[..app.cursor]
-                    .char_indices()
+                    .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -592,7 +599,7 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::Right => {
             if app.cursor < app.input.len() {
                 app.cursor = app.input[app.cursor..]
-                    .char_indices()
+                    .grapheme_indices(true)
                     .nth(1)
                     .map(|(i, _)| app.cursor + i)
                     .unwrap_or(app.input.len());

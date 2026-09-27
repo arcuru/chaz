@@ -2296,6 +2296,32 @@ mod session_picker_tests {
         assert!(view::turn_activity_line(tab.active_turns).is_none());
     }
 
+    #[tokio::test]
+    async fn chat_composer_edits_graphemes_and_multiline() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        for c in "a界e\u{301}👍🏽z".chars() {
+            input::handle_chat_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .await;
+        }
+        assert_eq!(app.cursor, app.input.len());
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        input::handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await;
+        assert_eq!(app.input, "a界e\u{301}z");
+        assert_eq!(app.cursor, "a界e\u{301}".len());
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        assert_eq!(app.cursor, "a界".len());
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).await;
+        assert_eq!(app.input, "a界\ne\u{301}z");
+        assert_eq!(app.cursor, "a界\n".len());
+    }
+
     fn index(n: usize) -> SessionIndex {
         SessionIndex {
             session_db_id: format!("session-{n}"),

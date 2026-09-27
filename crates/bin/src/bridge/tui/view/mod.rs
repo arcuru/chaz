@@ -41,6 +41,7 @@ use theme::SYSTEM as COLOR_SYSTEM;
 use theme::TOOL as COLOR_TOOL;
 use theme::USER as COLOR_USER;
 
+mod composer;
 mod settings;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
@@ -354,13 +355,23 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     let ext_status_h: u16 = if ext_segments.is_empty() { 0 } else { 1 };
     // 1-line tab bar at the top. Always present even with one tab so the user
     // has a consistent affordance.
+    let composer = composer::layout(&app.input, app.cursor, f.area().width.saturating_sub(2));
+    // Reserve a transcript row even when the draft is taller than the screen.
+    let composer_h = (composer.lines.len().min(u16::MAX as usize) as u16)
+        .saturating_add(2)
+        .min(
+            f.area()
+                .height
+                .saturating_sub(3 + approval_h + ext_status_h)
+                .max(3),
+        );
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(approval_h),
         Constraint::Length(ext_status_h),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(composer_h),
     ])
     .split(f.area());
 
@@ -828,7 +839,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     );
     f.render_widget(status, chunks[4]);
 
-    let input = Paragraph::new(app.input.as_str()).block(
+    let visible_h = chunks[5].height.saturating_sub(2) as usize;
+    // Keep the cursor visible while the draft exceeds its available height.
+    let start = composer
+        .cursor_row
+        .saturating_sub(visible_h.saturating_sub(1));
+    let input = Paragraph::new(composer.lines[start..].join("\n")).block(
         Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(COLOR_DIM))
@@ -840,9 +856,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     // the transcript. Drawn after the transcript so it sits on top.
     render_completion_popup(f, app, chunks[1], chunks[5]);
 
-    let cursor_x = chunks[5].x + app.cursor as u16 + 1;
-    let cursor_y = chunks[5].y + 1;
-    f.set_cursor_position((cursor_x, cursor_y));
+    if visible_h > 0 {
+        f.set_cursor_position((
+            chunks[5].x + composer.cursor_col + 1,
+            chunks[5].y + (composer.cursor_row - start) as u16 + 1,
+        ));
+    }
 }
 
 /// Slash-command completion dropdown. Anchored to the bottom-left of the input
