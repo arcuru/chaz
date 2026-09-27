@@ -118,9 +118,8 @@ impl SessionRegistry {
     /// cannot be proven complete is *uncertain* and requires reconciliation;
     /// it is never replaced by another child. This API is not job acceptance.
     ///
-    /// Single-executor staging only: callers must serialize submission at the
-    /// trusted boundary. Eidetica's CRDT transactions do not provide a
-    /// cross-process compare-and-set for competing writers of this key.
+    /// Single-executor staging only: this serializes competing callers in
+    /// one registry; it is not a cross-process or cross-peer fence.
     pub async fn stage_agent_job(
         &self,
         parent_id: &str,
@@ -128,6 +127,9 @@ impl SessionRegistry {
         definition: StagedAgentDefinition,
     ) -> anyhow::Result<StagedJob> {
         anyhow::ensure!(!request_key.is_empty(), "job request key must not be empty");
+        // coding: global lock; use per-key locks if staging throughput matters.
+        let _guard = self.job_stage_lock.lock().await;
+        let label = source(parent_id, request_key);
         anyhow::ensure!(
             !definition.target.is_empty() && !definition.task.is_empty(),
             "job target and task are required"
@@ -141,7 +143,6 @@ impl SessionRegistry {
             "spawn depth exceeds ceiling"
         );
         let (_, parent) = self.open_session(parent_id).await?;
-        let label = source(parent_id, request_key);
         let prior = read_intent(&parent, request_key).await?;
         if let Some(ref intent) = prior {
             anyhow::ensure!(
@@ -225,7 +226,9 @@ impl SessionRegistry {
                 })?,
             )
             .await?;
-        txn.commit().await?;
+        txn.commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("uncertain job submission for request key: {e}"))?;
         write_intent(
             &parent,
             request_key,
@@ -234,7 +237,8 @@ impl SessionRegistry {
                 child_id: Some(id.0.clone()),
             },
         )
-        .await?;
+        .await
+        .map_err(|e| anyhow::anyhow!("uncertain job submission for request key: {e}"))?;
         Ok(StagedJob {
             session_db_id: id.0,
         })
@@ -256,6 +260,73 @@ mod tests {
             allowed_tools: vec!["calculate".into()],
             capability_ceiling: Grants::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn competing_submitters_share_one_staged_handle() {
+        let (_, registry) = make_registry().await;
+        let (_, parent) = registry.create_session(Some("cli")).await.unwrap();
+        let pid = parent.root_id().to_string();
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join_all((0..24).map(|_| {
+                let registry = registry.clone();
+                let pid = pid.clone();
+                async move {
+                    registry
+                        .stage_agent_job(&pid, "same.key", definition())
+                        .await
+                }
+            })),
+        )
+        .await
+        .expect("concurrent staging must terminate");
+        let ids: std::collections::HashSet<_> = results
+            .into_iter()
+            .map(|result| result.unwrap().session_db_id)
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            matching_rows(
+                &registry.list_sessions().await.unwrap(),
+                &source(&pid, "same.key")
+            )
+            .len(),
+            1
+        );
+        let id = ids.into_iter().next().unwrap();
+        let (id, child) = registry.open_session(&id).await.unwrap();
+        assert!(Session::new(id, child).await.entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn competing_mismatched_definitions_never_create_two_children() {
+        let (_, registry) = make_registry().await;
+        let (_, parent) = registry.create_session(Some("cli")).await.unwrap();
+        let pid = parent.root_id().to_string();
+        let mut other = definition();
+        other.capability_ceiling = Grants {
+            shell: Some(crate::grants::ShellGrant {
+                allow: crate::grants::Allowlist::Only(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (a, b) = tokio::join!(
+            registry.stage_agent_job(&pid, "collision", definition()),
+            registry.stage_agent_job(&pid, "collision", other)
+        );
+        assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1);
+        let error = a.err().or_else(|| b.err()).unwrap();
+        assert!(error.to_string().contains("different definition"));
+        assert_eq!(
+            matching_rows(
+                &registry.list_sessions().await.unwrap(),
+                &source(&pid, "collision")
+            )
+            .len(),
+            1
+        );
     }
 
     #[tokio::test]
