@@ -5362,6 +5362,33 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
             .await
             .unwrap();
     assert_eq!(client_view, finished);
+    Box::pin(async {
+        let altered = Session::new(ConversationId(accepted_id.clone()), client_child.clone()).await;
+        altered
+            .update_meta(|meta| meta.agents[0].home_pubkey = Some("other-home".into()))
+            .await
+            .unwrap();
+        assert!(
+            executor
+                .validate_accepted_job(&client_child)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Agent/home identity")
+        );
+        altered
+            .update_meta(|meta| meta.agents[0].home_pubkey = Some(agent.pubkey.to_string()))
+            .await
+            .unwrap();
+        assert!(
+            executor
+                .validate_accepted_job(&client_child)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    })
+    .await;
     // The same service remains alive while its executor generation dies.
     // A started model call may already have acted, so restart must not replay.
     mock.push_text("aborted response");
@@ -5399,7 +5426,15 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
     )
     .await
     .unwrap();
-    assert_eq!(mock.recorded_calls().len(), 2);
+    assert_eq!(
+        mock.recorded_calls().len(),
+        2,
+        "calls: {:?}",
+        mock.recorded_calls()
+            .iter()
+            .map(|c| format!("{:?}", c.messages))
+            .collect::<Vec<_>>()
+    );
     let (_, interrupted_db) = executor
         .registry()
         .open_session(&interrupted_id)
@@ -5412,6 +5447,166 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
             .unwrap()
             .directive_id,
     );
+    Box::pin(async {
+        // Same service login and Agent/home key, but a different process token.
+        let contender_connection =
+            crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+                .await
+                .unwrap();
+        let contender_registry = Arc::new(
+            crate::session::SessionRegistry::new(
+                contender_connection.instance,
+                contender_connection.user,
+                Arc::new(AgentRegistry::with_default_agent()),
+            )
+            .await
+            .unwrap(),
+        );
+        let contender_index = HostedIndex::empty("agent");
+        contender_index.register(agent.clone());
+        let contender = Server::new(
+            contender_registry.clone(),
+            Arc::new(AgentRegistry::with_default_agent()),
+            contender_index,
+            HostedIndex::empty("bank"),
+            HostedIndex::empty("skill_bank"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+            SecurityContext {
+                leak_detector: crate::security::LeakDetector::new(
+                    crate::security::LeakPolicy::default(),
+                ),
+                auto_approved_tools: Default::default(),
+                approval_callback: None,
+            },
+            HashMap::new(),
+            Default::default(),
+            Arc::new(crate::tool_host::NativeToolHost::new()),
+            Arc::new(crate::extension::ExtensionHub::new()),
+            crate::backends::BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(contender_registry.chaz_peer().clone()).await,
+            ),
+            Arc::new(crate::mcp::McpRegistry::new()),
+            Some(crate::instance::ExecutorCapability::for_test()),
+        );
+        let (_, contender_db) = contender_registry
+            .open_job_session(&interrupted_id)
+            .await
+            .unwrap();
+        let accepted = crate::session::jobs::read_accepted_job(&contender_db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(executor.job_incarnation, contender.job_incarnation);
+        let client_server = Server::new(
+            client_registry.clone(),
+            Arc::new(AgentRegistry::with_default_agent()),
+            HostedIndex::empty("agent"),
+            HostedIndex::empty("bank"),
+            HostedIndex::empty("skill_bank"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+            SecurityContext {
+                leak_detector: crate::security::LeakDetector::new(
+                    crate::security::LeakPolicy::default(),
+                ),
+                auto_approved_tools: Default::default(),
+                approval_callback: None,
+            },
+            HashMap::new(),
+            Default::default(),
+            Arc::new(crate::tool_host::NativeToolHost::new()),
+            Arc::new(crate::extension::ExtensionHub::new()),
+            contender.default_backend.clone(),
+            Arc::new(crate::mcp::McpRegistry::new()),
+            None,
+        );
+        assert!(
+            client_server
+                .claim_accepted_job(&contender_db, &accepted)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("client cannot claim")
+        );
+        client_server.shutdown().await;
+        assert!(
+            !contender
+                .claim_accepted_job(&contender_db, &accepted)
+                .await
+                .unwrap()
+        );
+        // Simulate a collision's delayed write arriving during an in-flight call.
+        // The overlap is allowed, but the loser must stop without erasing history.
+        let winner = crate::session::jobs::JobOwner {
+            peer: agent.pubkey.to_string(),
+            agent_db_id: agent.db_id.to_string(),
+            incarnation: contender.job_incarnation.clone(),
+            refreshed_at: Utc::now(),
+        };
+        let txn = contender_db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("job_owner")
+            .await
+            .unwrap()
+            .set_string("v1", serde_json::to_string(&winner).unwrap())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if crate::session::jobs::job_stop_count(&contender_db)
+                    .await
+                    .unwrap()
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("claim loss must durably stop the first attempt");
+        crate::session::jobs::record_job_stop(
+            &contender_db,
+            &executor.interrupted_turns(&interrupted_id).await.unwrap()[0].attempt_id,
+            &executor.job_incarnation,
+            &winner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::session::jobs::job_stop_count(&contender_db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            executor.job_status(&interrupted_id).await.unwrap().state,
+            crate::session::jobs::JobState::Interrupted { .. }
+        ));
+        assert_eq!(
+            mock.recorded_calls().len(),
+            2,
+            "loss must not replay the uncertain attempt"
+        );
+        let retained =
+            Session::new(ConversationId(interrupted_id.clone()), contender_db.clone()).await;
+        assert!(
+            retained
+                .entries()
+                .iter()
+                .any(|entry| entry.entry_type == EntryType::Directive)
+        );
+        assert!(
+            retained
+                .entries()
+                .iter()
+                .any(|entry| entry.entry_type == EntryType::Ack)
+        );
+        contender.shutdown().await;
+    })
+    .await;
     executor.shutdown().await;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),

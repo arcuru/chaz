@@ -257,6 +257,7 @@ impl Server {
             }
         }
         self.watched.lock().await.insert(session_db_id.clone());
+        self.maintain_job_claim(child_db.clone(), accepted);
         // Reconcile the persisted Directive even if the acceptance commit
         // preceded this callback or the process restarted after acceptance.
         let _ = self
@@ -406,6 +407,14 @@ impl Server {
             child_db.clone(),
         )
         .await;
+        let child_meta = child.read_meta().await;
+        anyhow::ensure!(
+            child_meta.agents.len() == 1
+                && child_meta.agents[0].db_id == target.db_id.to_string()
+                && child_meta.agents[0].home_pubkey.as_deref()
+                    == Some(accepted.definition.executor_pubkey.as_str()),
+            "accepted job child Agent/home identity differs"
+        );
         let mut entries = child.entries_with_ids();
         let only = entries
             .next()
@@ -599,5 +608,115 @@ impl Server {
             | SessionCommandOutcome::Failed { message } => anyhow::bail!(message),
             _ => anyhow::bail!("job command settled with a non-job result"),
         }
+    }
+}
+
+impl Server {
+    /// Only the executor with the accepted Agent/home identity can claim. A
+    /// pubkey identifies the home peer, not a process generation.
+    pub(super) async fn claim_accepted_job(
+        &self,
+        db: &eidetica::Database,
+        accepted: &AcceptedAgentJob,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(self.executor_authorized, "client cannot claim agent jobs");
+        let target = self
+            .agent_index
+            .find_by_name(&accepted.definition.target)
+            .ok_or_else(|| anyhow::anyhow!("claim target Agent is not hosted"))?;
+        anyhow::ensure!(
+            target.pubkey.to_string() == accepted.definition.executor_pubkey
+                && self
+                    .peer_is_home_for(&db.root_id().to_string(), &target.display_name)
+                    .await,
+            "claimant does not hold target Agent/home identity"
+        );
+        // Recheck the full inherited authority before taking an ownership turn.
+        anyhow::ensure!(
+            self.validate_accepted_job(db).await?.as_ref() == Some(accepted),
+            "job admission authority changed"
+        );
+        crate::session::jobs::claim_job(
+            db,
+            &target.pubkey.to_string(),
+            &target.db_id.to_string(),
+            &self.job_incarnation,
+        )
+        .await
+    }
+
+    /// A registered job keeps its claim fresh and periodically retries stale
+    /// claims after executor death; wakeups also arrive on session DB writes.
+    pub(super) fn maintain_job_claim(&self, db: eidetica::Database, accepted: AcceptedAgentJob) {
+        let notify = self.notify_tx.clone();
+        let incarnation = self.job_incarnation.clone();
+        let authorized = self.executor_authorized;
+        let peer = accepted.definition.executor_pubkey.clone();
+        let agent_db_id = self
+            .agent_index
+            .find_by_name(&accepted.definition.target)
+            .expect("validated target")
+            .db_id
+            .to_string();
+        let shutdown = self.shutting_down.clone();
+        let live_attempts = self.live_attempts.clone();
+        self.track_task(tokio::spawn(async move {
+            if !authorized {
+                return;
+            }
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                // Don't renew a settled job. An interrupted attempt stays held
+                // until explicit retry, even after a new process takes over.
+                match crate::session::jobs::read_job_result(&db).await {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Job receipt read failed; pausing claim refresh");
+                        continue;
+                    }
+                }
+                let meta = crate::session::read_meta_from_db(&db).await;
+                if meta.agents.len() != 1
+                    || meta.agents[0].db_id != agent_db_id
+                    || meta.agents[0].home_pubkey.as_deref() != Some(peer.as_str())
+                {
+                    tracing::warn!("Job Agent/home identity changed; stopping claim refresh");
+                    break;
+                }
+                let live = live_attempts.lock().await.clone();
+                match crate::session::jobs::status_from_db(&db, &live, true).await {
+                    Ok(status) if status.state.is_terminal() => break,
+                    Ok(status)
+                        if matches!(
+                            status.state,
+                            crate::session::jobs::JobState::Interrupted { .. }
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Job status read failed; pausing claim refresh");
+                        continue;
+                    }
+                }
+                match crate::session::jobs::claim_job(&db, &peer, &agent_db_id, &incarnation).await
+                {
+                    Ok(true) => {
+                        let _ = notify
+                            .send(super::ProcessingCommand::Wake(db.root_id().to_string()))
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(%error, "Job claim refresh failed"),
+                }
+            }
+        }));
     }
 }

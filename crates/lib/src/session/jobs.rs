@@ -962,3 +962,182 @@ mod tests {
         );
     }
 }
+
+// A session-DB last-writer-wins claim is deliberately not a fence. Claim
+// collisions and delayed observations may overlap model/tool side effects.
+const JOB_OWNER: &str = "job_owner";
+const JOB_STOPS: &str = "job_stops";
+const CLAIM_TTL: chrono::Duration = chrono::Duration::seconds(4);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct JobOwner {
+    pub peer: String,
+    pub agent_db_id: String,
+    pub incarnation: String,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl JobOwner {
+    pub fn is_live(&self) -> bool {
+        self.refreshed_at > chrono::Utc::now() - CLAIM_TTL
+    }
+}
+
+pub(crate) async fn read_job_owner(db: &eidetica::Database) -> anyhow::Result<Option<JobOwner>> {
+    let txn = db.new_transaction().await?;
+    let doc = txn
+        .get_store::<DocStore>(JOB_OWNER)
+        .await?
+        .get_all()
+        .await?;
+    doc.get("v1")
+        .map(|value| -> anyhow::Result<JobOwner> {
+            let json: String = value.try_into()?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .transpose()
+}
+
+/// Caller checks role and hosted Agent/home identity before writing.
+pub(crate) async fn claim_job(
+    db: &eidetica::Database,
+    peer: &str,
+    agent_db_id: &str,
+    incarnation: &str,
+) -> anyhow::Result<bool> {
+    let current = read_job_owner(db).await?;
+    if current
+        .as_ref()
+        .is_some_and(|owner| owner.is_live() && owner.incarnation != incarnation)
+    {
+        return Ok(false);
+    }
+    let owner = JobOwner {
+        peer: peer.to_string(),
+        agent_db_id: agent_db_id.to_string(),
+        incarnation: incarnation.to_string(),
+        refreshed_at: chrono::Utc::now(),
+    };
+    let txn = db.new_transaction().await?;
+    txn.get_store::<DocStore>(JOB_OWNER)
+        .await?
+        .set_string("v1", serde_json::to_string(&owner)?)
+        .await?;
+    txn.commit().await?;
+    owns_job(db, incarnation).await
+}
+
+/// Stable marker key: retrying after an uncertain write doesn't add another.
+pub(crate) async fn record_job_stop(
+    db: &eidetica::Database,
+    attempt_id: &str,
+    loser: &str,
+    winner: &JobOwner,
+) -> anyhow::Result<()> {
+    let key = format!("{loser}:{attempt_id}");
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(JOB_STOPS).await?;
+    if store.get_all().await?.get(&key).is_none() {
+        store
+            .set_string(
+                &key,
+                serde_json::to_string(&serde_json::json!({
+                    "attempt_id": attempt_id, "loser": loser, "winner": winner.incarnation,
+                    "observed_at": chrono::Utc::now(),
+                }))?,
+            )
+            .await?;
+        txn.commit().await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn job_stop_count(db: &eidetica::Database) -> anyhow::Result<usize> {
+    let txn = db.new_transaction().await?;
+    Ok(txn
+        .get_store::<DocStore>(JOB_STOPS)
+        .await?
+        .get_all()
+        .await?
+        .iter()
+        .count())
+}
+
+pub(crate) async fn owns_job(db: &eidetica::Database, incarnation: &str) -> anyhow::Result<bool> {
+    Ok(read_job_owner(db)
+        .await?
+        .is_some_and(|owner| owner.incarnation == incarnation && owner.is_live()))
+}
+
+/// Watch writes, with a bounded poll in case the callback misses one.
+pub(crate) async fn wait_for_claim_loss(
+    db: &eidetica::Database,
+    incarnation: &str,
+) -> anyhow::Result<JobOwner> {
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signal = notify.clone();
+    let tips = db.snapshot().await?;
+    let _callback = db
+        .on_write_at_tips(tips, move |_, _| {
+            let signal = signal.clone();
+            async move {
+                signal.notify_one();
+                Ok(())
+            }
+        })
+        .await?;
+    loop {
+        if let Some(owner) = read_job_owner(db).await?
+            && owner.incarnation != incarnation
+        {
+            return Ok(owner);
+        }
+        tokio::select! {
+            _ = notify.notified() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::session::test_helpers::make_registry;
+
+    #[tokio::test]
+    async fn live_claim_refuses_rival_and_expired_claim_can_be_replaced() {
+        let (_, registry) = make_registry().await;
+        let (_, db) = registry.create_session(Some("claim-test")).await.unwrap();
+        assert!(claim_job(&db, "peer", "agent", "process-a").await.unwrap());
+        assert!(!claim_job(&db, "peer", "agent", "process-b").await.unwrap());
+        assert_eq!(
+            read_job_owner(&db).await.unwrap().unwrap().incarnation,
+            "process-a"
+        );
+        let txn = db.new_transaction().await.unwrap();
+        let stale = JobOwner {
+            peer: "peer".into(),
+            agent_db_id: "agent".into(),
+            incarnation: "process-a".into(),
+            refreshed_at: chrono::Utc::now() - CLAIM_TTL - chrono::Duration::seconds(1),
+        };
+        txn.get_store::<DocStore>(JOB_OWNER)
+            .await
+            .unwrap()
+            .set_string("v1", serde_json::to_string(&stale).unwrap())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(claim_job(&db, "peer", "agent", "process-b").await.unwrap());
+        assert!(!owns_job(&db, "process-a").await.unwrap());
+        let winner = read_job_owner(&db).await.unwrap().unwrap();
+        record_job_stop(&db, "attempt-1", "process-a", &winner)
+            .await
+            .unwrap();
+        record_job_stop(&db, "attempt-1", "process-a", &winner)
+            .await
+            .unwrap();
+        assert_eq!(job_stop_count(&db).await.unwrap(), 1);
+    }
+}
