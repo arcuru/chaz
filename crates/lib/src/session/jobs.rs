@@ -9,6 +9,7 @@ use super::{SessionIndex, SessionRegistry};
 use crate::grants::Grants;
 use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const INTENTS: &str = "job_intents";
 const DEFINITION: &str = "job_definition";
@@ -23,6 +24,9 @@ pub struct StagedAgentDefinition {
     pub max_call_depth: usize,
     /// Concrete tool names, captured before any turn can run (not glob patterns).
     pub allowed_tools: Vec<String>,
+    // Snapshot of the parent effective grant for each pinned tool name.
+    // Target policy may narrow this, never replace or widen it.
+    pub tool_ceilings: BTreeMap<String, Grants>,
     pub capability_ceiling: Grants,
 }
 
@@ -142,6 +146,15 @@ impl SessionRegistry {
             definition.call_depth <= definition.max_call_depth,
             "spawn depth exceeds ceiling"
         );
+        anyhow::ensure!(
+            definition.tool_ceilings.len() == definition.allowed_tools.len()
+                && definition.allowed_tools.iter().all(|name| {
+                    !name.is_empty()
+                        && name != "spawn_worker"
+                        && definition.tool_ceilings.contains_key(name)
+                }),
+            "job tools require one pinned grant ceiling per permitted name; spawn_worker is not a durable job child"
+        );
         let (_, parent) = self.open_session(parent_id).await?;
         let prior = read_intent(&parent, request_key).await?;
         if let Some(ref intent) = prior {
@@ -258,6 +271,7 @@ mod tests {
             call_depth: 1,
             max_call_depth: 3,
             allowed_tools: vec!["calculate".into()],
+            tool_ceilings: BTreeMap::from([("calculate".into(), Grants::default())]),
             capability_ceiling: Grants::default(),
         }
     }
@@ -455,5 +469,65 @@ mod tests {
                 .as_deref(),
             Some(child_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn staging_refuses_missing_or_untracked_tool_ceilings() {
+        let (_, registry) = make_registry().await;
+        let (_, parent) = registry.create_session(Some("cli")).await.unwrap();
+        let pid = parent.root_id().to_string();
+        let mut missing = definition();
+        missing.tool_ceilings.clear();
+        assert!(
+            registry
+                .stage_agent_job(&pid, "missing", missing)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pinned grant ceiling")
+        );
+        let mut worker = definition();
+        worker.allowed_tools = vec!["spawn_worker".into()];
+        worker.tool_ceilings = BTreeMap::from([("spawn_worker".into(), Grants::default())]);
+        assert!(
+            registry
+                .stage_agent_job(&pid, "worker", worker)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("spawn_worker")
+        );
+        assert!(registry.list_sessions().await.unwrap().iter().all(|s| {
+            !s.source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("job-stage:"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn child_snapshot_pins_only_current_parent_tools_and_effective_grants() {
+        use crate::grants::{Allowlist, ShellGrant};
+        use crate::test_support::{fresh_session, tool_context};
+        use crate::tool::{ScopedTools, ToolPolicyRegistry, ToolRegistry};
+        use std::sync::Arc;
+
+        let (_instance, session) = fresh_session().await;
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(crate::tools::Calculate);
+        registry.register(crate::tools::GetTime);
+        let mut ctx = tool_context(session, registry.clone());
+        ctx.tools = ScopedTools::new(registry, Some(vec!["calculate".into()]));
+        let bound = Grants {
+            shell: Some(ShellGrant {
+                allow: Allowlist::Only(vec!["cat".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ctx.agent_grants.insert("calculate".into(), bound.clone());
+        let snapshot = ctx.delegable_tool_ceilings(&ToolPolicyRegistry::empty());
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.get("calculate"), Some(&bound));
+        assert!(!snapshot.contains_key("get_time"));
     }
 }

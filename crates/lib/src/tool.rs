@@ -327,6 +327,27 @@ impl ToolContext {
             .attenuate(self.agent_grants.get(tool_name))
     }
 
+    /// Bound a durable child to the parent's current per-tool policy and grants.
+    // spawn_worker has no restartable authority record in v1; exclude it.
+    pub fn delegable_tool_ceilings(
+        &self,
+        policies: &ToolPolicyRegistry,
+    ) -> std::collections::BTreeMap<String, Grants> {
+        self.tools
+            .permitted_names()
+            .into_iter()
+            .filter(|name| name != "spawn_worker")
+            .filter_map(|name| {
+                let tool = self.tools.get(&name)?;
+                let policy = policies.resolve(tool.as_ref());
+                Some((
+                    name.clone(),
+                    self.resolve_call_grants(&policy.grants, &name),
+                ))
+            })
+            .collect()
+    }
+
     /// Access the execution host for sandboxed capability requests.
     pub fn host(&self) -> &dyn ToolHost {
         self.host.as_ref()
@@ -851,6 +872,19 @@ impl ScopedTools {
             allowed: narrowed,
             active_extensions: self.active_extensions.clone(),
         }
+    }
+
+    // Pin a concrete name set for a durable child. New MCP tools and newly
+    // activated extensions must not appear merely because the executor restarted.
+    pub fn permitted_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .definitions(&ToolProfile::default())
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn is_empty(&self) -> bool {

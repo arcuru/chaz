@@ -5153,6 +5153,7 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
                 call_depth: 1,
                 max_call_depth: 3,
                 allowed_tools: vec![],
+                tool_ceilings: Default::default(),
                 capability_ceiling: Default::default(),
             },
         )
