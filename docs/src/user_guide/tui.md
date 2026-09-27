@@ -46,7 +46,7 @@ The TUI has four main pieces:
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
 • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
    when those modes are on.
-4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight. The input wraps at the terminal edge and grows with the draft (keeping a message row visible); on a small terminal the box scrolls to keep the cursor visible. Use `Shift+Enter` for a new line, `Enter` to send, and `Left`/`Right` to move by a visible character (including combined Unicode characters).
+4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight. The input wraps at the terminal edge and grows with the draft, capped so it never takes the whole frame (a long draft squeezes the transcript instead); past that cap the box scrolls to keep the cursor visible. Use `Alt+Enter` for a new line, `Enter` to send, and `Left`/`Right` to move by a visible character (including combined Unicode characters).
 
 When prior sessions exist, the TUI opens straight into the session picker on launch so you choose which one to resume (or pick the "New session" row). A truly fresh state directory drops directly into the default `tui` session.
 
@@ -192,6 +192,7 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 | `Up` / `Down`                   | Move completion selection if popup is open; else scroll history (3) |
 | `PageUp` / `PageDown`           | Fast scroll history (20 lines)                                      |
 | `Home` / `End`                  | Move cursor to start / end of input                                 |
+| `Alt+Enter`                     | Insert a line break in the draft instead of sending                 |
 | `Esc`                           | First press: dismiss completion popup. Second (no popup): quit      |
 | `F1`                            | Open the help overlay                                               |
 | `Ctrl+P`                        | Toggle the session picker                                           |
@@ -308,7 +309,7 @@ Typing in the search box does fzf-style fuzzy matching across model ids and capa
 | `Ctrl+U`              | Clear the search query                              |
 | `Esc`                 | Dismiss without changing anything; return to Models |
 
-There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open.
+There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open. The same limitation is why a draft line break is bound to `Alt+Enter` rather than `Shift+Enter`: only terminals that negotiate the enhanced protocol report the `Shift`, which is also accepted where it arrives.
 
 ## Live turn activity
 
