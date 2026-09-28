@@ -5084,1296 +5084,7 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     task.await.unwrap().unwrap();
 }
 
-// Submit through the client-writable parent and wait only for the typed handle.
-async fn submit_capacity_test_job(
-    executor: &Arc<Server>,
-    parent: &eidetica::Database,
-    parent_id: &str,
-    key: &str,
-) -> String {
-    let command_id = crate::session::TurnRequestId::parse(key);
-    Session::new(ConversationId(parent_id.to_string()), parent.clone())
-        .await
-        .submit_command(crate::session::SessionCommandRequest {
-            command_id: command_id.clone(),
-            sender: "client".into(),
-            created_at: Utc::now(),
-            command: crate::session::SessionCommand::SubmitAgent {
-                agent_ref: "default".into(),
-                task: key.into(),
-            },
-        })
-        .await
-        .unwrap();
-    let observer = executor.observe_session_command(parent_id).await.unwrap();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        observer.wait(&command_id),
-    )
-    .await
-    .expect("submission must not wait for a model slot")
-    .unwrap();
-    match result.outcome {
-        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
-        other => panic!("expected job handle, got {other:?}"),
-    }
-}
-
-async fn exercise_job_capacity(
-    restarted: &Arc<Server>,
-    parent: &eidetica::Database,
-    parent_id: &str,
-    mock: &Arc<crate::test_support::MockBackend>,
-) -> String {
-    // Hold every real runtime permit. The child is adopted, but no attempt,
-    // Ack, or backend call may occur while there is no execution capacity.
-    Box::pin(async {
-        let permits = restarted
-            .semaphore
-            .clone()
-            .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
-            .await
-            .unwrap();
-        mock.push_text("capacity released");
-        let released_id =
-            submit_capacity_test_job(restarted, parent, parent_id, "capacity-release").await;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !restarted.is_watching_session(&released_id).await
-                || !restarted.processing.lock().await.contains(&released_id)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("accepted job must wait for a permit without blocking admission");
-        let (_, db) = restarted
-            .registry()
-            .open_session(&released_id)
-            .await
-            .unwrap();
-        let accepted = crate::session::jobs::read_accepted_job(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        let attempts = db
-            .new_transaction()
-            .await
-            .unwrap()
-            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
-            .await
-            .unwrap()
-            .search(|_| true)
-            .await
-            .unwrap();
-        assert!(
-            attempts.is_empty(),
-            "capacity wait must not persist an attempt"
-        );
-        let session = Session::new(ConversationId(released_id.clone()), db).await;
-        assert!(
-            !session
-                .entries()
-                .iter()
-                .any(|entry| entry.entry_type == EntryType::Ack)
-        );
-        assert!(!accepted.directive_id.is_empty());
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert_eq!(
-            restarted.job_status(&released_id).await.unwrap().state,
-            crate::session::jobs::JobState::Queued
-        );
-        assert_eq!(mock.recorded_calls().len(), 3);
-        drop(permits);
-        assert_eq!(
-            restarted
-                .wait_job(&released_id, std::time::Duration::from_secs(10))
-                .await
-                .unwrap()
-                .state,
-            crate::session::jobs::JobState::Succeeded {
-                text: Some("capacity released".into())
-            }
-        );
-        assert_eq!(mock.recorded_calls().len(), 4);
-    })
-    .await;
-
-    // A fully adopted, capacity-waiting job survives executor shutdown and
-    // runs once when the next generation has available capacity.
-    let permits = restarted
-        .semaphore
-        .clone()
-        .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
-        .await
-        .unwrap();
-    mock.push_text("queued resumed");
-    let queued_id =
-        submit_capacity_test_job(restarted, parent, parent_id, "queued-job-request").await;
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !restarted.is_watching_session(&queued_id).await
-            || !restarted.processing.lock().await.contains(&queued_id)
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("job must be waiting for capacity before restart");
-    let (_, queued_db) = restarted.registry().open_session(&queued_id).await.unwrap();
-    let attempts = queued_db
-        .new_transaction()
-        .await
-        .unwrap()
-        .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
-        .await
-        .unwrap()
-        .search(|_| true)
-        .await
-        .unwrap();
-    assert!(attempts.is_empty());
-    assert_eq!(
-        restarted.job_status(&queued_id).await.unwrap().state,
-        crate::session::jobs::JobState::Queued
-    );
-    assert_eq!(mock.recorded_calls().len(), 4);
-    restarted.shutdown().await;
-    drop(permits);
-    queued_id
-}
-
-async fn exercise_capacity_claim_loss(
-    executor: &Arc<Server>,
-    parent: &eidetica::Database,
-    parent_id: &str,
-    agent: &DbEntry,
-    mock: &Arc<crate::test_support::MockBackend>,
-) {
-    Box::pin(async {
-        let permits = executor
-            .semaphore
-            .clone()
-            .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
-            .await
-            .unwrap();
-        let lost_id =
-            submit_capacity_test_job(executor, parent, parent_id, "capacity-claim-loss").await;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !executor.processing.lock().await.contains(&lost_id) {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let (_, db) = executor.registry().open_session(&lost_id).await.unwrap();
-        let other = crate::session::jobs::JobOwner {
-            peer: agent.pubkey.to_string(),
-            agent_db_id: agent.db_id.to_string(),
-            incarnation: "other-live-incarnation".into(),
-            refreshed_at: Utc::now(),
-        };
-        let txn = db.new_transaction().await.unwrap();
-        txn.get_store::<eidetica::store::DocStore>("job_owner")
-            .await
-            .unwrap()
-            .set_string("v1", serde_json::to_string(&other).unwrap())
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-        drop(permits);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(
-            executor.job_status(&lost_id).await.unwrap().state,
-            crate::session::jobs::JobState::Queued
-        );
-        assert_eq!(
-            mock.recorded_calls().len(),
-            6,
-            "lost claim must not start a model"
-        );
-        let attempts = db
-            .new_transaction()
-            .await
-            .unwrap()
-            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
-            .await
-            .unwrap()
-            .search(|_| true)
-            .await
-            .unwrap();
-        assert!(
-            attempts.is_empty(),
-            "losing a capacity waiter cannot start an attempt"
-        );
-    })
-    .await;
-}
-
-// Public status/wait from a separate, non-hosting client connection.
-async fn observe_agent_job_as_client(
-    registry: Arc<crate::session::SessionRegistry>,
-    parent: &eidetica::Database,
-    parent_id: &str,
-    key: &crate::session::TurnRequestId,
-    handle: &str,
-    mock: &crate::test_support::MockBackend,
-) -> Arc<Server> {
-    let client = client_server_fixture_from_registry(registry).await;
-    assert!(!client.is_executor_authorized());
-    assert!(!client.job_status(handle).await.unwrap().state.is_terminal());
-    let pending = client
-        .wait_job(handle, std::time::Duration::from_millis(20))
-        .await
-        .unwrap();
-    assert!(
-        !pending.state.is_terminal(),
-        "timeout must not cancel the job"
-    );
-    let session = Session::new(ConversationId(parent_id.to_string()), parent.clone()).await;
-    session
-        .submit_command(crate::session::SessionCommandRequest {
-            command_id: key.clone(),
-            sender: "client".into(),
-            created_at: Utc::now(),
-            command: crate::session::SessionCommand::SubmitAgent {
-                agent_ref: "default".into(),
-                task: "trusted child work".into(),
-            },
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        client
-            .lookup_job(parent_id, key.as_str())
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(handle)
-    );
-    assert!(
-        session
-            .submit_command(crate::session::SessionCommandRequest {
-                command_id: key.clone(),
-                sender: "client".into(),
-                created_at: Utc::now(),
-                command: crate::session::SessionCommand::SubmitAgent {
-                    agent_ref: "default".into(),
-                    task: "different definition".into(),
-                },
-            })
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("different payload")
-    );
-    assert_eq!(
-        client
-            .lookup_job(parent_id, key.as_str())
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(handle)
-    );
-    assert_eq!(mock.recorded_calls().len(), 1);
-    // Syntactically valid but not mapped to this login: a handle is not a permission grant.
-    let unowned = "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm";
-    assert!(client.job_status(unowned).await.is_err());
-    assert!(
-        client
-            .wait_job(unowned, std::time::Duration::from_millis(20))
-            .await
-            .is_err()
-    );
-    client
-}
-
-#[tokio::test]
-async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directive() {
-    use crate::session::jobs::StagedAgentDefinition;
-    use eidetica::service::ServiceServer;
-    use tokio::sync::watch;
-
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("inert-job.sock");
-    let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
-            .await
-            .unwrap();
-    let (agent_db, agent_pubkey) = create_agent_db(
-        &mut owner_user,
-        "default",
-        &AgentDbConfig::default(),
-        &AgentMeta {
-            display_name: Some("default".into()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let agent = DbEntry {
-        db_id: agent_db.id(),
-        display_name: "default".into(),
-        pubkey: agent_pubkey,
-    };
-    let service = ServiceServer::bind(owner, &socket).await.unwrap();
-    let (shutdown, receiver) = watch::channel(());
-    let task = tokio::spawn(service.run(receiver));
-    let settings = crate::config::EideticaConfig {
-        connection: format!("unix://{}", socket.display()),
-        login: crate::config::EideticaLoginConfig {
-            username: "job-test".into(),
-            password: None,
-            passwordless: true,
-        },
-        sync: None,
-    };
-    let agents = Arc::new(AgentRegistry::with_default_agent());
-    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
-        .await
-        .unwrap();
-    let client_registry = Arc::new(
-        crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
-            .await
-            .unwrap(),
-    );
-    let (_, parent) = client_registry
-        .create_session(Some("local-client"))
-        .await
-        .unwrap();
-    let parent_id = parent.root_id().to_string();
-    client_registry
-        .attach_agent_to_session(&parent_id, &agent)
-        .await
-        .unwrap();
-    let staged = client_registry
-        .stage_agent_job(
-            &parent_id,
-            "untrusted-key",
-            StagedAgentDefinition {
-                target: "default".into(),
-                task: "must not execute".into(),
-                executor_pubkey: agent.pubkey.to_string(),
-                call_depth: 1,
-                max_call_depth: 3,
-                allowed_tools: vec![],
-                tool_ceilings: Default::default(),
-                capability_ceiling: Default::default(),
-            },
-        )
-        .await
-        .unwrap();
-    client_registry
-        .attach_agent_to_session(&staged.session_db_id, &agent)
-        .await
-        .unwrap();
-    let (_, child) = client_registry
-        .open_session(&staged.session_db_id)
-        .await
-        .unwrap();
-    let mut child_session =
-        Session::new(ConversationId(staged.session_db_id.clone()), child.clone()).await;
-    child_session
-        .add_entry(SessionEntry {
-            sender: "client".into(),
-            content: "forged runnable directive".into(),
-            timestamp: Utc::now(),
-            entry_type: EntryType::Directive,
-            metadata: None,
-            routing: None,
-        })
-        .await
-        .unwrap();
-
-    // A new resident scans the shared service catalog and the agent registry;
-    // neither path may treat a client's child-DB write as job acceptance.
-    let resident = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
-        .await
-        .unwrap();
-    let registry = Arc::new(
-        crate::session::SessionRegistry::new(resident.instance, resident.user, agents.clone())
-            .await
-            .unwrap(),
-    );
-    let mock = Arc::new(crate::test_support::MockBackend::new());
-    mock.push_text("incorrect execution");
-    let backend = crate::backends::BackendManager::with_mock(
-        mock.clone(),
-        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
-    );
-    let agent_index = HostedIndex::empty("agent");
-    agent_index.register(agent.clone());
-    let executor = Server::new(
-        registry,
-        agents,
-        agent_index,
-        HostedIndex::empty("bank"),
-        HostedIndex::empty("skill_bank"),
-        Arc::new(ToolRegistry::new()),
-        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-        SecurityContext {
-            leak_detector: crate::security::LeakDetector::new(
-                crate::security::LeakPolicy::default(),
-            ),
-            auto_approved_tools: std::collections::HashSet::new(),
-            approval_callback: None,
-        },
-        HashMap::new(),
-        Default::default(),
-        Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
-        backend,
-        Arc::new(crate::mcp::McpRegistry::new()),
-        Some(crate::instance::ExecutorCapability::for_test()),
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !executor.is_watching_session(&parent_id).await {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("resident must adopt the writable parent before testing child exclusion");
-    let (_, resident_child) = executor
-        .registry()
-        .open_session(&staged.session_db_id)
-        .await
-        .unwrap();
-    assert!(
-        executor
-            .register_session(
-                &resident_child,
-                executor.default_backend.clone(),
-                None,
-                None
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("staged job is not runnable")
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert_eq!(
-        mock.recorded_calls().len(),
-        0,
-        "staged child must remain inert"
-    );
-    assert!(!executor.is_watching_session(&staged.session_db_id).await);
-    assert!(executor.runtime_owner_of(&staged.session_db_id).is_none());
-    let narrow_executor = executor.clone();
-    let narrow_parent = parent.clone();
-    let narrow_parent_id = parent_id.clone();
-    tokio::spawn(async move {
-        let parent_session = Session::new(
-            ConversationId(narrow_parent_id.clone()), narrow_parent,
-        ).await;
-        parent_session.update_meta(|meta| {
-            meta.capabilities.shell = Some(crate::grants::ShellGrant {
-                allow: crate::grants::Allowlist::Only(vec![]),
-                ..Default::default()
-            });
-        }).await.unwrap();
-        let command_id = crate::session::TurnRequestId::parse("narrow-job-rejected");
-        parent_session.submit_command(crate::session::SessionCommandRequest {
-            command_id: command_id.clone(), sender: "client".into(),
-            created_at: Utc::now(),
-            command: crate::session::SessionCommand::SubmitAgent {
-                agent_ref: "default".into(), task: "not in broad mode".into(),
-            },
-        }).await.unwrap();
-        let observer = narrow_executor.observe_session_command(&narrow_parent_id).await.unwrap();
-        let rejected = tokio::time::timeout(
-            std::time::Duration::from_secs(10), observer.wait(&command_id)
-        ).await.unwrap().unwrap();
-        assert!(matches!(rejected.outcome,
-            crate::session::SessionCommandOutcome::Rejected { ref message } if message.contains("narrow")));
-        assert!(narrow_executor.registry().lookup_job_by_key(&narrow_parent_id, command_id.as_str())
-            .await.unwrap().is_none());
-        parent_session.update_meta(|meta| meta.capabilities = Default::default())
-            .await.unwrap();
-    }).await.unwrap();
-    let gate = mock.block_next_call();
-    // A typed request in the writable parent is different: the executor
-    // validates it and alone admits its child. It returns a DB handle before
-    // the eventual agent response and never runs the earlier forged child.
-    let command_id = crate::session::TurnRequestId::parse("trusted-job-request");
-    Session::new(ConversationId(parent_id.clone()), parent.clone())
-        .await
-        .submit_command(crate::session::SessionCommandRequest {
-            command_id: command_id.clone(),
-            sender: "client".into(),
-            created_at: Utc::now(),
-            command: crate::session::SessionCommand::SubmitAgent {
-                agent_ref: "default".into(),
-                task: "trusted child work".into(),
-            },
-        })
-        .await
-        .unwrap();
-    let observer = executor.observe_session_command(&parent_id).await.unwrap();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        observer.wait(&command_id),
-    )
-    .await
-    .expect("executor must settle the accepted request")
-    .unwrap();
-    let accepted_id = match result.outcome {
-        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
-        other => panic!("expected job handle, got {other:?}"),
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !executor.is_watching_session(&accepted_id).await || mock.recorded_calls().is_empty()
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("executor must adopt and execute accepted child");
-    assert_eq!(
-        mock.recorded_calls().len(),
-        1,
-        "forged child must remain inert"
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
-        .await
-        .expect("accepted job must begin its model call");
-    assert!(
-        !executor
-            .job_status(&accepted_id)
-            .await
-            .unwrap()
-            .state
-            .is_terminal(),
-        "the handle must be returned before the child finishes"
-    );
-    let client_observer = Box::pin(observe_agent_job_as_client(
-        client_registry.clone(),
-        &parent,
-        &parent_id,
-        &command_id,
-        &accepted_id,
-        &mock,
-    ))
-    .await;
-    gate.release();
-    let client_finished = client_observer
-        .wait_job(&accepted_id, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert!(client_finished.state.is_terminal());
-    assert_eq!(
-        client_observer.job_status(&accepted_id).await.unwrap(),
-        client_finished
-    );
-    assert_eq!(
-        mock.recorded_calls().len(),
-        1,
-        "client must not execute a model"
-    );
-    client_observer.shutdown().await;
-    let finished = executor
-        .wait_job(&accepted_id, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert_eq!(
-        finished.state,
-        crate::session::jobs::JobState::Succeeded {
-            text: Some("incorrect execution".into())
-        }
-    );
-    let (_, client_child) = client_registry
-        .open_job_session(&accepted_id)
-        .await
-        .unwrap();
-    let client_view =
-        crate::session::jobs::status_from_db(&client_child, &Default::default(), false)
-            .await
-            .unwrap();
-    assert_eq!(client_view, finished);
-    Box::pin(async {
-        let altered = Session::new(ConversationId(accepted_id.clone()), client_child.clone()).await;
-        altered
-            .update_meta(|meta| meta.agents[0].home_pubkey = Some("other-home".into()))
-            .await
-            .unwrap();
-        assert!(
-            executor
-                .validate_accepted_job(&client_child)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("Agent/home identity")
-        );
-        altered
-            .update_meta(|meta| meta.agents[0].home_pubkey = Some(agent.pubkey.to_string()))
-            .await
-            .unwrap();
-        assert!(
-            executor
-                .validate_accepted_job(&client_child)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    })
-    .await;
-    // The same service remains alive while its executor generation dies.
-    // A started model call may already have acted, so restart must not replay.
-    mock.push_text("aborted response");
-    let interrupted_gate = mock.block_next_call();
-    let interrupted_command = crate::session::TurnRequestId::parse("interrupted-job-request");
-    Session::new(ConversationId(parent_id.clone()), parent.clone())
-        .await
-        .submit_command(crate::session::SessionCommandRequest {
-            command_id: interrupted_command.clone(),
-            sender: "client".into(),
-            created_at: Utc::now(),
-            command: crate::session::SessionCommand::SubmitAgent {
-                agent_ref: "default".into(),
-                task: "possibly acted before restart".into(),
-            },
-        })
-        .await
-        .unwrap();
-    let observer = executor.observe_session_command(&parent_id).await.unwrap();
-    let interrupted_id = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        observer.wait(&interrupted_command),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .outcome
-    {
-        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
-        other => panic!("expected durable child handle, got {other:?}"),
-    };
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        interrupted_gate.wait_started(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        mock.recorded_calls().len(),
-        2,
-        "calls: {:?}",
-        mock.recorded_calls()
-            .iter()
-            .map(|c| format!("{:?}", c.messages))
-            .collect::<Vec<_>>()
-    );
-    let (_, interrupted_db) = executor
-        .registry()
-        .open_session(&interrupted_id)
-        .await
-        .unwrap();
-    let request_id = crate::session::TurnRequestId::parse(
-        crate::session::jobs::read_accepted_job(&interrupted_db)
-            .await
-            .unwrap()
-            .unwrap()
-            .directive_id,
-    );
-    Box::pin(async {
-        // Same service login and Agent/home key, but a different process token.
-        let contender_connection =
-            crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
-                .await
-                .unwrap();
-        let contender_registry = Arc::new(
-            crate::session::SessionRegistry::new(
-                contender_connection.instance,
-                contender_connection.user,
-                Arc::new(AgentRegistry::with_default_agent()),
-            )
-            .await
-            .unwrap(),
-        );
-        let contender_index = HostedIndex::empty("agent");
-        contender_index.register(agent.clone());
-        let contender = Server::new(
-            contender_registry.clone(),
-            Arc::new(AgentRegistry::with_default_agent()),
-            contender_index,
-            HostedIndex::empty("bank"),
-            HostedIndex::empty("skill_bank"),
-            Arc::new(ToolRegistry::new()),
-            Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-            SecurityContext {
-                leak_detector: crate::security::LeakDetector::new(
-                    crate::security::LeakPolicy::default(),
-                ),
-                auto_approved_tools: Default::default(),
-                approval_callback: None,
-            },
-            HashMap::new(),
-            Default::default(),
-            Arc::new(crate::tool_host::NativeToolHost::new()),
-            Arc::new(crate::extension::ExtensionHub::new()),
-            crate::backends::BackendManager::with_mock(
-                mock.clone(),
-                crate::security::SecretStore::new(contender_registry.chaz_peer().clone()).await,
-            ),
-            Arc::new(crate::mcp::McpRegistry::new()),
-            Some(crate::instance::ExecutorCapability::for_test()),
-        );
-        let (_, contender_db) = contender_registry
-            .open_job_session(&interrupted_id)
-            .await
-            .unwrap();
-        let accepted = crate::session::jobs::read_accepted_job(&contender_db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(executor.job_incarnation, contender.job_incarnation);
-        let client_server = Server::new(
-            client_registry.clone(),
-            Arc::new(AgentRegistry::with_default_agent()),
-            HostedIndex::empty("agent"),
-            HostedIndex::empty("bank"),
-            HostedIndex::empty("skill_bank"),
-            Arc::new(ToolRegistry::new()),
-            Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-            SecurityContext {
-                leak_detector: crate::security::LeakDetector::new(
-                    crate::security::LeakPolicy::default(),
-                ),
-                auto_approved_tools: Default::default(),
-                approval_callback: None,
-            },
-            HashMap::new(),
-            Default::default(),
-            Arc::new(crate::tool_host::NativeToolHost::new()),
-            Arc::new(crate::extension::ExtensionHub::new()),
-            contender.default_backend.clone(),
-            Arc::new(crate::mcp::McpRegistry::new()),
-            None,
-        );
-        assert!(
-            client_server
-                .claim_accepted_job(&contender_db, &accepted)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("client cannot claim")
-        );
-        client_server.shutdown().await;
-        let claimant = contender.clone();
-        let claim_db = contender_db.clone();
-        let claim_record = accepted.clone();
-        assert!(
-            !tokio::spawn(
-                async move { claimant.claim_accepted_job(&claim_db, &claim_record).await }
-            )
-            .await
-            .unwrap()
-            .unwrap()
-        );
-        // Simulate a collision's delayed write arriving during an in-flight call.
-        // The overlap is allowed, but the loser must stop without erasing history.
-        let winner = crate::session::jobs::JobOwner {
-            peer: agent.pubkey.to_string(),
-            agent_db_id: agent.db_id.to_string(),
-            incarnation: contender.job_incarnation.clone(),
-            refreshed_at: Utc::now(),
-        };
-        let txn = contender_db.new_transaction().await.unwrap();
-        txn.get_store::<eidetica::store::DocStore>("job_owner")
-            .await
-            .unwrap()
-            .set_string("v1", serde_json::to_string(&winner).unwrap())
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if crate::session::jobs::job_stop_count(&contender_db)
-                    .await
-                    .unwrap()
-                    == 1
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("claim loss must durably stop the first attempt");
-        crate::session::jobs::record_job_stop(
-            &contender_db,
-            &executor.interrupted_turns(&interrupted_id).await.unwrap()[0].attempt_id,
-            &executor.job_incarnation,
-            &winner,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            crate::session::jobs::job_stop_count(&contender_db)
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(matches!(
-            executor.job_status(&interrupted_id).await.unwrap().state,
-            crate::session::jobs::JobState::Interrupted { .. }
-        ));
-        assert_eq!(
-            mock.recorded_calls().len(),
-            2,
-            "loss must not replay the uncertain attempt"
-        );
-        let retained =
-            Session::new(ConversationId(interrupted_id.clone()), contender_db.clone()).await;
-        assert!(
-            retained
-                .entries()
-                .iter()
-                .any(|entry| entry.entry_type == EntryType::Directive)
-        );
-        assert!(
-            retained
-                .entries()
-                .iter()
-                .any(|entry| entry.entry_type == EntryType::Ack)
-        );
-        contender.shutdown().await;
-    })
-    .await;
-    executor.shutdown().await;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        interrupted_gate.wait_stopped(),
-    )
-    .await
-    .unwrap();
-    drop(executor);
-
-    let restarted_connection =
-        crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
-            .await
-            .unwrap();
-    let restarted_agents = Arc::new(AgentRegistry::with_default_agent());
-    let restarted_registry = Arc::new(
-        crate::session::SessionRegistry::new(
-            restarted_connection.instance,
-            restarted_connection.user,
-            restarted_agents.clone(),
-        )
-        .await
-        .unwrap(),
-    );
-    let restarted_backend = crate::backends::BackendManager::with_mock(
-        mock.clone(),
-        crate::security::SecretStore::new(restarted_registry.chaz_peer().clone()).await,
-    );
-    let restarted_index = HostedIndex::empty("agent");
-    restarted_index.register(agent.clone());
-    let restarted = Server::new(
-        restarted_registry,
-        restarted_agents,
-        restarted_index,
-        HostedIndex::empty("bank"),
-        HostedIndex::empty("skill_bank"),
-        Arc::new(ToolRegistry::new()),
-        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-        SecurityContext {
-            leak_detector: crate::security::LeakDetector::new(
-                crate::security::LeakPolicy::default(),
-            ),
-            auto_approved_tools: std::collections::HashSet::new(),
-            approval_callback: None,
-        },
-        HashMap::new(),
-        Default::default(),
-        Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
-        restarted_backend,
-        Arc::new(crate::mcp::McpRegistry::new()),
-        Some(crate::instance::ExecutorCapability::for_test()),
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !restarted.is_watching_session(&interrupted_id).await {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("restart must adopt accepted job");
-    let interrupted = restarted.interrupted_turns(&interrupted_id).await.unwrap();
-    assert_eq!(interrupted.len(), 1);
-    assert_eq!(interrupted[0].request_id, request_id);
-    assert!(matches!(
-        restarted.job_status(&interrupted_id).await.unwrap().state,
-        crate::session::jobs::JobState::Interrupted { .. }
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        mock.recorded_calls().len(),
-        2,
-        "ambiguous effect must not replay"
-    );
-    mock.push_text("retry completed");
-    restarted
-        .retry_interrupted_turn(&interrupted_id, &request_id)
-        .await
-        .unwrap();
-    let retry_status = restarted
-        .wait_job(&interrupted_id, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert_eq!(
-        retry_status.state,
-        crate::session::jobs::JobState::Succeeded {
-            text: Some("retry completed".into())
-        }
-    );
-    assert_eq!(mock.recorded_calls().len(), 3);
-    let queued_id = exercise_job_capacity(&restarted, &parent, &parent_id, &mock).await;
-    drop(restarted);
-
-    let next = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
-        .await
-        .unwrap();
-    let next_agents = Arc::new(AgentRegistry::with_default_agent());
-    let next_registry = Arc::new(
-        crate::session::SessionRegistry::new(next.instance, next.user, next_agents.clone())
-            .await
-            .unwrap(),
-    );
-    let next_backend = crate::backends::BackendManager::with_mock(
-        mock.clone(),
-        crate::security::SecretStore::new(next_registry.chaz_peer().clone()).await,
-    );
-    let next_index = HostedIndex::empty("agent");
-    next_index.register(agent.clone());
-    let next_executor = Server::new(
-        next_registry,
-        next_agents,
-        next_index,
-        HostedIndex::empty("bank"),
-        HostedIndex::empty("skill_bank"),
-        Arc::new(ToolRegistry::new()),
-        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-        SecurityContext {
-            leak_detector: crate::security::LeakDetector::new(
-                crate::security::LeakPolicy::default(),
-            ),
-            auto_approved_tools: std::collections::HashSet::new(),
-            approval_callback: None,
-        },
-        HashMap::new(),
-        Default::default(),
-        Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
-        next_backend,
-        Arc::new(crate::mcp::McpRegistry::new()),
-        Some(crate::instance::ExecutorCapability::for_test()),
-    );
-    let resumed = next_executor
-        .wait_job(&queued_id, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert_eq!(
-        resumed.state,
-        crate::session::jobs::JobState::Succeeded {
-            text: Some("queued resumed".into())
-        },
-        "calls: {:?}",
-        mock.recorded_calls()
-            .iter()
-            .map(|c| format!("{:?}", c.messages))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(mock.recorded_calls().len(), 5, "queued job must run once");
-    let inline_executor = next_executor.clone();
-    let inline_parent = parent.clone();
-    let inline_parent_id = parent_id.clone();
-    let inline_mock = mock.clone();
-    tokio::spawn(async move {
-        use crate::tool::Tool as _;
-        let mut parent_session =
-            Session::new(ConversationId(inline_parent_id), inline_parent).await;
-        let turn_id = parent_session
-            .add_entry(SessionEntry {
-                sender: "client".into(),
-                content: "delegation turn".into(),
-                timestamp: Utc::now(),
-                entry_type: EntryType::Summary,
-                metadata: None,
-                routing: None,
-            })
-            .await
-            .unwrap();
-        let session = Arc::new(tokio::sync::Mutex::new(parent_session));
-        let mut ctx = crate::test_support::tool_context(session, Arc::new(ToolRegistry::new()));
-        ctx.agent_name = "default".into();
-        ctx.turn_request_id = Some(turn_id);
-        ctx.tool_call_key = Some("0:0:model-call-id".into());
-        let slot = crate::instance::ServerSlot::default();
-        slot.set(inline_executor.clone());
-        let tool = crate::tools::SpawnAgent { server: slot };
-        inline_mock.push_text("inline finished");
-        let input = serde_json::json!({
-            "agent_ref": "default", "task": "from model tool", "context": "tool context"
-        });
-        let first = tool.execute(input, &ctx).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&first).unwrap()["state"],
-            "pending"
-        );
-        let handle = serde_json::from_str::<serde_json::Value>(&first).unwrap()["session_db_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let (_, submitted) = inline_executor
-            .registry()
-            .open_session(&handle)
-            .await
-            .unwrap();
-        let submitted = Session::new(ConversationId(handle.clone()), submitted).await;
-        let directive = submitted
-            .entries()
-            .iter()
-            .find(|entry| entry.entry_type == EntryType::Directive)
-            .unwrap();
-        assert_eq!(
-            directive.content,
-            "from model tool\n\nContext: tool context"
-        );
-        let status = inline_executor
-            .wait_job(&handle, std::time::Duration::from_secs(10))
-            .await
-            .unwrap();
-        assert_eq!(
-            status.state,
-            crate::session::jobs::JobState::Succeeded {
-                text: Some("inline finished".into())
-            }
-        );
-        assert_eq!(inline_mock.recorded_calls().len(), 6);
-    })
-    .await
-    .unwrap();
-    exercise_capacity_claim_loss(&next_executor, &parent, &parent_id, &agent, &mock).await;
-    next_executor.shutdown().await;
-    drop(shutdown);
-    task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn accepted_agent_job_can_submit_one_attenuated_child_while_running() {
-    let (instance, mut user) = Instance::create_backend(
-        Box::new(InMemory::new()),
-        NewUser::passwordless("nested-job-test"),
-    )
-    .await
-    .unwrap();
-    let (agent_db, pubkey) = create_agent_db(
-        &mut user,
-        "default",
-        &AgentDbConfig::default(),
-        &AgentMeta {
-            display_name: Some("default".into()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let agent = DbEntry {
-        db_id: agent_db.id(),
-        display_name: "default".into(),
-        pubkey,
-    };
-    let agents = Arc::new(AgentRegistry::with_default_agent());
-    let registry = Arc::new(
-        crate::session::SessionRegistry::new(instance, user, agents.clone())
-            .await
-            .unwrap(),
-    );
-    let index = HostedIndex::empty("agent");
-    index.register(agent.clone());
-    let mock = Arc::new(crate::test_support::MockBackend::new());
-    mock.push_text("parent result");
-    mock.push_text("nested result");
-    let gate = mock.block_next_call();
-    let backend = crate::backends::BackendManager::with_mock(
-        mock.clone(),
-        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
-    );
-    let tools = Arc::new(ToolRegistry::new());
-    tools.register(crate::tools::Calculate);
-    let server = Server::new(
-        registry.clone(),
-        agents,
-        index,
-        HostedIndex::empty("bank"),
-        HostedIndex::empty("skill_bank"),
-        tools,
-        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-        SecurityContext {
-            leak_detector: crate::security::LeakDetector::new(
-                crate::security::LeakPolicy::default(),
-            ),
-            auto_approved_tools: Default::default(),
-            approval_callback: None,
-        },
-        HashMap::new(),
-        Default::default(),
-        Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
-        backend.clone(),
-        Arc::new(crate::mcp::McpRegistry::new()),
-        Some(crate::instance::ExecutorCapability::for_test()),
-    );
-    let (_, parent_db) = registry.create_session(Some("local-client")).await.unwrap();
-    let parent_id = parent_db.root_id().to_string();
-    registry
-        .attach_agent_to_session(&parent_id, &agent)
-        .await
-        .unwrap();
-    server
-        .register_session(&parent_db, backend, None, None)
-        .await
-        .unwrap();
-    let parent_command = crate::session::TurnRequestId::parse("root-parent");
-    let root = Session::new(ConversationId(parent_id.clone()), parent_db).await;
-    root.submit_command(crate::session::SessionCommandRequest {
-        command_id: parent_command.clone(),
-        sender: "client".into(),
-        created_at: Utc::now(),
-        command: crate::session::SessionCommand::SubmitAgent {
-            agent_ref: "default".into(),
-            task: "first job".into(),
-        },
-    })
-    .await
-    .unwrap();
-    let observed = server.observe_session_command(&parent_id).await.unwrap();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        observed.wait(&parent_command),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let parent_job = match result.outcome {
-        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
-        other => panic!("expected accepted parent, got {other:?}"),
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_started())
-        .await
-        .unwrap();
-    let nested_key = crate::session::TurnRequestId::parse("job:nested-call");
-    let nested = server
-        .submit_agent_job_inline(
-            &parent_job,
-            nested_key.clone(),
-            "default",
-            Utc::now(),
-            "default",
-            "nested work",
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        server
-            .lookup_job(&parent_job, nested_key.as_str())
-            .await
-            .unwrap(),
-        Some(nested.clone())
-    );
-    assert_eq!(
-        server
-            .submit_agent_job_inline(
-                &parent_job,
-                nested_key,
-                "default",
-                Utc::now(),
-                "default",
-                "nested work"
-            )
-            .await
-            .unwrap(),
-        nested
-    );
-    let (_, db) = registry.open_session(&nested).await.unwrap();
-    let definition = crate::session::jobs::read_accepted_job(&db)
-        .await
-        .unwrap()
-        .unwrap()
-        .definition;
-    assert_eq!(definition.call_depth, 2);
-    assert_eq!(definition.allowed_tools, vec!["calculate"]);
-    assert_eq!(definition.tool_ceilings.len(), 1);
-    assert!(server.validate_accepted_job(&db).await.unwrap().is_some());
-    let (_, parent_job_db) = registry.open_session(&parent_job).await.unwrap();
-    let parent_session =
-        Session::new(ConversationId(parent_job.clone()), parent_job_db.clone()).await;
-    parent_session
-        .update_meta(|meta| {
-            meta.capabilities.shell = Some(crate::grants::ShellGrant {
-                allow: crate::grants::Allowlist::Only(vec![]),
-                ..Default::default()
-            })
-        })
-        .await
-        .unwrap();
-    let error = server
-        .submit_agent_job_inline(
-            &parent_job,
-            crate::session::TurnRequestId::parse("job:narrow"),
-            "default",
-            Utc::now(),
-            "default",
-            "should not run",
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("ceiling") || error.to_string().contains("scope"),
-        "{error}"
-    );
-    assert!(
-        server.validate_accepted_job(&db).await.is_err(),
-        "changed parent scope must invalidate child"
-    );
-    parent_session
-        .update_meta(|meta| meta.capabilities = Default::default())
-        .await
-        .unwrap();
-    gate.release();
-    assert!(
-        server
-            .wait_job(&parent_job, std::time::Duration::from_secs(10))
-            .await
-            .unwrap()
-            .state
-            .is_terminal()
-    );
-    assert!(
-        server
-            .wait_job(&nested, std::time::Duration::from_secs(10))
-            .await
-            .unwrap()
-            .state
-            .is_terminal()
-    );
-    let after = Box::pin(server.submit_agent_job_inline(
-        &parent_job,
-        crate::session::TurnRequestId::parse("job:after-terminal"),
-        "default",
-        Utc::now(),
-        "default",
-        "not allowed after completion",
-    ))
-    .await
-    .unwrap_err();
-    assert!(
-        after.to_string().contains("active claimed attempt"),
-        "{after}"
-    );
-    assert_eq!(mock.recorded_calls().len(), 2);
-    server.shutdown().await;
-}
-
-// Independent executor registries share the same service and key store.
+// A client publishes a prepared child; only executors adopt it.
 async fn published_executor(
     settings: &crate::config::EideticaConfig,
     agents: Arc<AgentRegistry>,
@@ -7027,7 +5738,152 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
         1,
         "rejected children cannot execute"
     );
+    // An old-style staged marker plus a Directive cannot enter ordinary or
+    // published-job execution, even when its ID appears in the catalog.
+    let obsolete = registry
+        .prepare_agent_job(&parent_id.0, "default", "obsolete")
+        .await
+        .unwrap();
+    let obsolete_id = obsolete.db.root_id().to_string();
+    crate::db_kind::write_marker(
+        &obsolete.db,
+        crate::db_kind::KIND_SESSION,
+        "job-stage:obsolete",
+    )
+    .await
+    .unwrap();
+    registry.publish_agent_job(obsolete).await.unwrap();
+    assert!(
+        !executor
+            .register_accepted_job(&registry.open_session(&obsolete_id).await.unwrap().1)
+            .await
+            .unwrap()
+    );
+    assert!(!executor.is_watching_session(&obsolete_id).await);
+    assert!(
+        executor
+            .register_session(
+                &registry.open_session(&obsolete_id).await.unwrap().1,
+                executor.default_backend.clone(),
+                None,
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.recorded_calls().len(), 1);
+
+    // A published, accepted job waits for capacity without a Started attempt.
+    let permits = executor
+        .semaphore
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+        .await
+        .unwrap();
+    mock.push_text("after capacity");
+    let queued = client
+        .submit_agent_job(&parent_id.0, "default", "queued")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while !executor.processing.lock().await.contains(&queued) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("published job must wait for a runtime permit");
+    let (_, queued_db) = registry.open_session(&queued).await.unwrap();
+    assert_eq!(
+        client.job_status(&queued).await.unwrap().state,
+        crate::session::jobs::JobState::Queued
+    );
+    assert!(
+        queued_db
+            .new_transaction()
+            .await
+            .unwrap()
+            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
+            .await
+            .unwrap()
+            .search(|_| true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(mock.recorded_calls().len(), 1);
+    drop(permits);
+    assert_eq!(
+        client
+            .wait_job(&queued, std::time::Duration::from_secs(14))
+            .await
+            .unwrap()
+            .state,
+        crate::session::jobs::JobState::Succeeded {
+            text: Some("after capacity".into())
+        }
+    );
+
+    // Kill an attempt after the mock recorded a call, then reopen the same ID.
+    mock.push_text("effect may have happened");
+    let gate = mock.block_next_call();
+    let held = client
+        .submit_agent_job(&parent_id.0, "default", "interrupted")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), gate.wait_started())
+        .await
+        .expect("job attempt must start");
     executor.shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_stopped())
+        .await
+        .expect("shutdown must cancel the model call");
+    let (_, held_db) = registry.open_session(&held).await.unwrap();
+    let directive_id = crate::session::jobs::read_accepted_job(&held_db)
+        .await
+        .unwrap()
+        .unwrap()
+        .directive_id;
+    assert!(matches!(
+        client.job_status(&held).await.unwrap().state,
+        crate::session::jobs::JobState::StartedUnknown { .. }
+    ));
+    let (restarted, next_mock) = published_executor_with_mock(
+        &settings,
+        Arc::new(AgentRegistry::with_default_agent()),
+        agent_for_narrow,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while !restarted.is_watching_session(&held).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("restart must adopt held job");
+    assert!(
+        next_mock.recorded_calls().is_empty(),
+        "uncertain attempt must not auto-replay"
+    );
+    assert!(matches!(
+        restarted.job_status(&held).await.unwrap().state,
+        crate::session::jobs::JobState::Interrupted { .. }
+    ));
+    restarted
+        .retry_interrupted_turn(&held, &crate::session::TurnRequestId::parse(directive_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .wait_job(&held, std::time::Duration::from_secs(14))
+            .await
+            .unwrap()
+            .state,
+        crate::session::jobs::JobState::Succeeded {
+            text: Some("finished".into())
+        }
+    );
+    assert_eq!(next_mock.recorded_calls().len(), 1);
+    restarted.shutdown().await;
     client.shutdown().await;
     drop(shutdown);
     task.await.unwrap().unwrap();
