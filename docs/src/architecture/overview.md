@@ -99,7 +99,7 @@ durable attempt relation prevents a completed request from running again after
 restart, but it is not distributed fencing or an exactly-once guarantee for
 external effects. See [Session Model](sessions.md#durable-turn-recovery).
 
-The server admits `spawn_agent` as a durable parent command, stages an inert child session, and accepts it with a Directive and inherited authority before returning its DB handle. The child runs through the Agent-job queue; `spawn_worker` remains a separate Worker-template path (synchronous by default).
+`spawn_agent` prepares a delegated child session with one Directive before publishing its DB ID to the watched catalog. The executor then validates parent authority, pins inherited limits and accepts that same child before running it; `spawn_worker` remains a separate Worker-template path (synchronous by default).
 
 **Source**: `crates/lib/src/server.rs`
 
