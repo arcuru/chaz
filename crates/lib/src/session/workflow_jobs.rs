@@ -1,5 +1,5 @@
-//! Workflow parents are parked job-shaped sessions. Catalog rows and client
-//! writes are discovery hints, never authority to execute a graph node.
+//! Workflow parents are accepted job-shaped sessions; only a validated root
+//! Spawn runs in this stage. Catalog and client writes are discovery hints.
 use super::{SessionIndex, SessionRegistry};
 use crate::extensions::orchestrator::spec::FlowSpec;
 use crate::grants::Grants;
@@ -33,12 +33,107 @@ pub struct AcceptedWorkflowParent {
 pub enum WorkflowParentState {
     Staged,
     Accepted,
+    Running,
+    Waiting {
+        child_id: String,
+    },
+    Succeeded {
+        child_id: String,
+        output: WorkflowOutput,
+    },
+    Failed {
+        child_id: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkflowParentStatus {
     pub session_db_id: String,
     pub state: WorkflowParentState,
+}
+
+/// Fixed path and key for the only supported node. Never use a caller-supplied
+/// node ID as the submission key.
+pub(crate) const ROOT_NODE: &str = "root/spawn";
+pub(crate) const ROOT_KEY: &str = "workflow:root/spawn:v1";
+const NODES: &str = "workflow_nodes";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RootNodeReceipt {
+    pub path: String,
+    pub request_key: String,
+    pub child_id: String,
+}
+
+pub(crate) async fn read_root_node(
+    db: &eidetica::Database,
+) -> anyhow::Result<Option<RootNodeReceipt>> {
+    read_json(db, NODES, ROOT_NODE).await
+}
+
+pub(crate) async fn record_root_node(
+    db: &eidetica::Database,
+    child_id: &str,
+) -> anyhow::Result<()> {
+    let receipt = RootNodeReceipt {
+        path: ROOT_NODE.into(),
+        request_key: ROOT_KEY.into(),
+        child_id: child_id.into(),
+    };
+    if let Some(existing) = read_root_node(db).await? {
+        anyhow::ensure!(existing == receipt, "workflow root child handle differs");
+        return Ok(());
+    }
+    let txn = db.new_transaction().await?;
+    txn.get_store::<DocStore>(NODES)
+        .await?
+        .set_string(ROOT_NODE, serde_json::to_string(&receipt)?)
+        .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+pub enum WorkflowOutput {
+    Text(String),
+    Json(serde_json::Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum WorkflowTerminal {
+    Succeeded {
+        child_id: String,
+        output: WorkflowOutput,
+    },
+    Failed {
+        child_id: String,
+        message: String,
+    },
+}
+
+pub(crate) async fn read_terminal(
+    db: &eidetica::Database,
+) -> anyhow::Result<Option<WorkflowTerminal>> {
+    read_json(db, "workflow_terminal", ROOT_NODE).await
+}
+
+pub(crate) async fn record_terminal(
+    db: &eidetica::Database,
+    terminal: &WorkflowTerminal,
+) -> anyhow::Result<()> {
+    if let Some(prior) = read_terminal(db).await? {
+        anyhow::ensure!(&prior == terminal, "workflow terminal receipt differs");
+        return Ok(());
+    }
+    let txn = db.new_transaction().await?;
+    txn.get_store::<DocStore>("workflow_terminal")
+        .await?
+        .set_string(ROOT_NODE, serde_json::to_string(terminal)?)
+        .await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 fn hash(key: &str) -> String {

@@ -1,7 +1,6 @@
 //! Orchestrator extension — the `workflow` tool.
 //!
-//! Parses inline graphs and submits a parked parent session DB. No graph
-//! nodes run until the durable driver is implemented; a handle is not a result.
+//! Submits a durable root Spawn parent. Other graph shapes fail closed.
 
 #[cfg(test)]
 mod executor;
@@ -138,7 +137,7 @@ impl Tool for WorkflowTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "workflow".to_string(),
-            description: "Store an inline workflow graph as a parked parent session and return its DB handle. NO AGENTS RUN and no graph result is produced yet. Supports single {agent, task}, parallel {tasks: [...]}, or {flow: {...}}; loops, cwd and scoped runs are unavailable."
+            description: "Submit a durable root Spawn workflow and immediately return its parent job DB handle. Use job_status or job_wait to observe its child and typed result. Sequence, fork, join, reducers, loops and scoped runs are unavailable."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -153,7 +152,7 @@ impl Tool for WorkflowTool {
                     },
                     "tasks": {
                         "type": "array",
-                        "description": "Parallel graph mode: tasks are stored as fork branches; they do not run yet.",
+                        "description": "Unsupported in this version.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -170,7 +169,7 @@ impl Tool for WorkflowTool {
                     },
                     "concurrency": {
                         "type": "integer",
-                        "description": "Future fork limit recorded in the graph (default 4); no branches run yet."
+                        "description": "Unsupported in this version."
                     },
                     "output": {
                         "type": "string",
@@ -231,7 +230,7 @@ impl Tool for WorkflowTool {
                 )
                 .await
                 .map_err(|e| ToolError::Execution(format!("Workflow submission failed: {e}")))?;
-            Ok(serde_json::json!({"session_db_id":session_db_id,"state":"accepted","execution":"unavailable"}).to_string())
+            Ok(serde_json::json!({"session_db_id":session_db_id,"state":"accepted"}).to_string())
         })
     }
 }

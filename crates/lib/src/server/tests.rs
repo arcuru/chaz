@@ -6059,10 +6059,14 @@ async fn accepted_agent_job_can_submit_one_attenuated_child_while_running() {
     server.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_parent_service_admission_is_parked_idempotent_and_validated() {
+    Box::pin(workflow_parent_service_case()).await;
+}
+
+async fn workflow_parent_service_case() {
     use crate::extensions::orchestrator::spec::parse_flow;
-    use crate::session::workflow_jobs::{AcceptedWorkflowParent, WorkflowParentState};
+
     use eidetica::service::ServiceServer;
     use tokio::sync::watch;
 
@@ -6165,14 +6169,15 @@ async fn workflow_parent_service_admission_is_parked_idempotent_and_validated() 
     })
     .await
     .unwrap();
-    let flow = parse_flow(&serde_json::json!({"kind":"sequence","steps":[
-        {"agent":"default","task":"first"},
-        {"kind":"fork","id":"parallel","branches":{
-            "a":{"agent":"default","task":"one"},
-            "b":{"agent":"default","task":"two"}}},
-        {"kind":"join","from":"parallel","mode":"all"}
-    ]}))
-    .unwrap();
+    Box::pin(assert_unsupported_root(&executor, &registry, &parent_id)).await;
+    Box::pin(assert_narrow_workflow_refused(
+        &executor, &registry, &parent_id, &parent_db,
+    ))
+    .await;
+    let flow = parse_flow(&serde_json::json!({"agent":"default","task":"first"})).unwrap();
+    mock.push_text("root result");
+    let gate = mock.block_next_call();
+    let root_gate = executor.block_next_workflow_root();
     let parent = Session::new(ConversationId(parent_id.clone()), parent_db.clone()).await;
     let command_id = crate::session::TurnRequestId::parse("workflow-parent-key");
     parent
@@ -6198,201 +6203,280 @@ async fn workflow_parent_service_admission_is_parked_idempotent_and_validated() 
         }
         other => panic!("unexpected outcome: {other:?}"),
     };
+    Box::pin(exercise_workflow_restarts(
+        executor,
+        registry,
+        client_registry,
+        parent_id,
+        agent,
+        flow,
+        command_id,
+        handle,
+        settings,
+        mock,
+        gate,
+        root_gate,
+    ))
+    .await;
+    drop(observer);
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}
+#[allow(clippy::too_many_arguments)] // Keep async test phases boxed on normal stacks.
+async fn exercise_workflow_restarts(
+    executor: Arc<Server>,
+    registry: Arc<crate::session::SessionRegistry>,
+    client_registry: Arc<crate::session::SessionRegistry>,
+    parent_id: String,
+    agent: DbEntry,
+    flow: crate::extensions::orchestrator::spec::FlowSpec,
+    command_id: crate::session::TurnRequestId,
+    handle: String,
+    settings: crate::config::EideticaConfig,
+    mock: Arc<crate::test_support::MockBackend>,
+    gate: crate::test_support::MockCallGate,
+    root_gate: Arc<super::workflow_jobs::WorkflowRootGate>,
+) {
+    use crate::session::workflow_jobs::WorkflowParentState;
     let (_, workflow_db) = client_registry.open_job_session(&handle).await.unwrap();
-    let accepted = crate::session::workflow_jobs::read_accepted_workflow(&workflow_db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(accepted.flow, flow);
-    assert_eq!(accepted.authority.agent_db_id, agent.db_id.to_string());
-    assert_eq!(accepted.authority.home_pubkey, agent.pubkey.to_string());
-    assert_eq!(accepted.authority.call_depth, 1);
-    assert_eq!(accepted.authority.capability_ceiling, Default::default());
-    assert!(accepted.authority.tool_ceilings.is_empty());
+    // Run the admission revalidation on a normal Tokio worker stack, not
+    // beneath the integration harness's service-setup frames.
+    let partial_id = tokio::spawn({
+        let executor = executor.clone();
+        let registry = registry.clone();
+        let client_registry = client_registry.clone();
+        let parent_id = parent_id.clone();
+        let agent = agent.clone();
+        let flow = flow.clone();
+        let command_id = command_id.clone();
+        let handle = handle.clone();
+        let workflow_db = workflow_db.clone();
+        async move {
+            Box::pin(check_workflow_admission(
+                &executor,
+                &registry,
+                &client_registry,
+                &parent_id,
+                &agent,
+                &flow,
+                &command_id,
+                &handle,
+                &workflow_db,
+            ))
+            .await
+        }
+    })
+    .await
+    .unwrap();
+    Box::pin(assert_root_claim_loss(
+        &executor,
+        &workflow_db,
+        &handle,
+        &mock,
+        &root_gate,
+    ))
+    .await;
+    executor.shutdown().await;
+    drop(executor);
+    // On startup, the accepted graph is discovered without a live caller or
+    // first-process driver. The stale foreign owner cannot claim the restart.
+    Box::pin(expire_workflow_owner(&workflow_db)).await;
+    let (registry, first_restart) = restart_workflow_executor(&settings, &agent, &mock).await;
+    let child_id = Box::pin(await_root_and_check_receipt(
+        &first_restart,
+        &registry,
+        &handle,
+        &workflow_db,
+        &gate,
+    ))
+    .await;
     assert_eq!(
-        executor
-            .workflow_parent_status(&handle)
+        crate::session::workflow_jobs::read_root_node(&workflow_db)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_id,
+        child_id
+    );
+    // Lose only the parent link, retaining the accepted child and deterministic
+    // catalog key. Restart must recover the same handle, not submit a second.
+    first_restart.shutdown().await;
+    drop(first_restart);
+    Box::pin(erase_root_link(&workflow_db)).await;
+    // A second restart sees an interrupted child, never replays the model call.
+    let (registry, restarted) = restart_workflow_executor(&settings, &agent, &mock).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !restarted.is_watching_session(&parent_id).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    Box::pin(assert_recovered_root_link(
+        &restarted,
+        &workflow_db,
+        &handle,
+        &child_id,
+    ))
+    .await;
+    assert_eq!(
+        Box::pin(restarted.workflow_parent_status(&handle))
             .await
             .unwrap()
             .state,
-        WorkflowParentState::Accepted
-    );
-    let client_server = Server::new(
-        client_registry.clone(),
-        Arc::new(AgentRegistry::with_default_agent()),
-        HostedIndex::empty("agent"),
-        HostedIndex::empty("bank"),
-        HostedIndex::empty("skill_bank"),
-        Arc::new(ToolRegistry::new()),
-        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
-        SecurityContext {
-            leak_detector: crate::security::LeakDetector::new(
-                crate::security::LeakPolicy::default(),
-            ),
-            auto_approved_tools: Default::default(),
-            approval_callback: None,
-        },
-        HashMap::new(),
-        Default::default(),
-        Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
-        executor.default_backend.clone(),
-        Arc::new(crate::mcp::McpRegistry::new()),
-        None,
+        WorkflowParentState::Waiting {
+            child_id: child_id.clone()
+        }
     );
     assert_eq!(
-        client_server
-            .workflow_parent_status(&handle)
-            .await
-            .unwrap()
-            .state,
-        WorkflowParentState::Accepted
-    );
-    client_server.shutdown().await;
-    assert_eq!(
-        executor
+        restarted
             .lookup_workflow_parent(&parent_id, command_id.as_str())
             .await
             .unwrap(),
         Some(handle.clone())
     );
+    assert!(!restarted.is_watching_session(&handle).await);
+    assert!(!restarted.is_watching_session(&partial_id.0).await);
     assert_eq!(
-        executor
-            .submit_workflow_parent_inline(
-                &parent_id,
-                command_id.clone(),
-                "client",
-                Utc::now(),
-                flow.clone()
-            )
+        mock.recorded_calls().len(),
+        1,
+        "interrupted child must not replay"
+    );
+    Box::pin(complete_restarted_root(
+        &restarted, &registry, &mock, &child_id, &handle,
+    ))
+    .await;
+    Box::pin(erase_root_link(&workflow_db)).await;
+    Box::pin(assert_recovered_root_link(
+        &restarted,
+        &workflow_db,
+        &handle,
+        &child_id,
+    ))
+    .await;
+    assert!(matches!(
+        Box::pin(restarted.workflow_parent_status(&handle))
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Succeeded { .. }
+    ));
+    assert_eq!(
+        mock.recorded_calls().len(),
+        2,
+        "terminal recovery must not replay child"
+    );
+    restarted.shutdown().await;
+    drop(restarted);
+}
+
+async fn erase_root_link(db: &eidetica::Database) {
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_nodes")
+        .await
+        .unwrap()
+        .delete(crate::session::workflow_jobs::ROOT_NODE)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        crate::session::workflow_jobs::read_root_node(db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+async fn assert_recovered_root_link(
+    server: &Arc<Server>,
+    db: &eidetica::Database,
+    handle: &str,
+    child_id: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while crate::session::workflow_jobs::read_root_node(db)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::session::workflow_jobs::read_root_node(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_id,
+        child_id
+    );
+    assert_eq!(
+        server
+            .lookup_job(handle, crate::session::workflow_jobs::ROOT_KEY)
             .await
             .unwrap(),
-        handle
+        Some(child_id.to_string())
     );
-    assert!(
-        executor
-            .submit_workflow_parent_inline(
-                &parent_id,
-                command_id.clone(),
-                "client",
-                Utc::now(),
-                parse_flow(&serde_json::json!({"agent":"default","task":"different"})).unwrap()
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("different payload")
-    );
-    assert!(
-        Session::new(ConversationId(handle.clone()), workflow_db.clone())
-            .await
-            .entries()
-            .is_empty()
-    );
-    assert!(!executor.is_watching_session(&handle).await);
-    assert!(executor.runtime_owner_of(&handle).is_none());
-    assert!(
-        executor
-            .register_session(&workflow_db, executor.default_backend.clone(), None, None)
-            .await
-            .is_err()
-    );
-    // A forged graph/marker in a child does not supply the parent intent or
-    // an executor-started matching command. A partial catalog parent stays inert.
-    let label = crate::session::workflow_jobs::source(&parent_id, "forged-key");
-    let (forged_id, forged_db) = client_registry
-        .create_child_session(&parent_id, Some(&label))
+}
+async fn assert_root_claim_loss(
+    executor: &Arc<Server>,
+    db: &eidetica::Database,
+    handle: &str,
+    mock: &Arc<crate::test_support::MockBackend>,
+    gate: &Arc<super::workflow_jobs::WorkflowRootGate>,
+) {
+    // Executor accepted the graph, then lost its claim before the first
+    // effect. No child command, catalog row or model request may be created.
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_started())
         .await
         .unwrap();
-    client_registry
-        .attach_agent_to_session(&forged_id.0, &agent)
-        .await
-        .unwrap();
-    let forged = AcceptedWorkflowParent {
-        parent_id: parent_id.clone(),
-        request_key_hash: blake3::hash(b"forged-key").to_hex().to_string(),
-        flow: flow.clone(),
-        authority: accepted.authority.clone(),
-    };
-    let txn = forged_db.new_transaction().await.unwrap();
-    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
-        .await
-        .unwrap()
-        .set_string("v1", serde_json::to_string(&forged).unwrap())
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
-    assert!(executor.validate_workflow_parent(&forged_db).await.is_err());
     assert!(
-        executor
-            .lookup_workflow_parent(&parent_id, "forged-key")
-            .await
-            .is_err()
-    );
-    let partial_label = crate::session::workflow_jobs::source(&parent_id, "partial-key");
-    let (partial_id, partial_db) = client_registry
-        .create_child_session(&parent_id, Some(&partial_label))
-        .await
-        .unwrap();
-    assert_eq!(
-        executor
-            .workflow_parent_status(&partial_id.0)
+        crate::session::workflow_jobs::read_root_node(db)
             .await
             .unwrap()
-            .state,
-        WorkflowParentState::Staged
+            .is_none()
     );
-    assert!(!executor.is_watching_session(&partial_id.0).await);
-    assert!(
-        executor
-            .register_session(&partial_db, executor.default_backend.clone(), None, None)
-            .await
-            .is_err()
-    );
-    assert!(
-        executor
-            .lookup_workflow_parent(&parent_id, "partial-key")
-            .await
-            .is_err()
-    );
-    let mut narrowed = accepted.clone();
-    narrowed.authority.call_depth = 129;
-    let txn = workflow_db.new_transaction().await.unwrap();
-    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+    let mut foreign = crate::session::jobs::read_job_owner(db)
         .await
         .unwrap()
-        .set_string("v1", serde_json::to_string(&narrowed).unwrap())
-        .await
         .unwrap();
-    txn.commit().await.unwrap();
+    foreign.incarnation = "other-process".into();
+    write_workflow_owner(db, &foreign).await;
+    gate.release();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while crate::session::jobs::job_stop_count(db).await.unwrap() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(
         executor
-            .validate_workflow_parent(&workflow_db)
+            .lookup_job(handle, crate::session::workflow_jobs::ROOT_KEY)
             .await
-            .is_err()
+            .unwrap()
+            .is_none()
     );
     assert_eq!(mock.recorded_calls().len(), 0);
-    let txn = workflow_db.new_transaction().await.unwrap();
-    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+}
+
+async fn expire_workflow_owner(db: &eidetica::Database) {
+    let mut foreign = crate::session::jobs::read_job_owner(db)
         .await
         .unwrap()
-        .set_string("v1", serde_json::to_string(&accepted).unwrap())
-        .await
         .unwrap();
-    txn.commit().await.unwrap();
-    assert_eq!(
-        executor
-            .workflow_parent_status(&handle)
-            .await
-            .unwrap()
-            .state,
-        WorkflowParentState::Accepted
-    );
-    executor.shutdown().await;
-    drop(executor);
-    drop(observer);
+    foreign.refreshed_at = Utc::now() - chrono::Duration::seconds(30);
+    write_workflow_owner(db, &foreign).await;
+}
+
+async fn restart_workflow_executor(
+    settings: &crate::config::EideticaConfig,
+    agent: &DbEntry,
+    mock: &Arc<crate::test_support::MockBackend>,
+) -> (Arc<crate::session::SessionRegistry>, Arc<Server>) {
     let connection =
-        crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+        crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
             .await
             .unwrap();
     let registry = Arc::new(
@@ -6405,7 +6489,7 @@ async fn workflow_parent_service_admission_is_parked_idempotent_and_validated() 
         .unwrap(),
     );
     let index = HostedIndex::empty("agent");
-    index.register(agent);
+    index.register(agent.clone());
     let restarted = Server::new(
         registry.clone(),
         Arc::new(AgentRegistry::with_default_agent()),
@@ -6432,36 +6516,661 @@ async fn workflow_parent_service_admission_is_parked_idempotent_and_validated() 
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !restarted.is_watching_session(&parent_id).await {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        restarted
-            .workflow_parent_status(&handle)
+    (registry, restarted)
+}
+
+async fn write_workflow_owner(db: &eidetica::Database, owner: &crate::session::jobs::JobOwner) {
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("job_owner")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(owner).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+}
+
+#[allow(clippy::too_many_arguments)] // Split the service test without a one-use fixture type.
+async fn check_workflow_admission(
+    executor: &Arc<Server>,
+    _registry: &Arc<crate::session::SessionRegistry>,
+    client_registry: &Arc<crate::session::SessionRegistry>,
+    parent_id: &str,
+    agent: &DbEntry,
+    flow: &crate::extensions::orchestrator::spec::FlowSpec,
+    command_id: &crate::session::TurnRequestId,
+    handle: &str,
+    workflow_db: &eidetica::Database,
+) -> crate::types::ConversationId {
+    use crate::extensions::orchestrator::spec::parse_flow;
+    use crate::session::workflow_jobs::WorkflowParentState;
+    let accepted = crate::session::workflow_jobs::read_accepted_workflow(workflow_db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&accepted.flow, flow);
+    assert_eq!(accepted.authority.agent_db_id, agent.db_id.to_string());
+    assert_eq!(accepted.authority.home_pubkey, agent.pubkey.to_string());
+    assert_eq!(accepted.authority.call_depth, 1);
+    assert_eq!(accepted.authority.capability_ceiling, Default::default());
+    assert!(accepted.authority.tool_ceilings.is_empty());
+    assert!(matches!(
+        Box::pin(executor.workflow_parent_status(handle))
             .await
             .unwrap()
             .state,
         WorkflowParentState::Accepted
+            | WorkflowParentState::Running
+            | WorkflowParentState::Waiting { .. }
+    ));
+    let client_server = Server::new(
+        client_registry.clone(),
+        Arc::new(AgentRegistry::with_default_agent()),
+        HostedIndex::empty("agent"),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: Default::default(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        executor.default_backend.clone(),
+        Arc::new(crate::mcp::McpRegistry::new()),
+        None,
     );
+    assert!(matches!(
+        Box::pin(client_server.workflow_parent_status(handle))
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Accepted
+            | WorkflowParentState::Running
+            | WorkflowParentState::Waiting { .. }
+    ));
+    Box::pin(assert_client_role_refuses(
+        &client_server,
+        parent_id,
+        flow,
+        workflow_db,
+        handle,
+    ))
+    .await;
+    client_server.shutdown().await;
     assert_eq!(
-        restarted
-            .lookup_workflow_parent(&parent_id, command_id.as_str())
+        executor
+            .lookup_workflow_parent(parent_id, command_id.as_str())
             .await
             .unwrap(),
-        Some(handle.clone())
+        Some(handle.to_string())
     );
-    assert!(!restarted.is_watching_session(&handle).await);
-    assert!(!restarted.is_watching_session(&partial_id.0).await);
-    assert_eq!(mock.recorded_calls().len(), 0);
-    restarted.shutdown().await;
-    drop(restarted);
-    drop(shutdown);
-    task.await.unwrap().unwrap();
+    assert_eq!(
+        executor
+            .submit_workflow_parent_inline(
+                parent_id,
+                command_id.clone(),
+                "client",
+                Utc::now(),
+                flow.clone()
+            )
+            .await
+            .unwrap(),
+        handle
+    );
+    assert!(
+        executor
+            .submit_workflow_parent_inline(
+                parent_id,
+                command_id.clone(),
+                "client",
+                Utc::now(),
+                parse_flow(&serde_json::json!({"agent":"default","task":"different"})).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different payload")
+    );
+    assert!(
+        Session::new(ConversationId(handle.to_string()), workflow_db.clone())
+            .await
+            .entries()
+            .is_empty()
+    );
+    assert!(!executor.is_watching_session(handle).await);
+    assert!(executor.runtime_owner_of(handle).is_none());
+    assert!(
+        executor
+            .register_session(workflow_db, executor.default_backend.clone(), None, None)
+            .await
+            .is_err()
+    );
+    Box::pin(check_partial_workflow_acceptance(
+        executor,
+        client_registry,
+        parent_id,
+        agent,
+        flow,
+        handle,
+        workflow_db,
+        &accepted,
+    ))
+    .await
 }
+
+#[allow(clippy::too_many_arguments)] // Split the service test without a one-use fixture type.
+async fn check_partial_workflow_acceptance(
+    executor: &Arc<Server>,
+    client_registry: &Arc<crate::session::SessionRegistry>,
+    parent_id: &str,
+    agent: &DbEntry,
+    flow: &crate::extensions::orchestrator::spec::FlowSpec,
+    handle: &str,
+    workflow_db: &eidetica::Database,
+    accepted: &crate::session::workflow_jobs::AcceptedWorkflowParent,
+) -> crate::types::ConversationId {
+    use crate::session::workflow_jobs::{AcceptedWorkflowParent, WorkflowParentState};
+    // A forged graph/marker in a child does not supply the parent intent or
+    // an executor-started matching command. A partial catalog parent stays inert.
+    let label = crate::session::workflow_jobs::source(parent_id, "forged-key");
+    let (forged_id, forged_db) = client_registry
+        .create_child_session(parent_id, Some(&label))
+        .await
+        .unwrap();
+    client_registry
+        .attach_agent_to_session(&forged_id.0, agent)
+        .await
+        .unwrap();
+    let forged = AcceptedWorkflowParent {
+        parent_id: parent_id.to_string(),
+        request_key_hash: blake3::hash(b"forged-key").to_hex().to_string(),
+        flow: flow.clone(),
+        authority: accepted.authority.clone(),
+    };
+    let txn = forged_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&forged).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        Box::pin(executor.validate_workflow_parent(&forged_db))
+            .await
+            .is_err()
+    );
+    assert!(
+        executor
+            .lookup_workflow_parent(parent_id, "forged-key")
+            .await
+            .is_err()
+    );
+    let partial_label = crate::session::workflow_jobs::source(parent_id, "partial-key");
+    let (partial_id, partial_db) = client_registry
+        .create_child_session(parent_id, Some(&partial_label))
+        .await
+        .unwrap();
+    assert_eq!(
+        executor
+            .workflow_parent_status(&partial_id.0)
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Staged
+    );
+    assert!(!executor.is_watching_session(&partial_id.0).await);
+    assert!(
+        executor
+            .register_session(&partial_db, executor.default_backend.clone(), None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        executor
+            .lookup_workflow_parent(parent_id, "partial-key")
+            .await
+            .is_err()
+    );
+    let mut narrowed = accepted.clone();
+    narrowed.authority.call_depth = 129;
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&narrowed).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        Box::pin(executor.validate_workflow_parent(workflow_db))
+            .await
+            .is_err()
+    );
+    assert!(!executor.is_watching_session(&forged_id.0).await);
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&accepted).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(matches!(
+        Box::pin(executor.workflow_parent_status(handle))
+            .await
+            .unwrap()
+            .state,
+        WorkflowParentState::Accepted
+            | WorkflowParentState::Running
+            | WorkflowParentState::Waiting { .. }
+    ));
+    partial_id
+}
+
+async fn assert_client_role_refuses(
+    client: &Arc<Server>,
+    parent_id: &str,
+    flow: &crate::extensions::orchestrator::spec::FlowSpec,
+    db: &eidetica::Database,
+    handle: &str,
+) {
+    assert!(!client.is_watching_session(handle).await);
+    assert!(
+        crate::session::jobs::read_job_owner(db)
+            .await
+            .unwrap()
+            .is_none_or(|owner| owner.incarnation != client.job_incarnation)
+    );
+    assert!(
+        Box::pin(client.submit_workflow_parent_inline(
+            parent_id,
+            crate::session::TurnRequestId::parse("client-no-admission"),
+            "client",
+            Utc::now(),
+            flow.clone()
+        ))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("client cannot")
+    );
+}
+
+async fn await_root_and_check_receipt(
+    executor: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    handle: &str,
+    workflow_db: &eidetica::Database,
+    gate: &crate::test_support::MockCallGate,
+) -> String {
+    use crate::session::workflow_jobs::WorkflowParentState;
+    if tokio::time::timeout(std::time::Duration::from_secs(12), gate.wait_started())
+        .await
+        .is_err()
+    {
+        panic!(
+            "root child not started: {}",
+            root_timeout_diagnostics(executor, registry, handle).await
+        );
+    }
+    let child_id = match Box::pin(executor.workflow_parent_status(handle))
+        .await
+        .unwrap()
+        .state
+    {
+        WorkflowParentState::Waiting { child_id } => child_id,
+        other => panic!("child was not linked before start: {other:?}"),
+    };
+    Box::pin(assert_real_acceptance_wake(
+        executor, registry, handle, &child_id,
+    ))
+    .await;
+    let original = crate::session::workflow_jobs::read_root_node(workflow_db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut wrong_path = original.clone();
+    wrong_path.path = "root/other".into();
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_nodes")
+        .await
+        .unwrap()
+        .set_string(
+            crate::session::workflow_jobs::ROOT_NODE,
+            serde_json::to_string(&wrong_path).unwrap(),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        Box::pin(executor.workflow_parent_status(handle))
+            .await
+            .is_err()
+    );
+    let mut wrong = original.clone();
+    wrong.child_id = "not-the-child".into();
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_nodes")
+        .await
+        .unwrap()
+        .set_string(
+            crate::session::workflow_jobs::ROOT_NODE,
+            serde_json::to_string(&wrong).unwrap(),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let status_server = executor.clone();
+    let status_id = handle.to_string();
+    assert!(
+        tokio::spawn(async move { status_server.workflow_parent_status(&status_id).await })
+            .await
+            .unwrap()
+            .is_err()
+    );
+    let txn = workflow_db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("workflow_nodes")
+        .await
+        .unwrap()
+        .set_string(
+            crate::session::workflow_jobs::ROOT_NODE,
+            serde_json::to_string(&original).unwrap(),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    Box::pin(assert_root_child_ceiling_refused(
+        executor, registry, handle, &child_id,
+    ))
+    .await;
+    child_id
+}
+
+async fn assert_root_child_ceiling_refused(
+    server: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    parent_id: &str,
+    child_id: &str,
+) {
+    let (_, parent) = registry.open_job_session(parent_id).await.unwrap();
+    let (_, child) = registry.open_job_session(child_id).await.unwrap();
+    let original = crate::session::jobs::read_accepted_job(&child)
+        .await
+        .unwrap()
+        .unwrap();
+    for change in 0..2 {
+        let mut invalid = original.clone();
+        if change == 0 {
+            invalid.definition.call_depth += 1;
+        } else {
+            invalid.definition.task = "wrong node".into();
+        }
+        let txn = child.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("job_acceptance")
+            .await
+            .unwrap()
+            .set_string("v1", serde_json::to_string(&invalid).unwrap())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(
+            Box::pin(server.validated_root_child(&parent, child_id))
+                .await
+                .is_err()
+        );
+    }
+    let txn = child.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("job_acceptance")
+        .await
+        .unwrap()
+        .set_string("v1", serde_json::to_string(&original).unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        Box::pin(server.validated_root_child(&parent, child_id))
+            .await
+            .is_ok()
+    );
+}
+
+async fn assert_narrow_workflow_refused(
+    executor: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    parent_id: &str,
+    db: &eidetica::Database,
+) {
+    let session = Session::new(ConversationId(parent_id.to_string()), db.clone()).await;
+    session
+        .update_meta(|meta| {
+            meta.capabilities.shell = Some(crate::grants::ShellGrant {
+                allow: crate::grants::Allowlist::Only(vec![]),
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap();
+    let rejected = Box::pin(
+        executor.submit_workflow_parent_inline(
+            parent_id,
+            crate::session::TurnRequestId::parse("narrow-workflow"),
+            "client",
+            Utc::now(),
+            crate::extensions::orchestrator::spec::parse_flow(&serde_json::json!({
+            "agent":"default","task":"must not run"}))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(rejected.to_string().contains("narrow"), "{rejected}");
+    assert!(!registry.list_sessions().await.unwrap().iter().any(|row| {
+        row.source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("workflow-stage:"))
+    }));
+    session
+        .update_meta(|meta| meta.capabilities = Default::default())
+        .await
+        .unwrap();
+}
+
+async fn assert_real_acceptance_wake(
+    server: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    parent_id: &str,
+    child_id: &str,
+) {
+    if tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while server
+            .accepted_job_events
+            .lock()
+            .await
+            .get(child_id)
+            .copied()
+            .unwrap_or(0)
+            == 0
+            || !server.is_watching_session(child_id).await
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        panic!(
+            "acceptance event was not received or child not watched: {}",
+            root_timeout_diagnostics(server, registry, parent_id).await
+        );
+    }
+}
+
+async fn assert_unsupported_root(
+    executor: &std::sync::Arc<Server>,
+    registry: &std::sync::Arc<crate::session::SessionRegistry>,
+    parent_id: &str,
+) {
+    for (key, graph) in [
+        (
+            "unsupported-sequence",
+            serde_json::json!({"kind":"sequence","steps":[
+            {"agent":"default","task":"first"}, {"agent":"default","task":"second"}]}),
+        ),
+        (
+            "unsupported-fork",
+            serde_json::json!({"kind":"fork","id":"f","branches":{
+            "left":{"agent":"default","task":"first"},
+            "right":{"agent":"default","task":"second"}}}),
+        ),
+        (
+            "unsupported-join",
+            serde_json::json!({"kind":"sequence","steps":[
+            {"kind":"fork","id":"f","branches":{"left":{"agent":"default","task":"first"}}},
+            {"kind":"join","from":"f","mode":"all","reducer":{
+                "kind":"agent","agent":"default","task":"reduce"}}]}),
+        ),
+    ] {
+        Box::pin(assert_unsupported_shape(executor, parent_id, key, graph)).await;
+    }
+    assert!(!registry.list_sessions().await.unwrap().iter().any(|row| {
+        row.source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("workflow-stage:"))
+    }));
+}
+
+async fn assert_unsupported_shape(
+    executor: &Arc<Server>,
+    parent_id: &str,
+    key: &str,
+    graph: serde_json::Value,
+) {
+    let flow = crate::extensions::orchestrator::spec::parse_flow(&graph).unwrap();
+    assert!(
+        Box::pin(executor.submit_workflow_parent_inline(
+            parent_id,
+            crate::session::TurnRequestId::parse(key),
+            "client",
+            Utc::now(),
+            flow
+        ))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("only root Spawn")
+    );
+}
+
+async fn root_timeout_diagnostics(
+    server: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    handle: &str,
+) -> String {
+    // Read the persisted pieces directly: a full status revalidation is a
+    // deep async stack and can mask the original timeout with a test overflow.
+    let parent = match registry.open_job_session(handle).await {
+        Ok((_, db)) => format!(
+            "acceptance={:?} node={:?} terminal={:?}",
+            crate::session::workflow_jobs::read_accepted_workflow(&db).await,
+            crate::session::workflow_jobs::read_root_node(&db).await,
+            crate::session::workflow_jobs::read_terminal(&db).await
+        ),
+        Err(error) => format!("open error={error}"),
+    };
+    let lookup = server
+        .lookup_job(handle, crate::session::workflow_jobs::ROOT_KEY)
+        .await;
+    let parent_claim = match registry.open_job_session(handle).await {
+        Ok((_, db)) => format!("{:?}", crate::session::jobs::read_job_owner(&db).await),
+        Err(error) => format!("{error}"),
+    };
+    let child = match &lookup {
+        Ok(Some(id)) => match registry.open_job_session(id).await {
+            Ok((_, db)) => {
+                let accepted = crate::session::jobs::read_accepted_job(&db).await;
+                let events = server
+                    .accepted_job_events
+                    .lock()
+                    .await
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0);
+                format!(
+                    "status={:?} claim={:?} watched={} accepted={accepted:?} watcher_accept_events={events}",
+                    server.job_status(id).await,
+                    crate::session::jobs::read_job_owner(&db).await,
+                    server.is_watching_session(id).await
+                )
+            }
+            Err(error) => format!("open error={error}"),
+        },
+        _ => "no child lookup".into(),
+    };
+    let parent_step = match registry.open_job_session(handle).await {
+        Ok((_, db)) => {
+            Session::new(ConversationId(handle.to_string()), db)
+                .await
+                .command_requests(&Default::default())
+                .await
+        }
+        Err(error) => {
+            return format!(
+                "parent={parent:?} parent_claim={parent_claim} open={error} child={child}"
+            );
+        }
+    };
+    format!(
+        "parent={parent:?} parent_claim={parent_claim} parent_step={parent_step:?} lookup={lookup:?} child={child}"
+    )
+}
+
+async fn complete_restarted_root(
+    restarted: &std::sync::Arc<Server>,
+    registry: &std::sync::Arc<crate::session::SessionRegistry>,
+    mock: &std::sync::Arc<crate::test_support::MockBackend>,
+    child_id: &str,
+    handle: &str,
+) {
+    let (_, child_db) = registry.open_job_session(child_id).await.unwrap();
+    let directive = crate::session::jobs::read_accepted_job(&child_db)
+        .await
+        .unwrap()
+        .unwrap()
+        .directive_id;
+    mock.push_text("root completed after explicit retry");
+    Box::pin(
+        restarted
+            .retry_interrupted_turn(child_id, &crate::session::TurnRequestId::parse(directive)),
+    )
+    .await
+    .unwrap();
+    let terminal = match tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        Box::pin(restarted.observe_job_wait(handle, std::time::Duration::from_secs(10))),
+    )
+    .await
+    {
+        Ok(Ok(status)) if status["state"].get("Succeeded").is_some() => status,
+        result => panic!(
+            "root did not settle after retry: {result:?}; {}",
+            root_timeout_diagnostics(restarted, registry, handle).await
+        ),
+    };
+    assert_eq!(
+        terminal["state"]["Succeeded"]["output"],
+        serde_json::json!({"kind":"text","value":"root completed after explicit retry"})
+    );
+    assert_eq!(mock.recorded_calls().len(), 2);
+}
+
 #[tokio::test]
 async fn workflow_parent_inherits_claimed_agent_job_ceiling() {
     let (instance, mut user) = Instance::create_backend(

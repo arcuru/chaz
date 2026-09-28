@@ -78,9 +78,43 @@ impl Server {
                 "job parent has no active claimed attempt"
             );
             Some(accepted.definition)
+        } else if parent_row
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("workflow-stage:"))
+        {
+            let accepted = Box::pin(self.validate_workflow_parent(&parent_db))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("workflow parent is not accepted"))?;
+            let crate::extensions::orchestrator::spec::FlowSpec::Spawn(node) = &accepted.flow
+            else {
+                anyhow::bail!("workflow node is not ready");
+            };
+            anyhow::ensure!(
+                command_id.as_str() == crate::session::workflow_jobs::ROOT_KEY
+                    && agent_ref == node.agent
+                    && task == node.task
+                    && crate::session::jobs::owns_job(&parent_db, &self.job_incarnation).await?,
+                "workflow root node does not match claimed graph"
+            );
+            let a = accepted.authority;
+            Some(StagedAgentDefinition {
+                target: a.agent,
+                task: String::new(),
+                executor_pubkey: a.home_pubkey,
+                call_depth: a.call_depth,
+                max_call_depth: a.max_call_depth,
+                allowed_tools: a.tool_ceilings.keys().cloned().collect(),
+                tool_ceilings: a.tool_ceilings,
+                capability_ceiling: a.capability_ceiling,
+            })
         } else {
             None
         };
+        let workflow_parent = parent_row
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("workflow-stage:"));
         let parent = Session::new(ConversationId(parent_id.to_string()), parent_db.clone()).await;
         let request = parent
             .command_requests(&Default::default())
@@ -117,16 +151,22 @@ impl Server {
             "narrow or malformed parent scope is not supported by local broad jobs"
         );
         let runtime = self.sessions.lock().await;
-        let registered = runtime
-            .get(parent_id)
-            .ok_or_else(|| anyhow::anyhow!("parent session is not registered with executor"))?;
+        let registered =
+            if workflow_parent {
+                None
+            } else {
+                Some(runtime.get(parent_id).ok_or_else(|| {
+                    anyhow::anyhow!("parent session is not registered with executor")
+                })?)
+            };
         anyhow::ensure!(
-            inherited.as_ref().map_or(
-                registered.parent_tools.is_none() && registered.call_depth == 0,
-                |authority| registered.parent_tools.is_some()
-                    && registered.call_depth == authority.call_depth
-                    && registered.max_call_depth == authority.max_call_depth
-            ),
+            workflow_parent
+                || inherited.as_ref().map_or(
+                    registered.is_some_and(|r| r.parent_tools.is_none() && r.call_depth == 0),
+                    |authority| registered.is_some_and(|r| r.parent_tools.is_some()
+                        && r.call_depth == authority.call_depth
+                        && r.max_call_depth == authority.max_call_depth)
+                ),
             "parent runtime does not match its durable authority"
         );
         drop(runtime);
@@ -422,6 +462,37 @@ impl Server {
                         .ok_or_else(|| anyhow::anyhow!("accepted job parent has no authority"))?
                         .definition,
                 )
+            } else if parent_row
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("workflow-stage:"))
+            {
+                let workflow = Box::pin(self.validate_workflow_parent(parent.database()))
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("accepted workflow parent is invalid"))?;
+                let crate::extensions::orchestrator::spec::FlowSpec::Spawn(node) = &workflow.flow
+                else {
+                    anyhow::bail!("workflow child node is not ready");
+                };
+                anyhow::ensure!(
+                    matching.request.command_id.as_str() == crate::session::workflow_jobs::ROOT_KEY
+                        && agent_ref == &node.agent
+                        && task == &node.task
+                        && workflow.authority.call_depth.checked_add(1)
+                            == Some(accepted.definition.call_depth),
+                    "workflow child command differs from graph or depth"
+                );
+                let a = workflow.authority;
+                Some(StagedAgentDefinition {
+                    target: a.agent,
+                    task: String::new(),
+                    executor_pubkey: a.home_pubkey,
+                    call_depth: a.call_depth,
+                    max_call_depth: a.max_call_depth,
+                    allowed_tools: a.tool_ceilings.keys().cloned().collect(),
+                    tool_ceilings: a.tool_ceilings,
+                    capability_ceiling: a.capability_ceiling,
+                })
             } else {
                 None
             };
