@@ -392,6 +392,10 @@ pub struct JobResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum JobState {
+    Pending,
+    Rejected {
+        message: String,
+    },
     Queued,
     Running {
         attempt_id: String,
@@ -413,7 +417,10 @@ pub enum JobState {
 
 impl JobState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded { .. } | Self::Failed { .. })
+        matches!(
+            self,
+            Self::Succeeded { .. } | Self::Failed { .. } | Self::Rejected { .. }
+        )
     }
 }
 
@@ -421,6 +428,30 @@ impl JobState {
 pub struct JobStatus {
     pub session_db_id: String,
     pub state: JobState,
+}
+
+const JOB_REJECTION: &str = "job_rejection";
+
+pub(crate) async fn read_job_rejection(db: &eidetica::Database) -> anyhow::Result<Option<String>> {
+    let txn = db.new_transaction().await?;
+    let doc = txn
+        .get_store::<DocStore>(JOB_REJECTION)
+        .await?
+        .get_all()
+        .await?;
+    doc.get("v1")
+        .map(|v| v.try_into().map_err(Into::into))
+        .transpose()
+}
+
+pub(crate) async fn reject_job(db: &eidetica::Database, message: &str) -> anyhow::Result<()> {
+    let txn = db.new_transaction().await?;
+    txn.get_store::<DocStore>(JOB_REJECTION)
+        .await?
+        .set_string("v1", message)
+        .await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 const JOB_RESULT: &str = "job_result";
@@ -454,9 +485,25 @@ pub(crate) async fn status_from_db(
     live_attempts: &std::collections::HashSet<String>,
     executor_observer: bool,
 ) -> anyhow::Result<JobStatus> {
-    let accepted = read_accepted_job(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session has no accepted agent job"))?;
+    let accepted = match read_accepted_job(db).await? {
+        Some(accepted) => accepted,
+        None if crate::db_kind::read_marker(db)
+            .await
+            .is_some_and(|(kind, name)| {
+                kind == crate::db_kind::KIND_SESSION && name.starts_with("job-stage:submitter:")
+            })
+            || read_job_rejection(db).await?.is_some() =>
+        {
+            return Ok(JobStatus {
+                session_db_id: db.root_id().to_string(),
+                state: match read_job_rejection(db).await? {
+                    Some(message) => JobState::Rejected { message },
+                    None => JobState::Pending,
+                },
+            });
+        }
+        None => anyhow::bail!("session has no accepted agent job"),
+    };
     let session_db_id = db.root_id().to_string();
     let session =
         super::Session::new(super::ConversationId(session_db_id.clone()), db.clone()).await;
