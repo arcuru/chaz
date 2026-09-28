@@ -1,9 +1,10 @@
 //! Durable outbound delivery for transport bridges.
 //!
-//! Matrix bridges deliver only addressed `MatrixSend` entries (automatic
-//! Matrix-origin finals or explicit tool sends) for their
-//! own login and room. Other transports keep their normal message delivery,
-//! but do not re-send a final explicitly paired with a Matrix outbox event.
+//! Reply-capable bridges deliver only addressed `BridgeEvent` outbound rows
+//! for their own login and channel (including already-written `MatrixSend`
+//! rows). Legacy Discord fanout of ordinary agent messages remains until its
+//! adapter migrates, but never publishes a final paired with an outbox event.
+//! After a transport acknowledgement, a generic receipt enters shared history.
 //! Progress is persisted per [`DeliveryBinding`] — the transport,
 //! login, channel, and session a bridge routes on — in the peer-local
 //! `chaz_peer` database. Two frontends sharing one Eidetica login therefore
@@ -42,7 +43,10 @@ use tracing::{debug, error, warn};
 
 use super::render_outbound;
 use crate::agent::AgentRegistry;
-use crate::session::{EntryRouting, EntryType, Session, SessionEntry, TurnRequestId};
+use crate::session::{
+    BridgeEventRole, EntryRouting, EntryType, Session, SessionEntry, TurnRequestId,
+};
+#[cfg(test)]
 use chrono::Utc;
 
 /// `chaz_peer` store holding one [`DeliveryProgress`] document per binding.
@@ -380,6 +384,13 @@ impl DeliveryReconciler {
     /// converged; `Ok(false)` when a send failed and the tail remains.
     async fn reconcile_once(&self) -> anyhow::Result<bool> {
         let mut state = self.state.lock().await;
+        anyhow::ensure!(
+            crate::session::transport_bindings(&self.session_db)
+                .await?
+                .len()
+                <= 1,
+            "session has multiple external bindings; delivery requires explicit migration"
+        );
         // A detached room or an ambiguous legacy session must never receive a
         // pending request even if the bridge is still watching its old DB.
         if self.binding.transport == "matrix"
@@ -396,28 +407,62 @@ impl DeliveryReconciler {
         let snapshot = self.session_db.snapshot().await?;
         let rows = Session::entries_with_ids_at_snapshot(&self.session_db, &snapshot).await?;
         let baseline = self.baseline_ids(&mut state).await?;
+        let legacy_fanout = if self.binding.transport == "matrix" {
+            false
+        } else {
+            !crate::session::session_attachment(&self.session_db)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|a| {
+                    a.conversational_replies
+                        && a.transport == self.binding.transport
+                        && a.login_id == self.binding.login_id
+                        && a.channel == self.binding.channel
+                })
+        };
 
+        // A future outbound role addressed here is not safely understood by
+        // this reader. Do not fold it into delivered_through: a newer reader
+        // must still be able to act on it after an upgrade.
+        let unsupported_addressed = rows.iter().any(|(id, entry)| {
+            entry.routing.as_ref().is_some_and(|r| {
+                r.destinations.iter().any(|d| {
+                    d.transport == self.binding.transport
+                        && d.login_id == self.binding.login_id
+                        && d.channel == self.binding.channel
+                })
+            }) && entry.bridge_role().is_none()
+                && (entry.entry_type == EntryType::BridgeEvent
+                    || matches!(entry.entry_type, EntryType::Unknown { .. }))
+                && !baseline.contains(id.as_str())
+        });
         let pending: Vec<&(TurnRequestId, SessionEntry)> = rows
             .iter()
             .filter(|(id, entry)| {
-                (if self.binding.transport == "matrix" {
-                    entry.entry_type == EntryType::MatrixSend
-                        && entry.sender == self.owning_agent
+                (if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
+                    entry.sender == self.owning_agent
                         && self.agents.get(&entry.sender).is_some()
                         && entry.routing.as_ref().is_some_and(|routing| {
                             routing.source.is_none()
                                 && routing.destinations.len() == 1
-                                && routing.destinations[0].transport == "matrix"
+                                && routing.destinations[0].transport == self.binding.transport
                                 && routing.destinations[0].login_id == self.binding.login_id
                                 && routing.destinations[0].channel == self.binding.channel
-                                && routing.destinations[0].message_id.is_some()
+                                && routing.destinations[0]
+                                    .message_id
+                                    .as_deref()
+                                    .is_some_and(|id| !id.is_empty())
                         })
                 } else {
-                    entry.entry_type == EntryType::Message
+                    // Existing Discord sessions still publish normal agent
+                    // messages; other adapters use addressed outbox rows.
+                    legacy_fanout
+                        && entry.entry_type == EntryType::Message
                         && entry
                             .routing
                             .as_ref()
-                            .and_then(|routing| routing.matrix_send_id.as_ref())
+                            .and_then(|r| r.outbound_id.as_ref())
                             .is_none()
                         && self.agents.get(&entry.sender).is_some()
                 }) && !baseline.contains(id.as_str())
@@ -426,8 +471,21 @@ impl DeliveryReconciler {
             .collect();
 
         for (id, entry) in pending {
-            let body = if self.binding.transport == "matrix" {
-                entry.content.clone()
+            if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
+                let attachment = crate::session::session_attachment(&self.session_db).await?;
+                anyhow::ensure!(
+                    attachment
+                        .as_ref()
+                        .is_some_and(|a| a.transport == self.binding.transport
+                            && a.login_id == self.binding.login_id
+                            && a.channel == self.binding.channel),
+                    "external attachment changed before delivery"
+                );
+            }
+            let body = if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
+                // Bound destination, owning agent, and supported role were
+                // checked above; never render the JSON envelope as a message.
+                entry.bridge_body().expect("supported outbound has a body")
             } else {
                 render_outbound(&self.owning_agent, &entry.sender, &entry.content)
             };
@@ -442,6 +500,11 @@ impl DeliveryReconciler {
                     body,
                     idempotency_key: self.binding.idempotency_key(id.as_str(), index),
                 };
+                debug!(entry_id = %id, transport = %self.binding.transport,
+                    outbound_id = ?entry.routing.as_ref().and_then(|r| r.destinations.first())
+                        .and_then(|d| d.message_id.as_deref()),
+                    channel = %self.binding.channel, idempotency_key = %chunk.idempotency_key,
+                    "Delivering addressed row chunk");
                 if let Err(error) = (self.send)(chunk).await {
                     warn!(
                         session_db_id = %self.binding.session_db_id,
@@ -462,8 +525,10 @@ impl DeliveryReconciler {
                 // complete. If this commit fails the same transport transaction
                 // ID safely retries. A second pass sees the confirmation and
                 // doesn't append another acknowledgement.
-                if mark == DeliveryMark::Complete && self.binding.transport == "matrix" {
-                    self.confirm_matrix_send(entry, &rows).await?;
+                if mark == DeliveryMark::Complete
+                    && entry.bridge_role() == Some(BridgeEventRole::Outbound)
+                {
+                    self.confirm_bridge_send(entry, &rows).await?;
                 }
                 state.progress.entries.insert(id.as_str().to_string(), mark);
                 self.store.save(&self.binding, &state.progress).await?;
@@ -477,9 +542,12 @@ impl DeliveryReconciler {
             }
         }
 
-        // Everything at `snapshot` is delivered. Fold the marks into the
-        // snapshot so the record stays small; skip the write when there is
-        // nothing to fold.
+        if unsupported_addressed {
+            warn!(session_db_id = %self.binding.session_db_id, "Unsupported addressed event left pending for a newer reader");
+            return Ok(false);
+        }
+        // Everything actionable at `snapshot` is delivered. Fold the marks
+        // into the snapshot so the record stays small.
         if !state.progress.entries.is_empty() {
             state.progress = DeliveryProgress {
                 delivered_through: Some(snapshot.clone()),
@@ -494,7 +562,7 @@ impl DeliveryReconciler {
         Ok(true)
     }
 
-    async fn confirm_matrix_send(
+    async fn confirm_bridge_send(
         &self,
         entry: &SessionEntry,
         rows: &[(TurnRequestId, SessionEntry)],
@@ -504,9 +572,9 @@ impl DeliveryReconciler {
             .as_ref()
             .and_then(|r| r.destinations.first())
             .and_then(|d| d.message_id.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("Matrix send missing durable message identity"))?;
+            .ok_or_else(|| anyhow::anyhow!("bridge outbound missing durable message identity"))?;
         if rows.iter().any(|(_, row)| {
-            row.entry_type == EntryType::MatrixSent
+            row.bridge_role() == Some(BridgeEventRole::Receipt)
                 && row.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(id)
         }) {
             return Ok(());
@@ -519,23 +587,21 @@ impl DeliveryReconciler {
         // Re-read after a retry or concurrent peer write; this is an audit
         // projection, not another request or external send.
         if session.entries().iter().any(|row| {
-            row.entry_type == EntryType::MatrixSent
+            row.bridge_role() == Some(BridgeEventRole::Receipt)
                 && row.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(id)
         }) {
             return Ok(());
         }
         session
-            .add_entry(SessionEntry {
-                sender: self.owning_agent.clone(),
-                content: String::new(),
-                timestamp: Utc::now(),
-                entry_type: EntryType::MatrixSent,
-                metadata: None,
-                routing: Some(EntryRouting {
+            .add_entry(SessionEntry::new_bridge_event(
+                &self.owning_agent,
+                BridgeEventRole::Receipt,
+                "",
+                Some(EntryRouting {
                     reply_to: Some(id.to_owned()),
                     ..Default::default()
                 }),
-            })
+            ))
             .await?;
         Ok(())
     }
@@ -565,7 +631,6 @@ mod tests {
     use super::*;
     use crate::session::EntryType;
     use crate::types::ConversationId;
-    use chrono::Utc;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::{Instance, NewUser};
@@ -764,7 +829,7 @@ mod tests {
             entries
                 .entries()
                 .iter()
-                .filter(|e| e.entry_type == EntryType::MatrixSent)
+                .filter(|e| e.bridge_role() == Some(BridgeEventRole::Receipt))
                 .count(),
             1
         );
@@ -772,7 +837,7 @@ mod tests {
             entries
                 .entries()
                 .iter()
-                .any(|e| e.entry_type == EntryType::MatrixSent
+                .any(|e| e.bridge_role() == Some(BridgeEventRole::Receipt)
                     && e.routing.as_ref().unwrap().reply_to.as_deref() == Some("the-send"))
         );
         assert_eq!(
@@ -808,6 +873,82 @@ mod tests {
             "detached rooms must receive nothing"
         );
         restarted.stop();
+    }
+
+    #[tokio::test]
+    async fn generic_test_transport_is_addressed_receipted_and_future_safe() {
+        let fx = fixture().await;
+        crate::session::bind_conversational_transport(&fx.session_db, "test", "login", "room")
+            .await
+            .unwrap();
+        write(&fx.session_db, "default", "local final stays here").await;
+        let mut session = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        let route = |id: &str| {
+            Some(EntryRouting {
+                destinations: vec![crate::session::TransportRef {
+                    transport: "test".into(),
+                    login_id: "login".into(),
+                    channel: "room".into(),
+                    sender: None,
+                    sender_display: None,
+                    message_id: Some(id.into()),
+                }],
+                ..Default::default()
+            })
+        };
+        session
+            .add_entry(SessionEntry::new_bridge_event(
+                "default",
+                BridgeEventRole::Outbound,
+                "only outbound",
+                route("generic-id"),
+            ))
+            .await
+            .unwrap();
+        let wire = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "room", &wire, one_chunk).await;
+        assert_eq!(wire.bodies().await, ["only outbound"]);
+        let receipt = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        assert!(receipt.entries().iter().any(|entry| entry.bridge_role()
+            == Some(BridgeEventRole::Receipt)
+            && entry.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some("generic-id")));
+        reconciler.stop();
+        let newer = Arc::new(Transport::default());
+        let restarted = attach(&fx, "room", &newer, one_chunk).await;
+        assert!(newer.bodies().await.is_empty());
+        restarted.stop();
+
+        let mut future = SessionEntry::new_bridge_event(
+            "default",
+            BridgeEventRole::Outbound,
+            "future effect",
+            route("future-id"),
+        );
+        future.content = r#"{"version":9,"role":"outbound","body":"future effect"}"#.into();
+        let future_id = session.add_entry(future).await.unwrap();
+        let future_snapshot = fx.session_db.snapshot().await.unwrap();
+        let future_wire = Arc::new(Transport::default());
+        let holding = attach(&fx, "room", &future_wire, one_chunk).await;
+        assert!(future_wire.bodies().await.is_empty());
+        let progress = fx.store.load(holding.binding()).await.unwrap().unwrap();
+        assert_ne!(
+            progress.delivered_through,
+            Some(future_snapshot),
+            "an unsupported addressed event must remain outside the delivered snapshot"
+        );
+        assert!(
+            !progress.entries.contains_key(future_id.as_str()),
+            "an unsupported addressed event must not be marked delivered"
+        );
+        holding.stop();
     }
 
     #[tokio::test]
@@ -863,7 +1004,7 @@ mod tests {
                 entry_type: EntryType::Message,
                 metadata: None,
                 routing: Some(EntryRouting {
-                    matrix_send_id: Some("room-send-id".into()),
+                    outbound_id: Some("room-send-id".into()),
                     ..Default::default()
                 }),
             })

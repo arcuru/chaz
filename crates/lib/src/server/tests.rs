@@ -164,17 +164,17 @@ async fn matrix_origin_final_queues_room_reply_but_local_final_and_no_reply_do_n
     let outbound: Vec<_> = answered
         .entries()
         .iter()
-        .filter(|entry| entry.entry_type == EntryType::MatrixSend)
+        .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
         .collect();
     assert_eq!(outbound.len(), 1);
-    assert_eq!(outbound[0].content, "room answer");
+    assert_eq!(outbound[0].bridge_body().as_deref(), Some("room answer"));
     let reply = answered
         .entries()
         .iter()
         .find(|entry| entry.entry_type == EntryType::Message && entry.content == "room answer")
         .unwrap();
     assert_eq!(
-        reply.routing.as_ref().unwrap().matrix_send_id,
+        reply.routing.as_ref().unwrap().outbound_id,
         outbound[0].routing.as_ref().unwrap().destinations[0].message_id,
     );
     assert_eq!(
@@ -211,14 +211,14 @@ async fn matrix_origin_final_queues_room_reply_but_local_final_and_no_reply_do_n
         local_final
             .routing
             .as_ref()
-            .and_then(|routing| routing.matrix_send_id.as_ref())
+            .and_then(|routing| routing.outbound_id.as_ref())
             .is_none()
     );
     assert_eq!(
         local
             .entries()
             .iter()
-            .filter(|entry| entry.entry_type == EntryType::MatrixSend)
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
             .count(),
         1
     );
@@ -246,7 +246,7 @@ async fn matrix_origin_final_queues_room_reply_but_local_final_and_no_reply_do_n
         silent
             .entries()
             .iter()
-            .filter(|entry| entry.entry_type == EntryType::MatrixSend)
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
             .count(),
         1
     );
@@ -295,7 +295,7 @@ async fn matrix_origin_final_queues_room_reply_but_local_final_and_no_reply_do_n
         local_silent
             .entries()
             .iter()
-            .filter(|entry| entry.entry_type == EntryType::MatrixSend)
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
             .count(),
         1
     );
@@ -391,14 +391,14 @@ async fn explicit_matrix_send_counts_as_reply_and_no_reply_cannot_retract_it() {
     let outbox: Vec<_> = replied
         .entries()
         .iter()
-        .filter(|entry| entry.entry_type == EntryType::MatrixSend)
+        .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
         .collect();
     assert_eq!(
         outbox.len(),
         1,
         "explicit send must suppress auto-final room post"
     );
-    assert_eq!(outbox[0].content, "explicit reply");
+    assert_eq!(outbox[0].bridge_body().as_deref(), Some("explicit reply"));
     assert!(
         replied
             .entries()
@@ -417,7 +417,7 @@ async fn explicit_matrix_send_counts_as_reply_and_no_reply_cannot_retract_it() {
         failed
             .entries()
             .iter()
-            .filter(|entry| entry.entry_type == EntryType::MatrixSend)
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
             .count(),
         2
     );
@@ -464,9 +464,14 @@ async fn matrix_origin_reply_requires_owner_and_current_single_room_binding() {
         .await
         .unwrap();
     let attempt = session.start_turn_attempt(request).await.unwrap();
-    let binding = ("@alpha:s".to_string(), "!room:s".to_string());
+    let binding = crate::session::TransportAttachment {
+        transport: "matrix".into(),
+        login_id: "@alpha:s".into(),
+        channel: "!room:s".into(),
+        conversational_replies: true,
+    };
     assert!(
-        matrix_reply_for_turn(
+        bridge_reply_for_turn(
             &session,
             &registry,
             &attempt,
@@ -493,7 +498,7 @@ async fn matrix_origin_reply_requires_owner_and_current_single_room_binding() {
     })
     .await
     .unwrap();
-    let outbound = matrix_reply_for_turn(
+    let outbound = bridge_reply_for_turn(
         &session,
         &registry,
         &attempt,
@@ -504,20 +509,26 @@ async fn matrix_origin_reply_requires_owner_and_current_single_room_binding() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(outbound.entry_type, EntryType::MatrixSend);
+    assert_eq!(
+        outbound.bridge_role(),
+        Some(crate::session::BridgeEventRole::Outbound)
+    );
     assert_eq!(
         outbound.routing.as_ref().unwrap().destinations[0].channel,
         "!room:s"
     );
     assert!(
-        matrix_reply_for_turn(&session, &registry, &attempt, "alpha", None, "answer")
+        bridge_reply_for_turn(&session, &registry, &attempt, "alpha", None, "answer")
             .await
             .is_err(),
         "ambiguous bindings must not choose a room"
     );
-    let wrong = ("@alpha:s".to_string(), "!wrong:s".to_string());
+    let wrong = crate::session::TransportAttachment {
+        channel: "!wrong:s".into(),
+        ..binding.clone()
+    };
     assert!(
-        matrix_reply_for_turn(
+        bridge_reply_for_turn(
             &session,
             &registry,
             &attempt,
@@ -532,7 +543,7 @@ async fn matrix_origin_reply_requires_owner_and_current_single_room_binding() {
         .await
         .unwrap();
     assert!(
-        matrix_reply_for_turn(
+        bridge_reply_for_turn(
             &session,
             &registry,
             &attempt,
@@ -583,7 +594,12 @@ async fn observed_matrix_input_is_context_not_a_turn_request() {
         "watching",
         Some("event".into()),
     );
-    observed.entry_type = EntryType::MatrixObserved;
+    observed = SessionEntry::new_bridge_event(
+        observed.sender,
+        crate::session::BridgeEventRole::Observation,
+        observed.content,
+        observed.routing,
+    );
     session.add_entry(observed).await.unwrap();
     assert!(
         session
@@ -597,9 +613,168 @@ async fn observed_matrix_input_is_context_not_a_turn_request() {
     write_user_message_with_content(&db, &sid, "from TUI").await;
     await_call_count(&mock, 1).await;
     assert!(mock.recorded_calls()[0].messages.iter().any(|m| matches!(m,
-        crate::runtime::RuntimeMessage::User(s) if s.contains("matrix_observed") && s.contains("watching"))));
+        crate::runtime::RuntimeMessage::User(s) if s.contains("bridge_observation") && s.contains("watching"))));
     await_no_processing(&server, &sid).await;
     assert_eq!(mock.recorded_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn completed_attempt_cannot_be_reused_from_a_stale_in_flight_selection() {
+    let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+    let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+    let request_id = session
+        .add_entry(SessionEntry {
+            sender: "visitor".into(),
+            content: "one request".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let first = session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    let stale = crate::session::TurnRequest {
+        id: request_id,
+        entry: session.entries()[0].clone(),
+        state: TurnRequestState::InFlight {
+            attempt_id: first.attempt_id.clone(),
+        },
+    };
+    session.complete_turn_attempt(&first, None).await.unwrap();
+    let live = std::collections::HashSet::from([first.attempt_id.clone()]);
+    assert!(
+        fresh_attempt_for_request(&session, &stale, &live, true)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale live-attempt selection must not re-run an already completed tool turn"
+    );
+}
+
+#[tokio::test]
+async fn neutral_test_adapter_replies_to_source_only_and_no_reply_stays_silent() {
+    use crate::agent_db::LoginRef;
+    use crate::session::{BridgeEventRole, bind_conversational_transport};
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (agent, adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("test:room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    adb.register_login(LoginRef {
+        kind: "test".into(),
+        identifier: "test-login".into(),
+        bridge_db_id: sid.clone(),
+        peer_pubkey: None,
+        agent_pubkey: None,
+        sync_addresses: Vec::new(),
+    })
+    .await
+    .unwrap();
+    bind_conversational_transport(&db, "test", "test-login", "room")
+        .await
+        .unwrap();
+    let model = Arc::new(MockBackend::new());
+    model.push_text("external answer");
+    model.push_text("local answer");
+    model.push_tool_calls(vec![("quiet".into(), "no_reply".into(), "{}".into())]);
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                model.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let external = |content: &str| {
+        crate::bridge::inbound_user_entry(
+            "test",
+            "test-login",
+            "room",
+            "visitor",
+            None,
+            content,
+            None,
+        )
+    };
+    session
+        .add_bridge_input(external("ask"), true)
+        .await
+        .unwrap();
+    await_call_count(&model, 1).await;
+    await_no_processing(&server, &sid).await;
+    let answered = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let outbound: Vec<_> = answered
+        .entries()
+        .iter()
+        .filter(|e| e.bridge_role() == Some(BridgeEventRole::Outbound))
+        .collect();
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(
+        outbound[0].bridge_body().as_deref(),
+        Some("external answer")
+    );
+    assert_eq!(
+        outbound[0].routing.as_ref().unwrap().destinations[0].transport,
+        "test"
+    );
+    assert!(
+        model.recorded_calls()[0]
+            .tools
+            .iter()
+            .any(|t| t.name == "no_reply")
+    );
+
+    session
+        .add_entry(SessionEntry {
+            sender: "visitor".into(),
+            content: "local question".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&model, 2).await;
+    await_no_processing(&server, &sid).await;
+    session
+        .add_bridge_input(external("silent"), true)
+        .await
+        .unwrap();
+    await_call_count(&model, 3).await;
+    await_no_processing(&server, &sid).await;
+    let final_session = Session::new(ConversationId(sid), db).await;
+    assert_eq!(
+        final_session
+            .entries()
+            .iter()
+            .filter(|e| e.bridge_role() == Some(BridgeEventRole::Outbound))
+            .count(),
+        1
+    );
+    assert!(
+        final_session
+            .entries()
+            .iter()
+            .any(|e| e.entry_type == EntryType::Message
+                && e.content == "local answer"
+                && e.routing.is_none())
+    );
 }
 
 #[test]

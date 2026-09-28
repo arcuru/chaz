@@ -1,7 +1,8 @@
-use crate::session::{EntryRouting, EntryType, SessionEntry, TransportRef, is_bound};
+use crate::session::{
+    BridgeEventRole, EntryRouting, SessionEntry, TransportRef, is_bound, session_attachment,
+};
 use crate::session::{Session, SessionRegistry};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
-use chrono::Utc;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -13,6 +14,7 @@ pub(crate) async fn ensure_agent_owns_login(
     registry: &SessionRegistry,
     session: &Session,
     agent_name: &str,
+    transport: &str,
     login: &str,
 ) -> Result<(), ToolError> {
     let meta = session.read_meta().await;
@@ -35,34 +37,33 @@ pub(crate) async fn ensure_agent_owns_login(
         .await
         .map_err(|error| ToolError::Execution(error.to_string()))?
         .iter()
-        .any(|candidate| candidate.kind == "matrix" && candidate.identifier == login);
+        .any(|candidate| candidate.kind == transport && candidate.identifier == login);
     if !owns_login {
         return Err(ToolError::Execution(
-            "this Matrix login does not belong to the executing agent".into(),
+            "this transport login does not belong to the executing agent".into(),
         ));
     }
     Ok(())
 }
 
-/// One addressed durable outbox row, whether produced by the explicit tool
-/// or by a Matrix-origin normal final at turn completion.
+/// One addressed durable outbox row, whether produced by an explicit tool
+/// or by an external-origin normal final at turn completion.
 pub(crate) fn addressed_send_entry(
     agent_name: &str,
     body: &str,
+    transport: &str,
     login: &str,
     room: &str,
 ) -> (SessionEntry, String) {
     let id = uuid::Uuid::new_v4().to_string();
     (
-        SessionEntry {
-            sender: agent_name.to_owned(),
-            content: body.to_owned(),
-            timestamp: Utc::now(),
-            entry_type: EntryType::MatrixSend,
-            metadata: None,
-            routing: Some(EntryRouting {
+        SessionEntry::new_bridge_event(
+            agent_name,
+            BridgeEventRole::Outbound,
+            body,
+            Some(EntryRouting {
                 destinations: vec![TransportRef {
-                    transport: "matrix".into(),
+                    transport: transport.to_owned(),
                     login_id: login.to_owned(),
                     channel: room.to_owned(),
                     sender: None,
@@ -71,7 +72,7 @@ pub(crate) fn addressed_send_entry(
                 }],
                 ..Default::default()
             }),
-        },
+        ),
         id,
     )
 }
@@ -108,29 +109,28 @@ impl Tool for MatrixSend {
                 .ok_or_else(|| ToolError::InvalidArgument("body must be nonempty text".into()))?;
             let mut session = ctx.session.lock().await;
             let db = session.database();
-            let bindings = crate::session::transport_bindings(db)
+            let attachment = session_attachment(db)
                 .await
-                .map_err(|e| ToolError::Execution(e.to_string()))?;
-            let matrix: Vec<_> = bindings
-                .into_iter()
-                .filter(|(kind, _, _)| kind == "matrix")
-                .collect();
-            if matrix.len() != 1 {
-                return Err(ToolError::Execution(
-                    "session must have exactly one Matrix binding".into(),
-                ));
-            }
-            let (_, login, room) = &matrix[0];
+                .map_err(|e| ToolError::Execution(e.to_string()))?
+                .filter(|a| a.transport == "matrix" && a.conversational_replies)
+                .ok_or_else(|| {
+                    ToolError::Execution(
+                        "session must have exactly one conversational Matrix attachment".into(),
+                    )
+                })?;
+            let login = &attachment.login_id;
+            let room = &attachment.channel;
             if !is_bound(db, "matrix", login, room)
                 .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?
             {
                 return Err(ToolError::Execution(
-                    "Matrix binding is no longer valid".into(),
+                    "Matrix attachment is no longer valid".into(),
                 ));
             }
-            ensure_agent_owns_login(&self.registry, &session, &ctx.agent_name, login).await?;
-            let (entry, id) = addressed_send_entry(&ctx.agent_name, body, login, room);
+            ensure_agent_owns_login(&self.registry, &session, &ctx.agent_name, "matrix", login)
+                .await?;
+            let (entry, id) = addressed_send_entry(&ctx.agent_name, body, "matrix", login, room);
             session
                 .add_entry(entry)
                 .await
@@ -216,8 +216,8 @@ mod tests {
             crate::session::Session::new(crate::types::ConversationId(sid), db.clone()).await;
         assert_eq!(reopened.entries().len(), 1);
         let entry = &reopened.entries()[0];
-        assert_eq!(entry.entry_type, EntryType::MatrixSend);
-        assert_eq!(entry.content, "@beta hello");
+        assert_eq!(entry.bridge_role(), Some(BridgeEventRole::Outbound));
+        assert_eq!(entry.bridge_body().as_deref(), Some("@beta hello"));
         assert_eq!(
             entry.routing.as_ref().unwrap().destinations[0].channel,
             "!room:s"

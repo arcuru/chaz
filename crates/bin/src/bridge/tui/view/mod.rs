@@ -514,7 +514,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
         };
         let dim = Style::default().fg(COLOR_DIM);
 
-        match entry.entry_type {
+        match &entry.entry_type {
             EntryType::Message => {
                 let is_agent = app.agent_names.contains(&entry.sender);
                 let is_system = entry.sender == "system";
@@ -559,8 +559,15 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
                 }
                 lines.push(Line::from(""));
             }
-            EntryType::MatrixObserved | EntryType::MatrixSend => {
-                let (label, source) = if entry.entry_type == EntryType::MatrixObserved {
+            EntryType::MatrixObserved | EntryType::MatrixSend | EntryType::BridgeEvent => {
+                use chaz_core::session::BridgeEventRole;
+                let Some(role) = entry.bridge_role() else {
+                    continue;
+                }; // future role is inert
+                if role == BridgeEventRole::Receipt {
+                    continue;
+                }
+                let (label, address) = if role == BridgeEventRole::Observation {
                     (
                         "observed, no wake",
                         entry.routing.as_ref().and_then(|r| r.source.as_ref()),
@@ -569,22 +576,30 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
                     let dest = entry.routing.as_ref().and_then(|r| r.destinations.first());
                     let id = dest.and_then(|d| d.message_id.as_deref());
                     let delivered = tab.entries.iter().any(|e| {
-                        e.entry_type == EntryType::MatrixSent
+                        e.bridge_role() == Some(BridgeEventRole::Receipt)
                             && e.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == id
                     });
                     (if delivered { "sent" } else { "pending" }, dest)
                 };
-                let room = source.map(|s| s.channel.as_str()).unwrap_or("unknown room");
+                let transport = address.map(|a| a.transport.as_str()).unwrap_or("external");
+                let channel = address
+                    .map(|a| a.channel.as_str())
+                    .unwrap_or("unknown channel");
                 lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}{} [Matrix {label} in {room}]:", entry.sender),
+                    format!(
+                        "{debug_prefix}{} [{transport} {label} in {channel}]:",
+                        entry.sender
+                    ),
                     dim,
                 )]));
-                for content_line in entry.content.lines() {
-                    lines.push(Line::from(format!("  {content_line}")));
+                if let Some(body) = entry.bridge_body() {
+                    for content_line in body.lines() {
+                        lines.push(Line::from(format!("  {content_line}")));
+                    }
                 }
                 lines.push(Line::from(""));
             }
-            EntryType::MatrixSent => {} // The send row above shows its confirmed status.
+            EntryType::MatrixSent | EntryType::Unknown { .. } => {} // Inert audit records.
             // Directives, ToolCall, ToolResult are collapsible. Per-entry
             // override flips the global default (`app.expand_all`).
             EntryType::Directive => {

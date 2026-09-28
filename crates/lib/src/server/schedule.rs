@@ -663,14 +663,7 @@ impl Server {
         .await;
         let session_capabilities = session.read_meta().await.capabilities;
         let session = Arc::new(tokio::sync::Mutex::new(session));
-        let matrix_binding = {
-            let all = crate::session::transport_bindings(session_db).await?;
-            let matrix: Vec<_> = all
-                .into_iter()
-                .filter(|(kind, _, _)| kind == "matrix")
-                .collect();
-            (matrix.len() == 1).then(|| (matrix[0].1.clone(), matrix[0].2.clone()))
-        };
+        let attachment = crate::session::session_attachment(session_db).await?;
 
         let tool_ctx = ToolContext {
             agent_name: agent_name.to_string(),
@@ -680,7 +673,9 @@ impl Server {
             max_call_depth,
             tools: scoped_tools,
             profile,
-            allow_no_reply: matrix_binding.is_some(),
+            allow_no_reply: attachment
+                .as_ref()
+                .is_some_and(|a| a.conversational_replies),
             session: session.clone(),
             grants: Default::default(),
             session_capabilities,
@@ -721,8 +716,8 @@ impl Server {
                 &agent.system_prompt,
                 &self.context_config,
             );
-            if let Some((login, room)) = &matrix_binding {
-                builder = builder.with_matrix_binding(login, room);
+            if let Some(attachment) = &attachment {
+                builder = builder.with_attachment(attachment);
             }
             let assembled = builder
                 .with_tools(&tool_defs)

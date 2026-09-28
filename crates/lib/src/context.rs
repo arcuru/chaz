@@ -127,7 +127,7 @@ pub struct ContextBuilder<'a> {
     /// standard "room note" listing the *other* participants and the
     /// `@mention` convention is appended to the system prompt.
     room_participants: &'a [String],
-    matrix_binding: Option<(&'a str, &'a str)>,
+    attachment: Option<(&'a str, &'a str, &'a str)>,
     /// ExtensionHub for system prompt augmentation (skills, memory, etc.).
     extension_hub: Option<Arc<ExtensionHub>>,
     /// Session DB passed through to the hub for per-session provider resolution.
@@ -150,7 +150,7 @@ impl<'a> ContextBuilder<'a> {
             config,
             max_context_tokens_override: None,
             room_participants: &[],
-            matrix_binding: None,
+            attachment: None,
             extension_hub: None,
             session_db: None,
         }
@@ -171,9 +171,20 @@ impl<'a> ContextBuilder<'a> {
         self
     }
 
-    /// One room is a stable session property, not a property of the current input.
+    /// An external attachment is a session property, never inferred from the
+    /// text of the current input.
+    pub fn with_attachment(mut self, attachment: &'a crate::session::TransportAttachment) -> Self {
+        self.attachment = Some((
+            &attachment.transport,
+            &attachment.login_id,
+            &attachment.channel,
+        ));
+        self
+    }
+
+    #[cfg(test)]
     pub fn with_matrix_binding(mut self, login: &'a str, room: &'a str) -> Self {
-        self.matrix_binding = Some((login, room));
+        self.attachment = Some(("matrix", login, room));
         self
     }
 
@@ -221,8 +232,9 @@ impl<'a> ContextBuilder<'a> {
             }
         }
 
-        if let Some((login, room)) = self.matrix_binding {
-            system_prompt.push_str(&format!(
+        if let Some((transport, login, room)) = self.attachment {
+            if transport == "matrix" {
+                system_prompt.push_str(&format!(
                 "\n\nThis session is attached to Matrix room {room} on login {login}. \
                  Incoming Matrix messages may be observed without waking you. \
                  On a turn triggered by a transport_message from this Matrix room, a normal final \
@@ -234,7 +246,17 @@ impl<'a> ContextBuilder<'a> {
                  a Matrix-origin turn, the later final stays local and will not post twice. \
                  JSON kind envelopes label context, not a response format. A local agent @mention \
                  wakes the mentioned agent for a normal local final."
-            ));
+                ));
+            } else {
+                system_prompt.push_str(&format!(
+                    "\n\nThis session is attached to {transport} channel {room} on login {login}. \
+                     External observations may supply context without waking you. \
+                     A normal final responding to an external-origin turn is posted only to its source; \
+                     a final from the TUI, a schedule, or a local agent stays local. \
+                     Call no_reply({{}}) as the sole terminal action to end without a final or external post. \
+                     JSON kind envelopes label context, not a response format."
+                ));
+            }
         }
 
         // 1.5. Extensions: skills, memory, etc. inject augmentations.
@@ -316,11 +338,13 @@ impl<'a> ContextBuilder<'a> {
             .filter(|(_, e)| {
                 matches!(
                     e.entry_type,
-                    EntryType::Message
-                        | EntryType::Directive
-                        | EntryType::Summary
-                        | EntryType::MatrixObserved
-                        | EntryType::MatrixSend
+                    EntryType::Message | EntryType::Directive | EntryType::Summary
+                ) || matches!(
+                    e.bridge_role(),
+                    Some(
+                        crate::session::BridgeEventRole::Observation
+                            | crate::session::BridgeEventRole::Outbound
+                    )
                 )
             })
             .map(|(i, e)| (start_idx + i, e))
@@ -331,12 +355,12 @@ impl<'a> ContextBuilder<'a> {
         let sent: HashSet<&str> = self
             .entries
             .iter()
-            .filter(|e| e.entry_type == EntryType::MatrixSent)
+            .filter(|e| e.bridge_role() == Some(crate::session::BridgeEventRole::Receipt))
             .filter_map(|e| e.routing.as_ref()?.reply_to.as_deref())
             .collect();
         let rendered: Vec<String> = contextable
             .iter()
-            .map(|(_, e)| render_entry(e, self.matrix_binding.is_some(), &sent))
+            .map(|(_, e)| render_entry(e, self.attachment, &sent))
             .collect();
         let entry_costs: Vec<usize> = rendered
             .iter()
@@ -392,7 +416,7 @@ impl<'a> ContextBuilder<'a> {
         for (offset, (index, entry)) in included_entries.iter().enumerate() {
             let text = rendered[included_from + offset].clone();
             let rm = if entry.sender == self.agent_name
-                && entry.entry_type != EntryType::MatrixObserved
+                && entry.bridge_role() != Some(crate::session::BridgeEventRole::Observation)
             {
                 RuntimeMessage::Assistant(text)
             } else {
@@ -420,32 +444,38 @@ impl<'a> ContextBuilder<'a> {
 
 /// JSON framing escapes content so an in-body provenance header cannot become
 /// a routing field. Only the session entry's typed routing is authoritative.
-fn render_entry(entry: &SessionEntry, matrix_attached: bool, sent: &HashSet<&str>) -> String {
-    if entry.entry_type == EntryType::MatrixSend {
+fn render_entry(
+    entry: &SessionEntry,
+    attachment: Option<(&str, &str, &str)>,
+    sent: &HashSet<&str>,
+) -> String {
+    use crate::session::BridgeEventRole;
+    if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
         let destination = entry.routing.as_ref().and_then(|r| r.destinations.first());
-        return serde_json::json!({"kind": "matrix_send", "sender": entry.sender,
+        return serde_json::json!({"kind": if entry.entry_type == EntryType::MatrixSend { "matrix_send" } else { "bridge_outbound" },
+            "sender": entry.sender, "transport": destination.map(|d| d.transport.as_str()),
             "room": destination.map(|d| d.channel.as_str()), "login": destination.map(|d| d.login_id.as_str()),
-            "delivery": if entry.routing.as_ref().and_then(|r| r.destinations.first())
-                .and_then(|d| d.message_id.as_deref()).is_some_and(|id| sent.contains(id)) { "sent" }
-                else { "pending" }, "body": entry.content}).to_string();
+            "delivery": if destination.and_then(|d| d.message_id.as_deref()).is_some_and(|id| sent.contains(id)) { "sent" }
+                else { "pending" }, "body": entry.bridge_body()}).to_string();
     }
     if let Some(source) = entry.routing.as_ref().and_then(|r| r.source.as_ref()) {
-        return serde_json::json!({"kind": if entry.entry_type == EntryType::MatrixObserved { "matrix_observed" } else { "transport_message" },
+        return serde_json::json!({"kind": if entry.bridge_role() == Some(BridgeEventRole::Observation) {
+                if entry.entry_type == EntryType::MatrixObserved { "matrix_observed" } else { "bridge_observation" }
+            } else { "transport_message" },
             "transport": source.transport, "login": source.login_id, "room": source.channel,
-            "sender": source.sender, "body": entry.content}).to_string();
+            "sender": source.sender, "body": if entry.bridge_role() == Some(BridgeEventRole::Observation) { entry.bridge_body().unwrap_or_default() } else { entry.content.clone() }}).to_string();
     }
     if entry.entry_type == EntryType::Message {
         if let Some(id) = entry
             .routing
             .as_ref()
-            .and_then(|routing| routing.matrix_send_id.as_deref())
+            .and_then(|routing| routing.outbound_id.as_deref())
         {
-            return serde_json::json!({"kind": "matrix_reply", "sender": entry.sender,
-                "delivery": if sent.contains(id) { "sent" } else { "pending" },
-                "body": entry.content})
-            .to_string();
+            return serde_json::json!({"kind": if attachment.is_some_and(|a| a.0 == "matrix") { "matrix_reply" } else { "bridge_reply" },
+                "sender": entry.sender, "delivery": if sent.contains(id) { "sent" } else { "pending" },
+                "body": entry.content}).to_string();
         }
-        if matrix_attached {
+        if attachment.is_some() {
             return serde_json::json!({"kind": "local_message", "sender": entry.sender, "body": entry.content}).to_string();
         }
     }
@@ -658,21 +688,33 @@ mod tests {
     fn auto_matrix_final_renders_as_room_reply_with_delivery_state() {
         let mut reply = make_entry("agent", "answer", EntryType::Message);
         reply.routing = Some(crate::session::EntryRouting {
-            matrix_send_id: Some("outbound-id".into()),
+            outbound_id: Some("outbound-id".into()),
             ..Default::default()
         });
-        let pending: serde_json::Value =
-            serde_json::from_str(&render_entry(&reply, true, &HashSet::new())).unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&render_entry(
+            &reply,
+            Some(("matrix", "@agent:s", "!room:s")),
+            &HashSet::new(),
+        ))
+        .unwrap();
         assert_eq!(pending["kind"], "matrix_reply");
         assert_eq!(pending["delivery"], "pending");
         assert_eq!(pending["body"], "answer");
         let sent_ids = HashSet::from(["outbound-id"]);
-        let sent: serde_json::Value =
-            serde_json::from_str(&render_entry(&reply, true, &sent_ids)).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&render_entry(
+            &reply,
+            Some(("matrix", "@agent:s", "!room:s")),
+            &sent_ids,
+        ))
+        .unwrap();
         assert_eq!(sent["delivery"], "sent");
         let local = make_entry("agent", "private", EntryType::Message);
-        let local: serde_json::Value =
-            serde_json::from_str(&render_entry(&local, true, &sent_ids)).unwrap();
+        let local: serde_json::Value = serde_json::from_str(&render_entry(
+            &local,
+            Some(("matrix", "@agent:s", "!room:s")),
+            &sent_ids,
+        ))
+        .unwrap();
         assert_eq!(local["kind"], "local_message");
     }
     #[tokio::test]

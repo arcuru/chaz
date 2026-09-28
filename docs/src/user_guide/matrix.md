@@ -262,9 +262,9 @@ are separate.
 | `no_reply({})` in a Matrix-bound session   | Terminal action: no final message and no room post                                                           |
 | `matrix__send({"body":"text"})`            | Explicit/proactive room send; on a Matrix-origin turn it counts as the reply and the later final stays local |
 
-The daemon commits a Matrix-origin final, its addressed `MatrixSend` outbox row,
+The daemon commits a Matrix-origin final, its addressed generic `BridgeEvent` outbound row,
 and its completed turn attempt atomically. The bridge delivers only addressed
-`MatrixSend` rows whose single destination still matches its own login and
+outbound events whose single destination still matches its own login and
 the session binding. A missing binding, mismatched identity, or conflicting
 legacy binding fails closed. No other session or joined room can be targeted.
 An acknowledged send appears as
@@ -312,7 +312,7 @@ Example in an allowlisted group room:
    session shows the addressed event as pending, then sent. A later normal
    final on that turn remains **local** and does not produce a second room post.
 3. A second room tries `!chaz attach <session>` and receives
-   `!chaz Error: failed to bind room: session has a different or conflicting Matrix binding; detach or migrate it explicitly`.
+   `!chaz Error: failed to bind room: session has a different or conflicting external attachment; detach or migrate explicitly`.
    Detach the old room first if moving the handle is intentional; an old
    queued send is not rerouted to the new room.
 4. `@you:example` sends `!chaz participation on` and sees

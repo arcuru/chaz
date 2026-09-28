@@ -14,10 +14,10 @@ A transport bridge (`chaz-matrix`, `chaz-discord`) is **dumb**: it is a pure I/O
 translator between one transport account and a set of session databases. It
 **never runs an agent**. Its entire job is three verbs:
 
-1. **proxy inbound** — turn a received message into a `Message` entry in the
-   right session DB;
-2. **deliver outbound** — reconcile new agent `Message` entries back onto the
-   transport;
+1. **proxy inbound** — give core the authenticated source and platform facts;
+   it writes either a waking `Message` or a context-only `BridgeEvent`;
+2. **deliver outbound** — reconcile addressed `BridgeEvent` requests to the
+   attached transport; existing Discord `Message` fanout remains legacy;
 3. **relay approvals** — render a tool-approval prompt the daemon raised, and
    write the human's decision back.
 
@@ -72,15 +72,29 @@ Two synced databases carry all cross-peer state. Nothing else is shared.
 ### The session DB — the conversation _and_ the channel
 
 Each conversation is one session DB. Beyond its entry log it holds the
-**transport bindings**: which `(transport, login_id, channel)` tuples this
-session is reachable on, in a per-session `transport_bindings` `DocStore`
+**transport bindings**: which single external `(transport, login_id, channel)` attachment this
+session publishes through, in a per-session `transport_bindings` `DocStore`
 (`session::transport`). Putting the binding _in the session DB_ (rather than a
 central peer-local index) means it syncs with the session — a bridge and the
 daemon agree on where a session is reachable without a side channel.
 
 The session DB is also the **only** channel between a bridge and the runtime.
-Every inbound message, every reply, every approval request, and every approval
-decision is a `SessionEntry`. See [`EntryType`](#entry-types) below.
+Every inbound message, observed event, addressed reply, receipt, approval
+request, and approval decision is a `SessionEntry`.
+For reply-capable adapters, the binding value declares `conversational_replies`;
+pre-upgrade Matrix bindings retain that capability on read, while Discord keeps
+its legacy path until migrated.
+
+One versioned `BridgeEvent` entry kind carries observation, outbound request,
+and receipt roles in `entries`.
+Its JSON content envelope has `version`, `role`, `body`, and optional namespaced
+`adapter` data; source and destination authority lives only in typed routing.
+Waking messages stay `Message` entries with source provenance.
+Unsupported roles, versions, or future entry kinds remain stored, warn with
+their row ID, and cannot wake an agent, enter context, or cause external sends.
+Older Matrix-specific entry kinds remain readable as legacy event roles, but
+new writes use the generic envelope; the already-installed old binary cannot
+read this forward-only schema.
 
 ### The agent DB — the session registry
 
@@ -164,13 +178,16 @@ Delivery is the transport-generic `DeliveryReconciler`
 `(transport, login, channel, session)` tuple a bridge routes on. Progress is
 persisted per binding in the peer-local `chaz_peer` database (store
 `transport_delivery`), so two frontends sharing one Eidetica login keep
-independent progress and a session bound to several channels is delivered to
-each of them separately.
+independent progress and new bindings cannot attach a second external channel to one session.
+Existing multi-binding sessions require explicit migration rather than an
+arbitrary choice of reply destination.
 
 A progress record has two parts: `delivered_through`, an Eidetica snapshot of
 the session at which every agent `Message` then present had been delivered, and
 `entries`, per-row marks (acknowledged chunk prefix, or complete) for rows
-delivered since that snapshot. A pass reads the session at its current
+delivered since that snapshot.
+Unsupported addressed future events are left outside the delivered snapshot so
+a newer reader can handle them; no progress mark acknowledges them. A pass reads the session at its current
 snapshot, treats rows present at `delivered_through` as shown, sends the
 remaining agent messages in order, and writes a mark only **after** the
 transport acknowledged each chunk. When a pass ends converged, the snapshot
