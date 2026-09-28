@@ -59,6 +59,27 @@ Scheduled turns currently retain the compatibility `RuntimeEvent` adapter becaus
 - A `LoopDetector` fingerprints each tool-call set (name + canonical args); when the same fingerprint repeats `LOOP_DETECTION_THRESHOLD` times the runtime pushes a "you're stuck in a loop" `User` message and breaks out.
 - If `MAX_TOOL_ITERATIONS` (10) is reached, a forced no-tools summary call is made so the agent always returns a text response.
 
+## Opt-in silent completion
+
+The runtime reserves `no_reply` as a terminal tool action when the caller sets
+`ToolContext.allow_no_reply` for a turn. Matrix bridge ingress marks eligible
+messages from an explicitly enabled group room, and the executor rechecks the
+room-bound policy before opting that turn in. DMs, other rooms, schedules, and
+agent configuration retain their default-off behavior. An opted-in turn adds
+behavioral guidance to the budgeted agent context; a tool definition alone does
+not make every model choose silence reliably.
+
+On an opted-in turn the model sees that ordinary final text is sent verbatim to
+chat and may instead make a sole `no_reply({})` call with no reply text. The
+runtime commits the completed turn and terminal model record without writing a
+Message or streaming a tool event. It does not retain private commentary.
+Previous completed tool exchanges remain replayable in future context, but the
+control call is not replayed as a tool/result pair.
+
+Tool-less backends, mixed or malformed terminal calls, unmarked empty text,
+retry fallback without tools, and iteration-budget exhaustion fail closed rather
+than silently sending a previous tool result. Non-opted-in turns do not change.
+
 ## Context Assembly
 
 The `ContextBuilder` assembles session entries into `RuntimeMessage` vectors within a token budget. The runtime receives these pre-built messages:

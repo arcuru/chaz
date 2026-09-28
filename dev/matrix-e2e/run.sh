@@ -827,6 +827,48 @@ group_said_count_is "$BACKENDS_MARKER" 1 \
 
 printf '\033[1;32mPASS\033[0m — group room cases passed (bare ignored, !chaz prefix, @-mention, allow_list rejection)\n' >&2
 
+# An unauthorized sender cannot enable the new mode; a valid sender waits for
+# the daemon's synced receipt. The silence case is followed by a model-reply
+# barrier so no outbound event can hide behind an arbitrary sleep.
+log "participation: reject unauthorized toggle"
+group_send "$STRANGER_TOKEN" '{"msgtype":"m.text","body":"!chaz participation on"}'
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation status"}'
+wait_for "default-off participation status" 60 group_said_at_least "Matrix participation: off" 1
+group_said_count_is "Matrix participation: on" 0 "unauthorized toggle enabled participation"
+log "participation: enable with executor receipt"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation on"}'
+wait_for "executor-confirmed participation" 90 group_said_at_least "Matrix participation: on" 1
+PARTICIPATION_TURNS="$(stub_requests)"
+PARTICIPATION_REPLIES="$(group_agent_said "$MARKER")"
+PARTICIPATION_OUTBOUND="$(group_agent_said "")"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation silence test"}'
+wait_for "silent action reached model" "$REPLY_TIMEOUT" \
+    grep -q "stub_llm: participation no_reply call" "$WORKSPACE/stub-llm.log"
+# The following reply is a barrier: the daemon serializes turns per session.
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation reply test"}'
+wait_for "participating reply" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 1))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 2)) ]] || fail "participation did not produce exactly two model requests"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 1))" "silent turn sent a room reply"
+group_said_count_is "" "$((PARTICIPATION_OUTBOUND + 1))" "silent turn or tool audit leaked an outbound event"
+log "participation: restart executor and confirm synced policy persists"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon exit with participation enabled" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+spawn daemon-participation "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon restart with participation enabled" 120 grep -q "daemon ready" "$WORKSPACE/daemon-participation.log"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation after restart"}'
+wait_for "reply with persisted participation after restart" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 2))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 3)) ]] || fail "restart participation request count changed"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation off"}'
+wait_for "participation disabled" 60 group_said_at_least "Matrix participation: off" 2
+DROPS_BEFORE="$(gate_drops)"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"bare again after participation off"}'
+wait_for "default address gate restored" 60 gate_dropped_more_than "$DROPS_BEFORE"
+printf '\033[1;32mPASS\033[0m — opt-in group participation, silent terminal, reply, authorization and off\n' >&2
+
 # -------------------------------------------------------- ReAct case ---
 # The stub answers a request whose user messages ask for a tool call with a
 # tool_calls response, and returns text only once a follow-up request carries

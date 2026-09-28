@@ -14,7 +14,10 @@ use chaz_core::config::Config;
 use chaz_core::hosted_index::DbEntry;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
-use chaz_core::session::{Session, bind_transport, transport_bindings, unbind_transport};
+use chaz_core::session::{
+    MatrixParticipation, Session, bind_transport, matrix_participation_receipt, read_meta_from_db,
+    transport_bindings, unbind_transport, update_meta_on_db,
+};
 
 use crate::credentials::MatrixCredentials;
 
@@ -463,6 +466,142 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomKind {
+    Direct,
+    Group,
+    Unknown,
+}
+
+fn classify_room(is_direct: Option<bool>, members: Result<usize, ()>) -> RoomKind {
+    match (is_direct, members) {
+        (Some(true), _) | (Some(false), Ok(0..=2)) => RoomKind::Direct,
+        (Some(false), Ok(_)) => RoomKind::Group,
+        _ => RoomKind::Unknown,
+    }
+}
+
+async fn room_kind(room: &Room) -> RoomKind {
+    // The sync summary count can be absent even in a populated room. The SDK
+    // fetches members only while its local member list is unsynced.
+    let direct = room.is_direct().await.ok();
+    if direct != Some(false) {
+        return classify_room(direct, Err(()));
+    }
+    let members = room
+        .members(matrix_sdk::RoomMemberships::JOIN)
+        .await
+        .map(|members| members.len())
+        .map_err(|_| ());
+    classify_room(direct, members)
+}
+
+fn participation_sender_allowed(allow_list: Option<&str>, sender: &str, bot_uid: &str) -> bool {
+    allow_list.is_some_and(|list| !list.trim().is_empty())
+        && is_allowed(allow_list, sender, bot_uid)
+}
+
+/// Participation is bridge-local; enabling requires the executor's synced
+/// generation receipt before the room is told it is active.
+async fn handle_participation(
+    args: &str,
+    room: &Room,
+    server: &Server,
+    login_id: &str,
+    owning_agent: &str,
+    allow_list: Option<&str>,
+    sender: &str,
+) -> anyhow::Result<String> {
+    if !participation_sender_allowed(
+        allow_list,
+        sender,
+        room.client().user_id().map(|id| id.as_str()).unwrap_or(""),
+    ) {
+        return Ok("!chaz Error: participation requires an explicit allowlisted sender".into());
+    }
+    if room_kind(room).await != RoomKind::Group {
+        return Ok("!chaz Error: participation is only available in group rooms".into());
+    }
+    let Some(agent) = owning_agent_entry(server, owning_agent) else {
+        anyhow::bail!("owning agent not hosted");
+    };
+    let room_id = room.room_id().to_string();
+    let db = match args {
+        "on" => Some(
+            server
+                .registry()
+                .get_or_create_channel_session(&agent, login_id, "matrix", login_id, &room_id)
+                .await?
+                .1,
+        ),
+        "off" | "status" => server
+            .registry()
+            .find_channel_session(&agent, login_id, "matrix", login_id, &room_id)
+            .await?
+            .map(|(_, db)| db),
+        _ => return Ok("Usage: !chaz participation <on|off|status>".into()),
+    };
+    let Some(db) = db else {
+        return Ok("Matrix participation: off".into());
+    };
+    let current = read_meta_from_db(&db).await.matrix_participation;
+    if args == "status" {
+        return Ok(if current
+            .as_ref()
+            .is_some_and(|p| p.matches(login_id, &room_id))
+            && matrix_participation_receipt(&db).await?.as_deref()
+                == current.as_ref().map(|p| p.generation.as_str())
+        {
+            "Matrix participation: on"
+        } else {
+            "Matrix participation: off"
+        }
+        .into());
+    }
+    if args == "off" {
+        // Another room attached to this session must not disable its policy.
+        if current
+            .as_ref()
+            .is_some_and(|p| p.matches(login_id, &room_id))
+        {
+            update_meta_on_db(&db, |meta| meta.matrix_participation = None).await?;
+        }
+        return Ok("Matrix participation: off".into());
+    }
+    if current
+        .as_ref()
+        .is_some_and(|p| !p.matches(login_id, &room_id))
+    {
+        return Ok("!chaz Error: another room is already participating on this session".into());
+    }
+    let policy = MatrixParticipation::new(login_id, &room_id);
+    let generation = policy.generation.clone();
+    update_meta_on_db(&db, |meta| meta.matrix_participation = Some(policy)).await?;
+    for _ in 0..150 {
+        if matrix_participation_receipt(&db).await?.as_deref() == Some(&generation)
+            && read_meta_from_db(&db)
+                .await
+                .matrix_participation
+                .as_ref()
+                .is_some_and(|p| p.matches(login_id, &room_id) && p.generation == generation)
+        {
+            return Ok("Matrix participation: on".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    // Never claim activation without executor observation. Do not clear a
+    // newer setting installed while this request was waiting.
+    if read_meta_from_db(&db)
+        .await
+        .matrix_participation
+        .as_ref()
+        .is_some_and(|p| p.generation == generation)
+    {
+        update_meta_on_db(&db, |meta| meta.matrix_participation = None).await?;
+    }
+    Ok("!chaz Error: executor did not confirm participation; mode is off".into())
+}
+
 /// Help text for `!chaz help` — the shared `/`-vocabulary plus the Matrix-local
 /// verbs, listed under the `!chaz ` prefix this transport uses.
 fn help_text() -> String {
@@ -477,7 +616,7 @@ fn help_text() -> String {
         "`extensions <list|add|remove|settings|set> …` — per-session extensions",
         "`channels` — rooms bound to this session",
         "",
-        "Matrix-local: `attach <session>` · `detach` · `clear` · `send <msg>` · `rename` · `party`",
+        "Matrix-local: `attach <session>` · `detach` · `participation <on|off|status>` · `clear` · `send <msg>` · `rename` · `party`",
         "",
         "In a DM or when @mentioned, just talk — no prefix needed.",
     ]
@@ -790,6 +929,13 @@ impl Bridge for MatrixBridge {
             let message_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+            // Per-process pilot ceiling; persist a room budget if this
+            // mode becomes a long-lived feature across bridge restarts.
+            let participation_counts: Arc<Mutex<HashMap<String, u64>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            // Serialize setting commands so an expired enable cannot clear a
+            // newer enable (or undo an off) while waiting for its receipt.
+            let participation_command_lock = Arc::new(Mutex::new(()));
             let pending_approvals = pending_approvals.clone();
 
             mc.client().add_event_handler(
@@ -804,6 +950,8 @@ impl Bridge for MatrixBridge {
                     let message_counts = message_counts.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
                     let seen_events = seen_events.clone();
+                    let participation_counts = participation_counts.clone();
+                    let participation_command_lock = participation_command_lock.clone();
                     let pending_approvals = pending_approvals.clone();
                     async move {
                         if room.state() != RoomState::Joined {
@@ -913,6 +1061,16 @@ impl Bridge for MatrixBridge {
                                     .await;
                                     return;
                                 }
+                                "participation" => {
+                                    let args = inner.strip_prefix("participation").unwrap_or("").trim();
+                                    let _guard = participation_command_lock.lock().await;
+                                    let result = handle_participation(
+                                        args, &room, &server, &login_id, &owning_agent,
+                                        allow_list.as_deref(), event.sender.as_str(),
+                                    ).await.unwrap_or_else(|e| format!("!chaz Error: {e}"));
+                                    let _ = room.send(RoomMessageEventContent::notice_plain(result)).await;
+                                    return;
+                                }
                                 "attach" => {
                                     let arg = inner.strip_prefix("attach").unwrap_or("").trim();
                                     handle_attach(
@@ -975,8 +1133,8 @@ impl Bridge for MatrixBridge {
                         }
 
                         // Plain message: only engage when addressed.
-                        let is_direct = room.is_direct().await.unwrap_or(false)
-                            || room.joined_members_count() < 3;
+                        let kind = room_kind(&room).await;
+                        let is_direct = kind == RoomKind::Direct;
                         let mentions_bot = event
                             .content
                             .mentions
@@ -988,7 +1146,24 @@ impl Bridge for MatrixBridge {
                                     .any(|mention| mention == room.client().user_id().unwrap())
                             })
                             .unwrap_or(false);
-                        if !(is_direct || mentions_bot) {
+                        let participating = if kind == RoomKind::Group {
+                            if let Some(agent) = owning_agent_entry(&server, &owning_agent) {
+                                match server.registry().find_channel_session(
+                                    &agent, &login_id, "matrix", &login_id, &room_id,
+                                ).await {
+                                    Ok(Some((_, db))) => {
+                                        let policy = read_meta_from_db(&db).await.matrix_participation;
+                                        if let Some(policy) = policy {
+                                            policy.matches(&login_id, &room_id)
+                                                && matrix_participation_receipt(&db).await.ok().flatten()
+                                                    .as_deref() == Some(policy.generation.as_str())
+                                        } else { false }
+                                    }
+                                    _ => false,
+                                }
+                            } else { false }
+                        } else { false };
+                        if !(is_direct || mentions_bot || participating) {
                             tracing::debug!(
                                 room_id = %room.room_id(),
                                 "Message is not addressed to the bot; ignoring"
@@ -996,6 +1171,15 @@ impl Bridge for MatrixBridge {
                             return;
                         }
 
+                        if participating {
+                            let mut counts = participation_counts.lock().await;
+                            let count = counts.entry(room_id.clone()).or_default();
+                            if *count >= 20 {
+                                tracing::warn!(room_id, "Participation turn budget exhausted");
+                                return;
+                            }
+                            *count += 1;
+                        }
                         if rate_limit(&room, &event.sender, &config, &message_counts).await {
                             return;
                         }
@@ -1068,18 +1252,15 @@ impl Bridge for MatrixBridge {
                         }
                         // Stamp transport provenance so an agent's reply can
                         // be routed back to this room on this login.
-                        if let Err(e) = session
-                            .add_entry(chaz_core::bridge::inbound_user_entry(
-                                "matrix",
-                                &login_id,
-                                room.room_id().as_ref(),
-                                event.sender.as_ref(),
-                                None,
-                                raw,
-                                Some(event.event_id.to_string()),
-                            ))
-                            .await
-                        {
+                        let mut entry = chaz_core::bridge::inbound_user_entry(
+                            "matrix", &login_id, room.room_id().as_ref(),
+                            event.sender.as_ref(), None, raw,
+                            Some(event.event_id.to_string()),
+                        );
+                        if participating {
+                            entry.routing.as_mut().unwrap().matrix_participation = true;
+                        }
+                        if let Err(e) = session.add_entry(entry).await {
                             error!("Failed to record inbound message: {e}");
                         }
                     }
@@ -1499,6 +1680,30 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn group_eligibility_uses_joined_members_not_sync_summary() {
+        let group = super::classify_room;
+        use super::RoomKind;
+        // /sync can omit summary even though /joined_members reports three.
+        assert_eq!(group(Some(false), Ok(3)), RoomKind::Group);
+        assert_eq!(group(Some(false), Ok(2)), RoomKind::Direct);
+        assert_eq!(group(Some(false), Ok(1)), RoomKind::Direct);
+        assert_eq!(group(Some(true), Ok(3)), RoomKind::Direct);
+        assert_eq!(group(None, Ok(3)), RoomKind::Unknown);
+        assert_eq!(group(Some(false), Err(())), RoomKind::Unknown);
+    }
+
+    #[test]
+    fn participation_requires_explicit_matching_allowlist() {
+        let allowed = super::participation_sender_allowed;
+        assert!(!allowed(None, "@human:test", "@bot:test"));
+        assert!(!allowed(Some(""), "@human:test", "@bot:test"));
+        assert!(!allowed(Some("  "), "@human:test", "@bot:test"));
+        assert!(!allowed(Some("@alice:test"), "@other:test", "@bot:test"));
+        assert!(!allowed(Some("@bot:test"), "@bot:test", "@bot:test"));
+        assert!(allowed(Some("@alice:test"), "@alice:test", "@bot:test"));
+    }
+
     #[test]
     fn matrix_typing_wire_lease_exceeds_renewal() {
         assert!(super::TYPING_LEASE > super::TYPING_RENEWAL * 2);

@@ -202,6 +202,302 @@ async fn react_loop_dispatches_tool_call_and_returns_final_text() {
 }
 
 #[tokio::test]
+async fn terminal_no_reply_is_opt_in_and_not_streamed_as_a_tool_call() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+    let outcome = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("No need to respond".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        Some(tx),
+        None,
+    )
+    .await
+    .expect("terminal no_reply should complete the turn");
+    assert!(outcome.body.is_empty());
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 1, "no follow-up model call or tool execution");
+    assert_eq!(
+        calls[0].tools.len(),
+        1,
+        "empty registry still exposes no_reply"
+    );
+    assert_eq!(calls[0].tools[0].name, "no_reply");
+    assert!(
+        rx.try_recv().is_err(),
+        "the control action is not a streamed tool event"
+    );
+}
+
+#[tokio::test]
+async fn no_reply_rejects_mixed_calls_before_other_tools_execute() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let echo = EchoTool::new();
+    let calls = echo.calls.clone();
+    let registry = ToolRegistry::new();
+    registry.register(echo);
+    let mut ctx = tool_context(session, Arc::new(registry));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![
+        (
+            "first".into(),
+            "echo".into(),
+            json!({"text":"must not run"}).to_string(),
+        ),
+        ("second".into(), "no_reply".into(), "{}".into()),
+    ]);
+    let backend = BackendManager::with_mock(mock, secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(result.as_ref().is_err_and(|e| e.contains("sole tool call")));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn no_reply_rejects_payload_instead_of_storing_commentary() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "stop".into(),
+        "no_reply".into(),
+        r#"{"commentary":"secret"}"#.into(),
+    )]);
+    let backend = BackendManager::with_mock(mock, secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(result.as_ref().is_err_and(|e| e.contains("no arguments")));
+}
+
+#[tokio::test]
+async fn no_reply_requires_tool_capability_and_does_not_fall_back() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new().with_supports_tools(false));
+    mock.push_text("must not be published");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(result.as_ref().is_err_and(|e| e.contains("tool-capable")));
+    assert!(mock.recorded_calls().is_empty());
+}
+
+#[tokio::test]
+async fn opted_in_empty_text_after_tool_does_not_publish_last_tool_result() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let echo = EchoTool::new();
+    let counter = echo.calls.clone();
+    let registry = ToolRegistry::new();
+    registry.register(echo);
+    let mut ctx = tool_context(session, Arc::new(registry));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "lookup".into(),
+        "echo".into(),
+        json!({"text":"PRIVATE RESULT"}).to_string(),
+    )]);
+    mock.push_text("");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("check then stay quiet".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.contains("without calling no_reply"))
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.recorded_calls().len(), 2, "no text-only fallback call");
+}
+
+#[tokio::test]
+async fn no_reply_is_not_advertised_or_accepted_without_opt_in() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool::new());
+    let ctx = tool_context(session, Arc::new(registry));
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
+    mock.push_text("Unable to end silently");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let outcome = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await
+    .expect("ordinary unknown-tool behavior must remain");
+    assert_eq!(outcome.body, "Unable to end silently");
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(!calls[0].tools.iter().any(|tool| tool.name == "no_reply"));
+    assert!(calls[1].messages.iter().any(|m| matches!(m,
+        RuntimeMessage::ToolResult { content, .. } if content.contains("Unknown tool: no_reply"))));
+}
+
+#[tokio::test]
+async fn opted_in_tool_failure_never_retries_without_tools() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    for _ in 0..4 {
+        mock.push_response(Err(LlmError::Timeout));
+    }
+    mock.push_text("unsafe no-tools reply");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.contains("tool-aware call failed"))
+    );
+    let calls = mock.recorded_calls();
+    assert_eq!(
+        calls.len(),
+        4,
+        "retry only the tool-aware call; never consume fallback"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.tools.iter().any(|t| t.name == "no_reply"))
+    );
+    assert_eq!(mock.pending(), 1);
+}
+
+#[tokio::test]
+async fn no_reply_rejects_mixed_final_text() {
+    use crate::runtime::{LLMResponse, ToolCallRequest};
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_response(Ok(LLMResponse::ToolCalls {
+        content: Some("do not send this".into()),
+        tool_calls: vec![ToolCallRequest {
+            id: "stop".into(),
+            name: "no_reply".into(),
+            arguments: "{}".into(),
+        }],
+        provider_extra: serde_json::Map::new(),
+        metadata: None,
+    }));
+    let backend = BackendManager::with_mock(mock, secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(result.is_err(), "mixed text was accepted");
+    let error = result.err().unwrap();
+    assert!(error.contains("or reply text"), "{error}");
+}
+
+#[tokio::test]
+async fn opted_in_iteration_exhaustion_does_not_force_an_unstructured_reply() {
+    use std::sync::atomic::AtomicU32;
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    ctx.allow_no_reply = true;
+    ctx.iteration_budget = Some(Arc::new(AtomicU32::new(0)));
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("unsafe forced summary");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &permissive_security(),
+        &ctx,
+        &ToolPolicyRegistry::empty(),
+        None,
+        None,
+    )
+    .await;
+    assert!(result.as_ref().is_err_and(|e| e.contains("exhausted")));
+    assert!(mock.recorded_calls().is_empty());
+}
+
+#[tokio::test]
 async fn empty_tool_registry_uses_no_tools_fast_path() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;

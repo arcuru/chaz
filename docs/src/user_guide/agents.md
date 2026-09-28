@@ -300,8 +300,21 @@ silent. Use `/agent room` to see the live roster and diagnose it.
 
 ### Agent→agent burst budget
 
-In a multi-agent session an agent's reply can `@mention` and wake another
-attached agent. The runaway backstop is a **burst budget**: the maximum
+In a multi-agent session an agent's reply wakes another attached agent **only**
+when it `@mentions` that agent. The mention is an invitation, not an obligation:
+the recipient can reply or use the terminal `no_reply({})` action to end silently.
+This default applies in TUI and Matrix sessions without enabling Matrix room
+participation; unmentioned agent messages remain context, not turn requests.
+An ordinary human message still routes to one agent and expects a reply unless
+Matrix room participation is explicitly enabled (see
+[Matrix Bot](./matrix.md#choosing-when-to-speak-in-a-group)).
+
+For example, a human asks `@alpha` to investigate. Alpha writes
+`Findings attached; @beta, can you check the counterexample?` and beta is
+woken. If beta has useful corrections, beta replies; otherwise beta calls
+`no_reply({})`, writes no room message, and the chain stops. If alpha merely
+writes `Findings attached`, beta is not woken at all. Even if agents repeatedly
+mention one another, the runaway backstop is a **burst budget**: the maximum
 run of consecutive agent-authored messages since the last human message or
 `Directive`. When the trailing burst reaches the budget, further
 agent→agent wakes are suppressed until a human (or a schedule) speaks

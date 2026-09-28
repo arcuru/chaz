@@ -142,6 +142,7 @@ pub(crate) fn tool_context_with_host(
         max_call_depth: 5,
         tools: ScopedTools::new(registry, None),
         profile: ToolProfile::default(),
+        allow_no_reply: false,
         session,
         active_extensions: Default::default(),
         grants: Default::default(),

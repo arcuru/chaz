@@ -2368,6 +2368,16 @@ impl Server {
         let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
 
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
+        // Receipt proves the executor observed this generation through session
+        // sync. A bridge never acknowledges enablement on its own write alone.
+        if let Some(policy) = session.read_meta().await.matrix_participation
+            && crate::session::is_bound(&session_db, "matrix", &policy.login_id, &policy.room_id)
+                .await
+                .unwrap_or(false)
+        {
+            crate::session::acknowledge_matrix_participation(&session_db, &policy.generation)
+                .await?;
+        }
 
         let live_attempts = self.live_attempts.lock().await.clone();
         let command = session.next_command_request(&live_attempts).await?;
@@ -2531,6 +2541,7 @@ impl Server {
         // For the agent→agent case the speaker is already pinned to the
         // mentioned agent (computed in the gate above); only the
         // human/Directive path runs the full resolution precedence.
+        let agent_to_agent_turn = agent_to_agent_target.is_some();
         let agent = match agent_to_agent_target {
             Some(a) => a,
             None => {
@@ -2594,6 +2605,8 @@ impl Server {
             approval_tx,
             backend,
             attempt,
+            latest,
+            agent_to_agent_turn,
             spawn_ctx,
         )
         .await;
@@ -2785,6 +2798,8 @@ impl Server {
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
         backend: BackendManager,
         attempt: TurnAttempt,
+        request_entry: SessionEntry,
+        agent_to_agent_turn: bool,
         spawn: SpawnContext,
     ) {
         let agent_name = agent.name.clone();
@@ -2894,12 +2909,23 @@ impl Server {
                 .clone()
                 .unwrap_or_else(|| Arc::new(AtomicU32::new(agent.max_iterations)));
 
+            let matrix_participation = {
+                let s = session.lock().await;
+                crate::session::matrix_participation_for_entry(s.database(), &request_entry).await
+            };
+            let allow_no_reply = agent_to_agent_turn || matrix_participation;
+            let system_prompt = if agent_to_agent_turn {
+                format!("{system_prompt}\n\nAnother agent @mentioned you in this shared session. A mention invites your input; it does not obligate you to respond. If you have useful work or a substantive answer, do it and reply. Otherwise call no_reply({{}}) alone to end silently. Do not send acknowledgments, thanks, or a reply merely to keep the conversation going. Do not mix no_reply with another tool call or final text.")
+            } else if matrix_participation {
+                format!("{system_prompt}\n\nYou are participating in a Matrix group room. Every normal final text reply is posted to the room. If no response is useful, call no_reply({{}}) as the sole action to end this turn silently, even when mentioned. Do not call it alongside other tools or final text. Reply only when you have something useful to add.")
+            } else { system_prompt };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
                 call_depth: spawn.call_depth,
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
+                allow_no_reply,
                 session: session.clone(),
                 grants: Default::default(),
                 session_capabilities,
@@ -2911,7 +2937,7 @@ impl Server {
                 routine_engine: routine_engine.clone(),
             };
 
-            let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+            let tool_defs = tool_ctx.definitions();
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
