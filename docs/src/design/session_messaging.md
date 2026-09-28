@@ -1,8 +1,8 @@
 # Session Messaging Primitive
 
-> **Status: Implemented**
+> **Status: Historical design.** As of 2026-09-27, `spawn_agent` submits a local durable Agent job and immediately returns a session DB handle; `job_status`/`job_wait` observe it. The synchronous completion flow below is historical, not the current tool contract. See [Agent jobs](../architecture/sessions.md#agent-jobs-and-worker-children).
 >
-> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). The callback primitive, entry types, `spawn_agent` flow, `OnceLock` wiring, `SpawnContext`, and `RuntimeEventSink` still apply. Request selection is durable reconciliation rather than a latest-entry check; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
+> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). Request selection is durable reconciliation rather than a latest-entry check; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery). The `spawn_agent` sequence and completion signal below are historical.
 
 ## Summary
 

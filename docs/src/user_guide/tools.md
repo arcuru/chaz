@@ -170,6 +170,17 @@ Submits a task to a hosted Agent as a durable child job. It returns the session 
 }
 ```
 
+### job_status / job_wait
+
+Use the `session_db_id` returned by `spawn_agent` to check a job, or wait for a bounded observation window:
+
+```json
+{"session_db_id":"<child DB ID>"}
+{"session_db_id":"<child DB ID>","timeout_seconds":30}
+```
+
+The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. The handle does not grant session DB access.
+
 ### spawn_worker
 
 Invokes a Worker template declared under the calling Agent. Workers are configured one-shot LLM calls — they have no identity, no keys, and no persistent state of their own; entries written to the child session are signed by the parent Agent's key. Use a Worker for focused, delegated work that doesn't need its own continuity; use `spawn_agent` when you want a named peer Agent (e.g. Chaz) with its own keys and persistent memory.

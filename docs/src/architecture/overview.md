@@ -99,7 +99,7 @@ durable attempt relation prevents a completed request from running again after
 restart, but it is not distributed fencing or an exactly-once guarantee for
 external effects. See [Session Model](sessions.md#durable-turn-recovery).
 
-The server also handles child session registration for `spawn_agent`, propagating call depth, tool scope, and completion signals.
+The server admits `spawn_agent` as a durable parent command, stages an inert child session, and accepts it with a Directive and inherited authority before returning its DB handle. The child runs through the Agent-job queue; `spawn_worker` remains a separate Worker-template path (synchronous by default).
 
 **Source**: `crates/lib/src/server.rs`
 
@@ -186,7 +186,7 @@ crates/lib/src/
     hooks.rs           Per-kind hook trait definitions + HookKind
   extensions/          Built-in extensions (each declares scopes + caps + endpoints)
     mod.rs             all_builtins, BuiltinDeps
-    core.rs            shell, compact, spawn_agent, spawn_worker
+    core.rs            shell, compact, spawn_agent, job_status, job_wait, spawn_worker
     fs.rs              read_file, write_file, edit_file
     system.rs          get_time, calculate, describe_tool
     web.rs             web_fetch, web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
@@ -198,7 +198,8 @@ crates/lib/src/
     path_normalizer.rs tool_call hook stripping trailing `/` from path args
     security_warnings.rs tool_result hook scanning for prompt-injection patterns
   tools/               Built-in tool impls (referenced from extensions/* above)
-    agent.rs           spawn_agent (delegate to a peer Living Agent)
+    agent.rs           spawn_agent (submit a hosted Agent job)
+    jobs.rs            job_status, job_wait (observe an Agent job)
     worker.rs          spawn_worker (invoke a per-Agent Worker template — no keys, no identity)
     shell.rs           shell execution with allowlist/denylist
     file.rs            read_file, write_file

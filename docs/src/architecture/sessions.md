@@ -257,16 +257,14 @@ Failover is **explicit and operator-driven** in v1. If the home peer's chaz proc
 
 `/agent revoke-peer` emits a soft warning when the revoked key was the home for any sessions or agent-level state, listing what needs rehosting; it does not block the revoke.
 
-Cross-peer `spawn_agent` works without special handling. The spawner is the attacher, so `attach_agent_to_session` on the child session defaults `home_pubkey` to the spawning peer's key — that peer runs the child turn. If a co-owner later syncs the child session, their gate skips it.
+Agent jobs are admitted only for Agents hosted by the local executor. Their child sessions pin the target Agent/home identity; the home gate is not a cross-peer delegation mechanism or an exactly-once execution fence.
 
-## Child Sessions (spawn_agent / spawn_worker)
+## Agent jobs and Worker children
 
-When an Agent spawns a child — either a peer Agent (`spawn_agent`) or a Worker template (`spawn_worker`):
+`spawn_agent` is an individual, durable Agent job, not a workflow graph. Its stable parent turn/tool-call key becomes a typed `SubmitAgent` command in the parent session DB. The executor checks the single hosted parent Agent, locally hosted target, and broad scope, then records a staged child DB with a pinned inherited capability, tool/grant and depth ceiling. A staged child is inert. Acceptance writes the child Directive and metadata together; only an accepted child is registered for execution. Submission returns its session DB ID before the job finishes. The same key and payload resolve to the same child; an incomplete staging or command start may be uncertain and must not create a duplicate. Same-login local clients are trusted to write requests and read authorized DBs, but client-role servers only observe; they cannot admit or execute jobs. Narrow, workspace and private scopes are rejected in v1. There is no workflow graph or task policy here.
 
-1. The server creates a new session DB via `register_child_session`
-2. The parent writes a `Directive` entry to the child session
-3. The server detects the directive and runs the child agent
-4. The child writes its response, completion is signaled to the parent
-5. The parent reads the response from the child session
+Job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten Agent-job runs hold runtime permits; accepted jobs wait **queued before starting an attempt** when capacity is full. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 
-Child sessions are full session DBs -- they appear in `/sessions` and can be inspected.
+Unlike the ordinary session protocol's single-executor assumption, an Agent job has a session-DB last-writer-wins owner claim for the same Agent/home identity. A contender losing the claim stops and records an interrupted/claim-loss marker while retaining the transcript. This is not fencing: delayed observations can overlap model or tool effects, and neither exactly-once effects nor cross-peer failover are promised. The pinned child authority cannot exceed the parent's admitted ceiling; `spawn_worker` is excluded from Agent-job delegation.
+
+`spawn_worker` is a separate Worker-template invocation, synchronous by default, with no durable Agent-job handle or Agent identity. Its child session must not be treated as an accepted Agent job.
