@@ -5307,6 +5307,84 @@ async fn exercise_capacity_claim_loss(
     .await;
 }
 
+// Public status/wait from a separate, non-hosting client connection.
+async fn observe_agent_job_as_client(
+    registry: Arc<crate::session::SessionRegistry>,
+    parent: &eidetica::Database,
+    parent_id: &str,
+    key: &crate::session::TurnRequestId,
+    handle: &str,
+    mock: &crate::test_support::MockBackend,
+) -> Arc<Server> {
+    let client = client_server_fixture_from_registry(registry).await;
+    assert!(!client.is_executor_authorized());
+    assert!(!client.job_status(handle).await.unwrap().state.is_terminal());
+    let pending = client
+        .wait_job(handle, std::time::Duration::from_millis(20))
+        .await
+        .unwrap();
+    assert!(
+        !pending.state.is_terminal(),
+        "timeout must not cancel the job"
+    );
+    let session = Session::new(ConversationId(parent_id.to_string()), parent.clone()).await;
+    session
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: key.clone(),
+            sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitAgent {
+                agent_ref: "default".into(),
+                task: "trusted child work".into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .lookup_job(parent_id, key.as_str())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(handle)
+    );
+    assert!(
+        session
+            .submit_command(crate::session::SessionCommandRequest {
+                command_id: key.clone(),
+                sender: "client".into(),
+                created_at: Utc::now(),
+                command: crate::session::SessionCommand::SubmitAgent {
+                    agent_ref: "default".into(),
+                    task: "different definition".into(),
+                },
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different payload")
+    );
+    assert_eq!(
+        client
+            .lookup_job(parent_id, key.as_str())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(handle)
+    );
+    assert_eq!(mock.recorded_calls().len(), 1);
+    // Syntactically valid but not mapped to this login: a handle is not a permission grant.
+    let unowned = "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm";
+    assert!(client.job_status(unowned).await.is_err());
+    assert!(
+        client
+            .wait_job(unowned, std::time::Duration::from_millis(20))
+            .await
+            .is_err()
+    );
+    client
+}
+
 #[tokio::test]
 async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directive() {
     use crate::session::jobs::StagedAgentDefinition;
@@ -5565,7 +5643,31 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
             .is_terminal(),
         "the handle must be returned before the child finishes"
     );
+    let client_observer = Box::pin(observe_agent_job_as_client(
+        client_registry.clone(),
+        &parent,
+        &parent_id,
+        &command_id,
+        &accepted_id,
+        &mock,
+    ))
+    .await;
     gate.release();
+    let client_finished = client_observer
+        .wait_job(&accepted_id, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(client_finished.state.is_terminal());
+    assert_eq!(
+        client_observer.job_status(&accepted_id).await.unwrap(),
+        client_finished
+    );
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "client must not execute a model"
+    );
+    client_observer.shutdown().await;
     let finished = executor
         .wait_job(&accepted_id, std::time::Duration::from_secs(10))
         .await
