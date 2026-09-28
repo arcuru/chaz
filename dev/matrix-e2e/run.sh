@@ -155,6 +155,33 @@ wait_for() {
 	fail "timed out after ${timeout}s waiting for $what"
 }
 
+# Exec a command with the kernel primed to TERM it when this harness dies.
+# `cleanup` runs from a trap, and no trap runs after SIGKILL, so a hard-killed
+# harness would otherwise strand every process it started — which is the leak
+# that put stray daemons on developer machines. PR_SET_PDEATHSIG is Linux-only;
+# elsewhere this is a plain exec and abrupt death leaks as it always did.
+#
+# Must be backgrounded by the caller. It `exec`s, so the wrapper does not linger
+# as an extra process and `$!` names the command itself.
+with_pdeathsig() {
+	exec python3 -c '
+import ctypes, os, signal, sys
+
+PR_SET_PDEATHSIG = 1
+parent = int(sys.argv[1])
+if sys.platform == "linux":
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
+    # The signal only fires for a death after the prctl call. The harness may
+    # already be gone, and then nothing would ever reap what we are about to
+    # exec, so check before committing.
+    if os.getppid() != parent:
+        sys.exit("harness exited before child startup")
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$$" "$@"
+}
+
 # Start a process, log it into the workspace, and register it for cleanup. The
 # pid lands in SPAWNED_PID rather than on stdout: a command substitution would
 # run this in a subshell, where the PIDS append is discarded and the process
@@ -163,18 +190,7 @@ SPAWNED_PID=""
 spawn() {
 	local name="$1"
 	shift
-	# EXIT traps cannot run after SIGKILL. Have the kernel TERM each spawned
-	# process if the harness dies without running cleanup (also covers HUP).
-	python3 -c '
-import ctypes, os, signal, sys
-parent = int(sys.argv[1])
-libc = ctypes.CDLL(None, use_errno=True)
-if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
-    raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
-if os.getppid() != parent:
-    sys.exit("harness exited before child startup")
-os.execvp(sys.argv[2], sys.argv[2:])
-' "$$" "$@" >"$WORKSPACE/$name.log" 2>&1 &
+	with_pdeathsig "$@" >"$WORKSPACE/$name.log" 2>&1 &
 	SPAWNED_PID=$!
 	PIDS+=("$SPAWNED_PID")
 	if [[ $VERBOSE -eq 1 ]]; then
@@ -183,7 +199,10 @@ os.execvp(sys.argv[2], sys.argv[2:])
 		# would kill the prefixer and leave `tail -f` alive, still holding
 		# this step's stderr. A CI step does not finish while a background
 		# process holds its output pipe.
-		tail -f "$WORKSPACE/$name.log" > >(sed "s/^/[$name] /" >&2) 2>/dev/null &
+		#
+		# `tail -f` never ends on its own, so it needs the death signal as much
+		# as the component does; `sed` then exits on EOF by itself.
+		with_pdeathsig tail -f "$WORKSPACE/$name.log" > >(sed "s/^/[$name] /" >&2) 2>/dev/null &
 		PIDS+=($!)
 	fi
 }

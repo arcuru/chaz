@@ -206,6 +206,16 @@ sequence exists to protect.
 - **Every `curl` carries `--max-time`.** A poll loop is only bounded if each
   attempt is, and a server that accepts a connection and then stops answering
   is otherwise an attempt that never returns.
+- **Spawned processes die with the harness, even when it is killed outright.**
+  `cleanup` runs from an `EXIT`/`INT`/`TERM`/`HUP` trap, and no trap runs after
+  a `SIGKILL`. So everything `spawn` starts — the components, and the `tail -f`
+  that `--verbose` attaches to each log — goes through `with_pdeathsig`, which
+  asks the kernel for `PR_SET_PDEATHSIG` and gets the process TERMed when the
+  harness goes away for any reason. That is what stops an aborted run from
+  stranding daemons on the machine. The temporary workspace is the one thing a
+  `SIGKILL` still leaves behind, because deleting it needs code the harness no
+  longer gets to run. `PR_SET_PDEATHSIG` is Linux-only; on other platforms the
+  wrapper is a plain exec and an abrupt kill leaks as it always did.
 
 ## Unpublished dependency: local acceptance only
 
