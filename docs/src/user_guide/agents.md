@@ -271,9 +271,9 @@ Revoked ed25519:PK_B... from agent 'alpha'. They retain read access to history b
 WARNING: revoked key was the home peer for 2 session(s): s_001, s_002. Their next turn will be silent until you run `/agent rehost alpha` from a surviving peer.
 ```
 
-### Cross-peer `spawn_agent`
+### Agent-job placement
 
-Works without special handling. The spawning peer is the one that calls `attach_agent_to_session` on the child session, so the per-session home defaults to that peer — and the spawning peer runs the child turn. If a co-owner later syncs the child session, their gate skips it.
+`spawn_agent` submits only to an Agent hosted on the local executor with the same Agent/home identity. It does not delegate to another peer or provide automatic failover. Same-login local clients with session DB access can observe a job by its handle; client-role Chaz cannot admit or run one.
 
 ### Migrating pre-existing co-owned setups
 
@@ -487,9 +487,9 @@ use the tool when you need a Fresh target.
 Tool access is controlled at two levels:
 
 1. **Agent / Worker definition**: the `tools:` field restricts which tools an Agent (or a Worker template under it) can see. Supports exact names and glob patterns (`"filesystem__*"` matches all tools from that MCP server namespace — the `__` separator matches the namespacing chaz uses for discovered MCP tools). `tools: null` (or omitted) means "inherit from parent" on a Worker; on an Agent it means "all tools".
-2. **Transitive narrowing**: When an Agent spawns a child — a peer Agent (`spawn_agent`) or a Worker (`spawn_worker`) — the child's resolved tools are the _intersection_ of the parent's tools and the child's `tools:` list.
+2. **Transitive narrowing**: An Agent job pins the parent's effective tool/grant ceiling at admission and intersects it with the target Agent's scope at execution. `spawn_worker` keeps its own synchronous Worker-template scoping.
 
-A child can never have more tools than its parent, even if its definition allows them.
+A child cannot widen its parent's tool authority. Agent jobs exclude `spawn_worker` from their inherited tools.
 
 ## Spawn Permissions
 
@@ -513,34 +513,31 @@ presets:
     role_suffix: "Be thorough and explore multiple angles."
 ```
 
-The calling agent can request a preset via the `spawn_agent` tool:
+Presets are available to Worker templates; `spawn_agent` does not accept a per-call preset or model override.
+
+## Agent jobs: submit and observe
+
+`spawn_agent` returns immediately after durable acceptance. It accepts a locally hosted `agent_ref` (display name or DB ID), `task`, and optional `context`; the legacy `agent` name is also accepted. It does not accept `async`, preset, model, workspace, narrow, or private options. Broad local scope is required; this is not an OS sandbox. Same-login clients are trusted, not isolated from one another.
 
 ```json
-{ "agent": "researcher", "task": "...", "preset": "deep" }
+{
+  "agent_ref": "researcher",
+  "task": "Find the canonical reference",
+  "context": "Check the latest revision"
+}
 ```
 
-## Synchronous vs Asynchronous Spawn
+The result is `{"session_db_id":"<child DB ID>","state":"accepted"}`. Keep that handle. `job_status({"session_db_id":"<child DB ID>"})` reads the state; `job_wait({"session_db_id":"<child DB ID>","timeout_seconds":30})` waits up to 30 seconds, then returns the current state without canceling the job (1–240 seconds; default 30). The status is typed: `Queued`, `Running { attempt_id }`, `StartedUnknown { attempt_id, activity_recent }` for a client that cannot tell whether a start is still active, `Interrupted { attempt_id }` for an executor observing an abandoned attempt, `Succeeded { text }`, or `Failed { message }`. A failed job is not a successful answer. Check the state rather than treating a wait timeout as completion.
 
-By default, `spawn_agent` waits for the child agent to complete and returns the result. With `"async": true`, it returns immediately and the child runs in the background:
+A queued job can be adopted after executor restart. An attempt that started but has no completion is **not** automatically replayed: model or tool effects may already have happened. Inspect its status and transcript, open the child session, and use `/interrupted` to find the request ID before deciding whether `/retry <request_id>` is safe; do not submit a new task to guess whether the old one ran. A repeated submission with the same parent turn/tool-call key and payload resolves to the same child; a different payload for that key is rejected. A partial submission can remain uncertain instead of creating a duplicate. Same-Agent/home last-writer-wins claims are not fencing: concurrent executors can overlap and effects are not exactly-once.
 
-```json
-{ "agent": "researcher", "task": "...", "async": true }
-```
+For example:
 
-Async spawns return the child session ID, which can be found via `/sessions` in the TUI.
+1. Submit `{"agent_ref":"researcher","task":"Find the canonical reference"}`. The response is `{"session_db_id":"<child DB ID>","state":"accepted"}`, not the research answer.
+2. Call `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":1}`. If capacity is full, it can return `{"session_db_id":"<child DB ID>","state":"Queued"}`. Keep the handle and check again; the timeout did not cancel the job.
+3. If an executor stops after starting, a client may instead see `{"session_db_id":"<child DB ID>","state":{"StartedUnknown":{"attempt_id":"<attempt ID>","activity_recent":false}}}`. Check the child session's `/interrupted` and transcript before an explicit retry. Do not treat a stale start as a failed result.
 
-## How Spawn Works Internally
-
-When an agent calls `spawn_agent`:
-
-1. A new session database is created via the server's `register_child_session`.
-2. A `Directive` entry is written to the child session.
-3. The server's `on_write` callback detects the directive and spawns an agent task.
-4. The agent runs the ReAct loop, writing Ack, ToolCall, ToolResult, and response entries.
-5. A completion signal notifies the parent (for synchronous spawns).
-6. The parent reads the response from the child session.
-
-This routes through the same server processing path as user messages, unifying all agent invocation.
+`spawn_worker` is separate: it invokes a Worker template under the calling Agent and waits by default. Its optional `async` mode is not a durable Agent job; Workers have no Agent identity or Agent-job status handle.
 
 ## Lifecycle Overview
 
@@ -628,51 +625,13 @@ Unmentioned messages fall through: host agent → first attached → default.
 
 ### 5. Delegate via `spawn_agent` or `spawn_worker`
 
-Two delegation paths from inside an Agent's ReAct loop:
-
-- `spawn_agent` — invoke a peer Agent (with its own keys and persistent memory). The target must be hosted on this peer.
-- `spawn_worker` — invoke a Worker template declared under the calling Agent's `workers:` list. No identity, no keys; entries are signed by the parent Agent.
-
-Worker invocation (most common case for delegated work):
+For a locally hosted Agent with its own keys and persistent memory, submit a job:
 
 ```json
-{
-  "name": "researcher",
-  "task": "find the canonical reference",
-  "preset": "deep"
-}
+{ "agent_ref": "researcher", "task": "Find the canonical reference" }
 ```
 
-Peer-Agent invocation:
-
-```json
-{
-  "agent": "chaz",
-  "task": "context-check this rewrite",
-  "preset": "deep"
-}
-```
-
-The parent blocks on completion (sync) or gets a child session ID back (`async: true`) and continues.
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant S as Session DB
-    participant C as coder (ReAct)
-    participant CS as Child session DB
-    participant R as researcher (ReAct)
-
-    U->>S: Message "@coder …"
-    S-->>C: on_write → dispatch
-    C->>C: spawn_agent(researcher, task)
-    C->>CS: register_child_session + Directive
-    CS-->>R: on_write → dispatch
-    R->>CS: Ack → ToolCall/ToolResult… → response
-    CS-->>C: completion signal
-    C->>S: final response
-    S-->>U: rendered reply
-```
+The immediate response contains `session_db_id`, not the answer. Observe it with `job_status` or `job_wait` as described in [Agent jobs: submit and observe](#agent-jobs-submit-and-observe). For a one-shot Worker-template call declared under this Agent's `workers:` list, use `spawn_worker` instead; it waits by default and Workers have no separate Agent identity.
 
 ### 6. Schedules
 
