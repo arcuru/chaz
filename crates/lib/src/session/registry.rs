@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
-use eidetica::store::DocStore;
+use eidetica::store::{DocStore, Table};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
@@ -81,6 +82,24 @@ pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// index there stays a cheap id→source map, while this store holds rich
 /// per-session metadata (bridge, created_at, status) as JSON.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
+
+#[allow(dead_code)] // Stage 1 remains private until executor admission migrates.
+const JOB_REQUEST_STORE: &str = "job_request";
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct JobRequest {
+    parent_id: String,
+    target: String,
+    task: String,
+}
+
+/// Only this completed setup handle can publish the child to the catalog.
+#[allow(dead_code)]
+struct PreparedAgentJob {
+    db: Database,
+    source: String,
+}
 
 /// Peer-runtime overrides that survive restart. v1 holds one key
 /// (`default_agents`) edited by the Peer Settings page; the slot is
@@ -201,6 +220,112 @@ impl SessionRegistry {
 
     // -------------------------------------------------------------------------
     // Session creation & opening
+    // Unindexed job setup and publication (private until admission migrates).
+
+    /// Prepare a delegated child without adding it to either discoverable index.
+    /// This is deliberately private until executor-side validation is migrated.
+    #[allow(dead_code)]
+    async fn prepare_agent_job(
+        &self,
+        parent_id: &str,
+        target: &str,
+        task: &str,
+    ) -> anyhow::Result<PreparedAgentJob> {
+        anyhow::ensure!(
+            !target.is_empty() && !task.is_empty(),
+            "job target and task are required"
+        );
+        let parent_root = eidetica::entry::ID::parse(parent_id)?;
+        let (parent, db) = {
+            let mut user = self.user.lock().await;
+            let parent = user.open_database(&parent_root).await?;
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", "session:job-stage:submitter");
+            let key = user.get_default_key()?;
+            let db = user.create_database(settings, &key).await?;
+            (parent, db)
+        };
+        let source = format!("job-stage:submitter:{}", db.root_id());
+        // Eidetica commits separately per DB; none of these writes makes the
+        // child discoverable through the watched catalog.
+        super::Session::initialize_turn_schema(&db).await?;
+        crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, &source).await?;
+        let txn = db.new_transaction().await?;
+        txn.get_settings()?
+            .add_delegated_tree(DelegatedTreeRef {
+                permission_bounds: PermissionBounds {
+                    max: Permission::Admin(0),
+                    min: None,
+                },
+                tree: TreeReference {
+                    root: parent_root,
+                    tips: parent.snapshot().await?.into_tips(),
+                },
+            })
+            .await?;
+        txn.get_store::<DocStore>(JOB_REQUEST_STORE)
+            .await?
+            .set_string(
+                "v1",
+                serde_json::to_string(&JobRequest {
+                    parent_id: parent_id.to_string(),
+                    target: target.to_string(),
+                    task: task.to_string(),
+                })?,
+            )
+            .await?;
+        txn.get_store::<Table<super::SessionEntry>>("entries")
+            .await?
+            .insert(super::SessionEntry {
+                sender: "submitter".into(),
+                content: task.to_string(),
+                timestamp: Utc::now(),
+                entry_type: super::EntryType::Directive,
+                metadata: None,
+                routing: None,
+            })
+            .await?;
+        txn.commit().await?;
+        Ok(PreparedAgentJob { db, source })
+    }
+
+    /// Publish only a fully prepared handle to both existing catalog stores.
+    #[allow(dead_code)]
+    async fn publish_agent_job(
+        &self,
+        prepared: PreparedAgentJob,
+    ) -> anyhow::Result<ConversationId> {
+        let id = prepared.db.root_id().to_string();
+        let txn = self.chaz_group.new_transaction().await?;
+        txn.get_store::<DocStore>(STORE_SESSIONS)
+            .await?
+            .set_string(&id, &prepared.source)
+            .await?;
+        txn.get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await?
+            .set_string(
+                &id,
+                serde_json::to_string(&SessionCatalogEntry {
+                    session_db_id: id.clone(),
+                    source: Some(prepared.source.clone()),
+                    bridge: BridgeKind::from_source(Some(&prepared.source)),
+                    created_at: Utc::now(),
+                    status: SessionStatus::Active,
+                })?,
+            )
+            .await?;
+        txn.commit().await?;
+        self.locally_created_sessions
+            .lock()
+            .await
+            .insert(id.clone());
+        let _ = self.new_session_tx.try_send(NewSessionEvent {
+            session_db_id: id.clone(),
+            source: Some(prepared.source),
+        });
+        Ok(ConversationId(id))
+    }
+
     // -------------------------------------------------------------------------
 
     /// Create a new session database and register it in the sessions index.
@@ -973,6 +1098,135 @@ mod tests {
             peers_after.is_empty(),
             "tree sync relationships should be removed after close, got {peers_after:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_prepares_then_publishes_one_inert_child_on_shared_service() {
+        use eidetica::backend::database::InMemory;
+        use eidetica::instance::{Instance, NewUser};
+        use eidetica::service::ServiceServer;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("job.sock");
+        let (owner, _) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
+                .await
+                .unwrap();
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let settings = crate::config::EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: crate::config::EideticaLoginConfig {
+                username: "job-test".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let agents = Arc::new(AgentRegistry::with_default_agent());
+        let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
+        let submitter = SessionRegistry::new(client.instance, client.user, agents.clone())
+            .await
+            .unwrap();
+        let (_, parent) = submitter.create_session(Some("cli")).await.unwrap();
+        let parent_id = parent.root_id().to_string();
+        let orphan = submitter
+            .prepare_agent_job(&parent_id, "default", "orphan task")
+            .await
+            .unwrap();
+        let orphan_id = orphan.db.root_id().to_string();
+        let prepared = submitter
+            .prepare_agent_job(&parent_id, "default", "requested task")
+            .await
+            .unwrap();
+        let id = prepared.db.root_id().to_string();
+        let resident =
+            crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+                .await
+                .unwrap();
+        let observer = SessionRegistry::new(resident.instance, resident.user, agents)
+            .await
+            .unwrap();
+        let rows = observer.list_sessions().await.unwrap();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.session_db_id == id || row.session_db_id == orphan_id)
+        );
+        assert!(observer.open_job_session(&id).await.is_err());
+        assert!(observer.open_job_session(&orphan_id).await.is_err());
+        drop(orphan);
+
+        assert_eq!(submitter.publish_agent_job(prepared).await.unwrap().0, id);
+        let rows = observer.list_sessions().await.unwrap();
+        assert_eq!(rows.iter().filter(|row| row.session_db_id == id).count(), 1);
+        assert!(!rows.iter().any(|row| row.session_db_id == orphan_id));
+        assert!(
+            rows.iter()
+                .find(|row| row.session_db_id == id)
+                .unwrap()
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("job-stage:")
+        );
+        let txn = observer.chaz_group.new_transaction().await.unwrap();
+        for store in [STORE_SESSIONS, STORE_SESSION_CATALOG] {
+            assert!(
+                txn.get_store::<DocStore>(store)
+                    .await
+                    .unwrap()
+                    .get_all()
+                    .await
+                    .unwrap()
+                    .get(&id)
+                    .is_some()
+            );
+        }
+        // This is the delegated-job open path, not find_sigkeys on a remote service.
+        let (_, child) = observer.open_job_session(&id).await.unwrap();
+        assert!(read_delegation(&child, parent.root_id()).await.is_some());
+        assert!(crate::session::jobs::is_staged_job(&child).await);
+        assert!(
+            crate::session::jobs::read_accepted_job(&child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let txn = child.new_transaction().await.unwrap();
+        let doc = txn
+            .get_store::<DocStore>(JOB_REQUEST_STORE)
+            .await
+            .unwrap()
+            .get_all()
+            .await
+            .unwrap();
+        let request: String = doc.get("v1").unwrap().try_into().unwrap();
+        assert_eq!(
+            serde_json::from_str::<JobRequest>(&request).unwrap(),
+            JobRequest {
+                parent_id,
+                target: "default".into(),
+                task: "requested task".into(),
+            }
+        );
+        let entries = txn
+            .get_store::<Table<super::super::SessionEntry>>("entries")
+            .await
+            .unwrap()
+            .search(|_| true)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.entry_type, super::super::EntryType::Directive);
+        assert_eq!(entries[0].1.content, "requested task");
+        assert!(observer.open_job_session(&orphan_id).await.is_err());
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
