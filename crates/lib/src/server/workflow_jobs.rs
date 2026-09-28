@@ -1,10 +1,11 @@
-//! Admission only. A workflow parent is parked; no graph driver runs here.
+//! Durable root Spawn workflow admission, validation, and recovery.
 use super::Server;
 use crate::extensions::orchestrator::spec::{FlowSpec, JoinReducer};
 use crate::grants::Grants;
 use crate::session::workflow_jobs::{
-    AcceptedWorkflowParent, WorkflowAuthority, WorkflowParentState, WorkflowParentStatus,
-    read_accepted_workflow,
+    AcceptedWorkflowParent, ROOT_KEY, WorkflowAuthority, WorkflowOutput, WorkflowParentState,
+    WorkflowParentStatus, WorkflowTerminal, read_accepted_workflow, read_root_node, read_terminal,
+    record_root_node, record_terminal,
 };
 use crate::session::{Session, SessionCommand, SessionCommandOutcome, TurnRequestId};
 use crate::tool::ScopedTools;
@@ -27,6 +28,25 @@ fn agents_in_flow(flow: &FlowSpec, names: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn node_output(flow: &FlowSpec, text: String) -> anyhow::Result<Option<WorkflowOutput>> {
+    let FlowSpec::Spawn(node) = flow else {
+        anyhow::bail!("root node is not Spawn");
+    };
+    Ok(
+        match node
+            .output
+            .unwrap_or(crate::extensions::orchestrator::spec::OutputMode::Text)
+        {
+            crate::extensions::orchestrator::spec::OutputMode::Text => {
+                Some(WorkflowOutput::Text(text))
+            }
+            crate::extensions::orchestrator::spec::OutputMode::Json => {
+                serde_json::from_str(&text).ok().map(WorkflowOutput::Json)
+            }
+        },
+    )
 }
 
 async fn strict_capabilities(db: &eidetica::Database) -> anyhow::Result<Grants> {
@@ -103,6 +123,11 @@ impl Server {
             crate::extensions::orchestrator::spec::parse_flow(&serde_json::to_value(flow)?)
                 .map_err(|e| anyhow::anyhow!(e))?;
         anyhow::ensure!(&canonical == flow, "workflow graph is not normalized");
+        // Only root Spawn is runnable in this stage. Do not park unsupported promises.
+        anyhow::ensure!(
+            matches!(flow, FlowSpec::Spawn(_)),
+            "only root Spawn workflows are supported"
+        );
         let mut targets = Vec::new();
         agents_in_flow(flow, &mut targets);
         anyhow::ensure!(!targets.is_empty(), "workflow needs an Agent node");
@@ -314,10 +339,72 @@ impl Server {
         } else {
             false
         };
-        let state = if accepted {
-            WorkflowParentState::Accepted
-        } else {
+        let state = if !accepted {
             WorkflowParentState::Staged
+        } else if let Some(node) = read_root_node(&db).await? {
+            anyhow::ensure!(
+                node.path == crate::session::workflow_jobs::ROOT_NODE
+                    && node.request_key == ROOT_KEY,
+                "workflow root node receipt differs"
+            );
+            let child = Box::pin(self.validated_root_child(&db, &node.child_id)).await?;
+            if let Some(terminal) = read_terminal(&db).await? {
+                match terminal {
+                    WorkflowTerminal::Succeeded { child_id, output } => {
+                        let expected = match child.state {
+                            crate::session::jobs::JobState::Succeeded { text } => {
+                                let text = text.unwrap_or_default();
+                                match node_output(
+                                    &read_accepted_workflow(&db).await?.unwrap().flow,
+                                    text,
+                                )? {
+                                    Some(value) => value,
+                                    None => anyhow::bail!(
+                                        "workflow success differs from malformed JSON output"
+                                    ),
+                                }
+                            }
+                            _ => anyhow::bail!("workflow success has no successful child"),
+                        };
+                        anyhow::ensure!(
+                            child_id == node.child_id && output == expected,
+                            "workflow terminal output differs from child"
+                        );
+                        WorkflowParentState::Succeeded { child_id, output }
+                    }
+                    WorkflowTerminal::Failed { child_id, message } => {
+                        let expected = match child.state {
+                            crate::session::jobs::JobState::Failed { message } => message,
+                            crate::session::jobs::JobState::Succeeded { text }
+                                if node_output(
+                                    &read_accepted_workflow(&db).await?.unwrap().flow,
+                                    text.as_deref().unwrap_or_default().to_string(),
+                                )?
+                                .is_none() =>
+                            {
+                                "invalid JSON output".into()
+                            }
+                            _ => anyhow::bail!("workflow failure has no matching failed child"),
+                        };
+                        anyhow::ensure!(
+                            child_id == node.child_id && message == expected,
+                            "workflow failure does not match terminal child"
+                        );
+                        WorkflowParentState::Failed { child_id, message }
+                    }
+                }
+            } else {
+                WorkflowParentState::Waiting {
+                    child_id: node.child_id,
+                }
+            }
+        } else if crate::session::jobs::read_job_owner(&db)
+            .await?
+            .is_some_and(|owner| owner.is_live())
+        {
+            WorkflowParentState::Running
+        } else {
+            WorkflowParentState::Accepted
         };
         Ok(WorkflowParentStatus {
             session_db_id: session_db_id.to_string(),
@@ -325,10 +412,112 @@ impl Server {
         })
     }
 
+    pub(super) async fn validated_root_child(
+        &self,
+        parent: &eidetica::Database,
+        child_id: &str,
+    ) -> anyhow::Result<crate::session::jobs::JobStatus> {
+        let record = read_accepted_workflow(parent)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow parent is not accepted"))?;
+        let FlowSpec::Spawn(node) = &record.flow else {
+            anyhow::bail!("root node is not Spawn");
+        };
+        let found = self
+            .registry
+            .lookup_job_by_key(
+                &parent.root_id().to_string(),
+                crate::session::workflow_jobs::ROOT_KEY,
+            )
+            .await?;
+        anyhow::ensure!(
+            found
+                .as_ref()
+                .is_some_and(|row| row.session_db_id == child_id),
+            "workflow root child does not match request key"
+        );
+        let (_, child) = self.registry.open_job_session(child_id).await?;
+        let accepted = if self.executor_authorized {
+            self.validate_accepted_job(&child).await?
+        } else {
+            crate::session::jobs::read_accepted_job(&child).await?
+        }
+        .ok_or_else(|| anyhow::anyhow!("workflow child has no valid accepted job"))?;
+        anyhow::ensure!(
+            crate::session::jobs::acceptance_matches_staging(&child, &accepted).await?,
+            "workflow child differs from staged definition"
+        );
+        let parent_session =
+            Session::new(ConversationId(parent.root_id().to_string()), parent.clone()).await;
+        let work = parent_session
+            .command_requests(&Default::default())
+            .await?
+            .into_iter()
+            .find(|work| {
+                work.request.command_id.as_str() == crate::session::workflow_jobs::ROOT_KEY
+            })
+            .ok_or_else(|| anyhow::anyhow!("workflow root child has no parent command"))?;
+        anyhow::ensure!(
+            !matches!(work.state, crate::session::TurnRequestState::Queued)
+                && matches!(work.request.command, SessionCommand::SubmitAgent { agent_ref, task }
+                if agent_ref == node.agent && task == node.task),
+            "workflow root child command is not ready or differs"
+        );
+        let child_meta = Session::new(ConversationId(child_id.to_string()), child.clone())
+            .await
+            .read_meta()
+            .await;
+        anyhow::ensure!(
+            child_meta.capabilities == accepted.definition.capability_ceiling
+                && strict_capabilities(&child).await? == accepted.definition.capability_ceiling,
+            "workflow child persisted capability ceiling differs"
+        );
+        let target = self.agent_index.find_by_name(&node.agent).or_else(|| {
+            ID::parse(&node.agent)
+                .ok()
+                .and_then(|id| self.agent_index.find_by_id(&id))
+        });
+        anyhow::ensure!(
+            accepted.definition.call_depth == record.authority.call_depth + 1
+                && accepted.definition.max_call_depth <= record.authority.max_call_depth
+                && accepted.definition.capability_ceiling == record.authority.capability_ceiling
+                && accepted.definition.tool_ceilings == record.authority.tool_ceilings
+                && accepted.definition.allowed_tools
+                    == record
+                        .authority
+                        .tool_ceilings
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                && (target
+                    .as_ref()
+                    .is_some_and(|t| accepted.definition.target == t.display_name
+                        && accepted.definition.executor_pubkey == t.pubkey.to_string()
+                        && child_meta.agents.len() == 1
+                        && child_meta.agents[0].db_id == t.db_id.to_string())
+                    || (!self.executor_authorized
+                        && child_meta.agents.len() == 1
+                        && child_meta.agents[0].display_name == accepted.definition.target
+                        && child_meta.agents[0].home_pubkey.as_deref()
+                            == Some(accepted.definition.executor_pubkey.as_str()))),
+            "workflow child authority or Agent identity differs from parent"
+        );
+        anyhow::ensure!(
+            accepted.parent_id == parent.root_id().to_string()
+                && accepted.request_key_hash
+                    == blake3::hash(crate::session::workflow_jobs::ROOT_KEY.as_bytes())
+                        .to_hex()
+                        .to_string()
+                && accepted.definition.task == node.task,
+            "workflow child acceptance differs from root node"
+        );
+        let live = self.live_attempts.lock().await.clone();
+        crate::session::jobs::status_from_db(&child, &live, self.executor_authorized).await
+    }
+
     /// A marker is not sufficient: check catalog, parent intent, started
-    /// command, and pinned Agent/home and graph. This is a consistency check,
-    /// not a child-effects grant: same-login clients can write session DBs.
-    /// A future graph driver must establish executor provenance independently.
+    /// command, and pinned Agent/home and graph. Same-login clients are trusted
+    /// for broad-local v1; these records are not an unforgeable signature.
     pub async fn validate_workflow_parent(
         &self,
         db: &eidetica::Database,
@@ -424,6 +613,11 @@ impl Server {
             self.executor_authorized,
             "client cannot admit workflow parents"
         );
+        // Reject unsupported shapes before persisting even a caller command.
+        anyhow::ensure!(
+            matches!(flow, FlowSpec::Spawn(_)),
+            "only root Spawn workflows are supported"
+        );
         let _admission = self.job_submission_lock.lock().await;
         let (id, db) = self.registry.open_session(parent_id).await?;
         let session = Session::new(id, db).await;
@@ -490,5 +684,293 @@ impl Server {
         self.registry
             .lookup_workflow_parent(parent_id, request_key)
             .await
+    }
+}
+
+impl Server {
+    /// Catalog discovery is repeated on startup and after a missed callback.
+    /// A child is never replayed: an uncertain submission is resolved by its
+    /// deterministic request key and validated acceptance receipt.
+    pub(super) async fn drive_workflow_roots(self: std::sync::Arc<Self>) {
+        let mut claimed = std::collections::HashSet::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = self.shutdown_notify.notified() => break,
+            }
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            let rows = match self.registry.list_sessions().await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(%error, "Workflow catalog scan failed");
+                    continue;
+                }
+            };
+            for row in rows.into_iter().filter(|r| {
+                r.source
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("workflow-stage:"))
+            }) {
+                let id = row.session_db_id;
+                let result = Box::pin(self.drive_workflow_root(&id, &mut claimed)).await;
+                if let Err(error) = result {
+                    tracing::warn!(session_db_id = %id, %error, "Workflow parent held for reconciliation");
+                }
+            }
+        }
+    }
+
+    async fn drive_workflow_root(
+        &self,
+        id: &str,
+        claimed: &mut std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let (_, db) = self.registry.open_job_session(id).await?;
+        let Some(accepted) = Box::pin(self.validate_workflow_parent(&db)).await? else {
+            return Ok(());
+        };
+        let FlowSpec::Spawn(node) = &accepted.flow else {
+            anyhow::bail!("unsupported workflow graph");
+        };
+        // The root driver does not advance nested workflow parents in this
+        // bounded slice; their child authority needs its own lifetime policy.
+        let caller = self
+            .registry
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|r| r.session_db_id == accepted.parent_id)
+            .ok_or_else(|| anyhow::anyhow!("workflow caller is not indexed"))?;
+        if caller
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("job-stage:"))
+        {
+            return Ok(());
+        }
+        if read_terminal(&db).await?.is_some() {
+            // A lost link can be recovered from the accepted child's stable
+            // key even after a terminal receipt. The marker alone proves no
+            // child effect or result; never spawn from this branch.
+            if read_root_node(&db).await?.is_none() {
+                let child = self
+                    .registry
+                    .lookup_job_by_key(id, ROOT_KEY)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("workflow terminal has no root child"))?;
+                Box::pin(self.validated_root_child(&db, &child.session_db_id)).await?;
+                record_root_node(&db, &child.session_db_id).await?;
+            }
+            Box::pin(self.workflow_parent_status(id)).await?;
+            claimed.remove(id);
+            return Ok(());
+        }
+        let owner = crate::session::jobs::read_job_owner(&db).await?;
+        if claimed.contains(id)
+            && owner
+                .as_ref()
+                .is_some_and(|o| o.incarnation != self.job_incarnation)
+        {
+            crate::session::jobs::record_job_stop(
+                &db,
+                ROOT_KEY,
+                &self.job_incarnation,
+                owner.as_ref().unwrap(),
+            )
+            .await?;
+            claimed.remove(id);
+            return Ok(());
+        }
+        if !crate::session::jobs::claim_job(
+            &db,
+            &accepted.authority.home_pubkey,
+            &accepted.authority.agent_db_id,
+            &self.job_incarnation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        claimed.insert(id.to_string());
+        #[cfg(test)]
+        let gate = { self.workflow_before_root.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.started.add_permits(1);
+            gate.release.acquire().await?.forget();
+        }
+        if !crate::session::jobs::owns_job(&db, &self.job_incarnation).await? {
+            if let Some(winner) = crate::session::jobs::read_job_owner(&db).await? {
+                crate::session::jobs::record_job_stop(
+                    &db,
+                    ROOT_KEY,
+                    &self.job_incarnation,
+                    &winner,
+                )
+                .await?;
+            }
+            claimed.remove(id);
+            return Ok(());
+        }
+        let child_id = if let Some(receipt) = read_root_node(&db).await? {
+            anyhow::ensure!(
+                receipt.path == crate::session::workflow_jobs::ROOT_NODE
+                    && receipt.request_key == ROOT_KEY,
+                "workflow root node receipt differs"
+            );
+            receipt.child_id
+        } else if let Some(existing) = self.registry.lookup_job_by_key(id, ROOT_KEY).await? {
+            // The child was accepted but the parent link/ack was lost.
+            Box::pin(self.validated_root_child(&db, &existing.session_db_id)).await?;
+            record_root_node(&db, &existing.session_db_id).await?;
+            existing.session_db_id
+        } else {
+            let command_id = TurnRequestId::parse(ROOT_KEY);
+            let child_id = Box::pin(self.submit_agent_job_inline(
+                id,
+                command_id,
+                &accepted.authority.agent,
+                chrono::Utc::now(),
+                &node.agent,
+                &node.task,
+            ))
+            .await?;
+            Box::pin(self.validated_root_child(&db, &child_id)).await?;
+            record_root_node(&db, &child_id).await?;
+            child_id
+        };
+        if !crate::session::jobs::owns_job(&db, &self.job_incarnation).await? {
+            if let Some(winner) = crate::session::jobs::read_job_owner(&db).await? {
+                crate::session::jobs::record_job_stop(
+                    &db,
+                    ROOT_KEY,
+                    &self.job_incarnation,
+                    &winner,
+                )
+                .await?;
+            }
+            claimed.remove(id);
+            return Ok(());
+        }
+        // Acceptance also notifies the watcher; direct validated registration
+        // is a redundant wake if catalog notification races with staging.
+        let (_, child_db) = self.registry.open_job_session(&child_id).await?;
+        anyhow::ensure!(
+            self.register_accepted_job(&child_db).await?,
+            "workflow child is not accepted for local execution"
+        );
+        let child = Box::pin(self.validated_root_child(&db, &child_id)).await?;
+        let terminal = match child.state {
+            crate::session::jobs::JobState::Succeeded { text } => {
+                let text = text.unwrap_or_default();
+                let Some(output) = node_output(&accepted.flow, text)? else {
+                    return record_terminal(
+                        &db,
+                        &WorkflowTerminal::Failed {
+                            child_id,
+                            message: "invalid JSON output".into(),
+                        },
+                    )
+                    .await;
+                };
+                Some(WorkflowTerminal::Succeeded { child_id, output })
+            }
+            crate::session::jobs::JobState::Failed { message } => {
+                Some(WorkflowTerminal::Failed { child_id, message })
+            }
+            // Started child attempts remain held on restart. Never replay.
+            _ => None,
+        };
+        if let Some(terminal) = terminal {
+            record_terminal(&db, &terminal).await?;
+            claimed.remove(id);
+        }
+        Ok(())
+    }
+}
+
+impl Server {
+    pub async fn observe_job_status(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let (_, db) = self.registry.open_job_session(id).await?;
+        if crate::session::workflow_jobs::is_workflow_parent(&db).await {
+            Ok(serde_json::to_value(
+                Box::pin(self.workflow_parent_status(id)).await?,
+            )?)
+        } else {
+            Ok(serde_json::to_value(self.job_status(id).await?)?)
+        }
+    }
+
+    pub async fn observe_job_wait(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+        deadline: std::time::Duration,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            deadline <= std::time::Duration::from_secs(300),
+            "job wait must be bounded"
+        );
+        let (_, db) = self.registry.open_job_session(id).await?;
+        if !crate::session::workflow_jobs::is_workflow_parent(&db).await {
+            return Ok(serde_json::to_value(self.wait_job(id, deadline).await?)?);
+        }
+        let server = self.clone();
+        let id = id.to_string();
+        let poll_id = id.clone();
+        let mut poll = tokio::spawn(async move {
+            loop {
+                let status = Box::pin(server.workflow_parent_status(&poll_id)).await?;
+                if matches!(
+                    status.state,
+                    WorkflowParentState::Succeeded { .. } | WorkflowParentState::Failed { .. }
+                ) {
+                    return Ok::<_, anyhow::Error>(status);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        let status = match tokio::time::timeout(deadline, &mut poll).await {
+            Ok(result) => result??,
+            Err(_) => {
+                poll.abort();
+                Box::pin(self.workflow_parent_status(&id)).await?
+            }
+        };
+        Ok(serde_json::to_value(status)?)
+    }
+}
+
+#[cfg(test)]
+pub(super) struct WorkflowRootGate {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl WorkflowRootGate {
+    pub(super) async fn wait_started(&self) {
+        self.started.acquire().await.unwrap().forget();
+    }
+    pub(super) fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[cfg(test)]
+impl Server {
+    pub(super) fn block_next_workflow_root(&self) -> std::sync::Arc<WorkflowRootGate> {
+        let gate = std::sync::Arc::new(WorkflowRootGate {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *self.workflow_before_root.lock().unwrap() = Some(gate.clone());
+        gate
     }
 }
