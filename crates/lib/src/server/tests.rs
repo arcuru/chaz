@@ -5084,6 +5084,229 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     task.await.unwrap().unwrap();
 }
 
+// Submit through the client-writable parent and wait only for the typed handle.
+async fn submit_capacity_test_job(
+    executor: &Arc<Server>,
+    parent: &eidetica::Database,
+    parent_id: &str,
+    key: &str,
+) -> String {
+    let command_id = crate::session::TurnRequestId::parse(key);
+    Session::new(ConversationId(parent_id.to_string()), parent.clone())
+        .await
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: command_id.clone(),
+            sender: "client".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::SubmitAgent {
+                agent_ref: "default".into(),
+                task: key.into(),
+            },
+        })
+        .await
+        .unwrap();
+    let observer = executor.observe_session_command(parent_id).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        observer.wait(&command_id),
+    )
+    .await
+    .expect("submission must not wait for a model slot")
+    .unwrap();
+    match result.outcome {
+        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
+        other => panic!("expected job handle, got {other:?}"),
+    }
+}
+
+async fn exercise_job_capacity(
+    restarted: &Arc<Server>,
+    parent: &eidetica::Database,
+    parent_id: &str,
+    mock: &Arc<crate::test_support::MockBackend>,
+) -> String {
+    // Hold every real runtime permit. The child is adopted, but no attempt,
+    // Ack, or backend call may occur while there is no execution capacity.
+    Box::pin(async {
+        let permits = restarted
+            .semaphore
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .await
+            .unwrap();
+        mock.push_text("capacity released");
+        let released_id =
+            submit_capacity_test_job(restarted, parent, parent_id, "capacity-release").await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !restarted.is_watching_session(&released_id).await
+                || !restarted.processing.lock().await.contains(&released_id)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("accepted job must wait for a permit without blocking admission");
+        let (_, db) = restarted
+            .registry()
+            .open_session(&released_id)
+            .await
+            .unwrap();
+        let accepted = crate::session::jobs::read_accepted_job(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let attempts = db
+            .new_transaction()
+            .await
+            .unwrap()
+            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
+            .await
+            .unwrap()
+            .search(|_| true)
+            .await
+            .unwrap();
+        assert!(
+            attempts.is_empty(),
+            "capacity wait must not persist an attempt"
+        );
+        let session = Session::new(ConversationId(released_id.clone()), db).await;
+        assert!(
+            !session
+                .entries()
+                .iter()
+                .any(|entry| entry.entry_type == EntryType::Ack)
+        );
+        assert!(!accepted.directive_id.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            restarted.job_status(&released_id).await.unwrap().state,
+            crate::session::jobs::JobState::Queued
+        );
+        assert_eq!(mock.recorded_calls().len(), 3);
+        drop(permits);
+        assert_eq!(
+            restarted
+                .wait_job(&released_id, std::time::Duration::from_secs(10))
+                .await
+                .unwrap()
+                .state,
+            crate::session::jobs::JobState::Succeeded {
+                text: Some("capacity released".into())
+            }
+        );
+        assert_eq!(mock.recorded_calls().len(), 4);
+    })
+    .await;
+
+    // A fully adopted, capacity-waiting job survives executor shutdown and
+    // runs once when the next generation has available capacity.
+    let permits = restarted
+        .semaphore
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+        .await
+        .unwrap();
+    mock.push_text("queued resumed");
+    let queued_id =
+        submit_capacity_test_job(restarted, parent, parent_id, "queued-job-request").await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !restarted.is_watching_session(&queued_id).await
+            || !restarted.processing.lock().await.contains(&queued_id)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("job must be waiting for capacity before restart");
+    let (_, queued_db) = restarted.registry().open_session(&queued_id).await.unwrap();
+    let attempts = queued_db
+        .new_transaction()
+        .await
+        .unwrap()
+        .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
+        .await
+        .unwrap()
+        .search(|_| true)
+        .await
+        .unwrap();
+    assert!(attempts.is_empty());
+    assert_eq!(
+        restarted.job_status(&queued_id).await.unwrap().state,
+        crate::session::jobs::JobState::Queued
+    );
+    assert_eq!(mock.recorded_calls().len(), 4);
+    restarted.shutdown().await;
+    drop(permits);
+    queued_id
+}
+
+async fn exercise_capacity_claim_loss(
+    executor: &Arc<Server>,
+    parent: &eidetica::Database,
+    parent_id: &str,
+    agent: &DbEntry,
+    mock: &Arc<crate::test_support::MockBackend>,
+) {
+    Box::pin(async {
+        let permits = executor
+            .semaphore
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .await
+            .unwrap();
+        let lost_id =
+            submit_capacity_test_job(executor, parent, parent_id, "capacity-claim-loss").await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !executor.processing.lock().await.contains(&lost_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, db) = executor.registry().open_session(&lost_id).await.unwrap();
+        let other = crate::session::jobs::JobOwner {
+            peer: agent.pubkey.to_string(),
+            agent_db_id: agent.db_id.to_string(),
+            incarnation: "other-live-incarnation".into(),
+            refreshed_at: Utc::now(),
+        };
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("job_owner")
+            .await
+            .unwrap()
+            .set_string("v1", serde_json::to_string(&other).unwrap())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        drop(permits);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            executor.job_status(&lost_id).await.unwrap().state,
+            crate::session::jobs::JobState::Queued
+        );
+        assert_eq!(
+            mock.recorded_calls().len(),
+            6,
+            "lost claim must not start a model"
+        );
+        let attempts = db
+            .new_transaction()
+            .await
+            .unwrap()
+            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
+            .await
+            .unwrap()
+            .search(|_| true)
+            .await
+            .unwrap();
+        assert!(
+            attempts.is_empty(),
+            "losing a capacity waiter cannot start an attempt"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directive() {
     use crate::session::jobs::StagedAgentDefinition;
@@ -5695,45 +5918,7 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
         }
     );
     assert_eq!(mock.recorded_calls().len(), 3);
-    // Hold watcher installation at the exact accepted-but-not-started edge.
-    // The parent command may settle while the child remains queued; a new
-    // executor must discover it from the catalog without any fresh write.
-    let hold_watcher = restarted.watched.lock().await;
-    mock.push_text("queued resumed");
-    let queued_command = crate::session::TurnRequestId::parse("queued-job-request");
-    Session::new(ConversationId(parent_id.clone()), parent.clone())
-        .await
-        .submit_command(crate::session::SessionCommandRequest {
-            command_id: queued_command.clone(),
-            sender: "client".into(),
-            created_at: Utc::now(),
-            command: crate::session::SessionCommand::SubmitAgent {
-                agent_ref: "default".into(),
-                task: "queued before executor exit".into(),
-            },
-        })
-        .await
-        .unwrap();
-    let observer = restarted.observe_session_command(&parent_id).await.unwrap();
-    let queued_id = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        observer.wait(&queued_command),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .outcome
-    {
-        crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => session_db_id,
-        other => panic!("expected queued child handle, got {other:?}"),
-    };
-    assert_eq!(
-        restarted.job_status(&queued_id).await.unwrap().state,
-        crate::session::jobs::JobState::Queued
-    );
-    assert_eq!(mock.recorded_calls().len(), 3);
-    restarted.shutdown().await;
-    drop(hold_watcher);
+    let queued_id = exercise_job_capacity(&restarted, &parent, &parent_id, &mock).await;
     drop(restarted);
 
     let next = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
@@ -5782,9 +5967,14 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
         resumed.state,
         crate::session::jobs::JobState::Succeeded {
             text: Some("queued resumed".into())
-        }
+        },
+        "calls: {:?}",
+        mock.recorded_calls()
+            .iter()
+            .map(|c| format!("{:?}", c.messages))
+            .collect::<Vec<_>>()
     );
-    assert_eq!(mock.recorded_calls().len(), 4, "queued job must run once");
+    assert_eq!(mock.recorded_calls().len(), 5, "queued job must run once");
     let inline_executor = next_executor.clone();
     let inline_parent = parent.clone();
     let inline_parent_id = parent_id.clone();
@@ -5834,10 +6024,11 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
                 text: Some("inline finished".into())
             }
         );
-        assert_eq!(inline_mock.recorded_calls().len(), 5);
+        assert_eq!(inline_mock.recorded_calls().len(), 6);
     })
     .await
     .unwrap();
+    exercise_capacity_claim_loss(&next_executor, &parent, &parent_id, &agent, &mock).await;
     next_executor.shutdown().await;
     drop(shutdown);
     task.await.unwrap().unwrap();
