@@ -127,7 +127,7 @@ cleanup() {
 	fi
 	exit $status
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # Ask the kernel for a port nobody is using. Racy in principle; the alternative
 # is hardcoded ports that collide with a developer's running daemon, which is
@@ -163,7 +163,18 @@ SPAWNED_PID=""
 spawn() {
 	local name="$1"
 	shift
-	"$@" >"$WORKSPACE/$name.log" 2>&1 &
+	# EXIT traps cannot run after SIGKILL. Have the kernel TERM each spawned
+	# process if the harness dies without running cleanup (also covers HUP).
+	python3 -c '
+import ctypes, os, signal, sys
+parent = int(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
+if os.getppid() != parent:
+    sys.exit("harness exited before child startup")
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$$" "$@" >"$WORKSPACE/$name.log" 2>&1 &
 	SPAWNED_PID=$!
 	PIDS+=("$SPAWNED_PID")
 	if [[ $VERBOSE -eq 1 ]]; then
