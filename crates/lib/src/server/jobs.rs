@@ -69,6 +69,16 @@ impl Server {
             .agents
             .get(parent_name)
             .ok_or_else(|| anyhow::anyhow!("parent Agent not hosted"))?;
+        let parent_host = self
+            .agent_index
+            .find_by_name(parent_name)
+            .ok_or_else(|| anyhow::anyhow!("invalid published job: parent Agent not hosted"))?;
+        anyhow::ensure!(
+            meta.agents[0].db_id == parent_host.db_id.to_string()
+                && meta.agents[0].home_pubkey.as_deref()
+                    == Some(parent_host.pubkey.to_string().as_str()),
+            "invalid published job: parent Agent is not home on executor"
+        );
         let strict_capabilities = strict_session_capabilities(&parent_db).await?;
         anyhow::ensure!(
             meta.capabilities == strict_capabilities

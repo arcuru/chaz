@@ -5301,6 +5301,12 @@ async fn published_job_is_adopted_without_creating_another_child() {
         })
         .await
         .expect("both executors must adopt the same child ID");
+        let refs = agent_db.list_session_refs().await.unwrap();
+        assert_eq!(
+            refs.iter().filter(|row| row.session_db_id == id).count(),
+            1,
+            "duplicate Agent DB session references for one child"
+        );
         Box::pin(async {
             // The accepted child is itself a parent. Its durable per-tool and depth
             // limits are inherited even when its model turn has already completed.
@@ -5584,6 +5590,17 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
         display_name: "default".into(),
         pubkey,
     };
+    let (_, foreign_home) = create_agent_db(
+        &mut user,
+        "foreign",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("foreign".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let service = ServiceServer::bind(owner, &socket).await.unwrap();
     let (shutdown, receiver) = watch::channel(());
     let task = tokio::spawn(service.run(receiver));
@@ -5881,6 +5898,28 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
         crate::session::jobs::JobState::Succeeded {
             text: Some("finished".into())
         }
+    );
+    assert_eq!(next_mock.recorded_calls().len(), 1);
+    let (_, foreign_parent) = registry.open_session(&parent_id.0).await.unwrap();
+    Session::new(parent_id.clone(), foreign_parent)
+        .await
+        .update_meta(|meta| meta.agents[0].home_pubkey = Some(foreign_home.to_string()))
+        .await
+        .unwrap();
+    let refused = client
+        .submit_agent_job(&parent_id.0, "default", "foreign parent home")
+        .await
+        .unwrap();
+    let refused_status = client
+        .wait_job(&refused, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            refused_status.state,
+            crate::session::jobs::JobState::Rejected { .. }
+        ),
+        "{refused_status:?}"
     );
     assert_eq!(next_mock.recorded_calls().len(), 1);
     restarted.shutdown().await;
