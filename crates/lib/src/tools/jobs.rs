@@ -1,4 +1,4 @@
-//! Observation tools for durable Agent jobs and workflow parents.
+//! Observation tools for durable one-shot Agent jobs.
 use crate::instance::ServerSlot;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy};
 use serde_json::Value;
@@ -26,7 +26,7 @@ impl Tool for JobStatusTool {
         ToolDescriptor {
             name: "job_status".into(),
             description:
-                "Read the durable state and typed result of an Agent job or workflow parent by session DB handle."
+                "Read the durable state and typed result of an Agent job by session DB handle."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -48,10 +48,7 @@ impl Tool for JobStatusTool {
                 .server
                 .get()
                 .ok_or_else(|| "Server not initialized".to_string())?;
-            let status = server
-                .observe_job_status(id)
-                .await
-                .map_err(|e| e.to_string())?;
+            let status = server.job_status(id).await.map_err(|e| e.to_string())?;
             serde_json::to_string(&status).map_err(|e| e.to_string().into())
         })
     }
@@ -61,7 +58,7 @@ impl Tool for JobWaitTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "job_wait".into(),
-            description: "Wait up to a bounded deadline for an Agent job or workflow parent; timeout returns current status without canceling work.".into(),
+            description: "Wait up to a bounded deadline for an Agent job; timeout returns current status without canceling work.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -99,7 +96,7 @@ impl Tool for JobWaitTool {
                 .get()
                 .ok_or_else(|| "Server not initialized".to_string())?;
             let status = server
-                .observe_job_wait(id, std::time::Duration::from_secs(seconds))
+                .wait_job(id, std::time::Duration::from_secs(seconds))
                 .await
                 .map_err(|e| e.to_string())?;
             serde_json::to_string(&status).map_err(|e| e.to_string().into())
