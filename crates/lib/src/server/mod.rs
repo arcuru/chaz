@@ -67,7 +67,7 @@ struct SessionRuntimeRecorder {
     attempt_id: String,
     sequence: AtomicU32,
     terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
-    explicit_matrix_send: AtomicBool,
+    explicit_bridge_send: AtomicBool,
     agent_name: String,
     #[cfg(test)]
     fail_after: Arc<std::sync::Mutex<Option<usize>>>,
@@ -152,22 +152,22 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 .await
                 .map_err(|error| format!("failed to persist runtime transcript: {error}"))?;
             if explicit_send {
-                self.explicit_matrix_send.store(true, Ordering::Release);
+                self.explicit_bridge_send.store(true, Ordering::Release);
             }
             Ok(())
         })
     }
 }
 
-/// A local or agent-to-agent request never acquires a Matrix destination merely
-/// because it shares the session. Validate the triggering row and current
-/// binding again at completion; the bridge repeats the binding check at send.
-async fn matrix_reply_for_turn(
+/// Only the origin of this exact turn may acquire an external destination.
+/// Revalidate attachment and login ownership before atomically committing
+/// the final and addressed outbox event; the publisher checks again at send.
+async fn bridge_reply_for_turn(
     session: &Session,
     registry: &SessionRegistry,
     attempt: &TurnAttempt,
     agent_name: &str,
-    matrix_binding: Option<&(String, String)>,
+    attachment: Option<&crate::session::TransportAttachment>,
     body: &str,
 ) -> anyhow::Result<Option<SessionEntry>> {
     let request = session
@@ -185,26 +185,77 @@ async fn matrix_reply_for_turn(
     else {
         return Ok(None);
     };
-    if source.transport != "matrix" {
-        return Ok(None);
+    let attachment = attachment
+        .ok_or_else(|| anyhow::anyhow!("external-origin turn has no unambiguous attachment"))?;
+    if !attachment.conversational_replies {
+        return Ok(None); // legacy non-conversational adapters retain their delivery path
     }
-    let (login, room) = matrix_binding
-        .ok_or_else(|| anyhow::anyhow!("Matrix-origin turn has no unambiguous room binding"))?;
-    if source.login_id != *login || source.channel != *room {
-        anyhow::bail!("Matrix-origin turn does not match its current room binding");
+    if source.transport != attachment.transport
+        || source.login_id != attachment.login_id
+        || source.channel != attachment.channel
+    {
+        anyhow::bail!("external-origin turn does not match its current attachment");
     }
     if body.trim().is_empty() {
-        anyhow::bail!("Matrix-origin final is empty without no_reply");
+        anyhow::bail!("external-origin final is empty without no_reply");
     }
-    if !crate::session::is_bound(session.database(), "matrix", login, room).await? {
-        anyhow::bail!("Matrix-origin turn was detached before its reply completed");
-    }
-    crate::tools::ensure_agent_owns_login(registry, session, agent_name, login)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let current = crate::session::session_attachment(session.database()).await?;
+    anyhow::ensure!(
+        current.as_ref() == Some(attachment),
+        "turn attachment changed before reply completed"
+    );
+    crate::tools::ensure_agent_owns_login(
+        registry,
+        session,
+        agent_name,
+        &attachment.transport,
+        &attachment.login_id,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(Some(
-        crate::tools::addressed_send_entry(agent_name, body, login, room).0,
+        crate::tools::addressed_send_entry(
+            agent_name,
+            body,
+            &attachment.transport,
+            &attachment.login_id,
+            &attachment.channel,
+        )
+        .0,
     ))
+}
+
+/// Revalidate a selected request after acquiring the per-session processing
+/// slot; selection can be older than another turn's completed commit.
+async fn fresh_attempt_for_request(
+    session: &Session,
+    request: &crate::session::TurnRequest,
+    live_attempts: &std::collections::HashSet<String>,
+    pending_retry: bool,
+) -> anyhow::Result<Option<TurnAttempt>> {
+    if pending_retry {
+        if let TurnRequestState::InFlight { attempt_id } = &request.state
+            && matches!(session.turn_state_for_entry(&request.id, live_attempts).await?,
+                TurnRequestState::InFlight { attempt_id: ref current } if current == attempt_id)
+        {
+            return session.read_turn_attempt(attempt_id).await;
+        }
+        return Ok(None);
+    }
+    if !matches!(request.state, TurnRequestState::Queued)
+        || !matches!(
+            session
+                .turn_state_for_entry(&request.id, live_attempts)
+                .await?,
+            TurnRequestState::Queued
+        )
+    {
+        return Ok(None);
+    }
+    session
+        .start_turn_attempt(request.id.clone())
+        .await
+        .map(Some)
 }
 
 fn display_entries_for_record(
@@ -596,6 +647,9 @@ pub struct Server {
     live_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Unique to this Server generation, even under the same service login.
     job_incarnation: String,
+    /// A retry command durably created these attempts, but no runtime has
+    /// consumed them yet. Consuming one marker is process-local and one-shot.
+    pending_retry_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -740,6 +794,7 @@ impl Server {
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
+            pending_retry_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -2480,12 +2535,14 @@ impl Server {
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
         // Receipt proves the executor observed this generation through session
         // sync. A bridge never acknowledges enablement on its own write alone.
-        if let Some(policy) = session.read_meta().await.matrix_participation
-            && crate::session::is_bound(&session_db, "matrix", &policy.login_id, &policy.room_id)
+        if let Some(policy) = session.read_meta().await.ambient_participation
+            && crate::session::session_attachment(&session_db)
                 .await
-                .unwrap_or(false)
+                .ok()
+                .flatten()
+                .is_some_and(|a| policy.matches_source(&a.transport, &a.login_id, &a.channel))
         {
-            crate::session::acknowledge_matrix_participation(&session_db, &policy.generation)
+            crate::session::acknowledge_ambient_participation(&session_db, &policy.generation)
                 .await?;
         }
 
@@ -2614,6 +2671,22 @@ impl Server {
         };
         if !should_process {
             return Ok(None);
+        }
+        if let Some(source) = latest.routing.as_ref().and_then(|r| r.source.as_ref()) {
+            let attachment = crate::session::session_attachment(&session_db).await?;
+            if !attachment.is_some_and(|a| {
+                a.transport == source.transport
+                    && a.login_id == source.login_id
+                    && a.channel == source.channel
+            }) || (latest.routing.as_ref().is_some_and(|r| r.ambient_candidate)
+                && !crate::session::ambient_participation_for_entry(&session_db, &latest).await)
+            {
+                warn!(
+                    session_db_id,
+                    "External turn no longer passes attachment or ambient policy gate"
+                );
+                return Ok(None);
+            }
         }
 
         // Fast-start gate: the gateway may already be drawn and accepting
@@ -2768,21 +2841,50 @@ impl Server {
             return Ok(None);
         }
 
-        // Non-job turns and explicit retries keep their existing lifecycle.
-        let attempt = match existing_attempt_id {
-            Some(attempt_id) => session
-                .read_turn_attempt(&attempt_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("live attempt {attempt_id} disappeared"))?,
-            None => {
-                let attempt = session.start_turn_attempt(request.id).await?;
-                self.live_attempts
-                    .lock()
-                    .await
-                    .insert(attempt.attempt_id.clone());
-                attempt
-            }
+        // This is the last check before model or tool side effects. A request
+        // stays queued through startup, runtime, and home-peer checks. Only
+        // the executor about to run it records the attempt start.
+        let live_now = self.live_attempts.lock().await.clone();
+        let pending_retry = match &request.state {
+            TurnRequestState::InFlight { attempt_id } => self
+                .pending_retry_attempts
+                .lock()
+                .await
+                .contains(attempt_id),
+            _ => false,
         };
+        let attempt =
+            match fresh_attempt_for_request(&session, &request, &live_now, pending_retry).await {
+                Ok(Some(attempt)) => {
+                    if pending_retry {
+                        self.pending_retry_attempts
+                            .lock()
+                            .await
+                            .remove(&attempt.attempt_id);
+                    }
+                    attempt
+                }
+                Ok(None) => {
+                    let current = session.turn_state_for_entry(&request.id, &live_now).await;
+                    self.processing.lock().await.remove(session_db_id);
+                    if matches!(current, Ok(TurnRequestState::Completed { .. })) {
+                        let _ = self
+                            .notify_tx
+                            .send(ProcessingCommand::Wake(session_db_id.to_string()))
+                            .await;
+                    }
+                    current?;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.processing.lock().await.remove(session_db_id);
+                    return Err(error);
+                }
+            };
+        self.live_attempts
+            .lock()
+            .await
+            .insert(attempt.attempt_id.clone());
 
         let attempt_id = attempt.attempt_id.clone();
         self.spawn_agent_task(
@@ -2957,6 +3059,10 @@ impl Server {
                                 )
                                 .await;
                         };
+                        self.pending_retry_attempts
+                            .lock()
+                            .await
+                            .insert(target_attempt.attempt_id.clone());
                         self.live_attempts
                             .lock()
                             .await
@@ -3191,15 +3297,14 @@ impl Server {
 
             // Stable for the session, independent of whether this turn came
             // from Matrix, the TUI, or another locally attached agent.
-            let matrix_binding = {
+            let attachment = {
                 let s = session.lock().await;
-                let bindings = crate::session::transport_bindings(s.database()).await;
-                match bindings {
-                    Ok(all) => {
-                        let matrix: Vec<_> = all.into_iter().filter(|(kind, _, _)| kind == "matrix").collect();
-                        (matrix.len() == 1).then(|| (matrix[0].1.clone(), matrix[0].2.clone()))
+                match crate::session::session_attachment(s.database()).await {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        warn!(%error, "Session has an invalid external attachment; disabling conversational tools");
+                        None
                     }
-                    Err(_) => None,
                 }
             };
             let tool_ctx = ToolContext {
@@ -3210,7 +3315,7 @@ impl Server {
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
-                allow_no_reply: matrix_binding.is_some(),
+                allow_no_reply: attachment.as_ref().is_some_and(|a| a.conversational_replies),
                 session: session.clone(),
                 grants: Default::default(),
                 session_capabilities,
@@ -3260,8 +3365,8 @@ impl Server {
                     max_context_tokens,
                 );
                 let mut builder = ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config);
-                if let Some((login, room)) = &matrix_binding {
-                    builder = builder.with_matrix_binding(login, room);
+                if let Some(attachment) = &attachment {
+                    builder = builder.with_attachment(attachment);
                 }
                 let assembled = builder.with_tools(&tool_defs)
                         .with_tool_history(&tool_history)
@@ -3290,7 +3395,7 @@ impl Server {
                 attempt_id: attempt.attempt_id.clone(),
                 sequence: AtomicU32::new(0),
                 terminal: std::sync::Mutex::new(None),
-                explicit_matrix_send: AtomicBool::new(false),
+                explicit_bridge_send: AtomicBool::new(false),
                 agent_name: agent_name.clone(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
@@ -3324,22 +3429,22 @@ impl Server {
                     (None, None)
                 }
                 Ok(outcome) => {
-                    let outbound = if recorder.explicit_matrix_send.load(Ordering::Acquire) {
+                    let outbound = if recorder.explicit_bridge_send.load(Ordering::Acquire) {
                         None
                     } else {
-                        match matrix_reply_for_turn(
+                        match bridge_reply_for_turn(
                             &s,
                             &registry,
                             &attempt,
                             &agent_name,
-                            matrix_binding.as_ref(),
+                            attachment.as_ref(),
                             &outcome.body,
                         )
                         .await
                         {
                             Ok(outbound) => outbound,
                             Err(error) => {
-                                error!(%error, "Matrix turn reply failed its binding or ownership check");
+                                error!(%error, "External turn reply failed its attachment or ownership check");
                                 reply_preflight_failed = true;
                                 None
                             }
@@ -3351,7 +3456,7 @@ impl Server {
                         .and_then(|routing| routing.destinations.first())
                         .and_then(|destination| destination.message_id.clone())
                         .map(|id| crate::session::EntryRouting {
-                            matrix_send_id: Some(id),
+                            outbound_id: Some(id),
                             ..Default::default()
                         });
                     (Some(SessionEntry {
@@ -3386,7 +3491,7 @@ impl Server {
             }
             if persistence_failed || reply_preflight_failed {
                 error!(
-                    "Turn {} for {session_db_id} remains interrupted: transcript or Matrix reply preflight failed",
+                    "Turn {} for {session_db_id} remains interrupted: transcript or external reply preflight failed",
                     attempt.attempt_id
                 );
             } else {

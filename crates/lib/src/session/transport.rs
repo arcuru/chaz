@@ -5,9 +5,9 @@
 //! The binding moved out of the peer-local `chaz_group` (the old
 //! `external_channels` index) and into each session's own DB, so it syncs with
 //! the session: whichever peer holds the session — the bridge that created it
-//! or the daemon that runs it — sees the same binding. A session carries at
-//! most one Matrix binding, keyed by the `(transport, login_id, channel)` triple.
-//! Other transports retain their own binding semantics.
+//! or the daemon that runs it — sees the same binding. New bindings permit
+//! only one external attachment, keyed by `(transport, login_id, channel)`;
+//! ambiguous older sessions require explicit migration.
 //!
 //! There is no central channel→session index anymore. A bridge finds the
 //! session for an inbound channel by walking its owning agent's synced session
@@ -22,6 +22,7 @@ use eidetica::Database;
 use eidetica::crdt::Doc;
 use eidetica::crdt::doc::Value;
 use eidetica::store::DocStore;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::registry::SessionRegistry;
@@ -30,6 +31,49 @@ use super::registry::SessionRegistry;
 /// [`channel_key`] → the transport name (informational; the key is the
 /// authoritative, reversible record).
 pub(super) const STORE_TRANSPORT_BINDINGS: &str = "transport_bindings";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportAttachment {
+    pub transport: String,
+    pub login_id: String,
+    pub channel: String,
+    pub conversational_replies: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BindingCapabilities {
+    conversational_replies: bool,
+}
+
+/// The sole external attachment, if any. Never guess among ambiguous legacy
+/// bindings. A pre-upgrade Matrix binding has conversational replies; an old
+/// Discord binding remains on its unchanged delivery path.
+pub async fn session_attachment(db: &Database) -> anyhow::Result<Option<TransportAttachment>> {
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
+    let bindings = binding_keys(&store.get_all().await?);
+    anyhow::ensure!(
+        bindings.len() <= 1,
+        "session has multiple external bindings; detach or migrate explicitly"
+    );
+    let Some((transport, login_id, channel)) = bindings.into_iter().next() else {
+        return Ok(None);
+    };
+    let raw = store
+        .get_string(&channel_key(&transport, &login_id, &channel))
+        .await?;
+    let conversational_replies = if raw == transport {
+        transport == "matrix" // compatibility with the already-live pilot
+    } else {
+        serde_json::from_str::<BindingCapabilities>(&raw)?.conversational_replies
+    };
+    Ok(Some(TransportAttachment {
+        transport,
+        login_id,
+        channel,
+        conversational_replies,
+    }))
+}
 
 /// Encode a channel identity as a stable DocStore key: JSON of the
 /// `(transport, login_id, channel)` triple. JSON is used because Matrix
@@ -82,19 +126,17 @@ pub async fn bind_transport(
 ) -> anyhow::Result<()> {
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
-    if transport == "matrix" {
-        let existing: Vec<_> = binding_keys(&store.get_all().await?)
-            .into_iter()
-            .filter(|(kind, _, _)| kind == "matrix")
-            .collect();
-        anyhow::ensure!(
-            existing.len() <= 1
-                && existing
-                    .iter()
-                    .all(|(_, login, room)| login == login_id && room == channel),
-            "session has a different or conflicting Matrix binding; detach or migrate it explicitly"
-        );
-    }
+    let existing = binding_keys(&store.get_all().await?);
+    anyhow::ensure!(
+        existing.len() <= 1
+            && existing.iter().all(|binding| binding
+                == &(
+                    transport.to_owned(),
+                    login_id.to_owned(),
+                    channel.to_owned()
+                )),
+        "session has a different or conflicting external attachment; detach or migrate explicitly"
+    );
     store
         .set_string(channel_key(transport, login_id, channel), transport)
         .await?;
@@ -106,6 +148,42 @@ pub async fn bind_transport(
         session_db_id = %session_db.root_id(),
         "Channel bound to session"
     );
+    Ok(())
+}
+
+/// Declare a reply-capable attachment in the session's authoritative binding.
+/// Existing ambiguous sessions require explicit migration, not an arbitrary
+/// destination choice.
+pub async fn bind_conversational_transport(
+    db: &Database,
+    transport: &str,
+    login_id: &str,
+    channel: &str,
+) -> anyhow::Result<()> {
+    let txn = db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
+    let bindings = binding_keys(&store.get_all().await?);
+    anyhow::ensure!(
+        bindings.len() <= 1
+            && bindings.iter().all(|binding| binding
+                == &(
+                    transport.to_owned(),
+                    login_id.to_owned(),
+                    channel.to_owned()
+                )),
+        "session has a different or conflicting external attachment; detach or migrate explicitly"
+    );
+    let key = channel_key(transport, login_id, channel);
+    let value = serde_json::to_string(&BindingCapabilities {
+        conversational_replies: true,
+    })?;
+    if store.get_string(&key).await.ok().as_deref() == Some(value.as_str()) {
+        return Ok(());
+    }
+    store.set_string(key, value).await?;
+    txn.commit().await?;
+    info!(transport, login_id, channel, session_db_id = %db.root_id(),
+        "Channel bound to session");
     Ok(())
 }
 
@@ -253,6 +331,45 @@ impl SessionRegistry {
         login_id: &str,
         channel: &str,
     ) -> anyhow::Result<(ConversationId, Database)> {
+        self.get_or_create_channel_session_with_capabilities(
+            agent,
+            bridge_label,
+            transport,
+            login_id,
+            channel,
+            false,
+        )
+        .await
+    }
+
+    pub async fn get_or_create_conversational_channel_session(
+        &self,
+        agent: &DbEntry,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        self.get_or_create_channel_session_with_capabilities(
+            agent,
+            bridge_label,
+            transport,
+            login_id,
+            channel,
+            true,
+        )
+        .await
+    }
+
+    async fn get_or_create_channel_session_with_capabilities(
+        &self,
+        agent: &DbEntry,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+        conversational_replies: bool,
+    ) -> anyhow::Result<(ConversationId, Database)> {
         // Open the agent DB once, up front. `None` → `find_key` so the bridge
         // opens it under its own `bridge` key (it doesn't hold the agent's key);
         // see find_channel_session. A `None` here means we hold no key for the
@@ -281,6 +398,9 @@ impl SessionRegistry {
             .find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
             .await?
         {
+            if conversational_replies {
+                bind_conversational_transport(&found.1, transport, login_id, channel).await?;
+            }
             self.publish_channel_session(&agent_db, found.1.root_id(), bridge_label)
                 .await?;
             tracing::debug!(
@@ -305,7 +425,11 @@ impl SessionRegistry {
             "Created transport channel session"
         );
 
-        bind_transport(&db, transport, login_id, channel).await?;
+        if conversational_replies {
+            bind_conversational_transport(&db, transport, login_id, channel).await?;
+        } else {
+            bind_transport(&db, transport, login_id, channel).await?;
+        }
         // Attach the owning agent as host: grants its pubkey Write, delegates
         // session auth to the agent DB, and lists the session in the agent
         // registry (exposed_on empty until the expose below).
@@ -431,7 +555,18 @@ mod tests {
         bind_transport(&db, "matrix", "@a:s", "!a:s").await.unwrap();
         assert!(bind_transport(&db, "matrix", "@b:s", "!a:s").await.is_err());
         assert!(bind_transport(&db, "matrix", "@a:s", "!b:s").await.is_err());
-        bind_transport(&db, "discord", "bot", "room").await.unwrap();
+        assert!(bind_transport(&db, "discord", "bot", "room").await.is_err());
+        let current = session_attachment(&db).await.unwrap().unwrap();
+        assert!(current.conversational_replies);
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
+            .await
+            .unwrap()
+            .set_string(channel_key("discord", "bot", "room"), "discord")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(session_attachment(&db).await.is_err());
         let txn = db.new_transaction().await.unwrap();
         txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
             .await

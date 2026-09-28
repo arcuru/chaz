@@ -47,7 +47,7 @@ graph TD
     RT <-->|tool calls| TS
     RT <-->|LLM calls| LLM
     RT -->|write response| EI
-    EI -->|addressed MatrixSend| MG
+    EI -->|addressed BridgeEvent| MG
     EI -->|callback| TG
     SV --> SR
     SR --> CG
@@ -118,7 +118,7 @@ The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event s
 
 ### Session Model
 
-Each conversation is an eidetica `Database` containing a `Table<SessionEntry>` (history) and a `DocStore` called `meta` (session config: name, agent, model, role, backend). Sessions are identified globally by their DB root ID. The `SessionRegistry` holds index stores only: `sessions` and `session_names`; Matrix bindings live in each session DB and permit only one login/room.
+Each conversation is an eidetica `Database` containing a `Table<SessionEntry>` (history) and a `DocStore` called `meta` (session config: name, agent, model, role, backend). Sessions are identified globally by their DB root ID. The `SessionRegistry` holds index stores only: `sessions` and `session_names`; External attachments live in each session DB and permit one publishable transport/login/channel; TUI stays a local interface.
 
 See [Session Model](sessions.md) for details.
 

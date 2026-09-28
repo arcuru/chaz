@@ -15,7 +15,7 @@ use chaz_core::hosted_index::DbEntry;
 use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{
-    MatrixParticipation, Session, bind_transport, matrix_participation_receipt, read_meta_from_db,
+    MatrixParticipation, Session, ambient_participation_receipt, read_meta_from_db,
     transport_bindings, unbind_transport, update_meta_on_db,
 };
 
@@ -182,7 +182,9 @@ async fn backfill_joined_room(
     // together, even if this is a rejoin after a previous run.
     let (conv, db) = server
         .registry()
-        .get_or_create_channel_session(&agent, login_id, "matrix", login_id, &room_id)
+        .get_or_create_conversational_channel_session(
+            &agent, login_id, "matrix", login_id, &room_id,
+        )
         .await?;
     let mut session = Session::new(conv, db).await;
     let previous = session.last_backfilled_join(&room_id).await?;
@@ -412,7 +414,13 @@ async fn dispatch_in_room(
     };
     let (_conv_id, session_db) = server
         .registry()
-        .get_or_create_channel_session(&agent_entry, login_id, "matrix", login_id, &room_id)
+        .get_or_create_conversational_channel_session(
+            &agent_entry,
+            login_id,
+            "matrix",
+            login_id,
+            &room_id,
+        )
         .await?;
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(Some(&session_db), &config, &secrets).await;
@@ -533,7 +541,9 @@ async fn handle_participation(
         "on" => Some(
             server
                 .registry()
-                .get_or_create_channel_session(&agent, login_id, "matrix", login_id, &room_id)
+                .get_or_create_conversational_channel_session(
+                    &agent, login_id, "matrix", login_id, &room_id,
+                )
                 .await?
                 .1,
         ),
@@ -547,12 +557,12 @@ async fn handle_participation(
     let Some(db) = db else {
         return Ok("Matrix participation: off".into());
     };
-    let current = read_meta_from_db(&db).await.matrix_participation;
+    let current = read_meta_from_db(&db).await.ambient_participation;
     if args == "status" {
         return Ok(if current
             .as_ref()
             .is_some_and(|p| p.matches(login_id, &room_id))
-            && matrix_participation_receipt(&db).await?.as_deref()
+            && ambient_participation_receipt(&db).await?.as_deref()
                 == current.as_ref().map(|p| p.generation.as_str())
         {
             "Matrix participation: on"
@@ -567,7 +577,7 @@ async fn handle_participation(
             .as_ref()
             .is_some_and(|p| p.matches(login_id, &room_id))
         {
-            update_meta_on_db(&db, |meta| meta.matrix_participation = None).await?;
+            update_meta_on_db(&db, |meta| meta.ambient_participation = None).await?;
         }
         return Ok("Matrix participation: off".into());
     }
@@ -579,12 +589,12 @@ async fn handle_participation(
     }
     let policy = MatrixParticipation::new(login_id, &room_id);
     let generation = policy.generation.clone();
-    update_meta_on_db(&db, |meta| meta.matrix_participation = Some(policy)).await?;
+    update_meta_on_db(&db, |meta| meta.ambient_participation = Some(policy)).await?;
     for _ in 0..150 {
-        if matrix_participation_receipt(&db).await?.as_deref() == Some(&generation)
+        if ambient_participation_receipt(&db).await?.as_deref() == Some(&generation)
             && read_meta_from_db(&db)
                 .await
-                .matrix_participation
+                .ambient_participation
                 .as_ref()
                 .is_some_and(|p| p.matches(login_id, &room_id) && p.generation == generation)
         {
@@ -596,11 +606,11 @@ async fn handle_participation(
     // newer setting installed while this request was waiting.
     if read_meta_from_db(&db)
         .await
-        .matrix_participation
+        .ambient_participation
         .as_ref()
         .is_some_and(|p| p.generation == generation)
     {
-        update_meta_on_db(&db, |meta| meta.matrix_participation = None).await?;
+        update_meta_on_db(&db, |meta| meta.ambient_participation = None).await?;
     }
     Ok("!chaz Error: executor did not confirm participation; mode is off".into())
 }
@@ -664,7 +674,10 @@ async fn handle_attach(
 
     // Bind the room into the session DB, then expose the session on this bridge
     // and ensure the owning agent hosts it so the daemon picks it up.
-    if let Err(e) = bind_transport(&target_db, "matrix", login_id, &room_id).await {
+    if let Err(e) =
+        chaz_core::session::bind_conversational_transport(&target_db, "matrix", login_id, &room_id)
+            .await
+    {
         let _ = room
             .send(RoomMessageEventContent::notice_plain(format!(
                 "!chaz Error: failed to bind room: {e}"
@@ -1194,10 +1207,10 @@ impl Bridge for MatrixBridge {
                                     &agent, &login_id, "matrix", &login_id, &room_id,
                                 ).await {
                                     Ok(Some((_, db))) => {
-                                        let policy = read_meta_from_db(&db).await.matrix_participation;
+                                        let policy = read_meta_from_db(&db).await.ambient_participation;
                                         if let Some(policy) = policy {
                                             policy.matches(&login_id, &room_id)
-                                                && matrix_participation_receipt(&db).await.ok().flatten()
+                                                && ambient_participation_receipt(&db).await.ok().flatten()
                                                     .as_deref() == Some(policy.generation.as_str())
                                         } else { false }
                                     }
@@ -1233,7 +1246,7 @@ impl Bridge for MatrixBridge {
                             return;
                         };
                         let resolved = if wake {
-                            server.registry().get_or_create_channel_session(
+                            server.registry().get_or_create_conversational_channel_session(
                                 &agent_entry, &login_id, "matrix", &login_id, &room_id,
                             ).await.map(Some)
                         } else {
@@ -1298,13 +1311,12 @@ impl Bridge for MatrixBridge {
                             Some(event.event_id.to_string()),
                         );
                         if participating && wake {
-                            entry.routing.as_mut().unwrap().matrix_participation = true;
+                            entry.routing.as_mut().unwrap().ambient_candidate = true;
                         }
                         if !wake {
                             tracing::debug!(room_id, "Recorded unaddressed Matrix observation");
-                            entry.entry_type = chaz_core::session::EntryType::MatrixObserved;
                         }
-                        if let Err(e) = session.add_entry(entry).await {
+                        if let Err(e) = session.add_bridge_input(entry, wake).await {
                             error!("Failed to record inbound message: {e}");
                         }
                     }
