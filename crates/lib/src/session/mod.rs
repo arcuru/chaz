@@ -30,6 +30,7 @@ mod agents;
 pub mod jobs;
 mod keys;
 mod registry;
+pub(crate) use registry::JobRequest;
 mod transport;
 pub mod usage;
 

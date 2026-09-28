@@ -5856,11 +5856,16 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
                 .contains("client cannot claim")
         );
         client_server.shutdown().await;
+        let claimant = contender.clone();
+        let claim_db = contender_db.clone();
+        let claim_record = accepted.clone();
         assert!(
-            !contender
-                .claim_accepted_job(&contender_db, &accepted)
-                .await
-                .unwrap()
+            !tokio::spawn(
+                async move { claimant.claim_accepted_job(&claim_db, &claim_record).await }
+            )
+            .await
+            .unwrap()
+            .unwrap()
         );
         // Simulate a collision's delayed write arriving during an in-flight call.
         // The overlap is allowed, but the loser must stop without erasing history.
@@ -6350,4 +6355,464 @@ async fn accepted_agent_job_can_submit_one_attenuated_child_while_running() {
     );
     assert_eq!(mock.recorded_calls().len(), 2);
     server.shutdown().await;
+}
+
+// Independent executor registries share the same service and key store.
+async fn published_executor(
+    settings: &crate::config::EideticaConfig,
+    agents: Arc<AgentRegistry>,
+    agent: DbEntry,
+) -> Arc<Server> {
+    let connection =
+        crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
+            .await
+            .unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(connection.instance, connection.user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let index = HostedIndex::empty("agent");
+    index.register(agent.clone());
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("finished");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock,
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(crate::tools::Calculate);
+    Server::new(
+        registry,
+        agents.clone(),
+        index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        tools,
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        SecurityContext {
+            leak_detector: crate::security::LeakDetector::new(
+                crate::security::LeakPolicy::default(),
+            ),
+            auto_approved_tools: std::collections::HashSet::new(),
+            approval_callback: None,
+        },
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    )
+}
+
+// The published DB ID is the handle; neither watcher creates a replacement.
+#[tokio::test]
+async fn published_job_is_adopted_without_creating_another_child() {
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+    Box::pin(async {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("published.sock");
+        let (owner, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
+                .await
+                .unwrap();
+        let restricted = crate::grants::Grants {
+            shell: Some(crate::grants::ShellGrant {
+                allow: crate::grants::Allowlist::Only(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut agent_config = AgentDbConfig::default();
+        agent_config.grants.insert("calculate".into(), restricted);
+        agent_config.max_iterations = Some(2);
+        let (agent_db, pubkey) = create_agent_db(
+            &mut user,
+            "default",
+            &agent_config,
+            &AgentMeta {
+                display_name: Some("default".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let agent = DbEntry {
+            db_id: agent_db.id(),
+            display_name: "default".into(),
+            pubkey,
+        };
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let settings = crate::config::EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: crate::config::EideticaLoginConfig {
+                username: "job-test".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let agents = Arc::new(AgentRegistry::with_default_agent());
+        let mut configured = agents.get("default").unwrap();
+        configured.max_iterations = 2;
+        configured.grants.insert(
+            "calculate".into(),
+            crate::grants::Grants {
+                shell: Some(crate::grants::ShellGrant {
+                    allow: crate::grants::Allowlist::Only(vec![]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        agents.upsert(configured);
+        let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
+        let client_registry = Arc::new(
+            crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
+                .await
+                .unwrap(),
+        );
+        let (parent_id, _) = client_registry.create_session(Some("cli")).await.unwrap();
+        client_registry
+            .attach_agent_to_session(&parent_id.0, &agent)
+            .await
+            .unwrap();
+        let prepared = client_registry
+            .prepare_agent_job(&parent_id.0, "default", "one task")
+            .await
+            .unwrap();
+        let id = prepared.db.root_id().to_string();
+        assert!(
+            !client_registry
+                .list_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.session_db_id == id)
+        );
+        let client_server = client_server_fixture_from_registry(client_registry.clone()).await;
+        assert!(!client_server.executor_authorized);
+        let mut executors = Vec::new();
+        for _ in 0..2 {
+            executors.push(published_executor(&settings, agents.clone(), agent.clone()).await);
+        }
+        assert_eq!(
+            client_registry.publish_agent_job(prepared).await.unwrap().0,
+            id
+        );
+        assert_eq!(
+            client_server.job_status(&id).await.unwrap().state,
+            crate::session::jobs::JobState::Pending
+        );
+        let (_, child) = client_registry.open_session(&id).await.unwrap();
+        assert!(client_server.register_accepted_job(&child).await.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let mut watching = false;
+                for server in &executors {
+                    watching |= server.is_watching_session(&id).await;
+                }
+                if watching {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("published child must be adopted by an executor");
+        let rows = client_registry.list_sessions().await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("job-stage:")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            Session::new(ConversationId(id.clone()), child.clone())
+                .await
+                .entries()
+                .iter()
+                .filter(|entry| entry.entry_type == EntryType::Directive)
+                .count(),
+            1
+        );
+        assert!(
+            crate::session::jobs::read_accepted_job(&child)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // A second executor can adopt the same handle after the first one has
+        // accepted it; neither has a creation path in this watcher.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !executors[0].is_watching_session(&id).await
+                || !executors[1].is_watching_session(&id).await
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both executors must adopt the same child ID");
+        Box::pin(async {
+            // The accepted child is itself a parent. Its durable per-tool and depth
+            // limits are inherited even when its model turn has already completed.
+            let first = crate::session::jobs::read_accepted_job(&child)
+                .await
+                .unwrap()
+                .unwrap();
+            let nested = client_registry
+                .prepare_agent_job(&id, "default", "nested")
+                .await
+                .unwrap();
+            let nested_id = nested.db.root_id().to_string();
+            client_registry.publish_agent_job(nested).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while crate::session::jobs::read_accepted_job(
+                    &client_registry.open_session(&nested_id).await.unwrap().1,
+                )
+                .await
+                .unwrap()
+                .is_none()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("nested published child must be accepted");
+            let (_, nested_db) = client_registry.open_session(&nested_id).await.unwrap();
+            let second = crate::session::jobs::read_accepted_job(&nested_db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                second.definition.call_depth,
+                first.definition.call_depth + 1
+            );
+            assert_eq!(
+                second.definition.tool_ceilings,
+                first.definition.tool_ceilings
+            );
+            assert_eq!(
+                second.definition.capability_ceiling,
+                first.definition.capability_ceiling
+            );
+            assert_eq!(
+                second.definition.max_call_depth,
+                first.definition.max_call_depth
+            );
+            assert_eq!(second.definition.allowed_tools, vec!["calculate"]);
+            assert_eq!(
+                second.definition.tool_ceilings["calculate"]
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .allow,
+                crate::grants::Allowlist::Only(vec![])
+            );
+            for server in &executors {
+                assert!(
+                    server
+                        .validate_accepted_job(&nested_db)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            let over_depth = client_registry
+                .prepare_agent_job(&nested_id, "default", "third")
+                .await
+                .unwrap();
+            let over_depth_id = over_depth.db.root_id().to_string();
+            client_registry.publish_agent_job(over_depth).await.unwrap();
+            let forged = client_registry
+                .prepare_agent_job(&parent_id.0, "default", "one task")
+                .await
+                .unwrap();
+            let forged_id = forged.db.root_id().to_string();
+            let mut forged_session =
+                Session::new(ConversationId(forged_id.clone()), forged.db.clone()).await;
+            forged_session
+                .add_entry(SessionEntry {
+                    sender: "client".into(),
+                    content: "second directive".into(),
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Directive,
+                    metadata: None,
+                    routing: None,
+                })
+                .await
+                .unwrap();
+            client_registry.publish_agent_job(forged).await.unwrap();
+            let (narrow_id, narrow_parent) =
+                client_registry.create_session(Some("cli")).await.unwrap();
+            client_registry
+                .attach_agent_to_session(&narrow_id.0, &agent)
+                .await
+                .unwrap();
+            Session::new(narrow_id.clone(), narrow_parent)
+                .await
+                .update_meta(|meta| {
+                    meta.capabilities.shell = Some(crate::grants::ShellGrant {
+                        allow: crate::grants::Allowlist::Only(vec![]),
+                        ..Default::default()
+                    });
+                })
+                .await
+                .unwrap();
+            let narrow = client_registry
+                .prepare_agent_job(&narrow_id.0, "default", "narrow")
+                .await
+                .unwrap();
+            let narrow_job_id = narrow.db.root_id().to_string();
+            client_registry.publish_agent_job(narrow).await.unwrap();
+            let forged_parent = client_registry
+                .prepare_agent_job(&parent_id.0, "default", "linked")
+                .await
+                .unwrap();
+            let forged_parent_id = forged_parent.db.root_id().to_string();
+            let txn = forged_parent.db.new_transaction().await.unwrap();
+            txn.get_store::<eidetica::store::DocStore>("job_request")
+                .await
+                .unwrap()
+                .set_string(
+                    "v1",
+                    serde_json::to_string(&crate::session::JobRequest {
+                        parent_id: narrow_id.0.clone(),
+                        target: "default".into(),
+                        task: "linked".into(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            client_registry
+                .publish_agent_job(forged_parent)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while !matches!(
+                    client_server.job_status(&forged_id).await.unwrap().state,
+                    crate::session::jobs::JobState::Rejected { .. }
+                ) || !matches!(
+                    client_server
+                        .job_status(&narrow_job_id)
+                        .await
+                        .unwrap()
+                        .state,
+                    crate::session::jobs::JobState::Rejected { .. }
+                ) || !matches!(
+                    client_server
+                        .job_status(&forged_parent_id)
+                        .await
+                        .unwrap()
+                        .state,
+                    crate::session::jobs::JobState::Rejected { .. }
+                ) || !matches!(
+                    client_server
+                        .job_status(&over_depth_id)
+                        .await
+                        .unwrap()
+                        .state,
+                    crate::session::jobs::JobState::Rejected { .. }
+                ) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("invalid and narrow published jobs must be rejected");
+            for rejected_id in [
+                &forged_id,
+                &narrow_job_id,
+                &forged_parent_id,
+                &over_depth_id,
+            ] {
+                let (_, db) = client_registry.open_session(rejected_id).await.unwrap();
+                assert!(
+                    crate::session::jobs::read_accepted_job(&db)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!executors[0].is_watching_session(rejected_id).await);
+                assert!(!executors[1].is_watching_session(rejected_id).await);
+            }
+            for server in &executors {
+                server.shutdown().await;
+            }
+            let restarted = published_executor(&settings, agents.clone(), agent.clone()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while !restarted.is_watching_session(&id).await
+                    || !restarted.is_watching_session(&nested_id).await
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("restart must re-adopt both published handles");
+            assert!(
+                restarted
+                    .validate_accepted_job(&child)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                restarted
+                    .validate_accepted_job(&nested_db)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                client_registry
+                    .list_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with("job-stage:")))
+                    .count(),
+                6
+            );
+            let changed = Session::new(ConversationId(nested_id.clone()), nested_db.clone()).await;
+            changed
+                .update_meta(|meta| meta.agents[0].home_pubkey = Some("forged-home".into()))
+                .await
+                .unwrap();
+            assert!(restarted.validate_accepted_job(&nested_db).await.is_err());
+            changed
+                .update_meta(|meta| meta.agents[0].home_pubkey = Some(agent.pubkey.to_string()))
+                .await
+                .unwrap();
+            assert!(
+                restarted
+                    .validate_accepted_job(&nested_db)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            restarted.shutdown().await;
+        })
+        .await;
+        for server in executors {
+            server.shutdown().await;
+        }
+        client_server.shutdown().await;
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    })
+    .await;
 }

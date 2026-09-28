@@ -5,6 +5,7 @@
 
 use super::Server;
 use crate::grants::Grants;
+use crate::session::JobRequest;
 use crate::session::jobs::{AcceptedAgentJob, StagedAgentDefinition, read_accepted_job};
 use crate::session::{EntryType, Session, SessionCommand, SessionCommandOutcome, TurnRequestId};
 use crate::tool::ScopedTools;
@@ -44,6 +45,73 @@ impl Server {
             !agent_ref.is_empty() && !task.is_empty(),
             "agent and task required"
         );
+        let (_, parent_db) = self.registry.open_session(parent_id).await?;
+        let parent = Session::new(ConversationId(parent_id.to_string()), parent_db).await;
+        let request = parent
+            .command_requests(&Default::default())
+            .await?
+            .into_iter()
+            .find(|work| work.request.command_id == *command_id)
+            .ok_or_else(|| anyhow::anyhow!("missing parent command"))?;
+        anyhow::ensure!(
+            matches!(request.request.command, SessionCommand::SubmitAgent { agent_ref: ref a, task: ref t } if a == agent_ref && t == task),
+            "parent command does not match job request"
+        );
+        let (definition, parent_name, target) = self
+            .derive_job_definition(parent_id, agent_ref, task, true)
+            .await?;
+        let target_name = target.display_name.clone();
+        let ceiling = definition.capability_ceiling.clone();
+        let staged = self
+            .registry
+            .stage_agent_job(parent_id, command_id.as_str(), definition.clone())
+            .await?;
+        let (_, child_db) = self.registry.open_session(&staged.session_db_id).await?;
+        let existing = read_accepted_job(&child_db).await?;
+        if existing.is_none() {
+            self.registry
+                .attach_agent_to_session(&staged.session_db_id, &target)
+                .await?;
+            let child = Session::new(
+                ConversationId(staged.session_db_id.clone()),
+                child_db.clone(),
+            )
+            .await;
+            child
+                .update_meta(|meta| meta.capabilities = ceiling)
+                .await?;
+            anyhow::ensure!(
+                self.peer_is_home_for(&staged.session_db_id, &target_name)
+                    .await,
+                "target Agent is hosted on another peer"
+            );
+        }
+        let accepted = self
+            .registry
+            .accept_staged_agent_job(
+                &staged,
+                parent_id,
+                command_id.as_str(),
+                &definition,
+                &parent_name,
+            )
+            .await?;
+        anyhow::ensure!(
+            !accepted.directive_id.is_empty(),
+            "job acceptance missing Directive identity"
+        );
+        Ok(staged.session_db_id)
+    }
+
+    /// One derivation for both legacy command admission and submitter-owned
+    /// child validation. Only the executor may call this with trusted runtime.
+    async fn derive_job_definition(
+        &self,
+        parent_id: &str,
+        agent_ref: &str,
+        task: &str,
+        require_runtime: bool,
+    ) -> anyhow::Result<(StagedAgentDefinition, String, crate::hosted_index::DbEntry)> {
         let parent_row = self
             .registry
             .list_sessions()
@@ -64,34 +132,32 @@ impl Server {
             .as_deref()
             .is_some_and(|s| s.starts_with("job-stage:"))
         {
-            let accepted = Box::pin(self.validate_accepted_job(&parent_db))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("job parent is not accepted"))?;
-            let live = self.live_attempts.lock().await.clone();
-            anyhow::ensure!(
-                matches!(
-                    crate::session::jobs::status_from_db(&parent_db, &live, true)
-                        .await?
-                        .state,
-                    crate::session::jobs::JobState::Running { .. }
-                ) && crate::session::jobs::owns_job(&parent_db, &self.job_incarnation).await?,
-                "job parent has no active claimed attempt"
-            );
+            let accepted = if require_runtime {
+                Box::pin(self.validate_accepted_job(&parent_db))
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("job parent is not accepted"))?
+            } else {
+                read_accepted_job(&parent_db)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("job parent is not accepted"))?
+            };
+            if require_runtime {
+                let live = self.live_attempts.lock().await.clone();
+                anyhow::ensure!(
+                    matches!(
+                        crate::session::jobs::status_from_db(&parent_db, &live, true)
+                            .await?
+                            .state,
+                        crate::session::jobs::JobState::Running { .. }
+                    ) && crate::session::jobs::owns_job(&parent_db, &self.job_incarnation).await?,
+                    "job parent has no active claimed attempt"
+                );
+            }
             Some(accepted.definition)
         } else {
             None
         };
         let parent = Session::new(ConversationId(parent_id.to_string()), parent_db.clone()).await;
-        let request = parent
-            .command_requests(&Default::default())
-            .await?
-            .into_iter()
-            .find(|work| work.request.command_id == *command_id)
-            .ok_or_else(|| anyhow::anyhow!("missing parent command"))?;
-        anyhow::ensure!(
-            matches!(request.request.command, SessionCommand::SubmitAgent { agent_ref: ref requested_agent, task: ref requested_task } if requested_agent == agent_ref && requested_task == task),
-            "parent command does not match job request"
-        );
         let meta = parent.read_meta().await;
         anyhow::ensure!(
             meta.agents.len() == 1
@@ -116,21 +182,22 @@ impl Server {
                 ),
             "narrow or malformed parent scope is not supported by local broad jobs"
         );
-        let runtime = self.sessions.lock().await;
-        let registered = runtime
-            .get(parent_id)
-            .ok_or_else(|| anyhow::anyhow!("parent session is not registered with executor"))?;
-        anyhow::ensure!(
-            inherited.as_ref().map_or(
-                registered.parent_tools.is_none() && registered.call_depth == 0,
-                |authority| registered.parent_tools.is_some()
-                    && registered.call_depth == authority.call_depth
-                    && registered.max_call_depth == authority.max_call_depth
-            ),
-            "parent runtime does not match its durable authority"
-        );
-        drop(runtime);
-
+        if require_runtime {
+            let runtime = self.sessions.lock().await;
+            let registered = runtime
+                .get(parent_id)
+                .ok_or_else(|| anyhow::anyhow!("parent session is not registered with executor"))?;
+            anyhow::ensure!(
+                inherited.as_ref().map_or(
+                    registered.parent_tools.is_none() && registered.call_depth == 0,
+                    |authority| registered.parent_tools.is_some()
+                        && registered.call_depth == authority.call_depth
+                        && registered.max_call_depth == authority.max_call_depth
+                ),
+                "parent runtime does not match its durable authority"
+            );
+            drop(runtime);
+        }
         let target = self
             .agent_index
             .find_by_name(agent_ref)
@@ -197,45 +264,204 @@ impl Server {
             definition.call_depth <= definition.max_call_depth && definition.call_depth <= 128,
             "spawn depth exceeds Agent ceiling"
         );
-        let staged = self
-            .registry
-            .stage_agent_job(parent_id, command_id.as_str(), definition.clone())
+        Ok((definition, parent_name.to_string(), target))
+    }
+
+    /// Prewritten requests are data, not execution authority. A malformed
+    /// published child is rejected; unavailable parent/Agent state retries.
+    async fn inspect_published_job(
+        &self,
+        db: &eidetica::Database,
+    ) -> anyhow::Result<(JobRequest, String)> {
+        let id = db.root_id().to_string();
+        let label = format!("job-stage:submitter:{id}");
+        let txn = self.registry.chaz_group().new_transaction().await?;
+        let routing = txn
+            .get_store::<DocStore>("sessions")
+            .await?
+            .get_all()
             .await?;
-        let (_, child_db) = self.registry.open_session(&staged.session_db_id).await?;
-        let existing = read_accepted_job(&child_db).await?;
-        if existing.is_none() {
-            self.registry
-                .attach_agent_to_session(&staged.session_db_id, &target)
-                .await?;
-            let child = Session::new(
-                ConversationId(staged.session_db_id.clone()),
-                child_db.clone(),
-            )
-            .await;
-            child
-                .update_meta(|meta| meta.capabilities = ceiling)
-                .await?;
+        let catalog = txn
+            .get_store::<DocStore>("session_catalog")
+            .await?
+            .get_all()
+            .await?;
+        let route: Option<String> = routing.get(&id).map(|value| value.try_into()).transpose()?;
+        let catalog_json: Option<String> =
+            catalog.get(&id).map(|value| value.try_into()).transpose()?;
+        let entry: Option<crate::session::SessionCatalogEntry> = catalog_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("invalid published job: catalog: {error}"))?;
+        anyhow::ensure!(
+            route.as_deref() == Some(label.as_str())
+                && entry.is_some_and(|row| row.session_db_id == id
+                    && row.source.as_deref() == Some(label.as_str())
+                    && row.status == crate::session::SessionStatus::Active),
+            "invalid published job: catalog differs"
+        );
+        let txn = db.new_transaction().await?;
+        let marker = txn.get_store::<DocStore>("meta").await?.get_all().await?;
+        let kind: Option<String> = marker.get("kind").map(|v| v.try_into()).transpose()?;
+        let name: Option<String> = marker
+            .get("display_name")
+            .map(|v| v.try_into())
+            .transpose()?;
+        anyhow::ensure!(
+            kind.as_deref() == Some(crate::db_kind::KIND_SESSION)
+                && name.as_deref() == Some(label.as_str()),
+            "invalid published job: marker differs"
+        );
+        let request = crate::session::SessionRegistry::read_job_request(db).await?;
+        anyhow::ensure!(
+            !request.parent_id.is_empty()
+                && !request.target.is_empty()
+                && !request.task.is_empty()
+                && request.parent_id != id,
+            "invalid published job: empty request or self-parent"
+        );
+        let root = ID::parse(&request.parent_id)
+            .map_err(|error| anyhow::anyhow!("invalid published job: parent ID: {error}"))?;
+        let settings = db
+            .get_settings()
+            .await?
+            .get_auth_doc_for_validation()
+            .await?;
+        let key = format!("delegations.{root}");
+        let delegation = match settings.get(&key) {
+            Some(eidetica::crdt::doc::Value::Doc(doc)) => {
+                eidetica::auth::types::DelegatedTreeRef::try_from(doc).map_err(|error| {
+                    anyhow::anyhow!("invalid published job: delegation: {error}")
+                })?
+            }
+            _ => anyhow::bail!("invalid published job: no parent delegation"),
+        };
+        anyhow::ensure!(
+            delegation.tree.root == root
+                && delegation.permission_bounds.max == eidetica::auth::types::Permission::Admin(0)
+                && delegation.permission_bounds.min.is_none(),
+            "invalid published job: parent delegation differs"
+        );
+        let child = Session::new(ConversationId(id), db.clone()).await;
+        let mut entries = child.entries_with_ids();
+        let (directive_id, first) = entries
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid published job: missing Directive"))?;
+        let remaining = entries.collect::<Vec<_>>();
+        anyhow::ensure!(
+            first.entry_type == EntryType::Directive
+                && first.content == request.task
+                && first.sender == "submitter"
+                && (read_accepted_job(db).await?.is_some() || remaining.is_empty())
+                && !remaining
+                    .iter()
+                    .any(|(_, entry)| entry.entry_type == EntryType::Directive
+                        || (entry.entry_type == EntryType::Message
+                            && entry.sender != request.target)),
+            "invalid published job: altered or multiple Directives"
+        );
+        Ok((request, directive_id.as_str().to_string()))
+    }
+
+    /// Complete the parent's admission check before deriving a nested child's
+    /// authority, rather than nesting two large validators on one poll stack.
+    async fn validate_job_parent(&self, parent_id: &str) -> anyhow::Result<()> {
+        let (_, parent_db) = self.registry.open_session(parent_id).await?;
+        let parent_is_job = self.registry.list_sessions().await?.iter().any(|row| {
+            row.session_db_id == parent_id
+                && row
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("job-stage:"))
+        });
+        if parent_is_job {
             anyhow::ensure!(
-                self.peer_is_home_for(&staged.session_db_id, &target_name)
-                    .await,
-                "target Agent is hosted on another peer"
+                self.validate_accepted_job(&parent_db).await?.is_some(),
+                "job parent is not accepted"
             );
         }
-        let accepted = self
-            .registry
-            .accept_staged_agent_job(
-                &staged,
-                parent_id,
-                command_id.as_str(),
-                &definition,
-                parent_name,
-            )
+        Ok(())
+    }
+
+    async fn accept_published_job(&self, db: &eidetica::Database) -> anyhow::Result<()> {
+        anyhow::ensure!(self.executor_authorized, "client cannot admit agent jobs");
+        let (request, directive_id) = self.inspect_published_job(db).await?;
+        self.validate_job_parent(&request.parent_id).await?;
+        let (definition, _, target) = self
+            .derive_job_definition(&request.parent_id, &request.target, &request.task, false)
+            .await
+            .map_err(|error| {
+                if error
+                    .to_string()
+                    .contains("narrow or malformed parent scope")
+                    || error.to_string().contains("spawn depth exceeds")
+                {
+                    anyhow::anyhow!("invalid published job: {error}")
+                } else {
+                    error
+                }
+            })?;
+        let id = db.root_id().to_string();
+        if let Some(existing) = read_accepted_job(db).await? {
+            anyhow::ensure!(
+                existing.parent_id == request.parent_id
+                    && existing.directive_id == directive_id
+                    && existing.definition == definition,
+                "invalid published job: acceptance differs"
+            );
+            return Ok(());
+        }
+        let meta = Session::new(ConversationId(id.clone()), db.clone())
+            .await
+            .read_meta()
+            .await;
+        let agents = strict_session_agents(db)
+            .await
+            .map_err(|error| anyhow::anyhow!("invalid published job: agents: {error}"))?;
+        anyhow::ensure!(
+            meta.agents == agents
+                && meta
+                    .host_agent_db_id
+                    .as_deref()
+                    .is_none_or(|home| home == target.db_id.to_string()),
+            "invalid published job: malformed Agent/home scope"
+        );
+        anyhow::ensure!(
+            (meta.agents.is_empty()
+                || (meta.agents.len() == 1
+                    && meta.agents[0].db_id == target.db_id.to_string()
+                    && meta.agents[0].display_name == target.display_name
+                    && meta.agents[0].home_pubkey.as_deref()
+                        == Some(target.pubkey.to_string().as_str())))
+                && (strict_session_capabilities(db).await? == Grants::default()
+                    || strict_session_capabilities(db).await? == definition.capability_ceiling),
+            "invalid published job: includes untrusted execution scope"
+        );
+        if meta.agents.is_empty() {
+            self.registry.attach_agent_to_session(&id, &target).await?;
+        }
+        Session::new(ConversationId(id.clone()), db.clone())
+            .await
+            .update_meta(|meta| meta.capabilities = definition.capability_ceiling.clone())
             .await?;
         anyhow::ensure!(
-            !accepted.directive_id.is_empty(),
-            "job acceptance missing Directive identity"
+            self.peer_is_home_for(&id, &target.display_name).await,
+            "target Agent is hosted on another peer"
         );
-        Ok(staged.session_db_id)
+        let accepted = AcceptedAgentJob {
+            parent_id: request.parent_id,
+            request_key_hash: String::new(),
+            definition,
+            directive_id,
+        };
+        let txn = db.new_transaction().await?;
+        txn.get_store::<DocStore>("job_acceptance")
+            .await?
+            .set_string("v1", serde_json::to_string(&accepted)?)
+            .await?;
+        txn.commit().await?;
+        Ok(())
     }
 
     /// Install a restartable child runtime only after parent-command and
@@ -244,6 +470,34 @@ impl Server {
         &self,
         child_db: &eidetica::Database,
     ) -> anyhow::Result<bool> {
+        anyhow::ensure!(self.executor_authorized, "client cannot adopt agent jobs");
+        if crate::session::jobs::read_job_rejection(child_db)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let request_store = child_db
+            .new_transaction()
+            .await?
+            .get_store::<DocStore>("job_request")
+            .await?
+            .get_all()
+            .await?;
+        let submitter_row = request_store.iter().next().is_some()
+            || crate::db_kind::read_marker(child_db)
+                .await
+                .is_some_and(|(_, marker)| marker.starts_with("job-stage:submitter:"));
+        if submitter_row
+            && read_accepted_job(child_db).await?.is_none()
+            && let Err(error) = self.accept_published_job(child_db).await
+        {
+            if error.to_string().starts_with("invalid published job:") {
+                crate::session::jobs::reject_job(child_db, &error.to_string()).await?;
+                return Ok(true);
+            }
+            return Err(error);
+        }
         let Some(accepted) = self.validate_accepted_job(child_db).await? else {
             return Ok(false);
         };
@@ -314,6 +568,336 @@ impl Server {
         Ok(true)
     }
 
+    /// Walk from child to root instead of recursively polling large service
+    /// futures: even a two-level job chain exceeds a normal test-thread stack.
+    async fn validate_published_chain(
+        &self,
+        child_db: &eidetica::Database,
+    ) -> anyhow::Result<AcceptedAgentJob> {
+        let original = read_accepted_job(child_db)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job has no acceptance"))?;
+        let mut current = child_db.clone();
+        for _ in 0..128 {
+            let accepted = read_accepted_job(&current)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("job ancestor has no acceptance"))?;
+            anyhow::ensure!(
+                (1..=128).contains(&accepted.definition.call_depth)
+                    && accepted.definition.call_depth <= accepted.definition.max_call_depth,
+                "accepted job has invalid depth"
+            );
+            let (request, directive_id) = self.inspect_published_job(&current).await?;
+            anyhow::ensure!(
+                request.parent_id == accepted.parent_id
+                    && directive_id == accepted.directive_id
+                    && accepted.request_key_hash.is_empty(),
+                "accepted job request differs"
+            );
+            let (_, parent_db) = self.registry.open_session(&request.parent_id).await?;
+            let parent_row = self
+                .registry
+                .list_sessions()
+                .await?
+                .into_iter()
+                .find(|row| row.session_db_id == request.parent_id)
+                .ok_or_else(|| anyhow::anyhow!("job ancestor parent is not indexed"))?;
+            if parent_row
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("job-stage:"))
+            {
+                let parent = read_accepted_job(&parent_db)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("job ancestor parent is not accepted"))?;
+                anyhow::ensure!(
+                    parent.definition.call_depth.checked_add(1)
+                        == Some(accepted.definition.call_depth),
+                    "accepted job parent chain has invalid depth"
+                );
+                if !parent_row
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("job-stage:submitter:"))
+                {
+                    anyhow::ensure!(
+                        self.validate_accepted_job(&parent_db).await?.is_some(),
+                        "legacy job ancestor is invalid"
+                    );
+                }
+            }
+            let (expected, _, target) = self
+                .derive_job_definition(&request.parent_id, &request.target, &request.task, false)
+                .await?;
+            anyhow::ensure!(
+                accepted.definition == expected,
+                "accepted job authority differs from parent"
+            );
+            let meta = Session::new(
+                ConversationId(current.root_id().to_string()),
+                current.clone(),
+            )
+            .await
+            .read_meta()
+            .await;
+            anyhow::ensure!(
+                meta.agents == strict_session_agents(&current).await?
+                    && meta.agents.len() == 1
+                    && meta.agents[0].db_id == target.db_id.to_string()
+                    && meta.agents[0].display_name == target.display_name
+                    && meta
+                        .host_agent_db_id
+                        .as_deref()
+                        .is_none_or(|home| home == target.db_id.to_string())
+                    && meta.agents[0].home_pubkey.as_deref()
+                        == Some(target.pubkey.to_string().as_str())
+                    && strict_session_capabilities(&current).await? == expected.capability_ceiling,
+                "accepted job Agent/home or scope differs"
+            );
+            if !parent_row
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("job-stage:submitter:"))
+            {
+                return Ok(original);
+            }
+            current = parent_db;
+        }
+        anyhow::bail!("accepted job parent chain exceeds depth limit")
+    }
+
+    /// Legacy command-owned acceptance remains on its original validation
+    /// path; keep its large async frame separate from published-chain checks.
+    async fn validate_legacy_job(
+        &self,
+        child_db: &eidetica::Database,
+        accepted: AcceptedAgentJob,
+    ) -> anyhow::Result<AcceptedAgentJob> {
+        anyhow::ensure!(
+            (1..=128).contains(&accepted.definition.call_depth)
+                && accepted.definition.call_depth <= accepted.definition.max_call_depth,
+            "accepted job has invalid delegation depth"
+        );
+        let (_, parent_db) = self.registry.open_session(&accepted.parent_id).await?;
+        let parent = Session::new(ConversationId(accepted.parent_id.clone()), parent_db).await;
+        anyhow::ensure!(
+            crate::session::jobs::acceptance_matches_staging(child_db, &accepted).await?,
+            "accepted job differs from staged definition"
+        );
+        let matching = parent
+            .command_requests(&Default::default())
+            .await?
+            .into_iter()
+            .find(|work| {
+                blake3::hash(work.request.command_id.as_str().as_bytes())
+                    .to_hex()
+                    .as_str()
+                    == accepted.request_key_hash
+            })
+            .ok_or_else(|| anyhow::anyhow!("accepted job has no matching parent request"))?;
+        anyhow::ensure!(
+            !matches!(matching.state, crate::session::TurnRequestState::Queued),
+            "accepted job parent command was never started by executor"
+        );
+        let SessionCommand::SubmitAgent { agent_ref, task } = &matching.request.command else {
+            anyhow::bail!("accepted job parent command is not SubmitAgent");
+        };
+        anyhow::ensure!(
+            task == &accepted.definition.task,
+            "accepted job task differs"
+        );
+        let target = self
+            .agent_index
+            .find_by_name(agent_ref)
+            .or_else(|| {
+                ID::parse(agent_ref)
+                    .ok()
+                    .and_then(|id| self.agent_index.find_by_id(&id))
+            })
+            .ok_or_else(|| anyhow::anyhow!("accepted target is no longer hosted"))?;
+        anyhow::ensure!(
+            target.display_name == accepted.definition.target
+                && target.pubkey.to_string() == accepted.definition.executor_pubkey,
+            "accepted job executor or target changed"
+        );
+        let meta = parent.read_meta().await;
+        anyhow::ensure!(
+            meta.agents.len() == 1
+                && meta
+                    .host_agent_db_id
+                    .as_deref()
+                    .is_none_or(|id| id == meta.agents[0].db_id),
+            "accepted job parent no longer has a single hosted Agent"
+        );
+        let parent_name = &meta.agents[0].display_name;
+        let parent_agent = self
+            .agents
+            .get(parent_name)
+            .ok_or_else(|| anyhow::anyhow!("accepted parent Agent is unavailable"))?;
+        let parent_row = self
+            .registry
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|row| row.session_db_id == accepted.parent_id)
+            .ok_or_else(|| anyhow::anyhow!("accepted parent is not indexed"))?;
+        anyhow::ensure!(
+            !parent_row
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("spawn:")),
+            "accepted parent has an ephemeral scope"
+        );
+        let inherited = if parent_row
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("job-stage:"))
+        {
+            // Check the monotonic depth *before* recursively validating. A
+            // writable DB can contain a forged parent cycle; never follow it.
+            let parent_record = read_accepted_job(parent.database())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("accepted job parent has no authority"))?;
+            anyhow::ensure!(
+                parent_record.definition.call_depth.checked_add(1)
+                    == Some(accepted.definition.call_depth),
+                "accepted job parent chain has invalid depth"
+            );
+            Some(
+                self.validate_accepted_job(parent.database())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("accepted job parent has no authority"))?
+                    .definition,
+            )
+        } else {
+            None
+        };
+        let parent_cap = strict_session_capabilities(parent.database()).await?;
+        anyhow::ensure!(
+            meta.capabilities == parent_cap
+                && inherited.as_ref().map_or(
+                    parent_cap == Grants::default(),
+                    |authority| parent_cap == authority.capability_ceiling
+                        && authority.target == *parent_name
+                ),
+            "accepted parent is not a valid broad local scope"
+        );
+        let expected_cap = parent_cap.attenuate(Some(&parent_agent.capabilities));
+        anyhow::ensure!(
+            accepted.definition.capability_ceiling == expected_cap
+                && strict_session_capabilities(child_db).await? == expected_cap,
+            "accepted job capability ceiling differs from parent"
+        );
+        let parent_active = self
+            .active_extensions_for_agent(&accepted.parent_id, parent_name)
+            .await;
+        let parent_tools = ScopedTools::new(self.tools.clone(), parent_agent.allowed_tools.clone())
+            .with_active_extensions(Some(parent_active));
+        let mut expected_tools = BTreeMap::new();
+        for name in parent_tools.permitted_names() {
+            if name == "spawn_worker"
+                || inherited
+                    .as_ref()
+                    .is_some_and(|authority| !authority.tool_ceilings.contains_key(&name))
+            {
+                continue;
+            }
+            let tool = parent_tools
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("parent tool disappeared during validation"))?;
+            let policy = self.policies.resolve(tool.as_ref());
+            expected_tools.insert(
+                name.clone(),
+                policy
+                    .grants
+                    .attenuate(Some(&parent_cap))
+                    .attenuate(Some(&parent_agent.capabilities))
+                    .attenuate(parent_agent.grants.get(&name))
+                    .attenuate(
+                        inherited
+                            .as_ref()
+                            .and_then(|authority| authority.tool_ceilings.get(&name)),
+                    ),
+            );
+        }
+        anyhow::ensure!(
+            accepted.definition.tool_ceilings == expected_tools
+                && accepted.definition.allowed_tools
+                    == expected_tools.keys().cloned().collect::<Vec<_>>(),
+            "accepted job tool authority differs from parent"
+        );
+        let target_agent = self
+            .agents
+            .get(&target.display_name)
+            .ok_or_else(|| anyhow::anyhow!("accepted target Agent runtime unavailable"))?;
+        anyhow::ensure!(
+            accepted.definition.call_depth
+                == inherited
+                    .as_ref()
+                    .map_or(1, |authority| authority.call_depth + 1)
+                && accepted.definition.max_call_depth
+                    == inherited
+                        .as_ref()
+                        .map_or(parent_agent.max_iterations as usize, |authority| authority
+                            .max_call_depth)
+                        .min(target_agent.max_iterations as usize),
+            "accepted job depth differs from parent ceiling"
+        );
+        anyhow::ensure!(
+            self.peer_is_home_for(&child_db.root_id().to_string(), &target.display_name)
+                .await,
+            "accepted job target is not home on this executor"
+        );
+        let label = format!(
+            "job-stage:{}",
+            blake3::hash(
+                format!("{}\0{}", accepted.parent_id, matching.request.command_id).as_bytes()
+            )
+            .to_hex()
+        );
+        anyhow::ensure!(
+            self.registry.list_sessions().await?.iter().any(|row| {
+                row.session_db_id == child_db.root_id().to_string()
+                    && row.source.as_deref() == Some(label.as_str())
+            }),
+            "accepted child does not match the parent request catalog entry"
+        );
+        let child = Session::new(
+            ConversationId(child_db.root_id().to_string()),
+            child_db.clone(),
+        )
+        .await;
+        let child_meta = child.read_meta().await;
+        anyhow::ensure!(
+            child_meta.agents.len() == 1
+                && child_meta.agents[0].db_id == target.db_id.to_string()
+                && child_meta.agents[0].home_pubkey.as_deref()
+                    == Some(accepted.definition.executor_pubkey.as_str()),
+            "accepted job child Agent/home identity differs"
+        );
+        let mut entries = child.entries_with_ids();
+        let only = entries
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("accepted job has no Directive"))?;
+        anyhow::ensure!(
+            only.0.as_str() == accepted.directive_id
+                && only.1.entry_type == EntryType::Directive
+                && only.1.content == accepted.definition.task,
+            "accepted job Directive differs"
+        );
+        anyhow::ensure!(
+            !entries.any(|(_, entry)| {
+                entry.entry_type == EntryType::Directive
+                    || (entry.entry_type == EntryType::Message
+                        && entry.sender != accepted.definition.target)
+            }),
+            "accepted job contains an additional runnable request"
+        );
+        // Completed attempts append Ack/Message/Error; verify only the
+        // submission prefix, not the later transcript.
+        Ok(accepted)
+    }
+
     /// Validate acceptance from the parent request as well as the child row.
     /// A child DB marker or Directive alone cannot authorize local execution.
     pub(super) fn validate_accepted_job<'a>(
@@ -326,231 +910,29 @@ impl Server {
             let Some(accepted) = read_accepted_job(child_db).await? else {
                 return Ok(None);
             };
-            anyhow::ensure!(
-                (1..=128).contains(&accepted.definition.call_depth)
-                    && accepted.definition.call_depth <= accepted.definition.max_call_depth,
-                "accepted job has invalid delegation depth"
-            );
-            let (_, parent_db) = self.registry.open_session(&accepted.parent_id).await?;
-            let parent = Session::new(ConversationId(accepted.parent_id.clone()), parent_db).await;
-            anyhow::ensure!(
-                crate::session::jobs::acceptance_matches_staging(child_db, &accepted).await?,
-                "accepted job differs from staged definition"
-            );
-            let matching = parent
-                .command_requests(&Default::default())
-                .await?
-                .into_iter()
-                .find(|work| {
-                    blake3::hash(work.request.command_id.as_str().as_bytes())
-                        .to_hex()
-                        .as_str()
-                        == accepted.request_key_hash
-                })
-                .ok_or_else(|| anyhow::anyhow!("accepted job has no matching parent request"))?;
-            anyhow::ensure!(
-                !matches!(matching.state, crate::session::TurnRequestState::Queued),
-                "accepted job parent command was never started by executor"
-            );
-            let SessionCommand::SubmitAgent { agent_ref, task } = &matching.request.command else {
-                anyhow::bail!("accepted job parent command is not SubmitAgent");
-            };
-            anyhow::ensure!(
-                task == &accepted.definition.task,
-                "accepted job task differs"
-            );
-            let target = self
-                .agent_index
-                .find_by_name(agent_ref)
-                .or_else(|| {
-                    ID::parse(agent_ref)
-                        .ok()
-                        .and_then(|id| self.agent_index.find_by_id(&id))
-                })
-                .ok_or_else(|| anyhow::anyhow!("accepted target is no longer hosted"))?;
-            anyhow::ensure!(
-                target.display_name == accepted.definition.target
-                    && target.pubkey.to_string() == accepted.definition.executor_pubkey,
-                "accepted job executor or target changed"
-            );
-            let meta = parent.read_meta().await;
-            anyhow::ensure!(
-                meta.agents.len() == 1
-                    && meta
-                        .host_agent_db_id
-                        .as_deref()
-                        .is_none_or(|id| id == meta.agents[0].db_id),
-                "accepted job parent no longer has a single hosted Agent"
-            );
-            let parent_name = &meta.agents[0].display_name;
-            let parent_agent = self
-                .agents
-                .get(parent_name)
-                .ok_or_else(|| anyhow::anyhow!("accepted parent Agent is unavailable"))?;
-            let parent_row = self
-                .registry
-                .list_sessions()
-                .await?
-                .into_iter()
-                .find(|row| row.session_db_id == accepted.parent_id)
-                .ok_or_else(|| anyhow::anyhow!("accepted parent is not indexed"))?;
-            anyhow::ensure!(
-                !parent_row
-                    .source
-                    .as_deref()
-                    .is_some_and(|s| s.starts_with("spawn:")),
-                "accepted parent has an ephemeral scope"
-            );
-            let inherited = if parent_row
-                .source
-                .as_deref()
-                .is_some_and(|s| s.starts_with("job-stage:"))
-            {
-                // Check the monotonic depth *before* recursively validating. A
-                // writable DB can contain a forged parent cycle; never follow it.
-                let parent_record = read_accepted_job(parent.database())
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("accepted job parent has no authority"))?;
-                anyhow::ensure!(
-                    parent_record.definition.call_depth.checked_add(1)
-                        == Some(accepted.definition.call_depth),
-                    "accepted job parent chain has invalid depth"
-                );
-                Some(
-                    self.validate_accepted_job(parent.database())
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("accepted job parent has no authority"))?
-                        .definition,
-                )
-            } else {
-                None
-            };
-            let parent_cap = strict_session_capabilities(parent.database()).await?;
-            anyhow::ensure!(
-                meta.capabilities == parent_cap
-                    && inherited
-                        .as_ref()
-                        .map_or(parent_cap == Grants::default(), |authority| parent_cap
-                            == authority.capability_ceiling
-                            && authority.target == *parent_name),
-                "accepted parent is not a valid broad local scope"
-            );
-            let expected_cap = parent_cap.attenuate(Some(&parent_agent.capabilities));
-            anyhow::ensure!(
-                accepted.definition.capability_ceiling == expected_cap
-                    && strict_session_capabilities(child_db).await? == expected_cap,
-                "accepted job capability ceiling differs from parent"
-            );
-            let parent_active = self
-                .active_extensions_for_agent(&accepted.parent_id, parent_name)
-                .await;
-            let parent_tools =
-                ScopedTools::new(self.tools.clone(), parent_agent.allowed_tools.clone())
-                    .with_active_extensions(Some(parent_active));
-            let mut expected_tools = BTreeMap::new();
-            for name in parent_tools.permitted_names() {
-                if name == "spawn_worker"
-                    || inherited
-                        .as_ref()
-                        .is_some_and(|authority| !authority.tool_ceilings.contains_key(&name))
-                {
-                    continue;
-                }
-                let tool = parent_tools
-                    .get(&name)
-                    .ok_or_else(|| anyhow::anyhow!("parent tool disappeared during validation"))?;
-                let policy = self.policies.resolve(tool.as_ref());
-                expected_tools.insert(
-                    name.clone(),
-                    policy
-                        .grants
-                        .attenuate(Some(&parent_cap))
-                        .attenuate(Some(&parent_agent.capabilities))
-                        .attenuate(parent_agent.grants.get(&name))
-                        .attenuate(
-                            inherited
-                                .as_ref()
-                                .and_then(|authority| authority.tool_ceilings.get(&name)),
-                        ),
-                );
+            if accepted.request_key_hash.is_empty() {
+                return Box::pin(self.validate_published_chain(child_db))
+                    .await
+                    .map(Some);
             }
-            anyhow::ensure!(
-                accepted.definition.tool_ceilings == expected_tools
-                    && accepted.definition.allowed_tools
-                        == expected_tools.keys().cloned().collect::<Vec<_>>(),
-                "accepted job tool authority differs from parent"
-            );
-            let target_agent = self
-                .agents
-                .get(&target.display_name)
-                .ok_or_else(|| anyhow::anyhow!("accepted target Agent runtime unavailable"))?;
-            anyhow::ensure!(
-                accepted.definition.call_depth
-                    == inherited
-                        .as_ref()
-                        .map_or(1, |authority| authority.call_depth + 1)
-                    && accepted.definition.max_call_depth
-                        == inherited
-                            .as_ref()
-                            .map_or(parent_agent.max_iterations as usize, |authority| authority
-                                .max_call_depth)
-                            .min(target_agent.max_iterations as usize),
-                "accepted job depth differs from parent ceiling"
-            );
-            anyhow::ensure!(
-                self.peer_is_home_for(&child_db.root_id().to_string(), &target.display_name)
-                    .await,
-                "accepted job target is not home on this executor"
-            );
-            let label = format!(
-                "job-stage:{}",
-                blake3::hash(
-                    format!("{}\0{}", accepted.parent_id, matching.request.command_id).as_bytes()
-                )
-                .to_hex()
-            );
-            anyhow::ensure!(
-                self.registry.list_sessions().await?.iter().any(|row| {
-                    row.session_db_id == child_db.root_id().to_string()
-                        && row.source.as_deref() == Some(label.as_str())
-                }),
-                "accepted child does not match the parent request catalog entry"
-            );
-            let child = Session::new(
-                ConversationId(child_db.root_id().to_string()),
-                child_db.clone(),
-            )
-            .await;
-            let child_meta = child.read_meta().await;
-            anyhow::ensure!(
-                child_meta.agents.len() == 1
-                    && child_meta.agents[0].db_id == target.db_id.to_string()
-                    && child_meta.agents[0].home_pubkey.as_deref()
-                        == Some(accepted.definition.executor_pubkey.as_str()),
-                "accepted job child Agent/home identity differs"
-            );
-            let mut entries = child.entries_with_ids();
-            let only = entries
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("accepted job has no Directive"))?;
-            anyhow::ensure!(
-                only.0.as_str() == accepted.directive_id
-                    && only.1.entry_type == EntryType::Directive
-                    && only.1.content == accepted.definition.task,
-                "accepted job Directive differs"
-            );
-            anyhow::ensure!(
-                !entries.any(|(_, entry)| {
-                    entry.entry_type == EntryType::Directive
-                        || (entry.entry_type == EntryType::Message
-                            && entry.sender != accepted.definition.target)
-                }),
-                "accepted job contains an additional runnable request"
-            );
-            // Completed attempts append Ack/Message/Error; verify only the
-            // submission prefix, not the later transcript.
-            Ok(Some(accepted))
+            Ok(Some(
+                Box::pin(self.validate_legacy_job(child_db, accepted)).await?,
+            ))
         })
+    }
+}
+
+async fn strict_session_agents(
+    db: &eidetica::Database,
+) -> anyhow::Result<Vec<crate::session::AgentRef>> {
+    let txn = db.new_transaction().await?;
+    let doc = txn.get_store::<DocStore>("meta").await?.get_all().await?;
+    match doc.get("agents") {
+        None => Ok(Vec::new()),
+        Some(value) => {
+            let json: String = value.try_into()?;
+            Ok(serde_json::from_str(&json)?)
+        }
     }
 }
 

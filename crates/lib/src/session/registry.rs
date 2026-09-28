@@ -83,21 +83,19 @@ pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// per-session metadata (bridge, created_at, status) as JSON.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 
-#[allow(dead_code)] // Stage 1 remains private until executor admission migrates.
 const JOB_REQUEST_STORE: &str = "job_request";
 
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-struct JobRequest {
-    parent_id: String,
-    target: String,
-    task: String,
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct JobRequest {
+    pub parent_id: String,
+    pub target: String,
+    pub task: String,
 }
 
 /// Only this completed setup handle can publish the child to the catalog.
 #[allow(dead_code)]
-struct PreparedAgentJob {
-    db: Database,
+pub(crate) struct PreparedAgentJob {
+    pub(crate) db: Database,
     source: String,
 }
 
@@ -225,7 +223,7 @@ impl SessionRegistry {
     /// Prepare a delegated child without adding it to either discoverable index.
     /// This is deliberately private until executor-side validation is migrated.
     #[allow(dead_code)]
-    async fn prepare_agent_job(
+    pub(crate) async fn prepare_agent_job(
         &self,
         parent_id: &str,
         target: &str,
@@ -289,9 +287,30 @@ impl SessionRegistry {
         Ok(PreparedAgentJob { db, source })
     }
 
+    /// Read the request as untrusted data. Admission checks the catalog, parent,
+    /// delegation and the one prewritten Directive before using its fields.
+    pub(crate) async fn read_job_request(db: &Database) -> anyhow::Result<JobRequest> {
+        let txn = db.new_transaction().await?;
+        let doc = txn
+            .get_store::<DocStore>(JOB_REQUEST_STORE)
+            .await?
+            .get_all()
+            .await?;
+        anyhow::ensure!(
+            doc.len() == 1,
+            "invalid published job: requires exactly one request record"
+        );
+        let json: String = doc
+            .get("v1")
+            .ok_or_else(|| anyhow::anyhow!("invalid published job: request is missing"))?
+            .try_into()?;
+        serde_json::from_str(&json)
+            .map_err(|error| anyhow::anyhow!("invalid published job: malformed request: {error}"))
+    }
+
     /// Publish only a fully prepared handle to both existing catalog stores.
     #[allow(dead_code)]
-    async fn publish_agent_job(
+    pub(crate) async fn publish_agent_job(
         &self,
         prepared: PreparedAgentJob,
     ) -> anyhow::Result<ConversationId> {
