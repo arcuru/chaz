@@ -6110,17 +6110,33 @@ async fn resident_executor_does_not_adopt_client_staged_job_with_spoofed_directi
         slot.set(inline_executor.clone());
         let tool = crate::tools::SpawnAgent { server: slot };
         inline_mock.push_text("inline finished");
-        let input = serde_json::json!({ "agent_ref": "default", "task": "from model tool" });
-        let first = tool.execute(input.clone(), &ctx).await.unwrap();
-        let second = tool.execute(input, &ctx).await.unwrap();
+        let input = serde_json::json!({
+            "agent_ref": "default", "task": "from model tool", "context": "tool context"
+        });
+        let first = tool.execute(input, &ctx).await.unwrap();
         assert_eq!(
-            first, second,
-            "same parent turn and call site must return one job"
+            serde_json::from_str::<serde_json::Value>(&first).unwrap()["state"],
+            "pending"
         );
         let handle = serde_json::from_str::<serde_json::Value>(&first).unwrap()["session_db_id"]
             .as_str()
             .unwrap()
             .to_string();
+        let (_, submitted) = inline_executor
+            .registry()
+            .open_session(&handle)
+            .await
+            .unwrap();
+        let submitted = Session::new(ConversationId(handle.clone()), submitted).await;
+        let directive = submitted
+            .entries()
+            .iter()
+            .find(|entry| entry.entry_type == EntryType::Directive)
+            .unwrap();
+        assert_eq!(
+            directive.content,
+            "from model tool\n\nContext: tool context"
+        );
         let status = inline_executor
             .wait_job(&handle, std::time::Duration::from_secs(10))
             .await
@@ -6363,6 +6379,16 @@ async fn published_executor(
     agents: Arc<AgentRegistry>,
     agent: DbEntry,
 ) -> Arc<Server> {
+    published_executor_with_mock(settings, agents, agent)
+        .await
+        .0
+}
+
+async fn published_executor_with_mock(
+    settings: &crate::config::EideticaConfig,
+    agents: Arc<AgentRegistry>,
+    agent: DbEntry,
+) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
     let connection =
         crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
             .await
@@ -6377,12 +6403,12 @@ async fn published_executor(
     let mock = Arc::new(crate::test_support::MockBackend::new());
     mock.push_text("finished");
     let backend = crate::backends::BackendManager::with_mock(
-        mock,
+        mock.clone(),
         crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
     );
     let tools = Arc::new(ToolRegistry::new());
     tools.register(crate::tools::Calculate);
-    Server::new(
+    let server = Server::new(
         registry,
         agents.clone(),
         index,
@@ -6404,7 +6430,8 @@ async fn published_executor(
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
-    )
+    );
+    (server, mock)
 }
 
 // The published DB ID is the handle; neither watcher creates a replacement.
@@ -6815,4 +6842,193 @@ async fn published_job_is_adopted_without_creating_another_child() {
         task.await.unwrap().unwrap();
     })
     .await;
+}
+
+#[tokio::test]
+async fn client_submission_publishes_one_child_then_executor_runs_it() {
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("client-submit.sock");
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("submitter"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "submitter".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+        .await
+        .unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .attach_agent_to_session(&parent_id.0, &agent)
+        .await
+        .unwrap();
+    let client = client_server_fixture_from_registry(registry.clone()).await;
+    assert!(!client.is_executor_authorized());
+    // Discard the reply as if the caller lost the publication acknowledgement.
+    client
+        .submit_agent_job(&parent_id.0, "default", "one task")
+        .await
+        .unwrap();
+    let jobs: Vec<_> = registry
+        .list_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| {
+            row.source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("job-stage:"))
+        })
+        .collect();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "inspection must recover the sole published handle"
+    );
+    let id = &jobs[0].session_db_id;
+    assert_eq!(
+        client.job_status(id).await.unwrap().state,
+        crate::session::jobs::JobState::Pending
+    );
+    let (_, child) = registry.open_session(id).await.unwrap();
+    assert_eq!(
+        Session::new(ConversationId(id.clone()), child.clone())
+            .await
+            .entries()
+            .iter()
+            .filter(|entry| entry.entry_type == EntryType::Directive)
+            .count(),
+        1
+    );
+    assert!(client.register_accepted_job(&child).await.is_err());
+    assert!(!client.is_watching_session(id).await);
+
+    let agent_for_narrow = agent.clone();
+    let (executor, mock) = published_executor_with_mock(&settings, agents, agent).await;
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client.wait_job(id, std::time::Duration::from_secs(14)),
+    )
+    .await
+    .expect("executor should run the prewritten Directive")
+    .unwrap();
+    assert_eq!(
+        finished.state,
+        crate::session::jobs::JobState::Succeeded {
+            text: Some("finished".into())
+        }
+    );
+    assert_eq!(client.job_status(id).await.unwrap(), finished);
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "one mock model execution, none on client"
+    );
+    assert_eq!(
+        registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("job-stage:")))
+            .count(),
+        1
+    );
+    assert_eq!(
+        Session::new(ConversationId(id.clone()), child)
+            .await
+            .entries()
+            .iter()
+            .filter(|entry| entry.entry_type == EntryType::Directive)
+            .count(),
+        1
+    );
+    let invalid = client
+        .submit_agent_job(&parent_id.0, "not-hosted", "invalid")
+        .await
+        .unwrap();
+    let (narrow_id, narrow_db) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .attach_agent_to_session(&narrow_id.0, &agent_for_narrow)
+        .await
+        .unwrap();
+    Session::new(narrow_id.clone(), narrow_db)
+        .await
+        .update_meta(|meta| {
+            meta.capabilities.shell = Some(crate::grants::ShellGrant {
+                allow: crate::grants::Allowlist::Only(vec![]),
+                ..Default::default()
+            });
+        })
+        .await
+        .unwrap();
+    let narrow = client
+        .submit_agent_job(&narrow_id.0, "default", "narrow")
+        .await
+        .unwrap();
+    for rejected in [&invalid, &narrow] {
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.wait_job(rejected, std::time::Duration::from_secs(14)),
+        )
+        .await
+        .expect("executor must reject invalid request")
+        .unwrap();
+        assert!(
+            matches!(
+                status.state,
+                crate::session::jobs::JobState::Rejected { .. }
+            ),
+            "{status:?}"
+        );
+    }
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "rejected children cannot execute"
+    );
+    executor.shutdown().await;
+    client.shutdown().await;
+    drop(shutdown);
+    task.await.unwrap().unwrap();
 }

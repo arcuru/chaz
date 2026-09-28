@@ -218,11 +218,9 @@ impl SessionRegistry {
 
     // -------------------------------------------------------------------------
     // Session creation & opening
-    // Unindexed job setup and publication (private until admission migrates).
+    // Unindexed job setup and publication.
 
     /// Prepare a delegated child without adding it to either discoverable index.
-    /// This is deliberately private until executor-side validation is migrated.
-    #[allow(dead_code)]
     pub(crate) async fn prepare_agent_job(
         &self,
         parent_id: &str,
@@ -309,7 +307,6 @@ impl SessionRegistry {
     }
 
     /// Publish only a fully prepared handle to both existing catalog stores.
-    #[allow(dead_code)]
     pub(crate) async fn publish_agent_job(
         &self,
         prepared: PreparedAgentJob,

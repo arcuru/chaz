@@ -1,12 +1,10 @@
-use crate::session::TurnRequestId;
 use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 
-/// Submit a one-shot job for another Agent hosted by this executor peer.
-/// The parent turn and model-call site form a stable submission key; the
-/// child session DB ID is returned after durable acceptance, not completion.
+/// Submit a one-shot job to the watched catalog. The executor validates
+/// and accepts the child later; the returned DB ID is the handle.
 pub struct SpawnAgent {
     pub server: crate::instance::ServerSlot,
 }
@@ -95,33 +93,21 @@ impl Tool for SpawnAgent {
                 .turn_request_id
                 .as_ref()
                 .ok_or_else(|| "spawn_agent needs a persisted parent turn".to_string())?;
-            let call_key = ctx
-                .tool_call_key
-                .as_deref()
-                .ok_or_else(|| "spawn_agent needs a stable model tool-call key".to_string())?;
-            let (parent_id, created_at) = {
+            let parent_id = {
                 let session = ctx.session.lock().await;
-                let (_, entry) = session
+                session
                     .entries_with_ids()
                     .find(|(id, _)| *id == turn_id)
                     .ok_or_else(|| "parent turn is not persisted".to_string())?;
-                (session.database().root_id().to_string(), entry.timestamp)
+                session.database().root_id().to_string()
             };
-            let command_id = TurnRequestId::parse(format!("job:{turn_id}:{call_key}"));
             let session_db_id = server
-                .submit_agent_job_inline(
-                    &parent_id,
-                    command_id,
-                    &ctx.agent_name,
-                    created_at,
-                    agent_ref,
-                    &directive,
-                )
+                .submit_agent_job(&parent_id, agent_ref, &directive)
                 .await
                 .map_err(|error| format!("Job submission failed: {error}"))?;
             Ok(serde_json::json!({
                 "session_db_id": session_db_id,
-                "state": "accepted"
+                "state": "pending"
             })
             .to_string())
         })

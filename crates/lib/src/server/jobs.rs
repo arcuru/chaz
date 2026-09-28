@@ -396,6 +396,9 @@ impl Server {
                     .to_string()
                     .contains("narrow or malformed parent scope")
                     || error.to_string().contains("spawn depth exceeds")
+                    || error
+                        .to_string()
+                        .contains("target Agent not hosted on executor")
                 {
                     anyhow::anyhow!("invalid published job: {error}")
                 } else {
@@ -1027,6 +1030,29 @@ impl Server {
 }
 
 impl Server {
+    /// Publish a delegated child to the watched catalog without executing it.
+    /// An uncertain publication is not safe to retry: inspect the catalog first.
+    pub async fn submit_agent_job(
+        &self,
+        parent_id: &str,
+        agent_ref: &str,
+        task: &str,
+    ) -> anyhow::Result<String> {
+        let prepared = self
+            .registry
+            .prepare_agent_job(parent_id, agent_ref, task)
+            .await?;
+        self.registry
+            .publish_agent_job(prepared)
+            .await
+            .map(|id| id.0)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "job publication outcome uncertain ({error}); inspect the existing session catalog before submitting again"
+                )
+            })
+    }
+
     /// Model tool calls already run on the executor while holding the parent
     /// processing slot; waiting for that slot to process the command would
     /// deadlock. Commit the same typed request and settle it inline instead.
