@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod approval_proxy;
@@ -2407,7 +2407,10 @@ impl Server {
         }
     }
 
-    async fn process_session(&self, session_db_id: &str) -> anyhow::Result<Option<String>> {
+    async fn process_session(
+        self: &Arc<Self>,
+        session_db_id: &str,
+    ) -> anyhow::Result<Option<String>> {
         if !self.executor_authorized {
             anyhow::bail!("client server cannot execute agent or tool turns");
         }
@@ -2654,9 +2657,64 @@ impl Server {
             return Ok(None);
         }
 
-        // This is the last check before model or tool side effects. A request
-        // stays queued through startup, runtime, and home-peer checks. Only
-        // the executor about to run it records the attempt start.
+        // An accepted job does not start its durable attempt until it owns a
+        // runtime slot. Keep its processing reservation while waiting so DB
+        // notifications cannot install a second capacity waiter for this job.
+        if let Some(job) = job_authority
+            .as_ref()
+            .filter(|_| existing_attempt_id.is_none())
+        {
+            let sid = session_db_id.to_string();
+            let job = job.clone();
+            match self.semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    Arc::clone(self)
+                        .finish_queued_job(
+                            sid,
+                            session,
+                            job,
+                            agent,
+                            approval_tx,
+                            backend,
+                            request.id,
+                            spawn_ctx,
+                            permit,
+                        )
+                        .await;
+                }
+                Err(TryAcquireError::NoPermits) => {
+                    let server = Arc::downgrade(self);
+                    let semaphore = self.semaphore.clone();
+                    self.track_task(tokio::spawn(async move {
+                        let Ok(permit) = semaphore.acquire_owned().await else {
+                            return;
+                        };
+                        let Some(server) = server.upgrade() else {
+                            return;
+                        };
+                        server
+                            .finish_queued_job(
+                                sid,
+                                session,
+                                job,
+                                agent,
+                                approval_tx,
+                                backend,
+                                request.id,
+                                spawn_ctx,
+                                permit,
+                            )
+                            .await;
+                    }));
+                }
+                Err(TryAcquireError::Closed) => {
+                    self.processing.lock().await.remove(session_db_id);
+                }
+            }
+            return Ok(None);
+        }
+
+        // Non-job turns and explicit retries keep their existing lifecycle.
         let attempt = match existing_attempt_id {
             Some(attempt_id) => session
                 .read_turn_attempt(&attempt_id)
@@ -2681,10 +2739,102 @@ impl Server {
             backend,
             attempt,
             spawn_ctx,
+            None,
         )
         .await;
 
         Ok(Some(attempt_id))
+    }
+
+    // A waiting job is rechecked after the permit arrives. Nothing durable is
+    // started by the capacity waiter; a lost LWW claim or changed authority
+    // simply drops the permit without producing an interrupted attempt.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_queued_job(
+        &self,
+        sid: String,
+        session: Session,
+        job: crate::session::jobs::AcceptedAgentJob,
+        agent: crate::agent::Agent,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+        backend: BackendManager,
+        request_id: TurnRequestId,
+        spawn: SpawnContext,
+        permit: OwnedSemaphorePermit,
+    ) -> anyhow::Result<bool> {
+        let db = session.database();
+        if self.shutting_down.load(Ordering::Acquire)
+            || self.validate_accepted_job(db).await?.as_ref() != Some(&job)
+            || crate::session::jobs::read_job_result(db).await?.is_some()
+            || !crate::session::jobs::owns_job(db, &self.job_incarnation).await?
+            || !self.peer_is_home_for(&sid, &job.definition.target).await
+            || agent.name != job.definition.target
+            || request_id.as_str() != job.directive_id
+            || !self.sessions.lock().await.contains_key(&sid)
+        {
+            return Ok(false);
+        }
+        let fresh = Session::new(ConversationId(sid.clone()), db.clone()).await;
+        let live = self.live_attempts.lock().await.clone();
+        let runnable = fresh
+            .turn_request(&request_id, |name| self.agents.get(name).is_some(), &live)
+            .await?;
+        if !matches!(runnable, Some(crate::session::TurnRequest { state: TurnRequestState::Queued, ref entry, .. })
+            if entry.entry_type == EntryType::Directive)
+        {
+            return Ok(false);
+        }
+        let attempt = fresh.start_turn_attempt(request_id).await?;
+        self.live_attempts
+            .lock()
+            .await
+            .insert(attempt.attempt_id.clone());
+        self.spawn_agent_task(
+            sid,
+            fresh,
+            agent,
+            approval_tx,
+            backend,
+            attempt,
+            spawn,
+            Some(permit),
+        )
+        .await;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_queued_job(
+        self: Arc<Self>,
+        sid: String,
+        session: Session,
+        job: crate::session::jobs::AcceptedAgentJob,
+        agent: crate::agent::Agent,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+        backend: BackendManager,
+        request_id: TurnRequestId,
+        spawn: SpawnContext,
+        permit: OwnedSemaphorePermit,
+    ) {
+        match self
+            .start_queued_job(
+                sid.clone(),
+                session,
+                job,
+                agent,
+                approval_tx,
+                backend,
+                request_id,
+                spawn,
+                permit,
+            )
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => warn!(%error, session_db_id = %sid, "Queued job no longer runnable"),
+        }
+        self.processing.lock().await.remove(&sid);
     }
 
     async fn process_session_command(
@@ -2886,6 +3036,7 @@ impl Server {
         backend: BackendManager,
         attempt: TurnAttempt,
         spawn: SpawnContext,
+        reserved_permit: Option<OwnedSemaphorePermit>,
     ) {
         let agent_name = agent.name.clone();
         let system_prompt = agent.system_prompt.clone();
@@ -2954,7 +3105,10 @@ impl Server {
                 }
             });
             let _heartbeat = ActivityHeartbeat(heartbeat);
-            let _permit = semaphore.acquire().await.expect("semaphore closed");
+            let _permit = match reserved_permit {
+                Some(permit) => permit,
+                None => semaphore.acquire_owned().await.expect("semaphore closed"),
+            };
             if shutting_down.load(Ordering::Acquire) {
                 return;
             }
