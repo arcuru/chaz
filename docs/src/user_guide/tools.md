@@ -6,32 +6,33 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 
 Every built-in is owned by an [extension](extensions.md); disabling an extension hides its tools from the LLM. The owning extension is shown so you can find a tool's lifecycle (and disable it per-session/per-agent) at a glance.
 
-| Tool                | Owner          | Risk   | Approval           | Description                                                            |
-| ------------------- | -------------- | ------ | ------------------ | ---------------------------------------------------------------------- |
-| `get_time`          | `system`       | Low    | Never              | Returns the current UTC time                                           |
-| `calculate`         | `system`       | Low    | Never              | Evaluates math expressions (via meval)                                 |
-| `describe_tool`     | `system`       | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
-| `compact`           | `core`         | Low    | Never              | Summarize and compact conversation context                             |
-| `spawn_agent`       | `core`         | Medium | UnlessAutoApproved | Delegates to a named peer Agent (persistent identity, own keys)        |
-| `workflow`          | `orchestrator` | Medium | UnlessAutoApproved | Composes bounded local `spawn_agent` calls into a flow                 |
-| `spawn_worker`      | `core`         | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
-| `shell`             | `core`         | High   | Always             | Executes a shell command                                               |
-| `read_file`         | `fs`           | Low    | Never              | Reads file contents from disk                                          |
-| `write_file`        | `fs`           | Medium | UnlessAutoApproved | Writes content to a file                                               |
-| `edit_file`         | `fs`           | Medium | UnlessAutoApproved | Replace exact text in a file (single or atomic-multi-edit)             |
-| `web_fetch`         | `web`          | Medium | UnlessAutoApproved | HTTP GET or POST requests                                              |
-| `web_search`        | `web`          | Low    | Never              | Search the web; returns title/url/snippet per result                   |
-| `remember`          | `memory`       | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank)  |
-| `recall`            | `memory`       | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword         |
-| `list_memory_banks` | `memory`       | Low    | Never              | Lists the memory banks this agent has been granted access to           |
-| `skill_list`        | `skills`       | Low    | Never              | List the skills available to this agent (progressive disclosure)       |
-| `skill_search`      | `skills`       | Low    | Never              | Search the skill catalog by keyword                                    |
-| `skill_show`        | `skills`       | Low    | Never              | Fetch a skill's body — the "activation" half of progressive disclosure |
-| `schedule_add`      | `schedule`     | Low    | Never              | Add a recurring agent-owned cron or interval schedule                  |
-| `schedule_modify`   | `schedule`     | Low    | Never              | Partial update of an existing schedule                                 |
-| `schedule_remove`   | `schedule`     | Low    | Never              | Delete a schedule by id                                                |
-| `schedule_list`     | `schedule`     | Low    | Never              | List an agent's schedules                                              |
-| `schedule_once`     | `schedule`     | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
+| Tool                | Owner      | Risk   | Approval           | Description                                                            |
+| ------------------- | ---------- | ------ | ------------------ | ---------------------------------------------------------------------- |
+| `get_time`          | `system`   | Low    | Never              | Returns the current UTC time                                           |
+| `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
+| `describe_tool`     | `system`   | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
+| `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
+| `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
+| `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
+| `job_wait`          | `core`     | Low    | Never              | Waits up to a deadline for a job; timeout returns its current status   |
+| `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
+| `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
+| `read_file`         | `fs`       | Low    | Never              | Reads file contents from disk                                          |
+| `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
+| `edit_file`         | `fs`       | Medium | UnlessAutoApproved | Replace exact text in a file (single or atomic-multi-edit)             |
+| `web_fetch`         | `web`      | Medium | UnlessAutoApproved | HTTP GET or POST requests                                              |
+| `web_search`        | `web`      | Low    | Never              | Search the web; returns title/url/snippet per result                   |
+| `remember`          | `memory`   | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank)  |
+| `recall`            | `memory`   | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword         |
+| `list_memory_banks` | `memory`   | Low    | Never              | Lists the memory banks this agent has been granted access to           |
+| `skill_list`        | `skills`   | Low    | Never              | List the skills available to this agent (progressive disclosure)       |
+| `skill_search`      | `skills`   | Low    | Never              | Search the skill catalog by keyword                                    |
+| `skill_show`        | `skills`   | Low    | Never              | Fetch a skill's body — the "activation" half of progressive disclosure |
+| `schedule_add`      | `schedule` | Low    | Never              | Add a recurring agent-owned cron or interval schedule                  |
+| `schedule_modify`   | `schedule` | Low    | Never              | Partial update of an existing schedule                                 |
+| `schedule_remove`   | `schedule` | Low    | Never              | Delete a schedule by id                                                |
+| `schedule_list`     | `schedule` | Low    | Never              | List an agent's schedules                                              |
+| `schedule_once`     | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
 
 Built-in tools are grouped by extension. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
 
@@ -159,73 +160,15 @@ Summarizes the conversation history via an LLM call and writes a `Summary` entry
 
 ### spawn_agent
 
-Delegates a task to another agent in a child session. The named agent's persistent identity and memory are used — pick this when the work needs continuity. See [Agents](agents.md).
+Submits a task to a hosted Agent as a durable child job. It returns the session DB handle immediately; use `job_status` or `job_wait` to observe completion. See [Agents](agents.md).
 
 ```json
 {
-  "agent": "researcher",
+  "agent_ref": "researcher",
   "task": "Find the latest papers on CRDT synchronization",
-  "async": false
+  "context": "Optional background"
 }
 ```
-
-### workflow
-
-`workflow` composes synchronous `spawn_agent` calls on this Peer. Each named child has its own Agent identity, child session, and iteration budget. The flow itself has no durable queue, claim, retry, or schedule: if the parent turn ends, resume/retry through your external job owner rather than treating the flow as a background job. `workflow` uses the same approval policy as `spawn_agent` and a 600-second tool timeout. A fork waits for its branches and returns `{branches, errors}`; the output is not a substitute for checking each branch. Only inline flows are supported. `loop` and `cwd` nodes are rejected before any child starts.
-
-| Input                                                  | Meaning                                                                                                                                                                                      |
-| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `agent`, `task`, `output?`                             | One named Agent; output is `text` (default) or validated `json`.                                                                                                                             |
-| `tasks: [{agent, task, output?}, ...]`, `concurrency?` | Parallel fork, default four concurrent branches; explicit cap 1–16.                                                                                                                          |
-| `flow`                                                 | Inline `spawn`, `sequence` (`steps`), `fork` (`id`, `branches`, `concurrency?`), and `join` (`from`, `mode: all\|any\|quorum`, `quorum?`, `onFailure: failFast\|collectErrors`, `reducer?`). |
-
-A sequence substitutes `{previous}` in the next spawn's task. Forks name their results by branch key; a join must follow its fork in the same sequence. `all` requires no branch errors, `any` needs one success, and `quorum` needs the requested successes. `collectErrors` permits a partial result only if at least one branch succeeded; a reducer Agent receives the collected JSON. Forks do not cancel other branches on failure.
-
-For example, to compare two independent sources despite a partial outage:
-
-1. Submit an inline flow (after approving delegation):
-
-   ```json
-   {
-     "flow": {
-       "kind": "sequence",
-       "steps": [
-         {
-           "kind": "fork",
-           "id": "sources",
-           "concurrency": 2,
-           "branches": {
-             "primary": {
-               "agent": "researcher",
-               "task": "Find primary sources for topic A"
-             },
-             "secondary": {
-               "agent": "scout",
-               "task": "Find primary sources for topic B"
-             }
-           }
-         },
-         {
-           "kind": "join",
-           "from": "sources",
-           "mode": "any",
-           "onFailure": "collectErrors"
-         }
-       ]
-     }
-   }
-   ```
-
-2. If `scout` fails, inspect the returned structure before continuing:
-
-   ```json
-   {
-     "branches": { "primary": "Source A: https://example.org/paper" },
-     "errors": { "secondary": "backend unavailable" }
-   }
-   ```
-
-3. Retry the failed task in a new flow after the backend recovers, or proceed explicitly with the surviving evidence. With `mode: "all"` and the default `failFast`, the join instead reports `join "sources" not satisfied (mode=All, 1 succeeded, 1 failed)`; nothing is automatically retried. A malformed later step (for example a `loop` node) rejects the whole flow before the first child starts.
 
 ### spawn_worker
 

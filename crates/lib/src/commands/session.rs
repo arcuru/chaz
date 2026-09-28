@@ -462,11 +462,6 @@ async fn submit_command(
             crate::session::SessionCommandOutcome::AgentJobAccepted { session_db_id } => {
                 CommandOutcome::Text(format!("Job accepted in session {session_db_id}."))
             }
-            crate::session::SessionCommandOutcome::WorkflowParentAccepted { session_db_id } => {
-                CommandOutcome::Text(format!(
-                    "Workflow parent accepted in session {session_db_id}; graph execution is not available yet."
-                ))
-            }
             crate::session::SessionCommandOutcome::Compact { summary } => {
                 CommandOutcome::Text(format!(
                     "Session compacted by command {command_id}. Summary ({} chars) persisted.",

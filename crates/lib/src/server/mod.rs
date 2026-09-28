@@ -45,7 +45,6 @@ mod build;
 mod jobs;
 mod runtime_lease;
 mod schedule;
-mod workflow_jobs;
 
 pub use build::{BuildOptions, BuiltServer, McpReadiness, build};
 pub use runtime_lease::{LeaseError, LocalRuntimeLease, OwnerId, RuntimeLease};
@@ -545,10 +544,6 @@ pub struct Server {
     job_submission_lock: Mutex<()>,
     /// Unique to this Server generation, even under the same service login.
     job_incarnation: String,
-    #[cfg(test)]
-    workflow_before_root: std::sync::Mutex<Option<std::sync::Arc<workflow_jobs::WorkflowRootGate>>>,
-    #[cfg(test)]
-    accepted_job_events: Mutex<HashMap<String, usize>>,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -694,10 +689,6 @@ impl Server {
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_submission_lock: Mutex::new(()),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
-            #[cfg(test)]
-            workflow_before_root: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            accepted_job_events: Mutex::new(HashMap::new()),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -742,12 +733,6 @@ impl Server {
         server.track_task(tokio::spawn(async move {
             server_clone.new_session_watcher().await;
         }));
-        if executor_authorized {
-            let driver = server.clone();
-            server.track_task(tokio::spawn(async move {
-                driver.drive_workflow_roots().await;
-            }));
-        }
 
         server
     }
@@ -1883,9 +1868,7 @@ impl Server {
         if !self.executor_authorized {
             anyhow::bail!("server has no executor loop");
         }
-        if crate::session::jobs::is_staged_job(session_db).await
-            || crate::session::workflow_jobs::is_workflow_parent(session_db).await
-        {
+        if crate::session::jobs::is_staged_job(session_db).await {
             anyhow::bail!("staged job is not runnable");
         }
         let session = Session::new(
@@ -2009,9 +1992,6 @@ impl Server {
             }
             SessionCommandOutcome::AgentJobAccepted { .. } => {
                 anyhow::bail!("retry command returned a job receipt")
-            }
-            SessionCommandOutcome::WorkflowParentAccepted { .. } => {
-                anyhow::bail!("retry command returned a workflow parent receipt")
             }
         }
     }
@@ -2283,24 +2263,14 @@ impl Server {
                 break;
             }
             let should_rescan = tokio::select! {
-                event = rx.recv() => {
-                    #[cfg(test)]
-                    if let Some(event) = &event { self.count_job_event(&event.session_db_id, event.source.is_none()).await; }
-                    event.is_some()
-                },
+                event = rx.recv() => event.is_some(),
                 _ = reconcile.tick() => true,
                 _ = self.shutdown_notify.notified() => false,
             };
             if !should_rescan {
                 break;
             }
-            while let Ok(event) = rx.try_recv() {
-                #[cfg(test)]
-                self.count_job_event(&event.session_db_id, event.source.is_none())
-                    .await;
-                #[cfg(not(test))]
-                let _ = event;
-            }
+            while rx.try_recv().is_ok() {}
             self.adopt_indexed_local_client_sessions(&mut seen).await;
         }
     }
@@ -2341,14 +2311,6 @@ impl Server {
     /// Return true when the row is settled for this process. A transient open
     /// or registration failure stays unseen so the next index write retries it.
     async fn adopt_local_client_session(&self, session: crate::session::SessionIndex) -> bool {
-        if session
-            .source
-            .as_deref()
-            .is_some_and(|s| s.starts_with("workflow-stage:"))
-        {
-            // Workflow parents are driven separately; never run a model turn here.
-            return true;
-        }
         if session
             .source
             .as_deref()
@@ -2735,10 +2697,7 @@ impl Server {
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
-        let _job_admission = if matches!(
-            request.command,
-            SessionCommand::SubmitAgent { .. } | SessionCommand::SubmitWorkflow { .. }
-        ) {
+        let _job_admission = if matches!(request.command, SessionCommand::SubmitAgent { .. }) {
             Some(self.job_submission_lock.lock().await)
         } else {
             None
@@ -2773,10 +2732,6 @@ impl Server {
                     &task,
                 )
                 .await
-            }
-            SessionCommand::SubmitWorkflow { flow } => {
-                self.execute_submit_workflow_command(session_db_id, &request.command_id, &flow)
-                    .await
             }
             SessionCommand::Retry {
                 target_request_id,
@@ -3271,17 +3226,3 @@ impl Drop for ActivityHeartbeat {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-impl Server {
-    async fn count_job_event(&self, id: &str, accepted: bool) {
-        if accepted {
-            *self
-                .accepted_job_events
-                .lock()
-                .await
-                .entry(id.to_string())
-                .or_default() += 1;
-        }
-    }
-}

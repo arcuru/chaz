@@ -576,6 +576,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn builtin_tools_expose_agent_jobs_without_workflow() {
+        let f = fixture().await;
+        let names = visible_tool_names(&scoped_for(&f).await);
+        assert!(
+            !names.contains("workflow"),
+            "workflow must not be registered"
+        );
+        for name in ["spawn_agent", "job_status", "job_wait"] {
+            assert!(names.contains(name), "missing built-in {name}");
+        }
+        for name in ["job_status", "job_wait"] {
+            let description = f.tool_registry.get(name).unwrap().descriptor().description;
+            assert!(description.contains("Agent job"));
+            assert!(!description.contains("workflow"));
+        }
+    }
+
     // -------------------------------------------------------------------------
     // listing
     // -------------------------------------------------------------------------
