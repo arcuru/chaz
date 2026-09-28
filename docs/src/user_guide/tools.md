@@ -160,7 +160,7 @@ Summarizes the conversation history via an LLM call and writes a `Summary` entry
 
 ### spawn_agent
 
-Submits a task to a hosted Agent as a durable child job. It returns the session DB handle immediately; use `job_status` or `job_wait` to observe completion. See [Agents](agents.md).
+Creates one child session DB with its Directive, publishes its ID to the watched catalog, and returns that handle before the executor accepts or runs it; use `job_status` or `job_wait` to observe completion. See [Agents](agents.md).
 
 ```json
 {
@@ -179,7 +179,7 @@ Use the `session_db_id` returned by `spawn_agent` to check a job, or wait for a 
 {"session_db_id":"<child DB ID>","timeout_seconds":30}
 ```
 
-The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. The handle does not grant session DB access.
+The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Pending`, `Rejected`, `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. If creation returns an uncertain outcome, inspect the catalog before submitting another job; there is no stable request key or automatic submission retry. The handle does not grant session DB access.
 
 ### spawn_worker
 

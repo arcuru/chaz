@@ -540,8 +540,6 @@ pub struct Server {
     /// behind by a previous process. It is process-local coordination, not
     /// distributed fencing.
     live_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
-    // coding: global local-executor admission lock; shard by parent if throughput needs it.
-    job_submission_lock: Mutex<()>,
     /// Unique to this Server generation, even under the same service login.
     job_incarnation: String,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
@@ -687,7 +685,6 @@ impl Server {
             #[cfg(test)]
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            job_submission_lock: Mutex::new(()),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
@@ -1868,8 +1865,8 @@ impl Server {
         if !self.executor_authorized {
             anyhow::bail!("server has no executor loop");
         }
-        if crate::session::jobs::is_staged_job(session_db).await {
-            anyhow::bail!("staged job is not runnable");
+        if crate::session::jobs::is_job_session(session_db).await {
+            anyhow::bail!("job session requires executor admission");
         }
         let session = Session::new(
             ConversationId(session_db.root_id().to_string()),
@@ -1990,9 +1987,6 @@ impl Server {
             SessionCommandOutcome::Compact { .. } => {
                 anyhow::bail!("retry command returned a compact result")
             }
-            SessionCommandOutcome::AgentJobAccepted { .. } => {
-                anyhow::bail!("retry command returned a job receipt")
-            }
         }
     }
 
@@ -2063,7 +2057,7 @@ impl Server {
     /// If `parent_session_db_id` is provided, wires a `DelegatedTreeRef`
     /// (max = Admin(0)) from the child's auth settings back to the parent —
     /// any key with Admin on the parent inherits Admin on the child
-    /// transparently. `spawn_agent`/`spawn_worker` rely on this so the
+    /// transparently. `spawn_worker` relies on this so the
     /// invoking session's supervisor authority carries into the child.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_child_session(
@@ -2415,11 +2409,11 @@ impl Server {
             anyhow::bail!("client server cannot execute agent or tool turns");
         }
         let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
-        let job_authority = if crate::session::jobs::is_staged_job(&session_db).await {
+        let job_authority = if crate::session::jobs::is_job_session(&session_db).await {
             Some(
                 self.validate_accepted_job(&session_db)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("staged job has no executor acceptance"))?,
+                    .ok_or_else(|| anyhow::anyhow!("job session has no executor acceptance"))?,
             )
         } else {
             None
@@ -2847,11 +2841,6 @@ impl Server {
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
-        let _job_admission = if matches!(request.command, SessionCommand::SubmitAgent { .. }) {
-            Some(self.job_submission_lock.lock().await)
-        } else {
-            None
-        };
         let attempt = match existing_attempt_id {
             Some(attempt_id) => session
                 .read_turn_attempt(&attempt_id)
@@ -2873,15 +2862,6 @@ impl Server {
             SessionCommand::Compact { source_snapshot } => {
                 self.execute_compact_command(session_db_id, &session, &source_snapshot)
                     .await
-            }
-            SessionCommand::SubmitAgent { agent_ref, task } => {
-                self.execute_submit_agent_command(
-                    session_db_id,
-                    &request.command_id,
-                    &agent_ref,
-                    &task,
-                )
-                .await
             }
             SessionCommand::Retry {
                 target_request_id,

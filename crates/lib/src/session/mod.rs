@@ -171,18 +171,11 @@ pub struct TurnRequest {
 #[serde(deny_unknown_fields)]
 pub enum SessionCommand {
     /// Summarize the context visible at this immutable database snapshot.
-    Compact {
-        source_snapshot: Snapshot,
-    },
+    Compact { source_snapshot: Snapshot },
     /// Retry one specifically observed interrupted turn attempt.
     Retry {
         target_request_id: TurnRequestId,
         expected_interrupted_attempt_id: String,
-    },
-    // Requests a child under the existing session; only an executor may accept it.
-    SubmitAgent {
-        agent_ref: String,
-        task: String,
     },
 }
 
@@ -198,8 +191,6 @@ pub struct SessionCommandRequest {
 /// Terminal executor-owned command outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionCommandOutcome {
-    // A committed child session DB handle, not its eventual agent reply.
-    AgentJobAccepted { session_db_id: String },
     Compact { summary: String },
     RetryAccepted { target_attempt_id: String },
     Rejected { message: String },
@@ -942,12 +933,6 @@ impl Session {
             .await?;
         match store.get(request.command_id.as_str()).await {
             Ok(existing) if existing == request => return Ok(()),
-            Ok(existing)
-                if matches!(existing.command, SessionCommand::SubmitAgent { .. })
-                    && existing.command == request.command =>
-            {
-                return Ok(());
-            }
             Ok(_) => anyhow::bail!(
                 "command {} already exists with a different payload",
                 request.command_id

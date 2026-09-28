@@ -71,9 +71,6 @@ pub struct SessionRegistry {
     /// Keyed by `transport::channel_key`. Grows by distinct channel seen
     /// (bounded; never pruned — entries are tiny).
     pub(super) channel_create_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
-    /// Coarse in-process serialization for staging. Eidetica CRDT transactions
-    /// do not provide a cross-process compare-and-set.
-    pub(super) job_stage_lock: Mutex<()>,
 }
 
 pub(super) const STORE_SESSIONS: &str = "sessions";
@@ -177,7 +174,6 @@ impl SessionRegistry {
             local_client_sessions: Mutex::new(std::collections::HashMap::new()),
             locally_created_sessions: Mutex::new(std::collections::HashSet::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
-            job_stage_lock: Mutex::new(()),
         })
     }
 
@@ -1206,7 +1202,7 @@ mod tests {
         // This is the delegated-job open path, not find_sigkeys on a remote service.
         let (_, child) = observer.open_job_session(&id).await.unwrap();
         assert!(read_delegation(&child, parent.root_id()).await.is_some());
-        assert!(crate::session::jobs::is_staged_job(&child).await);
+        assert!(crate::session::jobs::is_job_session(&child).await);
         assert!(
             crate::session::jobs::read_accepted_job(&child)
                 .await

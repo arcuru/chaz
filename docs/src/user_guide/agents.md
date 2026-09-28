@@ -273,7 +273,7 @@ WARNING: revoked key was the home peer for 2 session(s): s_001, s_002. Their nex
 
 ### Agent-job placement
 
-`spawn_agent` submits only to an Agent hosted on the local executor with the same Agent/home identity. It does not delegate to another peer or provide automatic failover. Same-login local clients with session DB access can observe a job by its handle; client-role Chaz cannot admit or run one.
+`spawn_agent` submits only to an Agent hosted on the local executor with the same Agent/home identity. It does not delegate to another peer or provide automatic failover. Same-login local clients with session DB access can submit and observe a job by its handle; client-role Chaz cannot admit or run one.
 
 ### Migrating pre-existing co-owned setups
 
@@ -517,7 +517,7 @@ Presets are available to Worker templates; `spawn_agent` does not accept a per-c
 
 ## Agent jobs: submit and observe
 
-`spawn_agent` returns immediately after durable acceptance. It accepts a locally hosted `agent_ref` (display name or DB ID), `task`, and optional `context`; the legacy `agent` name is also accepted. It does not accept `async`, preset, model, workspace, narrow, or private options. Broad local scope is required; this is not an OS sandbox. Same-login clients are trusted, not isolated from one another.
+`spawn_agent` creates a child session DB with one Directive, then returns its ID after catalog publication. The executor validates and accepts that same DB later. It accepts a locally hosted `agent_ref` (display name or DB ID), `task`, and optional `context`; the legacy `agent` name is also accepted. It does not accept `async`, preset, model, workspace, narrow, or private options. Broad local scope is required; this is not an OS sandbox. Same-login clients are trusted, not isolated from one another.
 
 ```json
 {
@@ -527,13 +527,13 @@ Presets are available to Worker templates; `spawn_agent` does not accept a per-c
 }
 ```
 
-The result is `{"session_db_id":"<child DB ID>","state":"accepted"}`. Keep that handle. `job_status({"session_db_id":"<child DB ID>"})` reads the state; `job_wait({"session_db_id":"<child DB ID>","timeout_seconds":30})` waits up to 30 seconds, then returns the current state without canceling the job (1–240 seconds; default 30). The status is typed: `Queued`, `Running { attempt_id }`, `StartedUnknown { attempt_id, activity_recent }` for a client that cannot tell whether a start is still active, `Interrupted { attempt_id }` for an executor observing an abandoned attempt, `Succeeded { text }`, or `Failed { message }`. A failed job is not a successful answer. Check the state rather than treating a wait timeout as completion.
+The result is `{"session_db_id":"<child DB ID>","state":"pending"}`. Keep that handle. `job_status({"session_db_id":"<child DB ID>"})` reads the state; `job_wait({"session_db_id":"<child DB ID>","timeout_seconds":30})` waits up to 30 seconds, then returns the current state without canceling the job (1–240 seconds; default 30). The status is typed: `Pending` before executor acceptance, `Rejected { message }` on refusal, `Queued`, `Running { attempt_id }`, `StartedUnknown { attempt_id, activity_recent }` for a client that cannot tell whether a start is still active, `Interrupted { attempt_id }` for an executor observing an abandoned attempt, `Succeeded { text }`, or `Failed { message }`. A failed job is not a successful answer. Check the state rather than treating a wait timeout as completion.
 
-A queued job can be adopted after executor restart. An attempt that started but has no completion is **not** automatically replayed: model or tool effects may already have happened. Inspect its status and transcript, open the child session, and use `/interrupted` to find the request ID before deciding whether `/retry <request_id>` is safe; do not submit a new task to guess whether the old one ran. A repeated submission with the same parent turn/tool-call key and payload resolves to the same child; a different payload for that key is rejected. A partial submission can remain uncertain instead of creating a duplicate. Same-Agent/home last-writer-wins claims are not fencing: concurrent executors can overlap and effects are not exactly-once.
+A queued job can be adopted after executor restart. An attempt that started but has no completion is **not** automatically replayed: model or tool effects may already have happened. Inspect its status and transcript, open the child session, and use `/interrupted` to find the request ID before deciding whether `/retry <request_id>` is safe; do not submit a new task to guess whether the old one ran. If creation or publication returns an uncertain outcome, inspect the session catalog for the published job before submitting again. There is no stable parent request key or automatic submission retry; an unpublished prepared DB is inert and may require manual inspection. Same-Agent/home last-writer-wins claims are not fencing: concurrent executors can overlap and effects are not exactly-once.
 
 For example:
 
-1. Submit `{"agent_ref":"researcher","task":"Find the canonical reference"}`. The response is `{"session_db_id":"<child DB ID>","state":"accepted"}`, not the research answer.
+1. Submit `{"agent_ref":"researcher","task":"Find the canonical reference"}`. The response is `{"session_db_id":"<child DB ID>","state":"pending"}`, not the research answer.
 2. Call `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":1}`. If capacity is full, it can return `{"session_db_id":"<child DB ID>","state":"Queued"}`. Keep the handle and check again; the timeout did not cancel the job.
 3. If an executor stops after starting, a client may instead see `{"session_db_id":"<child DB ID>","state":{"StartedUnknown":{"attempt_id":"<attempt ID>","activity_recent":false}}}`. Check the child session's `/interrupted` and transcript before an explicit retry. Do not treat a stale start as a failed result.
 
