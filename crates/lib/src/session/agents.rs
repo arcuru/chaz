@@ -377,18 +377,24 @@ impl SessionRegistry {
         session_db: &Database,
         agent_index: &crate::hosted_index::HostedIndex,
     ) -> Vec<crate::hosted_index::DbEntry> {
+        self.authorized_hosted_agents(session_db, agent_index)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Hosted agents with active Write membership; unlike routing, config
+    /// commands must not mistake an unreadable auth snapshot for an empty roster.
+    pub async fn authorized_hosted_agents(
+        &self,
+        session_db: &Database,
+        agent_index: &crate::hosted_index::HostedIndex,
+    ) -> anyhow::Result<Vec<crate::hosted_index::DbEntry>> {
         use eidetica::auth::crypto::PublicKey;
         use eidetica::auth::types::KeyStatus;
 
-        let Ok(settings) = session_db.get_settings().await else {
-            return Vec::new();
-        };
-        let Ok(auth) = settings.auth_snapshot().await else {
-            return Vec::new();
-        };
-        let Ok(keys) = auth.get_all_keys() else {
-            return Vec::new();
-        };
+        let settings = session_db.get_settings().await?;
+        let auth = settings.auth_snapshot().await?;
+        let keys = auth.get_all_keys()?;
 
         let mut out = Vec::new();
         for (pubkey_str, key_info) in keys {
@@ -405,7 +411,7 @@ impl SessionRegistry {
                 out.push(entry);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Mention-aware turn routing. Turn precedence:
