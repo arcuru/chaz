@@ -61,7 +61,7 @@ impl Tool for SpawnWorker {
                     },
                     "max_iterations": {
                         "type": "integer",
-                        "description": "Accepted for compatibility; the Worker invocation shares the calling Agent's iteration budget rather than starting fresh, so this override has no practical effect under normal use."
+                        "description": "Legacy name for the Worker's maximum nested spawn depth. It does not limit tool calls: the Worker keeps calling tools until the model replies without one."
                     },
                     "async": {
                         "type": "boolean",
@@ -197,9 +197,7 @@ impl Tool for SpawnWorker {
             // forward-compat but currently unused: propagating spawn-time
             // overrides into the child's `SessionRuntime` needs a separate
             // expansion of `register_child_session` (and matching pickup in
-            // `spawn_agent_task`). The budget plumbing handled by
-            // `ctx.iteration_budget` does not cover these — they're a
-            // distinct concern parked for follow-up.
+            // `spawn_agent_task`), parked for follow-up.
             let _ = resolved_model;
             let _ = role_suffix;
 
@@ -218,10 +216,9 @@ impl Tool for SpawnWorker {
 
             // Register child session with parent→child delegation wired in.
             // No ephemeral keypair: entries on the child are signed by the
-            // parent Agent's key via the delegation chain. The shared
-            // iteration budget descends from the parent so nested
-            // Worker invocations draw from the top-level Agent's pool
-            // rather than each level getting its own.
+            // parent Agent's key via the delegation chain. The resolved
+            // `max_iterations` value is the child's spawn-depth ceiling;
+            // it does not bound the child's tool-calling loop.
             let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session(
                     &ctx.agent_name,
@@ -231,7 +228,6 @@ impl Tool for SpawnWorker {
                     resolved_max_iterations as usize,
                     child_tools,
                     Some(&parent_session_db_id),
-                    ctx.iteration_budget.clone(),
                 )
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;

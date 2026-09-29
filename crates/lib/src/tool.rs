@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -297,14 +296,6 @@ pub struct ToolContext {
     /// Tools go through the host for system access (shell, HTTP, filesystem)
     /// rather than calling OS APIs directly. Defaults to [`NativeToolHost`].
     pub host: Arc<dyn ToolHost>,
-    /// Shared ReAct iteration budget. Seeded by the top-level Agent's
-    /// `max_iterations` and inherited by descendant Workers via
-    /// `spawn_worker` so nested work draws from the same pool rather than
-    /// each level getting a fresh allotment. `None` = no shared budget;
-    /// the runtime falls back to its built-in cap (used by tests and
-    /// direct `runtime::execute` callers that don't go through the
-    /// spawn machinery).
-    pub iteration_budget: Option<Arc<AtomicU32>>,
     /// Handle to the running `RoutineEngine`, threaded from `Server` at
     /// context construction. Tools that mutate schedules resync the live
     /// heap through this after a committed write. `None` under `--print`

@@ -83,7 +83,7 @@ impl MockBackend {
     }
 
     /// Configure whether `BackendDispatch::supports_tools` reports true.
-    /// Use `false` to drive the runtime's no-tools fallback.
+    /// Use `false` to drive the runtime's no-tools fast path.
     pub fn with_supports_tools(mut self, value: bool) -> Self {
         self.supports_tools = value;
         self

@@ -3271,6 +3271,84 @@ async fn transcript_commits_full_tool_exchange_before_progression() {
 }
 
 #[tokio::test]
+async fn executor_turn_keeps_tools_past_former_iteration_cap() {
+    // A live executor turn is not capped by the Agent's `max_iterations`
+    // (1 here, and the former default of 10 is also exceeded): every model
+    // request offers tools until the model replies without a tool call.
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Step(Arc<AtomicUsize>);
+    impl Tool for Step {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "step".into(),
+                description: "advances one step".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(format!("step {n}")) })
+        }
+    }
+
+    const ROUNDS: usize = 12;
+    let (_instance, server, registry) = server_fixture().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    server.tools.register(Step(calls.clone()));
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("long-turn")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid, "keep going").await;
+    let mock = Arc::new(MockBackend::new());
+    for i in 0..ROUNDS {
+        mock.push_tool_calls(vec![(format!("call-{i}"), "step".into(), "{}".into())]);
+    }
+    mock.push_text("finished all steps");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("alpha".into()), None)
+        .await
+        .unwrap();
+    await_call_count(&mock, ROUNDS + 1).await;
+    await_no_processing(&server, &sid).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), ROUNDS);
+    let recorded = mock.recorded_calls();
+    assert_eq!(recorded.len(), ROUNDS + 1);
+    assert!(
+        recorded.iter().all(|call| !call.tools.is_empty()),
+        "no model request withholds tools"
+    );
+    let reopened = Session::new(ConversationId(sid), db).await;
+    assert_eq!(
+        reopened
+            .entries()
+            .iter()
+            .filter(|e| e.content == "finished all steps")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn next_turn_replays_prior_native_tool_exchange() {
     use crate::test_support::MockBackend;
     use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};

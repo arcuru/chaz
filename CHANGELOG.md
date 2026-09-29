@@ -21,6 +21,12 @@ All notable changes to this project will be documented in this file.
   - `--session NAME` still pairs with `-p` for find-or-create session reuse
 - `chaz --no-tui` rejects a positional prompt rather than silently ignoring
   it (background bridges take input from their transport, not the CLI).
+- The ReAct loop no longer caps tool iterations. A turn keeps calling tools
+  until the model replies without a tool call, matching Pi's agent loop. The
+  forced no-tools summary after `max_iterations`, the repeated-call loop
+  detector, and the no-tools retry after a provider failure are removed; a
+  provider failure after bounded retries now fails the turn. `max_iterations`
+  is kept only as the nested spawn-depth ceiling (default 10).
 
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 

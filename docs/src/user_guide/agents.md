@@ -17,7 +17,7 @@ agents:
       - ~/AGENTS.md # Tilde expands to $HOME
     system_prompt: |
       Stay terse on Matrix.
-    max_iterations: 10 # Max ReAct loop iterations before forced summary
+    max_iterations: 10 # Legacy name: max nested spawn depth. Tool calls are not capped.
     tools: null # null = all tools, or list specific tools
     # Worker templates this Agent can invoke via `spawn_worker(name=…)`.
     # Workers have no identity of their own; entries written during a
@@ -498,7 +498,21 @@ Worker scoping replaces the previous cross-Agent `can_spawn` permission system:
 - A Worker is invocable iff it's declared under the calling Agent's `workers:` list. There is no global Worker registry.
 - A peer Agent is invocable via `spawn_agent` iff it's hosted on the local peer's agent index. There is no `allowed_callers` gate any more.
 
-Spawn depth is bounded by the call-depth cap (a hard recursion limit). The top-level Agent's `max_iterations` seeds a shared iteration budget — a single atomic counter that descends through `spawn_worker` invocations. Each ReAct turn in the Agent or in any nested Worker consumes one unit; when the pool reaches zero, force-summary kicks in at whichever level drained it. Worker `max_iterations` overrides are ignored once a parent budget is in scope: nested Workers share, they don't reset. Delegating to a peer Agent via `spawn_agent` is the opposite — that target gets its own freshly-seeded budget because it's running on its own identity.
+Spawn depth is bounded by the call-depth cap (a hard recursion limit). The field that sets it is still named `max_iterations` (default 10): an Agent's value is the depth ceiling for its sessions, and a Worker's resolved `max_iterations` (template → preset → inline override) is the ceiling for that Worker's child session. `spawn_agent` targets are further limited by the lower of the caller's and target's ceilings. None of these values limit how many tool calls a turn makes; see [How a turn ends](#how-a-turn-ends).
+
+## How a turn ends
+
+A turn keeps calling tools for as long as the model asks for them, the same way Pi's agent loop does. Every model request in the turn offers the Agent's tools, and the turn ends only when:
+
+- the model returns a response with no native tool calls — that response is the reply;
+- a model request fails after the backend's bounded retries (`max_retries`) — the turn fails with that error, and nothing is retried without tools;
+- the executor stops (shutdown or crash) — the turn is interrupted and shows up in `/interrupted` for an explicit `/retry`.
+
+There is no iteration cap, no "you are stuck in a loop" prompt, and no forced no-tools summary. Those fallbacks made models that still wanted a tool print their tool call as plain text instead of calling it. Repeated identical calls simply run again and return their own results.
+
+What still bounds a turn is per call, not per turn: tool approval (`Deny` and approval timeouts come back to the model as tool results), per-tool `rate_limit`, per-tool timeouts, grants, and the spawn-depth ceiling above. Tool errors are also returned to the model as results, so it can recover or stop. To limit a noisy tool, set a `rate_limit` or require approval for it; see [Tool Rate Limiting](security.md#tool-rate-limiting) and [Tool Approval](security.md#tool-approval).
+
+`max_iterations` remains accepted in YAML, `/agent set`, presets, and `spawn_worker` for compatibility, but only as the spawn-depth ceiling.
 
 ## Presets
 

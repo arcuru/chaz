@@ -403,7 +403,6 @@ impl Server {
                 call_depth: accepted.definition.call_depth,
                 max_call_depth: accepted.definition.max_call_depth,
                 parent_tools: Some(ScopedTools::new(self.tools.clone(), allowed)),
-                iteration_budget: None,
                 completion_tx: None,
             },
         );

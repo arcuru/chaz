@@ -81,7 +81,6 @@ fn make_ctx(agent_name: &str, session: Arc<TokioMutex<Session>>) -> ToolContext 
         agent_grants: std::collections::HashMap::new(),
         host: Arc::new(crate::tool_host::NativeToolHost::new()),
         active_extensions: std::collections::HashSet::new(),
-        iteration_budget: None,
         routine_engine: None,
     }
 }
