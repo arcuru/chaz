@@ -76,19 +76,19 @@ Lists every bank the agent can see, with the permission level. Always includes `
 
 Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix uses `!chaz memory <sub>`.
 
-| Command                                        | What                                                                                                                                                                              |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/memory new <name> [description]`             | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                                                                      |
-| `/memory list`                                 | List banks hosted by this peer.                                                                                                                                                   |
-| `/memory delete <ref>`                         | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                                                                             |
-| `/memory grant <bank> <agent> <read\|write>`   | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                                                                             |
-| `/memory revoke <bank> <agent>`                | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                                                                  |
-| `/memory share <bank>`                         | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                                                                                 |
-| `/memory unshare <bank>`                       | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.                                                   |
-| `/memory import <ticket> [admin\|write\|read]` | Sync a shared bank from another peer's ticket. Optional permission (default `write`) is the level requested when bootstrapping. Requires the ticket to carry a key for this peer. |
-| `/memory attach <bank>`                        | Attach a bank to the current session. Its memories are surfaced in context (see [Autonomous Auto-recall](#autonomous-memory-auto-recall)).                                        |
-| `/memory detach <bank>`                        | Detach a previously-attached bank from this session.                                                                                                                              |
-| `/memory config [show\|set\|reset]`            | View or change memory auto-recall behaviour for this agent. See [Auto-recall config](#auto-recall-configuration).                                                                 |
+| Command                                                    | What                                                                                                                                                                              |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/memory new <name> [description]`                         | Create a new standalone bank DB on this peer. The peer holds the bank's key.                                                                                                      |
+| `/memory list`                                             | List banks hosted by this peer.                                                                                                                                                   |
+| `/memory delete <ref>`                                     | Unregister the bank from this peer's index. The DB itself is preserved as an archive.                                                                                             |
+| `/memory grant <bank> <agent> <read\|write>`               | Authorise an agent on a bank. Writes bank AuthSettings first, then mirrors a ref into the agent's DB.                                                                             |
+| `/memory revoke <bank> <agent>`                            | Reverse a grant. Revokes auth, then best-effort removes the ref.                                                                                                                  |
+| `/memory share <bank>`                                     | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                                                                                 |
+| `/memory unshare <bank>`                                   | Stop sharing the bank — disable sync so this peer stops serving it. Does not revoke keys held by peers who already imported it.                                                   |
+| `/memory import <ticket> [admin\|write\|read]`             | Sync a shared bank from another peer's ticket. Optional permission (default `write`) is the level requested when bootstrapping. Requires the ticket to carry a key for this peer. |
+| `/memory attach <bank>`                                    | Attach a bank to the current session. Its memories are surfaced in context (see [Autonomous Auto-recall](#autonomous-memory-auto-recall)).                                        |
+| `/memory detach <bank>`                                    | Detach a previously-attached bank from this session.                                                                                                                              |
+| `/memory config [show\|set\|reset] [--agent <name-or-id>]` | View or change an agent's auto-recall settings. See [Auto-recall config](#auto-recall-configuration).                                                                             |
 
 Refs accept either a display name or an eidetica DB ID.
 
@@ -142,11 +142,13 @@ Missing banks are auto-created on first startup — no manual `/memory new` need
 
 ### Auto-recall configuration
 
-Per-agent settings stored in the agent DB. View and change with `/memory config`:
+Per-agent settings live in each agent DB, not on the session. `/memory config` (equivalent to `show`), `show`, `set`, and `reset` accept an optional trailing `--agent <hosted-name-or-id>`. Without it, a session with zero or one authorized hosted agent uses the resolved turn agent; if multiple agents have active Write authorization on the session, **all three operations**, including show, require an explicit target. The command reads session authorization rather than its cached roster; if that cannot be read, it fails without changing a config. Results name the effective agent.
+
+View and change with `/memory config`:
 
 ```text
 /memory config show
-# Auto-recall config:
+# Auto-recall config for chaz:
 # ──────────────────────
 # auto_recall_enabled     = true
 # auto_recall_max_entries = 3
@@ -159,6 +161,24 @@ Per-agent settings stored in the agent DB. View and change with `/memory config`
 /memory config set auto_recall_enabled false       # disable auto-recall
 /memory config reset                             # revert to defaults
 ```
+
+In a shared session, choose the target explicitly:
+
+```text
+/memory config show
+# Error: Multiple agents authorized on this session; specify --agent <hosted-name-or-id>
+/memory config set auto_recall_max_entries 5 --agent chaz
+# Set auto_recall_max_entries = 5 for chaz. Changes take effect next turn.
+/memory config show --agent chaz
+# Auto-recall config for chaz:
+# auto_recall_max_entries = 5
+/memory config reset --agent chaz
+# Auto-recall config for chaz reset to defaults.
+/memory config show --agent unknown
+# Error: No hosted agent matches 'unknown'
+```
+
+An unknown agent or misplaced/unknown flag is rejected. If a session unexpectedly has multiple agents, use `/agents` to find the hosted name or DB ID before retrying; no config is changed by the ambiguous request.
 
 | Setting                   | Default | Range      | What                                                   |
 | ------------------------- | ------- | ---------- | ------------------------------------------------------ |
