@@ -580,6 +580,29 @@ pub(super) async fn refresh_status_segments(app: &mut App) {
         .collect();
 }
 
+/// First visible row of each cursor-driven list in the TUI.
+///
+/// Held here rather than derived from the cursor so a list keeps its place
+/// while the cursor moves inside the window — deriving it would snap the
+/// window to the cursor on every keypress. Each list clamps its own entry to
+/// the row count it just drew, so a list that shrinks self-corrects without an
+/// explicit reset.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ListScroll {
+    /// Row index into `App::picker_len()`; 0 is the virtual "New session" row.
+    pub(super) picker: usize,
+    /// Peer → Defaults agent list.
+    pub(super) peer_defaults: usize,
+    /// Peer → Agents list.
+    pub(super) peer_agents: usize,
+    /// Peer → MCP server list.
+    pub(super) peer_mcp: usize,
+    /// Session → Agents list.
+    pub(super) session_agents: usize,
+    /// Session → Models scope list.
+    pub(super) session_models: usize,
+}
+
 pub(super) struct App {
     pub(super) mode: TuiMode,
     pub(super) overlay: Option<Overlay>,
@@ -620,6 +643,8 @@ pub(super) struct App {
     pub(super) session_rows_loading: HashSet<String>,
     pub(super) session_metadata_limit: Arc<Semaphore>,
     pub(super) picker_index: usize,
+    /// Scroll offsets for the cursor-driven lists — see [`ListScroll`].
+    pub(super) scroll: ListScroll,
     /// Sorted snapshot of the model picker's contents — favorites
     /// (YAML-configured) followed by the live OpenRouter catalog when
     /// available. Repopulated when the picker opens. Sort order: current
@@ -785,6 +810,7 @@ impl App {
             session_rows_loading: HashSet::new(),
             session_metadata_limit: Arc::new(Semaphore::new(4)),
             picker_index: 0,
+            scroll: ListScroll::default(),
             model_list: Vec::new(),
             session_catalog: None,
             model_picker_index: 0,

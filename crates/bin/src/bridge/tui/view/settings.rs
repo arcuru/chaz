@@ -194,13 +194,22 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
         Line::from(""),
     ];
 
+    let window = ListWindow::uniform(
+        defaults_count,
+        1,
+        Some(cursor),
+        area.height.saturating_sub(4) as usize,
+        app.scroll.peer_defaults,
+    );
+    app.scroll.peer_defaults = window.offset;
     if app.peer_defaults.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (none — falls back to first registered agent on new sessions)",
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        for (i, name) in app.peer_defaults.iter().enumerate() {
+        for i in window.rows() {
+            let name = &app.peer_defaults[i];
             let is_selected = i == cursor;
             let is_host = i == 0;
             let marker = if is_selected { "> " } else { "  " };
@@ -234,13 +243,13 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
         Style::default().fg(theme::DIM),
     )]));
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    f.render_widget(Paragraph::new(lines), area);
 
     // Per-row click regions. Header is 4 lines (blank, title, dashes,
     // blank); each default is one line after that.
     let rows_y0 = area.y.saturating_add(4);
-    for i in 0..defaults_count {
-        let y = rows_y0.saturating_add(i as u16);
+    for i in window.rows() {
+        let y = rows_y0.saturating_add((i - window.first) as u16);
         if y >= area.y.saturating_add(area.height) {
             break;
         }
@@ -415,13 +424,25 @@ fn render_peer_agents(
     // worker nesting.
     let mut agent_line_offsets: Vec<u16> = Vec::with_capacity(names.len());
 
+    let heights: Vec<usize> = names
+        .iter()
+        .map(|n| server.agents().get(n).map_or(1, |a| 1 + a.workers.len()))
+        .collect();
+    let window = ListWindow::new(
+        &heights,
+        Some(cursor),
+        chunks[0].height.saturating_sub(3) as usize,
+        app.scroll.peer_agents,
+    );
+    app.scroll.peer_agents = window.offset;
     if names.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no agents configured)",
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        for (i, name) in names.iter().enumerate() {
+        for i in window.rows() {
+            let name = &names[i];
             let agent = server.agents().get(name);
             let resolved = agent
                 .as_ref()
@@ -472,7 +493,7 @@ fn render_peer_agents(
     // (the Paragraph clips them too — no point in a hit region you can't
     // see).
     let list_bottom = chunks[0].y.saturating_add(chunks[0].height);
-    for (i, offset) in agent_line_offsets.iter().enumerate() {
+    for (i, offset) in window.rows().zip(agent_line_offsets.iter()) {
         let y = chunks[0].y.saturating_add(*offset);
         if y >= list_bottom {
             break;
@@ -796,13 +817,22 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     let mut row_offsets: Vec<u16> = Vec::with_capacity(servers.len());
 
+    let window = ListWindow::uniform(
+        servers.len(),
+        1,
+        Some(cursor),
+        chunks[0].height.saturating_sub(3) as usize,
+        app.scroll.peer_mcp,
+    );
+    app.scroll.peer_mcp = window.offset;
     if servers.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no MCP servers configured)",
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        for (i, entry) in servers.iter().enumerate() {
+        for i in window.rows() {
+            let entry = &servers[i];
             let is_selected = i == cursor;
             let marker = if is_selected { "> " } else { "  " };
             let style = if is_selected {
@@ -833,7 +863,7 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     // Per-server click regions; same clamp pattern as Peer → Agents.
     let list_bottom = chunks[0].y.saturating_add(chunks[0].height);
-    for (i, offset) in row_offsets.iter().enumerate() {
+    for (i, offset) in window.rows().zip(row_offsets.iter()) {
         let y = chunks[0].y.saturating_add(*offset);
         if y >= list_bottom {
             break;
@@ -1137,13 +1167,22 @@ fn render_session_agents(
         Line::from(""),
     ];
 
+    let window = ListWindow::uniform(
+        agent_count,
+        1,
+        Some(cursor),
+        area.height.saturating_sub(4) as usize,
+        app.scroll.session_agents,
+    );
+    app.scroll.session_agents = window.offset;
     if snapshot.agents.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no agents attached — press [a] to add)",
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        for (i, agent) in snapshot.agents.iter().enumerate() {
+        for i in window.rows() {
+            let agent = &snapshot.agents[i];
             let resolved_override = snapshot
                 .agent_models
                 .get(&agent.display_name)
@@ -1180,13 +1219,13 @@ fn render_session_agents(
         Style::default().fg(theme::DIM),
     )]));
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    f.render_widget(Paragraph::new(lines), area);
 
     // One click region per agent row (header is 4 lines: blank, title,
     // dashes, blank). Click focuses the detail pane and moves the cursor.
     let rows_y0 = area.y.saturating_add(4);
-    for i in 0..agent_count {
-        let y = rows_y0.saturating_add(i as u16);
+    for i in window.rows() {
+        let y = rows_y0.saturating_add((i - window.first) as u16);
         if y >= area.y.saturating_add(area.height) {
             break;
         }
@@ -1291,7 +1330,7 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
 /// Session → Models — cursor list of scopes (row 0 = Session pin,
 /// rows 1..n = each attached agent). The selected row's scope is what
 /// Enter opens the picker for.
-fn render_session_models(
+pub(super) fn render_session_models(
     f: &mut ratatui::Frame,
     area: Rect,
     app: &mut App,
@@ -1331,30 +1370,50 @@ fn render_session_models(
         Line::from(""),
     ];
 
+    let heights: Vec<usize> = (0..total_rows)
+        .map(|i| {
+            if i == 0 {
+                3
+            } else if i == 1 {
+                2
+            } else {
+                1
+            }
+        })
+        .collect();
+    let window = ListWindow::new(
+        &heights,
+        Some(cursor),
+        area.height.saturating_sub(4) as usize,
+        app.scroll.session_models,
+    );
+    app.scroll.session_models = window.offset;
+    let mut row_offsets = Vec::new();
     // Row 0 — Session pin. Selection marker + resolved-to suffix so the
     // user sees what the pin maps to without flipping to /agents.
-    let row_offsets_start = lines.len() as u16;
 
-    let session_marker = if cursor == 0 { "> " } else { "  " };
-    let session_style = if cursor == 0 {
-        theme::selected()
-    } else {
-        Style::default().fg(Color::White)
-    };
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{session_marker}{name:<14}  {pin}",
-            name = "Session",
-            pin = session_pin_label
-        ),
-        session_style,
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        format!("      resolves to {session_resolved}"),
-        Style::default().fg(theme::DIM),
-    )]));
-    lines.push(Line::from(""));
-
+    if window.first == 0 {
+        row_offsets.push((0, lines.len() as u16));
+        let session_marker = if cursor == 0 { "> " } else { "  " };
+        let session_style = if cursor == 0 {
+            theme::selected()
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "{session_marker}{name:<14}  {pin}",
+                name = "Session",
+                pin = session_pin_label
+            ),
+            session_style,
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("      resolves to {session_resolved}"),
+            Style::default().fg(theme::DIM),
+        )]));
+        lines.push(Line::from(""));
+    }
     // Rows 1..n — per-agent overrides. Display the override id when set
     // or "(uses session pin)" otherwise.
     if snapshot.agents.is_empty() {
@@ -1363,12 +1422,15 @@ fn render_session_models(
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        lines.push(Line::from(vec![Span::styled(
-            "  Per-agent overrides",
-            Style::default().fg(theme::DIM),
-        )]));
-        for (i, agent) in snapshot.agents.iter().enumerate() {
-            let row = i + 1;
+        if window.first <= 1 {
+            lines.push(Line::from(vec![Span::styled(
+                "  Per-agent overrides",
+                Style::default().fg(theme::DIM),
+            )]));
+        }
+        for row in window.rows().filter(|&i| i > 0) {
+            let agent = &snapshot.agents[row - 1];
+            row_offsets.push((row, lines.len() as u16));
             let is_selected = row == cursor;
             let marker = if is_selected { "> " } else { "  " };
             let style = if is_selected {
@@ -1394,36 +1456,18 @@ fn render_session_models(
         Style::default().fg(theme::DIM),
     )]));
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    f.render_widget(Paragraph::new(lines), area);
 
-    // Click regions — one row per scope. Row 0 (Session) takes 1 line;
-    // each agent row takes 1 line further down. Row 0 sits at
-    // `row_offsets_start`; agents sit at offset + 3 + i (Session row +
-    // resolved-to subline + blank line + per-agent header line).
-    let area_bottom = area.y.saturating_add(area.height);
-    let session_y = area.y.saturating_add(row_offsets_start);
-    if session_y < area_bottom {
-        app.click_regions.push(ClickRegion {
-            x: area.x,
-            y: session_y,
-            w: area.width,
-            h: 1,
-            target: ClickTarget::SettingsDetailRow(0),
-        });
-    }
-    if !snapshot.agents.is_empty() {
-        let agents_start = row_offsets_start + 4;
-        for (i, _) in snapshot.agents.iter().enumerate() {
-            let y = area.y.saturating_add(agents_start + i as u16);
-            if y >= area_bottom {
-                break;
-            }
+    let bottom = area.y.saturating_add(area.height);
+    for (row, offset) in row_offsets {
+        let y = area.y.saturating_add(offset);
+        if y < bottom {
             app.click_regions.push(ClickRegion {
                 x: area.x,
                 y,
                 w: area.width,
                 h: 1,
-                target: ClickTarget::SettingsDetailRow(i + 1),
+                target: ClickTarget::SettingsDetailRow(row),
             });
         }
     }
