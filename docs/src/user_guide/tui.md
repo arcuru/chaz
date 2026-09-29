@@ -205,7 +205,7 @@ Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` appr
 
 ### Mouse
 
-Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls history (or the active overlay when one is open).
+Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session picker, model picker, and Settings lists it moves the selection three rows (over the Settings detail pane, not its category rail), and the list scrolls to keep the selection visible; other overlays swallow it; otherwise it scrolls history.
 
 ## Debug Mode
 

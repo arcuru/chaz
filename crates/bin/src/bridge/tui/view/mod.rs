@@ -1351,8 +1351,8 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     // Session rows below the pinned row are windowed, so a cursor moving past
     // the fold scrolls the list instead of walking off the bottom edge — which
     // is exactly what happened when every row was built and the pane clipped
-    // them. `y_off` is now the pinned row's screen offset, which is also where
-    // the first windowed row draws.
+    // them. `y_off` is now the first line below the pinned row, which is
+    // where the first windowed row draws.
     let rows_y0 = y_off;
     let row_h: u16 = 2;
     let window = ListWindow::uniform(
@@ -1895,6 +1895,35 @@ mod chat_frame_tests {
             },
         );
         assert_eq!(app.picker_index, 3);
+        assert_eq!(app.active().scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn settings_wheel_moves_detail_cursor_only_over_detail_pane() {
+        use super::super::input;
+        use super::super::{PeerSettingsCategory, SETTINGS_SIDEBAR_W, SettingsScope, TuiMode};
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = test_app("", 0).await;
+        app.mode = TuiMode::Settings(SettingsScope::Peer);
+        app.peer_settings_index = PeerSettingsCategory::ALL
+            .iter()
+            .position(|c| *c == PeerSettingsCategory::Defaults)
+            .unwrap();
+        app.peer_defaults = (0..10).map(|i| format!("agent-{i}")).collect();
+        let wheel = |column| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W - 1));
+        assert_eq!(app.peer_defaults_cursor, 0, "rail wheel must not move list");
+        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W));
+        assert_eq!(app.peer_defaults_cursor, 3);
+        for _ in 0..5 {
+            input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W + 4));
+        }
+        assert_eq!(app.peer_defaults_cursor, 9, "wheel clamps at the last row");
         assert_eq!(app.active().scroll_offset, 0);
     }
 
