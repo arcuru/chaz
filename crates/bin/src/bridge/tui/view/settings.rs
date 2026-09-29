@@ -526,7 +526,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
             .unwrap_or("");
         ellipsize(first.trim(), 80)
     };
-    let max_iter = format!("{}", a.max_iterations);
+    let spawn_depth = format!("{}", a.max_iterations);
     let autonomous = if a.autonomous { "yes" } else { "no" };
 
     let mut lines = vec![
@@ -537,7 +537,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
         )]),
         Line::from(""),
         about_kv("  default model", default_model),
-        about_kv("  max iter", &max_iter),
+        about_kv("  spawn depth", &spawn_depth),
         about_kv("  autonomous", autonomous),
         about_kv("  tools", &tools),
         Line::from(""),
@@ -582,7 +582,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
             Some(v) if v.is_empty() => "(none)".to_string(),
             Some(v) => v.join(", "),
         };
-        let w_max_iter = w
+        let w_spawn_depth = w
             .max_iterations
             .map(|n| n.to_string())
             .unwrap_or_else(|| "(inherit)".to_string());
@@ -603,7 +603,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
             theme::accent_bold(),
         )]));
         lines.push(about_kv("        model", &w_model));
-        lines.push(about_kv("        max iter", &w_max_iter));
+        lines.push(about_kv("        spawn depth", &w_spawn_depth));
         lines.push(about_kv("        tools", &w_tools));
         lines.push(about_kv("        prompt", &w_prompt_preview));
     }
@@ -1051,7 +1051,7 @@ fn render_peer_about(
 /// without lifetime games with their local Strings.
 fn about_kv(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<18}"), Style::default().fg(theme::DIM)),
+        Span::styled(format!("{label:<20}"), Style::default().fg(theme::DIM)),
         Span::styled(value.to_string(), Style::default().fg(Color::White)),
     ])
 }

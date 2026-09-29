@@ -26,7 +26,8 @@ All notable changes to this project will be documented in this file.
   forced no-tools summary after `max_iterations`, the repeated-call loop
   detector, and the no-tools retry after a provider failure are removed; a
   provider failure after bounded retries now fails the turn. `max_iterations`
-  is kept only as the nested spawn-depth ceiling (default 10).
+  is kept only as the nested spawn-depth ceiling (default 10), and the TUI
+  agent settings page now labels it "spawn depth".
 
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 
