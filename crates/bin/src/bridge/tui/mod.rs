@@ -580,6 +580,9 @@ pub(super) async fn refresh_status_segments(app: &mut App) {
         .collect();
 }
 
+/// Width of the Settings category rail; the detail pane starts right of it.
+pub(super) const SETTINGS_SIDEBAR_W: u16 = 16;
+
 /// First visible row of each cursor-driven list in the TUI.
 ///
 /// Held here rather than derived from the cursor so a list keeps its place

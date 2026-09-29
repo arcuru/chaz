@@ -32,7 +32,8 @@ pub(super) fn ui_settings(
 
     widgets::header(f, chunks[0], title, subtitle.as_deref(), Some("[Esc back]"));
 
-    let (sidebar_area, detail_area) = widgets::sidebar_detail_layout(chunks[1], 16);
+    let (sidebar_area, detail_area) =
+        widgets::sidebar_detail_layout(chunks[1], super::super::SETTINGS_SIDEBAR_W);
     let selected = app.settings_index(scope);
     let labels: Vec<&str> = match scope {
         SettingsScope::Peer => PeerSettingsCategory::ALL
