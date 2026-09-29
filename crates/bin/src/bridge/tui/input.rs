@@ -348,23 +348,82 @@ pub(super) enum MouseOutcome {
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
-    // Wheel scrolls the overlay when one is up, otherwise the chat history.
+    // Route the wheel to the visible cursor list; never scroll chat behind it.
     match m.kind {
-        MouseEventKind::ScrollUp => {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let down = m.kind == MouseEventKind::ScrollDown;
             if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
-                *scroll = scroll.saturating_sub(3);
+                *scroll = if down {
+                    scroll.saturating_add(3)
+                } else {
+                    scroll.saturating_sub(3)
+                };
+            } else if app.overlay.is_some() {
+                // Modal overlays own the wheel even when they have no scroll.
+            } else if let Some(picker) = app.settings_picker.as_mut() {
+                let last = picker.filtered().len().saturating_sub(1);
+                picker.selected = if down {
+                    picker.selected.saturating_add(3).min(last)
+                } else {
+                    picker.selected.saturating_sub(3)
+                };
+            } else if app.mode == TuiMode::ModelPicker {
+                let last = app.model_picker_filtered.len().saturating_sub(1);
+                app.model_picker_index = if down {
+                    app.model_picker_index.saturating_add(3).min(last)
+                } else {
+                    app.model_picker_index.saturating_sub(3)
+                };
+            } else if app.mode == TuiMode::SessionPicker {
+                let last = app.picker_len().saturating_sub(1);
+                app.picker_index = if down {
+                    app.picker_index.saturating_add(3).min(last)
+                } else {
+                    app.picker_index.saturating_sub(3)
+                };
+            } else if let TuiMode::Settings(scope) = app.mode {
+                // The left rail has no scrollable rows; only the detail pane does.
+                if m.column < 16 {
+                    return None;
+                }
+                let cat = app.settings_index(scope);
+                if let Some(len) = settings_inner_list_len(app, scope, cat) {
+                    let current = match scope {
+                        SettingsScope::Peer => match super::PeerSettingsCategory::ALL.get(cat) {
+                            Some(super::PeerSettingsCategory::Agents) => {
+                                &mut app.peer_agents_cursor
+                            }
+                            Some(super::PeerSettingsCategory::Defaults) => {
+                                &mut app.peer_defaults_cursor
+                            }
+                            Some(super::PeerSettingsCategory::Mcp) => &mut app.peer_mcp_cursor,
+                            _ => return None,
+                        },
+                        SettingsScope::Session => {
+                            match super::SessionSettingsCategory::ALL.get(cat) {
+                                Some(super::SessionSettingsCategory::Agents) => {
+                                    &mut app.session_agents_cursor
+                                }
+                                Some(super::SessionSettingsCategory::Models) => {
+                                    &mut app.session_models_cursor
+                                }
+                                _ => return None,
+                            }
+                        }
+                    };
+                    *current = if down {
+                        current.saturating_add(3).min(len.saturating_sub(1))
+                    } else {
+                        current.saturating_sub(3)
+                    };
+                }
             } else {
                 let off = &mut app.active_mut().scroll_offset;
-                *off = off.saturating_add(3);
-            }
-            return None;
-        }
-        MouseEventKind::ScrollDown => {
-            if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
-                *scroll = scroll.saturating_add(3);
-            } else {
-                let off = &mut app.active_mut().scroll_offset;
-                *off = off.saturating_sub(3);
+                *off = if down {
+                    off.saturating_sub(3)
+                } else {
+                    off.saturating_add(3)
+                };
             }
             return None;
         }
