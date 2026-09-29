@@ -19,10 +19,9 @@ graph TD
     SCAN --> INJECT[Scan for injection]
     INJECT --> FEED[Feed results to LLM]
     FEED --> CALL
-    EXEC --> CAP{Max iterations?}
-    CAP -->|Yes| FORCE[Force summary]
-    FORCE --> DONE
 ```
+
+There is no iteration cap. The loop ends when the model returns a response without native tool calls, when a model request fails after its bounded retries, or when the executor stops the task. Repeated identical calls are executed like any others; each gets its own result.
 
 ## Security Gates
 
@@ -54,10 +53,10 @@ Scheduled turns currently retain the compatibility `RuntimeEvent` adapter becaus
 
 ## Fallback Behavior
 
-- If the backend doesn't support tool calling, the runtime falls back to a single-shot LLM call.
-- If the first tool-aware call fails after retries, it retries once without tools (covers models/providers that advertise tools but reject the schema).
-- A `LoopDetector` fingerprints each tool-call set (name + canonical args); when the same fingerprint repeats `LOOP_DETECTION_THRESHOLD` times the runtime pushes a "you're stuck in a loop" `User` message and breaks out.
-- If `MAX_TOOL_ITERATIONS` (10) is reached, a forced no-tools summary call is made so the agent always returns a text response.
+- If the scoped tool set is empty, or the backend does not support tool calling, the runtime makes a single-shot call without tool definitions.
+- Otherwise every model request in the turn offers the same tool definitions. The runtime never withholds tools to force a final answer: withholding them lets a model that still wants a tool print its call as plain text.
+- A retryable provider error (rate limit, 5xx, timeout, network) is retried with backoff up to the backend's `max_retries`. When retries are exhausted, or the error is not retryable, the turn fails with that error. It is not retried without tools.
+- If the model returns an empty response after tool calls, the last tool result becomes the reply.
 
 ## Context Assembly
 

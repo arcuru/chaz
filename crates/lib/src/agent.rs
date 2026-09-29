@@ -72,7 +72,8 @@ pub struct Agent {
     /// Worker name (unique within the Agent). Lookup is scoped — Workers
     /// are NOT in a global registry; each Agent sees only its own.
     pub workers: HashMap<String, Worker>,
-    /// Maximum ReAct loop iterations.
+    /// Maximum nested spawn depth (legacy name). The ReAct loop itself
+    /// is unbounded: it runs until the model replies without tool calls.
     pub max_iterations: u32,
     /// Whether this agent can run without user input.
     pub autonomous: bool,
@@ -111,12 +112,9 @@ pub struct Worker {
     /// allowed_tools. When set, narrowed against the parent's list at
     /// spawn time (intersection).
     pub allowed_tools: Option<Vec<String>>,
-    /// Worker-level cap on ReAct iterations. **Ignored when invoked
-    /// under a parent Agent's iteration budget** — nested Workers share
-    /// the top-level Agent's atomic counter (see
-    /// `ToolContext::iteration_budget`) rather than each level getting a
-    /// fresh allotment. Used only when no parent budget is in scope
-    /// (test paths via direct `runtime::execute` calls).
+    /// Legacy-named maximum nested spawn depth for this Worker's child
+    /// session. It does not bound the ReAct loop: a turn keeps calling
+    /// tools until the model returns a response without tool calls.
     pub max_iterations: Option<u32>,
     /// Named override bundles selectable via the `preset` arg of `spawn_worker`.
     pub presets: HashMap<String, AgentPreset>,

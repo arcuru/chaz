@@ -480,7 +480,8 @@ pub struct AgentConfig {
     /// `researcher`. A Worker is a configured one-shot LLM call with no
     /// identity of its own; entries it writes are signed by this Agent's key.
     pub workers: Option<Vec<WorkerConfig>>,
-    /// Maximum ReAct loop iterations (default: 10)
+    /// Maximum nested spawn depth (legacy name; default: 10). Does not
+    /// bound the ReAct loop, which runs until the model stops calling tools.
     pub max_iterations: Option<u32>,
     /// Whether this agent can run without user input (scheduled/schedule)
     #[serde(default)]
@@ -542,13 +543,10 @@ pub struct WorkerConfig {
     pub model: Option<String>,
     /// Tool names this Worker may use. Narrows the parent Agent's tool
     /// list (intersection). May include other Workers; recursion is
-    /// bounded by depth + budget propagation on the calling Agent.
+    /// bounded by the spawn-depth ceiling.
     pub tools: Option<Vec<String>>,
-    /// Configured for completeness, but ignored when this Worker is
-    /// invoked under a parent Agent's iteration budget — nested Workers
-    /// share the top-level Agent's pool rather than getting a fresh
-    /// quota. Effective only when there is no parent budget (rare;
-    /// primarily test paths).
+    /// Maximum nested spawn depth for this Worker's child session
+    /// (legacy name). Does not bound the Worker's ReAct loop.
     pub max_iterations: Option<u32>,
     /// Named override bundles selectable at spawn time via the `preset`
     /// argument of `spawn_worker`.
@@ -560,7 +558,7 @@ pub struct WorkerConfig {
 pub struct AgentPreset {
     /// Override the model
     pub model: Option<String>,
-    /// Override max iterations
+    /// Override the maximum nested spawn depth (legacy name)
     pub max_iterations: Option<u32>,
     /// Restrict tools (must be subset of agent definition's tools)
     pub tools: Option<Vec<String>>,

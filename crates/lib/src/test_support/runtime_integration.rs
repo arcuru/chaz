@@ -591,7 +591,9 @@ async fn leak_detector_redacts_secret_in_tool_output() {
 }
 
 #[tokio::test]
-async fn loop_detection_breaks_when_same_tool_call_repeats() {
+async fn repeated_tool_calls_keep_tools_until_model_replies() {
+    // Identical native tool calls are not special: each one runs and gets
+    // its own result, and tools stay offered until the model stops asking.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
     let echo = EchoTool::new();
@@ -603,21 +605,19 @@ async fn loop_detection_breaks_when_same_tool_call_repeats() {
     let policies = ToolPolicyRegistry::empty();
 
     let mock = Arc::new(MockBackend::new());
-    // Three identical tool calls trip the LOOP_DETECTION_THRESHOLD.
     for i in 0..3 {
         mock.push_tool_calls(vec![(
             format!("c{i}"),
             "echo".into(),
-            json!({ "text": "loop" }).to_string(),
+            json!({ "text": "same" }).to_string(),
         )]);
     }
-    // Runtime then forces a no-tools final call after detecting the loop.
-    mock.push_text("got unstuck");
+    mock.push_text("done");
     let backend = BackendManager::with_mock(mock.clone(), secrets);
 
     let outcome = runtime::execute(
         Some("mock-model"),
-        vec![RuntimeMessage::User("loop please".into())],
+        vec![RuntimeMessage::User("repeat please".into())],
         &backend,
         &security,
         &ctx,
@@ -626,28 +626,27 @@ async fn loop_detection_breaks_when_same_tool_call_repeats() {
         None,
     )
     .await
-    .expect("runtime should exit cleanly when looping");
+    .expect("runtime should continue until the model replies");
 
-    assert_eq!(outcome.body, "got unstuck");
-    // Loop detector trips ON the 3rd repeated call before the tool runs again,
-    // so the echo tool only dispatches twice.
-    assert_eq!(
-        call_counter.load(Ordering::SeqCst),
-        2,
-        "echo runs for the first two iterations; the third trips the detector"
-    );
-    let final_call = mock.recorded_calls().pop().expect("at least one call");
+    assert_eq!(outcome.body, "done");
+    assert_eq!(call_counter.load(Ordering::SeqCst), 3);
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 4);
     assert!(
-        final_call.tools.is_empty(),
-        "the loop-break call advertises no tools"
+        calls.iter().all(|call| !call.tools.is_empty()),
+        "every model call advertises tools"
     );
-    let saw_break_prompt = final_call.messages.iter().any(|m| match m {
-        RuntimeMessage::User(s) => s.contains("stuck in a loop"),
-        _ => false,
-    });
+    let last = &calls[3].messages;
     assert!(
-        saw_break_prompt,
-        "loop-break user-prompt is appended before the final no-tools call"
+        last.iter()
+            .any(|m| matches!(m, RuntimeMessage::ToolResult { call_id, .. } if call_id == "c2")),
+        "the third repeated call's result reaches the model"
+    );
+    assert!(
+        !last
+            .iter()
+            .any(|m| matches!(m, RuntimeMessage::User(s) if s != "repeat please")),
+        "the runtime injects no synthetic user prompt"
     );
 }
 
@@ -845,32 +844,28 @@ async fn tool_result_messages_use_xml_wrapper_for_injection_safety() {
 }
 
 #[tokio::test]
-async fn max_iterations_forces_no_tools_summary_call() {
-    // If the LLM keeps requesting tool calls past the max-iteration cap, the
-    // runtime must break out and force a final no-tools call to produce a
-    // text response. We push more tool-call responses than the cap and a
-    // final summary text — the runtime should still terminate.
+async fn tool_loop_continues_past_ten_rounds() {
+    // The model, not an iteration count, decides when tool use is finished.
+    // Twelve rounds is past the former default cap of ten.
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
+    let echo = EchoTool::new();
+    let call_counter = echo.calls.clone();
     let registry = ToolRegistry::new();
-    registry.register(EchoTool::new());
+    registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
     let policies = ToolPolicyRegistry::empty();
 
     let mock = Arc::new(MockBackend::new());
-    // Push exactly MAX_TOOL_ITERATIONS (10) tool-call responses so the loop
-    // hits the cap, then a text for the post-cap no-tools summary call.
-    // Each iteration uses a different argument so loop detection does NOT
-    // trip — we want to exercise the max-iterations branch specifically.
-    for i in 0..10 {
+    for i in 0..12 {
         mock.push_tool_calls(vec![(
             format!("c{i}"),
             "echo".into(),
             json!({ "text": format!("turn-{i}") }).to_string(),
         )]);
     }
-    mock.push_text("forced summary");
+    mock.push_text("finished after twelve rounds");
     let backend = BackendManager::with_mock(mock.clone(), secrets);
 
     let outcome = runtime::execute(
@@ -884,21 +879,80 @@ async fn max_iterations_forces_no_tools_summary_call() {
         None,
     )
     .await
-    .expect("runtime should terminate at MAX_TOOL_ITERATIONS");
+    .expect("runtime should continue past ten tool rounds");
 
-    assert_eq!(outcome.body, "forced summary");
-    let final_call = mock.recorded_calls().pop().expect("had calls");
+    assert_eq!(outcome.body, "finished after twelve rounds");
+    assert_eq!(call_counter.load(Ordering::SeqCst), 12);
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 13);
     assert!(
-        final_call.tools.is_empty(),
-        "the forced-summary call advertises no tools"
+        calls.iter().all(|call| !call.tools.is_empty()),
+        "no forced no-tools call is made"
     );
-    let saw_summary_prompt = final_call.messages.iter().any(|m| match m {
-        RuntimeMessage::User(s) => s.contains("summarize"),
-        _ => false,
-    });
+    let last = &calls[12].messages;
     assert!(
-        saw_summary_prompt,
-        "summary-forcing prompt should be appended before the final call"
+        last.iter()
+            .any(|m| matches!(m, RuntimeMessage::ToolResult { call_id, .. } if call_id == "c11")),
+        "the twelfth tool result reaches the model"
+    );
+    assert!(
+        !last
+            .iter()
+            .any(|m| matches!(m, RuntimeMessage::User(s) if s != "go")),
+        "no summary prompt is injected"
+    );
+}
+
+#[tokio::test]
+async fn provider_failure_with_tools_is_an_error_not_a_no_tools_retry() {
+    // Retryable provider errors are retried with the same tool definitions;
+    // once retries are exhausted the turn fails explicitly instead of
+    // silently re-asking the model with tools withheld.
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let registry = ToolRegistry::new();
+    registry.register(EchoTool::new());
+    let ctx = tool_context(session, Arc::new(registry));
+    let security = permissive_security();
+    let policies = ToolPolicyRegistry::empty();
+
+    let mock = Arc::new(MockBackend::new());
+    let max_retries = 3;
+    for _ in 0..=max_retries {
+        mock.push_err(LlmError::ServerError {
+            status: 503,
+            message: "provider down".into(),
+        });
+    }
+    mock.push_text("must not be requested");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    assert_eq!(
+        backend.max_retries_for_model(Some("mock-model")),
+        max_retries
+    );
+
+    let result = runtime::execute(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("hi".into())],
+        &backend,
+        &security,
+        &ctx,
+        &policies,
+        None,
+        None,
+    )
+    .await;
+
+    let err = match result {
+        Ok(outcome) => panic!("provider failure should surface, got {:?}", outcome.body),
+        Err(e) => e,
+    };
+    assert!(err.contains("provider down"), "error propagates: {err}");
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), (max_retries + 1) as usize);
+    assert!(
+        calls.iter().all(|call| !call.tools.is_empty()),
+        "every attempt keeps the tool definitions"
     );
 }
 

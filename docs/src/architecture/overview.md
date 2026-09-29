@@ -110,8 +110,7 @@ The ReAct loop (`runtime::execute`) drives agent reasoning:
 1. Build context from session history
 2. Call LLM with tool definitions
 3. If the LLM returns tool calls: check approval, execute with timeout, scan for leaks, feed results back
-4. If the LLM returns text: return as the agent's response
-5. After max iterations: force a summary
+4. If the LLM returns text: return as the agent's response; otherwise repeat from step 2 (there is no iteration cap)
 
 The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event sink for audit trail logging.
 

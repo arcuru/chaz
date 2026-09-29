@@ -680,9 +680,6 @@ impl Server {
             agent_grants,
             host: self.host.clone(),
             active_extensions: active_extensions.clone(),
-            iteration_budget: Some(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
-                agent.max_iterations,
-            ))),
             routine_engine: self.routine_engine().cloned(),
         };
 

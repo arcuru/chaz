@@ -18,12 +18,9 @@ use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::security::SecurityContext;
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::future::Future;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -82,72 +79,6 @@ pub enum ToolResultOutcome {
     Blocked,
     TimedOut,
     Unavailable,
-}
-
-/// Fallback per-call ReAct cap used when `ToolContext::iteration_budget`
-/// is `None` (direct `runtime::execute` callers without the spawn
-/// machinery; primarily tests). Top-level Agent calls populate the
-/// budget so this value is unused under normal operation.
-const MAX_TOOL_ITERATIONS: usize = 10;
-
-/// Atomically consume one unit from a shared iteration budget.
-/// Returns `true` if a unit was claimed; `false` when the budget is
-/// already at zero (exhaustion).
-fn consume_budget(budget: &Arc<AtomicU32>) -> bool {
-    let mut current = budget.load(Ordering::SeqCst);
-    loop {
-        if current == 0 {
-            return false;
-        }
-        match budget.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => return true,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
-/// Number of times a tool call fingerprint can repeat before loop detection triggers.
-const LOOP_DETECTION_THRESHOLD: u32 = 3;
-
-/// Detects repetitive tool call patterns that indicate the agent is stuck in a loop.
-///
-/// Fingerprints each set of tool calls per iteration (sorted hash of name + arguments).
-/// When the same fingerprint appears `LOOP_DETECTION_THRESHOLD` times, the loop is
-/// considered stuck and should be broken.
-struct LoopDetector {
-    /// Maps iteration fingerprints to their occurrence count.
-    fingerprints: HashMap<u64, u32>,
-}
-
-impl LoopDetector {
-    fn new() -> Self {
-        Self {
-            fingerprints: HashMap::new(),
-        }
-    }
-
-    /// Record a set of tool calls for one iteration and check for loops.
-    /// Returns `true` if a loop is detected.
-    fn record_and_check(&mut self, tool_calls: &[ToolCallRequest]) -> bool {
-        let fingerprint = Self::fingerprint(tool_calls);
-        let count = self.fingerprints.entry(fingerprint).or_insert(0);
-        *count += 1;
-        *count >= LOOP_DETECTION_THRESHOLD
-    }
-
-    /// Compute a fingerprint for a set of tool calls.
-    /// Sorts by name to be order-independent within a single iteration.
-    fn fingerprint(tool_calls: &[ToolCallRequest]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        let mut pairs: Vec<(&str, &str)> = tool_calls
-            .iter()
-            .map(|tc| (tc.name.as_str(), tc.arguments.as_str()))
-            .collect();
-        pairs.sort();
-        pairs.hash(&mut hasher);
-        hasher.finish()
-    }
 }
 
 // === Message types for the ReAct loop ===
@@ -567,22 +498,9 @@ pub async fn execute_with_recorder(
 
     let mut approve_all = false; // tracks if user chose "approve all" this turn
     let mut rate_limiter = RateLimiter::new();
-    let mut loop_detector = LoopDetector::new();
 
     let mut iteration: usize = 0;
     loop {
-        // Budget gate: top-level Agents and inherited Workers share a
-        // single `Arc<AtomicU32>` so nested invocations draw from one
-        // pool. When no budget is plumbed in (test contexts), fall back
-        // to the built-in cap.
-        let budget_exhausted = match tool_ctx.iteration_budget.as_ref() {
-            Some(budget) => !consume_budget(budget),
-            None => iteration >= MAX_TOOL_ITERATIONS,
-        };
-        if budget_exhausted {
-            break;
-        }
-
         let response = match llm_call_with_retry(
             backend,
             model,
@@ -594,53 +512,6 @@ pub async fn execute_with_recorder(
         .await
         {
             Ok(resp) => resp,
-            Err(ref e) if e.is_retryable() && iteration == 0 => {
-                // All retries exhausted on first call with tools — try without tools
-                // in case this model/provider doesn't support function calling.
-                info!(
-                    error = %e,
-                    "Tool-aware call failed after retries, falling back to no-tools execution"
-                );
-                return match llm_call_with_retry(
-                    backend,
-                    model,
-                    &messages,
-                    &[],
-                    &resolved_model,
-                    max_retries,
-                )
-                .await
-                {
-                    Ok(LLMResponse::Text { content, metadata }) => {
-                        record_runtime(
-                            &recorder,
-                            RuntimeRecord::ModelResponse {
-                                model_sequence,
-                                content: Some(content.clone()),
-                                tool_calls: Vec::new(),
-                                provider_extra: Default::default(),
-                                metadata: metadata.clone(),
-                                terminal: true,
-                            },
-                        )
-                        .await?;
-                        if let Some(m) = metadata {
-                            acc.record(m);
-                        }
-                        Ok(finalize_outcome(
-                            hub,
-                            hook_ctx.as_ref(),
-                            RuntimeOutcome {
-                                body: content,
-                                metadata: acc.finalize(),
-                            },
-                        )
-                        .await)
-                    }
-                    Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
-            }
             Err(e) => {
                 // All retries exhausted or non-retryable — stop
                 warn!(
@@ -767,20 +638,6 @@ pub async fn execute_with_recorder(
                     "Tool calls requested: {:?}",
                     tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>()
                 );
-
-                // --- Loop detection: check if the agent is repeating the same calls ---
-                if loop_detector.record_and_check(&tool_calls) {
-                    warn!(
-                        iteration,
-                        threshold = LOOP_DETECTION_THRESHOLD,
-                        tools = ?tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>(),
-                        "Loop detected: agent is repeating the same tool calls"
-                    );
-                    messages.push(RuntimeMessage::User(
-                        "You are stuck in a loop — you have made the same tool calls multiple times with the same arguments. Stop using tools and provide your best response based on the information you already have.".to_string(),
-                    ));
-                    break;
-                }
 
                 // Record the assistant's tool call request
                 messages.push(RuntimeMessage::AssistantToolCalls {
@@ -1035,61 +892,6 @@ pub async fn execute_with_recorder(
 
         model_sequence += 1;
         iteration += 1;
-    }
-
-    // Hit the cap or loop detected — make one final call without tools to force a text summary
-    info!("Forcing final response (max iterations or loop detected)");
-    // Only add summary prompt if the last message isn't already a loop-break prompt
-    if !matches!(messages.last(), Some(RuntimeMessage::User(msg)) if msg.contains("stuck in a loop"))
-    {
-        messages.push(RuntimeMessage::User(
-            "Please summarize what you found so far and respond to the user.".to_string(),
-        ));
-    }
-    match llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries).await {
-        Ok(LLMResponse::Text { content, metadata }) if !content.is_empty() => {
-            record_runtime(
-                &recorder,
-                RuntimeRecord::ModelResponse {
-                    model_sequence,
-                    content: Some(content.clone()),
-                    tool_calls: Vec::new(),
-                    provider_extra: Default::default(),
-                    metadata: metadata.clone(),
-                    terminal: true,
-                },
-            )
-            .await?;
-            if let Some(m) = metadata {
-                acc.record(m);
-            }
-            Ok(finalize_outcome(
-                hub,
-                hook_ctx.as_ref(),
-                RuntimeOutcome {
-                    body: content,
-                    metadata: acc.finalize(),
-                },
-            )
-            .await)
-        }
-        Ok(_) | Err(_) => {
-            // Last resort: return the last tool result
-            for msg in messages.iter().rev() {
-                if let RuntimeMessage::ToolResult { content, .. } = msg {
-                    return Ok(finalize_outcome(
-                        hub,
-                        hook_ctx.as_ref(),
-                        RuntimeOutcome {
-                            body: content.clone(),
-                            metadata: acc.finalize(),
-                        },
-                    )
-                    .await);
-                }
-            }
-            Err("Agent reached maximum tool iterations without a final response".to_string())
-        }
     }
 }
 
@@ -1363,101 +1165,6 @@ mod tests {
         );
     }
 
-    fn make_tool_call(name: &str, args: &str) -> ToolCallRequest {
-        ToolCallRequest {
-            id: "call_1".to_string(),
-            name: name.to_string(),
-            arguments: args.to_string(),
-        }
-    }
-
-    #[test]
-    fn test_loop_detector_no_loop() {
-        let mut detector = LoopDetector::new();
-        // Different tool calls each time — no loop
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"pwd"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("read_file", r#"{"path":"a.txt"}"#)]));
-    }
-
-    #[test]
-    fn test_loop_detector_triggers_on_repetition() {
-        let mut detector = LoopDetector::new();
-        let calls = vec![make_tool_call("shell", r#"{"cmd":"ls"}"#)];
-        assert!(!detector.record_and_check(&calls)); // 1st
-        assert!(!detector.record_and_check(&calls)); // 2nd
-        assert!(detector.record_and_check(&calls)); // 3rd — loop detected
-    }
-
-    #[test]
-    fn test_loop_detector_order_independent() {
-        let mut detector = LoopDetector::new();
-        let calls_a = vec![
-            make_tool_call("shell", r#"{"cmd":"ls"}"#),
-            make_tool_call("read_file", r#"{"path":"a.txt"}"#),
-        ];
-        let calls_b = vec![
-            make_tool_call("read_file", r#"{"path":"a.txt"}"#),
-            make_tool_call("shell", r#"{"cmd":"ls"}"#),
-        ];
-        assert!(!detector.record_and_check(&calls_a));
-        assert!(!detector.record_and_check(&calls_b)); // same tools, different order
-        assert!(detector.record_and_check(&calls_a)); // 3rd — loop detected
-    }
-
-    #[test]
-    fn test_loop_detector_different_args_no_loop() {
-        let mut detector = LoopDetector::new();
-        // Same tool, different arguments each time — not a loop
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -l"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -a"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -la"}"#)]));
-    }
-
-    #[test]
-    fn test_loop_detector_fingerprint_deterministic() {
-        let calls = vec![make_tool_call("a", "1"), make_tool_call("b", "2")];
-        let fp1 = LoopDetector::fingerprint(&calls);
-        let fp2 = LoopDetector::fingerprint(&calls);
-        assert_eq!(fp1, fp2);
-    }
-
-    // ================================================================
-    // iteration budget
-    // ================================================================
-
-    #[test]
-    fn consume_budget_decrements_and_signals_exhaustion() {
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(3));
-        assert!(consume_budget(&budget));
-        assert!(consume_budget(&budget));
-        assert!(consume_budget(&budget));
-        // 4th attempt — pool drained.
-        assert!(!consume_budget(&budget));
-        // Still drained on subsequent attempts (doesn't underflow).
-        assert!(!consume_budget(&budget));
-        assert_eq!(budget.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn consume_budget_starting_at_zero_is_immediately_exhausted() {
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        assert!(!consume_budget(&budget));
-    }
-
-    #[test]
-    fn consume_budget_is_shared_across_clones() {
-        // Two clones of the same Arc see the same underlying counter —
-        // the property that lets nested Worker invocations drain the
-        // top-level Agent's pool rather than each getting a fresh one.
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(5));
-        let alias = budget.clone();
-        assert!(consume_budget(&budget));
-        assert!(consume_budget(&alias));
-        assert!(consume_budget(&budget));
-        assert_eq!(alias.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
     // ================================================================
     // execute_with_retry
     // ================================================================
@@ -1565,7 +1272,6 @@ mod tests {
             agent_grants: Default::default(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
-            iteration_budget: None,
             routine_engine: None,
         }
     }
