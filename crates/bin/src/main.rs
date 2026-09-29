@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
-    let mut config: Config = serde_yaml::from_str(&contents)?;
+    let mut config: Config = config::parse_config(&contents)?;
 
     // Validate the connector contract before even creating log/state
     // directories. A missing or mixed migration config must be a read-only

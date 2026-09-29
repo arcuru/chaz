@@ -143,10 +143,10 @@ impl Server {
                 .map_or(1, |authority| authority.call_depth + 1),
             max_call_depth: inherited
                 .as_ref()
-                .map_or(parent_agent.max_iterations as usize, |authority| {
+                .map_or(parent_agent.max_spawn_depth as usize, |authority| {
                     authority.max_call_depth
                 })
-                .min(target_agent.max_iterations as usize),
+                .min(target_agent.max_spawn_depth as usize),
             allowed_tools: tool_ceilings.keys().cloned().collect(),
             tool_ceilings,
             capability_ceiling: ceiling.clone(),

@@ -235,7 +235,7 @@ agents:
     workers:
       - name: researcher
         system_prompt: "You are a focused research assistant. Use web_fetch and calculate to answer questions concisely."
-        max_iterations: 20
+        max_spawn_depth: 20
         tools: ["web_fetch", "calculate", "get_time"]
 
 # Security settings

@@ -399,6 +399,17 @@ fn config_gate_hash(cfg: &crate::agent_db::AgentDbConfig) -> anyhow::Result<Stri
     Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
 }
 
+/// [`config_gate_hash`] as a build from before the `max_iterations` →
+/// `max_spawn_depth` rename computed it for the same config. Only the key name
+/// differs, so a record whose stored hash matches this was reconciled from a
+/// yaml block that is unchanged apart from the rename.
+fn legacy_config_gate_hash(cfg: &crate::agent_db::AgentDbConfig) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(cfg)?;
+    crate::agent_db::downgrade_spawn_depth_keys(&mut value);
+    let canonical = serde_json::to_string(&value)?;
+    Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
+}
+
 /// Outcome of [`Server::reload_config_for`]. `considered` counts the yaml agent
 /// entries that passed the optional name filter — `considered == 0` with a name
 /// filter means "no such agent in yaml", distinct from "matched but unchanged".
@@ -1329,7 +1340,7 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("no config path set — reload unavailable"))?;
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-        let config: crate::config::Config = serde_yaml::from_str(&contents)
+        let config = crate::config::parse_config(&contents)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
 
         // Warn about unrecognised keys on each reload (config may change).
@@ -1415,6 +1426,23 @@ impl Server {
         if current.applied_config_hash.as_deref() == Some(new_hash.as_str()) {
             return Ok(false);
         }
+        // Spawn-depth rename migration: a hash written by a pre-rename build
+        // for this same yaml block means the yaml is unchanged, so re-applying
+        // it would clobber live `/agent set` edits. Keep the DB values (the
+        // read already moved the depth to its new key) and only restamp the
+        // gate, which also persists the record in its renamed shape.
+        if current.applied_config_hash.as_deref()
+            == Some(legacy_config_gate_hash(&intended)?.as_str())
+        {
+            let mut migrated = current;
+            migrated.applied_config_hash = Some(new_hash);
+            db.write_config(&migrated).await?;
+            tracing::info!(
+                agent = %ac.name,
+                "migrated agent config to max_spawn_depth; yaml unchanged, DB values kept"
+            );
+            return Ok(false);
+        }
         intended.applied_config_hash = Some(new_hash);
         db.write_config(&intended).await?;
         Ok(true)
@@ -1431,7 +1459,7 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("no config path set — config unavailable"))?;
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-        serde_yaml::from_str(&contents)
+        crate::config::parse_config(&contents)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
     }
 
@@ -3023,7 +3051,7 @@ impl Server {
         let max_call_depth = if spawn.max_call_depth > 0 {
             spawn.max_call_depth
         } else {
-            agent.max_iterations as usize
+            agent.max_spawn_depth as usize
         };
 
         let profile = agent

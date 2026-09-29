@@ -526,7 +526,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
             .unwrap_or("");
         ellipsize(first.trim(), 80)
     };
-    let spawn_depth = format!("{}", a.max_iterations);
+    let spawn_depth = format!("{}", a.max_spawn_depth);
     let autonomous = if a.autonomous { "yes" } else { "no" };
 
     let mut lines = vec![
@@ -583,7 +583,7 @@ fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
             Some(v) => v.join(", "),
         };
         let w_spawn_depth = w
-            .max_iterations
+            .max_spawn_depth
             .map(|n| n.to_string())
             .unwrap_or_else(|| "(inherit)".to_string());
         let w_prompt_preview = if w.system_prompt.is_empty() {

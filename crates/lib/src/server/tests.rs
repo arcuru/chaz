@@ -240,7 +240,7 @@ async fn hydrate_picks_up_db_config_edits() {
             "alpha",
             &AgentDbConfig {
                 model: Some("haiku".to_string()),
-                max_iterations: Some(5),
+                max_spawn_depth: Some(5),
                 ..Default::default()
             },
             &AgentMeta {
@@ -267,7 +267,7 @@ async fn hydrate_picks_up_db_config_edits() {
         default_model: Some("opus".to_string()),
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 999,
+        max_spawn_depth: 999,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -281,7 +281,7 @@ async fn hydrate_picks_up_db_config_edits() {
     let input = stale.clone();
     let hydrated = server.hydrate_agent_from_db(input).await;
     assert_eq!(hydrated.default_model.as_deref(), Some("haiku"));
-    assert_eq!(hydrated.max_iterations, 5);
+    assert_eq!(hydrated.max_spawn_depth, 5);
     // And the registry reflects the live state too.
     assert_eq!(
         server
@@ -296,7 +296,7 @@ async fn hydrate_picks_up_db_config_edits() {
     // Write V2 to the DB.
     db.write_config(&AgentDbConfig {
         model: Some("sonnet".to_string()),
-        max_iterations: Some(42),
+        max_spawn_depth: Some(42),
         ..Default::default()
     })
     .await
@@ -305,7 +305,7 @@ async fn hydrate_picks_up_db_config_edits() {
     stale.default_model = Some("opus".to_string()); // re-enter with stale snapshot
     let hydrated_v2 = server.hydrate_agent_from_db(stale).await;
     assert_eq!(hydrated_v2.default_model.as_deref(), Some("sonnet"));
-    assert_eq!(hydrated_v2.max_iterations, 42);
+    assert_eq!(hydrated_v2.max_spawn_depth, 42);
     assert_eq!(
         server
             .agents()
@@ -329,7 +329,7 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
         default_model: Some("ghost".to_string()),
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 7,
+        max_spawn_depth: 7,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -340,7 +340,7 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
     let result = server.hydrate_agent_from_db(input.clone()).await;
     assert_eq!(result.name, "phantom");
     assert_eq!(result.default_model.as_deref(), Some("ghost"));
-    assert_eq!(result.max_iterations, 7);
+    assert_eq!(result.max_spawn_depth, 7);
 }
 
 #[tokio::test]
@@ -394,7 +394,7 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
         default_model: None,
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 10,
+        max_spawn_depth: 10,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -490,7 +490,7 @@ async fn reload_config_for_rereads_yaml_from_disk() {
         default_model: None,
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 10,
+        max_spawn_depth: 10,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -1455,7 +1455,7 @@ fn register_alpha_agent_runtime(server: &Server) {
         default_model: Some("test-model".to_string()),
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 1,
+        max_spawn_depth: 1,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -3272,7 +3272,7 @@ async fn transcript_commits_full_tool_exchange_before_progression() {
 
 #[tokio::test]
 async fn executor_turn_keeps_tools_past_former_iteration_cap() {
-    // A live executor turn is not capped by the Agent's `max_iterations`
+    // A live executor turn is not capped by the Agent's `max_spawn_depth`
     // (1 here, and the former default of 10 is also exceeded): every model
     // request offers tools until the model replies without a tool call.
     use crate::test_support::MockBackend;
@@ -5244,7 +5244,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
         };
         let mut agent_config = AgentDbConfig::default();
         agent_config.grants.insert("calculate".into(), restricted);
-        agent_config.max_iterations = Some(2);
+        agent_config.max_spawn_depth = Some(2);
         let (agent_db, pubkey) = create_agent_db(
             &mut user,
             "default",
@@ -5275,7 +5275,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
         };
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let mut configured = agents.get("default").unwrap();
-        configured.max_iterations = 2;
+        configured.max_spawn_depth = 2;
         configured.grants.insert(
             "calculate".into(),
             crate::grants::Grants {
@@ -5633,6 +5633,269 @@ async fn published_job_is_adopted_without_creating_another_child() {
             server.shutdown().await;
         }
         client_server.shutdown().await;
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// A pre-rename build stamped the reconcile gate with a hash over the old
+/// `max_iterations` key. Upgrading must recognise that stamp as "yaml
+/// unchanged": keep the DB's live `/agent set` value instead of re-applying
+/// yaml, rewrite the record under the new key, and only apply yaml again once
+/// the yaml block itself changes.
+#[tokio::test]
+async fn reconcile_migrates_pre_rename_record_without_clobbering_live_edits() {
+    let (_instance, server, registry) = server_fixture().await;
+    let ac: crate::config::AgentConfig = serde_yaml::from_str(
+        "name: chaz\nmax_spawn_depth: 20\nworkers:\n  - name: researcher\n    max_spawn_depth: 30\n",
+    )
+    .unwrap();
+    let (db, pubkey) = {
+        let mut user = registry.user_for_tests().await;
+        create_agent_db(
+            &mut user,
+            "chaz",
+            &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
+            &AgentMeta {
+                display_name: Some("chaz".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    };
+    server.agent_index().register(DbEntry {
+        db_id: db.id(),
+        display_name: "chaz".to_string(),
+        pubkey,
+    });
+    assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
+    let current = db.read_raw_config_for_tests().await.unwrap();
+    let new_hash = current["applied_config_hash"].as_str().unwrap().to_string();
+
+    // Rebuild the record the old build would have left: same content with
+    // the old key name, its gate hash computed over that shape, then a live
+    // `/agent set chaz max_iterations 40` on top.
+    let mut unstamped = current.clone();
+    unstamped
+        .as_object_mut()
+        .unwrap()
+        .remove("applied_config_hash");
+    let old_text = serde_json::to_string(&unstamped)
+        .unwrap()
+        .replace("\"max_spawn_depth\"", "\"max_iterations\"");
+    let old_hash = blake3::hash(old_text.as_bytes()).to_hex().to_string();
+    let mut old_record: serde_json::Value = serde_json::from_str(&old_text).unwrap();
+    old_record["applied_config_hash"] = old_hash.clone().into();
+    old_record["max_iterations"] = 40.into();
+    db.write_raw_config_for_tests(&old_record).await.unwrap();
+
+    // Upgrade restart: yaml (renamed key, same values) is unchanged.
+    assert!(!server.reconcile_agent_from_yaml(&ac).await.unwrap());
+    let migrated = db.read_raw_config_for_tests().await.unwrap();
+    assert!(
+        !migrated.to_string().contains("max_iterations"),
+        "{migrated}"
+    );
+    assert_eq!(migrated["max_spawn_depth"], 40, "live edit survives");
+    assert_eq!(migrated["workers"][0]["max_spawn_depth"], 30);
+    assert_eq!(migrated["applied_config_hash"], new_hash.as_str());
+    // Settled: the next reconcile is a no-op.
+    assert!(!server.reconcile_agent_from_yaml(&ac).await.unwrap());
+    assert_eq!(db.read_raw_config_for_tests().await.unwrap(), migrated);
+
+    // A real yaml edit applies as before.
+    let mut edited = ac.clone();
+    edited.max_spawn_depth = Some(25);
+    assert!(server.reconcile_agent_from_yaml(&edited).await.unwrap());
+    assert_eq!(db.read_config().await.unwrap().max_spawn_depth, Some(25));
+
+    // A pre-rename record whose yaml changed while chaz was down is not
+    // mistaken for unchanged: yaml applies.
+    old_record["max_iterations"] = 40.into();
+    db.write_raw_config_for_tests(&old_record).await.unwrap();
+    assert!(server.reconcile_agent_from_yaml(&edited).await.unwrap());
+    let applied = db.read_config().await.unwrap();
+    assert_eq!(applied.max_spawn_depth, Some(25));
+    assert_eq!(applied.workers[0].max_spawn_depth, Some(30));
+}
+
+/// Accepted jobs freeze `min(parent, target)` spawn depth, and every restart
+/// re-derives that value from the runtime Agents to validate the chain. The
+/// rename must therefore reproduce the pre-upgrade depth exactly: a pre-rename
+/// AgentDb record and the renamed yaml key both yield 3, while a silent reset
+/// to the default 10 would invalidate the in-flight jobs.
+#[tokio::test]
+async fn pre_rename_spawn_depth_keeps_accepted_jobs_valid_across_restart() {
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+    Box::pin(async {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("depth-rename.sock");
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("depth-rename"),
+        )
+        .await
+        .unwrap();
+        let (agent_db, pubkey) = create_agent_db(
+            &mut user,
+            "default",
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some("default".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // The record as a pre-rename build persisted it.
+        let mut record = serde_json::to_value(AgentDbConfig::default()).unwrap();
+        let obj = record.as_object_mut().unwrap();
+        obj.remove("max_spawn_depth");
+        obj.insert("max_iterations".into(), 3.into());
+        agent_db.write_raw_config_for_tests(&record).await.unwrap();
+        let agent = DbEntry {
+            db_id: agent_db.id(),
+            display_name: "default".into(),
+            pubkey,
+        };
+
+        // The old yaml key is refused rather than defaulting to 10; the
+        // renamed key carries the same value.
+        let yaml = "agents:\n  - name: default\n    max_spawn_depth: 3\n";
+        assert!(
+            crate::config::parse_config(&yaml.replace("max_spawn_depth", "max_iterations"))
+                .is_err()
+        );
+        let config = crate::config::parse_config(yaml).unwrap();
+        let agents = Arc::new(AgentRegistry::from_config(&config));
+        assert_eq!(agents.get("default").unwrap().max_spawn_depth, 3);
+
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let settings = crate::config::EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: crate::config::EideticaLoginConfig {
+                username: "depth-rename".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
+        let registry = Arc::new(
+            crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
+                .await
+                .unwrap(),
+        );
+        let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+        registry
+            .attach_agent_to_session(&parent_id.0, &agent)
+            .await
+            .unwrap();
+        let client = client_server_fixture_from_registry(registry.clone()).await;
+        let (executor, mock) =
+            published_executor_with_mock(&settings, agents.clone(), agent.clone()).await;
+        // The per-turn DB hydration reads the pre-rename record: still 3.
+        assert_eq!(
+            executor
+                .hydrate_agent_from_db(agents.get("default").unwrap())
+                .await
+                .max_spawn_depth,
+            3
+        );
+
+        let id = client
+            .submit_agent_job(&parent_id.0, "default", "first")
+            .await
+            .unwrap();
+        let wait = |id: String| {
+            let client = client.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    client.wait_job(&id, std::time::Duration::from_secs(14)),
+                )
+                .await
+                .expect("job must finish")
+                .unwrap()
+            }
+        };
+        assert!(matches!(
+            wait(id.clone()).await.state,
+            crate::session::jobs::JobState::Succeeded { .. }
+        ));
+        let (_, child) = registry.open_session(&id).await.unwrap();
+        let first = crate::session::jobs::read_accepted_job(&child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.definition.call_depth, 1);
+        assert_eq!(first.definition.max_call_depth, 3, "not reset to 10");
+
+        // A descendant of the accepted job inherits the frozen ceiling.
+        mock.push_text("nested");
+        let nested_id = client
+            .submit_agent_job(&id, "default", "nested")
+            .await
+            .unwrap();
+        assert!(matches!(
+            wait(nested_id.clone()).await.state,
+            crate::session::jobs::JobState::Succeeded { .. }
+        ));
+        let (_, nested) = registry.open_session(&nested_id).await.unwrap();
+        let second = crate::session::jobs::read_accepted_job(&nested)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.definition.call_depth, 2);
+        assert_eq!(second.definition.max_call_depth, 3);
+        executor.shutdown().await;
+
+        // Restart: a fresh runtime registry from the renamed yaml.
+        let restarted_agents = Arc::new(AgentRegistry::from_config(&config));
+        let restarted =
+            published_executor(&settings, restarted_agents.clone(), agent.clone()).await;
+        assert!(
+            restarted
+                .validate_accepted_job(&child)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            restarted
+                .validate_accepted_job(&nested)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Same after the DB hydration a turn performs.
+        restarted
+            .hydrate_agent_from_db(restarted_agents.get("default").unwrap())
+            .await;
+        assert_eq!(restarted_agents.get("default").unwrap().max_spawn_depth, 3);
+        assert!(
+            restarted
+                .validate_accepted_job(&nested)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Control: the silent reset this migration prevents would break the
+        // in-flight chain.
+        let mut reset = restarted_agents.get("default").unwrap();
+        reset.max_spawn_depth = 10;
+        restarted_agents.upsert(reset);
+        assert!(restarted.validate_accepted_job(&nested).await.is_err());
+
+        restarted.shutdown().await;
+        client.shutdown().await;
         drop(shutdown);
         task.await.unwrap().unwrap();
     })

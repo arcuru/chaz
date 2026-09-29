@@ -641,7 +641,7 @@ impl Server {
         let allowed_tools = agent.allowed_tools.clone();
         let agent_capabilities = agent.capabilities.clone();
         let agent_grants = agent.grants.clone();
-        let max_call_depth = agent.max_iterations as usize;
+        let max_call_depth = agent.max_spawn_depth as usize;
         let max_context_tokens = agent.max_context_tokens;
         let profile = agent
             .tool_profile
