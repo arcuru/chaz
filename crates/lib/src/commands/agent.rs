@@ -257,7 +257,7 @@ pub(super) async fn agent_set_burst(n: Option<usize>, ctx: &CommandContext<'_>) 
 /// Supported `/agent new` and `/agent set` keys. Nested-structure fields
 /// (`grants`, `presets`) intentionally omitted — edit yaml template or add
 /// a dedicated command.
-const SUPPORTED_AGENT_FIELDS: &str = "model, tools, autonomous, max_iterations, tool_profile, max_context_tokens, system_prompt, system_prompt_files";
+const SUPPORTED_AGENT_FIELDS: &str = "model, tools, autonomous, max_spawn_depth, tool_profile, max_context_tokens, system_prompt, system_prompt_files";
 
 /// Apply a single `key=value` override to an `AgentDbConfig`. Used by
 /// `/agent new` (on a fresh config) and `/agent set` (on a DB-loaded one).
@@ -285,11 +285,18 @@ pub(super) fn apply_agent_field(
         "model" => cfg.model = Some(value.to_string()),
         "tools" => cfg.tools = Some(comma_split(value)),
         "autonomous" => cfg.autonomous = parse_bool(value)?,
-        "max_iterations" => {
-            cfg.max_iterations = Some(
+        "max_spawn_depth" => {
+            cfg.max_spawn_depth = Some(
                 value
                     .parse::<u32>()
-                    .map_err(|e| format!("Invalid max_iterations '{value}': {e}"))?,
+                    .map_err(|e| format!("Invalid max_spawn_depth '{value}': {e}"))?,
+            );
+        }
+        "max_iterations" => {
+            return Err(
+                "max_iterations was renamed to max_spawn_depth (it sets the nested spawn-depth \
+                 ceiling). Use: max_spawn_depth"
+                    .to_string(),
             );
         }
         "tool_profile" => cfg.tool_profile = Some(value.to_string()),

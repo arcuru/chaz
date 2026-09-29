@@ -131,7 +131,7 @@ pub enum Command {
     // --- Agent lifecycle ---
     /// Create a new Living Agent DB. Optional `overrides` apply to the
     /// `AgentDbConfig` before the DB is written — e.g. `role`, `model`,
-    /// `max_iterations`, `tools`.
+    /// `max_spawn_depth`, `tools`.
     AgentNew {
         name: String,
         overrides: Vec<(String, String)>,
