@@ -255,6 +255,34 @@ with every owner stopped and a backup retained. This is an operator step, not
 an automatic startup reset. The fixture uses fresh Eidetica databases and upgrades
 only the legacy Matrix session/device state.
 
+### Supervised live smoke test without production state
+
+A local pass does not establish live-homeserver compatibility or a safe upgrade of
+existing Eidetica verification labels. Keep those as separate operator gates:
+
+1. With operator approval, create disposable bot and sender accounts on the target
+   homeserver. Use a new, isolated Chaz daemon/bridge configuration, fresh Eidetica
+   databases, separate Matrix stores, and the local stub model. Do not copy production
+   tokens, databases, login directories, or account cross-signing secrets into them.
+2. Cross-sign the sender's device, then test an encrypted DM: ordinary text and
+   `!chaz help` must get decryptable replies. Inspect raw room history for
+   `m.room.encrypted`, not only the client's decrypted display. No manual trust
+   ceremony with the bot should be required for these fresh identities.
+3. Add an unsigned sender device. Confirm deliberate reply-key withholding and
+   ignored incoming messages; also check an unencrypted room and allow-list rejection.
+   Do not weaken policy or reset an identity to make a failing case work.
+4. Stop and restart only the isolated bridge, keeping its session and store together.
+   Confirm unchanged device/key fingerprints, no replacement identity, and another
+   encrypted reply. Retain redacted logs and revision/binary fingerprints, then stop
+   the test processes and retire the disposable accounts with operator approval.
+5. Before a later production upgrade, separately assess the old Eidetica revision's
+   verification rules and inventory all owners. Rehearse the documented offline
+   trust reset and re-verification on an isolated backup copy with network sync
+   disabled. Reset only disposable local verification labels, not Matrix identities
+   or immutable Entries. A successful fresh-state smoke test is not migration proof;
+   do not start the new version against production data until the operator approves
+   the backup, offline procedure, and rollback plan.
+
 ## Writing a new case
 
 `run.sh` is deliberately a single linear script rather than a framework: it

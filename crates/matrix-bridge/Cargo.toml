@@ -36,3 +36,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 reqwest = "0.13"
 ruma = { version = "0.16", default-features = false, features = ["client-api-c"] }
+wiremock = "0.6"

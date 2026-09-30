@@ -134,8 +134,8 @@ build context, call an LLM, or write a reply.
 Transport encryption terminates in the bridge. The Matrix bridge decrypts before its
 message handler runs, through matrix-sdk with a persistent per-login crypto store. It
 writes the same plaintext `Message` entry it writes for an unencrypted room, and it
-encrypts replies on the way out. Trust follows MSC4153: keys go only to cross-signed
-devices, and only cross-signed senders are decrypted. The session DB, peer sync, and model
+encrypts replies on the way out. Recipient policy follows MSC4153: keys go only to
+cross-signed devices. The bridge also requires cross-signed incoming senders. The session DB, peer sync, and model
 backend see plaintext either way. See [Encrypted Rooms](../user_guide/matrix.md#encrypted-rooms).
 
 ## The daemon registry-watch

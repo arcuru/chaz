@@ -281,9 +281,8 @@ fn resolve_store(session: &mut ClientSession, state_dir: &Path) -> anyhow::Resul
 
 /// Build a client on the login's persistent, passphrase-encrypted store.
 ///
-/// Trust follows MSC4153 in both directions: room keys are shared only with
-/// devices their owner has cross-signed, and only messages from cross-signed
-/// devices are decrypted. No interactive verification with the bot is needed.
+/// Recipient policy follows MSC4153: room keys go only to devices their owner
+/// has cross-signed. The bridge also requires cross-signed incoming senders. No interactive verification with the bot is needed.
 /// `auto_enable_cross_signing` stays off; see [`MatrixClient::ensure_cross_signed`].
 fn encrypted_builder(session: &ClientSession) -> ClientBuilder {
     Client::builder()
@@ -324,15 +323,30 @@ async fn check_device_key(client: &Client, expected: Option<&str>) -> anyhow::Re
         .device_keys
         .insert(user.to_owned(), vec![device.to_owned()]);
     let response = client.send(request).await?;
+    anyhow::ensure!(
+        response.failures.is_empty(),
+        "Matrix device key query failed; refusing to upload replacement device keys"
+    );
     let remote = match response
         .device_keys
         .get(user)
         .and_then(|devices| devices.get(device))
     {
-        Some(raw) => serde_json::from_str::<serde_json::Value>(raw.json().get())?["keys"]
-            [format!("ed25519:{device}")]
-        .as_str()
-        .map(str::to_owned),
+        Some(raw) => {
+            let published = raw.deserialize()?;
+            anyhow::ensure!(
+                published.user_id == user && published.device_id == device,
+                "published Matrix device account differs; refusing to overwrite it"
+            );
+            let key_id: matrix_sdk::ruma::OwnedDeviceKeyId = format!("ed25519:{device}").parse()?;
+            Some(
+                published
+                    .keys
+                    .get(&key_id)
+                    .context("published Matrix device key missing; refusing to overwrite it")?
+                    .clone(),
+            )
+        }
         None => None,
     };
     anyhow::ensure!(
@@ -447,22 +461,35 @@ async fn do_login(
 /// unencrypted rooms keep working.
 async fn initialize_cross_signing(client: &Client, login: &Login) -> anyhow::Result<()> {
     let encryption = client.encryption();
-    if encryption
-        .cross_signing_status()
-        .await
-        .is_some_and(|status| status.is_complete())
-    {
-        return Ok(());
-    }
     let user = client.user_id().context("Matrix user missing")?.to_owned();
-    // Refresh our own identity from the server before deciding it is absent:
-    // bootstrapping over an existing identity would reset it for every client.
-    if encryption.request_user_identity(&user).await?.is_some() {
-        let signed = encryption
+    // Local keys can be complete before their upload succeeds. The SDK also
+    // retains a cached identity when the server returns none, so query the raw
+    // published identity before deciding whether bootstrap is safe or needed.
+    let mut request = get_keys::v3::Request::new();
+    request.device_keys.insert(user.clone(), vec![]);
+    let published = client.send(request).await?;
+    anyhow::ensure!(
+        published.failures.is_empty(),
+        "Matrix identity query failed; refusing cross-signing bootstrap"
+    );
+    if published.master_keys.contains_key(&user) {
+        encryption.request_user_identity(&user).await?;
+        let device = encryption
             .get_own_device()
             .await?
-            .is_some_and(|device| device.is_cross_signed_by_owner());
-        if !signed {
+            .context("Matrix device missing")?;
+        if encryption
+            .cross_signing_status()
+            .await
+            .is_some_and(|status| status.is_complete())
+        {
+            // The SDK may also cache a signature whose upload failed. Re-send
+            // our device signature with the existing keys, never reset identity.
+            device
+                .verify()
+                .await
+                .context("Matrix device cross-signing failed")?;
+        } else if !device.is_cross_signed_by_owner() {
             warn!(
                 "{user} already has a cross-signing identity this device does not hold; \
                  replies in encrypted rooms stay disabled until another session of the \
@@ -515,6 +542,11 @@ async fn write_session(session_file: &Path, full: &FullSession) -> anyhow::Resul
             options.mode(0o600);
         }
         let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(&serialized)?;
         file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
@@ -621,16 +653,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_cross_signing_upload_is_retried_without_replacing_keys() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for failed_path in [
+            "/_matrix/client/v3/keys/device_signing/upload",
+            "/_matrix/client/v3/keys/signatures/upload",
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.11"]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/_matrix/client/v3/keys/query"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}, "master_keys": {}, "self_signing_keys": {},
+                    "user_signing_keys": {}, "failures": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/_matrix/client/v3/keys/upload"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/_matrix/client/v3/keys/signatures/upload"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "failures": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/_matrix/client/v3/keys/device_signing/upload"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(failed_path))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errcode": "M_FORBIDDEN", "error": "injected upload failure"
+                })))
+                .with_priority(1)
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = legacy(&server.uri());
+            resolve_store(&mut session, dir.path()).unwrap();
+            let client = encrypted_builder(&session).build().await.unwrap();
+            let user_session: MatrixSession = serde_json::from_value(serde_json::json!({
+                "user_id": "@a:hs", "device_id": "DEV", "access_token": "disposable"
+            }))
+            .unwrap();
+            client.restore_session(user_session.clone()).await.unwrap();
+            assert!(
+                client
+                    .encryption()
+                    .bootstrap_cross_signing(None)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .encryption()
+                    .cross_signing_status()
+                    .await
+                    .unwrap()
+                    .is_complete()
+            );
+            drop(client);
+
+            if failed_path.ends_with("signatures/upload") {
+                let requests = server.received_requests().await.unwrap();
+                let identity: serde_json::Value = serde_json::from_slice(
+                    &requests
+                        .iter()
+                        .find(|request| request.url.path().ends_with("device_signing/upload"))
+                        .unwrap()
+                        .body,
+                )
+                .unwrap();
+                let device: serde_json::Value = serde_json::from_slice(
+                    &requests
+                        .iter()
+                        .find(|request| request.url.path() == "/_matrix/client/v3/keys/upload")
+                        .unwrap()
+                        .body,
+                )
+                .unwrap();
+                Mock::given(method("POST"))
+                    .and(path("/_matrix/client/v3/keys/query"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "device_keys": {"@a:hs": {"DEV": device["device_keys"]}},
+                        "master_keys": {"@a:hs": identity["master_key"]},
+                        "self_signing_keys": {"@a:hs": identity["self_signing_key"]},
+                        "user_signing_keys": {"@a:hs": identity["user_signing_key"]},
+                        "failures": {}
+                    })))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+            let client = encrypted_builder(&session).build().await.unwrap();
+            client.restore_session(user_session).await.unwrap();
+            initialize_cross_signing(
+                &client,
+                &Login {
+                    homeserver_url: server.uri(),
+                    username: "a".into(),
+                    password: None,
+                },
+            )
+            .await
+            .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let uploads: Vec<_> = requests
+                .iter()
+                .filter(|request| {
+                    request.url.path() == "/_matrix/client/v3/keys/device_signing/upload"
+                })
+                .collect();
+            if failed_path.ends_with("device_signing/upload") {
+                assert_eq!(
+                    uploads.len(),
+                    2,
+                    "restart must retry the unpublished identity"
+                );
+                assert_eq!(
+                    uploads[0].body, uploads[1].body,
+                    "retry must retain cross-signing keys"
+                );
+            } else {
+                assert_eq!(
+                    uploads.len(),
+                    1,
+                    "a published identity must not be rewritten"
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path().ends_with("signatures/upload"))
+                        .count(),
+                    2,
+                    "restart must retry the device signature"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn crypto_account_and_published_key_checks_fail_closed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"versions": ["v1.11"]})),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = legacy(&server.uri());
+        resolve_store(&mut session, dir.path()).unwrap();
+        let user_session: MatrixSession = serde_json::from_value(serde_json::json!({
+            "user_id": "@a:hs", "device_id": "DEV", "access_token": "disposable"
+        }))
+        .unwrap();
+        let client = encrypted_builder(&session).build().await.unwrap();
+        client.restore_session(user_session.clone()).await.unwrap();
+        let key = client.encryption().ed25519_key().await.unwrap();
+        assert!(
+            check_device_key(&client, Some("different recorded key"))
+                .await
+                .is_err()
+        );
+        for (remote_key, failures, expected_ok) in [
+            (Some(key.as_str()), serde_json::json!({}), true),
+            (
+                Some("different published key"),
+                serde_json::json!({}),
+                false,
+            ),
+            (None, serde_json::json!({}), false),
+            (
+                None,
+                serde_json::json!({"hs": {"errcode": "M_UNAVAILABLE"}}),
+                false,
+            ),
+        ] {
+            let device_keys = if failures.as_object().unwrap().is_empty() {
+                let keys = remote_key
+                    .map(|key| serde_json::json!({"ed25519:DEV": key}))
+                    .unwrap_or(serde_json::json!({}));
+                serde_json::json!({"@a:hs": {"DEV": {"user_id": "@a:hs", "device_id": "DEV", "algorithms": [], "keys": keys, "signatures": {}}}})
+            } else {
+                serde_json::json!({})
+            };
+            Mock::given(method("POST"))
+                .and(path("/_matrix/client/v3/keys/query"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": device_keys, "failures": failures
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                check_device_key(&client, Some(&key)).await.is_ok(),
+                expected_ok,
+                "missing or mismatched published key must not authorize a replacement upload"
+            );
+        }
+        // Even an identity the SDK cannot parse must not be treated as absent
+        // and overwritten; a failed query is not proof of absence either.
+        for (body, expected_ok) in [
+            (
+                serde_json::json!({"device_keys": {}, "master_keys": {"@a:hs": {
+                    "user_id": "@a:hs", "usage": ["master"], "keys": {}
+                }}}),
+                true,
+            ),
+            (
+                serde_json::json!({"device_keys": {}, "failures": {"hs": {"errcode": "M_UNAVAILABLE"}}}),
+                false,
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/_matrix/client/v3/keys/query"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .up_to_n_times(if expected_ok { 2 } else { 1 })
+                .mount(&server)
+                .await;
+            assert_eq!(
+                initialize_cross_signing(
+                    &client,
+                    &Login {
+                        homeserver_url: server.uri(),
+                        username: "a".into(),
+                        password: None,
+                    }
+                )
+                .await
+                .is_ok(),
+                expected_ok
+            );
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| { !request.url.path().ends_with("/upload") }),
+            "account/key/identity checks must not upload anything"
+        );
+        drop(client);
+        for (user, device) in [("@b:hs", "DEV"), ("@a:hs", "OTHER")] {
+            let client = encrypted_builder(&session).build().await.unwrap();
+            let other: MatrixSession = serde_json::from_value(serde_json::json!({
+                "user_id": user, "device_id": device, "access_token": "disposable"
+            }))
+            .unwrap();
+            assert!(
+                client.restore_session(other).await.is_err(),
+                "mismatched account must not restore"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_session_file_is_private_and_replaced_whole() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session");
         std::fs::write(&path, b"old").unwrap();
+        // A prior interrupted write may have left a temporary file with a
+        // permissive mode; creation options do not change an existing inode.
+        std::fs::write(path.with_extension("tmp"), b"interrupted").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                path.with_extension("tmp"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
         let full: FullSession = serde_json::from_str(
             r#"{"client_session":{"homeserver":"http://hs","db_path":"/s","passphrase":"p"},
                 "user_session":{"user_id":"@a:hs","device_id":"DEV","access_token":"tok"}}"#,
         )
         .unwrap();
         write_session(&path, &full).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         persist_sync_token(&path, "s2".into()).await.unwrap();
 
         let saved: FullSession =

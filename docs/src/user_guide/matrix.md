@@ -291,7 +291,8 @@ never trusts a device just because it appeared in the room.
   `Could not decrypt a message; it is ignored.` with its room, sender, and event id.
 - **The bot's side.** On first start the bridge signs its own device. If the account has no
   cross-signing identity, the bridge creates one. It uses the configured password if the
-  homeserver asks for re-authentication. If the account already has an identity that was
+  homeserver asks for re-authentication. An interrupted upload is retried on restart with
+  the same keys; an existing published identity is never reset. If the account has an identity that was
   created elsewhere, for example by signing the bot account into Element, the bridge cannot
   sign itself. It logs a warning, and it can read encrypted rooms but cannot reply in them
   until you verify its device from that other session. Plaintext rooms are not affected.
