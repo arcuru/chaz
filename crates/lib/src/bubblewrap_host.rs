@@ -1,5 +1,4 @@
 //! Bubblewrap tool host — OS-level sandboxing via `bwrap`.
-#![allow(dead_code)] // Available but not yet wired into config
 //!
 //! Wraps high-risk capability execution in Linux namespaces using
 //! [bubblewrap](https://github.com/containers/bubblewrap). Provides
@@ -13,7 +12,10 @@
 //! - No IPC access (`--unshare-ipc`)
 //! - Read-only system directories (`/usr`, `/bin`, `/lib`, `/lib64`, `/nix`)
 //! - Ephemeral `/tmp` (tmpfs)
-//! - Isolated PID namespace
+//! - The working directory (when supplied) bind-mounted read-write; every
+//!   other path is simply absent from the mount namespace
+//! - No `/proc` — the host's PID namespace and `/proc/<pid>/root` escape
+//!   hatch are not exposed
 //! - Killed when the parent exits (`--die-with-parent`)
 //!
 //! File read/write and HTTP capabilities fall through to native
@@ -38,8 +40,9 @@ use tracing::warn;
 /// restricting filesystem access, network, and process visibility.
 /// Non-shell capabilities pass through to native execution.
 ///
-/// Available for use; not yet selectable in config. To use, replace
-/// `NativeToolHost` with `BubblewrapToolHost` in main.rs.
+/// Selectable via `tool_host: bubblewrap` in config; the default is
+/// [`NativeToolHost`]. When `bwrap` is absent from `PATH` the host
+/// degrades to native execution for every capability.
 pub struct BubblewrapToolHost {
     /// Path to the `bwrap` binary.
     bwrap_path: String,
@@ -122,7 +125,9 @@ fn build_bwrap_command(
         }
     }
 
-    cmd.arg("--proc").arg("/proc");
+    // `/proc` is deliberately *not* mounted: without `--unshare-pid` a fresh
+    // procfs still shows the host's PID namespace, leaking the host process
+    // list and re-exposing the host root through `/proc/<pid>/root`.
     cmd.arg("--dev").arg("/dev");
 
     if let Some(dir) = working_dir {
@@ -279,5 +284,160 @@ mod tests {
     #[test]
     fn test_default_does_not_panic() {
         let _host = BubblewrapToolHost::default();
+    }
+}
+
+// ── Integration tests (real bwrap execution) ───────────────────
+//
+// These run a *real* `bwrap` sandbox and assert on the denials — the whole
+// point of the host. They skip (rather than fail) when bwrap is absent from
+// PATH or the kernel refuses unprivileged user namespaces, so they stay green
+// on systems without bubblewrap while still exercising the boundary where it
+// is available.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use crate::tool_host::ShellOutput;
+
+    /// Run `command` through a freshly-built bwrap host and return the shell
+    /// output. Panics if the host is degraded or returns a non-shell result —
+    /// a degraded host silently falls through to native execution, which would
+    /// make every "denied" assertion below a false pass.
+    async fn run(command: &str, working_dir: Option<&str>) -> ShellOutput {
+        let host = BubblewrapToolHost::new();
+        assert!(host.available, "bwrap must be usable for this test");
+        let result = host
+            .request(
+                &Capability::Shell {
+                    command: command.to_string(),
+                    working_dir: working_dir.map(String::from),
+                },
+                &Grants::default(),
+            )
+            .await
+            .expect("host request should not error");
+        match result {
+            CapabilityResult::Shell(o) => o,
+            other => panic!("expected shell output, got {other:?}"),
+        }
+    }
+
+    /// Probe whether a real sandbox can be created here: bwrap on PATH *and*
+    /// unprivileged user namespaces enabled. Binds the host root read-only so
+    /// the probe exercises the same mount-namespace path the host uses rather
+    /// than a no-op `true`.
+    fn bwrap_usable() -> bool {
+        std::process::Command::new("bwrap")
+            .args([
+                "--unshare-net",
+                "--unshare-ipc",
+                "--ro-bind",
+                "/",
+                "/",
+                "--chdir",
+                "/",
+                "true",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn network_access_is_denied_with_a_useful_error() {
+        if !bwrap_usable() {
+            eprintln!("skipping: bwrap sandbox unavailable");
+            return;
+        }
+        // `/dev/tcp` is a bash builtin: a successful connect would print
+        // CONNECTED. `--unshare-net` must make the connect fail instead, and
+        // the failure should carry a diagnostic on stderr.
+        let out = run(
+            "cat < /dev/tcp/1.1.1.1/80 2>/dev/null && echo CONNECTED || echo BLOCKED",
+            None,
+        )
+        .await;
+        assert!(
+            !out.stdout.contains("CONNECTED"),
+            "a sandboxed shell reached the network: {}",
+            out.stdout
+        );
+        assert!(out.stdout.contains("BLOCKED"), "got: {}", out.stdout);
+        assert!(
+            !out.stderr.is_empty(),
+            "a denied connection should surface a diagnostic on stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_to_readonly_system_dir_is_denied() {
+        if !bwrap_usable() {
+            eprintln!("skipping: bwrap sandbox unavailable");
+            return;
+        }
+        let out = run("echo PWNED > /nix/bwrap-escape-test", None).await;
+        assert_ne!(out.exit_code, 0, "write to /nix must fail, got {out:?}");
+        assert!(
+            !out.stderr.is_empty(),
+            "a denied write should surface a useful error on stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_outside_working_dir_is_denied() {
+        if !bwrap_usable() {
+            eprintln!("skipping: bwrap sandbox unavailable");
+            return;
+        }
+        // `/etc` is not mounted into the namespace at all, so the path is
+        // absent and the write fails without touching the host.
+        let out = run("echo PWNED > /etc/bwrap-escape-test", None).await;
+        assert_ne!(out.exit_code, 0, "write to /etc must fail, got {out:?}");
+        assert!(
+            !out.stderr.is_empty(),
+            "a denied write should surface a useful error on stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_to_working_dir_is_allowed() {
+        if !bwrap_usable() {
+            eprintln!("skipping: bwrap sandbox unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("chaz-bwrap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = run("echo hello > out.txt", Some(dir.to_str().unwrap())).await;
+        assert_eq!(
+            out.exit_code, 0,
+            "write inside workdir must succeed: {out:?}"
+        );
+        // The working dir is bind-mounted read-write, so the file is visible
+        // on the host at the same path.
+        let content = std::fs::read_to_string(dir.join("out.txt")).unwrap();
+        assert_eq!(content.trim(), "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn host_pid_namespace_is_not_exposed() {
+        if !bwrap_usable() {
+            eprintln!("skipping: bwrap sandbox unavailable");
+            return;
+        }
+        // `/proc` is deliberately not mounted; `test -d /proc` must report it
+        // absent rather than listing the host's processes.
+        let out = run(
+            "test -d /proc && echo PROC_EXISTS || echo PROC_ABSENT",
+            None,
+        )
+        .await;
+        assert!(
+            out.stdout.contains("PROC_ABSENT"),
+            "/proc must not be mounted, got: {}",
+            out.stdout
+        );
     }
 }
