@@ -4623,7 +4623,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion() {
         .await
         .unwrap();
     txn.commit().await.unwrap();
-    owner_user.enable_sync(owner_db.root_id()).await.unwrap();
+    owner_db.share().await.unwrap();
     let owner_sync = owner.sync().unwrap();
     owner_sync
         .register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))

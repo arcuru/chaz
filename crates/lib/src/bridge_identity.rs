@@ -130,10 +130,24 @@ impl AccessBootstrap for SyncBootstrap {
         permission: Permission,
         metadata: Option<Doc>,
     ) -> anyhow::Result<BootstrapOutcome> {
+        // Match the prior bootstrap API: preserve configured preferences on
+        // retries; a new database stays disabled until establish_login enables it.
+        let sync_settings = user
+            .database(ticket.database_id())
+            .await
+            .map(|tracked| tracked.sync_settings)
+            .unwrap_or_default();
         let mut last_err = None;
         for attempt in single_address_tickets(ticket) {
             match user
-                .request_database_access(&self.sync, &attempt, key, permission, metadata.clone())
+                .request_database_access(
+                    &self.sync,
+                    &attempt,
+                    key,
+                    permission,
+                    sync_settings.clone(),
+                    metadata.clone(),
+                )
                 .await
             {
                 Ok(()) => return Ok(BootstrapOutcome::Approved),
@@ -280,8 +294,8 @@ pub async fn establish_login<B: AccessBootstrap>(
         );
         return Ok(outcome);
     }
-    // Approved. `request_database_access` tracks the database with sync
-    // **disabled** by default, so without this the agent DB is openable but
+    // Approved. SyncBootstrap preserves existing preferences and requests new
+    // databases with sync disabled, so without this the agent DB is openable but
     // never converges — neither eidetica's background engine nor chaz's keyed
     // reconciler looks at a database whose owner has not asked for sync. A
     // bridge always wants its agent DB syncing; that is the whole point of

@@ -216,13 +216,15 @@ log "transport: $TRANSPORT"
 # http mode the bridge binds only loopback HTTP, so the run stays hermetic; in
 # iroh mode both peers register the P2P transport and nothing else.
 if [[ $TRANSPORT == "http" ]]; then
-	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
+	EIDETICA_SYNC_DAEMON="  sync:\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
 	EIDETICA_SYNC_BRIDGE="  sync:\n    http_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
 else
 	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true"
 	EIDETICA_SYNC_BRIDGE="  sync:\n    iroh: true"
 fi
-EIDETICA_BIN="git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04"
+# Keep provisioning on the same dependency as the consumer. A local immutable
+# flake override is allowed while that revision is not published.
+EIDETICA_FLAKE="${EIDETICA_FLAKE:-git+https://github.com/arcuru/eidetica?rev=$(sed -n 's/^eidetica = .*rev = "\([^"]*\)".*/\1/p' "$REPO_ROOT/Cargo.toml")}"
 
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
@@ -360,13 +362,13 @@ default_agents: [chaz]
 EOF
 
 mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
-nix run "$EIDETICA_BIN" -- \
+nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
 # The bridge's store is provisioned the same explicit way: the connector
 # never creates one, and the legacy `chaz-matrix` login is what its config
 # names.
-nix run "$EIDETICA_BIN" -- \
+nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
 

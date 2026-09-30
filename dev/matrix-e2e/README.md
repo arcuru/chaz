@@ -134,7 +134,7 @@ and bridge peers.
 
 | Flag               | Behavior                                                                                                                                                                                                                                                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--transport http` | **Default.** Both peers listen on loopback HTTP. The daemon's `sync_listen` is set and iroh hints are stripped from the ticket. Fast, reliable, good for CI iteration.                                                                                                                                                     |
+| `--transport http` | **Default.** Both peers set `eidetica.sync.http_listen` to loopback. Neither registers an Iroh endpoint, so sync stays local.                                                                                                                                                                                              |
 | `--transport iroh` | Neither peer binds a sync port. They discover each other through iroh's DHT/relay mechanism instead. Expected to be slower and less reliable — that's the point, it exercises the production transport path that unit tests and the default http mode can't reach. If it doesn't reliably connect, that's actionable data. |
 
 `--transport iroh` is the one mode that is **not hermetic**: iroh discovery
@@ -197,11 +197,8 @@ sequence exists to protect.
   bridge deployed before encryption support. The first start must upgrade that
   device in place. Creating a fresh device would pass the other cases and miss
   the path a real upgrade takes.
-- **The ticket's `iroh:` hints are stripped** (in `--transport http` mode only;
-  `--transport iroh` keeps them). The daemon mints a fresh iroh
-  endpoint on every start, so a recorded address is stale as soon as it is
-  written, and sync pays a full timeout per dead address. Both processes are on
-  loopback, where the `http:` hint is what connects.
+- **HTTP mode registers only loopback transports.** It also strips any
+  `iroh:` ticket hints defensively; `--transport iroh` keeps them.
 - **`XDG_CONFIG_HOME` is redirected into the workspace**, because
   `/agent share` writes a copy of every ticket under the config directory.
 - **Ports are requested from the kernel**, not hardcoded, so a run does not
@@ -209,6 +206,54 @@ sequence exists to protect.
 - **Every `curl` carries `--max-time`.** A poll loop is only bounded if each
   attempt is, and a server that accepts a connection and then stops answering
   is otherwise an attempt that never returns.
+
+## Unpublished dependency: local acceptance only
+
+The E2EE dependency pin is Eidetica
+`94c2624c7793c798847240c3287ff06280420eed` (sqlx 0.9). It is not yet
+published at the public Git URL. The manifest and lock name that final revision;
+**a fresh public checkout cannot build until it is published**. Do not substitute
+the old pin with a sqlx backport: that tests a different API and source tree.
+
+With a local Git repository containing that exact commit, create an immutable
+copy and a disposable consumer snapshot. Only the snapshot's dependency URL is
+rewritten; no path patch or file URL belongs in the committed consumer:
+
+```bash
+# Run from a committed Chaz checkout; set this to the local Eidetica repository.
+EIDETICA_REPO=/path/to/eidetica
+REV=94c2624c7793c798847240c3287ff06280420eed
+WORK=$(mktemp -d -p /tmp)
+git clone --no-hardlinks "$EIDETICA_REPO" "$WORK/eidetica"
+git -C "$WORK/eidetica" checkout --detach "$REV"
+test "$(git -C "$WORK/eidetica" rev-parse HEAD)" = "$REV"
+test -z "$(git -C "$WORK/eidetica" status --porcelain)"
+chmod -R a-w "$WORK/eidetica"
+mkdir "$WORK/chaz"
+git archive HEAD | tar -x -C "$WORK/chaz"
+sed -i "s|https://github.com/arcuru/eidetica|file://$WORK/eidetica|g" \
+    "$WORK/chaz/Cargo.toml" "$WORK/chaz/Cargo.lock"
+cd "$WORK/chaz"
+export CARGO_TARGET_DIR="$WORK/target"
+export CHAZ_BIN="$CARGO_TARGET_DIR/debug/chaz"
+export CHAZ_MATRIX_BIN="$CARGO_TARGET_DIR/debug/chaz-matrix"
+export E2EE_PROBE_BIN="$CARGO_TARGET_DIR/debug/examples/e2ee_probe"
+export EIDETICA_FLAKE="git+file://$WORK/eidetica?rev=$REV"
+CI=1 nix develop .# -c just nix full
+nix develop .# -c just e2e --keep --timeout 60
+```
+
+`EIDETICA_FLAKE` controls the CLI that provisions both disposable peer stores;
+it must point to the same revision as the consumer. Without the override the
+harness derives the public pin from `Cargo.toml`. Keep the logs and both source
+revisions when reporting results. An overlay pass establishes local integration,
+not publication, deployment, or compatibility of an existing production database.
+
+When upgrading an existing Eidetica database across verification-rule changes,
+follow Eidetica's [offline trust-reset procedure](https://github.com/arcuru/eidetica/blob/main/docs/src/design/verification.md#explicit-trust-reset-on-verification-rule-upgrades)
+with every owner stopped and a backup retained. This is an operator step, not
+an automatic startup reset. The fixture uses fresh Eidetica databases and upgrades
+only the legacy Matrix session/device state.
 
 ## Writing a new case
 
