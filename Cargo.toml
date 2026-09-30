@@ -23,7 +23,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "proce
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-matrix-sdk = { version = "0.18", default-features = false, features = ["markdown"] }
+matrix-sdk = { version = "0.18", default-features = false, features = ["markdown", "e2e-encryption", "sqlite"] }
+# Crypto policy types (recipient strategy, decryption trust) that matrix-sdk
+# does not re-export. Keep in lockstep with matrix-sdk.
+matrix-sdk-base = { version = "0.18", default-features = false, features = ["e2e-encryption"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "http"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

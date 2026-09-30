@@ -102,6 +102,23 @@ stranger, and the agent all joined:
   addressing gate, so `allow_list` is the only thing left that can produce
   silence. A bare message here would prove nothing Case 1a does not.
 
+### Encrypted rooms
+
+A cross-signed puppet device opens an encrypted DM with the agent. A second,
+unsigned puppet device shares the room:
+
+- **E1/E2** — a plain message and a `!chaz` command are decrypted and answered,
+  and the probe decrypts the replies.
+- **E3** — the unsigned device receives the same reply as undecryptable, with
+  the key withheld as `m.unverified`. That proves the bridge knew about the
+  device and withheld the key on purpose, rather than missing it.
+- **E4** — a message from the unsigned device is logged as undecryptable and
+  gets no answer. A later message from the signed device is the barrier.
+- **E5** — after a bridge restart the device id and device key are unchanged,
+  no new cross-signing identity is created, and the room still works.
+- **E6** — the server's copy of the room holds only `m.room.encrypted` events
+  from the agent, never a plaintext `m.room.message`.
+
 ### Room reset
 
 The `chaz-matrix rooms` maintenance command runs last, against the same
@@ -169,11 +186,17 @@ sequence exists to protect.
 
 ## Notes
 
-- **The room is unencrypted, and it has to be.** chaz builds `matrix-sdk`
-  without the `e2e-encryption` feature, so an encrypted room is one the bridge
-  cannot read. The puppet is plain HTTP against the client-server API for the
-  same reason — no Olm, no client library, nothing to keep in sync with the
-  bridge's capabilities.
+- **The main rooms are unencrypted; one room is encrypted.** The plaintext
+  cases use plain HTTP against the client-server API, with no client library.
+  Encryption needs a real Olm/Megolm device, so the encrypted cases drive
+  `e2ee_probe` (`crates/matrix-bridge/examples/e2ee_probe.rs`), a small
+  matrix-sdk client that keeps each device's store in the workspace. `just e2e`
+  builds it; override its path with `E2EE_PROBE_BIN`.
+- **The bridge starts from a pre-encryption session.** The harness logs the
+  agent in over HTTP and writes a session file with no crypto store, like every
+  bridge deployed before encryption support. The first start must upgrade that
+  device in place. Creating a fresh device would pass the other cases and miss
+  the path a real upgrade takes.
 - **The ticket's `iroh:` hints are stripped** (in `--transport http` mode only;
   `--transport iroh` keeps them). The daemon mints a fresh iroh
   endpoint on every start, so a recorded address is stale as soon as it is

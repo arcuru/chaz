@@ -23,6 +23,9 @@ use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{
     Request as TypingRequest, Typing, TypingInfo,
 };
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
+use matrix_sdk::ruma::events::room::encrypted::{
+    EncryptedEventScheme, OriginalSyncRoomEncryptedEvent,
+};
 use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::{
@@ -34,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use client::is_allowed;
 pub(crate) use client::{Login, MatrixClient};
@@ -633,16 +636,13 @@ impl Bridge for MatrixBridge {
         let room_size_limit = creds.room_size_limit.or(config.room_size_limit);
 
         // --- Connect: login/restore, auto-join, prime the sync token ---
-        let mut mc = MatrixClient::login(
-            &Login {
-                homeserver_url: creds.homeserver_url.clone(),
-                username: creds.username.clone(),
-                password: creds.password.clone(),
-            },
-            state_dir.as_deref(),
-            "chaz",
-        )
-        .await?;
+        let login = Login {
+            homeserver_url: creds.homeserver_url.clone(),
+            username: creds.username.clone(),
+            password: creds.password.clone(),
+        };
+        let mut mc = MatrixClient::login(&login, state_dir.as_deref(), "chaz").await?;
+        mc.ensure_cross_signed(&login).await?;
 
         mc.install_autojoin(allow_list.clone(), room_size_limit);
 
@@ -693,6 +693,47 @@ impl Bridge for MatrixBridge {
                         }
                     }
                 });
+        }
+
+        // The SDK decrypts before dispatch, so a message the bridge can read
+        // reaches the handler below as an ordinary `m.room.message`. What
+        // arrives here is an event it could not decrypt: no room key yet, a
+        // withheld key, or a sender device that is not cross-signed. Name it,
+        // so an encrypted room that gets no reply is diagnosable from the log.
+        {
+            let allow_list = allow_list.clone();
+            mc.client().add_event_handler(
+                move |event: OriginalSyncRoomEncryptedEvent, room: Room| {
+                    let allow_list = allow_list.clone();
+                    async move {
+                        let Some(bot_uid) = room.client().user_id().map(|u| u.to_string()) else {
+                            return;
+                        };
+                        let session_id = match &event.content.scheme {
+                            EncryptedEventScheme::MegolmV1AesSha2(c) => c.session_id.as_str(),
+                            _ => "",
+                        };
+                        if is_allowed(allow_list.as_deref(), event.sender.as_str(), &bot_uid) {
+                            warn!(
+                                room_id = %room.room_id(),
+                                sender = %event.sender,
+                                event_id = %event.event_id,
+                                session_id,
+                                "Could not decrypt a message; it is ignored. The sender's \
+                                 device must be cross-signed and must share its room key \
+                                 with this device"
+                            );
+                        } else {
+                            debug!(
+                                room_id = %room.room_id(),
+                                sender = %event.sender,
+                                event_id = %event.event_id,
+                                "Could not decrypt a message from a sender outside the allow list"
+                            );
+                        }
+                    }
+                },
+            );
         }
 
         info!("The client is ready! Listening to new messages…");

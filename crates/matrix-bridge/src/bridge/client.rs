@@ -10,12 +10,18 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::ruma::api::client::filter::FilterDefinition;
+use matrix_sdk::ruma::api::client::{keys::get_keys, uiaa};
 use matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent;
-use matrix_sdk::{Client, Error, LoopCtrl, Room, RoomMemberships, config::SyncSettings};
+use matrix_sdk::{
+    Client, ClientBuilder, Error, LoopCtrl, Room, RoomMemberships, config::SyncSettings,
+};
+use matrix_sdk_base::crypto::{CollectStrategy, DecryptionSettings, TrustRequirement};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use tokio::fs;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -35,6 +41,9 @@ struct ClientSession {
     homeserver: String,
     db_path: PathBuf,
     passphrase: String,
+    /// Public device fingerprint, used to detect an empty/replaced crypto DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_ed25519_key: Option<String>,
 }
 
 /// The full session persisted to `{state_dir}/session` as JSON. Layout is
@@ -76,19 +85,33 @@ impl MatrixClient {
                 .expect("no state_dir directory found")
                 .join(name),
         };
+        prepare_private_dir(&state_dir).await?;
         let session_file = state_dir.join("session");
 
         let (client, sync_token) = if session_file.exists() {
-            restore_session(&session_file).await?
+            restore_session(&session_file, &state_dir).await?
         } else {
-            (do_login(&session_file, login, name).await?, None)
+            (
+                do_login(&session_file, &state_dir, login, name).await?,
+                None,
+            )
         };
-
         Ok(Self {
             client,
             sync_token,
             session_file,
         })
+    }
+
+    /// Sign this device with the account's cross-signing identity, creating
+    /// the identity if the account has none. Only the long-lived bridge device
+    /// calls this: a throwaway device must never own the identity.
+    ///
+    /// Done explicitly, and awaited, rather than through the SDK's
+    /// `auto_enable_cross_signing`, whose background task only logs failures
+    /// and could run before the session file is saved.
+    pub async fn ensure_cross_signed(&self, login: &Login) -> anyhow::Result<()> {
+        initialize_cross_signing(&self.client, login).await
     }
 
     /// Install the invite auto-join handler: allow-list filtered, exponential
@@ -222,26 +245,135 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Reuse both halves of the store metadata, or migrate a genuinely legacy
+/// session. A half-written pair is not permission to generate replacement keys.
+fn resolve_store(session: &mut ClientSession, state_dir: &Path) -> anyhow::Result<bool> {
+    let no_path = session.db_path.as_os_str().is_empty();
+    let no_passphrase = session.passphrase.is_empty();
+    anyhow::ensure!(
+        no_path == no_passphrase,
+        "incomplete Matrix crypto store metadata; restore the session and store together from backup"
+    );
+    if no_path {
+        session.db_path = state_dir.join("store");
+        anyhow::ensure!(
+            !session.db_path.exists(),
+            "unrecorded Matrix store exists; refusing to replace crypto keys; restore the session and store together from backup"
+        );
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("system RNG unavailable"))?;
+        session.passphrase = bytes.iter().fold(String::new(), |mut value, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(value, "{byte:02x}");
+            value
+        });
+    } else {
+        // No recorded device key means the store was never opened (a crash
+        // right after recording the passphrase), so there are no keys to lose.
+        anyhow::ensure!(
+            session.db_path.join("matrix-sdk-crypto.sqlite3").is_file()
+                || session.device_ed25519_key.is_none(),
+            "Matrix crypto store is missing; refusing to replace device keys; restore the session and store together from backup"
+        );
+    }
+    Ok(no_path)
+}
+
+/// Build a client on the login's persistent, passphrase-encrypted store.
+///
+/// Trust follows MSC4153 in both directions: room keys are shared only with
+/// devices their owner has cross-signed, and only messages from cross-signed
+/// devices are decrypted. No interactive verification with the bot is needed.
+/// `auto_enable_cross_signing` stays off; see [`MatrixClient::ensure_cross_signed`].
+fn encrypted_builder(session: &ClientSession) -> ClientBuilder {
+    Client::builder()
+        .homeserver_url(&session.homeserver)
+        .sqlite_store(&session.db_path, Some(&session.passphrase))
+        .with_room_key_recipient_strategy(CollectStrategy::IdentityBasedStrategy)
+        .with_decryption_settings(DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::CrossSigned,
+        })
+}
+
+async fn prepare_private_dir(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
+/// Query the server before any key upload. In particular, a legacy session
+/// must not overwrite encryption keys published by some other client/store.
+async fn check_device_key(client: &Client, expected: Option<&str>) -> anyhow::Result<String> {
+    let local = client
+        .encryption()
+        .ed25519_key()
+        .await
+        .context("Matrix device key missing")?;
+    anyhow::ensure!(
+        expected.is_none_or(|key| key == local),
+        "Matrix crypto account changed; refusing to upload replacement device keys; restore the session and store together from backup"
+    );
+    let user = client.user_id().context("Matrix user missing")?;
+    let device = client.device_id().context("Matrix device missing")?;
+    let mut request = get_keys::v3::Request::new();
+    request
+        .device_keys
+        .insert(user.to_owned(), vec![device.to_owned()]);
+    let response = client.send(request).await?;
+    let remote = match response
+        .device_keys
+        .get(user)
+        .and_then(|devices| devices.get(device))
+    {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw.json().get())?["keys"]
+            [format!("ed25519:{device}")]
+        .as_str()
+        .map(str::to_owned),
+        None => None,
+    };
+    anyhow::ensure!(
+        remote.as_deref().is_none_or(|key| key == local),
+        "published Matrix device key differs from the local store; refusing to overwrite it; \
+         restore the original crypto store"
+    );
+    Ok(local)
+}
+
 /// Restore a client + sync token from a persisted session file.
-async fn restore_session(session_file: &Path) -> anyhow::Result<(Client, Option<String>)> {
+///
+/// A pre-encryption session (empty `db_path`/`passphrase`, as headjack wrote
+/// it) is upgraded in place: a fresh store and passphrase are recorded in the
+/// session file before the client can upload any key material.
+async fn restore_session(
+    session_file: &Path,
+    state_dir: &Path,
+) -> anyhow::Result<(Client, Option<String>)> {
     info!(
         "Previous session found in '{}'",
         session_file.to_string_lossy()
     );
     let serialized = fs::read_to_string(session_file).await?;
-    let FullSession {
-        client_session,
-        user_session,
-        sync_token,
-    } = serde_json::from_str(&serialized)?;
+    let mut full: FullSession = serde_json::from_str(&serialized)?;
+    let migrated = resolve_store(&mut full.client_session, state_dir)?;
+    if migrated {
+        info!("Upgrading pre-encryption Matrix session with a persistent crypto store");
+        // Record the passphrase before the store it protects exists.
+        write_session(session_file, &full).await?;
+    }
 
-    let client = Client::builder()
-        .homeserver_url(client_session.homeserver)
-        .build()
-        .await?;
-    info!("Restoring session for {}…", &user_session.meta.user_id);
-    client.restore_session(user_session).await?;
-    Ok((client, sync_token))
+    let client = encrypted_builder(&full.client_session).build().await?;
+    info!("Restoring session for {}…", &full.user_session.meta.user_id);
+    client.restore_session(full.user_session.clone()).await?;
+    let key = check_device_key(&client, full.client_session.device_ed25519_key.as_deref()).await?;
+    if full.client_session.device_ed25519_key.as_deref() != Some(key.as_str()) {
+        full.client_session.device_ed25519_key = Some(key);
+        write_session(session_file, &full).await?;
+    }
+    Ok((client, full.sync_token))
 }
 
 /// Password-login a fresh device and persist the session.
@@ -249,18 +381,43 @@ async fn restore_session(session_file: &Path) -> anyhow::Result<(Client, Option<
 /// `device_name` is the Matrix initial device display name: it identifies this
 /// device in the account's session list, and is the caller's `name` from
 /// [`MatrixClient::login`].
-async fn do_login(session_file: &Path, login: &Login, device_name: &str) -> anyhow::Result<Client> {
+async fn do_login(
+    session_file: &Path,
+    state_dir: &Path,
+    login: &Login,
+    device_name: &str,
+) -> anyhow::Result<Client> {
     info!("No previous session found, logging in…");
-    let client = Client::builder()
-        .homeserver_url(&login.homeserver_url)
-        .build()
-        .await?;
-    let matrix_auth = client.matrix_auth();
-
     let password = match &login.password {
         Some(p) => p.clone(),
         None => anyhow::bail!("password is required (interactive entry is not supported)"),
     };
+
+    // A store without a session file belongs to a device whose access token
+    // was never saved; it can never be restored. Keep it rather than delete key
+    // material, but move it aside so the new device starts from an empty store.
+    let store = state_dir.join("store");
+    if store.exists() {
+        let aside = state_dir.join(format!(
+            "store.orphaned-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S")
+        ));
+        warn!(
+            "Crypto store without a session file; moving it to {}",
+            aside.display()
+        );
+        fs::rename(&store, &aside).await?;
+    }
+    let mut client_session = ClientSession {
+        homeserver: login.homeserver_url.clone(),
+        db_path: PathBuf::new(),
+        passphrase: String::new(),
+        device_ed25519_key: None,
+    };
+    resolve_store(&mut client_session, state_dir)?;
+
+    let client = encrypted_builder(&client_session).build().await?;
+    let matrix_auth = client.matrix_auth();
     matrix_auth
         .login_username(&login.username, &password)
         .initial_device_display_name(device_name)
@@ -270,21 +427,101 @@ async fn do_login(session_file: &Path, login: &Login, device_name: &str) -> anyh
     let user_session = matrix_auth
         .session()
         .expect("a logged-in client should have a session");
+    client_session.device_ed25519_key = client.encryption().ed25519_key().await;
     let full = FullSession {
-        client_session: ClientSession {
-            homeserver: login.homeserver_url.clone(),
-            db_path: PathBuf::new(),
-            passphrase: String::new(),
-        },
+        client_session,
         user_session,
         sync_token: None,
     };
-    if let Some(parent) = session_file.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    fs::write(session_file, serde_json::to_string(&full)?).await?;
+    write_session(session_file, &full).await?;
     info!("Session persisted in {}", session_file.to_string_lossy());
     Ok(client)
+}
+
+/// Make sure this device is signed by the account's cross-signing identity.
+///
+/// Outbound room keys go only to cross-signed devices (MSC4153's
+/// `IdentityBasedStrategy`), and that strategy also refuses to send from a
+/// device that is not itself cross-signed. So a device we cannot sign can still
+/// read encrypted rooms but cannot reply in them; that is logged, not fatal, so
+/// unencrypted rooms keep working.
+async fn initialize_cross_signing(client: &Client, login: &Login) -> anyhow::Result<()> {
+    let encryption = client.encryption();
+    if encryption
+        .cross_signing_status()
+        .await
+        .is_some_and(|status| status.is_complete())
+    {
+        return Ok(());
+    }
+    let user = client.user_id().context("Matrix user missing")?.to_owned();
+    // Refresh our own identity from the server before deciding it is absent:
+    // bootstrapping over an existing identity would reset it for every client.
+    if encryption.request_user_identity(&user).await?.is_some() {
+        let signed = encryption
+            .get_own_device()
+            .await?
+            .is_some_and(|device| device.is_cross_signed_by_owner());
+        if !signed {
+            warn!(
+                "{user} already has a cross-signing identity this device does not hold; \
+                 replies in encrypted rooms stay disabled until another session of the \
+                 account verifies this device"
+            );
+        }
+        return Ok(());
+    }
+
+    info!("Creating a cross-signing identity for {user}");
+    match encryption.bootstrap_cross_signing(None).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let Some(response) = error.as_uiaa_response() else {
+                return Err(error).context("Matrix cross-signing bootstrap failed");
+            };
+            let Some(password) = &login.password else {
+                anyhow::bail!(
+                    "creating a cross-signing identity for {user} needs the account password"
+                );
+            };
+            let mut auth = uiaa::Password::new(
+                uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(user.to_string())),
+                password.clone(),
+            );
+            auth.session = response.session.clone();
+            encryption
+                .bootstrap_cross_signing(Some(uiaa::AuthData::Password(auth)))
+                .await
+                .context("Matrix cross-signing bootstrap failed")
+        }
+    }
+}
+
+/// Atomically write the session file with owner-only permissions: it holds
+/// the access token and the passphrase to the device's key store, and a torn
+/// write would lose the latter.
+async fn write_session(session_file: &Path, full: &FullSession) -> anyhow::Result<()> {
+    let serialized = serde_json::to_vec(full)?;
+    let path = session_file.to_owned();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let dir = path.parent().context("session file has no parent")?;
+        std::fs::create_dir_all(dir)?;
+        let tmp = path.with_extension("tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&serialized)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })
+    .await?
 }
 
 /// Rewrite the session file with the latest sync token.
@@ -292,8 +529,7 @@ async fn persist_sync_token(session_file: &Path, sync_token: String) -> anyhow::
     let serialized = fs::read_to_string(session_file).await?;
     let mut full: FullSession = serde_json::from_str(&serialized)?;
     full.sync_token = Some(sync_token);
-    fs::write(session_file, serde_json::to_string(&full)?).await?;
-    Ok(())
+    write_session(session_file, &full).await
 }
 
 /// Whether the room exceeds the configured member cap.
@@ -305,5 +541,108 @@ async fn is_room_too_large(room: &Room, room_size_limit: Option<usize>) -> bool 
             .map(|m| m.len() > limit)
             .unwrap_or(false),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy(homeserver: &str) -> ClientSession {
+        ClientSession {
+            homeserver: homeserver.to_owned(),
+            db_path: PathBuf::new(),
+            passphrase: String::new(),
+            device_ed25519_key: None,
+        }
+    }
+
+    #[test]
+    fn a_pre_encryption_session_gets_a_fresh_store_and_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = legacy("http://hs");
+        assert!(resolve_store(&mut session, dir.path()).unwrap());
+        assert_eq!(session.db_path, dir.path().join("store"));
+        assert_eq!(session.passphrase.len(), 64);
+        assert!(session.passphrase.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let mut other = legacy("http://hs");
+        let other_dir = tempfile::tempdir().unwrap();
+        resolve_store(&mut other, other_dir.path()).unwrap();
+        assert_ne!(session.passphrase, other.passphrase);
+    }
+
+    #[test]
+    fn an_unrecorded_store_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("store")).unwrap();
+        let error = resolve_store(&mut legacy("http://hs"), dir.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("unrecorded Matrix store"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn half_recorded_store_metadata_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = legacy("http://hs");
+        session.passphrase = "secret".into();
+        let error = resolve_store(&mut session, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("incomplete"), "{error}");
+    }
+
+    #[test]
+    fn a_recorded_store_must_still_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = legacy("http://hs");
+        session.db_path = dir.path().join("store");
+        session.passphrase = "secret".into();
+        // Recorded, but never opened: nothing to lose, so it may be created.
+        assert!(!resolve_store(&mut session, dir.path()).unwrap());
+        session.device_ed25519_key = Some("key".into());
+        let error = resolve_store(&mut session, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("store is missing"), "{error}");
+
+        std::fs::create_dir(&session.db_path).unwrap();
+        std::fs::write(session.db_path.join("matrix-sdk-crypto.sqlite3"), b"").unwrap();
+        assert!(!resolve_store(&mut session, dir.path()).unwrap());
+        assert_eq!(session.passphrase, "secret");
+    }
+
+    #[test]
+    fn a_headjack_session_file_still_parses() {
+        let json = r#"{"client_session":{"homeserver":"http://hs","db_path":"","passphrase":""},
+            "user_session":{"user_id":"@a:hs","device_id":"DEV","access_token":"tok"},
+            "sync_token":"s1"}"#;
+        let full: FullSession = serde_json::from_str(json).unwrap();
+        assert!(full.client_session.device_ed25519_key.is_none());
+        assert_eq!(full.sync_token.as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn the_session_file_is_private_and_replaced_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session");
+        std::fs::write(&path, b"old").unwrap();
+        let full: FullSession = serde_json::from_str(
+            r#"{"client_session":{"homeserver":"http://hs","db_path":"/s","passphrase":"p"},
+                "user_session":{"user_id":"@a:hs","device_id":"DEV","access_token":"tok"}}"#,
+        )
+        .unwrap();
+        write_session(&path, &full).await.unwrap();
+        persist_sync_token(&path, "s2".into()).await.unwrap();
+
+        let saved: FullSession =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.client_session.passphrase, "p");
+        assert_eq!(saved.sync_token.as_deref(), Some("s2"));
+        assert!(!path.with_extension("tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 }

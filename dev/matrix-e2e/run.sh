@@ -82,10 +82,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$REPO_ROOT/dev/matrix-e2e"
 CHAZ_BIN="${CHAZ_BIN:-$REPO_ROOT/target/debug/chaz}"
 CHAZ_MATRIX_BIN="${CHAZ_MATRIX_BIN:-$REPO_ROOT/target/debug/chaz-matrix}"
+E2EE_PROBE_BIN="${E2EE_PROBE_BIN:-$REPO_ROOT/target/debug/examples/e2ee_probe}"
 
-for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN"; do
+for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN" "$E2EE_PROBE_BIN"; do
 	if [[ ! -x $bin ]]; then
-		echo "missing binary: $bin (run 'just build', or set CHAZ_BIN / CHAZ_MATRIX_BIN)" >&2
+		echo "missing binary: $bin (run 'just e2e', or set CHAZ_BIN / CHAZ_MATRIX_BIN / E2EE_PROBE_BIN)" >&2
 		exit 2
 	fi
 done
@@ -476,6 +477,24 @@ BRIDGE_RUST_LOG="info,chaz_matrix_bridge=debug,chaz_core::session::transport=deb
 # under a second name, and the group-room cases run after that.
 BRIDGE_LOG="$WORKSPACE/bridge.log"
 
+# Every bridge deployed before encryption support holds a session file with an
+# empty crypto store path and passphrase, for a device that never uploaded
+# keys. Start this run from one, so the first bridge start takes the upgrade
+# path a real deployment takes rather than the fresh-login path.
+LOGIN_STATE_DIR="$WORKSPACE/state-bridge/matrix/_agent_e2e_test"
+log "seeding a pre-encryption bridge session"
+LEGACY_LOGIN="$(curl -sS --max-time "$CURL_MAX_TIME" -X POST -H 'Content-Type: application/json' \
+	-d "$(jq -nc --arg p "$AGENT_PASSWORD" \
+		'{type:"m.login.password",identifier:{type:"m.id.user",user:"agent"},password:$p,initial_device_display_name:"chaz"}')" \
+	"$HOMESERVER/_matrix/client/v3/login")"
+LEGACY_DEVICE="$(jq -r '.device_id // empty' <<<"$LEGACY_LOGIN")"
+[[ -n $LEGACY_DEVICE ]] || fail "could not log the agent in to seed a legacy session"
+mkdir -p "$LOGIN_STATE_DIR"
+jq -c --arg hs "$HOMESERVER" '{
+	client_session: {homeserver: $hs, db_path: "", passphrase: ""},
+	user_session: {user_id: .user_id, device_id: .device_id, access_token: .access_token}
+}' <<<"$LEGACY_LOGIN" >"$LOGIN_STATE_DIR/session"
+
 log "starting bridge"
 spawn bridge env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
 BRIDGE_PID="$SPAWNED_PID"
@@ -484,6 +503,17 @@ wait_for "bridge matrix login" 120 grep -q "The client is ready" "$WORKSPACE/bri
 if grep -qi "pending owner approval" "$WORKSPACE/bridge.log"; then
 	fail "bridge is waiting on manual approval — pre-authorization did not take (see $WORKSPACE/bridge.log)"
 fi
+
+grep -q "Upgrading pre-encryption Matrix session" "$WORKSPACE/bridge.log" ||
+	fail "bridge did not upgrade the pre-encryption session (see $WORKSPACE/bridge.log)"
+[[ $(jq -r '.user_session.device_id' "$LOGIN_STATE_DIR/session") == "$LEGACY_DEVICE" ]] ||
+	fail "bridge replaced the pre-encryption device instead of upgrading it"
+[[ -n $(jq -r '.client_session.passphrase' "$LOGIN_STATE_DIR/session") ]] ||
+	fail "upgraded session has no crypto store passphrase"
+[[ $(stat -c %a "$LOGIN_STATE_DIR/session") == 600 && $(stat -c %a "$LOGIN_STATE_DIR") == 700 ]] ||
+	fail "session file or login state dir is readable by others"
+AGENT_DEVICE_KEY="$(jq -r '.client_session.device_ed25519_key // empty' "$LOGIN_STATE_DIR/session")"
+[[ -n $AGENT_DEVICE_KEY ]] || fail "upgraded session did not record the device key"
 
 # Preserve the daemon's pre-conversation state. Restoring it below models the
 # observed failure: the daemon's copied state knows the agent and bridge but
@@ -517,9 +547,8 @@ PUPPET_TOKEN="$(mx POST /_matrix/client/v3/login "" "$(jq -nc \
 [[ -n $PUPPET_TOKEN ]] || fail "puppet could not log in"
 
 log "creating the room"
-# Unencrypted on purpose, and not a limitation of the harness: chaz builds
-# matrix-sdk without the e2e-encryption feature, so an encrypted room is one
-# the bridge could not read at all.
+# Unencrypted, so these cases keep covering plaintext rooms. The encrypted
+# cases have their own room further down.
 ROOM_ID="$(mx POST /_matrix/client/v3/createRoom "$PUPPET_TOKEN" "$(jq -nc \
 	--arg agent "$AGENT_MXID" \
 	'{preset:"trusted_private_chat",is_direct:true,invite:[$agent]}')" |
@@ -848,6 +877,110 @@ wait_for "ReAct tool result" "$REPLY_TIMEOUT" \
 wait_for "sixth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 6
 
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
+
+# ------------------------------------------------------ encrypted cases ---
+# An encrypted DM driven by e2ee_probe, a real Olm/Megolm client. The puppet's
+# probe device is cross-signed, like a device verified in Element. A second
+# puppet device is left unsigned: the bridge must withhold room keys from it
+# and must not act on what it sends. Each probe device keeps its own store.
+#
+# Case E1 — a plain message is decrypted, answered, and the answer is encrypted
+# Case E2 — a `!chaz` command in the encrypted room is answered
+# Case E3 — the unsigned device gets the reply's key withheld as unverified
+# Case E4 — a message from the unsigned device is not decrypted or answered
+# Case E5 — after a bridge restart the device and keys are unchanged, and the
+#           encrypted room still works
+# Case E6 — the server never saw a plaintext message from the bridge there
+probe() { "$E2EE_PROBE_BIN" "$@" 2>>"$WORKSPACE/probe.log"; }
+SIGNED_DIR="$WORKSPACE/probe-signed"
+UNSIGNED_DIR="$WORKSPACE/probe-unsigned"
+
+log "encrypted: logging in a cross-signed puppet device"
+probe --dir "$SIGNED_DIR" login --homeserver "$HOMESERVER" --user puppet \
+	--password "$PUPPET_PASSWORD" >/dev/null ||
+	fail "cross-signed probe login failed (see $WORKSPACE/probe.log)"
+E2EE_ROOM="$(probe --dir "$SIGNED_DIR" create-dm --invite "$AGENT_MXID")" ||
+	fail "could not create the encrypted room (see $WORKSPACE/probe.log)"
+log "encrypted room: $E2EE_ROOM"
+probe --dir "$SIGNED_DIR" wait-joined --room "$E2EE_ROOM" --user "$AGENT_MXID" --timeout 90 ||
+	fail "the agent did not join the encrypted room"
+
+# The first message in a room's session is always answered when the room is a
+# DM, so it has to be the one carrying the prompt.
+log "Case E1: plain message in the encrypted room"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "encrypted ping" >/dev/null ||
+	fail "could not send the encrypted message (see $WORKSPACE/probe.log)"
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "no decryptable encrypted reply to the plain message (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
+
+log "Case E2: !chaz command in the encrypted room"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz backends" >/dev/null ||
+	fail "could not send the encrypted command"
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$BACKENDS_MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "no decryptable encrypted reply to the command (see $WORKSPACE/probe.log)"
+
+log "Case E3: an unsigned puppet device is refused the reply's key"
+probe --dir "$UNSIGNED_DIR" login --homeserver "$HOMESERVER" --user puppet \
+	--password "$PUPPET_PASSWORD" --unsigned >/dev/null ||
+	fail "unsigned probe login failed (see $WORKSPACE/probe.log)"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz help" >/dev/null ||
+	fail "could not send the encrypted help command"
+SIGNED_SAW="$(probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$HELP_MARKER" --timeout "$REPLY_TIMEOUT")" ||
+	fail "the cross-signed device could not read the reply (see $WORKSPACE/probe.log)"
+UNSIGNED_SAW="$(probe --dir "$UNSIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--withheld --timeout "$REPLY_TIMEOUT")" ||
+	fail "the unsigned device was not refused the reply's key (see $WORKSPACE/probe.log)"
+[[ $SIGNED_SAW == "$UNSIGNED_SAW" ]] ||
+	fail "the devices judged different replies ($SIGNED_SAW vs $UNSIGNED_SAW)"
+
+log "Case E4: a message from the unsigned device is not acted on"
+UNSIGNED_EVENT="$(probe --dir "$UNSIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz backends")" ||
+	fail "the unsigned device could not send"
+# The log is coloured, so match the event id as a fixed string on the line.
+reported_undecryptable() {
+	grep "Could not decrypt a message" "$BRIDGE_LOG" | grep -qF "$UNSIGNED_EVENT"
+}
+wait_for "the bridge to report the undecryptable message" "$REPLY_TIMEOUT" reported_undecryptable
+# Barrier: a later message from the signed device is answered, so the unsigned
+# one had its chance first. The reply must be to this message, not a stray
+# `backends` reply to the unsigned one.
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz help" >/dev/null
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$HELP_MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "barrier reply after the unsigned message never arrived"
+[[ $(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender "$AGENT_MXID") -eq 4 ]] ||
+	fail "the bridge answered the unsigned device's message (expected exactly 4 replies)"
+
+log "Case E5: bridge restart keeps the encrypted device"
+DEVICE_BEFORE="$(jq -r '.user_session.device_id' "$LOGIN_STATE_DIR/session")"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+spawn bridge-encrypted-restart env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-encrypted-restart.log"
+wait_for "bridge to come back online" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+[[ $(jq -r '.user_session.device_id' "$LOGIN_STATE_DIR/session") == "$DEVICE_BEFORE" ]] ||
+	fail "the bridge came back as a different device"
+[[ $(jq -r '.client_session.device_ed25519_key' "$LOGIN_STATE_DIR/session") == "$AGENT_DEVICE_KEY" ]] ||
+	fail "the bridge's device key changed across restart"
+! grep -q "Creating a cross-signing identity" "$BRIDGE_LOG" ||
+	fail "the bridge re-created its cross-signing identity on restart"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "encrypted after restart" >/dev/null
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "no decryptable reply after the bridge restart (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
+
+log "Case E6: nothing from the bridge reached the server in plaintext"
+ENCRYPTED_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender "$AGENT_MXID")" ||
+	fail "the bridge sent a plaintext message into the encrypted room (see $WORKSPACE/probe.log)"
+[[ $ENCRYPTED_REPLIES -eq 5 ]] ||
+	fail "expected 5 encrypted replies from the bridge, found $ENCRYPTED_REPLIES"
+
+printf '\033[1;32mPASS\033[0m — encrypted cases passed (plain message, command, withheld unsigned device, ignored unsigned sender, restart, on-wire encryption)\n' >&2
 
 # ----------------------------------------------------------- room reset ---
 # The `chaz-matrix rooms` maintenance command, run against the same throwaway

@@ -261,6 +261,82 @@ If the Matrix connection drops, the bot retries with a 5-second backoff. The ret
 
 The bot surfaces approval requests as markdown notices in the room. Respond either via reactions (✅ approve · ❌ deny · ⏭ approve all) or by sending `!chaz approve` / `!chaz deny`. To skip approval altogether for specific low-risk tools, add them to `security.auto_approved_tools`.
 
+## Encrypted Rooms
+
+The bridge reads and answers encrypted rooms. There is nothing to configure: every
+Matrix login keeps a persistent encryption device, and the bridge decides which other
+devices it trusts from Matrix cross-signing alone.
+
+| What                   | Behavior                                                                                                             |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Device store           | `{state_dir}/matrix/{login_id}/store/`, a passphrase-encrypted SQLite store holding the device's keys and room state |
+| Store passphrase       | Generated on first start, kept in `{state_dir}/matrix/{login_id}/session` (mode `0600`, directory `0700`)            |
+| Bot device             | Signed with the account's cross-signing identity on first start; the identity is created if the account has none     |
+| Outbound room keys     | Shared only with devices their owner has cross-signed (MSC4153)                                                      |
+| Inbound messages       | Decrypted only from cross-signed devices; anything else is logged and ignored                                        |
+| Command authorization  | Unchanged: `allow_list`, approvals, and command rules apply exactly as in plaintext rooms                            |
+| Pre-encryption session | Upgraded in place on first start: same device, new store                                                             |
+
+### How encrypted-room trust works
+
+A Matrix client that is signed in on several devices publishes a _cross-signing identity_
+and signs each of its devices with it; Element does this when you verify a new login.
+The bridge relies on that and nothing else. It never asks you to verify the bot, and it
+never trusts a device just because it appeared in the room.
+
+- **Your side.** Messages you send from a verified (cross-signed) device are decrypted
+  and handled like any other message. A reply is encrypted to every cross-signed device
+  in the room. A device you never verified gets no key for the reply, and its own messages
+  are not decrypted. The bridge logs each such message:
+  `Could not decrypt a message; it is ignored.` with its room, sender, and event id.
+- **The bot's side.** On first start the bridge signs its own device. If the account has no
+  cross-signing identity, the bridge creates one. It uses the configured password if the
+  homeserver asks for re-authentication. If the account already has an identity that was
+  created elsewhere, for example by signing the bot account into Element, the bridge cannot
+  sign itself. It logs a warning, and it can read encrypted rooms but cannot reply in them
+  until you verify its device from that other session. Plaintext rooms are not affected.
+- **Keys live on disk.** Moving or restoring a bridge means moving the `session` file and the
+  `store/` directory together. The bridge refuses to start rather than silently becoming a new
+  device when they do not match. This covers a missing store, a store it did not record, half
+  of the store metadata, or a device key that differs from the recorded or published one.
+  The error says which. A new device would lose every room key and would need your trust again.
+- **A late key is not retried.** A message that arrives before its room key is logged as
+  undecryptable and is not processed when the key turns up later. Send it again.
+
+**Where encryption ends.** Matrix encryption protects the message between your device and
+the bridge. Once the bridge accepts a message, the plaintext is written to the chaz session
+database and handled like a message from a plaintext room: it syncs to the peers that host
+the agent, and it is sent to the configured model backend. Neither the session database nor
+the model provider is covered by Matrix encryption. An encrypted room keeps the homeserver
+out of the conversation. It does not keep the conversation out of chaz or the model.
+
+### Walkthrough: moving a conversation into an encrypted room
+
+1. Upgrade `chaz-matrix` and restart it. A bridge deployed before encryption support upgrades
+   its existing device and creates the bot's cross-signing identity:
+
+   ```text
+   INFO chaz_matrix_bridge::bridge::client: Previous session found in '/var/lib/chaz-matrix/matrix/_chaz_example/session'
+   INFO chaz_matrix_bridge::bridge::client: Upgrading pre-encryption Matrix session with a persistent crypto store
+   INFO chaz_matrix_bridge::bridge::client: Restoring session for @chaz:example…
+   INFO chaz_matrix_bridge::bridge::client: Creating a cross-signing identity for @chaz:example
+   INFO chaz_matrix_bridge::bridge: The client is ready! Listening to new messages…
+   ```
+
+2. From a verified Element session, start an encrypted direct message with the bot. It joins,
+   and `!chaz help` or a plain message is answered in the room like anywhere else.
+3. Restart the bridge. The upgrade and identity lines do not appear again. The device and its
+   keys are the same, so the room keeps working without re-verification.
+4. Failure path: send a message from a device you never verified, such as a new login you
+   skipped verification for. The bot does not answer, and its log names the message:
+
+   ```text
+   WARN matrix_sdk_crypto::machine: Failed to decrypt a room event: decryption failed because trust requirement not satisfied: The sending device was not signed by the user's identity
+   WARN chaz_matrix_bridge::bridge: Could not decrypt a message; it is ignored. The sender's device must be cross-signed and must share its room key with this device room_id=!room:example sender=@you:example event_id=$event session_id="…"
+   ```
+
+   Verify that device from another of your sessions, then send the message again.
+
 ## Limitations
 
 - **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/matrix-bridge/src/bridge/commands.rs` and `crates/matrix-bridge/src/bridge/history.rs`.
